@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024" fill="none">
+  <defs>
+    <filter id="tile-shadow" x="72" y="72" width="880" height="900" filterUnits="userSpaceOnUse"><feDropShadow dx="0" dy="18" stdDeviation="18" flood-color="#000" flood-opacity="0.16"/></filter>
+    <filter id="mark-shadow" x="144" y="250" width="758" height="500" filterUnits="userSpaceOnUse"><feDropShadow dx="0" dy="7" stdDeviation="6" flood-color="#000" flood-opacity="0.22"/></filter>
+  </defs>
+  <rect width="1024" height="1024" fill="#FFF"/>
+  <g filter="url(#tile-shadow)"><rect x="116" y="116" width="792" height="792" rx="190" fill="#FFF"/><rect x="117.5" y="117.5" width="789" height="789" rx="188.5" stroke="#E9E9E9" stroke-width="3"/></g>
+  <g filter="url(#mark-shadow)" fill="none" stroke="#18191A" stroke-linecap="round" stroke-linejoin="round">
+    <path stroke-width="36" d="M306 340H696C748 340 780 372 780 424V558C780 606 750 638 700 644H518L414 720V644H306C256 644 224 612 224 562V422C224 372 256 340 306 340Z"/>
+    <path stroke-width="28" d="M306 510H330C350 510 352 458 372 458C394 458 400 574 420 574C442 574 446 420 468 420C490 420 494 498 520 510H704"/>
+    <path stroke-width="26" d="M520 580H688"/>
+  </g>
+</svg>

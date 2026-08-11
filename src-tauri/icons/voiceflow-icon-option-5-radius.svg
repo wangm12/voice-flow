@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024" fill="none">
+  <defs>
+    <filter id="tile-shadow" x="72" y="72" width="880" height="900" filterUnits="userSpaceOnUse"><feDropShadow dx="0" dy="18" stdDeviation="18" flood-color="#000" flood-opacity="0.16"/></filter>
+    <filter id="mark-shadow" x="144" y="180" width="758" height="600" filterUnits="userSpaceOnUse"><feDropShadow dx="0" dy="7" stdDeviation="6" flood-color="#000" flood-opacity="0.22"/></filter>
+  </defs>
+  <rect width="1024" height="1024" fill="#FFF"/>
+  <g filter="url(#tile-shadow)"><rect x="116" y="116" width="792" height="792" rx="190" fill="#FFF"/><rect x="117.5" y="117.5" width="789" height="789" rx="188.5" stroke="#E9E9E9" stroke-width="3"/></g>
+  <g filter="url(#mark-shadow)" fill="none" stroke="#18191A" stroke-width="44" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M270 642V500A200 200 0 0 1 470 300H768"/>
+    <path stroke-width="36" d="M356 606V500A114 114 0 0 1 470 386H724"/>
+    <path stroke-width="30" d="M442 566V500A28 28 0 0 1 470 472H672"/>
+    <path stroke-width="34" d="M768 368V500"/>
+  </g>
+</svg>

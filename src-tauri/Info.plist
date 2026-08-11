@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>VoiceFlow 只会在录音时使用麦克风，将你的语音转换为文字。</string>
+  <key>NSAppleEventsUsageDescription</key>
+  <string>启用浏览器上下文检测后，VoiceFlow 才会读取当前站点信息，并仅将结果保存在本机。</string>
+</dict>
+</plist>

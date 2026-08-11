@@ -1,0 +1,62 @@
+[package]
+name = "voiceflow"
+version = "0.1.0"
+description = "VoiceFlow desktop voice dictation app"
+authors = ["you"]
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "tauri_app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(cargo_clippy)'] }
+
+[features]
+default = []
+macos-private-api = ["tauri/macos-private-api"]
+
+[dependencies]
+tauri = { version = "2", features = ["macos-private-api", "tray-icon", "image-png"] }
+tauri-plugin-global-shortcut = "2"
+tauri-plugin-clipboard-manager = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-single-instance = "2"
+libc = "0.2"
+cpal = "0.16"
+hound = "3.5"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "json", "stream", "multipart"] }
+futures-util = "0.3"
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+log = "0.4"
+env_logger = "0.11"
+thiserror = "2"
+rusqlite = { version = "0.37", features = ["bundled"] }
+enigo = "0.6.1"
+rubato = "0.16"
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc = "0.2"
+objc2 = "0.6"
+objc2-av-foundation = { version = "0.3", default-features = false, features = ["std", "AVCaptureDevice", "AVCaptureInput", "AVMediaFormat", "block2"] }
+block2 = "0.6"
+core-graphics = "0.24"
+core-foundation = "0.10"
+security-framework = { version = "3", features = ["OSX_10_15"] }
+security-framework-sys = "2"
+tauri-nspanel = { git = "https://github.com/ahkohd/tauri-nspanel", rev = "18ffb9a201fbf6fedfaa382fd4b92315ea30ab1a" }

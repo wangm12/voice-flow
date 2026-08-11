@@ -1,0 +1,42 @@
+# VoiceFlow 数据与隐私说明
+
+## 数据流
+
+VoiceFlow 的录音只在用户主动触发 dictation 后开始。音频会发送到用户配置的 Groq ASR 服务；启用 AI 文字整理时，转录文本会发送到 Groq LLM 服务。VoiceFlow 不发送 raw URL、窗口标题、PID 或目标 identity 给 LLM。用户主动启用 selected-text action 时，当前选中文本和语音操作会作为该次 Groq 请求的输入；它不会写入普通 History，也不会被 VoiceFlow 自动保存为个性化数据。
+
+上下文检测在本机完成。浏览器 host 检测只有在用户开启浏览器访问后才会执行；本地只保留必要的 host/profile 信息和不可逆的目标 fingerprint，用于防止录音期间误粘贴到变化后的窗口或 Tab。
+
+## 本地数据
+
+以下数据保存在 Tauri app_data_dir：
+
+- history SQLite：原始转录、整理结果、状态、delivery/fallback 信息和 context policy；
+- recovery spool：失败或中断录音的 WAV/F32 分块；
+- usage：当天的请求数量和录音时长；
+- settings：不包含明文 API Key；API Key 存储在 macOS Keychain。
+
+当前默认保留策略：
+
+- recovery audio：7 天；
+- history text：365 天；
+- usage：按天存储，清空全部数据会一并删除。
+
+设置中的保留策略会在启动时执行，也会在修改历史保留时间后立即执行。历史文字可以选择“永久”，这表示不会自动清理，直到你手动删除单条记录或清空全部数据。
+
+## 删除和导出
+
+History 页面提供：
+
+- 导出全部 history JSON；
+- 删除单条记录；
+- 清空全部 history、recovery audio 和本地 usage。
+
+清空操作不可撤销。删除 API Key 是独立操作，会从 Keychain 删除凭据并将 onboarding 标记为未完成。
+
+## 第三方服务和 telemetry
+
+VoiceFlow 当前不收集 telemetry、广告标识或用户行为分析。网络请求只发往用户选择并配置的 provider。用户需要分别遵守 Groq 的服务条款和隐私政策。
+
+## 安全边界
+
+VoiceFlow 的本地 SQLite 和 recovery audio 依赖 macOS 用户账户和应用数据目录的文件权限；当前版本没有对 history 数据做应用层加密。共享 macOS 用户账户或未加密备份可能暴露本地转录，因此 public release 前应在产品隐私说明和支持文档中明确这一点。

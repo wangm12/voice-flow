@@ -7,8 +7,8 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-pub const SETTINGS_SCHEMA_VERSION: u32 = 11;
-const HISTORY_SCHEMA_VERSION: i32 = 4;
+pub const SETTINGS_SCHEMA_VERSION: u32 = 13;
+const HISTORY_SCHEMA_VERSION: i32 = 5;
 
 fn current_settings_schema_version() -> u32 {
     SETTINGS_SCHEMA_VERSION
@@ -42,7 +42,10 @@ pub struct Settings {
     pub activation_mode: String,
     pub chunk_threshold_secs: u64,
     pub chunk_length_secs: usize,
+    #[serde(default = "default_long_output_mode")]
     pub long_output_mode: String,
+    #[serde(default = "default_delivery_policy")]
+    pub delivery_policy: String,
     pub keep_audio_days: u64,
     pub keep_history_days: u64,
     pub onboarded: bool,
@@ -86,6 +89,16 @@ fn default_translation_target_language() -> String {
     "en".into()
 }
 
+fn default_long_output_mode() -> String {
+    "paste".into()
+}
+
+fn default_delivery_policy() -> String {
+    crate::delivery::DeliveryPolicy::default_value()
+        .as_str()
+        .into()
+}
+
 fn default_selected_action_hotkey() -> String {
     "CmdOrControl+Shift+Slash".into()
 }
@@ -107,7 +120,8 @@ impl Default for Settings {
             activation_mode: "tap".into(),
             chunk_threshold_secs: 25,
             chunk_length_secs: 35,
-            long_output_mode: "clipboard".into(),
+            long_output_mode: default_long_output_mode(),
+            delivery_policy: default_delivery_policy(),
             keep_audio_days: 7,
             keep_history_days: 365,
             onboarded: false,
@@ -144,6 +158,20 @@ impl Settings {
             if self.schema_version < 11 && self.output_mode == "plain" {
                 self.output_mode = default_output_mode();
             }
+            // Schema 11 used clipboard as the long-recording default. Treat
+            // that legacy default as a migration to the new default, while
+            // preserving explicit choices made in the current schema.
+            if self.schema_version < 12 && self.long_output_mode == "clipboard" {
+                self.long_output_mode = default_long_output_mode();
+            }
+            if self.schema_version < 13 {
+                let migrated_policy = match self.long_output_mode.as_str() {
+                    "clipboard" => "clipboard_only",
+                    "history" => "history_only",
+                    _ => "auto",
+                };
+                self.delivery_policy = migrated_policy.into();
+            }
             self.schema_version = SETTINGS_SCHEMA_VERSION;
         }
         self.chunk_threshold_secs = self.chunk_threshold_secs.clamp(5, 3_600);
@@ -163,7 +191,10 @@ impl Settings {
             self.long_output_mode.as_str(),
             "clipboard" | "paste" | "history"
         ) {
-            self.long_output_mode = "clipboard".into();
+            self.long_output_mode = default_long_output_mode();
+        }
+        if !crate::delivery::DeliveryPolicy::is_valid(&self.delivery_policy) {
+            self.delivery_policy = default_delivery_policy();
         }
         if !crate::llm::is_supported_model(&self.cleanup_model) {
             self.cleanup_model = default_cleanup_model();
@@ -265,6 +296,12 @@ impl Settings {
         ) {
             anyhow::bail!("unsupported long output mode");
         }
+        if !matches!(
+            self.delivery_policy.as_str(),
+            "auto" | "paste_shortcut" | "clipboard_only" | "history_only"
+        ) {
+            anyhow::bail!("unsupported delivery policy");
+        }
         if !crate::llm::is_supported_model(&self.cleanup_model) {
             anyhow::bail!("unsupported cleanup model");
         }
@@ -342,6 +379,7 @@ pub struct SettingsView {
     pub chunk_threshold_secs: u64,
     pub chunk_length_secs: usize,
     pub long_output_mode: String,
+    pub delivery_policy: String,
     pub keep_audio_days: u64,
     pub keep_history_days: u64,
     pub onboarded: bool,
@@ -383,6 +421,7 @@ impl From<&Settings> for SettingsView {
             chunk_threshold_secs: settings.chunk_threshold_secs,
             chunk_length_secs: settings.chunk_length_secs,
             long_output_mode: settings.long_output_mode.clone(),
+            delivery_policy: settings.delivery_policy.clone(),
             keep_audio_days: settings.keep_audio_days,
             keep_history_days: settings.keep_history_days,
             onboarded: settings.onboarded,
@@ -416,6 +455,20 @@ pub struct HistoryItem {
     pub fallback_reason: Option<String>,
     pub context_profile_id: Option<String>,
     pub retryable: bool,
+    pub revision_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct HistoryRevision {
+    pub revision_id: i64,
+    pub dictation_id: i64,
+    pub created_at: String,
+    pub final_text: String,
+    pub cleanup_status: Option<String>,
+    pub intent: Option<serde_json::Value>,
+    pub model: Option<String>,
+    pub context_policy: Option<serde_json::Value>,
+    pub revision_reason: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -862,7 +915,7 @@ pub fn save_settings(dir: &Path, settings: &Settings) -> anyhow::Result<()> {
 }
 static SETTINGS_WRITE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 fn schema(c: &Connection) -> anyhow::Result<()> {
-    c.execute_batch("CREATE TABLE IF NOT EXISTS dictations (id INTEGER PRIMARY KEY, created_at TEXT NOT NULL, duration_secs REAL, raw_text TEXT, final_text TEXT, cleanup_status TEXT, engine TEXT, degraded INTEGER, degraded_reason TEXT, status TEXT, raw_audio_path TEXT, delivery_method TEXT, fallback_reason TEXT, context_profile_id TEXT, context_policy_json TEXT); CREATE TABLE IF NOT EXISTS usage (day TEXT PRIMARY KEY, asr_requests INTEGER NOT NULL DEFAULT 0, llm_requests INTEGER NOT NULL DEFAULT 0, audio_seconds REAL NOT NULL DEFAULT 0);")?;
+    c.execute_batch("CREATE TABLE IF NOT EXISTS dictations (id INTEGER PRIMARY KEY, created_at TEXT NOT NULL, duration_secs REAL, raw_text TEXT, final_text TEXT, cleanup_status TEXT, engine TEXT, degraded INTEGER, degraded_reason TEXT, status TEXT, raw_audio_path TEXT, delivery_method TEXT, fallback_reason TEXT, context_profile_id TEXT, context_policy_json TEXT); CREATE TABLE IF NOT EXISTS dictation_revisions (revision_id INTEGER PRIMARY KEY, dictation_id INTEGER NOT NULL, created_at TEXT NOT NULL, final_text TEXT NOT NULL, cleanup_status TEXT, intent_json TEXT, model TEXT, context_policy_json TEXT, revision_reason TEXT NOT NULL, FOREIGN KEY(dictation_id) REFERENCES dictations(id) ON DELETE CASCADE); CREATE INDEX IF NOT EXISTS idx_dictation_revisions_dictation ON dictation_revisions(dictation_id, revision_id DESC); CREATE TABLE IF NOT EXISTS usage (day TEXT PRIMARY KEY, asr_requests INTEGER NOT NULL DEFAULT 0, llm_requests INTEGER NOT NULL DEFAULT 0, audio_seconds REAL NOT NULL DEFAULT 0);")?;
     ensure_column(c, "raw_audio_path", "TEXT")?;
     ensure_column(c, "degraded_reason", "TEXT")?;
     ensure_column(c, "delivery_method", "TEXT")?;
@@ -879,6 +932,7 @@ fn open_history(dir: &Path) -> anyhow::Result<Connection> {
     let path = dir.join("history.sqlite");
     let existed = path.exists();
     let connection = Connection::open(&path)?;
+    connection.execute_batch("PRAGMA foreign_keys = ON;")?;
     // History writes can overlap with a completion, recovery scan, or the
     // settings window loading its list. Let SQLite briefly wait for the
     // active writer instead of turning a transient lock into lost history.
@@ -1181,9 +1235,9 @@ pub fn get_history_page(
     let limit = limit.clamp(1, 100);
     let fetch_limit = limit + 1;
     let sql = if before_id.is_some() {
-        "SELECT id,created_at,COALESCE(raw_text,''),COALESCE(final_text,''),COALESCE(duration_secs,0),COALESCE(degraded,0),degraded_reason,COALESCE(status,'ok'),delivery_method,fallback_reason,context_profile_id,raw_audio_path,COALESCE(cleanup_status,'unknown') FROM dictations WHERE id < ? ORDER BY id DESC LIMIT ?"
+        "SELECT id,created_at,COALESCE(raw_text,''),COALESCE((SELECT final_text FROM dictation_revisions WHERE dictation_id=dictations.id ORDER BY revision_id DESC LIMIT 1),final_text,''),COALESCE(duration_secs,0),COALESCE(degraded,0),degraded_reason,COALESCE(status,'ok'),delivery_method,fallback_reason,context_profile_id,raw_audio_path,COALESCE(cleanup_status,'unknown'),(SELECT COUNT(*) FROM dictation_revisions WHERE dictation_id=dictations.id) FROM dictations WHERE id < ? ORDER BY id DESC LIMIT ?"
     } else {
-        "SELECT id,created_at,COALESCE(raw_text,''),COALESCE(final_text,''),COALESCE(duration_secs,0),COALESCE(degraded,0),degraded_reason,COALESCE(status,'ok'),delivery_method,fallback_reason,context_profile_id,raw_audio_path,COALESCE(cleanup_status,'unknown') FROM dictations ORDER BY id DESC LIMIT ?"
+        "SELECT id,created_at,COALESCE(raw_text,''),COALESCE((SELECT final_text FROM dictation_revisions WHERE dictation_id=dictations.id ORDER BY revision_id DESC LIMIT 1),final_text,''),COALESCE(duration_secs,0),COALESCE(degraded,0),degraded_reason,COALESCE(status,'ok'),delivery_method,fallback_reason,context_profile_id,raw_audio_path,COALESCE(cleanup_status,'unknown'),(SELECT COUNT(*) FROM dictation_revisions WHERE dictation_id=dictations.id) FROM dictations ORDER BY id DESC LIMIT ?"
     };
     let mut s = c.prepare(sql)?;
     let rows = if let Some(before_id) = before_id {
@@ -1220,6 +1274,7 @@ fn history_row<'a>(
             fallback_reason: r.get(9)?,
             context_profile_id: r.get(10)?,
             retryable,
+            revision_count: r.get::<_, i64>(13)? as usize,
         })
     }
 }
@@ -1320,6 +1375,69 @@ pub fn history_context(
     json.map(|value| serde_json::from_str(&value).map_err(anyhow::Error::from))
         .transpose()
 }
+
+#[allow(clippy::too_many_arguments)]
+pub fn save_history_revision(
+    dir: &Path,
+    dictation_id: i64,
+    final_text: &str,
+    cleanup_status: Option<&str>,
+    intent: Option<&crate::llm::CleanupIntent>,
+    model: Option<&str>,
+    context_policy: Option<&crate::context::ContextPolicy>,
+    revision_reason: &str,
+) -> anyhow::Result<i64> {
+    if final_text.trim().is_empty() {
+        anyhow::bail!("history revision cannot be empty");
+    }
+    if revision_reason.trim().is_empty() || revision_reason.len() > 128 {
+        anyhow::bail!("history revision reason is invalid");
+    }
+    let c = open_history(dir)?;
+    let intent_json = intent.map(serde_json::to_string).transpose()?;
+    let context_policy_json = context_policy.map(serde_json::to_string).transpose()?;
+    c.execute(
+        "INSERT INTO dictation_revisions (dictation_id,created_at,final_text,cleanup_status,intent_json,model,context_policy_json,revision_reason) SELECT ?,datetime('now'),?,?,?,?,?,? WHERE EXISTS (SELECT 1 FROM dictations WHERE id=?)",
+        params![
+            dictation_id,
+            final_text,
+            cleanup_status,
+            intent_json,
+            model,
+            context_policy_json,
+            revision_reason,
+            dictation_id
+        ],
+    )?;
+    if c.changes() == 0 {
+        anyhow::bail!("history record was not found");
+    }
+    Ok(c.last_insert_rowid())
+}
+
+pub fn get_history_revisions(
+    dir: &Path,
+    dictation_id: i64,
+) -> anyhow::Result<Vec<HistoryRevision>> {
+    let c = open_history(dir)?;
+    let mut statement = c.prepare("SELECT revision_id,dictation_id,created_at,final_text,cleanup_status,intent_json,model,context_policy_json,revision_reason FROM dictation_revisions WHERE dictation_id=? ORDER BY revision_id ASC")?;
+    let rows = statement.query_map([dictation_id], |row| {
+        let intent_json: Option<String> = row.get(5)?;
+        let context_policy_json: Option<String> = row.get(7)?;
+        Ok(HistoryRevision {
+            revision_id: row.get(0)?,
+            dictation_id: row.get(1)?,
+            created_at: row.get(2)?,
+            final_text: row.get(3)?,
+            cleanup_status: row.get(4)?,
+            intent: intent_json.and_then(|value| serde_json::from_str(&value).ok()),
+            model: row.get(6)?,
+            context_policy: context_policy_json.and_then(|value| serde_json::from_str(&value).ok()),
+            revision_reason: row.get(8)?,
+        })
+    })?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
 #[allow(dead_code)]
 pub fn mark_retried(
     dir: &Path,
@@ -1342,13 +1460,16 @@ pub fn mark_retried_with_texts(
 ) -> anyhow::Result<()> {
     let c = open_history(dir)?;
     c.execute(
-        "UPDATE dictations SET status=?, degraded=?, degraded_reason=?, raw_text=COALESCE(?,raw_text), final_text=?, cleanup_status=COALESCE(?,cleanup_status), raw_audio_path=NULL, delivery_method='clipboard', fallback_reason='retry_clipboard_only' WHERE id=?",
+        "INSERT INTO dictation_revisions (dictation_id,created_at,final_text,cleanup_status,revision_reason) SELECT ?,datetime('now'),?,?,? WHERE EXISTS (SELECT 1 FROM dictations WHERE id=?)",
+        params![id, final_text, cleanup_status, "retry", id],
+    )?;
+    c.execute(
+        "UPDATE dictations SET status=?, degraded=?, degraded_reason=?, raw_text=COALESCE(?,raw_text), cleanup_status=COALESCE(?,cleanup_status), raw_audio_path=NULL, delivery_method='clipboard', fallback_reason='retry_clipboard_only' WHERE id=?",
         params![
             if degraded { "degraded" } else { "copied" },
             degraded as i32,
             degraded_reason,
             raw_text,
-            final_text,
             cleanup_status,
             id
         ],
@@ -1405,10 +1526,38 @@ pub fn remove_spool_artifact(dir: &Path, path: &Path) {
 pub fn history_text(dir: &Path, id: i64) -> anyhow::Result<String> {
     let c = open_history(dir)?;
     Ok(c.query_row(
-        "SELECT COALESCE(NULLIF(final_text,''), raw_text, '') FROM dictations WHERE id=?",
+        "SELECT COALESCE(NULLIF((SELECT final_text FROM dictation_revisions WHERE dictation_id=dictations.id ORDER BY revision_id DESC LIMIT 1),''),NULLIF(final_text,''),raw_text,'') FROM dictations WHERE id=?",
         [id],
         |r| r.get(0),
     )?)
+}
+
+pub fn history_raw_text(dir: &Path, id: i64) -> anyhow::Result<String> {
+    let c = open_history(dir)?;
+    Ok(c.query_row(
+        "SELECT COALESCE(raw_text,'') FROM dictations WHERE id=?",
+        [id],
+        |r| r.get(0),
+    )?)
+}
+
+pub fn update_history_revision_state(
+    dir: &Path,
+    id: i64,
+    degraded: bool,
+    degraded_reason: Option<&str>,
+    status: &str,
+    cleanup_status: Option<&str>,
+) -> anyhow::Result<()> {
+    let c = open_history(dir)?;
+    c.execute(
+        "UPDATE dictations SET status=?,degraded=?,degraded_reason=?,cleanup_status=COALESCE(?,cleanup_status),delivery_method='clipboard',fallback_reason=NULL WHERE id=?",
+        params![status, degraded as i32, degraded_reason, cleanup_status, id],
+    )?;
+    if c.changes() == 0 {
+        anyhow::bail!("history record was not found");
+    }
+    Ok(())
 }
 pub fn delete_history(dir: &Path, id: i64) -> anyhow::Result<()> {
     let c = open_history(dir)?;
@@ -1478,6 +1627,7 @@ mod tests {
         assert_eq!(settings.theme, "system");
         assert_eq!(settings.output_mode, "auto");
         assert_eq!(settings.translation_target_language, "en");
+        assert_eq!(settings.long_output_mode, "paste");
         assert_eq!(settings.selected_action_hotkey, "CmdOrControl+Shift+Slash");
         assert!(settings.selected_actions_enabled);
         assert!(settings.input_device.is_empty());
@@ -1521,6 +1671,48 @@ mod tests {
         assert_eq!(settings.input_device, "EarPods Microphone");
         assert!(Settings::default().input_device.is_empty());
         assert!(settings.validate().is_ok());
+    }
+
+    #[test]
+    fn long_recording_defaults_to_auto_paste() {
+        assert_eq!(Settings::default().long_output_mode, "paste");
+        assert_eq!(Settings::default().delivery_policy, "auto");
+
+        let mut settings = Settings {
+            long_output_mode: "unsupported".into(),
+            ..Settings::default()
+        };
+        settings.normalize();
+        assert_eq!(settings.long_output_mode, "paste");
+        assert_eq!(settings.delivery_policy, "auto");
+    }
+
+    #[test]
+    fn legacy_long_recording_default_migrates_to_auto_paste() {
+        let mut settings = Settings {
+            schema_version: 11,
+            long_output_mode: "clipboard".into(),
+            ..Settings::default()
+        };
+        settings.normalize();
+        assert_eq!(settings.schema_version, SETTINGS_SCHEMA_VERSION);
+        assert_eq!(settings.long_output_mode, "paste");
+        assert_eq!(settings.delivery_policy, "auto");
+
+        let mut current_choice = Settings {
+            schema_version: SETTINGS_SCHEMA_VERSION,
+            long_output_mode: "clipboard".into(),
+            ..Settings::default()
+        };
+        current_choice.normalize();
+        assert_eq!(current_choice.long_output_mode, "clipboard");
+
+        let mut explicit_delivery = Settings {
+            delivery_policy: "clipboard_only".into(),
+            ..Settings::default()
+        };
+        explicit_delivery.normalize();
+        assert_eq!(explicit_delivery.delivery_policy, "clipboard_only");
     }
 
     #[test]
@@ -1879,6 +2071,47 @@ mod tests {
         assert_eq!(item.degraded_reason.as_deref(), Some("llm_cleanup_failed"));
         assert_eq!(item.delivery_method.as_deref(), Some("clipboard"));
         assert!(failed_spool(&dir, id).unwrap().is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn history_revisions_keep_the_parent_and_latest_text() {
+        let dir = temp_dir("revisions");
+        insert_history(&dir, "raw", "first", 1.0, false).unwrap();
+        let id = get_history(&dir, 10).unwrap()[0].id;
+        let intent =
+            crate::llm::CleanupIntent::selected_text(crate::llm::CleanupOperation::Shorten, "raw");
+        save_history_revision(
+            &dir,
+            id,
+            "second",
+            Some("ai_success"),
+            Some(&intent),
+            Some(crate::llm::MODEL),
+            Some(&crate::context::ContextPolicy::default()),
+            "ai_reclean",
+        )
+        .unwrap();
+        let item = get_history(&dir, 10).unwrap().remove(0);
+        assert_eq!(item.final_text, "second");
+        assert_eq!(item.revision_count, 1);
+        assert_eq!(history_text(&dir, id).unwrap(), "second");
+        assert_eq!(get_history_revisions(&dir, id).unwrap().len(), 1);
+        delete_history(&dir, id).unwrap();
+        assert!(get_history_revisions(&dir, id).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn history_reclean_state_does_not_create_a_fake_fallback_error() {
+        let dir = temp_dir("revision-state");
+        insert_history(&dir, "raw", "first", 1.0, false).unwrap();
+        let id = get_history(&dir, 10).unwrap()[0].id;
+        update_history_revision_state(&dir, id, false, None, "copied", Some("ai_success")).unwrap();
+        let item = get_history(&dir, 10).unwrap().remove(0);
+        assert_eq!(item.status, "copied");
+        assert_eq!(item.fallback_reason, None);
+        assert_eq!(item.cleanup_status, "ai_success");
         let _ = std::fs::remove_dir_all(dir);
     }
 

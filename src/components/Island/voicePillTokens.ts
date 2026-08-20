@@ -10,16 +10,25 @@ export function voicePillWidthForState(state: string): number {
   return 132;
 }
 
-export function pillCaption(state: string, translate: (source: string) => string = (source) => source): string | null {
+export function pillCaption(
+  state: string,
+  translate: (source: string) => string = (source) => source,
+  retryAfterSecs?: number | null,
+): string | null {
   switch (state) {
     case "recording":
       return null;
     case "processing":
       return null;
     case "recording_limited":
-      return translate("已达到 15 分钟上限，请按热键结束");
-    case "rate_limited":
-      return translate("处理时间比平时长…");
+      return translate("已达上限 · 按热键结束");
+    case "rate_limited": {
+      const base = translate("处理时间比平时长…");
+      if (retryAfterSecs != null && retryAfterSecs > 0) {
+        return `${base} ${translate("约 {n} 秒后重试").replace("{n}", String(retryAfterSecs))}`;
+      }
+      return base;
+    }
     case "degraded":
       return translate("部分结果已保存，请检查后再使用");
     case "error":

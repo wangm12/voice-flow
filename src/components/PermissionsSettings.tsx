@@ -17,6 +17,13 @@ export function PermissionsSettings({ permissions, onRefresh }: { permissions: P
     }
     await onRefresh();
   };
+  const requestAccessibility = async () => {
+    const granted = await invoke<boolean>("request_accessibility_permission");
+    if (!granted) {
+      await invoke("open_privacy_settings", { pane: "accessibility" });
+    }
+    await onRefresh();
+  };
 
   return (
     <SettingsShell>
@@ -38,7 +45,7 @@ export function PermissionsSettings({ permissions, onRefresh }: { permissions: P
           status={permissions ? (permissions.accessibility ? t("已开启") : t("未开启，可稍后设置")) : t("检测中…")}
           ok={permissions?.accessibility ?? false}
           actionLabel={t("开启权限")}
-          onAction={() => void invoke("open_privacy_settings", { pane: "accessibility" })}
+          onAction={() => void requestAccessibility()}
         />
       </SettingsGroup>
       <p className="mt-4 max-w-2xl text-xs leading-5 text-tertiary">{t("自动粘贴权限只用于将结果写入当前光标；未开启时，VoiceFlow 会保留文字并复制到剪贴板。")} </p>
@@ -50,7 +57,7 @@ function PermissionSettingRow({ icon, title, description, status, ok, actionLabe
   return (
     <SettingsRow title={title} description={description} icon={icon}>
       <SettingsStatus label={status} tone={ok ? "success" : "warning"} />
-      {ok ? <Check size={17} className="text-success" aria-label={status} /> : <button type="button" onClick={onAction} className={`${secondaryButtonClass} shrink-0`}>{actionLabel}</button>}
+      {ok ? <Check size={17} className="text-success" aria-hidden="true" /> : <button type="button" onClick={onAction} className={`${secondaryButtonClass} shrink-0`}>{actionLabel}</button>}
     </SettingsRow>
   );
 }

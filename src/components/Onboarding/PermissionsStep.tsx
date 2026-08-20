@@ -4,9 +4,9 @@ import { compactButtonClass } from "../../lib/theme";
 import { iconProps, iconPropsSm } from "../../lib/icons";
 import { useI18n } from "../../lib/i18n";
 
-function statusLabel(title: string, ok: boolean, status: string, t: (source: string) => string): string {
+function statusLabel(kind: "microphone" | "accessibility", ok: boolean, status: string, t: (source: string) => string): string {
   if (ok) return t("已授权");
-  if (title === "麦克风") {
+  if (kind === "microphone") {
     if (status === "denied") return t("需要在系统设置中开启");
     if (status === "restricted") return t("系统限制，无法授权");
     if (status === "checking") return t("检测中…");
@@ -18,19 +18,21 @@ function statusLabel(title: string, ok: boolean, status: string, t: (source: str
 
 function PermissionRow({
   icon,
+  kind,
   title,
   ok,
   status,
   action,
 }: {
   icon: React.ReactNode;
+  kind: "microphone" | "accessibility";
   title: string;
   ok: boolean;
   status: string;
   action?: React.ReactNode;
 }) {
   const { t } = useI18n();
-  const label = statusLabel(title, ok, status, t);
+  const label = statusLabel(kind, ok, status, t);
 
   return (
     <div className="flex items-center gap-3 border-t border-border py-4 first:border-t-0">
@@ -44,7 +46,7 @@ function PermissionRow({
       {action}
       {ok && (
         <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-success/15 text-success">
-          <Check {...iconPropsSm} />
+          <Check {...iconPropsSm} aria-hidden="true" />
         </span>
       )}
     </div>
@@ -76,7 +78,8 @@ export function PermissionsStep({
 
       <div className="mt-6 border-y border-border">
         <PermissionRow
-          icon={<Mic {...iconProps} />}
+          icon={<Mic {...iconProps} aria-hidden="true" />}
+          kind="microphone"
           title="麦克风"
           ok={permissions?.microphone ?? false}
           status={permissions?.microphone_status ?? "checking"}
@@ -89,7 +92,8 @@ export function PermissionsStep({
           }
         />
         <PermissionRow
-          icon={<TextCursorInput {...iconProps} />}
+          icon={<TextCursorInput {...iconProps} aria-hidden="true" />}
+          kind="accessibility"
           title="自动粘贴（可选）"
           ok={permissions?.accessibility ?? false}
           status={permissions?.accessibility ? "authorized" : "pending"}
@@ -108,7 +112,7 @@ export function PermissionsStep({
           {t("没有自动粘贴权限也没关系，结果会复制到剪贴板。")}
         </p>
         <button type="button" onClick={onRefresh} className={`${compactButtonClass} shrink-0 gap-1.5`}>
-          <RefreshCw {...iconPropsSm} />
+          <RefreshCw {...iconPropsSm} aria-hidden="true" />
           {t("重新检测")}
         </button>
       </div>

@@ -63,7 +63,6 @@ export function HotkeyStep({
           />
         </div>
         <HotkeyUsageGuide hotkey={currentHotkey} activationMode={isDictation ? activationMode : "tap"} />
-        {error && <p className="mt-3 text-xs text-error">{error}</p>}
       </div>
 
       <TryItStep
@@ -73,7 +72,7 @@ export function HotkeyStep({
         hotkeyDisplay={isDictation ? currentHotkeyDisplay : formatHotkeyDisplay(hotkey)}
         selectedActionHotkeyDisplay={isDictation ? formatHotkeyDisplay(selectedActionHotkey) : currentHotkeyDisplay}
         activationMode={activationMode}
-        error={null}
+        error={error}
       />
     </div>
   );

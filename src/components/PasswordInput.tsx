@@ -16,16 +16,17 @@ type PasswordInputProps = {
   monospace?: boolean;
 };
 
-export function PasswordInput({ value, onChange, id, ariaLabel = "API Key", placeholder, className = "", valid = false, monospace = false }: PasswordInputProps) {
+export function PasswordInput({ value, onChange, id, ariaLabel, placeholder, className = "", valid = false, monospace = false }: PasswordInputProps) {
   const { t } = useI18n();
   const [visible, setVisible] = useState(false);
   const [focused, setFocused] = useState(false);
+  const accessibleName = ariaLabel ?? t("API Key");
 
   return (
     <div className={`relative ${className}`}>
       <input
         id={id}
-        aria-label={ariaLabel}
+        aria-label={accessibleName}
         value={value}
         onChange={(event) => onChange(event.target.value)}
         onFocus={() => setFocused(true)}

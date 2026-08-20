@@ -19,7 +19,7 @@ describe("PermissionsSettings", () => {
     expect(screen.getByText("麦克风")).toBeInTheDocument();
     expect(screen.getByText("自动粘贴")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "开启权限" })).toBeInTheDocument();
-    expect(screen.getByLabelText("已允许")).toBeInTheDocument();
+    expect(screen.getByText("已允许")).toBeInTheDocument();
   });
 
   it("opens the right macOS entry for a denied microphone permission", async () => {
@@ -59,6 +59,35 @@ describe("PermissionsSettings", () => {
     await waitFor(() => {
       expect(invokeMock).toHaveBeenCalledWith("request_microphone_permission");
       expect(invokeMock).not.toHaveBeenCalledWith("open_privacy_settings", { pane: "microphone" });
+      expect(onRefresh).toHaveBeenCalledOnce();
+    });
+  });
+
+  it("prompts for accessibility before opening System Settings", async () => {
+    invokeMock.mockResolvedValueOnce(false);
+    invokeMock.mockResolvedValueOnce(undefined);
+    const onRefresh = vi.fn().mockResolvedValue(undefined);
+    render(<PermissionsSettings permissions={{ microphone: true, microphone_status: "authorized", accessibility: false }} onRefresh={onRefresh} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "开启权限" }));
+
+    await waitFor(() => {
+      expect(invokeMock).toHaveBeenCalledWith("request_accessibility_permission");
+      expect(invokeMock).toHaveBeenCalledWith("open_privacy_settings", { pane: "accessibility" });
+      expect(onRefresh).toHaveBeenCalledOnce();
+    });
+  });
+
+  it("does not open System Settings when accessibility is granted by the native prompt", async () => {
+    invokeMock.mockResolvedValueOnce(true);
+    const onRefresh = vi.fn().mockResolvedValue(undefined);
+    render(<PermissionsSettings permissions={{ microphone: true, microphone_status: "authorized", accessibility: false }} onRefresh={onRefresh} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "开启权限" }));
+
+    await waitFor(() => {
+      expect(invokeMock).toHaveBeenCalledWith("request_accessibility_permission");
+      expect(invokeMock).not.toHaveBeenCalledWith("open_privacy_settings", { pane: "accessibility" });
       expect(onRefresh).toHaveBeenCalledOnce();
     });
   });

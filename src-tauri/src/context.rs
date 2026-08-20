@@ -223,6 +223,8 @@ pub struct TargetAppGuard {
     /// geometry.
     pub window_id: Option<u64>,
     pub input_token: Option<u64>,
+    /// Secure/password fields are never eligible for automatic injection.
+    pub secure_input: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -291,6 +293,9 @@ impl ContextSnapshot {
 }
 
 pub fn display_label(snapshot: &ContextSnapshot) -> String {
+    if snapshot.profile.confidence < 0.75 {
+        return "未知 App · 通用".into();
+    }
     let style = match snapshot.profile.family {
         ContextFamily::PromptOrCode | ContextFamily::DeveloperCollaboration => "Code",
         ContextFamily::Email => "Professional",
@@ -624,6 +629,7 @@ struct AppSignal {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum FocusKind {
+    Secure,
     Search,
     Code,
     Terminal,
@@ -638,7 +644,11 @@ enum FocusKind {
 
 impl FocusKind {
     fn is_editable(self) -> bool {
-        !matches!(self, Self::Unknown)
+        !matches!(self, Self::Unknown | Self::Secure)
+    }
+
+    fn is_secure(self) -> bool {
+        matches!(self, Self::Secure)
     }
 }
 
@@ -704,6 +714,7 @@ fn snapshot_for_signal_with_modes(
             window_token: signal.window_token,
             window_id: signal.window_id,
             input_token: signal.input_token,
+            secure_input: signal.focus_kind.is_secure(),
         },
     }
 }
@@ -1316,6 +1327,9 @@ pub fn target_mismatch_reason(
     if guard.pid != current.pid || guard.bundle_id != current.bundle_id {
         return Some("target_changed");
     }
+    if guard.secure_input || current.secure_input {
+        return Some("secure_input");
+    }
     // Window metadata is best-effort on macOS. Some apps do not expose a
     // stable AX window title/bounds pair, and CGWindowList can temporarily
     // omit a window while the app is changing spaces. A missing optional
@@ -1345,6 +1359,12 @@ pub fn target_mismatch_reason(
     // the user's paste. If both probes return a concrete value, reject an
     // actual host/tab change.
     if is_browser_bundle_id(guard.bundle_id.as_deref()) {
+        if guard.browser_host.is_some() && current.browser_host.is_none() {
+            return Some("target_unavailable");
+        }
+        if guard.browser_target_token.is_some() && current.browser_target_token.is_none() {
+            return Some("target_unavailable");
+        }
         if let (Some(expected), Some(actual)) = (&guard.browser_host, &current.browser_host) {
             if expected != actual {
                 return Some("target_changed");
@@ -1696,6 +1716,9 @@ fn classify_focus(
     focused_title: &str,
 ) -> FocusKind {
     let role_value = format!("{role} {subrole}").to_ascii_lowercase();
+    if role_value.contains("securetextfield") || role_value.contains("secure text field") {
+        return FocusKind::Secure;
+    }
     let editable = role_value.contains("textfield")
         || role_value.contains("textarea")
         || role_value.contains("combobox");
@@ -1888,6 +1911,62 @@ end tell
     }
 }
 
+/// Best-effort local read of the focused Accessibility value. The value is
+/// used only in memory to compare the input before and after a Cmd+V; it is
+/// never serialized, persisted, or sent to a provider. `None` means macOS
+/// could not expose a readable value for this control.
+#[cfg(target_os = "macos")]
+pub fn focused_input_value() -> Option<String> {
+    const TIMEOUT_MS: u64 = 350;
+    const UNAVAILABLE: &str = "__VOICEFLOW_AX_UNAVAILABLE__";
+    let script = r#"
+tell application "System Events"
+  try
+    set p to first application process whose frontmost is true
+    set focusedElement to value of attribute "AXFocusedUIElement" of p
+    try
+      return (value of focusedElement) as text
+    on error
+      return "__VOICEFLOW_AX_UNAVAILABLE__"
+    end try
+  on error
+    return "__VOICEFLOW_AX_UNAVAILABLE__"
+  end try
+end tell
+"#;
+    let mut child = Command::new("osascript")
+        .args(["-e", script])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = std::time::Instant::now() + Duration::from_millis(TIMEOUT_MS);
+    let output = loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => break child.wait_with_output().ok()?,
+            Ok(Some(_)) => return None,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(15));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            Err(_) => return None,
+        }
+    };
+    let value = String::from_utf8_lossy(&output.stdout)
+        .trim_end_matches(['\r', '\n'])
+        .to_owned();
+    (value != UNAVAILABLE).then_some(value)
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn focused_input_value() -> Option<String> {
+    None
+}
+
 #[cfg(target_os = "macos")]
 fn frontmost_signal(browser_access_enabled: bool) -> AppSignal {
     use std::ffi::CStr;
@@ -1922,7 +2001,7 @@ fn frontmost_signal(browser_access_enabled: bool) -> AppSignal {
         // invoke System Events until the user has granted Accessibility: the
         // window/focused-element probe is both unnecessary for the native
         // profile preview and can trigger an avoidable macOS permission flow.
-        let window = if crate::permissions::request_accessibility() {
+        let window = if crate::permissions::accessibility_is_trusted() {
             query_frontmost_window(pid)
         } else {
             WindowIdentity::default()
@@ -2481,6 +2560,7 @@ mod tests {
             window_token: Some(10),
             window_id: Some(100),
             input_token: Some(20),
+            secure_input: false,
         };
         let changed_host = TargetAppGuard {
             browser_host: Some("github.com".into()),
@@ -2553,6 +2633,36 @@ mod tests {
                 ..original.clone()
             }
         ));
+        assert_eq!(
+            target_mismatch_reason(
+                &original,
+                &TargetAppGuard {
+                    browser_target_token: None,
+                    ..original.clone()
+                }
+            ),
+            Some("target_unavailable")
+        );
+        assert_eq!(
+            target_mismatch_reason(
+                &original,
+                &TargetAppGuard {
+                    browser_host: None,
+                    ..original.clone()
+                }
+            ),
+            Some("target_unavailable")
+        );
+        assert_eq!(
+            target_mismatch_reason(
+                &original,
+                &TargetAppGuard {
+                    secure_input: true,
+                    ..original.clone()
+                }
+            ),
+            Some("secure_input")
+        );
     }
 
     #[test]
@@ -2565,12 +2675,29 @@ mod tests {
             window_token: Some(7),
             window_id: Some(1001),
             input_token: Some(9),
+            secure_input: false,
         };
         let same_title_and_geometry = TargetAppGuard {
             window_id: Some(1002),
             ..original.clone()
         };
         assert!(!target_matches(&original, &same_title_and_geometry));
+    }
+
+    #[test]
+    fn secure_text_fields_are_not_editable_delivery_targets() {
+        assert_eq!(
+            classify_focus("AXTextField", "AXSecureTextField", "", "", ""),
+            FocusKind::Secure
+        );
+        assert!(!FocusKind::Secure.is_editable());
+        let mut signal = signal("com.example.login", "Login", None);
+        signal.focus_kind = FocusKind::Secure;
+        assert!(
+            snapshot_for_signal(&signal, &[], false)
+                .target_guard
+                .secure_input
+        );
     }
 
     #[test]
@@ -2623,6 +2750,7 @@ mod tests {
             window_token: Some(10),
             window_id: Some(100),
             input_token: Some(20),
+            secure_input: false,
         };
         assert_eq!(target_mismatch_reason(&browser, &browser), None);
 
@@ -2646,6 +2774,7 @@ mod tests {
             window_token: Some(10),
             window_id: Some(100),
             input_token: Some(20),
+            secure_input: false,
         };
         let incomplete = TargetAppGuard {
             window_token: None,

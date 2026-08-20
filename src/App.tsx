@@ -4,21 +4,24 @@ import type React from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { emit, listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
-import { AudioLines, BookMarked, ChevronDown, CloudCog, FileText, History as HistoryIcon, KeyRound, Languages, Monitor, Moon, ShieldCheck, Sparkles, Sun, Upload } from "lucide-react";
+import { AudioLines, BookMarked, Check, ChevronDown, CloudCog, Copy, FileText, History as HistoryIcon, KeyRound, Languages, Monitor, Moon, PenLine, ShieldCheck, Sparkles, Sun, Upload, X } from "lucide-react";
 import { History, type HistoryItem } from "./components/History/History";
 import { Onboarding } from "./components/Onboarding/Onboarding";
 import { PasswordInput } from "./components/PasswordInput";
 import { ValidationStatus } from "./components/Onboarding/ValidationStatus";
 import { HotkeyRecorder } from "./components/HotkeyRecorder";
 import { HotkeyUsageGuide } from "./components/HotkeyUsageGuide";
+import { ActivationModeSelector } from "./components/ActivationModeSelector";
 import { ContextSettings, type WritingMode } from "./components/ContextSettings";
 import { AnimatedContent } from "./components/ReactBits/AnimatedContent";
 import { Toggle } from "./components/Toggle";
 import { SettingsAlert, SettingsGroup, SettingsPageHeader, SettingsRow, SettingsShell, SettingsStatus } from "./components/SettingsLayout";
+import { ConfirmDialog } from "./components/ConfirmDialog";
 import { PermissionsSettings, type Permissions } from "./components/PermissionsSettings";
 import { SnippetsSettings, type Snippet } from "./components/SnippetsSettings";
 import { MAX_DICTIONARY_FILE_BYTES, mergeDictionary, parseDictionaryText } from "./lib/dictionaryImport";
 import { resolveUiLanguage, type UiLanguagePreference, useI18n } from "./lib/i18n";
+import { isModifierOnlyHotkey } from "./lib/hotkeyFormat";
 import { colors, radius, buttonClass, secondaryButtonClass } from "./lib/theme";
 
 type Settings = {
@@ -34,6 +37,7 @@ type Settings = {
   chunk_threshold_secs: number;
   chunk_length_secs: number;
   long_output_mode: string;
+  delivery_policy: string;
   keep_audio_days: number;
   keep_history_days: number;
   onboarded: boolean;
@@ -55,7 +59,8 @@ type Settings = {
 };
 type HistoryPage = { items: HistoryItem[]; has_more: boolean };
 type AudioInputDevice = { name: string; is_default: boolean };
-type View = "general" | "engine" | "dictionary" | "history" | "smart" | "permissions" | "system" | "snippets";
+type SelectedActionPreview = { selected_text: string; transcript: string; final_text: string };
+type View = "general" | "engine" | "dictionary" | "history" | "smart" | "writing" | "permissions" | "system" | "snippets";
 
 function friendlySettingsError(reason: unknown, translate: (source: string) => string): string {
   const message = reason instanceof Error ? reason.message : String(reason);
@@ -107,6 +112,7 @@ const navigationGroups: { label: string; items: { id: View; label: string; icon:
     items: [
       { id: "general", label: "录音与输出", icon: AudioLines },
       { id: "smart", label: "智能整理", icon: Sparkles },
+      { id: "writing", label: "写作模式", icon: PenLine },
       { id: "engine", label: "语音服务", icon: CloudCog },
     ],
   },
@@ -142,6 +148,9 @@ export default function App() {
   const [loadingError, setLoadingError] = useState<string | null>(null);
   const [saveError, setSaveError] = useState<string | null>(null);
   const [runtimeError, setRuntimeError] = useState<string | null>(null);
+  const [selectedPreview, setSelectedPreview] = useState<SelectedActionPreview | null>(null);
+  const [selectedPreviewDraft, setSelectedPreviewDraft] = useState("");
+  const selectedPreviewRestoreRef = useRef<HTMLElement | null>(null);
   const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const saveQueue = useRef<Promise<void>>(Promise.resolve());
   const saveRevision = useRef(0);
@@ -220,6 +229,20 @@ export default function App() {
     } finally {
       permissionCheckInFlight.current = false;
     }
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+    const subscription = listen<SelectedActionPreview>("selected-action://preview", (event) => {
+      if (!active) return;
+      selectedPreviewRestoreRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+      setSelectedPreview(event.payload);
+      setSelectedPreviewDraft(event.payload.final_text);
+    });
+    return () => {
+      active = false;
+      void subscription.then((unlisten) => unlisten()).catch(() => undefined);
+    };
   }, []);
 
   const refreshAudioInputDevice = useCallback(async (selectedDevice: string) => {
@@ -350,7 +373,7 @@ export default function App() {
     let active = true;
     const subscription = listen<{ state?: string }>("dictation://state", (event) => {
       if (!active || view !== "history") return;
-      if (!event.payload.state || !["done", "copied", "degraded", "error"].includes(event.payload.state)) return;
+      if (!event.payload.state || !["done", "unverified", "copied", "degraded", "error"].includes(event.payload.state)) return;
       reloadHistory();
     });
     return () => {
@@ -375,6 +398,34 @@ export default function App() {
     };
   }, []);
 
+  const closeSelectedPreview = useCallback(() => {
+    setSelectedPreview(null);
+    setSelectedPreviewDraft("");
+    const restore = selectedPreviewRestoreRef.current;
+    selectedPreviewRestoreRef.current = null;
+    window.requestAnimationFrame(() => restore?.focus());
+  }, []);
+  const cancelSelectedPreview = useCallback(async () => {
+    try {
+      await invoke("cancel_selected_action_preview");
+    } finally {
+      closeSelectedPreview();
+    }
+  }, [closeSelectedPreview]);
+  const selectedPreviewDialogRef = useRef<HTMLElement>(null);
+  useEffect(() => {
+    if (!selectedPreview) return;
+    selectedPreviewDialogRef.current?.focus();
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        void cancelSelectedPreview();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [cancelSelectedPreview, selectedPreview]);
+
   if (loadingError) {
     return (
       <main className={`flex min-h-screen items-center justify-center ${colors.bg.base} p-8 ${colors.text.primary}`}>
@@ -387,7 +438,7 @@ export default function App() {
       </main>
     );
   }
-  if (!settings) return <main className={`min-h-screen ${colors.bg.base} p-12 ${colors.text.secondary}`}>{t("正在加载 VoiceFlow…")}</main>;
+  if (!settings) return <main className={`min-h-screen ${colors.bg.base} p-12 ${colors.text.secondary}`} role="status" aria-live="polite">{t("正在加载 VoiceFlow…")}</main>;
   if (showOnboarding) {
     return (
       <Onboarding
@@ -442,13 +493,29 @@ export default function App() {
     setSettings(next);
     setSaveError(null);
   };
+  const confirmSelectedPreview = async () => {
+    try {
+      await invoke("confirm_selected_action_preview", { final_text: selectedPreviewDraft });
+      closeSelectedPreview();
+    } catch (reason) {
+      setRuntimeError(String(reason));
+    }
+  };
+  const copySelectedPreview = async () => {
+    try {
+      await invoke("copy_selected_action_preview", { final_text: selectedPreviewDraft });
+      closeSelectedPreview();
+    } catch (reason) {
+      setRuntimeError(String(reason));
+    }
+  };
   return (
-    <main className={`h-screen overflow-hidden ${colors.bg.base} ${colors.text.primary}`}>
+    <main className={`relative h-screen overflow-hidden ${colors.bg.base} ${colors.text.primary}`}>
       <div className="mx-auto flex h-full w-full max-w-6xl">
         <aside className={`flex w-56 shrink-0 flex-col border-r ${colors.border} px-3 py-6`}>
           <div className="flex items-center gap-2.5 px-2">
             <img src={brandIconSrc} alt="VoiceFlow" className="h-8 w-8 shrink-0" />
-            <p className="truncate text-sm font-semibold tracking-tight text-primary">VoiceFlow</p>
+            <p className="truncate text-sm font-semibold tracking-tight text-primary" translate="no">VoiceFlow</p>
           </div>
 
           {!settings.onboarded && (
@@ -460,7 +527,7 @@ export default function App() {
           <nav aria-label={t("设置页面")} className="mt-8 space-y-6">
             {navigationGroups.map((group) => (
               <div key={group.label}>
-                <p className="mb-2 px-3 text-[10px] font-semibold uppercase tracking-[0.12em] text-tertiary">{t(group.label)}</p>
+                <h3 className="mb-2 px-3 text-[10px] font-semibold uppercase tracking-[0.12em] text-tertiary">{t(group.label)}</h3>
                 <div className="space-y-0.5">
                   {group.items.map(({ id, label, icon: Icon }) => {
                     const active = view === id;
@@ -472,7 +539,7 @@ export default function App() {
                         aria-current={active ? "page" : undefined}
                         className={`flex w-full items-center gap-3 rounded-lg px-3 py-2 text-left text-sm transition-colors duration-150 ${active ? "bg-elevated/60 font-medium text-primary" : "text-secondary hover:bg-card hover:text-primary"}`}
                       >
-                        <Icon size={16} strokeWidth={1.7} className={active ? "text-primary" : "text-tertiary"} />
+                        <Icon size={16} strokeWidth={1.7} aria-hidden="true" className={active ? "text-primary" : "text-tertiary"} />
                         <span className="min-w-0 flex-1 truncate">{t(label)}</span>
                         {id === "engine" && !settings.api_key_configured && (
                           <span role="img" aria-label={t("需要配置语音服务")} title={t("需要配置语音服务")} className="h-1.5 w-1.5 shrink-0 rounded-full bg-warning" />
@@ -526,11 +593,40 @@ export default function App() {
             )}
             {runtimeError && <SettingsAlert>{t("语音输入失败：")}{runtimeError}</SettingsAlert>}
             <AnimatedContent key={view} className="w-full">
-              {view === "history" ? <History items={history} reload={reloadHistory} hasMore={historyHasMore} loading={historyLoading} onLoadMore={loadMoreHistory} error={historyError} onRetry={reloadHistory} /> : view === "smart" ? <ContextSettings combined writingModes={settings.writing_modes} onWritingModesChange={(writingModes) => save({ writing_modes: writingModes })} outputMode={settings.output_mode} translationTargetLanguage={settings.translation_target_language} onOutputModeChange={(outputMode) => save({ output_mode: outputMode })} onTranslationTargetLanguageChange={(language) => save({ translation_target_language: language })} /> : view === "snippets" ? <SnippetsSettings snippets={settings.snippets} onChange={(snippets) => save({ snippets })} /> : <SettingsView view={view} settings={settings} permissions={permissions} audioInputDevice={audioInputDevice} audioInputDevices={audioInputDevices} refreshPermissions={refreshPermissions} save={save} saveApiKey={saveApiKey} removeApiKey={removeApiKey} />}
+              {view === "history" ? <History items={history} reload={reloadHistory} hasMore={historyHasMore} loading={historyLoading} onLoadMore={loadMoreHistory} error={historyError} onRetry={reloadHistory} /> : view === "smart" ? <ContextSettings automationOnly writingModes={settings.writing_modes} onWritingModesChange={(writingModes) => save({ writing_modes: writingModes })} outputMode={settings.output_mode} translationTargetLanguage={settings.translation_target_language} onOutputModeChange={(outputMode) => save({ output_mode: outputMode })} onTranslationTargetLanguageChange={(language) => save({ translation_target_language: language })} /> : view === "writing" ? <ContextSettings writingModes={settings.writing_modes} onWritingModesChange={(writingModes) => save({ writing_modes: writingModes })} /> : view === "snippets" ? <SnippetsSettings snippets={settings.snippets} onChange={(snippets) => save({ snippets })} /> : <SettingsView view={view} settings={settings} permissions={permissions} audioInputDevice={audioInputDevice} audioInputDevices={audioInputDevices} refreshPermissions={refreshPermissions} save={save} saveApiKey={saveApiKey} removeApiKey={removeApiKey} />}
             </AnimatedContent>
           </div>
         </section>
       </div>
+      {selectedPreview && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/20 p-5 backdrop-blur-[2px]">
+          <section ref={selectedPreviewDialogRef} tabIndex={-1} role="dialog" aria-modal="true" aria-labelledby="selected-preview-title" className={`w-full max-w-2xl rounded-2xl border ${colors.border} ${colors.bg.card} p-5 shadow-2xl outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent`}>\
+            <div className="flex items-start justify-between gap-4">
+              <div>
+                <h2 id="selected-preview-title" className="text-base font-semibold text-primary">{t("预览选中文本操作")}</h2>
+                <p className="mt-1 text-xs leading-5 text-tertiary">{t("确认后才会替换原文；取消或复制不会修改原输入框。")}</p>
+              </div>
+              <button type="button" aria-label={t("取消")} onClick={() => void cancelSelectedPreview()} className="rounded-lg p-1.5 text-tertiary transition-colors hover:bg-elevated hover:text-primary"><X size={16} aria-hidden="true" /></button>
+            </div>
+            <div className="mt-5 grid gap-4">
+              <div>
+                <p className="mb-1.5 text-xs font-medium text-secondary">{t("原选中文本")}</p>
+                <p className={`max-h-28 overflow-y-auto rounded-xl border ${colors.border} ${colors.bg.elevated} px-3 py-2 text-sm leading-6 text-secondary whitespace-pre-wrap`}>{selectedPreview.selected_text}</p>
+              </div>
+              <div>
+                <p className="mb-1.5 text-xs font-medium text-secondary">{t("VoiceFlow 生成结果")}</p>
+                <textarea aria-label={t("VoiceFlow 生成结果")} value={selectedPreviewDraft} onChange={(event) => setSelectedPreviewDraft(event.target.value)} rows={7} className={`w-full resize-y rounded-xl border ${colors.border} ${colors.bg.elevated} ${colors.text.primary} px-3 py-2 text-sm leading-6 outline-none focus:border-accent`} />
+              </div>
+              <p className="text-xs leading-5 text-tertiary">{t("语音指令")}: {selectedPreview.transcript}</p>
+            </div>
+            <div className="mt-5 flex flex-wrap justify-end gap-2">
+              <button type="button" onClick={() => void cancelSelectedPreview()} className={secondaryButtonClass}>{t("取消")}</button>
+              <button type="button" onClick={() => void copySelectedPreview()} disabled={!selectedPreviewDraft.trim()} className={secondaryButtonClass}><Copy size={14} aria-hidden="true" />{t("只复制")}</button>
+              <button type="button" onClick={() => void confirmSelectedPreview()} disabled={!selectedPreviewDraft.trim()} className={buttonClass}><Check size={14} aria-hidden="true" />{t("替换原文")}</button>
+            </div>
+          </section>
+        </div>
+      )}
     </main>
   );
 }
@@ -541,6 +637,7 @@ function DictionarySettings({ settings, save }: { settings: Settings; save: (pat
   const [dictionaryMessage, setDictionaryMessage] = useState<string | null>(null);
   const [dictionaryDragging, setDictionaryDragging] = useState(false);
   const [dictionaryImporting, setDictionaryImporting] = useState(false);
+  const [pendingDeleteWord, setPendingDeleteWord] = useState<string | null>(null);
   const dictionaryFileInput = useRef<HTMLInputElement | null>(null);
   const dictionaryDropZone = useRef<HTMLDivElement | null>(null);
   const importingRef = useRef(false);
@@ -679,7 +776,7 @@ function DictionarySettings({ settings, save }: { settings: Settings; save: (pat
       <SettingsGroup title={t("添加词条")}>
         <SettingsRow title={t("添加个人词典词条")} description={t("输入一个词条，或从 CSV、TXT、TSV 文件导入。")}>
           <div className="flex w-full min-w-0 gap-2 sm:w-auto">
-            <input aria-label={t("添加个人词典词条")} value={newWord} onChange={(event) => setNewWord(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") addWord(); }} placeholder={t("添加人名或术语")} className={"min-w-0 flex-1 sm:w-48 " + controlClass} />
+            <input aria-label={t("添加个人词典词条")} value={newWord} onChange={(event) => setNewWord(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") addWord(); }} placeholder={t("添加人名或术语…")} className={"min-w-0 flex-1 sm:w-48 " + controlClass} />
             <button type="button" onClick={addWord} disabled={!newWord.trim()} className={buttonClass}>{t("添加")}</button>
           </div>
         </SettingsRow>
@@ -710,10 +807,22 @@ function DictionarySettings({ settings, save }: { settings: Settings; save: (pat
         {settings.dictionary.length > 0 ? settings.dictionary.map((word) => (
           <div key={word} className="flex items-center gap-3 px-4 py-3.5 text-sm sm:px-5">
             <span className="flex-1 text-primary">{word}</span>
-            <button type="button" aria-label={`${t("删除")} ${word}`} onClick={() => save({ dictionary: settings.dictionary.filter((item) => item !== word) })} className="rounded-lg px-2 py-1 text-xs text-tertiary transition-colors hover:bg-error/10 hover:text-error">{t("删除")}</button>
+            <button type="button" aria-label={`${t("删除")} ${word}`} onClick={() => setPendingDeleteWord(word)} className="rounded-lg px-2 py-1 text-xs text-tertiary transition-colors hover:bg-error/10 hover:text-error">{t("删除")}</button>
           </div>
         )) : <p className="px-4 py-5 text-sm text-tertiary sm:px-5">{t("还没有词条。添加后，VoiceFlow 会更准确地识别人名和专业术语。")}</p>}
       </SettingsGroup>
+      <ConfirmDialog
+        open={pendingDeleteWord != null}
+        title={t("删除词条")}
+        description={t("确定删除“{name}”吗？").replace("{name}", pendingDeleteWord ?? "")}
+        confirmLabel={t("删除")}
+        cancelLabel={t("取消")}
+        onCancel={() => setPendingDeleteWord(null)}
+        onConfirm={() => {
+          if (pendingDeleteWord) save({ dictionary: settings.dictionary.filter((item) => item !== pendingDeleteWord) });
+          setPendingDeleteWord(null);
+        }}
+      />
     </SettingsShell>
   );
 }
@@ -725,6 +834,7 @@ function SettingsView({ view, settings, permissions, audioInputDevice, audioInpu
   const [validating, setValidating] = useState(false);
   const [valid, setValid] = useState<string | null>(null);
   const [removing, setRemoving] = useState(false);
+  const [confirmRemoveKey, setConfirmRemoveKey] = useState(false);
   const selectedInputDevice = settings.input_device?.trim() ?? "";
   const selectedInputDeviceAvailable = !selectedInputDevice || audioInputDevices.some((device) => device.name === selectedInputDevice);
 
@@ -753,7 +863,7 @@ function SettingsView({ view, settings, permissions, audioInputDevice, audioInpu
   };
 
   const commitRemoveApiKey = async () => {
-    if (!window.confirm(t("删除后需要重新配置 API Key 才能使用语音输入。确定删除吗？"))) return;
+    setConfirmRemoveKey(false);
     setRemoving(true);
     try {
       await removeApiKey();
@@ -808,8 +918,8 @@ function SettingsView({ view, settings, permissions, audioInputDevice, audioInpu
           <div className="px-4 py-4 sm:px-5">
             <div className="flex flex-wrap items-start justify-between gap-3">
               <div>
-                <p className="text-sm font-medium text-primary">Groq API Key</p>
-                <p className="mt-1 text-xs leading-5 text-tertiary">{settings.api_key_configured ? t("当前已配置：") + (settings.api_key_hint ?? t("已隐藏")) : t("在 Groq Console 创建，通常以 gsk_ 开头。")}</p>
+                <p className="text-sm font-medium text-primary">{t("Groq API Key")}</p>
+                <p className="mt-1 text-xs leading-5 text-tertiary">{settings.api_key_configured ? t("当前已配置：") + (settings.api_key_hint ?? t("已隐藏")) : <>{t("在")} <a className="text-accent underline underline-offset-2" href="https://console.groq.com" target="_blank" rel="noreferrer">{t("Groq Console")}</a> {t("创建，通常以 gsk_ 开头。")}</>}</p>
               </div>
               <SettingsStatus label={settings.api_key_configured ? t("已配置") : t("未配置")} tone={settings.api_key_configured ? "success" : "warning"} />
             </div>
@@ -819,14 +929,14 @@ function SettingsView({ view, settings, permissions, audioInputDevice, audioInpu
                 ariaLabel={t("Groq API Key（访问密钥）")}
                 value={apiKeyDraft}
                 onChange={(value) => { setApiKeyDraft(value); setValid(null); setApiKeySaveError(null); }}
-                placeholder={settings.api_key_configured ? t("留空保持当前密钥") : "gsk_…"}
+                placeholder={settings.api_key_configured ? t("留空保持当前密钥…") : "gsk_…"}
                 valid={valid === "valid"}
                 monospace
               />
               <div className="mt-3 flex flex-wrap items-center gap-2">
                 <button type="button" onClick={() => void commitApiKey()} disabled={!apiKeyDraft.trim()} className={buttonClass}>{t("验证并保存")}</button>
                 <button type="button" onClick={() => void validate()} disabled={(!apiKeyDraft.trim() && !settings.api_key_configured) || validating} className={secondaryButtonClass}>{validating ? t("验证中…") : t("仅验证")}</button>
-                {settings.api_key_configured && <button type="button" onClick={() => void commitRemoveApiKey()} disabled={removing} className="rounded-lg px-3 py-2 text-xs text-error transition-colors hover:bg-error/10 disabled:opacity-50">{removing ? t("删除中…") : t("删除本机密钥")}</button>}
+                {settings.api_key_configured && <button type="button" onClick={() => setConfirmRemoveKey(true)} disabled={removing} className="rounded-lg px-3 py-2 text-xs text-error transition-colors hover:bg-error/10 disabled:opacity-50">{removing ? t("删除中…") : t("删除本机密钥")}</button>}
                 <ValidationStatus status={valid} validating={validating} />
               </div>
               {apiKeySaveError && <p role="alert" className="mt-3 text-xs leading-5 text-error">{apiKeySaveError}</p>}
@@ -846,19 +956,35 @@ function SettingsView({ view, settings, permissions, audioInputDevice, audioInpu
             </SettingsRow>
           )}
         </SettingsGroup>
+      <ConfirmDialog
+        open={confirmRemoveKey}
+        title={t("删除本机密钥")}
+        description={t("删除后需要重新配置 API Key 才能使用语音输入。确定删除吗？")}
+        confirmLabel={t("删除")}
+        cancelLabel={t("取消")}
+        onCancel={() => setConfirmRemoveKey(false)}
+        onConfirm={() => void commitRemoveApiKey()}
+      />
       </SettingsShell>
     );
   }
 
   return (
     <SettingsShell>
-      <SettingsPageHeader title={t("录音与输出")} description={t("快捷键、识别语言、长录音和本地存储。")} />
+      <SettingsPageHeader title={t("录音与输出")} description={t("快捷键、识别语言、输出方式和本地存储。")} />
       <SettingsGroup title={t("快捷键")}>
         <div className="px-4 py-4 sm:px-5">
           <p className="text-sm font-medium text-primary">{t("全局快捷键")}</p>
           <p className="mt-1 text-xs text-tertiary">{t("在 Cursor、浏览器、邮件等 App 中都能使用。")}</p>
           {settings.hotkey_error && <p role="alert" className="mt-3 rounded-lg bg-error/5 px-3 py-2 text-xs text-error">{t("快捷键注册失败：")}{settings.hotkey_error}。{t("请重新设置一个快捷键。")}</p>}
           <div className="mt-4"><HotkeyRecorder value={settings.hotkey} onChange={(hotkey, mode, options) => save(mode ? { hotkey, activation_mode: mode } : { hotkey }, options)} /></div>
+          <div className="mt-4">
+            <ActivationModeSelector
+              value={isModifierOnlyHotkey(settings.hotkey) ? "double_tap" : settings.activation_mode}
+              modifierOnly={isModifierOnlyHotkey(settings.hotkey)}
+              onChange={(activation_mode) => save({ activation_mode })}
+            />
+          </div>
           <HotkeyUsageGuide hotkey={settings.hotkey} activationMode={settings.activation_mode} />
         </div>
       </SettingsGroup>
@@ -890,18 +1016,25 @@ function SettingsView({ view, settings, permissions, audioInputDevice, audioInpu
       </SettingsGroup>
       <SettingsGroup title={t("识别")}>
         <SettingsRow title={t("识别语言")} description={t("自动检测适合中文、English 和混合语音。只有在识别结果不稳定时，才建议手动指定。")}> 
-          <select aria-label={t("识别语言")} value={settings.language} onChange={(event) => save({ language: event.target.value })} className={selectClass}><option value="auto">{t("自动检测")}</option><option value="zh">{t("中文")}</option><option value="en">English</option></select>
+          <select aria-label={t("识别语言")} value={settings.language} onChange={(event) => save({ language: event.target.value })} className={selectClass}><option value="auto">{t("自动检测")}</option><option value="zh">{t("中文")}</option><option value="en">{t("English")}</option></select>
+        </SettingsRow>
+      </SettingsGroup>
+      <SettingsGroup title={t("输出方式")} description={t("短录音和长录音都先尝试写入当前输入框；如果目标没有接收，会保留文字并复制到剪贴板。你也可以改成只复制或仅保存历史。")}>
+        <SettingsRow title={t("默认行为")} description={t("自动会先粘贴；目标没有接收时保留文字并复制到剪贴板。")}>
+          <select aria-label={t("输出方式")} value={settings.delivery_policy} onChange={(event) => save({ delivery_policy: event.target.value })} className={selectClass}>
+            <option value="auto">{t("自动（优先粘贴）")}</option>
+            <option value="paste_shortcut">{t("写入当前输入框")}</option>
+            <option value="clipboard_only">{t("复制到剪贴板")}</option>
+            <option value="history_only">{t("仅保存到历史")}</option>
+          </select>
         </SettingsRow>
       </SettingsGroup>
       <SettingsGroup title={t("长录音")} description={t("较长的录音会自动分段处理，避免一次请求过大。")}>
-        <SettingsRow title={t("开始分段（秒）")} description={t("超过这个时长后开始分段。默认 25 秒。")}>
-          <input aria-label={t("开始分段（秒）")} type="number" min={5} max={3600} step={1} value={settings.chunk_threshold_secs} onChange={(event) => save({ chunk_threshold_secs: Number(event.target.value) })} className={controlClass + " w-28 text-right"} />
+        <SettingsRow title={t("开始分段（秒）")} description={t("超过这个时长后开始分段。默认 25 秒。范围 5–3600。")}>
+          <ChunkNumberField label={t("开始分段（秒）")} value={settings.chunk_threshold_secs} min={5} max={3600} onCommit={(chunk_threshold_secs) => save({ chunk_threshold_secs })} />
         </SettingsRow>
-        <SettingsRow title={t("每段长度（秒）")} description={t("每个语音请求的目标长度。默认 35 秒。")}>
-          <input aria-label={t("每段长度（秒）")} type="number" min={15} max={60} step={1} value={settings.chunk_length_secs} onChange={(event) => save({ chunk_length_secs: Number(event.target.value) })} className={controlClass + " w-28 text-right"} />
-        </SettingsRow>
-        <SettingsRow title={t("长录音输出")} description={t("长录音完成后如何交付结果。")}>
-          <select aria-label={t("长录音输出")} value={settings.long_output_mode} onChange={(event) => save({ long_output_mode: event.target.value })} className={selectClass}><option value="clipboard">{t("复制到剪贴板")}</option><option value="paste">{t("自动粘贴")}</option><option value="history">{t("仅保存到历史")}</option></select>
+        <SettingsRow title={t("每段长度（秒）")} description={t("每个语音请求的目标长度。默认 35 秒。范围 15–60。")}>
+          <ChunkNumberField label={t("每段长度（秒）")} value={settings.chunk_length_secs} min={15} max={60} onCommit={(chunk_length_secs) => save({ chunk_length_secs })} />
         </SettingsRow>
       </SettingsGroup>
       <SettingsGroup title={t("本地存储")}>
@@ -933,6 +1066,53 @@ function SettingsView({ view, settings, permissions, audioInputDevice, audioInpu
         </div>
       </SettingsGroup>
     </SettingsShell>
+  );
+}
+
+function ChunkNumberField({
+  label,
+  value,
+  min,
+  max,
+  onCommit,
+}: {
+  label: string;
+  value: number;
+  min: number;
+  max: number;
+  onCommit: (next: number) => void;
+}) {
+  const [draft, setDraft] = useState(String(value));
+  useEffect(() => {
+    setDraft(String(value));
+  }, [value]);
+
+  const commit = () => {
+    const parsed = Number(draft);
+    if (!Number.isFinite(parsed)) {
+      setDraft(String(value));
+      return;
+    }
+    const clamped = Math.min(max, Math.max(min, Math.round(parsed)));
+    setDraft(String(clamped));
+    if (clamped !== value) onCommit(clamped);
+  };
+
+  return (
+    <input
+      aria-label={label}
+      type="number"
+      min={min}
+      max={max}
+      step={1}
+      value={draft}
+      onChange={(event) => setDraft(event.target.value)}
+      onBlur={commit}
+      onKeyDown={(event) => {
+        if (event.key === "Enter") event.currentTarget.blur();
+      }}
+      className={`${controlClass} w-28 text-right`}
+    />
   );
 }
 

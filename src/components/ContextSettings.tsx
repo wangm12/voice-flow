@@ -7,6 +7,7 @@ import { colors, radius, buttonClass, secondaryButtonClass } from "../lib/theme"
 import { useI18n } from "../lib/i18n";
 import { IconButton } from "./IconButton";
 import { Toggle } from "./Toggle";
+import { ConfirmDialog } from "./ConfirmDialog";
 import { SettingsAlert, SettingsGroup, SettingsPageHeader, SettingsRow, SettingsShell } from "./SettingsLayout";
 
 export type ContextFamily =
@@ -186,6 +187,12 @@ export function ContextSettings({
   const [overrideFamily, setOverrideFamily] = useState<ContextFamily | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [pendingConfirm, setPendingConfirm] = useState<{
+    title: string;
+    description: string;
+    confirmLabel: string;
+    action: () => void;
+  } | null>(null);
 
   useEffect(() => {
     setWritingModes(managedWritingModes);
@@ -295,8 +302,7 @@ export function ContextSettings({
     onWritingModesChange?.(nextWritingModes);
   };
 
-  const selectEditingMode = (modeId: string) => {
-    if (modeIsDirty && !window.confirm(t("当前模式有未保存修改，确定放弃吗？"))) return;
+  const applySelectEditingMode = (modeId: string) => {
     const nextWritingModes = draftModeId && draftModeId !== modeId
       ? writingModes.filter((mode) => mode.id !== draftModeId)
       : writingModes;
@@ -312,14 +318,26 @@ export function ContextSettings({
     setError(null);
   };
 
-  const addCustomMode = () => {
-    if (modeIsDirty && !window.confirm(t("当前模式有未保存修改，确定放弃吗？"))) return;
+  const selectEditingMode = (modeId: string) => {
+    if (modeIsDirty) {
+      setPendingConfirm({
+        title: t("放弃未保存修改"),
+        description: t("当前模式有未保存修改，确定放弃吗？"),
+        confirmLabel: t("放弃修改"),
+        action: () => applySelectEditingMode(modeId),
+      });
+      return;
+    }
+    applySelectEditingMode(modeId);
+  };
+
+  const applyAddCustomMode = () => {
     const id = `custom.${Date.now()}.${Math.random().toString(36).slice(2, 8)}`;
     const mode: WritingMode = {
       id,
-      label: "自定义模式",
+      label: t("自定义模式"),
       family: "general",
-      prompt: "根据我说的内容整理文字，保留事实、语气和具体信息，不要添加我没有说过的内容。",
+      prompt: t("根据我说的内容整理文字，保留事实、语气和具体信息，不要添加我没有说过的内容。"),
       builtin: false,
     };
     const baseWritingModes = draftModeId ? writingModes.filter((item) => item.id !== draftModeId) : writingModes;
@@ -330,6 +348,19 @@ export function ContextSettings({
     setModeLabelDraft(mode.label);
     setModePromptDraft(mode.prompt);
     setError(null);
+  };
+
+  const addCustomMode = () => {
+    if (modeIsDirty) {
+      setPendingConfirm({
+        title: t("放弃未保存修改"),
+        description: t("当前模式有未保存修改，确定放弃吗？"),
+        confirmLabel: t("放弃修改"),
+        action: applyAddCustomMode,
+      });
+      return;
+    }
+    applyAddCustomMode();
   };
 
   const saveEditingMode = () => {
@@ -359,22 +390,28 @@ export function ContextSettings({
       setError(t("请先删除使用这个模式的 App 映射"));
       return;
     }
-    if (!window.confirm(t("确定删除“{name}”吗？").replace("{name}", editingMode.label))) return;
-    const next = writingModes.filter((mode) => mode.id !== editingMode.id);
-    if (editingMode.id === draftModeId) {
-      setWritingModes(next);
-      setDraftModeId(null);
-    } else {
-      publishWritingModes(next);
-    }
-    const fallback = next[0];
-    if (fallback) {
-      setEditingModeId(fallback.id);
-      setModeLabelDraft(fallback.label);
-      setModePromptDraft(fallback.prompt);
-    }
-    if (selectedModeId === editingMode.id) setSelectedModeId("general");
-    setError(null);
+    setPendingConfirm({
+      title: t("删除自定义模式"),
+      description: t("确定删除“{name}”吗？").replace("{name}", editingMode.label),
+      confirmLabel: t("删除"),
+      action: () => {
+        const next = writingModes.filter((mode) => mode.id !== editingMode.id);
+        if (editingMode.id === draftModeId) {
+          setWritingModes(next);
+          setDraftModeId(null);
+        } else {
+          publishWritingModes(next);
+        }
+        const fallback = next[0];
+        if (fallback) {
+          setEditingModeId(fallback.id);
+          setModeLabelDraft(fallback.label);
+          setModePromptDraft(fallback.prompt);
+        }
+        if (selectedModeId === editingMode.id) setSelectedModeId("general");
+        setError(null);
+      },
+    });
   };
 
   const selectApplication = (bundleId: string) => {
@@ -506,7 +543,7 @@ export function ContextSettings({
   return (
     <SettingsShell>
       <SettingsPageHeader
-        title={t(automationOnly || combined ? "智能整理" : "上下文模式")}
+        title={t(automationOnly || combined ? "智能整理" : "写作模式")}
         description={t(combined ? "根据当前 App、输入框和你说的内容整理文字，也可以编辑 Prompt 和 App / 网站规则。" : automationOnly ? "根据当前 App、输入框和你说的内容，自动选择合适的 Prompt 和输出格式。" : "编辑写作 Prompt，并为 App 或网站配置固定模式。")}
       />
       {(automationOnly || combined) && (
@@ -515,8 +552,14 @@ export function ContextSettings({
             <SettingsRow title={t("App 上下文适配")} description={t("根据你当前使用的 App 和输入框自动选择合适的 Prompt。")} icon={<ScanSearch size={17} strokeWidth={1.7} aria-hidden="true" />}>
               <Toggle checked={enabled} onChange={(nextEnabled) => void toggle(nextEnabled)} disabled={busy} label={t("App 上下文适配")} />
             </SettingsRow>
-            <SettingsRow title={t("临时模式覆盖")} description={t("只对当前运行有效；不选择时会恢复自动适配。")}>
-              <select id="context-temporary-override" aria-label={t("临时模式覆盖")} value={overrideFamily ?? "auto"} onChange={(event) => void setOverride(event.target.value)} disabled={busy} className={`w-52 max-w-full ${fieldClass}`}>
+            {snapshot && (
+              <SettingsRow
+                title={t("当前上下文")}
+                description={`${snapshot.profile.app_label} · ${t(familyLabels[snapshot.profile.family])}`}
+              />
+            )}
+            <SettingsRow title={t("临时覆盖")} description={t("只对当前运行有效，重启或切换 App 后会恢复自动适配。")}>
+              <select id="context-temporary-override" aria-label={t("临时覆盖")} value={overrideFamily ?? "auto"} onChange={(event) => void setOverride(event.target.value)} disabled={busy} className={`w-52 max-w-full ${fieldClass}`}>
                 <option value="auto">{t("自动适配")}</option>
                 {Object.entries(familyLabels).map(([value, label]) => <option key={value} value={value}>{t(label)}</option>)}
               </select>
@@ -543,7 +586,7 @@ export function ContextSettings({
       )}
 
       {(!automationOnly || combined) && <>
-      <SettingsGroup title={t("写作模式")} description={t("编辑 Prompt，或创建只属于你的模式。")}> 
+      <SettingsGroup title={t("编辑 Prompt")} description={t("编辑 Prompt，或创建只属于你的模式。")}> 
         <div className="px-4 py-4 sm:px-5">
           <p className="max-w-xl text-xs leading-5 text-tertiary">{t("Prompt 只作为写作指导，不会覆盖 VoiceFlow 的事实保护规则。")} </p>
         </div>
@@ -589,20 +632,33 @@ export function ContextSettings({
           <label className="block text-xs text-secondary">{t("写作模式")}<select aria-label={t("应用映射写作模式")} value={selectedMappingMode?.id ?? ""} onChange={(event) => setSelectedModeId(event.target.value)} disabled={busy || savedWritingModes.length === 0} className={`mt-1 w-full ${fieldClass}`}>{savedWritingModes.map((mode) => <option key={mode.id} value={mode.id}>{t(mode.label)}{mode.builtin ? "" : ` · ${t("自定义")}`}</option>)}</select></label>
           <div className="grid gap-3 sm:grid-cols-2">
             <label className="block text-xs text-secondary">{t("示例输入")}
-              <textarea aria-label={t("App 风格示例输入")} value={styleExampleInput} onChange={(event) => setStyleExampleInput(event.target.value)} maxLength={2_000} rows={3} disabled={busy || !selectedApplicationId} placeholder={t("说一句典型的话")} className={`mt-1 w-full resize-y rounded-lg border ${colors.border} ${colors.bg.elevated} ${colors.text.primary} px-3 py-2 text-sm outline-none focus:border-accent`} />
+              <textarea aria-label={t("App 风格示例输入")} value={styleExampleInput} onChange={(event) => setStyleExampleInput(event.target.value)} maxLength={2_000} rows={3} disabled={busy || !selectedApplicationId} placeholder={t("说一句典型的话…")} className={`mt-1 w-full resize-y rounded-lg border ${colors.border} ${colors.bg.elevated} ${colors.text.primary} px-3 py-2 text-sm outline-none focus:border-accent`} />
             </label>
             <label className="block text-xs text-secondary">{t("期望输出")}
-              <textarea aria-label={t("App 风格期望输出")} value={styleExampleOutput} onChange={(event) => setStyleExampleOutput(event.target.value)} maxLength={2_000} rows={3} disabled={busy || !selectedApplicationId} placeholder={t("希望 VoiceFlow 输出的样子")} className={`mt-1 w-full resize-y rounded-lg border ${colors.border} ${colors.bg.elevated} ${colors.text.primary} px-3 py-2 text-sm outline-none focus:border-accent`} />
+              <textarea aria-label={t("App 风格期望输出")} value={styleExampleOutput} onChange={(event) => setStyleExampleOutput(event.target.value)} maxLength={2_000} rows={3} disabled={busy || !selectedApplicationId} placeholder={t("希望 VoiceFlow 输出的样子…")} className={`mt-1 w-full resize-y rounded-lg border ${colors.border} ${colors.bg.elevated} ${colors.text.primary} px-3 py-2 text-sm outline-none focus:border-accent`} />
             </label>
           </div>
-          <p className="text-xs text-tertiary">{t("保存后只作为这个 App 的本地整理参考，不会自动从历史记录学习。")} </p>
+          <p className="text-xs text-tertiary">{t("保存后只作为这个 App 的本地整理参考，不会自动从历史记录学习。")} {t("确认后的 App 风格样例会发送给当前配置的 LLM 服务。")} </p>
           {selectedExistingMapping && <p className="text-xs text-secondary">{t("这个目标已有设置；保存后会更新它的写作模式。")} </p>}
-          <button type="button" onClick={() => void saveMapping()} disabled={busy || applicationsLoading || !selectedApplicationId} className={buttonClass}><Plus size={16} />{t("保存 App 设置")}</button>
+          <button type="button" onClick={() => void saveMapping()} disabled={busy || applicationsLoading || !selectedApplicationId} className={buttonClass}><Plus size={16} aria-hidden="true" />{t("保存 App 设置")}</button>
         </div>
-        {mappings.length > 0 && <div className="border-t border-border px-4 sm:px-5"><p className="py-3 text-xs font-medium text-tertiary">{t("已保存的 App 设置")}</p>{mappings.map((mapping) => <div key={mapping.id} className="flex items-center gap-3 border-t border-border py-3"><span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-elevated text-xs font-semibold text-primary">{mapping.label.slice(0, 1)}</span><div className="min-w-0 flex-1"><p className="truncate text-sm font-medium text-primary">{mapping.label}</p><p className="mt-0.5 truncate text-xs text-tertiary">{t(writingModes.find((mode) => mode.id === mapping.mode_id)?.label ?? familyLabels[mapping.family])} · {mapping.browser_host ? t("按网站匹配") : t("按 App 匹配")}</p></div><IconButton size="sm" label={t("删除映射")} aria-label={`${t("删除应用映射")} ${mapping.label}`} tone="danger" icon={<Trash2 size={15} aria-hidden="true" />} onClick={() => void deleteMapping(mapping.id)} disabled={busy} /></div>)}</div>}
+        {mappings.length > 0 && <div className="border-t border-border px-4 sm:px-5"><p className="py-3 text-xs font-medium text-tertiary">{t("已保存的 App 设置")}</p>{mappings.map((mapping) => <div key={mapping.id} className="flex items-center gap-3 border-t border-border py-3"><span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-elevated text-xs font-semibold text-primary">{mapping.label.slice(0, 1)}</span><div className="min-w-0 flex-1"><p className="truncate text-sm font-medium text-primary">{mapping.label}</p><p className="mt-0.5 truncate text-xs text-tertiary">{t(writingModes.find((mode) => mode.id === mapping.mode_id)?.label ?? familyLabels[mapping.family])} · {mapping.browser_host ? t("按网站匹配") : t("按 App 匹配")}</p></div><IconButton size="sm" label={t("删除映射")} aria-label={`${t("删除应用映射")} ${mapping.label}`} tone="danger" icon={<Trash2 size={15} aria-hidden="true" />} onClick={() => setPendingConfirm({ title: t("删除映射"), description: t("确定删除“{name}”吗？").replace("{name}", mapping.label), confirmLabel: t("删除"), action: () => void deleteMapping(mapping.id) })} disabled={busy} /></div>)}</div>}
       </SettingsGroup>
       </>}
       {error && <SettingsAlert>{error}</SettingsAlert>}
+      <ConfirmDialog
+        open={pendingConfirm != null}
+        title={pendingConfirm?.title ?? ""}
+        description={pendingConfirm?.description ?? ""}
+        confirmLabel={pendingConfirm?.confirmLabel ?? t("确定")}
+        cancelLabel={t("取消")}
+        onCancel={() => setPendingConfirm(null)}
+        onConfirm={() => {
+          const action = pendingConfirm?.action;
+          setPendingConfirm(null);
+          action?.();
+        }}
+      />
     </SettingsShell>
   );
 }

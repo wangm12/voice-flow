@@ -3,6 +3,7 @@ import { Trash2 } from "lucide-react";
 import { colors, radius, buttonClass } from "../lib/theme";
 import { useI18n } from "../lib/i18n";
 import { SettingsGroup, SettingsPageHeader, SettingsShell } from "./SettingsLayout";
+import { ConfirmDialog } from "./ConfirmDialog";
 import { Toggle } from "./Toggle";
 
 export type Snippet = {
@@ -21,6 +22,7 @@ export function SnippetsSettings({ snippets, onChange }: { snippets: Snippet[]; 
   const [trigger, setTrigger] = useState("");
   const [expansion, setExpansion] = useState("");
   const [error, setError] = useState<string | null>(null);
+  const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null);
 
   const add = () => {
     const nextTrigger = trigger.trim().replace(/\s+/g, " ");
@@ -55,7 +57,7 @@ export function SnippetsSettings({ snippets, onChange }: { snippets: Snippet[]; 
                 aria-label={t("触发短语")}
                 value={trigger}
                 onChange={(event) => setTrigger(event.target.value)}
-                placeholder={t("说出的完整短语")}
+                placeholder={t("说出的完整短语…")}
                 className={`mt-3 w-full ${radius.control} h-9 border ${colors.border} ${colors.bg.elevated} ${colors.text.primary} px-3 text-sm outline-none transition-colors focus:border-accent`}
               />
             </label>
@@ -67,7 +69,7 @@ export function SnippetsSettings({ snippets, onChange }: { snippets: Snippet[]; 
                 value={expansion}
                 onChange={(event) => setExpansion(event.target.value)}
                 rows={3}
-                placeholder={t("要插入的文字")}
+                placeholder={t("要插入的文字…")}
                 className={`mt-3 min-h-20 w-full resize-y ${radius.control} border ${colors.border} ${colors.bg.elevated} ${colors.text.primary} px-3 py-2 text-sm outline-none transition-colors focus:border-accent`}
               />
             </label>
@@ -91,11 +93,23 @@ export function SnippetsSettings({ snippets, onChange }: { snippets: Snippet[]; 
                 onChange={(enabled) => onChange(snippets.map((item) => item.id === snippet.id ? { ...item, enabled } : item))}
                 label={`${t("启用")} ${snippet.trigger}`}
               />
-              <button type="button" aria-label={`${t("删除片段")} ${snippet.trigger}`} onClick={() => onChange(snippets.filter((item) => item.id !== snippet.id))} className="rounded-lg p-2 text-tertiary transition-colors hover:bg-error/10 hover:text-error"><Trash2 size={15} aria-hidden="true" /></button>
+              <button type="button" aria-label={`${t("删除片段")} ${snippet.trigger}`} onClick={() => setPendingDeleteId(snippet.id)} className="rounded-lg p-2 text-tertiary transition-colors hover:bg-error/10 hover:text-error"><Trash2 size={15} aria-hidden="true" /></button>
             </div>
           </div>
         ))}
       </SettingsGroup>
+      <ConfirmDialog
+        open={pendingDeleteId != null}
+        title={t("删除片段")}
+        description={t("确定删除“{name}”吗？").replace("{name}", snippets.find((item) => item.id === pendingDeleteId)?.trigger ?? "")}
+        confirmLabel={t("删除")}
+        cancelLabel={t("取消")}
+        onCancel={() => setPendingDeleteId(null)}
+        onConfirm={() => {
+          onChange(snippets.filter((item) => item.id !== pendingDeleteId));
+          setPendingDeleteId(null);
+        }}
+      />
     </SettingsShell>
   );
 }

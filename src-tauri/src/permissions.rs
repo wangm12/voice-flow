@@ -4,6 +4,7 @@ use serde::Serialize;
 #[link(name = "ApplicationServices", kind = "framework")]
 unsafe extern "C" {
     fn AXIsProcessTrustedWithOptions(options: *const std::ffi::c_void) -> bool;
+    static kAXTrustedCheckOptionPrompt: core_foundation::string::CFStringRef;
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -18,11 +19,16 @@ extern "C" {
     static AVMediaTypeAudio: *const objc::runtime::Object;
 }
 #[cfg(target_os = "macos")]
-fn accessibility_is_trusted() -> bool {
+pub fn accessibility_is_trusted() -> bool {
     // A null options dictionary performs a non-interactive check. This is the
     // same native API used by Enigo before it creates the keyboard injector,
     // so the settings card and the actual paste path agree on the result.
     unsafe { AXIsProcessTrustedWithOptions(std::ptr::null()) }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn accessibility_is_trusted() -> bool {
+    true
 }
 
 #[cfg(target_os = "macos")]
@@ -113,7 +119,19 @@ pub fn open_privacy_settings(pane: &str) -> Result<(), String> {
 
 #[cfg(target_os = "macos")]
 pub fn request_accessibility() -> bool {
-    accessibility_is_trusted()
+    use core_foundation::base::TCFType;
+    use core_foundation::boolean::CFBoolean;
+    use core_foundation::dictionary::CFDictionary;
+    use core_foundation::string::CFString;
+
+    // Only the user-initiated command path should prompt. Paste and the idle
+    // context loop must keep using `accessibility_is_trusted`.
+    unsafe {
+        let key = CFString::wrap_under_get_rule(kAXTrustedCheckOptionPrompt);
+        let value = CFBoolean::true_value();
+        let dict = CFDictionary::from_CFType_pairs(&[(key, value)]);
+        AXIsProcessTrustedWithOptions(dict.as_concrete_TypeRef() as *const std::ffi::c_void)
+    }
 }
 
 #[cfg(not(target_os = "macos"))]

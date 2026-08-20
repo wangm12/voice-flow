@@ -45,6 +45,8 @@ pub enum PasteError {
 const COMMAND_COPY_KEYCODE: u16 = 0x08;
 #[cfg(target_os = "macos")]
 const COMMAND_PASTE_KEYCODE: u16 = 0x09;
+#[cfg(target_os = "macos")]
+const COMMAND_UNDO_KEYCODE: u16 = 0x06;
 
 /// The platform's "primary" modifier used for the paste shortcut
 /// (Ctrl on Windows/Linux).
@@ -61,7 +63,7 @@ fn map_enigo_connection_error(error: NewConError) -> PasteError {
 
 #[cfg(target_os = "macos")]
 fn send_command_shortcut(keycode: u16) -> Result<(), PasteError> {
-    if !crate::permissions::request_accessibility() {
+    if !crate::permissions::accessibility_is_trusted() {
         return Err(PasteError::Accessibility);
     }
     let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
@@ -125,6 +127,26 @@ fn simulate_copy() -> Result<(), PasteError> {
     send_command_shortcut(COMMAND_COPY_KEYCODE)
 }
 
+#[cfg(target_os = "macos")]
+fn simulate_undo() -> Result<(), PasteError> {
+    send_command_shortcut(COMMAND_UNDO_KEYCODE)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn simulate_undo() -> Result<(), PasteError> {
+    let mut enigo = Enigo::new(&Settings::default()).map_err(map_enigo_connection_error)?;
+    enigo
+        .key(PRIMARY_MODIFIER, Direction::Press)
+        .map_err(|error| PasteError::Input(error.to_string()))?;
+    enigo
+        .key(Key::Unicode('z'), Direction::Click)
+        .map_err(|error| PasteError::Input(error.to_string()))?;
+    enigo
+        .key(PRIMARY_MODIFIER, Direction::Release)
+        .map_err(|error| PasteError::Input(error.to_string()))?;
+    Ok(())
+}
+
 #[cfg(not(target_os = "macos"))]
 fn simulate_copy() -> Result<(), PasteError> {
     let mut enigo = Enigo::new(&Settings::default()).map_err(map_enigo_connection_error)?;
@@ -165,6 +187,18 @@ fn simulate_copy() -> Result<(), PasteError> {
 pub struct CapturedSelection {
     pub text: String,
     pub fingerprint: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InsertOutcome {
+    /// The platform shortcut was posted successfully.
+    pub shortcut_sent: bool,
+    /// Reserved for a future AX direct-insertion adapter. Cmd+V alone cannot
+    /// prove that the target application accepted the clipboard contents.
+    pub verified: bool,
+    /// In-memory fingerprint of the complete focused input value immediately
+    /// after a verified paste. Undo uses this to avoid undoing later user edits.
+    pub post_insert_input_fingerprint: Option<u64>,
 }
 
 pub fn selection_fingerprint(text: &str) -> u64 {
@@ -215,6 +249,39 @@ pub fn capture_selected_text(
     Ok(CapturedSelection { text, fingerprint })
 }
 
+#[derive(Debug)]
+struct PasteAttempt {
+    shortcut_sent: bool,
+    result: Result<(), PasteError>,
+}
+
+impl PasteAttempt {
+    fn sent() -> Self {
+        Self {
+            shortcut_sent: true,
+            result: Ok(()),
+        }
+    }
+
+    fn not_sent(error: PasteError) -> Self {
+        Self {
+            shortcut_sent: false,
+            result: Err(error),
+        }
+    }
+
+    fn failed_after_send(error: PasteError) -> Self {
+        Self {
+            shortcut_sent: true,
+            result: Err(error),
+        }
+    }
+}
+
+fn should_restore_clipboard(attempt: &PasteAttempt) -> bool {
+    !attempt.shortcut_sent
+}
+
 /// Run the irreversible keyboard injection only after the last cancellation and
 /// target checks. This stays synchronous because the caller already runs inside
 /// `spawn_blocking`; detaching it behind a timeout could let a timed-out paste
@@ -223,11 +290,10 @@ fn run_paste_attempt(
     cancellation: &CancellationToken,
     verify_target: impl Fn() -> Result<(), PasteError>,
     simulate: impl FnOnce() -> Result<(), PasteError>,
-) -> Result<(), PasteError> {
+) -> PasteAttempt {
     if cancellation.is_cancelled() {
-        return Err(PasteError::Cancelled);
+        return PasteAttempt::not_sent(PasteError::Cancelled);
     }
-    verify_target()?;
 
     crate::modifier_hotkey::set_paste_suppressed(true);
     struct PasteSuppressionGuard;
@@ -237,15 +303,28 @@ fn run_paste_attempt(
         }
     }
 
+    let shortcut_attempted = std::sync::atomic::AtomicBool::new(false);
     let _suppression_guard = PasteSuppressionGuard;
-    std::panic::catch_unwind(AssertUnwindSafe(|| {
+    let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
         if cancellation.is_cancelled() {
             return Err(PasteError::Cancelled);
         }
+        // Keep the final target check inside the suppression window so the
+        // focused app cannot change between verification and Cmd+V.
         verify_target()?;
+        if cancellation.is_cancelled() {
+            return Err(PasteError::Cancelled);
+        }
+        shortcut_attempted.store(true, std::sync::atomic::Ordering::Release);
         simulate()
     }))
-    .unwrap_or_else(|_| Err(PasteError::Input("paste worker panicked".into())))
+    .unwrap_or_else(|_| Err(PasteError::Input("paste worker panicked".into())));
+    let shortcut_sent = shortcut_attempted.load(std::sync::atomic::Ordering::Acquire);
+    match result {
+        Ok(()) => PasteAttempt::sent(),
+        Err(error) if shortcut_sent => PasteAttempt::failed_after_send(error),
+        Err(error) => PasteAttempt::not_sent(error),
+    }
 }
 
 fn check_before_clipboard(cancellation: &CancellationToken) -> Result<(), PasteError> {
@@ -256,40 +335,98 @@ fn check_before_clipboard(cancellation: &CancellationToken) -> Result<(), PasteE
     }
 }
 
+fn input_value_verifies_delivery(
+    before: Option<&str>,
+    after: Option<&str>,
+    expected: &str,
+) -> bool {
+    if expected.is_empty() || expected.chars().count() < 2 {
+        return false;
+    }
+    let Some(after) = after else {
+        return false;
+    };
+    let after_count = after.matches(expected).count();
+    if after_count == 0 {
+        return false;
+    }
+    let expected_chars = expected.chars().count();
+    let after_chars = after.chars().count();
+    match before {
+        Some(before) => {
+            after_count > before.matches(expected).count()
+                && after_chars >= before.chars().count().saturating_add(expected_chars)
+        }
+        None => after_chars >= expected_chars,
+    }
+}
+
+fn restore_clipboard(app: &AppHandle, previous: Option<&str>) -> Result<(), PasteError> {
+    let Some(previous) = previous else {
+        return Ok(());
+    };
+    app.clipboard()
+        .write_text(previous)
+        .map_err(|error| PasteError::Clipboard(error.to_string()))
+}
+
 pub fn insert(
     app: &AppHandle,
     text: &str,
     accessibility: bool,
     cancellation: CancellationToken,
     verify_target: impl Fn() -> Result<(), PasteError> + Send + Sync + 'static,
-) -> Result<(), PasteError> {
+) -> Result<InsertOutcome, PasteError> {
     // A clipboard write is itself a user-visible delivery side effect. Do not
-    // let a cancellation that arrived while processing overwrite the user's
-    // existing clipboard before the keyboard-injection guard runs.
+    // let a failed permission or target check overwrite the user's existing
+    // clipboard before the keyboard-injection guard runs.
+    check_before_clipboard(&cancellation)?;
+    if !accessibility {
+        return Err(PasteError::Accessibility);
+    }
+    verify_target()?;
+    let value_before = crate::context::focused_input_value();
+    check_before_clipboard(&cancellation)?;
+    // Images and files cannot be restored as text. Continue the paste instead
+    // of aborting the whole delivery because the previous clipboard was not
+    // a string.
+    let previous_clipboard = app.clipboard().read_text().ok();
     check_before_clipboard(&cancellation)?;
     app.clipboard()
         .write_text(text)
         .map_err(|error| PasteError::Clipboard(error.to_string()))?;
     thread::sleep(Duration::from_millis(100));
     if cancellation.is_cancelled() {
+        let _ = restore_clipboard(app, previous_clipboard.as_deref());
         return Err(PasteError::Cancelled);
     }
-    if !accessibility {
-        return Err(PasteError::Accessibility);
-    }
-    verify_target()?;
-
     // Suppress the modifier event-tap while we synthesize the paste keystroke:
     // our own keystroke must not be read as a physical hotkey tap, and re-entrant
     // event delivery during the paste aborts the main runloop (uncaught
     // NSException -> SIGABRT). Enigo is called synchronously here, but this
     // function is reached from `paste_text`'s `spawn_blocking` worker, never from
     // the AppKit/tao main-thread callback.
-    let result = run_paste_attempt(&cancellation, verify_target, simulate_paste);
-    if result.is_ok() {
+    let attempt = run_paste_attempt(&cancellation, verify_target, simulate_paste);
+    if should_restore_clipboard(&attempt) {
+        // Restore only when Cmd+V was never posted. Once the shortcut is sent,
+        // keep VoiceFlow's text available as the manual fallback.
+        let _ = restore_clipboard(app, previous_clipboard.as_deref());
+    }
+    if attempt.result.is_ok() {
         thread::sleep(Duration::from_millis(250));
     }
-    result
+    attempt.result.map(|()| {
+        let value_after = crate::context::focused_input_value();
+        let verified =
+            input_value_verifies_delivery(value_before.as_deref(), value_after.as_deref(), text);
+        InsertOutcome {
+            shortcut_sent: true,
+            verified,
+            post_insert_input_fingerprint: verified
+                .then(|| value_after.as_deref().map(selection_fingerprint))
+                .flatten(),
+        }
+    })
 }
 
 pub fn copy(app: &AppHandle, text: &str) -> Result<(), PasteError> {
@@ -309,6 +446,47 @@ pub fn copy_if_not_cancelled(
 ) -> Result<(), PasteError> {
     check_before_clipboard(cancellation)?;
     copy(app, text)
+}
+
+/// Bring the original target app back to the front before a user confirms a
+/// selected-text preview. The preview window necessarily took focus, so the
+/// target guard must be checked again after activation.
+pub fn activate_target(pid: i32) -> Result<(), PasteError> {
+    #[cfg(target_os = "macos")]
+    {
+        unsafe {
+            use objc::{class, msg_send, sel, sel_impl};
+            let application: *mut objc::runtime::Object = msg_send![
+                class!(NSRunningApplication),
+                runningApplicationWithProcessIdentifier: pid
+            ];
+            if application.is_null() {
+                return Err(PasteError::TargetUnavailable);
+            }
+            let activated: bool = msg_send![application, activateWithOptions: (1u64 << 1)];
+            if !activated {
+                return Err(PasteError::TargetUnavailable);
+            }
+        }
+        thread::sleep(Duration::from_millis(120));
+        Ok(())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = pid;
+        Ok(())
+    }
+}
+
+/// Undo is deliberately a separate primitive from paste. Callers must verify
+/// the target immediately before invoking it; this function only performs the
+/// platform shortcut after the permission check.
+pub fn undo(accessibility: bool) -> Result<(), PasteError> {
+    if !accessibility {
+        return Err(PasteError::Accessibility);
+    }
+    std::panic::catch_unwind(AssertUnwindSafe(simulate_undo))
+        .unwrap_or_else(|_| Err(PasteError::Input("undo worker panicked".into())))
 }
 
 #[cfg(test)]
@@ -332,7 +510,9 @@ mod tests {
             },
         );
 
-        assert!(matches!(result, Err(PasteError::Cancelled)));
+        assert!(!result.shortcut_sent);
+        assert!(should_restore_clipboard(&result));
+        assert!(matches!(result.result, Err(PasteError::Cancelled)));
         assert!(!*called.lock().unwrap());
     }
 
@@ -345,6 +525,31 @@ mod tests {
             check_before_clipboard(&cancellation),
             Err(PasteError::Cancelled)
         ));
+    }
+
+    #[test]
+    fn cancellation_after_target_check_never_runs_keyboard_injection() {
+        let cancellation = CancellationToken::new();
+        let called = Arc::new(Mutex::new(false));
+        let called_in_simulate = called.clone();
+        let cancellation_in_verify = cancellation.clone();
+
+        let result = run_paste_attempt(
+            &cancellation,
+            move || {
+                cancellation_in_verify.cancel();
+                Ok(())
+            },
+            move || {
+                *called_in_simulate.lock().unwrap() = true;
+                Ok::<(), PasteError>(())
+            },
+        );
+
+        assert!(!result.shortcut_sent);
+        assert!(should_restore_clipboard(&result));
+        assert!(matches!(result.result, Err(PasteError::Cancelled)));
+        assert!(!*called.lock().unwrap());
     }
 
     #[test]
@@ -362,7 +567,9 @@ mod tests {
             },
         );
 
-        assert!(matches!(result, Err(PasteError::TargetChanged)));
+        assert!(!result.shortcut_sent);
+        assert!(should_restore_clipboard(&result));
+        assert!(matches!(result.result, Err(PasteError::TargetChanged)));
         assert!(!*called.lock().unwrap());
     }
 
@@ -375,7 +582,20 @@ mod tests {
             || -> Result<(), PasteError> { panic!("synthetic input failure") },
         );
 
-        assert!(matches!(result, Err(PasteError::Input(message)) if message.contains("panicked")));
+        assert!(result.shortcut_sent);
+        assert!(!should_restore_clipboard(&result));
+        assert!(
+            matches!(result.result, Err(PasteError::Input(message)) if message.contains("panicked"))
+        );
+    }
+
+    #[test]
+    fn successful_shortcut_keeps_dictation_clipboard() {
+        let cancellation = CancellationToken::new();
+        let result = run_paste_attempt(&cancellation, || Ok(()), || Ok(()));
+        assert!(result.shortcut_sent);
+        assert!(!should_restore_clipboard(&result));
+        assert!(result.result.is_ok());
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -401,5 +621,45 @@ mod tests {
             selection_fingerprint("first"),
             selection_fingerprint("second")
         );
+    }
+
+    #[test]
+    fn input_verification_requires_a_new_occurrence_of_the_delivered_text() {
+        assert!(input_value_verifies_delivery(
+            Some("before"),
+            Some("before + inserted"),
+            "inserted"
+        ));
+        assert!(!input_value_verifies_delivery(
+            Some("already inserted"),
+            Some("already inserted"),
+            "inserted"
+        ));
+        assert!(!input_value_verifies_delivery(
+            Some("before inserted"),
+            Some("before changed"),
+            "inserted"
+        ));
+        assert!(!input_value_verifies_delivery(None, None, "inserted"));
+        assert!(!input_value_verifies_delivery(
+            Some("aa"),
+            Some("aa"),
+            "a"
+        ));
+        assert!(!input_value_verifies_delivery(
+            Some("aa"),
+            Some("aaa"),
+            "a"
+        ));
+        assert!(input_value_verifies_delivery(
+            Some("hi"),
+            Some("hi hello"),
+            "hello"
+        ));
+        assert!(!input_value_verifies_delivery(
+            None,
+            Some("inserted"),
+            "i"
+        ));
     }
 }

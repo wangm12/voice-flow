@@ -58,6 +58,12 @@ describe("ContextSettings", () => {
     expect(screen.queryByLabelText("可执行文件名")).not.toBeInTheDocument();
   });
 
+  it("shows the current app and family from the live snapshot", async () => {
+    render(<ContextSettings combined />);
+
+    expect(await screen.findByText("Cursor · 通用")).toBeInTheDocument();
+  });
+
   it("saves the selected app and writing mode using generated selectors", async () => {
     render(<ContextSettings />);
 

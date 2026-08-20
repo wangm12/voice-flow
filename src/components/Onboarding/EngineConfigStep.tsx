@@ -34,7 +34,7 @@ export function EngineConfigStep({
 
       <div className="mt-6 border-y border-border">
         <div className="flex items-start gap-3 py-4">
-          <CloudCog {...iconProps} className="mt-0.5 shrink-0 text-secondary" />
+          <CloudCog {...iconProps} className="mt-0.5 shrink-0 text-secondary" aria-hidden="true" />
           <div className="min-w-0 flex-1">
             <p className="text-sm font-medium text-primary">{t("当前服务 · Groq")}</p>
             <p className="mt-1 text-xs leading-relaxed text-secondary">{t("低延迟")} · {t("适合日常口述；密钥只保存在这台 Mac 上。")}</p>
@@ -43,7 +43,7 @@ export function EngineConfigStep({
 
         <div className="border-t border-border py-4">
           <label htmlFor="onboarding-groq-api-key" className="block text-sm font-medium text-primary">{t("Groq API Key（访问密钥）")}</label>
-          <p className="mt-0.5 text-xs text-tertiary">{t("在 Groq Console 创建，通常以 gsk_ 开头。")}</p>
+          <p className="mt-0.5 text-xs text-tertiary">{t("在")} <a className="text-accent underline underline-offset-2" href="https://console.groq.com" target="_blank" rel="noreferrer">{t("Groq Console")}</a> {t("创建，通常以 gsk_ 开头。")}</p>
           <PasswordInput id="onboarding-groq-api-key" ariaLabel={t("Groq API Key")} value={keyValue} onChange={onKeyChange} placeholder="gsk_…" valid={isValid} monospace className="mt-2" />
         </div>
 
@@ -57,7 +57,7 @@ export function EngineConfigStep({
         {error && <p role="alert" className="border-t border-error/20 py-3 text-xs text-error">{error}</p>}
 
         <p className="flex items-center gap-1.5 border-t border-border py-4 text-xs text-tertiary">
-          <Lock {...iconPropsSm} className="shrink-0" />
+          <Lock {...iconPropsSm} className="shrink-0" aria-hidden="true" />
           {t("密钥仅保存在这台 Mac 的钥匙串中；VoiceFlow 不会代存，验证时只发送到 Groq")}
         </p>
       </div>

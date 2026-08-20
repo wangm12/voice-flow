@@ -1,13 +1,16 @@
 # VoiceFlow Acceptance Evidence
 
-更新时间：2026-08-10（最新确定性审计）
+更新时间：2026-08-11（最新确定性审计）
 
 ## P0/P1 implementation delta
 
 - Silent ASR prefetch is bounded, cancellation-aware, and never delivers partial text to the HUD, clipboard, or external apps. The internal latency output separates `prefetch_asr`, `final_asr`, `cleanup`, `paste`, and `stop_to_insert`.
 - Selected-text actions are opt-in and use an independent combination hotkey. Selection capture restores the previous clipboard; the replacement path rechecks target identity and selected text, and falls back to copying the result when validation fails. Selected actions do not create ordinary History entries.
+- Delivery policy is now explicit (`auto`, `paste_shortcut`, `clipboard_only`, `history_only`). Cmd+V returns a local best-effort focused-value verification result; an unverified shortcut is recorded as `paste_unverified` instead of ordinary `done`. Long recordings still default to input delivery.
+- Selected-text actions are preview-first outside onboarding: the user can edit the generated result, replace the original selection only after confirmation, copy only, or cancel. Confirmation reactivates the original target before rechecking it.
+- The end-to-end state machine is documented in `docs/end-to-end-workflows.md`.
 - The cleanup corpus is stored in `src-tauri/src/cleanup_corpus.rs` and contains de-identified regression targets for filler removal, self-correction, mixed language, code/URL preservation, email, repetition, and chunk-boundary continuity.
-- Current deterministic gates for this implementation: Rust `cargo test --locked --lib` — 129 passed, 1 ignored; frontend `npm test -- --run` — 38 passed; `npm run lint`, `npm run build`, and strict Clippy — pass.
+- Current deterministic gates for this implementation: Rust `cargo test --manifest-path src-tauri/Cargo.toml` — 151 passed, 1 ignored; frontend `npm test -- --run` — 55 passed; `npm run lint`, `npm run build`, and strict Clippy — pass.
 
 这份矩阵对应权威验收 brief。`Automated` 表示当前代码和本地测试已经证明；`Real macOS` 表示仍需要在用户授权的 macOS 外部状态中执行。
 
@@ -28,10 +31,10 @@
 
 - `npm run build` — pass (latest audit run)
 - `npm run lint` — pass (latest audit run)
-- `npm test -- --run` — 38 passed (latest audit run)
+- `npm test -- --run` — 55 passed (latest audit run)
 - `npm audit --registry=https://registry.npmjs.org --audit-level=high` — 0 vulnerabilities
-- `cargo fmt --check` — pass (latest audit run)
-- `cargo test --locked --lib` — 129 passed, 1 ignored (130 tests discovered; ignored test is the real OS Keychain round-trip)
+- `cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check` — pass (latest audit run)
+- `cargo test --manifest-path src-tauri/Cargo.toml` — 151 passed, 1 ignored (152 tests discovered; ignored test is the real OS Keychain round-trip)
 - `cargo clippy --locked --all-targets --all-features -- -D warnings` — pass (latest audit run)
 - `cargo check --target aarch64-apple-darwin` — pass (latest audit run)
 - `cargo check --target x86_64-apple-darwin` — pass (latest audit run)
@@ -63,7 +66,7 @@ The run must also cover App/window/Tab changes, clipboard fallback, cancellation
 - Context settings now expose a non-persistent manual family override; it changes only the policy/profile and preserves the actual target guard.
 - Hotkey-capture validation and app-data-path failures restore the previous binding before unsuspending global shortcuts.
 - The installed and development binaries were rebuilt from the current source and contain only `com.voiceflow.desktop.credentials.v3`; the former legacy app was moved out of `/Applications` so it cannot be launched accidentally.
-- Latest gate rerun: frontend build/lint/tests, public npm audit, Rust fmt/tests/strict Clippy, both locked macOS architecture checks, and cargo audit all pass. Rust reports 108 passed and 1 intentional ignored test; frontend reports 15 passed. Cargo audit retains non-shipping Linux GTK3/`glib` warnings.
+- Earlier gate history: frontend build/lint/tests, public npm audit, Rust fmt/tests/strict Clippy, both locked macOS architecture checks, and cargo audit all passed at an earlier checkpoint. The current totals are maintained in the local gate table above; cargo audit retains non-shipping Linux GTK3/`glib` warnings.
 - API Key controls now expose a programmatic label, `autoComplete="off"`, and keyboard-visible focus on the show/hide control; fake `gsk_`-shaped test strings were removed so secret scanners do not report them.
 - Clean Up protected-token validation now recognizes protocol-less domains such as `docs.example.com`, with regression coverage against domain mutation.
 - Settings window configuration now enforces a 720×520 minimum; compact settings actions use a 44px hit area and visible keyboard focus.

@@ -311,6 +311,20 @@ mod tests {
     }
 
     #[test]
+    fn merge_skips_failed_chunks_without_placeholder_text() {
+        assert_eq!(
+            merge_transcripts(vec![
+                (0, "hello world".into()),
+                (2, "and done".into())
+            ]),
+            "hello world and done"
+        );
+        let merged = merge_transcripts(vec![(0, "你好".into()), (1, "世界".into())]);
+        assert!(!merged.contains("识别失败"));
+        assert!(!merged.contains('['));
+    }
+
+    #[test]
     fn merge_keeps_mixed_script_boundaries_readable() {
         assert_eq!(
             merge_transcripts(vec![(0, "部署到".into()), (1, "v2 --dry-run".into())]),

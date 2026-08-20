@@ -4,7 +4,7 @@ import { waveformScaleForLevel } from "./VoiceWaveform";
 
 describe("voice pill state tokens", () => {
   it("surfaces the recording limit without relying on hover", () => {
-    expect(pillCaption("recording_limited")).toContain("15 分钟");
+    expect(pillCaption("recording_limited")).toBe("已达上限 · 按热键结束");
     expect(voicePillWidthForState("recording_limited")).toBeGreaterThan(104);
   });
 
@@ -14,6 +14,11 @@ describe("voice pill state tokens", () => {
 
   it("does not surface clipboard delivery as HUD copy", () => {
     expect(pillCaption("copied")).toBeNull();
+  });
+
+  it("appends a retry countdown to the rate-limit caption", () => {
+    expect(pillCaption("rate_limited", undefined, 8)).toContain("8");
+    expect(pillCaption("rate_limited")).toBe("处理时间比平时长…");
   });
 
   it("maps a louder microphone level to a taller waveform bar", () => {

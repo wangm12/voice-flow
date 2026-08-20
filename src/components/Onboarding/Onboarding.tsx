@@ -149,7 +149,16 @@ export function Onboarding({
 
   const enableAccessibility = async () => {
     setSettingsError(null);
-    await openPrivacySettings("accessibility");
+    try {
+      const granted = await invoke<boolean>("request_accessibility_permission");
+      if (!granted) {
+        await openPrivacySettings("accessibility");
+      }
+      setPermissions(await invoke<Permissions>("check_permissions"));
+    } catch {
+      setSettingsError(t("无法打开系统设置，请在“隐私与安全性”中手动开启权限"));
+      await openPrivacySettings("accessibility");
+    }
   };
 
   const requestMicrophone = async () => {

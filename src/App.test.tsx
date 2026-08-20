@@ -22,6 +22,7 @@ const settings = {
   chunk_threshold_secs: 25,
   chunk_length_secs: 35,
   long_output_mode: "paste",
+  delivery_policy: "auto",
   keep_audio_days: 7,
   keep_history_days: 90,
   onboarded: true,
@@ -75,6 +76,17 @@ describe("settings navigation", () => {
     expect(screen.getByText("自动粘贴")).toBeInTheDocument();
   });
 
+  it("splits smart formatting and writing modes into separate settings pages", async () => {
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "智能整理" }));
+    expect(await screen.findByRole("heading", { name: "智能整理" })).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "写作模式" })).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "写作模式" }));
+    expect(await screen.findByRole("heading", { name: "写作模式" })).toBeInTheDocument();
+  });
+
   it("shows and lets the user choose the input device in system settings", async () => {
     render(<App />);
 
@@ -99,9 +111,14 @@ describe("settings navigation", () => {
     expect(screen.queryByRole("button", { name: "上下文" })).not.toBeInTheDocument();
     expect(screen.getByRole("combobox", { name: "输出模式" })).toHaveValue("auto");
     expect(screen.getByRole("switch", { name: "App 上下文适配" })).toBeInTheDocument();
+    expect(screen.queryByRole("textbox", { name: "写作模式 Prompt" })).not.toBeInTheDocument();
+    expect(screen.queryByText("App / 网站映射")).not.toBeInTheDocument();
+    expect(screen.getByText("自动根据当前 App、输入框和你说的内容选择整理方式；手动模式会覆盖自动判断。")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "写作模式" }));
+    expect(await screen.findByRole("heading", { name: "写作模式" })).toBeInTheDocument();
     expect(screen.getByRole("textbox", { name: "写作模式 Prompt" })).toBeInTheDocument();
     expect(screen.getByText("App / 网站映射")).toBeInTheDocument();
-    expect(screen.getByText("自动根据当前 App、输入框和你说的内容选择整理方式；手动模式会覆盖自动判断。")).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "录音与输出" }));
     await waitFor(() => expect(screen.getByRole("heading", { name: "录音与输出" })).toBeInTheDocument());
@@ -139,6 +156,25 @@ describe("settings navigation", () => {
     expect(screen.getByRole("status")).toHaveTextContent("请先设置快捷键后才能触发");
     await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("update_settings_patch", {
       patch: { selected_actions_enabled: true },
+    }));
+  });
+
+  it("lets the user choose activation mode and does not persist empty chunk values", async () => {
+    render(<App />);
+
+    expect(await screen.findByText("按一下切换")).toBeInTheDocument();
+    expect(screen.getByRole("radio", { name: /按一下切换/ })).toBeChecked();
+
+    invokeMock.mockClear();
+    const threshold = screen.getByRole("spinbutton", { name: "开始分段（秒）" });
+    fireEvent.change(threshold, { target: { value: "" } });
+    fireEvent.blur(threshold);
+    expect(invokeMock).not.toHaveBeenCalledWith("update_settings_patch", expect.anything());
+
+    fireEvent.change(threshold, { target: { value: "8" } });
+    fireEvent.blur(threshold);
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("update_settings_patch", {
+      patch: { chunk_threshold_secs: 8 },
     }));
   });
 

@@ -8,6 +8,7 @@
 
 use crate::{asr, chunker::AudioChunk, metrics, queue};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
@@ -31,29 +32,60 @@ pub struct RealtimeAsrResult {
     pub transcripts: HashMap<usize, String>,
 }
 
+/// Bounded prefetch inbox shared by the audio capture thread and the ASR worker.
+/// `try_send` never blocks the audio thread; drops are counted so callers can
+/// ignore incomplete prefetch results.
+#[derive(Clone)]
+pub struct PrefetchInbox {
+    sender: mpsc::Sender<RealtimeMessage>,
+    drops: Arc<AtomicU32>,
+}
+
+impl PrefetchInbox {
+    pub fn try_send(&self, message: RealtimeMessage) -> bool {
+        match self.sender.try_send(message) {
+            Ok(()) => true,
+            Err(_) => {
+                let count = self.drops.fetch_add(1, Ordering::Relaxed) + 1;
+                log::warn!(
+                    "realtime ASR prefetch dropped a chunk (drop #{count}); final ASR will cover it"
+                );
+                false
+            }
+        }
+    }
+}
+
 pub struct RealtimeAsrSession {
     sender: mpsc::Sender<RealtimeMessage>,
     cancellation: CancellationToken,
     results: Arc<Mutex<RealtimeAsrResult>>,
+    drops: Arc<AtomicU32>,
 }
 
 impl RealtimeAsrSession {
-    pub fn channel() -> (
-        mpsc::Sender<RealtimeMessage>,
-        mpsc::Receiver<RealtimeMessage>,
-    ) {
-        mpsc::channel(CHANNEL_CAPACITY)
+    pub fn channel() -> (PrefetchInbox, mpsc::Receiver<RealtimeMessage>) {
+        let (sender, receiver) = mpsc::channel(CHANNEL_CAPACITY);
+        (
+            PrefetchInbox {
+                sender,
+                drops: Arc::new(AtomicU32::new(0)),
+            },
+            receiver,
+        )
     }
 
     pub fn spawn(
         receiver: mpsc::Receiver<RealtimeMessage>,
-        sender: mpsc::Sender<RealtimeMessage>,
+        inbox: PrefetchInbox,
         gate: Arc<queue::RequestGate>,
         provider: Arc<dyn asr::AsrProvider>,
         options: asr::AsrOptions,
         metrics: metrics::Metrics,
         cancellation: CancellationToken,
     ) -> Self {
+        let sender = inbox.sender.clone();
+        let drops = Arc::clone(&inbox.drops);
         let results = Arc::new(Mutex::new(RealtimeAsrResult::default()));
         let shared_results = Arc::clone(&results);
         let worker_cancellation = cancellation.clone();
@@ -139,10 +171,12 @@ impl RealtimeAsrSession {
             sender,
             cancellation,
             results,
+            drops,
         }
     }
 
     pub async fn finish(self, timeout: Duration) -> RealtimeAsrResult {
+        let dropped = self.drops.load(Ordering::Relaxed);
         let (reply_tx, reply_rx) = oneshot::channel();
         let result = tokio::time::timeout(timeout, async {
             self.sender
@@ -152,21 +186,51 @@ impl RealtimeAsrSession {
             reply_rx.await.map_err(|_| ())
         })
         .await;
+        if dropped > 0 {
+            log::warn!(
+                "ignoring prefetch results because {dropped} chunk(s) were dropped; final ASR will cover them"
+            );
+            self.cancellation.cancel();
+            return RealtimeAsrResult::default();
+        }
         match result {
             Ok(Ok(result)) => result,
             _ => {
                 self.cancellation.cancel();
-                let result = self
-                    .results
+                self.results
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .clone();
-                result
+                    .clone()
             }
         }
     }
 
     pub fn cancel(self) {
         self.cancellation.cancel();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_chunk(index: usize) -> AudioChunk {
+        AudioChunk {
+            index,
+            samples: vec![0.0; 16],
+            start_secs: index as f32,
+            end_secs: index as f32 + 1.0,
+        }
+    }
+
+    #[test]
+    fn prefetch_inbox_counts_dropped_chunks_without_blocking() {
+        let (inbox, _receiver) = RealtimeAsrSession::channel();
+        for index in 0..CHANNEL_CAPACITY {
+            assert!(inbox.try_send(RealtimeMessage::Chunk(sample_chunk(index))));
+        }
+        assert_eq!(inbox.drops.load(Ordering::Relaxed), 0);
+        assert!(!inbox.try_send(RealtimeMessage::Chunk(sample_chunk(CHANNEL_CAPACITY))));
+        assert!(inbox.drops.load(Ordering::Relaxed) > 0);
     }
 }

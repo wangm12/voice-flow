@@ -2,6 +2,7 @@
 
 use serde::Serialize;
 use std::future::Future;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter};
@@ -14,12 +15,14 @@ const UNKNOWN_QUOTA_RESET_MS: i64 = 60_000;
 pub enum RequestKind {
     Asr,
     Llm,
+    HistoryLlm,
 }
 impl RequestKind {
     pub fn name(self) -> &'static str {
         match self {
             Self::Asr => "asr",
             Self::Llm => "llm",
+            Self::HistoryLlm => "history_llm",
         }
     }
 }
@@ -64,6 +67,7 @@ pub struct RequestGate {
     semaphore: Arc<Semaphore>,
     quotas: Arc<Mutex<(Quota, Quota)>>,
     app: Option<AppHandle>,
+    session_generation: Arc<AtomicU64>,
 }
 impl RequestGate {
     pub fn new(app: Option<AppHandle>) -> Self {
@@ -71,7 +75,12 @@ impl RequestGate {
             semaphore: Arc::new(Semaphore::new(2)),
             quotas: Arc::new(Mutex::new((default_asr(), default_llm()))),
             app,
+            session_generation: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    pub fn set_session_generation(&self, generation: u64) {
+        self.session_generation.store(generation, Ordering::Release);
     }
     pub fn snapshots(&self) -> QuotaView {
         let q = self.quotas.lock().unwrap();
@@ -190,6 +199,10 @@ impl RequestGate {
             let _ = app.emit(event, payload);
         }
     }
+
+    fn current_session_generation(&self) -> u64 {
+        self.session_generation.load(Ordering::Acquire)
+    }
 }
 
 #[derive(Debug)]
@@ -259,12 +272,36 @@ where
                     // Sync the quota view so `wait_for_quota` and the UI reflect
                     // that we've hit the rate limit.
                     gate.mark_rate_limited(kind, seconds);
+                    let rate_event = if kind == RequestKind::HistoryLlm {
+                        "history://rate_limited"
+                    } else {
+                        "quota://rate_limited"
+                    };
                     gate.emit(
-                        "quota://rate_limited",
-                        serde_json::json!({"retry_after_secs": seconds}),
+                        rate_event,
+                        serde_json::json!({
+                            "retry_after_secs": seconds,
+                            "session_generation": gate.current_session_generation(),
+                        }),
                     );
+                    if kind != RequestKind::HistoryLlm {
+                        gate.emit(
+                            "dictation://state",
+                            serde_json::json!({
+                                "state": "processing",
+                                "phase": "waiting_retry",
+                                "retry_after_secs": seconds.ceil() as u64,
+                                "session_generation": gate.current_session_generation(),
+                            }),
+                        );
+                    }
                     let wait_ms = (seconds * 1000.0).ceil() as u64;
-                    gate.emit("quota://retrying", serde_json::json!({"attempt": rate_retries, "wait_ms": wait_ms, "kind": kind.name()}));
+                    let retry_event = if kind == RequestKind::HistoryLlm {
+                        "history://retrying"
+                    } else {
+                        "quota://retrying"
+                    };
+                    gate.emit(retry_event, serde_json::json!({"attempt": rate_retries, "wait_ms": wait_ms, "kind": kind.name(), "session_generation": gate.current_session_generation()}));
                     tokio::select! { _ = cancellation.cancelled() => return Err(ExecuteError::Cancelled), _ = tokio::time::sleep(Duration::from_millis(wait_ms)) => {} }
                 }
                 RetryClass::Network | RetryClass::Server if transient_retries < 3 => {

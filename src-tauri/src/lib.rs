@@ -4,6 +4,7 @@ mod chunker;
 #[cfg(test)]
 mod cleanup_corpus;
 mod context;
+mod delivery;
 mod groq;
 mod hotkey;
 mod instance;
@@ -34,6 +35,13 @@ enum Phase {
     Stopping,
     Processing,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OperationLease {
+    Idle,
+    LiveDictation,
+    HistoryReclean,
+}
 struct DictationManager {
     phase: Phase,
     started: std::time::Instant,
@@ -44,11 +52,29 @@ struct DictationManager {
 }
 
 #[derive(Debug, Clone)]
+struct UndoTransaction {
+    session_generation: u64,
+    created_at: std::time::Instant,
+    expires_at: std::time::Instant,
+    target_guard: context::TargetAppGuard,
+    delivery_method: String,
+    post_insert_input_fingerprint: u64,
+    consumed: bool,
+}
+
+#[derive(Debug, Clone)]
 struct SelectedActionSession {
     selected_text: String,
     selection_fingerprint: u64,
     target_guard: context::TargetAppGuard,
     onboarding_trial: bool,
+}
+
+#[derive(Debug, Clone)]
+struct SelectedActionPreview {
+    session: SelectedActionSession,
+    session_generation: u64,
+    context: context::ContextSnapshot,
 }
 
 struct AppState {
@@ -59,6 +85,9 @@ struct AppState {
     recorder: Arc<Mutex<audio::Recorder>>,
     realtime_asr: Mutex<Option<realtime_asr::RealtimeAsrSession>>,
     selected_action: Mutex<Option<SelectedActionSession>>,
+    selected_preview: Mutex<Option<SelectedActionPreview>>,
+    undo: Mutex<Option<UndoTransaction>>,
+    operation_lease: Mutex<OperationLease>,
     asr_provider: Arc<dyn asr::AsrProvider>,
     settings: Mutex<store::Settings>,
     context: Mutex<context::ContextState>,
@@ -68,6 +97,36 @@ struct AppState {
     onboarding_test_mode: Mutex<bool>,
     onboarding_selected_text: Mutex<Option<String>>,
     _instance_lock: instance::InstanceLock,
+}
+
+fn try_claim_operation(state: &AppState, requested: OperationLease) -> bool {
+    let mut lease = state
+        .operation_lease
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    claim_operation(&mut lease, requested)
+}
+
+fn claim_operation(lease: &mut OperationLease, requested: OperationLease) -> bool {
+    if *lease != OperationLease::Idle {
+        return false;
+    }
+    *lease = requested;
+    true
+}
+
+fn release_operation(state: &AppState, expected: OperationLease) {
+    let mut lease = state
+        .operation_lease
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    release_operation_lease(&mut lease, expected);
+}
+
+fn release_operation_lease(lease: &mut OperationLease, expected: OperationLease) {
+    if *lease == expected {
+        *lease = OperationLease::Idle;
+    }
 }
 
 #[derive(Debug)]
@@ -103,7 +162,8 @@ enum CleanupDecision {
 }
 
 const CLEANUP_STATUS_AI_SUCCESS: &str = "ai_success";
-const CLEANUP_STATUS_AI_FAILED: &str = "ai_failed";
+const CLEANUP_STATUS_AI_FAILED_LOCAL: &str = "ai_failed_local";
+const CLEANUP_STATUS_AI_FAILED_RAW: &str = "ai_failed_raw";
 const CLEANUP_STATUS_LOCAL_ONLY: &str = "local_only";
 const CLEANUP_STATUS_SNIPPET_BYPASS: &str = "snippet_bypass";
 const CLEANUP_STATUS_UNKNOWN: &str = "unknown";
@@ -119,12 +179,12 @@ fn finalize_text(raw: &str, decision: CleanupDecision) -> Result<FinalText, &'st
     let (candidate, mut degraded, mut degraded_reason) = match decision {
         CleanupDecision::Provider(text) => (text, false, None),
         CleanupDecision::Disabled => (local_cleanup_or_raw(raw), false, None),
-        CleanupDecision::Failed => (raw.to_owned(), true, Some("llm_cleanup_failed")),
+        CleanupDecision::Failed => (local_cleanup_or_raw(raw), true, Some("llm_cleanup_failed")),
     };
     let text = if candidate.trim().is_empty() {
         degraded = true;
         degraded_reason = Some("llm_cleanup_empty");
-        raw.to_owned()
+        local_cleanup_or_raw(raw)
     } else {
         candidate
     };
@@ -136,6 +196,18 @@ fn finalize_text(raw: &str, decision: CleanupDecision) -> Result<FinalText, &'st
         degraded,
         degraded_reason,
     })
+}
+
+fn cleanup_failure_status(raw: &str, final_text: &str) -> &'static str {
+    if final_text.trim() != raw.trim() {
+        CLEANUP_STATUS_AI_FAILED_LOCAL
+    } else {
+        CLEANUP_STATUS_AI_FAILED_RAW
+    }
+}
+
+fn cleanup_profile_for(snapshot: &context::ContextSnapshot) -> Option<&context::ContextProfile> {
+    (snapshot.profile.confidence >= 0.75).then_some(&snapshot.profile)
 }
 
 fn local_cleanup_or_raw(raw: &str) -> String {
@@ -151,7 +223,11 @@ fn cleanup_policy_for(
     settings: &store::Settings,
     recording_context: &context::ContextSnapshot,
 ) -> context::ContextPolicy {
-    let mut policy = recording_context.policy.clone();
+    let mut policy = if recording_context.profile.confidence >= 0.75 {
+        recording_context.policy.clone()
+    } else {
+        context::ContextPolicy::default()
+    };
     if settings.output_mode != "auto" {
         policy.output_mode = Some(settings.output_mode.clone());
     }
@@ -166,7 +242,9 @@ fn delivery_fallback_reason(target_current: bool, paste_error: &str) -> &'static
         "accessibility_required"
     } else if paste_error.contains("browser access is required") {
         "browser_permission_required"
-    } else if paste_error.contains("focused input is not available") {
+    } else if paste_error.contains("focused input is not available")
+        || paste_error.contains("secure")
+    {
         "input_unavailable"
     } else if paste_error.contains("focused input changed") {
         "input_changed"
@@ -209,7 +287,13 @@ fn emit_state(app: &tauri::AppHandle, state: &str) {
             "starting" | "recording" | "recording_limited" | "processing" | "rate_limited"
         ),
     );
-    let _ = app.emit("dictation://state", serde_json::json!({ "state": state }));
+    let _ = app.emit(
+        "dictation://state",
+        serde_json::json!({
+            "state": state,
+            "session_generation": current_session_generation(app),
+        }),
+    );
     if state == "idle" {
         emit_selected_action_state(app, "idle");
     }
@@ -225,12 +309,89 @@ fn emit_selected_action_state(app: &tauri::AppHandle, state: &str) {
     );
 }
 
+fn current_session_generation(app: &tauri::AppHandle) -> u64 {
+    app.try_state::<AppState>()
+        .map(|state| state.manager.lock().unwrap().session_generation)
+        .unwrap_or_default()
+}
+
 fn clear_selected_action(state: &AppState) {
     state
         .selected_action
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .take();
+}
+
+fn clear_selected_preview(state: &AppState) {
+    state
+        .selected_preview
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take();
+}
+
+fn selected_preview_lease_is_current(state: &AppState, generation: u64) -> bool {
+    let current_generation = state.manager.lock().unwrap().session_generation;
+    let lease = *state
+        .operation_lease
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    current_generation == generation && lease == OperationLease::LiveDictation
+}
+
+fn selected_preview_completion_is_current(
+    phase: Phase,
+    current_generation: u64,
+    expected_generation: u64,
+    lease: OperationLease,
+) -> bool {
+    phase == Phase::Idle
+        && current_generation == expected_generation
+        && lease == OperationLease::LiveDictation
+}
+
+fn take_preview_if_current(
+    preview: &mut Option<SelectedActionPreview>,
+    current_generation: u64,
+    lease: OperationLease,
+) -> Result<SelectedActionPreview, String> {
+    match preview.as_ref() {
+        None => Err("Selected-text preview is no longer available".into()),
+        Some(value)
+            if current_generation != value.session_generation
+                || lease != OperationLease::LiveDictation =>
+        {
+            Err("Selected-text preview is stale".into())
+        }
+        Some(_) => Ok(preview
+            .take()
+            .expect("selected-text preview was present after the stale check")),
+    }
+}
+
+fn should_invalidate_selected_preview(
+    had_preview: bool,
+    lease: OperationLease,
+    phase: Phase,
+) -> bool {
+    had_preview || (lease == OperationLease::LiveDictation && phase == Phase::Idle)
+}
+
+fn long_chunk_progress_payload(
+    session_generation: u64,
+    elapsed_secs: u64,
+    chunks_done: usize,
+    total: usize,
+    progress: f32,
+) -> serde_json::Value {
+    serde_json::json!({
+        "session_generation": session_generation,
+        "elapsed_secs": elapsed_secs,
+        "chunks_done": chunks_done,
+        "total": total,
+        "progress": progress,
+    })
 }
 
 async fn show_selected_action_error(
@@ -241,7 +402,7 @@ async fn show_selected_action_error(
 ) {
     show_island(app);
     let _ = app.emit("dictation://error", message);
-    emit_state_with_delivery(app, "error", None, "none", Some(fallback_reason));
+    emit_state_with_delivery(app, "error", None, "none", Some(fallback_reason), None);
     emit_selected_action_state(app, "idle");
     tokio::time::sleep(std::time::Duration::from_millis(1_500)).await;
     if state.manager.lock().unwrap().phase == Phase::Idle {
@@ -251,7 +412,10 @@ async fn show_selected_action_error(
 fn emit_progress(app: &tauri::AppHandle, progress: f32) {
     let _ = app.emit(
         "dictation://progress",
-        serde_json::json!({ "progress": progress.clamp(0.0, 1.0) }),
+        serde_json::json!({
+            "progress": progress.clamp(0.0, 1.0),
+            "session_generation": current_session_generation(app),
+        }),
     );
 }
 fn emit_state_with_context(
@@ -259,7 +423,7 @@ fn emit_state_with_context(
     state: &str,
     context: Option<&context::ContextSnapshot>,
 ) {
-    emit_state_with_delivery(app, state, context, "pending", None);
+    emit_state_with_delivery(app, state, context, "pending", None, None);
 }
 fn emit_state_with_context_and_input_device(
     app: &tauri::AppHandle,
@@ -267,7 +431,15 @@ fn emit_state_with_context_and_input_device(
     context: Option<&context::ContextSnapshot>,
     input_device: Option<&str>,
 ) {
-    emit_state_with_delivery_and_input_device(app, state, context, "pending", None, input_device);
+    emit_state_with_delivery_and_input_device(
+        app,
+        state,
+        context,
+        "pending",
+        None,
+        None,
+        input_device,
+    );
 }
 fn emit_state_with_delivery(
     app: &tauri::AppHandle,
@@ -275,6 +447,7 @@ fn emit_state_with_delivery(
     context: Option<&context::ContextSnapshot>,
     delivery_method: &str,
     fallback_reason: Option<&str>,
+    cleanup_status: Option<&str>,
 ) {
     emit_state_with_delivery_and_input_device(
         app,
@@ -282,6 +455,7 @@ fn emit_state_with_delivery(
         context,
         delivery_method,
         fallback_reason,
+        cleanup_status,
         None,
     );
 }
@@ -291,6 +465,7 @@ fn emit_state_with_delivery_and_input_device(
     context: Option<&context::ContextSnapshot>,
     delivery_method: &str,
     fallback_reason: Option<&str>,
+    cleanup_status: Option<&str>,
     input_device: Option<&str>,
 ) {
     island_window::set_interactive(
@@ -298,19 +473,62 @@ fn emit_state_with_delivery_and_input_device(
         matches!(
             state,
             "starting" | "recording" | "recording_limited" | "processing" | "rate_limited"
-        ),
+        ) || (delivery_method == "paste" && matches!(state, "done" | "unverified" | "degraded")),
     );
-    let mut payload = serde_json::json!({ "state": state });
+    let mut payload = serde_json::json!({
+        "state": state,
+        "session_generation": current_session_generation(app),
+    });
     if let Some(context) = context {
         payload["context_id"] = serde_json::json!(context.profile.id);
         payload["context_label"] = serde_json::json!(context::display_label(context));
     }
     payload["delivery_method"] = serde_json::json!(delivery_method);
+    payload["phase"] = serde_json::json!(match state {
+        "starting" => "finalizing_audio",
+        "rate_limited" => "waiting_retry",
+        "processing" => "cleanup",
+        _ => "idle",
+    });
     payload["fallback_reason"] = fallback_reason
         .map(serde_json::Value::from)
         .unwrap_or(serde_json::Value::Null);
+    payload["cleanup_status"] = cleanup_status
+        .map(serde_json::Value::from)
+        .unwrap_or(serde_json::Value::Null);
+    payload["undo_available"] =
+        serde_json::json!(delivery_method == "paste" && matches!(state, "done" | "degraded"));
     if let Some(input_device) = input_device {
         payload["input_device"] = serde_json::Value::from(input_device);
+    }
+    let _ = app.emit("dictation://state", payload);
+}
+
+fn emit_processing_phase(
+    app: &tauri::AppHandle,
+    phase: &str,
+    context: Option<&context::ContextSnapshot>,
+    retry_after_secs: Option<f64>,
+    chunk_progress: Option<(usize, usize)>,
+) {
+    let mut payload = serde_json::json!({
+        "state": "processing",
+        "phase": phase,
+        "session_generation": current_session_generation(app),
+        "delivery_method": "pending",
+        "fallback_reason": serde_json::Value::Null,
+        "cleanup_status": serde_json::Value::Null,
+    });
+    if let Some(context) = context {
+        payload["context_id"] = serde_json::json!(context.profile.id);
+        payload["context_label"] = serde_json::json!(context::display_label(context));
+    }
+    if let Some(seconds) = retry_after_secs {
+        payload["retry_after_secs"] = serde_json::json!(seconds.ceil() as u64);
+    }
+    if let Some((completed, total)) = chunk_progress {
+        payload["completed_chunks"] = serde_json::json!(completed);
+        payload["total_chunks"] = serde_json::json!(total);
     }
     let _ = app.emit("dictation://state", payload);
 }
@@ -417,7 +635,7 @@ async fn start_audio(
     session: String,
     input_device: String,
     chunk_length_secs: usize,
-    realtime_tx: tokio::sync::mpsc::Sender<realtime_asr::RealtimeMessage>,
+    realtime_tx: realtime_asr::PrefetchInbox,
 ) -> Result<(), String> {
     let recorder = Arc::clone(&state.recorder);
     tokio::task::spawn_blocking(move || {
@@ -489,6 +707,7 @@ async fn start_selected_action_with_feedback(
     app: &tauri::AppHandle,
     state: &AppState,
 ) -> Result<(), String> {
+    clear_selected_preview(state);
     emit_selected_action_state(app, "waiting_for_selection");
     let onboarding_selected_text = if *state.onboarding_test_mode.lock().unwrap() {
         state
@@ -619,16 +838,28 @@ async fn start_internal(app: &tauri::AppHandle, state: &AppState) -> Result<(), 
     // Claim the start transition before preflight or context detection. This
     // prevents a second command from resetting the first command while it is
     // waiting on permissions or the frontmost-app probe.
-    {
+    if !try_claim_operation(state, OperationLease::LiveDictation) {
+        let _ = app.emit(
+            "dictation://error",
+            "正在处理上一次结果，请稍候".to_string(),
+        );
+        return Ok(());
+    }
+    let session_generation = {
         let mut m = state.manager.lock().unwrap();
         if m.phase != Phase::Idle {
+            drop(m);
+            release_operation(state, OperationLease::LiveDictation);
             return Ok(());
         }
         m.phase = Phase::Starting;
         m.session_generation = m.session_generation.wrapping_add(1);
         m.cancellation = CancellationToken::new();
         m.recording_context = None;
-    }
+        m.session_generation
+    };
+    state.gate.set_session_generation(session_generation);
+    clear_selected_preview(state);
     // Give the user immediate feedback while permission/context/audio setup
     // completes. The HUD must not appear to ignore a global shortcut.
     show_island(app);
@@ -664,7 +895,7 @@ async fn start_internal(app: &tauri::AppHandle, state: &AppState) -> Result<(), 
     let id = format!("{}", chrono_like_id());
     let chunk_length_secs = state.settings.lock().unwrap().chunk_length_secs;
     let input_device = settings_snapshot.input_device.clone();
-    let (realtime_tx, realtime_rx) = realtime_asr::RealtimeAsrSession::channel();
+    let (realtime_inbox, realtime_rx) = realtime_asr::RealtimeAsrSession::channel();
 
     // Phase 2: cpal setup waits on a blocking channel, so keep it off the
     // async runtime worker and the UI-facing command path.
@@ -674,7 +905,7 @@ async fn start_internal(app: &tauri::AppHandle, state: &AppState) -> Result<(), 
         id,
         input_device,
         chunk_length_secs,
-        realtime_tx.clone(),
+        realtime_inbox.clone(),
     )
     .await
     {
@@ -703,6 +934,7 @@ async fn start_internal(app: &tauri::AppHandle, state: &AppState) -> Result<(), 
     if start_was_cancelled {
         // Raced with another transition; roll back the recorder we started.
         cancel_audio(state, app.clone()).await;
+        release_operation(state, OperationLease::LiveDictation);
         return Ok(());
     }
     let selected_action_active = state
@@ -723,7 +955,7 @@ async fn start_internal(app: &tauri::AppHandle, state: &AppState) -> Result<(), 
         );
         let realtime_session = realtime_asr::RealtimeAsrSession::spawn(
             realtime_rx,
-            realtime_tx,
+            realtime_inbox,
             state.gate.clone(),
             state.asr_provider.clone(),
             asr::AsrOptions {
@@ -767,6 +999,7 @@ fn reset_starting(state: &AppState) -> u64 {
     let generation = reset_starting_manager(&mut manager);
     drop(manager);
     clear_selected_action(state);
+    release_operation(state, OperationLease::LiveDictation);
     generation
 }
 
@@ -813,6 +1046,7 @@ async fn handle_audio_error(app: &tauri::AppHandle, state: &AppState, message: S
     let Some(failure_generation) = failure_generation else {
         return;
     };
+    release_operation(state, OperationLease::LiveDictation);
     clear_selected_action(state);
     // The audio engine marks the active session as device_failed, so canceling
     // it here preserves durable chunks for recovery instead of deleting them.
@@ -862,7 +1096,7 @@ async fn paste_text(
     expected_target: &context::TargetAppGuard,
     accessibility: bool,
     cancellation: CancellationToken,
-) -> Result<(), String> {
+) -> Result<paste::InsertOutcome, String> {
     let app = app.clone();
     let text = text.to_owned();
     let (mappings, browser_access_enabled) = {
@@ -871,19 +1105,8 @@ async fn paste_text(
     };
     let expected_target = expected_target.clone();
     tokio::task::spawn_blocking(move || {
-        let verify_target = move || {
-            let current = context::detect_snapshot(&mappings, browser_access_enabled);
-            match context::target_mismatch_reason(&expected_target, &current.target_guard) {
-                None => Ok(()),
-                Some("browser_permission_required") => {
-                    Err(paste::PasteError::BrowserAccessRequired)
-                }
-                Some("input_unavailable") => Err(paste::PasteError::InputUnavailable),
-                Some("input_changed") => Err(paste::PasteError::InputChanged),
-                Some("target_unavailable") => Err(paste::PasteError::TargetUnavailable),
-                Some(_) => Err(paste::PasteError::TargetChanged),
-            }
-        };
+        let verify_target =
+            move || verify_delivery_target(&expected_target, &mappings, browser_access_enabled);
         paste::insert(&app, &text, accessibility, cancellation, verify_target)
     })
     .await
@@ -902,6 +1125,122 @@ async fn copy_text(
         .await
         .map_err(|error| format!("clipboard worker failed: {error}"))?
         .map_err(|error| error.to_string())
+}
+
+fn arm_undo_transaction(
+    state: &AppState,
+    session_generation: u64,
+    target_guard: &context::TargetAppGuard,
+    post_insert_input_fingerprint: Option<u64>,
+    delivery_method: &str,
+) {
+    if delivery_method != "paste" {
+        return;
+    }
+    let Some(post_insert_input_fingerprint) = post_insert_input_fingerprint else {
+        return;
+    };
+    let now = std::time::Instant::now();
+    *state
+        .undo
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(UndoTransaction {
+        session_generation,
+        created_at: now,
+        expires_at: now + std::time::Duration::from_secs(3),
+        target_guard: target_guard.clone(),
+        delivery_method: delivery_method.to_owned(),
+        post_insert_input_fingerprint,
+        consumed: false,
+    });
+}
+
+fn undo_preflight(
+    transaction: &UndoTransaction,
+    current_generation: u64,
+    now: std::time::Instant,
+) -> &'static str {
+    if transaction.delivery_method != "paste" || now < transaction.created_at {
+        "not_available"
+    } else if transaction.consumed {
+        "already_consumed"
+    } else if now >= transaction.expires_at {
+        "expired"
+    } else if current_generation != transaction.session_generation {
+        "stale_target"
+    } else {
+        "available"
+    }
+}
+
+#[tauri::command]
+async fn undo_last_delivery(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let generation = state.manager.lock().unwrap().session_generation;
+    let now = std::time::Instant::now();
+    let transaction = {
+        let mut undo = state
+            .undo
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(transaction) = undo.as_mut() else {
+            return Ok("not_available".into());
+        };
+        match undo_preflight(transaction, generation, now) {
+            "already_consumed" => return Ok("already_consumed".into()),
+            "expired" => {
+                transaction.consumed = true;
+                return Ok("expired".into());
+            }
+            "stale_target" => {
+                transaction.consumed = true;
+                return Ok("stale_target".into());
+            }
+            "not_available" => return Ok("not_available".into()),
+            "available" => {}
+            _ => unreachable!(),
+        }
+        let transaction = transaction.clone();
+        // Claim the transaction before doing the blocking target probe so a
+        // double click cannot send two undo shortcuts.
+        if let Some(current) = undo.as_mut() {
+            current.consumed = true;
+        }
+        transaction
+    };
+
+    let (mappings, browser_access_enabled) = {
+        let current = state.context.lock().unwrap();
+        (current.mappings.clone(), current.browser_access_enabled)
+    };
+    let expected_target = transaction.target_guard.clone();
+    let (current_target, current_input_fingerprint) = tokio::task::spawn_blocking(move || {
+        let current_target =
+            context::detect_snapshot(&mappings, browser_access_enabled).target_guard;
+        let current_input_fingerprint =
+            context::focused_input_value().map(|value| paste::selection_fingerprint(&value));
+        (current_target, current_input_fingerprint)
+    })
+    .await
+    .map_err(|error| format!("undo target probe failed: {error}"))?;
+    if context::target_mismatch_reason(&expected_target, &current_target).is_some() {
+        return Ok("stale_target".into());
+    }
+    if current_input_fingerprint != Some(transaction.post_insert_input_fingerprint) {
+        return Ok("stale_target".into());
+    }
+    let accessibility = permissions::check().accessibility;
+    tokio::task::spawn_blocking(move || paste::undo(accessibility))
+        .await
+        .map_err(|error| format!("undo worker failed: {error}"))?
+        .map_err(|error| error.to_string())?;
+    let _ = app.emit(
+        "dictation://undo",
+        serde_json::json!({ "status": "success" }),
+    );
+    Ok("success".into())
 }
 
 fn onboarding_delivery_target_matches(
@@ -970,11 +1309,19 @@ async fn stop_internal(app: &tauri::AppHandle, state: &AppState) -> Result<(), S
             recording_context,
         )
     };
+    state.gate.set_session_generation(session_generation);
 
     // Finalizing a long recording can take noticeable time. Show processing
     // immediately so the HUD never appears to ignore the user's stop press.
     sync_modifier_hotkey_phase(Phase::Stopping);
     emit_state_with_context(app, "processing", Some(&recording_context));
+    emit_processing_phase(
+        app,
+        "finalizing_audio",
+        Some(&recording_context),
+        None,
+        None,
+    );
     emit_progress(app, 0.05);
     let stop_to_insert = state.metrics.timer(metrics::MetricKind::StopToInsert);
 
@@ -1012,6 +1359,7 @@ async fn stop_internal(app: &tauri::AppHandle, state: &AppState) -> Result<(), S
                 m.phase = Phase::Idle;
                 m.recording_context = None;
             }
+            release_operation(state, OperationLease::LiveDictation);
             sync_modifier_hotkey_phase(Phase::Idle);
             hotkey::unregister_cancel(app);
             fail_for_generation(app, state, message.clone(), session_generation).await;
@@ -1155,8 +1503,47 @@ fn selected_target_error(reason: &'static str) -> paste::PasteError {
         "browser_permission_required" => paste::PasteError::BrowserAccessRequired,
         "input_unavailable" => paste::PasteError::InputUnavailable,
         "input_changed" => paste::PasteError::InputChanged,
+        "secure_input" => paste::PasteError::InputUnavailable,
         "target_unavailable" => paste::PasteError::TargetUnavailable,
         _ => paste::PasteError::TargetChanged,
+    }
+}
+
+const TARGET_PROBE_RETRIES: usize = 3;
+const TARGET_PROBE_RETRY_DELAY_MS: u64 = 60;
+
+/// macOS can briefly report no frontmost application while switching Spaces,
+/// activating a browser tab, or handing focus back after a global shortcut.
+/// Retry only that transient "unavailable" result. A concrete app/window/input
+/// mismatch remains fail-closed and falls back to the clipboard.
+fn target_guard_mismatch_with_retry(
+    expected: &context::TargetAppGuard,
+    mut detect: impl FnMut() -> context::TargetAppGuard,
+) -> Option<&'static str> {
+    for attempt in 0..TARGET_PROBE_RETRIES {
+        let current = detect();
+        let reason = context::target_mismatch_reason(expected, &current)?;
+        if reason == "target_unavailable" && attempt + 1 < TARGET_PROBE_RETRIES {
+            std::thread::sleep(std::time::Duration::from_millis(
+                TARGET_PROBE_RETRY_DELAY_MS,
+            ));
+            continue;
+        }
+        return Some(reason);
+    }
+    Some("target_unavailable")
+}
+
+fn verify_delivery_target(
+    expected: &context::TargetAppGuard,
+    mappings: &[context::AppMapping],
+    browser_access_enabled: bool,
+) -> Result<(), paste::PasteError> {
+    match target_guard_mismatch_with_retry(expected, || {
+        context::detect_snapshot(mappings, browser_access_enabled).target_guard
+    }) {
+        None => Ok(()),
+        Some(reason) => Err(selected_target_error(reason)),
     }
 }
 
@@ -1167,7 +1554,7 @@ async fn paste_selected_text(
     session: &SelectedActionSession,
     accessibility: bool,
     cancellation: CancellationToken,
-) -> Result<(), String> {
+) -> Result<paste::InsertOutcome, String> {
     let app = app.clone();
     let text = text.to_owned();
     let expected_target = session.target_guard.clone();
@@ -1180,12 +1567,7 @@ async fn paste_selected_text(
     tokio::task::spawn_blocking(move || {
         let capture_app = app.clone();
         let verify_target = move || {
-            let current = context::detect_snapshot(&mappings, browser_access_enabled);
-            if let Some(reason) =
-                context::target_mismatch_reason(&expected_target, &current.target_guard)
-            {
-                return Err(selected_target_error(reason));
-            }
+            verify_delivery_target(&expected_target, &mappings, browser_access_enabled)?;
             let selection =
                 paste::capture_selected_text(&capture_app, accessibility).map_err(|error| {
                     match error {
@@ -1318,74 +1700,249 @@ async fn process_selected_action(
             Some(recording_context),
             "onboarding",
             None,
+            Some(CLEANUP_STATUS_AI_SUCCESS),
             Some(session_generation),
         )
         .await;
         return Ok(());
     }
 
-    emit_selected_action_state(app, "ready_to_replace");
-    let paste_result = {
-        let _latency = state.metrics.timer(metrics::MetricKind::Paste);
-        paste_selected_text(
-            app,
-            state,
-            &final_text,
-            &selected_action,
-            permissions::check().accessibility,
-            cancellation.clone(),
-        )
-        .await
+    let preview = SelectedActionPreview {
+        session: selected_action,
+        session_generation,
+        context: recording_context.clone(),
     };
-    match paste_result {
-        Ok(()) => {
-            stop_to_insert.finish();
-            finish_with_delivery(
-                app,
-                state,
-                "done",
-                Some(recording_context),
-                "paste",
-                None,
-                Some(session_generation),
-            )
-            .await;
-            Ok(())
-        }
-        Err(_error)
-            if cancellation.is_cancelled() || processing_aborted(state, session_generation) =>
-        {
-            Ok(())
-        }
-        Err(error) => {
-            log::warn!("selected text replacement failed; copying result instead: {error}");
-            if let Err(copy_error) = copy_text(app, &final_text, cancellation.clone()).await {
-                emit_selected_action_state(app, "idle");
-                fail_for_generation(app, state, copy_error.to_string(), session_generation).await;
-                return Err(copy_error);
-            }
-            emit_selected_action_state(
-                app,
-                if error.contains("selected text changed") {
-                    "selection_changed"
-                } else {
-                    "copied_instead"
-                },
-            );
-            stop_to_insert.finish();
-            finish_with_delivery(
-                app,
-                state,
-                "copied",
-                Some(recording_context),
-                "clipboard",
-                Some("selected_action_clipboard_fallback"),
-                Some(session_generation),
-            )
-            .await;
-            Ok(())
+    *state
+        .selected_preview
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(preview);
+    stop_to_insert.finish();
+    if move_processing_to_selected_preview(state, session_generation) {
+        hotkey::unregister_cancel(app);
+        sync_modifier_hotkey_phase(Phase::Idle);
+        emit_progress(app, 0.0);
+        emit_selected_action_state(app, "preview_ready");
+        let _ = app.emit(
+            "selected-action://preview",
+            serde_json::json!({
+                "selected_text": state
+                    .selected_preview
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .as_ref()
+                    .map(|preview| preview.session.selected_text.clone())
+                    .unwrap_or_default(),
+                "transcript": transcript,
+                "final_text": final_text,
+            }),
+        );
+        island_window::hide_overlay(app);
+        if let Some(window) = app.get_webview_window("main") {
+            let _ = window.show();
+            let _ = window.unminimize();
+            let _ = window.set_focus();
         }
     }
+    Ok(())
+}
+
+fn move_processing_to_selected_preview(state: &AppState, expected_generation: u64) -> bool {
+    let mut manager = state.manager.lock().unwrap();
+    if manager.phase != Phase::Processing
+        || manager.session_generation != expected_generation
+        || manager.cancellation.is_cancelled()
+    {
+        return false;
+    }
+    manager.cancellation.cancel();
+    manager.phase = Phase::Idle;
+    manager.recording_context = None;
+    true
+}
+
+fn take_current_selected_preview(state: &AppState) -> Result<SelectedActionPreview, String> {
+    let current_generation = state.manager.lock().unwrap().session_generation;
+    let lease = *state
+        .operation_lease
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut preview = state
+        .selected_preview
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    take_preview_if_current(&mut preview, current_generation, lease)
+}
+
+#[tauri::command]
+async fn confirm_selected_action_preview(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    final_text: String,
+) -> Result<String, String> {
+    let final_text = final_text.trim().to_owned();
+    if final_text.is_empty() {
+        return Err("Preview text cannot be empty".into());
+    }
+    if final_text.chars().count() > 100_000 {
+        return Err("Preview text is too long".into());
+    }
+    let preview = take_current_selected_preview(&state)?;
+    if !selected_preview_lease_is_current(&state, preview.session_generation) {
+        return Err("Selected-text preview is stale".into());
+    }
+
+    let pid = preview.session.target_guard.pid;
+    let activation = tokio::task::spawn_blocking(move || paste::activate_target(pid))
+        .await
+        .map_err(|error| format!("target activation worker failed: {error}"))
+        .and_then(|result| result.map_err(|error| error.to_string()));
+    if let Err(error) = activation {
+        if selected_preview_lease_is_current(&state, preview.session_generation) {
+            release_operation(&state, OperationLease::LiveDictation);
+        }
+        return Err(error);
+    }
+    if !selected_preview_lease_is_current(&state, preview.session_generation) {
+        return Err("Selected-text preview is stale".into());
+    }
+
+    let paste_result = paste_selected_text(
+        &app,
+        &state,
+        &final_text,
+        &preview.session,
+        permissions::check().accessibility,
+        CancellationToken::new(),
+    )
+    .await;
+    match paste_result {
+        Ok(outcome) => {
+            let method = if outcome.verified {
+                delivery::DeliveryMethod::Paste
+            } else {
+                delivery::DeliveryMethod::PasteUnverified
+            };
+            arm_undo_transaction(
+                &state,
+                preview.session_generation,
+                &preview.session.target_guard,
+                outcome.post_insert_input_fingerprint,
+                method.as_str(),
+            );
+            emit_selected_action_state(&app, "replaced");
+            finish_with_delivery(
+                &app,
+                &state,
+                if outcome.verified {
+                    "done"
+                } else {
+                    "unverified"
+                },
+                Some(&preview.context),
+                method.as_str(),
+                (!outcome.verified).then_some("paste_unverified"),
+                Some(CLEANUP_STATUS_AI_SUCCESS),
+                Some(preview.session_generation),
+            )
+            .await;
+            Ok("replaced".into())
+        }
+        Err(error) => {
+            log::warn!("selected text replacement failed after preview confirmation: {error}");
+            copy_selected_action_preview_result(
+                &app,
+                &state,
+                &final_text,
+                &preview.context,
+                preview.session_generation,
+            )
+            .await
+        }
+    }
+}
+
+async fn copy_selected_action_preview_result(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    final_text: &str,
+    context: &context::ContextSnapshot,
+    session_generation: u64,
+) -> Result<String, String> {
+    if !selected_preview_lease_is_current(state, session_generation) {
+        return Err("Selected-text preview is stale".into());
+    }
+    if let Err(error) = copy_text(app, final_text, CancellationToken::new()).await {
+        if selected_preview_lease_is_current(state, session_generation) {
+            release_operation(state, OperationLease::LiveDictation);
+        }
+        return Err(error);
+    }
+    if !selected_preview_lease_is_current(state, session_generation) {
+        return Err("Selected-text preview is stale".into());
+    }
+    emit_selected_action_state(app, "copied_instead");
+    finish_with_delivery(
+        app,
+        state,
+        "copied",
+        Some(context),
+        delivery::DeliveryMethod::Clipboard.as_str(),
+        Some("selected_action_clipboard_fallback"),
+        Some(CLEANUP_STATUS_AI_SUCCESS),
+        Some(session_generation),
+    )
+    .await;
+    Ok("copied".into())
+}
+
+#[tauri::command]
+async fn copy_selected_action_preview(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    final_text: String,
+) -> Result<String, String> {
+    let final_text = final_text.trim().to_owned();
+    if final_text.is_empty() {
+        return Err("Preview text cannot be empty".into());
+    }
+    let preview = take_current_selected_preview(&state)?;
+    copy_selected_action_preview_result(
+        &app,
+        &state,
+        &final_text,
+        &preview.context,
+        preview.session_generation,
+    )
+    .await
+}
+
+#[tauri::command]
+fn cancel_selected_action_preview(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let had_preview = state
+        .selected_preview
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .is_some();
+    clear_selected_preview(&state);
+    let phase = state.manager.lock().unwrap().phase;
+    let lease = *state
+        .operation_lease
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if should_invalidate_selected_preview(had_preview, lease, phase) {
+        let generation = {
+            let mut manager = state.manager.lock().unwrap();
+            manager.session_generation = manager.session_generation.wrapping_add(1);
+            manager.session_generation
+        };
+        state.gate.set_session_generation(generation);
+        release_operation(&state, OperationLease::LiveDictation);
+    }
+    emit_selected_action_state(&app, "cancelled");
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1402,6 +1959,7 @@ async fn process_short(
     cancellation: CancellationToken,
     stop_to_insert: metrics::LatencyTimer,
 ) -> Result<(), String> {
+    emit_processing_phase(app, "asr", Some(recording_context), None, None);
     let language = asr::normalize_language(Some(settings.language.as_str())).map(str::to_owned);
     let asr_prompt = build_asr_prompt(&settings.dictionary, Some(&recording_context.policy));
     let asr_provider = state.asr_provider.clone();
@@ -1503,9 +2061,16 @@ async fn process_short(
         transcript.text
     };
     let spoken_raw = raw.clone();
+    let intent =
+        llm::parse_cleanup_intent(&raw, Some(settings.translation_target_language.as_str()));
     let snippet_expansion = snippets::resolve_exact(&settings.snippets, &raw);
-    let raw = snippet_expansion.clone().unwrap_or(raw);
     let snippet_expanded = snippet_expansion.is_some();
+    let raw = snippet_expansion.clone().unwrap_or(raw);
+    let cleanup_input = if snippet_expanded {
+        raw.clone()
+    } else {
+        intent.content.clone()
+    };
     if processing_aborted(state, session_generation) {
         return Ok(());
     }
@@ -1516,21 +2081,23 @@ async fn process_short(
     }
     emit_progress(app, 0.45);
     let cleanup_decision = if settings.cleanup_enabled && !snippet_expanded {
+        emit_processing_phase(app, "cleanup", Some(recording_context), None, None);
         let cleanup_result = {
             let _latency = state.metrics.timer(metrics::MetricKind::Cleanup);
             queue::execute_with_retry_cancelled(
                 &state.gate,
                 queue::RequestKind::Llm,
                 || {
-                    llm::cleanup_with_model_and_limits_and_language_and_profile(
+                    llm::cleanup_with_model_and_limits_and_language_and_profile_and_intent(
                         &settings.cleanup_model,
-                        &raw,
+                        &cleanup_input,
                         &settings.api_key,
                         &settings.dictionary,
                         None,
                         Some(&cleanup_policy),
                         Some(settings.language.as_str()),
-                        Some(&recording_context.profile),
+                        cleanup_profile_for(recording_context),
+                        Some(&intent),
                     )
                 },
                 cancellation.clone(),
@@ -1552,9 +2119,13 @@ async fn process_short(
         CleanupDecision::Disabled
     };
     let cleanup_status = match &cleanup_decision {
-        CleanupDecision::Provider(text) if text.trim().is_empty() => CLEANUP_STATUS_AI_FAILED,
+        CleanupDecision::Provider(text) if text.trim().is_empty() => {
+            cleanup_failure_status(&cleanup_input, &local_cleanup_or_raw(&cleanup_input))
+        }
         CleanupDecision::Provider(_) => CLEANUP_STATUS_AI_SUCCESS,
-        CleanupDecision::Failed => CLEANUP_STATUS_AI_FAILED,
+        CleanupDecision::Failed => {
+            cleanup_failure_status(&cleanup_input, &local_cleanup_or_raw(&cleanup_input))
+        }
         CleanupDecision::Disabled if snippet_expanded => CLEANUP_STATUS_SNIPPET_BYPASS,
         CleanupDecision::Disabled => CLEANUP_STATUS_LOCAL_ONLY,
     };
@@ -1562,7 +2133,7 @@ async fn process_short(
         return Ok(());
     }
     emit_progress(app, 0.70);
-    let resolved_text = match finalize_text(&raw, cleanup_decision) {
+    let resolved_text = match finalize_text(&cleanup_input, cleanup_decision) {
         Ok(value) => value,
         Err("no_speech") => {
             let message = "No speech detected".to_string();
@@ -1592,62 +2163,120 @@ async fn process_short(
     // Avoid an extra detector pass here; browser AppleScript/System Events can
     // each take hundreds of milliseconds, and the inner checks are the safety
     // boundary that matters for the irreversible keystroke.
-    let (pasted, fallback_reason) = {
+    let delivery_policy = delivery::DeliveryPolicy::parse(&settings.delivery_policy);
+    let (pasted, fallback_reason, delivery_method) = {
         if processing_aborted(state, session_generation) {
             return Ok(());
         }
         emit_progress(app, 0.88);
-        let paste_result = {
-            let _latency = state.metrics.timer(metrics::MetricKind::Paste);
-            if should_use_onboarding_delivery(state, recording_context) {
-                emit_onboarding_result(app, &spoken_raw, &final_text);
-                Ok(())
-            } else {
-                paste_text(
+        emit_processing_phase(app, "delivery", Some(recording_context), None, None);
+        if matches!(delivery_policy, delivery::DeliveryPolicy::HistoryOnly) {
+            (false, None, delivery::DeliveryMethod::History.as_str())
+        } else if matches!(delivery_policy, delivery::DeliveryPolicy::ClipboardOnly) {
+            if let Err(copy_err) = copy_text(app, &final_text, cancellation.clone()).await {
+                let message = copy_err.to_string();
+                record_delivery_failure(
                     app,
-                    state,
+                    &spoken_raw,
                     &final_text,
-                    &recording_context.target_guard,
-                    permissions::check().accessibility,
-                    cancellation.clone(),
-                )
-                .await
+                    started.elapsed().as_secs_f64(),
+                    recording_context,
+                    recovery_spool.as_deref(),
+                    cleanup_status,
+                );
+                fail_for_generation(app, state, message.clone(), session_generation).await;
+                return Err(message);
             }
-        };
-        match paste_result {
-            Ok(()) => (true, None),
-            Err(e) => {
-                if processing_aborted(state, session_generation) || cancellation.is_cancelled() {
-                    discard_short_recovery_audio(app, recovery_spool.as_deref());
-                    return Ok(());
+            (false, None, delivery::DeliveryMethod::Clipboard.as_str())
+        } else {
+            let paste_result = {
+                let _latency = state.metrics.timer(metrics::MetricKind::Paste);
+                if should_use_onboarding_delivery(state, recording_context) {
+                    emit_onboarding_result(app, &spoken_raw, &final_text);
+                    Ok(paste::InsertOutcome {
+                        shortcut_sent: true,
+                        verified: false,
+                        post_insert_input_fingerprint: None,
+                    })
+                } else {
+                    paste_text(
+                        app,
+                        state,
+                        &final_text,
+                        &recording_context.target_guard,
+                        permissions::check().accessibility,
+                        cancellation.clone(),
+                    )
+                    .await
                 }
-                log::warn!("paste failed, falling back to clipboard: {e}");
-                if let Err(copy_err) = copy_text(app, &final_text, cancellation.clone()).await {
+            };
+            match paste_result {
+                Ok(outcome) => {
+                    debug_assert!(outcome.shortcut_sent);
+                    let method = if outcome.verified {
+                        delivery::DeliveryMethod::Paste
+                    } else {
+                        delivery::DeliveryMethod::PasteUnverified
+                    };
+                    arm_undo_transaction(
+                        state,
+                        session_generation,
+                        &recording_context.target_guard,
+                        outcome.post_insert_input_fingerprint,
+                        method.as_str(),
+                    );
+                    (
+                        true,
+                        (!outcome.verified).then_some("paste_unverified"),
+                        method.as_str(),
+                    )
+                }
+                Err(e) => {
                     if processing_aborted(state, session_generation) || cancellation.is_cancelled()
                     {
                         discard_short_recovery_audio(app, recovery_spool.as_deref());
                         return Ok(());
                     }
-                    // Total failure: neither paste nor clipboard worked.
-                    if recovery_spool.is_none() {
-                        recovery_spool = persist_short_recovery_audio(app, &wav);
+                    log::warn!("paste failed, falling back to clipboard: {e}");
+                    if let Err(copy_err) = copy_text(app, &final_text, cancellation.clone()).await {
+                        if processing_aborted(state, session_generation)
+                            || cancellation.is_cancelled()
+                        {
+                            discard_short_recovery_audio(app, recovery_spool.as_deref());
+                            return Ok(());
+                        }
+                        // Total failure: neither paste nor clipboard worked.
+                        if recovery_spool.is_none() {
+                            recovery_spool = persist_short_recovery_audio(app, &wav);
+                        }
+                        record_delivery_failure(
+                            app,
+                            &spoken_raw,
+                            &final_text,
+                            started.elapsed().as_secs_f64(),
+                            recording_context,
+                            recovery_spool.as_deref(),
+                            cleanup_status,
+                        );
+                        fail_for_generation(app, state, copy_err.to_string(), session_generation)
+                            .await;
+                        return Err(copy_err);
                     }
-                    record_delivery_failure(
-                        app,
-                        &spoken_raw,
-                        &final_text,
-                        started.elapsed().as_secs_f64(),
-                        recording_context,
-                        recovery_spool.as_deref(),
-                        cleanup_status,
-                    );
-                    fail_for_generation(app, state, copy_err.to_string(), session_generation).await;
-                    return Err(copy_err);
+                    (
+                        false,
+                        Some(delivery_fallback_reason(true, &e)),
+                        delivery::DeliveryMethod::Clipboard.as_str(),
+                    )
                 }
-                (false, Some(delivery_fallback_reason(true, &e)))
             }
         }
     };
+    let delivery_result = delivery::DeliveryResult::for_method(delivery_method, fallback_reason);
+    let mut fallback_reason = delivery_result.fallback_reason;
+    let delivery_method = delivery_result.method.as_str();
+    if degraded && fallback_reason.is_none() {
+        fallback_reason = degraded_reason;
+    }
     // Cancellation can arrive after delivery returns but before durable History
     // persistence. Do not let an aborted processing generation leave a late
     // result behind as if the user had completed the dictation.
@@ -1665,12 +2294,14 @@ async fn process_short(
             degraded_reason,
             if degraded {
                 "degraded"
+            } else if delivery_method == "paste_unverified" {
+                "unverified"
             } else if pasted {
                 "ok"
             } else {
                 "copied"
             },
-            if pasted { "paste" } else { "clipboard" },
+            delivery_method,
             fallback_reason,
             recording_context,
             recovery_spool.as_deref(),
@@ -1683,19 +2314,21 @@ async fn process_short(
         return Ok(());
     }
     emit_progress(app, 1.0);
+    let completion = completion_state_for_result(degraded, &delivery_result);
     if pasted {
         stop_to_insert.finish();
         finish_with_delivery(
             app,
             state,
-            "done",
+            completion,
             Some(recording_context),
-            "paste",
-            None,
+            delivery_method,
+            fallback_reason,
+            Some(cleanup_status),
             Some(session_generation),
         )
         .await;
-    } else {
+    } else if delivery_method == delivery::DeliveryMethod::Clipboard.as_str() {
         stop_to_insert.finish();
         let _ = app.emit(
             "dictation://copied",
@@ -1704,10 +2337,24 @@ async fn process_short(
         finish_with_delivery(
             app,
             state,
-            "copied",
+            completion,
             Some(recording_context),
-            "clipboard",
+            delivery_method,
             fallback_reason,
+            Some(cleanup_status),
+            Some(session_generation),
+        )
+        .await;
+    } else {
+        stop_to_insert.finish();
+        finish_with_delivery(
+            app,
+            state,
+            completion,
+            Some(recording_context),
+            delivery_method,
+            fallback_reason,
+            Some(cleanup_status),
             Some(session_generation),
         )
         .await;
@@ -1757,6 +2404,7 @@ async fn process_long(
     stop_to_insert: metrics::LatencyTimer,
 ) -> Result<(), String> {
     let total = chunks.len();
+    emit_processing_phase(app, "asr", Some(recording_context), None, Some((0, total)));
     emit_progress(app, 0.05);
     let mut jobs = Vec::new();
     let dir = app.path().app_data_dir().ok().map(|p| {
@@ -1902,8 +2550,6 @@ async fn process_long(
                         "asr_failed",
                     );
                 }
-                let placeholder = format!("[此处约{}秒识别失败]", settings.chunk_length_secs);
-                raw_texts.push((index, placeholder));
             }
         }
         let progress = if total == 0 {
@@ -1913,12 +2559,20 @@ async fn process_long(
         };
         let _ = app.emit(
             "dictation://progress",
-            serde_json::json!({
-                "elapsed_secs": started.elapsed().as_secs(),
-                "chunks_done": done + 1,
-                "total": total,
-                "progress": progress.clamp(0.0, 0.84),
-            }),
+            long_chunk_progress_payload(
+                session_generation,
+                started.elapsed().as_secs(),
+                done + 1,
+                total,
+                progress.clamp(0.0, 0.84),
+            ),
+        );
+        emit_processing_phase(
+            app,
+            "asr",
+            Some(recording_context),
+            None,
+            Some((done + 1, total)),
         );
     }
     if processing_aborted(state, session_generation) {
@@ -1946,9 +2600,16 @@ async fn process_long(
         return Err(message);
     }
     let raw_text = chunker::merge_transcripts(raw_texts);
+    let intent = llm::parse_cleanup_intent(
+        &raw_text,
+        Some(settings.translation_target_language.as_str()),
+    );
+    let snippet_expansion = snippets::resolve_exact(&settings.snippets, &raw_text);
+    let cleanup_input = snippet_expansion
+        .clone()
+        .unwrap_or_else(|| intent.content.clone());
     let cleanup_status;
-    let final_text = if let Some(expansion) = snippets::resolve_exact(&settings.snippets, &raw_text)
-    {
+    let final_text = if let Some(expansion) = snippet_expansion {
         cleanup_status = CLEANUP_STATUS_SNIPPET_BYPASS;
         expansion
     } else if settings.cleanup_enabled {
@@ -1956,21 +2617,29 @@ async fn process_long(
         // merged. This gives the model the complete spoken structure instead
         // of asking it to make independent decisions at chunk boundaries.
         emit_progress(app, 0.86);
+        emit_processing_phase(
+            app,
+            "cleanup",
+            Some(recording_context),
+            None,
+            Some((total, total)),
+        );
         let cleanup_result = {
             let _latency = state.metrics.timer(metrics::MetricKind::Cleanup);
             queue::execute_with_retry_cancelled(
                 &state.gate,
                 queue::RequestKind::Llm,
                 || {
-                    llm::cleanup_with_model_and_limits_and_language_and_profile(
+                    llm::cleanup_with_model_and_limits_and_language_and_profile_and_intent(
                         &settings.cleanup_model,
-                        &raw_text,
+                        &cleanup_input,
                         &settings.api_key,
                         &settings.dictionary,
                         None,
                         Some(&cleanup_policy),
                         Some(settings.language.as_str()),
-                        Some(&recording_context.profile),
+                        cleanup_profile_for(recording_context),
+                        Some(&intent),
                     )
                 },
                 cancellation.clone(),
@@ -1985,26 +2654,28 @@ async fn process_long(
             }
             Ok((_text, limits)) => {
                 state.gate.update_llm(&limits);
-                cleanup_status = CLEANUP_STATUS_AI_FAILED;
                 cleanup_failure_reason = Some("llm_cleanup_empty");
-                raw_text.clone()
+                let fallback = local_cleanup_or_raw(&cleanup_input);
+                cleanup_status = cleanup_failure_status(&cleanup_input, &fallback);
+                fallback
             }
             Err(queue::ExecuteError::Cancelled) => {
                 discard_spool(dir.as_deref());
                 return Ok(());
             }
             Err(error) => {
-                cleanup_status = CLEANUP_STATUS_AI_FAILED;
                 cleanup_failure_reason = Some("llm_cleanup_failed");
                 log::warn!(
-                    "long-recording LLM cleanup failed after transcript merge, keeping raw transcript: {error:?}"
+                    "long-recording LLM cleanup failed after transcript merge, using local cleanup: {error:?}"
                 );
-                raw_text.clone()
+                let fallback = local_cleanup_or_raw(&cleanup_input);
+                cleanup_status = cleanup_failure_status(&cleanup_input, &fallback);
+                fallback
             }
         }
     } else {
         cleanup_status = CLEANUP_STATUS_LOCAL_ONLY;
-        local_cleanup_or_raw(&raw_text)
+        local_cleanup_or_raw(&cleanup_input)
     };
     if final_text.trim().is_empty() {
         let message = "No speech detected".to_string();
@@ -2017,10 +2688,18 @@ async fn process_long(
     }
     // Output with graceful fallback to clipboard so the text is never lost.
     emit_progress(app, 0.88);
+    emit_processing_phase(
+        app,
+        "delivery",
+        Some(recording_context),
+        None,
+        Some((total, total)),
+    );
+    let delivery_policy = delivery::DeliveryPolicy::parse(&settings.delivery_policy);
     let mut delivered_via_paste = false;
     let mut delivery_method = "history";
     let mut fallback_reason = None;
-    if settings.long_output_mode == "paste" {
+    if delivery_policy.attempts_paste() {
         delivery_method = "clipboard";
         if failed_chunks > 0 {
             if processing_aborted(state, session_generation) {
@@ -2072,9 +2751,22 @@ async fn process_long(
                 .await
             };
             match paste_result {
-                Ok(()) => {
+                Ok(outcome) => {
+                    debug_assert!(outcome.shortcut_sent);
+                    let method = if outcome.verified {
+                        delivery::DeliveryMethod::Paste
+                    } else {
+                        delivery::DeliveryMethod::PasteUnverified
+                    };
+                    arm_undo_transaction(
+                        state,
+                        session_generation,
+                        &recording_context.target_guard,
+                        outcome.post_insert_input_fingerprint,
+                        method.as_str(),
+                    );
                     delivered_via_paste = true;
-                    delivery_method = "paste";
+                    delivery_method = method.as_str();
                 }
                 Err(e) => {
                     if processing_aborted(state, session_generation) || cancellation.is_cancelled()
@@ -2111,7 +2803,7 @@ async fn process_long(
                 }
             }
         }
-    } else if settings.long_output_mode == "clipboard" {
+    } else if matches!(delivery_policy, delivery::DeliveryPolicy::ClipboardOnly) {
         delivery_method = "clipboard";
         if processing_aborted(state, session_generation) {
             discard_spool(dir.as_deref());
@@ -2185,6 +2877,8 @@ async fn process_long(
                 "degraded"
             } else if delivery_method == "clipboard" {
                 "copied"
+            } else if delivery_method == "paste_unverified" {
+                "unverified"
             } else {
                 "ok"
             },
@@ -2202,7 +2896,7 @@ async fn process_long(
             let _ = std::fs::remove_dir_all(d);
         }
     }
-    let copied_fallback = settings.long_output_mode == "paste" && !delivered_via_paste;
+    let copied_fallback = delivery_policy.attempts_paste() && !delivered_via_paste;
     if copied_fallback {
         stop_to_insert.finish();
         if !degraded {
@@ -2214,10 +2908,11 @@ async fn process_long(
         finish_with_delivery(
             app,
             state,
-            long_completion_state(degraded, true),
+            long_completion_state(degraded, delivery_method, true),
             Some(recording_context),
             "clipboard",
             fallback_reason,
+            Some(cleanup_status),
             Some(session_generation),
         )
         .await;
@@ -2226,10 +2921,11 @@ async fn process_long(
         finish_with_delivery(
             app,
             state,
-            long_completion_state(degraded, false),
+            long_completion_state(degraded, delivery_method, false),
             Some(recording_context),
             delivery_method,
             fallback_reason,
+            Some(cleanup_status),
             Some(session_generation),
         )
         .await;
@@ -2282,6 +2978,7 @@ async fn recover_processing_timeout(
         None,
         "none",
         Some("processing_timeout"),
+        None,
         Some(completion_generation),
     )
     .await;
@@ -2333,13 +3030,52 @@ fn should_refresh_context_preview(
     !same_application || browser_refresh || last_accessibility != Some(accessibility)
 }
 
-fn long_completion_state(degraded: bool, copied_fallback: bool) -> &'static str {
+fn long_completion_state(
+    degraded: bool,
+    delivery_method: &str,
+    copied_fallback: bool,
+) -> &'static str {
+    if copied_fallback {
+        completion_state(degraded, false)
+    } else {
+        completion_state_for_delivery(degraded, delivery_method)
+    }
+}
+
+fn completion_state(degraded: bool, pasted: bool) -> &'static str {
     if degraded {
         "degraded"
-    } else if copied_fallback {
+    } else if pasted {
+        "done"
+    } else {
         "copied"
+    }
+}
+
+fn completion_state_for_delivery(degraded: bool, delivery_method: &str) -> &'static str {
+    if degraded {
+        "degraded"
+    } else if delivery_method == "paste_unverified" {
+        "unverified"
+    } else if delivery_method == "clipboard" {
+        "copied"
+    } else if delivery_method == "history" {
+        "history"
     } else {
         "done"
+    }
+}
+
+fn completion_state_for_result(
+    degraded: bool,
+    delivery_result: &delivery::DeliveryResult,
+) -> &'static str {
+    if degraded {
+        "degraded"
+    } else if !delivery_result.verified {
+        "unverified"
+    } else {
+        completion_state_for_delivery(degraded, delivery_result.method.as_str())
     }
 }
 
@@ -2407,14 +3143,38 @@ fn build_asr_prompt(
         Some(prompt.chars().take(2_000).collect())
     }
 }
+fn abort_processing_manager(manager: &mut DictationManager) -> bool {
+    if manager.phase != Phase::Processing {
+        return false;
+    }
+    manager.cancellation.cancel();
+    manager.session_generation = manager.session_generation.wrapping_add(1);
+    manager.phase = Phase::Idle;
+    manager.recording_context = None;
+    true
+}
+
+#[cfg(test)]
+fn apply_processing_abort(manager: &mut DictationManager, lease: &mut OperationLease) -> bool {
+    if !abort_processing_manager(manager) {
+        return false;
+    }
+    release_operation_lease(lease, OperationLease::LiveDictation);
+    true
+}
+
 fn abort_processing(app: &tauri::AppHandle, state: &AppState) {
-    let mut m = state.manager.lock().unwrap();
-    if m.phase != Phase::Processing {
+    // Release the manager lock before the operation lease. start_internal claims
+    // the lease first, then the manager; holding both here in the reverse order
+    // can deadlock a live start against an abort.
+    let aborted = {
+        let mut manager = state.manager.lock().unwrap();
+        abort_processing_manager(&mut manager)
+    };
+    if !aborted {
         return;
     }
-    m.cancellation.cancel();
-    m.session_generation = m.session_generation.wrapping_add(1);
-    m.phase = Phase::Idle;
+    release_operation(state, OperationLease::LiveDictation);
     sync_modifier_hotkey_phase(Phase::Idle);
     hotkey::unregister_cancel(app);
     emit_state(app, "idle");
@@ -2449,10 +3209,12 @@ async fn fail_for_generation(
         None,
         "none",
         Some(error_reason),
+        None,
         Some(expected_generation),
     )
     .await;
 }
+#[allow(clippy::too_many_arguments)]
 async fn finish_with_delivery(
     app: &tauri::AppHandle,
     state: &AppState,
@@ -2460,11 +3222,16 @@ async fn finish_with_delivery(
     context: Option<&context::ContextSnapshot>,
     delivery_method: &str,
     fallback_reason: Option<&str>,
+    cleanup_status: Option<&str>,
     expected_generation: Option<u64>,
 ) {
     let completion_generation = {
         let mut m = state.manager.lock().unwrap();
         if let Some(expected_generation) = expected_generation {
+            let lease = *state
+                .operation_lease
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             let is_current = if phase == "error" {
                 error_completion_is_current(
                     m.phase,
@@ -2478,6 +3245,11 @@ async fn finish_with_delivery(
                     m.session_generation,
                     expected_generation,
                     m.cancellation.is_cancelled(),
+                ) || selected_preview_completion_is_current(
+                    m.phase,
+                    m.session_generation,
+                    expected_generation,
+                    lease,
                 )
             };
             if !is_current {
@@ -2489,6 +3261,7 @@ async fn finish_with_delivery(
         m.recording_context = None;
         m.session_generation
     };
+    release_operation(state, OperationLease::LiveDictation);
     // Only the current processing generation may release the active cancel
     // shortcut. A stale completion can arrive after the user cancelled and
     // started a new recording; unregistering here would otherwise remove the
@@ -2498,18 +3271,35 @@ async fn finish_with_delivery(
     if phase == "error" {
         show_island(app);
     }
-    if matches!(phase, "done" | "copied" | "degraded") {
+    if matches!(
+        phase,
+        "done" | "unverified" | "copied" | "degraded" | "history"
+    ) {
         emit_progress(app, 1.0);
     }
     if let Some(context) = context {
-        emit_state_with_delivery(app, phase, Some(context), delivery_method, fallback_reason);
+        emit_state_with_delivery(
+            app,
+            phase,
+            Some(context),
+            delivery_method,
+            fallback_reason,
+            cleanup_status,
+        );
     } else {
-        emit_state_with_delivery(app, phase, None, delivery_method, fallback_reason);
+        emit_state_with_delivery(
+            app,
+            phase,
+            None,
+            delivery_method,
+            fallback_reason,
+            cleanup_status,
+        );
     }
     let dwell_ms = match phase {
-        "done" => 550,
+        "done" | "unverified" | "history" => 3_000,
         "copied" => 1800,
-        "degraded" => 2200,
+        "degraded" => 3_000,
         _ => 1500,
     };
     tokio::time::sleep(std::time::Duration::from_millis(dwell_ms)).await;
@@ -2540,6 +3330,21 @@ async fn cancel_dictation(app: tauri::AppHandle, state: State<'_, AppState>) -> 
 async fn cancel_internal(app: &tauri::AppHandle, state: &AppState) {
     let phase = state.manager.lock().unwrap().phase;
     clear_selected_action(state);
+    let had_preview = state
+        .selected_preview
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .is_some();
+    clear_selected_preview(state);
+    if had_preview && phase == Phase::Idle {
+        let generation = {
+            let mut manager = state.manager.lock().unwrap();
+            manager.session_generation = manager.session_generation.wrapping_add(1);
+            manager.session_generation
+        };
+        state.gate.set_session_generation(generation);
+    }
+    release_operation(state, OperationLease::LiveDictation);
     match phase {
         Phase::Starting => {
             let mut m = state.manager.lock().unwrap();
@@ -3046,7 +3851,7 @@ async fn update_settings_patch(
         "activation_mode",
         "chunk_threshold_secs",
         "chunk_length_secs",
-        "long_output_mode",
+        "delivery_policy",
         "keep_audio_days",
         "keep_history_days",
         "onboarded",
@@ -3164,9 +3969,158 @@ fn repaste_history(id: i64, app: tauri::AppHandle) -> Result<(), String> {
     }
     paste::copy(&app, &text).map_err(|e| e.to_string())?;
     let _ = app.emit(
-        "dictation://copied",
+        "history://copied",
         serde_json::json!({ "message": "已复制，请手动粘贴" }),
     );
+    Ok(())
+}
+
+fn cleanup_operation_from_name(value: &str) -> Option<llm::CleanupOperation> {
+    match value {
+        "cleanup" => Some(llm::CleanupOperation::Cleanup),
+        "rewrite" => Some(llm::CleanupOperation::Rewrite),
+        "shorten" => Some(llm::CleanupOperation::Shorten),
+        "formalize" => Some(llm::CleanupOperation::Formalize),
+        "casualize" => Some(llm::CleanupOperation::Casualize),
+        "translate" => Some(llm::CleanupOperation::Translate),
+        _ => None,
+    }
+}
+
+#[tauri::command]
+fn save_history_revision(
+    id: i64,
+    final_text: String,
+    revision_reason: Option<String>,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let reason = revision_reason.as_deref().unwrap_or("manual_edit");
+    store::save_history_revision(&dir, id, &final_text, None, None, None, None, reason)
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn get_history_revisions(
+    id: i64,
+    app: tauri::AppHandle,
+) -> Result<Vec<store::HistoryRevision>, String> {
+    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    store::get_history_revisions(&dir, id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn reclean_history(
+    id: i64,
+    operation: String,
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let raw_text = store::history_raw_text(&dir, id).map_err(|e| e.to_string())?;
+    if raw_text.trim().is_empty() {
+        return Err("这条历史记录没有可重新整理的原文".into());
+    }
+    let operation =
+        cleanup_operation_from_name(&operation).ok_or_else(|| "不支持的重新整理模式".to_owned())?;
+    let settings = state.settings.lock().unwrap().clone();
+    let history_policy = store::history_context(&dir, id).map_err(|e| e.to_string())?;
+    let mut policy = history_policy.unwrap_or_default();
+    if settings.output_mode != "auto" {
+        policy.output_mode = Some(settings.output_mode.clone());
+    }
+    if settings.output_mode == "translation" {
+        policy.translation_target_language = Some(settings.translation_target_language.clone());
+    }
+    let intent = llm::CleanupIntent::selected_text(operation, &raw_text);
+    if !try_claim_operation(&state, OperationLease::HistoryReclean) {
+        return Err("Dictation is active; try history cleanup again after it finishes".into());
+    }
+    let (final_text, degraded, degraded_reason, cleanup_status) = if !settings.cleanup_enabled {
+        (
+            local_cleanup_or_raw(&raw_text),
+            false,
+            None,
+            CLEANUP_STATUS_LOCAL_ONLY,
+        )
+    } else {
+        let result = queue::execute_with_retry(&state.gate, queue::RequestKind::HistoryLlm, || {
+            llm::cleanup_with_model_and_limits_and_language_and_profile_and_intent(
+                &settings.cleanup_model,
+                &raw_text,
+                &settings.api_key,
+                &settings.dictionary,
+                None,
+                Some(&policy),
+                Some(settings.language.as_str()),
+                None,
+                Some(&intent),
+            )
+        })
+        .await;
+        match result {
+            Ok((text, limits)) if !text.trim().is_empty() => {
+                state.gate.update_llm(&limits);
+                (text, false, None, CLEANUP_STATUS_AI_SUCCESS)
+            }
+            Ok((_, limits)) => {
+                state.gate.update_llm(&limits);
+                let fallback = local_cleanup_or_raw(&raw_text);
+                (
+                    fallback.clone(),
+                    true,
+                    Some("llm_cleanup_empty"),
+                    cleanup_failure_status(&raw_text, &fallback),
+                )
+            }
+            Err(error) => {
+                log::warn!("history re-clean failed; using local cleanup: {error}");
+                let fallback = local_cleanup_or_raw(&raw_text);
+                (
+                    fallback.clone(),
+                    true,
+                    Some("llm_cleanup_failed"),
+                    cleanup_failure_status(&raw_text, &fallback),
+                )
+            }
+        }
+    };
+    if paste::copy(&app, &final_text).is_err() {
+        release_operation(&state, OperationLease::HistoryReclean);
+        return Err("Failed to copy the history result to the clipboard".into());
+    }
+    store::save_history_revision(
+        &dir,
+        id,
+        &final_text,
+        Some(cleanup_status),
+        Some(&intent),
+        Some(&settings.cleanup_model),
+        Some(&policy),
+        "ai_reclean",
+    )
+    .map_err(|error| {
+        release_operation(&state, OperationLease::HistoryReclean);
+        error.to_string()
+    })?;
+    store::update_history_revision_state(
+        &dir,
+        id,
+        degraded,
+        degraded_reason,
+        if degraded { "degraded" } else { "copied" },
+        Some(cleanup_status),
+    )
+    .map_err(|error| {
+        release_operation(&state, OperationLease::HistoryReclean);
+        error.to_string()
+    })?;
+    let _ = app.emit(
+        "history://recleaned",
+        serde_json::json!({ "dictation_id": id, "degraded": degraded }),
+    );
+    release_operation(&state, OperationLease::HistoryReclean);
     Ok(())
 }
 #[tauri::command]
@@ -3179,6 +4133,19 @@ async fn retry_dictation(
     id: i64,
     app: tauri::AppHandle,
     state: State<'_, AppState>,
+) -> Result<(), String> {
+    if !try_claim_operation(&state, OperationLease::HistoryReclean) {
+        return Err("Dictation is active; try retry again after it finishes".into());
+    }
+    let result = retry_dictation_inner(id, app, &state).await;
+    release_operation(&state, OperationLease::HistoryReclean);
+    result
+}
+
+async fn retry_dictation_inner(
+    id: i64,
+    app: tauri::AppHandle,
+    state: &AppState,
 ) -> Result<(), String> {
     let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
     let path = store::failed_spool(&dir, id)
@@ -3213,14 +4180,18 @@ async fn retry_dictation(
     state.gate.update_asr(&transcript.limits);
     let snippet_expansion = snippets::resolve_exact(&settings.snippets, &transcript.text);
     let raw_text = transcript.text.clone();
+    let intent = llm::parse_cleanup_intent(
+        &raw_text,
+        Some(settings.translation_target_language.as_str()),
+    );
     let cleanup_input = snippet_expansion
         .clone()
-        .unwrap_or_else(|| transcript.text.clone());
+        .unwrap_or_else(|| intent.content.clone());
     let cleanup_decision = if settings.cleanup_enabled && snippet_expansion.is_none() {
         let cleanup_result = {
             let _latency = state.metrics.timer(metrics::MetricKind::Cleanup);
             queue::execute_with_retry(&state.gate, queue::RequestKind::Llm, || {
-                llm::cleanup_with_model_and_limits_and_language(
+                llm::cleanup_with_model_and_limits_and_language_and_profile_and_intent(
                     &settings.cleanup_model,
                     &cleanup_input,
                     &settings.api_key,
@@ -3228,6 +4199,8 @@ async fn retry_dictation(
                     None,
                     Some(&retry_policy),
                     Some(settings.language.as_str()),
+                    None,
+                    Some(&intent),
                 )
             })
             .await
@@ -3246,9 +4219,13 @@ async fn retry_dictation(
         CleanupDecision::Disabled
     };
     let cleanup_status = match &cleanup_decision {
-        CleanupDecision::Provider(text) if text.trim().is_empty() => CLEANUP_STATUS_AI_FAILED,
+        CleanupDecision::Provider(text) if text.trim().is_empty() => {
+            cleanup_failure_status(&cleanup_input, &local_cleanup_or_raw(&cleanup_input))
+        }
         CleanupDecision::Provider(_) => CLEANUP_STATUS_AI_SUCCESS,
-        CleanupDecision::Failed => CLEANUP_STATUS_AI_FAILED,
+        CleanupDecision::Failed => {
+            cleanup_failure_status(&cleanup_input, &local_cleanup_or_raw(&cleanup_input))
+        }
         CleanupDecision::Disabled if snippet_expansion.is_some() => CLEANUP_STATUS_SNIPPET_BYPASS,
         CleanupDecision::Disabled => CLEANUP_STATUS_LOCAL_ONLY,
     };
@@ -3402,6 +4379,9 @@ pub fn run() {
                 recorder: Arc::new(Mutex::new(audio::Recorder::new())),
                 realtime_asr: Mutex::new(None),
                 selected_action: Mutex::new(None),
+                selected_preview: Mutex::new(None),
+                undo: Mutex::new(None),
+                operation_lease: Mutex::new(OperationLease::Idle),
                 asr_provider: Arc::new(asr::GroqAsrProvider::default()),
                 settings: Mutex::new(settings.clone()),
                 context: Mutex::new(context::ContextState::new_with_modes(
@@ -3441,7 +4421,7 @@ pub fn run() {
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
                         .browser_access_enabled;
-                    let accessibility = permissions::request_accessibility();
+                    let accessibility = permissions::accessibility_is_trusted();
                     let same_application = last_application.as_ref() == Some(&application);
                     let browser_refresh = same_application
                         && context::is_browser_application(application.1.as_deref())
@@ -3624,6 +4604,13 @@ pub fn run() {
             validate_api_key,
             validate_configured_api_key,
             repaste_history,
+            save_history_revision,
+            get_history_revisions,
+            reclean_history,
+            undo_last_delivery,
+            confirm_selected_action_preview,
+            copy_selected_action_preview,
+            cancel_selected_action_preview,
             delete_history,
             check_permissions,
             get_audio_input_devices,
@@ -3656,11 +4643,13 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        claim_processing_timeout, context, delivery_fallback_reason, error_completion_is_current,
-        error_fallback_reason, finalize_text, long_completion_state,
-        processing_completion_is_current, processing_watchdog_delay, read_dictionary_file_contents,
-        reset_starting_manager, should_chunk_recording, stop_transition_is_current,
-        CleanupDecision, DictationManager, Phase, MAX_DICTIONARY_FILE_BYTES,
+        claim_processing_timeout, completion_state, completion_state_for_delivery, context,
+        delivery_fallback_reason, error_completion_is_current, error_fallback_reason,
+        finalize_text, long_completion_state, processing_completion_is_current,
+        processing_watchdog_delay, read_dictionary_file_contents, reset_starting_manager,
+        should_chunk_recording, stop_transition_is_current, target_guard_mismatch_with_retry,
+        undo_preflight, CleanupDecision, DictationManager, OperationLease, Phase, UndoTransaction,
+        MAX_DICTIONARY_FILE_BYTES,
     };
     use crate::store;
     use std::fs;
@@ -3855,17 +4844,248 @@ mod tests {
 
     #[test]
     fn degraded_long_recording_never_reports_success() {
-        assert_eq!(long_completion_state(true, false), "degraded");
-        assert_eq!(long_completion_state(true, true), "degraded");
-        assert_eq!(long_completion_state(false, true), "copied");
-        assert_eq!(long_completion_state(false, false), "done");
+        assert_eq!(
+            long_completion_state(true, "paste_unverified", false),
+            "degraded"
+        );
+        assert_eq!(long_completion_state(true, "clipboard", true), "degraded");
+        assert_eq!(long_completion_state(false, "clipboard", true), "copied");
+        assert_eq!(long_completion_state(false, "paste", false), "done");
+    }
+
+    #[test]
+    fn completion_state_prioritizes_degraded_over_delivery_method() {
+        assert_eq!(completion_state(true, true), "degraded");
+        assert_eq!(completion_state(true, false), "degraded");
+        assert_eq!(completion_state(false, true), "done");
+        assert_eq!(completion_state(false, false), "copied");
+        assert_eq!(
+            completion_state_for_delivery(false, "paste_unverified"),
+            "unverified"
+        );
+        assert_eq!(completion_state_for_delivery(false, "paste"), "done");
+        assert_eq!(completion_state_for_delivery(false, "history"), "history");
+    }
+
+    #[test]
+    fn operation_lease_serializes_live_and_history_operations() {
+        let mut lease = OperationLease::Idle;
+        assert!(super::claim_operation(
+            &mut lease,
+            OperationLease::LiveDictation
+        ));
+        assert!(!super::claim_operation(
+            &mut lease,
+            OperationLease::HistoryReclean
+        ));
+        super::release_operation_lease(&mut lease, OperationLease::HistoryReclean);
+        assert_eq!(lease, OperationLease::LiveDictation);
+        super::release_operation_lease(&mut lease, OperationLease::LiveDictation);
+        assert_eq!(lease, OperationLease::Idle);
+
+        assert!(super::claim_operation(
+            &mut lease,
+            OperationLease::HistoryReclean
+        ));
+        assert!(!super::claim_operation(
+            &mut lease,
+            OperationLease::LiveDictation
+        ));
+        super::release_operation_lease(&mut lease, OperationLease::HistoryReclean);
+        assert_eq!(lease, OperationLease::Idle);
+    }
+
+    #[test]
+    fn abort_from_processing_releases_live_dictation_lease() {
+        let cancellation = CancellationToken::new();
+        let mut manager = DictationManager {
+            phase: Phase::Processing,
+            started: Instant::now(),
+            gesture_lock: None,
+            session_generation: 4,
+            cancellation: cancellation.clone(),
+            recording_context: Some(context::ContextSnapshot::general()),
+        };
+        let mut lease = OperationLease::LiveDictation;
+
+        assert!(super::apply_processing_abort(&mut manager, &mut lease));
+        assert_eq!(manager.phase, Phase::Idle);
+        assert_eq!(manager.session_generation, 5);
+        assert!(manager.recording_context.is_none());
+        assert!(cancellation.is_cancelled());
+        assert_eq!(lease, OperationLease::Idle);
+        assert!(super::claim_operation(
+            &mut lease,
+            OperationLease::LiveDictation
+        ));
+    }
+
+    #[test]
+    fn abort_from_idle_does_not_clear_an_unrelated_lease() {
+        let mut manager = DictationManager {
+            phase: Phase::Idle,
+            started: Instant::now(),
+            gesture_lock: None,
+            session_generation: 2,
+            cancellation: CancellationToken::new(),
+            recording_context: None,
+        };
+        let mut lease = OperationLease::HistoryReclean;
+        assert!(!super::apply_processing_abort(&mut manager, &mut lease));
+        assert_eq!(lease, OperationLease::HistoryReclean);
+        assert_eq!(manager.session_generation, 2);
+    }
+
+    fn sample_preview(generation: u64) -> super::SelectedActionPreview {
+        super::SelectedActionPreview {
+            session: super::SelectedActionSession {
+                selected_text: "hello".into(),
+                selection_fingerprint: 1,
+                target_guard: context::TargetAppGuard {
+                    pid: 1,
+                    bundle_id: Some("com.example.editor".into()),
+                    browser_host: None,
+                    browser_target_token: None,
+                    window_token: None,
+                    window_id: None,
+                    input_token: None,
+                    secure_input: false,
+                },
+                onboarding_trial: false,
+            },
+            session_generation: generation,
+            context: context::ContextSnapshot::general(),
+        }
+    }
+
+    #[test]
+    fn selected_preview_take_keeps_the_preview_when_the_lease_is_gone() {
+        let mut preview = Some(sample_preview(4));
+        let result = super::take_preview_if_current(&mut preview, 4, OperationLease::Idle);
+        assert_eq!(result.unwrap_err(), "Selected-text preview is stale");
+        assert!(preview.is_some());
+    }
+
+    #[test]
+    fn selected_preview_take_keeps_the_preview_when_generation_moved() {
+        let mut preview = Some(sample_preview(4));
+        let result =
+            super::take_preview_if_current(&mut preview, 5, OperationLease::LiveDictation);
+        assert_eq!(result.unwrap_err(), "Selected-text preview is stale");
+        assert!(preview.is_some());
+    }
+
+    #[test]
+    fn selected_preview_take_removes_only_a_current_lease() {
+        let mut preview = Some(sample_preview(4));
+        let taken =
+            super::take_preview_if_current(&mut preview, 4, OperationLease::LiveDictation).unwrap();
+        assert_eq!(taken.session_generation, 4);
+        assert!(preview.is_none());
+    }
+
+    #[test]
+    fn selected_preview_completion_requires_idle_matching_generation_and_lease() {
+        assert!(super::selected_preview_completion_is_current(
+            Phase::Idle,
+            4,
+            4,
+            OperationLease::LiveDictation
+        ));
+        assert!(!super::selected_preview_completion_is_current(
+            Phase::Recording,
+            4,
+            4,
+            OperationLease::LiveDictation
+        ));
+        assert!(!super::selected_preview_completion_is_current(
+            Phase::Idle,
+            5,
+            4,
+            OperationLease::LiveDictation
+        ));
+        assert!(!super::selected_preview_completion_is_current(
+            Phase::Idle,
+            4,
+            4,
+            OperationLease::Idle
+        ));
+    }
+
+    #[test]
+    fn selected_preview_cancel_invalidates_an_in_flight_confirm() {
+        assert!(super::should_invalidate_selected_preview(
+            false,
+            OperationLease::LiveDictation,
+            Phase::Idle
+        ));
+        assert!(super::should_invalidate_selected_preview(
+            true,
+            OperationLease::Idle,
+            Phase::Idle
+        ));
+        assert!(!super::should_invalidate_selected_preview(
+            false,
+            OperationLease::Idle,
+            Phase::Idle
+        ));
+        assert!(!super::should_invalidate_selected_preview(
+            false,
+            OperationLease::LiveDictation,
+            Phase::Recording
+        ));
+    }
+
+    #[test]
+    fn long_chunk_progress_includes_session_generation() {
+        let payload = super::long_chunk_progress_payload(9, 12, 2, 4, 0.46);
+        assert_eq!(payload["session_generation"], 9);
+        assert_eq!(payload["chunks_done"], 2);
+        assert_eq!(payload["total"], 4);
+        assert!((payload["progress"].as_f64().unwrap() - 0.46).abs() < 1e-6);
+    }
+
+    #[test]
+    fn undo_preflight_rejects_expired_stale_and_consumed_transactions() {
+        let now = Instant::now();
+        let target_guard = context::TargetAppGuard {
+            pid: 1,
+            bundle_id: Some("com.example.editor".into()),
+            browser_host: None,
+            browser_target_token: None,
+            window_token: None,
+            window_id: None,
+            input_token: None,
+            secure_input: false,
+        };
+        let transaction = UndoTransaction {
+            session_generation: 4,
+            created_at: now,
+            expires_at: now + std::time::Duration::from_secs(3),
+            target_guard,
+            delivery_method: "paste".into(),
+            post_insert_input_fingerprint: 1,
+            consumed: false,
+        };
+        assert_eq!(undo_preflight(&transaction, 4, now), "available");
+        assert_eq!(
+            undo_preflight(&transaction, 4, now + std::time::Duration::from_secs(3)),
+            "expired"
+        );
+        assert_eq!(undo_preflight(&transaction, 5, now), "stale_target");
+
+        let consumed = UndoTransaction {
+            consumed: true,
+            ..transaction
+        };
+        assert_eq!(undo_preflight(&consumed, 4, now), "already_consumed");
     }
 
     #[test]
     fn cleanup_failure_preserves_raw_transcript_and_marks_degraded() {
         let result =
             finalize_text("uh deploy v2 /Users/mingjie/app", CleanupDecision::Failed).unwrap();
-        assert_eq!(result.text, "uh deploy v2 /Users/mingjie/app");
+        assert_eq!(result.text, "deploy v2 /Users/mingjie/app");
         assert!(result.degraded);
         assert_eq!(result.degraded_reason, Some("llm_cleanup_failed"));
     }
@@ -3887,7 +5107,7 @@ mod tests {
     #[test]
     fn empty_provider_cleanup_falls_back_to_raw_and_is_degraded() {
         let result = finalize_text("uh hello", CleanupDecision::Provider("  ".into())).unwrap();
-        assert_eq!(result.text, "uh hello");
+        assert_eq!(result.text, "hello");
         assert!(result.degraded);
         assert_eq!(result.degraded_reason, Some("llm_cleanup_empty"));
     }
@@ -3913,6 +5133,39 @@ mod tests {
         assert_eq!(
             delivery_fallback_reason(true, "focused input is not available"),
             "input_unavailable"
+        );
+    }
+
+    #[test]
+    fn transient_target_probe_failure_is_retried_but_real_change_is_not() {
+        let expected = context::TargetAppGuard {
+            pid: 42,
+            bundle_id: Some("com.example.editor".into()),
+            browser_host: None,
+            browser_target_token: None,
+            window_token: Some(1),
+            window_id: Some(2),
+            input_token: Some(3),
+            secure_input: false,
+        };
+        let unavailable = context::TargetAppGuard {
+            pid: 0,
+            bundle_id: None,
+            ..expected.clone()
+        };
+        let mut probes = vec![unavailable, expected.clone()].into_iter();
+        assert_eq!(
+            target_guard_mismatch_with_retry(&expected, || probes.next().unwrap()),
+            None
+        );
+
+        let changed = context::TargetAppGuard {
+            pid: 43,
+            ..expected.clone()
+        };
+        assert_eq!(
+            target_guard_mismatch_with_retry(&expected, || changed.clone()),
+            Some("target_changed")
         );
     }
 
@@ -4015,6 +5268,7 @@ mod tests {
             window_token: Some(2),
             window_id: Some(3),
             input_token: Some(4),
+            secure_input: false,
         };
 
         let payload = serde_json::to_string(&super::context_payload(&snapshot)).unwrap();

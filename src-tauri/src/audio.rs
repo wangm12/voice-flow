@@ -1,6 +1,6 @@
 //! Microphone capture and crash-safe audio spooling.
 use crate::chunker::{AudioChunk, Chunker, ChunkerConfig};
-use crate::realtime_asr::RealtimeMessage;
+use crate::realtime_asr::{PrefetchInbox, RealtimeMessage};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use rubato::Resampler;
 use serde::Serialize;
@@ -98,7 +98,7 @@ enum EngineCmd {
         input_device: String,
         chunk_length_secs: usize,
         max_recording_secs: usize,
-        realtime_tx: tokio::sync::mpsc::Sender<RealtimeMessage>,
+        realtime_tx: PrefetchInbox,
         reply: mpsc::Sender<Result<StartHandle, AudioError>>,
     },
     Stop {
@@ -284,7 +284,7 @@ impl CaptureWorker {
         input_rate: u32,
         max_samples: usize,
         chunk_length_secs: usize,
-        realtime_tx: tokio::sync::mpsc::Sender<RealtimeMessage>,
+        realtime_tx: PrefetchInbox,
         auto_stop_tx: mpsc::Sender<EngineCmd>,
         app: AppHandle,
     ) -> Result<Self, AudioError> {
@@ -370,9 +370,7 @@ impl CaptureWorker {
                                     start_secs: 0.0,
                                     end_secs: crate::realtime_asr::WARMUP_CHUNK_SECS as f32,
                                 };
-                                warmup_sent = realtime_tx
-                                    .try_send(RealtimeMessage::Warmup(warmup))
-                                    .is_ok();
+                                warmup_sent = realtime_tx.try_send(RealtimeMessage::Warmup(warmup));
                             }
                         }
                         for chunk in realtime_chunker.push(&produced[..accepted]) {
@@ -760,7 +758,7 @@ fn build_stream(
     input_device: &str,
     chunk_length_secs: usize,
     max_recording_secs: usize,
-    realtime_tx: tokio::sync::mpsc::Sender<RealtimeMessage>,
+    realtime_tx: PrefetchInbox,
 ) -> Result<ActiveRec, AudioError> {
     let host = cpal::default_host();
     let device = resolve_input_device(&host, input_device)?;
@@ -947,7 +945,7 @@ impl Recorder {
         session: &str,
         input_device: &str,
         chunk_length_secs: usize,
-        realtime_tx: tokio::sync::mpsc::Sender<RealtimeMessage>,
+        realtime_tx: PrefetchInbox,
     ) -> Result<(), AudioError> {
         if self.active.is_some() {
             return Err(AudioError::Device("recording already active".into()));

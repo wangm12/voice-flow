@@ -92,7 +92,7 @@ export function HotkeyRecorder({
           recorder.isRecording ? "border-accent bg-elevated" : "border-border bg-elevated hover:border-accent/60"
         } ${disabled ? "cursor-not-allowed opacity-50" : ""}`}
       >
-      <Keyboard {...iconPropsSm} className="shrink-0 -translate-y-px text-tertiary" />
+      <Keyboard {...iconPropsSm} className="shrink-0 -translate-y-px text-tertiary" aria-hidden="true" />
       <span className="min-w-0 flex-1">
         {recorder.isRecording ? (
           <span className="text-secondary">

@@ -159,7 +159,7 @@ export function TryItStep({
           id="onboarding-try-input"
           value={inputText}
           onChange={(event) => setInputText(event.target.value)}
-          placeholder={t("把光标放在这里，然后按语音输入快捷键开始")}
+          placeholder={t("把光标放在这里，然后按语音输入快捷键开始…")}
           rows={3}
           className={`mt-3 w-full resize-none ${radius.control} border border-border bg-base p-3 text-sm text-primary outline-none transition-colors placeholder:text-tertiary focus:border-accent`}
         />
@@ -193,7 +193,7 @@ export function TryItStep({
 function TrialStatus({ active, processing, text }: { active: boolean; processing: boolean; text: string }) {
   return (
     <div className="mt-3 flex items-center gap-2.5 text-xs" aria-live="polite">
-      {processing ? <Loader2 {...iconPropsLg} className="animate-spin text-secondary motion-reduce:animate-none" /> : <Mic {...iconPropsLg} className={active ? "text-error" : "text-secondary"} />}
+      {processing ? <Loader2 {...iconPropsLg} className="animate-spin text-secondary motion-reduce:animate-none" aria-hidden="true" /> : <Mic {...iconPropsLg} className={active ? "text-error" : "text-secondary"} aria-hidden="true" />}
       <span className={active || processing ? "text-primary" : "text-secondary"}>{text}</span>
     </div>
   );

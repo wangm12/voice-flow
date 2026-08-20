@@ -8,7 +8,7 @@ export function ValidationStatus({ status, validating }: { status: string | null
   if (validating) {
     return (
         <span key="loading" role="status" aria-live="polite" className={`${tagClass} vf-status-enter bg-elevated text-secondary`}>
-          <Loader2 {...iconPropsSm} className="animate-spin motion-reduce:animate-none" />
+          <Loader2 {...iconPropsSm} className="animate-spin motion-reduce:animate-none" aria-hidden="true" />
           {t("验证中…")}
         </span>
     );
@@ -23,7 +23,7 @@ export function ValidationStatus({ status, validating }: { status: string | null
                 : "bg-warning/10 text-warning"
           }`}
         >
-          {status === "valid" && <Check {...iconPropsSm} />}
+          {status === "valid" && <Check {...iconPropsSm} aria-hidden="true" />}
           {validationMessage(status, t)}
         </span>
     );

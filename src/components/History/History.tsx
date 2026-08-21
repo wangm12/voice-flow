@@ -1,9 +1,11 @@
 import { invoke } from "@tauri-apps/api/core";
 import { Check, CheckCircle2, CircleHelp, CircleX, Copy, Download, Eraser, History as HistoryIcon, LoaderCircle, Pencil, RotateCcw, Save, Trash2, TriangleAlert, Wand2, X } from "lucide-react";
-import { useMemo, useState } from "react";
-import { colors, radius } from "../../lib/theme";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { mergeDictionary } from "../../lib/dictionaryImport";
+import { colors, radius, focusRingClass } from "../../lib/theme";
 import { IconButton } from "../IconButton";
 import { useI18n } from "../../lib/i18n";
+import { deliveryReasonLabels } from "../../lib/deliveryCopy";
 import { ConfirmDialog } from "../ConfirmDialog";
 import { SettingsAlert, SettingsGroup, SettingsPageHeader, SettingsShell } from "../SettingsLayout";
 
@@ -32,16 +34,28 @@ type HistoryRevision = {
   revision_reason: string;
 };
 
-export function History({ items, reload, hasMore, loading, onLoadMore, error, onRetry }: { items: HistoryItem[]; reload: () => void; hasMore: boolean; loading: boolean; onLoadMore: () => void; error?: string | null; onRetry?: () => void }) {
+export function History({ items, reload, hasMore, loading, onLoadMore, error, onRetry, onQueryChange }: { items: HistoryItem[]; reload: () => void; hasMore: boolean; loading: boolean; onLoadMore: () => void; error?: string | null; onRetry?: () => void; onQueryChange?: (query: string) => void }) {
   const { t } = useI18n();
   const [query, setQuery] = useState("");
   const [dataError, setDataError] = useState<string | null>(null);
   const [dataMessage, setDataMessage] = useState<string | null>(null);
   const [confirmClear, setConfirmClear] = useState(false);
+  const queryInitializedRef = useRef(false);
+  const normalizedQuery = query.trim().toLowerCase();
   const visible = useMemo(
-    () => items.filter((item) => `${item.raw_text} ${item.final_text}`.toLowerCase().includes(query.toLowerCase())),
-    [items, query],
+    () => items.filter((item) => !normalizedQuery || `${item.raw_text} ${item.final_text}`.toLowerCase().includes(normalizedQuery)),
+    [items, normalizedQuery],
   );
+
+  useEffect(() => {
+    if (!onQueryChange) return;
+    if (!queryInitializedRef.current) {
+      queryInitializedRef.current = true;
+      return;
+    }
+    const timer = window.setTimeout(() => onQueryChange(query.trim()), 200);
+    return () => window.clearTimeout(timer);
+  }, [onQueryChange, query]);
 
   const exportData = async () => {
     setDataError(null);
@@ -72,9 +86,9 @@ export function History({ items, reload, hasMore, loading, onLoadMore, error, on
 
   return (
     <SettingsShell>
-      <SettingsPageHeader title={t("历史")} description={t("每一次表达，都留在这里。")} actions={<div className="flex shrink-0 items-center gap-1"><IconButton label={t("下载")} aria-label={t("下载历史记录")} icon={<Download size={16} aria-hidden="true" />} onClick={() => void exportData()} /><IconButton label={t("清空")} aria-label={t("清空全部数据")} tone="danger" icon={<Eraser size={16} aria-hidden="true" />} disabled={!items.length || loading} onClick={() => void clearAll()} /></div>} />
+      <SettingsPageHeader title={t("历史")} description={t("每一次表达，都留在这里。")} actions={<div className="flex shrink-0 items-center gap-1"><IconButton label={t("下载")} aria-label={t("下载历史记录")} icon={<Download size={16} aria-hidden="true" />} onClick={() => void exportData()} /><IconButton label={t("清空")} aria-label={t("清空全部数据")} tone="danger" icon={<Eraser size={16} aria-hidden="true" />} disabled={loading} onClick={() => void clearAll()} /></div>} />
       <div className="mt-7 flex flex-wrap items-center justify-between gap-3 border-y border-border py-3">
-        <input aria-label={t("搜索历史记录")} value={query} onChange={(event) => setQuery(event.target.value)} placeholder={t("搜索历史…")} className={`h-9 w-64 max-w-full ${radius.control} border ${colors.border} ${colors.bg.elevated} px-3 text-sm text-primary outline-none transition-colors placeholder:text-tertiary focus:border-accent`} />
+        <input aria-label={t("搜索历史记录")} value={query} onChange={(event) => setQuery(event.target.value)} placeholder={t("搜索历史…")} className={`h-9 w-64 max-w-full ${radius.control} border ${colors.border} ${colors.bg.elevated} px-3 text-sm text-primary outline-none transition-colors placeholder:text-tertiary focus:border-accent ${focusRingClass}`} />
         <p className="text-xs text-tertiary">{items.length ? `${items.length}${hasMore ? "+" : ""} ${t("条")} · ${hasMore ? t("还有更早记录") : t("已显示全部")}` : ""}</p>
       </div>
       {dataMessage && <p role="status" className="mt-4 text-xs text-success">{dataMessage}</p>}
@@ -85,7 +99,14 @@ export function History({ items, reload, hasMore, loading, onLoadMore, error, on
       ) : visible.length ? (
         <>
           <SettingsGroup title={t("记录")} description={`${visible.length}${hasMore ? "+" : ""} ${t("条")}`}>
-            {visible.map((item) => <HistoryRow key={item.id} item={item} reload={reload} />)}
+            {visible.map((item) => (
+              <HistoryRow
+                key={item.id}
+                item={item}
+                reload={reload}
+                windowed={visible.length > 50}
+              />
+            ))}
           </SettingsGroup>
           {hasMore && <LoadMoreButton loading={loading} searching={Boolean(query.trim())} onClick={onLoadMore} />}
         </>
@@ -94,13 +115,15 @@ export function History({ items, reload, hasMore, loading, onLoadMore, error, on
           <p role="status" className="mt-8 text-sm text-secondary">{t("当前已加载的记录中没有匹配项。")}</p>
           {hasMore && <LoadMoreButton loading={loading} searching={Boolean(query.trim())} onClick={onLoadMore} />}
         </>
+      ) : query.trim() ? (
+        <p role="status" className="mt-8 text-sm text-secondary">{t("全库没有匹配的记录。")}</p>
       ) : (
         <Empty />
       )}
       <ConfirmDialog
         open={confirmClear}
         title={t("清空全部数据")}
-        description={t("这会删除全部历史文字、恢复音频和本地用量，且无法撤销。确定继续吗？")}
+        description={t("这会删除全部历史文字、恢复音频和本地用量，但不会删除 Keychain 中的 API Key，且无法撤销。确定继续吗？")}
         confirmLabel={t("确定继续")}
         cancelLabel={t("取消")}
         onCancel={() => setConfirmClear(false)}
@@ -110,7 +133,7 @@ export function History({ items, reload, hasMore, loading, onLoadMore, error, on
   );
 }
 
-function HistoryRow({ item, reload }: { item: HistoryItem; reload: () => void }) {
+function HistoryRow({ item, reload, windowed = false }: { item: HistoryItem; reload: () => void; windowed?: boolean }) {
   const { t, language } = useI18n();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -164,13 +187,23 @@ function HistoryRow({ item, reload }: { item: HistoryItem; reload: () => void })
     }
   };
 
+  const suggestDictionaryCandidates = async (before: string, after: string) => {
+    try {
+      const candidates = await invoke<string[]>("suggest_dictionary_entries", { before, after });
+      setDictionaryCandidates(Array.isArray(candidates) ? candidates.slice(0, 3) : []);
+    } catch {
+      setDictionaryCandidates([]);
+    }
+  };
+
   const confirmDictionaryCandidate = async (candidate: string) => {
     setBusy(true);
     setError(null);
     try {
       const settings = await invoke<{ dictionary: string[] }>("get_settings");
-      if (!settings.dictionary.some((word) => word.toLocaleLowerCase() === candidate.toLocaleLowerCase())) {
-        await invoke("update_settings_patch", { patch: { dictionary: [...settings.dictionary, candidate] } });
+      const result = mergeDictionary(settings.dictionary ?? [], [candidate]);
+      if (result.added > 0) {
+        await invoke("update_settings_patch", { patch: { dictionary: result.words } });
       }
       setDictionaryCandidates((current) => current.filter((value) => value !== candidate));
     } catch (reason) {
@@ -181,13 +214,13 @@ function HistoryRow({ item, reload }: { item: HistoryItem; reload: () => void })
   };
 
   return (
-    <div className="flex flex-wrap items-center gap-3 border-t border-border px-4 py-4 first:border-t-0 sm:px-5">
+    <div className={`flex flex-wrap items-center gap-3 border-t border-border px-4 py-4 first:border-t-0 sm:px-5${windowed ? " history-list--windowed" : ""}`}>
       <span role="img" aria-label={busy ? t("处理中…") : status.label} className="flex h-7 w-7 shrink-0 items-center justify-center">
         {busy ? <LoaderCircle size={16} className="animate-spin text-secondary motion-reduce:animate-none" aria-hidden="true" /> : <StatusIcon size={16} className={status.iconClass} aria-hidden="true" />}
       </span>
       <div className="min-w-0 flex-1">
         {editing ? (
-          <textarea aria-label={t("编辑整理结果")} value={draft} onChange={(event) => setDraft(event.target.value)} rows={3} className="w-full rounded-lg border border-border bg-elevated px-3 py-2 text-sm text-primary outline-none focus:border-accent" />
+          <textarea aria-label={t("编辑整理结果")} value={draft} onChange={(event) => setDraft(event.target.value)} rows={3} className={`w-full rounded-lg border border-border bg-elevated px-3 py-2 text-sm text-primary outline-none focus:border-accent ${focusRingClass}`} />
         ) : <p className="truncate text-sm text-primary">{item.final_text || item.raw_text || t("识别失败")}</p>}
         <p className="mt-1 flex flex-wrap items-center gap-x-1.5 gap-y-1 text-xs text-tertiary"><span>{relativeTime(item.created_at, t, language)} · {formatDuration(item.duration, language)} {t("秒")}</span>{cleanupLabel && <><span aria-hidden="true">·</span><span>{cleanupLabel}</span></>}{(item.revision_count ?? 0) > 0 && <><span aria-hidden="true">·</span><span>{item.revision_count} {t("个版本")}</span></>}</p>
         {(item.raw_text && item.final_text) && <button type="button" className="mt-2 text-xs text-secondary underline decoration-border underline-offset-2 transition-colors hover:text-primary" onClick={() => setShowRaw((value) => !value)}>{showRaw ? t("隐藏原文") : t("查看原文")}</button>}
@@ -199,7 +232,7 @@ function HistoryRow({ item, reload }: { item: HistoryItem; reload: () => void })
       </div>
       <div className="flex shrink-0 items-center gap-1">
         {editing ? (
-          <IconButton label={t("保存版本")} aria-label={t("保存历史版本")} icon={<Save size={15} aria-hidden="true" />} disabled={busy || !draft.trim()} onClick={() => void (async () => { if (await run("save_history_revision", { final_text: draft, revision_reason: "manual_edit" }, true)) { setDictionaryCandidates(localDictionaryCandidates(item.raw_text, draft)); setEditing(false); } })()} />
+          <IconButton label={t("保存版本")} aria-label={t("保存历史版本")} icon={<Save size={15} aria-hidden="true" />} disabled={busy || !draft.trim()} onClick={() => void (async () => { if (await run("save_history_revision", { final_text: draft, revision_reason: "manual_edit" }, true)) { setEditing(false); await suggestDictionaryCandidates(item.raw_text, draft); } })()} />
         ) : <IconButton label={t("编辑")} aria-label={t("编辑这条历史记录")} icon={<Pencil size={15} aria-hidden="true" />} disabled={busy || !(item.final_text || item.raw_text)} onClick={() => { setDraft(item.final_text || item.raw_text); setEditing(true); }} />}
         <IconButton label={t("复制")} aria-label={t("复制这条历史记录到剪贴板")} icon={<Copy size={15} aria-hidden="true" />} disabled={busy} onClick={() => void run("repaste_history")} />
         <select aria-label={t("重新整理模式")} value={operation} disabled={busy} onChange={(event) => setOperation(event.target.value)} className="h-8 rounded-md border border-border bg-elevated px-1 text-xs text-secondary">
@@ -225,13 +258,6 @@ function HistoryRow({ item, reload }: { item: HistoryItem; reload: () => void })
       {error && <p role="alert" className="basis-full text-xs text-error">{error}</p>}
     </div>
   );
-}
-
-function localDictionaryCandidates(raw: string, finalText: string): string[] {
-  const rawTokens = new Set((raw.match(/[A-Za-z][A-Za-z0-9._-]{2,}/g) ?? []).map((token) => token.toLocaleLowerCase()));
-  return [...new Set(finalText.match(/[A-Za-z][A-Za-z0-9._-]{2,}/g) ?? [])]
-    .filter((token) => !rawTokens.has(token.toLocaleLowerCase()))
-    .slice(0, 3);
 }
 
 function RevisionList({ rawText, revisions, t }: { rawText: string; revisions: HistoryRevision[]; t: (source: string) => string }) {
@@ -262,19 +288,6 @@ const degradedReasonLabels: Record<string, string> = {
   llm_cleanup_empty: "AI 整理没有返回结果，已插入原文",
   partial_asr_failure: "部分语音未识别，已保留已识别内容，可重试",
   partial_llm_cleanup_failure: "部分内容未完成整理，原始转录已保留，可重试",
-};
-
-const deliveryReasonLabels: Record<string, string> = {
-  delivery_failed: "自动插入失败，文字已保存，可复制",
-  accessibility_required: "未能自动粘贴，文字已复制到剪贴板，请手动粘贴",
-  browser_permission_required: "未能自动粘贴，文字已复制到剪贴板，请手动粘贴",
-  input_unavailable: "未找到可编辑输入框，文字已复制到剪贴板，请手动粘贴",
-  input_changed: "输入框已变化，文字已复制到剪贴板，请手动粘贴",
-  target_changed: "输入目标已变化，文字已复制到剪贴板，请手动粘贴",
-  target_unavailable: "未能确认输入目标，文字已复制到剪贴板，请手动粘贴",
-  paste_failed: "自动粘贴未完成，文字已复制到剪贴板，请手动粘贴",
-  retry_clipboard_only: "自动插入失败，文字已复制到剪贴板",
-  paste_unverified: "已尝试写入输入框，请确认目标内容",
 };
 
 function statusPresentation(status: string, t: (source: string) => string) {

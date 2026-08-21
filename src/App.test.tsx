@@ -159,6 +159,28 @@ describe("settings navigation", () => {
     }));
   });
 
+  it("opens the selected-text preview dialog from the native event", async () => {
+    let previewHandler: ((event: { payload: { selected_text: string; transcript: string; final_text: string } }) => void) | undefined;
+    listenMock.mockImplementation((event: string, handler: (event: { payload: { selected_text: string; transcript: string; final_text: string } }) => void) => {
+      if (event === "selected-action://preview") previewHandler = handler;
+      return Promise.resolve(vi.fn());
+    });
+
+    render(<App />);
+    await waitFor(() => expect(previewHandler).toBeDefined());
+
+    previewHandler?.({
+      payload: {
+        selected_text: "原文",
+        transcript: "请整理",
+        final_text: "整理后的文本",
+      },
+    });
+
+    expect(await screen.findByRole("dialog", { name: "预览选中文本操作" })).toBeInTheDocument();
+    expect(screen.getByRole("textbox", { name: "VoiceFlow 生成结果" })).toHaveValue("整理后的文本");
+  });
+
   it("lets the user choose activation mode and does not persist empty chunk values", async () => {
     render(<App />);
 

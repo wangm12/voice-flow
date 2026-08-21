@@ -16,7 +16,10 @@ type HudState = {
   fallbackReason: string | null;
   waveformLevels: number[];
   progress: number;
+  completedChunks: number | null;
+  totalChunks: number | null;
   selectedActionState: string | null;
+  partialText: string | null;
 };
 
 function emptyWaveform(): number[] {
@@ -25,6 +28,63 @@ function emptyWaveform(): number[] {
 
 export function acceptsSessionGeneration(current: number, incoming?: number): incoming is number {
   return incoming !== undefined && incoming >= current;
+}
+
+export function hudPartialFromEvent(
+  currentGeneration: number,
+  incomingGeneration: number | undefined,
+  currentState: string,
+  text: string | undefined,
+): string | null | undefined {
+  if (!acceptsSessionGeneration(currentGeneration, incomingGeneration)) return undefined;
+  if (currentState === "idle") return undefined;
+  const next = text?.trim() ?? "";
+  return next.length > 0 ? next : null;
+}
+
+export function hudPartialAfterState(
+  currentGeneration: number,
+  incomingGeneration: number | undefined,
+  nextState: string,
+  currentPartial: string | null,
+): string | null {
+  if (!acceptsSessionGeneration(currentGeneration, incomingGeneration)) return currentPartial;
+  if (incomingGeneration > currentGeneration || nextState === "idle") return null;
+  return currentPartial;
+}
+
+export function normalizeChunkProgress(
+  completed?: number,
+  total?: number,
+): { completed: number; total: number } | null {
+  if (
+    completed === undefined
+    || total === undefined
+    || !Number.isInteger(completed)
+    || !Number.isInteger(total)
+    || total <= 0
+    || completed < 0
+    || completed > total
+  ) {
+    return null;
+  }
+  return { completed, total };
+}
+
+export function selectedActionStateForDictation(
+  current: string | null,
+  next: DictationState,
+): string | null {
+  if (!current) return null;
+  if (next === "idle") {
+    return current === "waiting_for_selection" ? current : null;
+  }
+  if (next === "starting" || next === "recording" || next === "processing") {
+    return ["waiting_for_selection", "listening", "preparing_rewrite"].includes(current)
+      ? current
+      : null;
+  }
+  return current;
 }
 
 export function IslandWindow() {
@@ -38,7 +98,10 @@ export function IslandWindow() {
     fallbackReason: null,
     waveformLevels: emptyWaveform(),
     progress: 0,
+    completedChunks: null,
+    totalChunks: null,
     selectedActionState: null,
+    partialText: null,
   });
   const reduced = useReducedMotionPreference();
 
@@ -72,6 +135,10 @@ export function IslandWindow() {
           const nextProgress = next === "idle" || next === "recording" ? 0 : ["done", "unverified", "copied", "degraded", "history"].includes(next) ? 1 : next === "processing" ? phase === "asr" ? 0.35 : phase === "cleanup" ? 0.65 : phase === "delivery" ? 0.9 : 0.05 : 0;
         setHud((current) => {
           if (!acceptsSessionGeneration(current.sessionGeneration, eventGeneration)) return current;
+          const chunkProgress = normalizeChunkProgress(
+            event.payload.completed_chunks,
+            event.payload.total_chunks,
+          );
           const nextHud = {
             sessionGeneration: eventGeneration,
             state: next,
@@ -84,7 +151,15 @@ export function IslandWindow() {
             // the live waveform continuous through that short starting phase.
             waveformLevels: next === "starting" || next === "recording" ? current.waveformLevels : emptyWaveform(),
             progress: nextProgress,
-            selectedActionState: current.selectedActionState,
+            completedChunks: next === "processing" ? chunkProgress?.completed ?? null : null,
+            totalChunks: next === "processing" ? chunkProgress?.total ?? null : null,
+            selectedActionState: selectedActionStateForDictation(current.selectedActionState, next),
+            partialText: hudPartialAfterState(
+              current.sessionGeneration,
+              eventGeneration,
+              next,
+              current.partialText,
+            ),
           };
           return current.sessionGeneration === nextHud.sessionGeneration
             && current.state === nextHud.state
@@ -95,6 +170,10 @@ export function IslandWindow() {
             && current.fallbackReason === nextHud.fallbackReason
             && current.waveformLevels === nextHud.waveformLevels
             && current.progress === nextHud.progress
+            && current.completedChunks === nextHud.completedChunks
+            && current.totalChunks === nextHud.totalChunks
+            && current.selectedActionState === nextHud.selectedActionState
+            && current.partialText === nextHud.partialText
             ? current
             : nextHud;
         });
@@ -109,27 +188,88 @@ export function IslandWindow() {
         return { ...current, waveformLevels };
       });
     });
-    register<{ progress?: number; session_generation?: number }>("dictation://progress", (event) => {
+    register<{
+      session_generation?: number;
+      text?: string;
+    }>("dictation://partial", (event) => {
+      const eventGeneration = event.payload.session_generation;
+      if (!acceptsSessionGeneration(0, eventGeneration)) return;
+      setHud((current) => {
+        const nextText = hudPartialFromEvent(
+          current.sessionGeneration,
+          eventGeneration,
+          current.state,
+          event.payload.text,
+        );
+        if (nextText === undefined) return current;
+        return current.partialText === nextText && current.sessionGeneration === eventGeneration
+          ? current
+          : {
+            ...current,
+            sessionGeneration: eventGeneration,
+            partialText: nextText,
+          };
+      });
+    });
+    register<{
+      progress?: number;
+      chunks_done?: number;
+      total?: number;
+      session_generation?: number;
+    }>("dictation://progress", (event) => {
       const eventGeneration = event.payload.session_generation;
       if (!acceptsSessionGeneration(0, eventGeneration)) return;
       const nextProgress = Math.max(0, Math.min(1, event.payload.progress ?? 0));
-      setHud((current) => !acceptsSessionGeneration(current.sessionGeneration, eventGeneration) || current.progress === nextProgress
-        ? current
-        : { ...current, progress: nextProgress });
+      setHud((current) => {
+        if (!acceptsSessionGeneration(current.sessionGeneration, eventGeneration)) return current;
+        const chunkProgress = normalizeChunkProgress(event.payload.chunks_done, event.payload.total);
+        const nextCompleted = chunkProgress?.completed ?? current.completedChunks;
+        const nextTotal = chunkProgress?.total ?? current.totalChunks;
+        return current.progress === nextProgress
+          && current.completedChunks === nextCompleted
+          && current.totalChunks === nextTotal
+          ? current
+          : {
+            ...current,
+            progress: nextProgress,
+            completedChunks: nextCompleted,
+            totalChunks: nextTotal,
+          };
+      });
     });
     register<{ max_recording_secs: number; session_generation?: number }>("audio://limit", (event) => {
       const eventGeneration = event.payload.session_generation;
       if (!acceptsSessionGeneration(0, eventGeneration)) return;
       setHud((current) => !acceptsSessionGeneration(current.sessionGeneration, eventGeneration)
         ? current
-        : { ...current, sessionGeneration: eventGeneration, state: "recording_limited", phase: "idle", retryAfterSecs: null, fallbackReason: null, waveformLevels: emptyWaveform() });
+        : {
+          ...current,
+          sessionGeneration: eventGeneration,
+          state: "recording_limited",
+          phase: "idle",
+          retryAfterSecs: null,
+          fallbackReason: null,
+          waveformLevels: emptyWaveform(),
+          completedChunks: null,
+          totalChunks: null,
+        });
     });
     register<{ retry_after_secs: number; session_generation?: number }>("quota://rate_limited", (event) => {
       const eventGeneration = event.payload.session_generation;
       if (!acceptsSessionGeneration(0, eventGeneration)) return;
       setHud((current) => !acceptsSessionGeneration(current.sessionGeneration, eventGeneration)
         ? current
-        : { ...current, sessionGeneration: eventGeneration, state: "rate_limited", phase: "waiting_retry", retryAfterSecs: event.payload.retry_after_secs, fallbackReason: null, waveformLevels: emptyWaveform() });
+        : {
+          ...current,
+          sessionGeneration: eventGeneration,
+          state: "rate_limited",
+          phase: "waiting_retry",
+          retryAfterSecs: event.payload.retry_after_secs,
+          fallbackReason: null,
+          waveformLevels: emptyWaveform(),
+          completedChunks: null,
+          totalChunks: null,
+        });
     });
     register<{ state?: string }>("selected-action://state", (event) => {
       setHud((current) => ({
@@ -147,7 +287,7 @@ export function IslandWindow() {
 
   return (
     <div className="voice-pill-stage">
-      <VoicePill state={hud.state} phase={hud.phase} retryAfterSecs={hud.retryAfterSecs} undoAvailable={hud.undoAvailable} contextLabel={hud.contextLabel} fallbackReason={hud.fallbackReason} selectedActionState={hud.selectedActionState} waveformLevels={hud.waveformLevels} progress={hud.progress} reduced={reduced} />
+      <VoicePill state={hud.state} phase={hud.phase} retryAfterSecs={hud.retryAfterSecs} undoAvailable={hud.undoAvailable} contextLabel={hud.contextLabel} fallbackReason={hud.fallbackReason} selectedActionState={hud.selectedActionState} waveformLevels={hud.waveformLevels} progress={hud.progress} chunkProgress={hud.completedChunks != null && hud.totalChunks != null ? { completed: hud.completedChunks, total: hud.totalChunks } : null} partialText={hud.partialText} reduced={reduced} />
     </div>
   );
 }

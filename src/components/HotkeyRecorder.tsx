@@ -3,7 +3,7 @@ import { Keyboard } from "lucide-react";
 import { useHotkeyCapture } from "../hooks/useHotkeyCapture";
 import { ACTIVATION_MODES, type ActivationMode } from "../lib/activationCopy";
 import { hotkeyDisplayParts, isModifierOnlyHotkey, toTanStackHotkey } from "../lib/hotkeyFormat";
-import { radius } from "../lib/theme";
+import { radius, focusRingClass } from "../lib/theme";
 import { iconPropsSm } from "../lib/icons";
 import { useI18n } from "../lib/i18n";
 
@@ -88,7 +88,7 @@ export function HotkeyRecorder({
             beginRecording();
           }
         }}
-        className={`flex w-full cursor-pointer items-center gap-3 ${radius.control} border px-4 py-3 text-left text-sm transition-colors focus-visible:border-accent focus-visible:outline-none ${
+        className={`flex w-full cursor-pointer items-center gap-3 ${radius.control} border px-4 py-3 text-left text-sm transition-colors focus-visible:border-accent ${focusRingClass} ${
           recorder.isRecording ? "border-accent bg-elevated" : "border-border bg-elevated hover:border-accent/60"
         } ${disabled ? "cursor-not-allowed opacity-50" : ""}`}
       >

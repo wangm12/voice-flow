@@ -10,6 +10,38 @@ static CANCEL_REGISTERED: AtomicBool = AtomicBool::new(false);
 static REGISTRATION_ERROR: Mutex<Option<String>> = Mutex::new(None);
 static SELECTED_ACTION_REGISTERED: Mutex<Option<String>> = Mutex::new(None);
 
+pub const HYBRID_HOLD_MS: u64 = 280;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HybridReleaseAction {
+    Stop,
+    KeepRecording,
+    Ignore,
+}
+
+pub fn hybrid_release_action(elapsed_ms: u64, started_this_press: bool) -> HybridReleaseAction {
+    if !started_this_press {
+        return HybridReleaseAction::Ignore;
+    }
+    if elapsed_ms >= HYBRID_HOLD_MS {
+        HybridReleaseAction::Stop
+    } else {
+        HybridReleaseAction::KeepRecording
+    }
+}
+
+pub(crate) fn combo_hotkey_event(
+    activation_mode: &str,
+    state: ShortcutState,
+) -> Option<&'static str> {
+    match (activation_mode, state) {
+        ("hybrid", ShortcutState::Pressed) => Some("hotkey://press"),
+        ("hybrid", ShortcutState::Released) => Some("hotkey://release"),
+        (_, ShortcutState::Pressed) => Some("hotkey://toggle"),
+        _ => None,
+    }
+}
+
 pub fn registration_error() -> Option<String> {
     REGISTRATION_ERROR
         .lock()
@@ -160,14 +192,19 @@ pub fn register(app: &AppHandle, hotkey: &str, activation_mode: &str) -> Result<
             }
         };
 
+        let mode = activation_mode.to_string();
         plugin
             .on_shortcut(shortcut, move |app, _, event| {
-                if !is_suspended() && event.state == ShortcutState::Pressed {
-                    let app = app.clone();
-                    tauri::async_runtime::spawn(async move {
-                        let _ = app.emit("hotkey://toggle", ());
-                    });
+                if is_suspended() {
+                    return;
                 }
+                let Some(event_name) = combo_hotkey_event(&mode, event.state) else {
+                    return;
+                };
+                let app = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    let _ = app.emit(event_name, ());
+                });
             })
             .map_err(map_register_error(app))?;
     }
@@ -296,4 +333,71 @@ pub async fn apply_selected_action_hotkey(
         .map_err(|error| format!("selected action hotkey dispatch failed: {error}"))?;
     rx.await
         .map_err(|_| "selected action hotkey dispatch was cancelled".to_owned())?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hybrid_hold_release_stops() {
+        assert_eq!(
+            hybrid_release_action(400, true),
+            HybridReleaseAction::Stop
+        );
+    }
+
+    #[test]
+    fn hybrid_short_tap_release_keeps_recording() {
+        assert_eq!(
+            hybrid_release_action(80, true),
+            HybridReleaseAction::KeepRecording
+        );
+    }
+
+    #[test]
+    fn hybrid_hold_threshold_is_280ms() {
+        assert_eq!(HYBRID_HOLD_MS, 280);
+        assert_eq!(
+            hybrid_release_action(280, true),
+            HybridReleaseAction::Stop
+        );
+        assert_eq!(
+            hybrid_release_action(279, true),
+            HybridReleaseAction::KeepRecording
+        );
+    }
+
+    #[test]
+    fn hybrid_release_without_this_press_starting_is_ignored() {
+        assert_eq!(
+            hybrid_release_action(400, false),
+            HybridReleaseAction::Ignore
+        );
+        assert_eq!(
+            hybrid_release_action(80, false),
+            HybridReleaseAction::Ignore
+        );
+    }
+
+    #[test]
+    fn tap_mode_toggles_on_press_only() {
+        assert_eq!(
+            combo_hotkey_event("tap", ShortcutState::Pressed),
+            Some("hotkey://toggle")
+        );
+        assert_eq!(combo_hotkey_event("tap", ShortcutState::Released), None);
+    }
+
+    #[test]
+    fn hybrid_mode_emits_press_and_release() {
+        assert_eq!(
+            combo_hotkey_event("hybrid", ShortcutState::Pressed),
+            Some("hotkey://press")
+        );
+        assert_eq!(
+            combo_hotkey_event("hybrid", ShortcutState::Released),
+            Some("hotkey://release")
+        );
+    }
 }

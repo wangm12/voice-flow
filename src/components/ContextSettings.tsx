@@ -3,7 +3,7 @@ import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { AppWindowMac, FolderOpen, Globe, Plus, RefreshCw, ScanSearch, Trash2 } from "lucide-react";
-import { colors, radius, buttonClass, secondaryButtonClass } from "../lib/theme";
+import { colors, radius, buttonClass, secondaryButtonClass, focusRingClass } from "../lib/theme";
 import { useI18n } from "../lib/i18n";
 import { IconButton } from "./IconButton";
 import { Toggle } from "./Toggle";
@@ -632,10 +632,10 @@ export function ContextSettings({
           <label className="block text-xs text-secondary">{t("写作模式")}<select aria-label={t("应用映射写作模式")} value={selectedMappingMode?.id ?? ""} onChange={(event) => setSelectedModeId(event.target.value)} disabled={busy || savedWritingModes.length === 0} className={`mt-1 w-full ${fieldClass}`}>{savedWritingModes.map((mode) => <option key={mode.id} value={mode.id}>{t(mode.label)}{mode.builtin ? "" : ` · ${t("自定义")}`}</option>)}</select></label>
           <div className="grid gap-3 sm:grid-cols-2">
             <label className="block text-xs text-secondary">{t("示例输入")}
-              <textarea aria-label={t("App 风格示例输入")} value={styleExampleInput} onChange={(event) => setStyleExampleInput(event.target.value)} maxLength={2_000} rows={3} disabled={busy || !selectedApplicationId} placeholder={t("说一句典型的话…")} className={`mt-1 w-full resize-y rounded-lg border ${colors.border} ${colors.bg.elevated} ${colors.text.primary} px-3 py-2 text-sm outline-none focus:border-accent`} />
+              <textarea aria-label={t("App 风格示例输入")} value={styleExampleInput} onChange={(event) => setStyleExampleInput(event.target.value)} maxLength={2_000} rows={3} disabled={busy || !selectedApplicationId} placeholder={t("贴一条你平时微信怎么打")} className={`mt-1 w-full resize-y rounded-lg border ${colors.border} ${colors.bg.elevated} ${colors.text.primary} px-3 py-2 text-sm outline-none focus:border-accent ${focusRingClass}`} />
             </label>
             <label className="block text-xs text-secondary">{t("期望输出")}
-              <textarea aria-label={t("App 风格期望输出")} value={styleExampleOutput} onChange={(event) => setStyleExampleOutput(event.target.value)} maxLength={2_000} rows={3} disabled={busy || !selectedApplicationId} placeholder={t("希望 VoiceFlow 输出的样子…")} className={`mt-1 w-full resize-y rounded-lg border ${colors.border} ${colors.bg.elevated} ${colors.text.primary} px-3 py-2 text-sm outline-none focus:border-accent`} />
+              <textarea aria-label={t("App 风格期望输出")} value={styleExampleOutput} onChange={(event) => setStyleExampleOutput(event.target.value)} maxLength={2_000} rows={3} disabled={busy || !selectedApplicationId} placeholder={t("希望 VoiceFlow 输出的样子…")} className={`mt-1 w-full resize-y rounded-lg border ${colors.border} ${colors.bg.elevated} ${colors.text.primary} px-3 py-2 text-sm outline-none focus:border-accent ${focusRingClass}`} />
             </label>
           </div>
           <p className="text-xs text-tertiary">{t("保存后只作为这个 App 的本地整理参考，不会自动从历史记录学习。")} {t("确认后的 App 风格样例会发送给当前配置的 LLM 服务。")} </p>

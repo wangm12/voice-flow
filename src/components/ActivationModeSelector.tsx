@@ -12,12 +12,12 @@ export function ActivationModeSelector({
   modifierOnly?: boolean;
 }) {
   const { t } = useI18n();
-  const allowed: ActivationMode = modifierOnly ? "double_tap" : "tap";
+  const enabled = (mode: ActivationMode) => (modifierOnly ? mode === "double_tap" : mode !== "double_tap");
   return (
-    <div className="space-y-2" role="radiogroup" aria-describedby={modifierOnly ? "activation-mode-modifier-hint" : undefined}>
+    <div className="space-y-2" role="radiogroup" aria-label={t("激活方式")} aria-describedby={modifierOnly ? "activation-mode-modifier-hint" : undefined}>
       {ACTIVATION_MODES.map((mode) => {
         const active = (modifierOnly ? "double_tap" : value) === mode.id;
-        const disabled = mode.id !== allowed;
+        const disabled = !enabled(mode.id);
         return (
           <label
             key={mode.id}

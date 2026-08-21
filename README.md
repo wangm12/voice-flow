@@ -134,7 +134,7 @@ Context 只作为文字整理的软提示，用户实际说出的内容优先。
 - 录音目标在开始时锁定；目标改变会触发 fail-closed，结果改走剪贴板。
 - history retry 始终是 clipboard-only，不会把旧记录注入到当前可能不同的 App。
 - 支持配置恢复音频和历史文字的保留时间，也支持导出、删除和清空。
-- 当前 history SQLite 和恢复音频依赖 macOS 文件权限，未做应用层加密。
+- 默认 history SQLite 和恢复音频依赖 macOS 文件权限；可选的 recovery spool 应用层加密不会默认开启。
 
 完整数据流和删除说明见 [`docs/privacy.md`](docs/privacy.md)。
 

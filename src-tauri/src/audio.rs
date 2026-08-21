@@ -1,6 +1,6 @@
 //! Microphone capture and crash-safe audio spooling.
 use crate::chunker::{AudioChunk, Chunker, ChunkerConfig};
-use crate::realtime_asr::{PrefetchInbox, RealtimeMessage};
+use crate::prefetch_asr::{PrefetchInbox, PrefetchMessage};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use rubato::Resampler;
 use serde::Serialize;
@@ -98,7 +98,8 @@ enum EngineCmd {
         input_device: String,
         chunk_length_secs: usize,
         max_recording_secs: usize,
-        realtime_tx: PrefetchInbox,
+        input_gain: f32,
+        prefetch_tx: PrefetchInbox,
         reply: mpsc::Sender<Result<StartHandle, AudioError>>,
     },
     Stop {
@@ -284,7 +285,8 @@ impl CaptureWorker {
         input_rate: u32,
         max_samples: usize,
         chunk_length_secs: usize,
-        realtime_tx: PrefetchInbox,
+        input_gain: f32,
+        prefetch_tx: PrefetchInbox,
         auto_stop_tx: mpsc::Sender<EngineCmd>,
         app: AppHandle,
     ) -> Result<Self, AudioError> {
@@ -303,8 +305,9 @@ impl CaptureWorker {
         let join = thread::spawn(move || {
             let mut resampler = resampler;
             let mut data = Vec::new();
-            let mut realtime_chunker = Chunker::new(ChunkerConfig { chunk_length_secs });
-            let warmup_samples = crate::realtime_asr::WARMUP_CHUNK_SECS * TARGET_RATE as usize;
+            // Batch prefetch uploads completed files; this is not streaming ASR.
+            let mut prefetch_chunker = Chunker::new(ChunkerConfig { chunk_length_secs });
+            let warmup_samples = crate::prefetch_asr::WARMUP_CHUNK_SECS * TARGET_RATE as usize;
             let mut warmup_pending = Vec::with_capacity(warmup_samples);
             let mut warmup_sent = false;
             let mut processing_error: Option<String> = None;
@@ -328,7 +331,7 @@ impl CaptureWorker {
                             let _ = recycle_tx.try_send(input);
                             continue;
                         }
-                        let produced = match resampler.push(&input) {
+                        let mut produced = match resampler.push(&input) {
                             Ok(produced) => produced,
                             Err(error) => {
                                 if processing_error.is_none() {
@@ -347,6 +350,7 @@ impl CaptureWorker {
                         };
                         input.clear();
                         let _ = recycle_tx.try_send(input);
+                        apply_input_gain(&mut produced, input_gain);
                         if produced.is_empty() {
                             continue;
                         }
@@ -368,20 +372,21 @@ impl CaptureWorker {
                                     index: 0,
                                     samples: std::mem::take(&mut warmup_pending),
                                     start_secs: 0.0,
-                                    end_secs: crate::realtime_asr::WARMUP_CHUNK_SECS as f32,
+                                    end_secs: crate::prefetch_asr::WARMUP_CHUNK_SECS as f32,
                                 };
-                                warmup_sent = realtime_tx.try_send(RealtimeMessage::Warmup(warmup));
+                                warmup_sent =
+                                    prefetch_tx.try_send(PrefetchMessage::Warmup(warmup));
                             }
                         }
-                        for chunk in realtime_chunker.push(&produced[..accepted]) {
-                            let _ = realtime_tx.try_send(RealtimeMessage::Chunk(chunk));
+                        for chunk in prefetch_chunker.push(&produced[..accepted]) {
+                            let _ = prefetch_tx.try_send(PrefetchMessage::Chunk(chunk));
                         }
                         if hit_limit && !worker_limit_reached.swap(true, Ordering::AcqRel) {
                             let _ = auto_stop_tx.send(EngineCmd::AutoStop { app: app.clone() });
                         }
                     }
                     CaptureCommand::Finish { reply } => {
-                        let trailing = match resampler.finish() {
+                        let mut trailing = match resampler.finish() {
                             Ok(trailing) => trailing,
                             Err(error) => {
                                 if processing_error.is_none() {
@@ -390,6 +395,7 @@ impl CaptureWorker {
                                 Vec::new()
                             }
                         };
+                        apply_input_gain(&mut trailing, input_gain);
                         if !trailing.is_empty() {
                             let remaining = max_samples.saturating_sub(data.len());
                             let accepted = trailing.len().min(remaining);
@@ -410,13 +416,14 @@ impl CaptureWorker {
                                         index: 0,
                                         samples: std::mem::take(&mut warmup_pending),
                                         start_secs: 0.0,
-                                        end_secs: crate::realtime_asr::WARMUP_CHUNK_SECS as f32,
+                                        end_secs: crate::prefetch_asr::WARMUP_CHUNK_SECS as f32,
                                     };
-                                    let _ = realtime_tx.try_send(RealtimeMessage::Warmup(warmup));
+                                    let _ =
+                                        prefetch_tx.try_send(PrefetchMessage::Warmup(warmup));
                                 }
                             }
-                            for chunk in realtime_chunker.push(&trailing[..accepted]) {
-                                let _ = realtime_tx.try_send(RealtimeMessage::Chunk(chunk));
+                            for chunk in prefetch_chunker.push(&trailing[..accepted]) {
+                                let _ = prefetch_tx.try_send(PrefetchMessage::Chunk(chunk));
                             }
                         }
                         let spool_result = spool_writer
@@ -667,7 +674,8 @@ fn handle_cmd(cmd: EngineCmd, active: &mut Option<ActiveRec>) {
             input_device,
             chunk_length_secs,
             max_recording_secs,
-            realtime_tx,
+            input_gain,
+            prefetch_tx,
             reply,
         } => {
             if active.is_some() {
@@ -680,7 +688,8 @@ fn handle_cmd(cmd: EngineCmd, active: &mut Option<ActiveRec>) {
                 &input_device,
                 chunk_length_secs,
                 max_recording_secs,
-                realtime_tx,
+                input_gain,
+                prefetch_tx,
             ) {
                 Ok(rec) => {
                     let handle = StartHandle {};
@@ -758,7 +767,8 @@ fn build_stream(
     input_device: &str,
     chunk_length_secs: usize,
     max_recording_secs: usize,
-    realtime_tx: PrefetchInbox,
+    input_gain: f32,
+    prefetch_tx: PrefetchInbox,
 ) -> Result<ActiveRec, AudioError> {
     let host = cpal::default_host();
     let device = resolve_input_device(&host, input_device)?;
@@ -799,7 +809,8 @@ fn build_stream(
         rate,
         max_samples,
         chunk_length_secs,
-        realtime_tx,
+        input_gain,
+        prefetch_tx,
         auto_stop_tx.clone(),
         app.clone(),
     ) {
@@ -945,7 +956,8 @@ impl Recorder {
         session: &str,
         input_device: &str,
         chunk_length_secs: usize,
-        realtime_tx: PrefetchInbox,
+        input_gain: f32,
+        prefetch_tx: PrefetchInbox,
     ) -> Result<(), AudioError> {
         if self.active.is_some() {
             return Err(AudioError::Device("recording already active".into()));
@@ -959,7 +971,8 @@ impl Recorder {
                 input_device: input_device.to_owned(),
                 chunk_length_secs,
                 max_recording_secs: MAX_RECORDING_SECS,
-                realtime_tx,
+                input_gain,
+                prefetch_tx,
                 reply: tx,
             })
             .map_err(|_| AudioError::Device("audio engine stopped".into()))?;
@@ -1081,6 +1094,15 @@ fn smooth_audio_level(previous: f32, current: f32) -> f32 {
     previous + (current - previous) * response
 }
 
+fn apply_input_gain(samples: &mut [f32], gain: f32) {
+    if (gain - 1.0).abs() <= f32::EPSILON {
+        return;
+    }
+    for sample in samples.iter_mut() {
+        *sample *= gain;
+    }
+}
+
 fn append_bounded(samples: &mut Vec<f32>, produced: &[f32], max_samples: usize) -> bool {
     let remaining = max_samples.saturating_sub(samples.len());
     samples.extend_from_slice(&produced[..produced.len().min(remaining)]);
@@ -1124,8 +1146,18 @@ fn encode(input: Vec<f32>, spool: PathBuf) -> Result<Vec<u8>, AudioError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        append_bounded, normalized_audio_level, smooth_audio_level, StreamResampler, TARGET_RATE,
+        append_bounded, apply_input_gain, normalized_audio_level, smooth_audio_level,
+        StreamResampler, TARGET_RATE,
     };
+
+    #[test]
+    fn input_gain_multiplies_samples() {
+        let mut samples = vec![0.5, -0.25, 0.0];
+        apply_input_gain(&mut samples, 2.0);
+        assert_eq!(samples, vec![1.0, -0.5, 0.0]);
+        apply_input_gain(&mut samples, 1.0);
+        assert_eq!(samples, vec![1.0, -0.5, 0.0]);
+    }
 
     #[test]
     fn pass_through_resampler_keeps_native_target_rate_samples() {

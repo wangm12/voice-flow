@@ -1,4 +1,4 @@
-use crate::context::{ContextPolicy, ContextProfile};
+use crate::context::{default_writing_prompt, ContextFamily, ContextPolicy, ContextProfile};
 use futures_util::StreamExt;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
@@ -854,7 +854,10 @@ fn scene_guidance(policy: &ContextPolicy) -> &'static str {
     match policy.artifact_kind.as_str() {
         "email_body" => "Write a natural, polite email body. Organize spoken greeting, request, timing, and closing only when they were spoken. Do not create a subject line or signature.",
         "search_query_or_web_input" => "Prefer a concise search query or clear web-field value. Keep named entities, dates, numbers, and URLs exact. Do not add search background.",
-        "chat_message" => "Keep the message natural, short, and conversational. Do not turn it into an email or add greetings/sign-offs.",
+        "chat_message" if policy.formality == "casual" => {
+            default_writing_prompt(ContextFamily::PersonalChat)
+        }
+        "chat_message" => default_writing_prompt(ContextFamily::WorkChat),
         "task_update" => "Keep owners, status, blockers, dates, and next actions explicit. Do not invent a person, deadline, or project fact.",
         "calendar_or_task_entry" => "Keep dates, times, durations, reminders, attendees, locations, and next actions exact. Return a concise entry and do not invent scheduling details.",
         "developer_prompt_or_text" => "Preserve code, identifiers, paths, commands, API names, versions, and error text exactly. Organize a spoken coding request without generating code unless it was spoken.",
@@ -878,14 +881,16 @@ fn profile_guidance(profile: &ContextProfile) -> &'static str {
         "email.gmail" | "email.outlook" | "email.native" | "email.focused" | "email.window" => {
             "This is an email surface. Keep the body clear and professional only to the extent supported by the transcript."
         }
+        "chat.personal" | "chat.personal.window" => {
+            "This is a personal chat surface. Keep the user's casual chat voice; do not add greetings or sanitize swears."
+        }
         "chat.slack"
         | "chat.teams"
         | "chat.native"
-        | "chat.personal"
+        | "chat.team"
         | "chat.focused"
-        | "chat.team.window"
-        | "chat.personal.window" => {
-            "This is a conversation surface. Keep the result concise and natural."
+        | "chat.team.window" => {
+            "This is a workplace chat surface. Keep the message short and conversational; do not turn it into an email."
         }
         "document.notion" | "document.google_docs" | "document.google_drive"
         | "document.native" | "document.focused" | "document.window" => {
@@ -1794,5 +1799,55 @@ data: [DONE]
         let policy = ContextPolicy::for_family(crate::context::ContextFamily::CalendarTask);
         assert!(scene_guidance(&policy).contains("dates"));
         assert!(profile_guidance(&profile).contains("reminders"));
+    }
+
+    #[test]
+    fn empty_writing_prompt_casual_chat_uses_personal_chat_guidance() {
+        let policy = ContextPolicy::for_family(crate::context::ContextFamily::PersonalChat);
+        assert!(
+            policy
+                .writing_prompt
+                .as_deref()
+                .unwrap_or("")
+                .trim()
+                .is_empty()
+        );
+        let guidance = scene_guidance(&policy);
+        assert!(
+            guidance.contains("哈哈") || guidance.contains("您好"),
+            "casual chat fallback should keep 哈哈 or forbid 您好: {guidance}"
+        );
+    }
+
+    #[test]
+    fn empty_writing_prompt_work_chat_differs_from_personal() {
+        let personal =
+            scene_guidance(&ContextPolicy::for_family(crate::context::ContextFamily::PersonalChat));
+        let work =
+            scene_guidance(&ContextPolicy::for_family(crate::context::ContextFamily::WorkChat));
+        assert_ne!(personal, work);
+    }
+
+    #[test]
+    fn personal_profile_guidance_differs_from_slack() {
+        let personal = ContextProfile {
+            id: "chat.personal".into(),
+            family: crate::context::ContextFamily::PersonalChat,
+            writing_mode_id: None,
+            app_label: "WeChat".into(),
+            icon_key: "chat".into(),
+            source: crate::context::ContextSource::NativeProcess,
+            confidence: 0.9,
+        };
+        let slack = ContextProfile {
+            id: "chat.slack".into(),
+            family: crate::context::ContextFamily::WorkChat,
+            writing_mode_id: None,
+            app_label: "Slack".into(),
+            icon_key: "chat".into(),
+            source: crate::context::ContextSource::NativeProcess,
+            confidence: 0.9,
+        };
+        assert_ne!(profile_guidance(&personal), profile_guidance(&slack));
     }
 }

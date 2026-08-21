@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
 import { I18nProvider } from "../../lib/i18n";
@@ -53,6 +53,7 @@ describe("History", () => {
     render(<History items={[item]} reload={reload} hasMore={false} loading={false} onLoadMore={vi.fn()} />);
 
     fireEvent.click(screen.getByRole("button", { name: "清空全部数据" }));
+    expect(screen.getByRole("dialog")).toHaveTextContent("不会删除 Keychain 中的 API Key");
     fireEvent.click(screen.getByRole("button", { name: "确定继续" }));
 
     await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("clear_all_data"));
@@ -170,10 +171,184 @@ describe("History", () => {
     expect(onLoadMore).toHaveBeenCalledOnce();
   });
 
+  it("debounces server searches by 200 milliseconds", () => {
+    vi.useFakeTimers();
+    const onQueryChange = vi.fn();
+    render(
+      <History
+        items={[item]}
+        reload={vi.fn()}
+        hasMore={false}
+        loading={false}
+        onLoadMore={vi.fn()}
+        onQueryChange={onQueryChange}
+      />,
+    );
+
+    fireEvent.change(screen.getByRole("textbox", { name: "搜索历史记录" }), {
+      target: { value: "VoiceFlow" },
+    });
+    expect(onQueryChange).not.toHaveBeenCalled();
+
+    act(() => {
+      vi.advanceTimersByTime(199);
+    });
+    expect(onQueryChange).not.toHaveBeenCalled();
+
+    act(() => {
+      vi.advanceTimersByTime(1);
+    });
+    expect(onQueryChange).toHaveBeenCalledWith("VoiceFlow");
+  });
+
+  it("distinguishes no global search matches from an unloaded search range", () => {
+    const { rerender } = render(
+      <History
+        items={[item]}
+        reload={vi.fn()}
+        hasMore
+        loading={false}
+        onLoadMore={vi.fn()}
+      />,
+    );
+    fireEvent.change(screen.getByRole("textbox", { name: "搜索历史记录" }), {
+      target: { value: "missing" },
+    });
+    expect(screen.getByText("当前已加载的记录中没有匹配项。")).toBeInTheDocument();
+
+    rerender(
+      <History
+        items={[]}
+        reload={vi.fn()}
+        hasMore={false}
+        loading={false}
+        onLoadMore={vi.fn()}
+      />,
+    );
+    fireEvent.change(screen.getByRole("textbox", { name: "搜索历史记录" }), {
+      target: { value: "missing" },
+    });
+    expect(screen.getByText("全库没有匹配的记录。")).toBeInTheDocument();
+  });
+
+  it("applies content-visibility to each row in a long list", () => {
+    const items = Array.from({ length: 51 }, (_, index) => ({ ...item, id: index + 1 }));
+    const { container } = render(
+      <History items={items} reload={vi.fn()} hasMore={false} loading={false} onLoadMore={vi.fn()} />,
+    );
+
+    expect(container.querySelectorAll(".history-list--windowed")).toHaveLength(51);
+  });
+
   it("shows an explicit initial loading state", () => {
     render(<History items={[]} reload={vi.fn()} hasMore={false} loading={true} onLoadMore={vi.fn()} />);
 
     expect(screen.getByRole("status", { name: "正在加载历史记录…" })).toBeInTheDocument();
     expect(screen.queryByText("还没有记录，按热键说一句吧")).not.toBeInTheDocument();
+  });
+
+  it("shows CJK dictionary candidates from Rust after saving an edit", async () => {
+    invokeMock.mockImplementation(async (command) => {
+      if (command === "suggest_dictionary_entries") return ["知乎"];
+      return undefined;
+    });
+    render(
+      <History
+        items={[{ ...item, raw_text: "知呼", final_text: "知呼" }]}
+        reload={vi.fn()}
+        hasMore={false}
+        loading={false}
+        onLoadMore={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "编辑这条历史记录" }));
+    fireEvent.change(screen.getByRole("textbox", { name: "编辑整理结果" }), { target: { value: "知乎" } });
+    fireEvent.click(screen.getByRole("button", { name: "保存历史版本" }));
+
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("suggest_dictionary_entries", { before: "知呼", after: "知乎" }),
+    );
+    expect(await screen.findByRole("button", { name: '确认 “知乎”' })).toBeInTheDocument();
+  });
+
+  it("confirms a dictionary candidate into settings and respects the 256 cap", async () => {
+    const existing = Array.from({ length: 256 }, (_, index) => `word-${index}`);
+    invokeMock.mockImplementation(async (command) => {
+      if (command === "suggest_dictionary_entries") return ["知乎"];
+      if (command === "get_settings") return { dictionary: existing };
+      return undefined;
+    });
+    render(
+      <History
+        items={[{ ...item, raw_text: "知呼", final_text: "知呼" }]}
+        reload={vi.fn()}
+        hasMore={false}
+        loading={false}
+        onLoadMore={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "编辑这条历史记录" }));
+    fireEvent.change(screen.getByRole("textbox", { name: "编辑整理结果" }), { target: { value: "知乎" } });
+    fireEvent.click(screen.getByRole("button", { name: "保存历史版本" }));
+    fireEvent.click(await screen.findByRole("button", { name: '确认 “知乎”' }));
+
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("get_settings"));
+    expect(invokeMock.mock.calls.some(([command]) => command === "update_settings_patch")).toBe(false);
+  });
+
+  it("hides dictionary suggestions when learning is disabled", async () => {
+    invokeMock.mockImplementation(async (command) => {
+      if (command === "suggest_dictionary_entries") return [];
+      if (command === "get_settings") return { dictionary: [], dictionary_learn_enabled: false };
+      return undefined;
+    });
+    render(
+      <History
+        items={[{ ...item, raw_text: "知呼", final_text: "知呼" }]}
+        reload={vi.fn()}
+        hasMore={false}
+        loading={false}
+        onLoadMore={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "编辑这条历史记录" }));
+    fireEvent.change(screen.getByRole("textbox", { name: "编辑整理结果" }), { target: { value: "知乎" } });
+    fireEvent.click(screen.getByRole("button", { name: "保存历史版本" }));
+
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("suggest_dictionary_entries", { before: "知呼", after: "知乎" }),
+    );
+    expect(screen.queryByText("可能的词典建议")).not.toBeInTheDocument();
+  });
+
+  it("writes a confirmed candidate into the dictionary", async () => {
+    invokeMock.mockImplementation(async (command) => {
+      if (command === "suggest_dictionary_entries") return ["Python"];
+      if (command === "get_settings") return { dictionary: ["VoiceFlow"] };
+      return undefined;
+    });
+    render(
+      <History
+        items={[{ ...item, raw_text: "配森", final_text: "配森" }]}
+        reload={vi.fn()}
+        hasMore={false}
+        loading={false}
+        onLoadMore={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "编辑这条历史记录" }));
+    fireEvent.change(screen.getByRole("textbox", { name: "编辑整理结果" }), { target: { value: "Python" } });
+    fireEvent.click(screen.getByRole("button", { name: "保存历史版本" }));
+    fireEvent.click(await screen.findByRole("button", { name: '确认 “Python”' }));
+
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("update_settings_patch", {
+        patch: { dictionary: ["VoiceFlow", "Python"] },
+      }),
+    );
   });
 });

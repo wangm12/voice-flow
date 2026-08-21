@@ -1,8 +1,21 @@
+import { deliveryReasonMessage } from "../../lib/deliveryCopy";
+
 export const voicePillHeight = 34;
 // Keep the transparent native surface close to the visible HUD. A large
 // transparent WebView still participates in WindowServer composition.
 export const voicePillWindowWidth = 172;
+export const voicePillWindowWidthWithPartial = 400;
 export const voicePillWindowHeight = 60;
+export const voicePillCaptionMaxWidth = 164;
+export const voicePillCaptionMaxWidthWithPartial = 360;
+
+export function voicePillWindowWidthForPartial(hasPartial: boolean): number {
+  return hasPartial ? voicePillWindowWidthWithPartial : voicePillWindowWidth;
+}
+
+export function voicePillCaptionMaxWidthForPartial(hasPartial: boolean): number {
+  return hasPartial ? voicePillCaptionMaxWidthWithPartial : voicePillCaptionMaxWidth;
+}
 
 /** Compact fixed width; state labels ellipsize inside the center slot. */
 export function voicePillWidthForState(state: string): number {
@@ -10,18 +23,44 @@ export function voicePillWidthForState(state: string): number {
   return 132;
 }
 
+export const selectedActionCaptionLabels: Record<string, string> = {
+  waiting_for_selection: "等待选中文本",
+  listening: "正在听取操作",
+  preparing_rewrite: "正在准备改写",
+  accessibility_required: "需要辅助功能权限",
+  replaced: "已替换选中文本",
+  copied_instead: "目标变化，结果已复制",
+};
+
+export function selectedActionCaption(
+  state: string | null | undefined,
+  translate: (source: string) => string = (source) => source,
+): string | null {
+  if (!state) return null;
+  const label = selectedActionCaptionLabels[state];
+  return label ? translate(label) : null;
+}
+
+type PillCaptionOptions = {
+  fallbackReason?: string | null;
+  selectedActionState?: string | null;
+  contextLabel?: string | null;
+  partialText?: string | null;
+  chunkProgress?: {
+    completed: number;
+    total: number;
+  } | null;
+};
+
+const CONTEXT_LABEL_STATES = new Set(["recording", "recording_limited", "starting", "processing"]);
+
 export function pillCaption(
   state: string,
   translate: (source: string) => string = (source) => source,
   retryAfterSecs?: number | null,
+  options?: PillCaptionOptions,
 ): string | null {
   switch (state) {
-    case "recording":
-      return null;
-    case "processing":
-      return null;
-    case "recording_limited":
-      return translate("已达上限 · 按热键结束");
     case "rate_limited": {
       const base = translate("处理时间比平时长…");
       if (retryAfterSecs != null && retryAfterSecs > 0) {
@@ -29,11 +68,69 @@ export function pillCaption(
       }
       return base;
     }
-    case "degraded":
+    case "degraded": {
+      const fallbackCaption = deliveryReasonMessage(options?.fallbackReason, translate);
+      if (fallbackCaption) return fallbackCaption;
       return translate("部分结果已保存，请检查后再使用");
+    }
     case "error":
       return translate("语音输入失败，请重试");
     default:
-      return null;
+      break;
   }
+
+  const fallbackCaption = deliveryReasonMessage(options?.fallbackReason, translate);
+  if (fallbackCaption) return fallbackCaption;
+
+  let statusCaption: string | null = null;
+  if (state === "recording_limited") {
+    statusCaption = translate("已达上限 · 按热键结束");
+  }
+
+  const selectedState = options?.selectedActionState;
+  if (!statusCaption && state === "processing" && selectedState === "preparing_rewrite") {
+    statusCaption = selectedActionCaption("preparing_rewrite", translate);
+  }
+  if (!statusCaption && state === "recording" && selectedState === "listening") {
+    statusCaption = selectedActionCaption("listening", translate);
+  }
+  if (!statusCaption && state === "idle" && selectedState) {
+    statusCaption = selectedActionCaption(selectedState, translate);
+  }
+  if (!statusCaption && selectedState && ["copied", "done", "unverified"].includes(state)) {
+    statusCaption = selectedActionCaption(selectedState, translate);
+  }
+
+  const contextLabel = CONTEXT_LABEL_STATES.has(state) ? options?.contextLabel?.trim() || null : null;
+  if (statusCaption) {
+    if (contextLabel) return `${contextLabel} · ${statusCaption}`;
+    return statusCaption;
+  }
+
+  const partialText = CONTEXT_LABEL_STATES.has(state) ? options?.partialText?.trim() || null : null;
+  if (partialText) {
+    if (contextLabel) return `${contextLabel} · ${partialText}`;
+    return partialText;
+  }
+
+  const chunkProgress = options?.chunkProgress;
+  if (
+    state === "processing"
+    && chunkProgress
+    && chunkProgress.total > 0
+    && chunkProgress.completed >= 0
+    && chunkProgress.completed <= chunkProgress.total
+  ) {
+    statusCaption = `${translate("正在识别")} ${chunkProgress.completed}/${chunkProgress.total}`;
+  }
+
+  if (contextLabel && statusCaption) return `${contextLabel} · ${statusCaption}`;
+  if (contextLabel) return contextLabel;
+  return statusCaption;
+}
+
+export function hasSelectedActionCaption(
+  selectedActionState: string | null | undefined,
+): boolean {
+  return Boolean(selectedActionState && selectedActionCaptionLabels[selectedActionState]);
 }

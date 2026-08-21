@@ -1,5 +1,7 @@
-import { useEffect, useRef } from "react";
-import { buttonClass, colors, secondaryButtonClass } from "../lib/theme";
+import { useRef } from "react";
+import { createPortal } from "react-dom";
+import { useDialogBehavior } from "../lib/focusTrap";
+import { buttonClass, colors, focusRingClass, secondaryButtonClass } from "../lib/theme";
 
 export function ConfirmDialog({
   open,
@@ -21,20 +23,21 @@ export function ConfirmDialog({
   onCancel: () => void;
 }) {
   const dialogRef = useRef<HTMLElement>(null);
-  const previousFocusRef = useRef<HTMLElement | null>(null);
-  useEffect(() => {
-    if (!open) return;
-    previousFocusRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
-    dialogRef.current?.focus();
-    return () => {
-      previousFocusRef.current?.focus();
-    };
-  }, [open]);
+  const restoreFocusRef = useRef<HTMLElement | null>(null);
+
+  useDialogBehavior({
+    open,
+    dialogRef,
+    onCancel,
+    restoreFocusRef,
+    isolateBackground: open,
+  });
 
   if (!open) return null;
 
-  return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/35 p-5">
+  return createPortal(
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-5">
+      <div role="presentation" className="absolute inset-0 bg-black/35" onClick={onCancel} />
       <section
         ref={dialogRef}
         tabIndex={-1}
@@ -42,13 +45,8 @@ export function ConfirmDialog({
         aria-modal="true"
         aria-labelledby="confirm-dialog-title"
         aria-describedby="confirm-dialog-description"
-        onKeyDown={(event) => {
-          if (event.key === "Escape") {
-            event.preventDefault();
-            onCancel();
-          }
-        }}
-        className={`w-full max-w-md rounded-2xl border ${colors.border} ${colors.bg.card} p-5 outline-none focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent`}
+        onClick={(event) => event.stopPropagation()}
+        className={`relative w-full max-w-md rounded-2xl border ${colors.border} ${colors.bg.card} p-5 outline-none ${focusRingClass}`}
       >
         <h2 id="confirm-dialog-title" className="text-base font-semibold text-primary">{title}</h2>
         <p id="confirm-dialog-description" className="mt-2 text-sm leading-6 text-secondary">{description}</p>
@@ -57,7 +55,7 @@ export function ConfirmDialog({
           <button
             type="button"
             className={danger
-              ? "inline-flex h-9 items-center rounded-xl border border-error/30 bg-error/10 px-4 text-sm font-medium text-error transition-colors hover:bg-error/15 focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent"
+              ? `inline-flex h-9 items-center rounded-xl border border-error/30 bg-error/10 px-4 text-sm font-medium text-error transition-colors hover:bg-error/15 ${focusRingClass}`
               : buttonClass}
             onClick={onConfirm}
           >
@@ -65,6 +63,7 @@ export function ConfirmDialog({
           </button>
         </div>
       </section>
-    </div>
+    </div>,
+    document.body,
   );
 }

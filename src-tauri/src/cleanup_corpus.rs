@@ -427,6 +427,33 @@ const CASES: &[CleanupCase] = &[
         allow_rewrite: false,
         preserve_structure: true,
     },
+    CleanupCase {
+        name: "zh_wechat_casual",
+        raw: "好的哈哈我晚点回你",
+        expected: "好的哈哈我晚点回你",
+        protected_tokens: &["哈哈", "晚点"],
+        context_family: "personal_chat",
+        allow_rewrite: false,
+        preserve_structure: true,
+    },
+    CleanupCase {
+        name: "zh_wechat_swear_kept",
+        raw: "这破需求我晚点再改",
+        expected: "这破需求我晚点再改",
+        protected_tokens: &["破"],
+        context_family: "personal_chat",
+        allow_rewrite: false,
+        preserve_structure: true,
+    },
+    CleanupCase {
+        name: "work_chat_not_email",
+        raw: "can you ping Maya about the launch when you have a minute",
+        expected: "Can you ping Maya about the launch when you have a minute?",
+        protected_tokens: &["Maya"],
+        context_family: "work_chat",
+        allow_rewrite: true,
+        preserve_structure: true,
+    },
 ];
 
 #[cfg(test)]
@@ -440,8 +467,45 @@ mod tests {
         assert!(CASES
             .iter()
             .any(|case| case.context_family == "prompt_or_code"));
+        assert!(CASES
+            .iter()
+            .any(|case| case.context_family == "personal_chat"));
         assert!(CASES.iter().any(|case| case.name == "zh_self_correction"));
         assert!(CASES.iter().any(|case| case.name == "long_chunk_boundary"));
+    }
+
+    #[test]
+    fn personal_chat_cases_keep_casual_voice() {
+        let casual = CASES
+            .iter()
+            .find(|case| case.name == "zh_wechat_casual")
+            .expect("zh_wechat_casual");
+        assert_eq!(casual.raw, "好的哈哈我晚点回你");
+        assert_eq!(casual.context_family, "personal_chat");
+        assert!(!casual.allow_rewrite);
+        assert!(casual.expected.contains("哈哈"));
+        assert!(casual.expected.contains("晚点"));
+        assert!(!casual.expected.contains("您好"));
+        assert!(!casual.expected.contains("稍后回复"));
+
+        let swear = CASES
+            .iter()
+            .find(|case| case.name == "zh_wechat_swear_kept")
+            .expect("zh_wechat_swear_kept");
+        assert_eq!(swear.context_family, "personal_chat");
+        assert!(!swear.allow_rewrite);
+        assert!(!swear.expected.contains("有待商榷"));
+
+        let work = CASES
+            .iter()
+            .find(|case| case.name == "work_chat_not_email")
+            .expect("work_chat_not_email");
+        assert_eq!(work.context_family, "work_chat");
+        let lower = work.expected.to_ascii_lowercase();
+        assert!(!lower.contains("dear "));
+        assert!(!lower.contains("best regards"));
+        assert!(!lower.starts_with("hello"));
+        assert!(!lower.starts_with("hi "));
     }
 
     #[test]

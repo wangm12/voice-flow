@@ -5,9 +5,18 @@ use tauri::{AppHandle, Monitor};
 
 /// Logical window size in points (pill animates inside, centered).
 const PILL_WIDTH: f64 = 172.0;
+pub const PILL_WIDTH_WITH_PARTIAL: f64 = 400.0;
 const PILL_HEIGHT: f64 = 60.0;
 /// Gap between pill bottom edge and top of dock / screen edge.
 const BOTTOM_GAP: f64 = 12.0;
+
+pub fn pill_window_width(has_partial: bool) -> f64 {
+    if has_partial {
+        PILL_WIDTH_WITH_PARTIAL
+    } else {
+        PILL_WIDTH
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 struct ScreenRect {
@@ -34,7 +43,7 @@ pub struct IslandPlacement {
     pub height: f64,
 }
 
-fn placement_for_monitor(monitor: &Monitor) -> IslandPlacement {
+fn placement_for_monitor(monitor: &Monitor, pill_width: f64) -> IslandPlacement {
     let scale = monitor.scale_factor();
     let pos = monitor.position();
     let size = monitor.size();
@@ -53,6 +62,7 @@ fn placement_for_monitor(monitor: &Monitor) -> IslandPlacement {
             height: work_area.size.height as f64,
         },
         scale,
+        pill_width,
     )
 }
 
@@ -116,12 +126,16 @@ fn point_in_monitor_logical(
 }
 
 pub fn placement_for_cursor_screen(app: &AppHandle) -> IslandPlacement {
+    placement_for_cursor_screen_with_width(app, pill_window_width(false))
+}
+
+pub fn placement_for_cursor_screen_with_width(app: &AppHandle, pill_width: f64) -> IslandPlacement {
     if let Some(monitor) = monitor_for_cursor(app).or_else(|| app.primary_monitor().ok().flatten())
     {
-        return placement_for_monitor(&monitor);
+        return placement_for_monitor(&monitor, pill_width);
     }
 
-    placement_for_monitor_at_scale(0.0, 0.0, 1440.0, 900.0, 1.0, 56.0)
+    placement_for_monitor_at_scale_with_width(0.0, 0.0, 1440.0, 900.0, 1.0, 56.0, pill_width)
 }
 
 fn placement_for_monitor_at_scale(
@@ -131,6 +145,26 @@ fn placement_for_monitor_at_scale(
     monitor_height: f64,
     scale: f64,
     dock_inset: f64,
+) -> IslandPlacement {
+    placement_for_monitor_at_scale_with_width(
+        origin_x,
+        origin_y,
+        monitor_width,
+        monitor_height,
+        scale,
+        dock_inset,
+        PILL_WIDTH,
+    )
+}
+
+fn placement_for_monitor_at_scale_with_width(
+    origin_x: f64,
+    origin_y: f64,
+    monitor_width: f64,
+    monitor_height: f64,
+    scale: f64,
+    dock_inset: f64,
+    pill_width: f64,
 ) -> IslandPlacement {
     placement_for_monitor_rect(
         ScreenRect {
@@ -146,6 +180,7 @@ fn placement_for_monitor_at_scale(
             height: monitor_height - dock_inset * scale,
         },
         scale,
+        pill_width,
     )
 }
 
@@ -153,8 +188,9 @@ fn placement_for_monitor_rect(
     frame: ScreenRect,
     work_area: ScreenRect,
     scale: f64,
+    pill_width: f64,
 ) -> IslandPlacement {
-    let width = PILL_WIDTH * scale;
+    let width = pill_width * scale;
     let height = PILL_HEIGHT * scale;
     let raw_x = work_area.x + (work_area.width - width) / 2.0;
     let raw_y = work_area.y + work_area.height - height - BOTTOM_GAP * scale;
@@ -183,6 +219,23 @@ mod tests {
     fn centers_pill_above_dock() {
         let p = placement_for_monitor_at_scale(100.0, 20.0, 1440.0, 900.0, 1.0, 56.0);
         assert_eq!((p.x, p.y, p.width, p.height), (734.0, 792.0, 172.0, 60.0));
+        assert_eq!(pill_window_width(false), PILL_WIDTH);
+    }
+
+    #[test]
+    fn uses_partial_width_when_expected() {
+        assert_eq!(pill_window_width(true), PILL_WIDTH_WITH_PARTIAL);
+        assert_eq!(PILL_WIDTH_WITH_PARTIAL, 400.0);
+        let p = placement_for_monitor_at_scale_with_width(
+            100.0,
+            20.0,
+            1440.0,
+            900.0,
+            1.0,
+            56.0,
+            pill_window_width(true),
+        );
+        assert_eq!((p.x, p.y, p.width, p.height), (620.0, 792.0, 400.0, 60.0));
     }
 
     #[test]

@@ -31,7 +31,7 @@ flowchart LR
 
 ## 2. 长录音
 
-1. 超过分段阈值后，音频按 chunk 处理，HUD 只显示 indicator，不显示文字。
+1. 超过分段阈值后，音频按 chunk 处理；HUD 在 caption chip 中显示 `正在识别 3/8` 这类进度，132×34 药丸仍保持紧凑。
 2. 所有 chunk 完成后合并 transcript，再执行一次 cleanup 和 protected-fact 校验。
 3. Settings 的“长录音输出”使用 `delivery_policy`：
 
@@ -41,6 +41,8 @@ flowchart LR
    - 仅保存到历史：不修改当前 App，也不覆盖剪贴板。
 
 4. 任何部分 ASR、AI cleanup 或 delivery 降级都会保留 raw/final、原因和可恢复音频到 History。
+
+当前 ASR 是 batch 上传；prefetch 只做静默的整段 chunk 预热，部分转录不会进入 HUD、剪贴板、外部 App 或 History。
 
 ## 3. 选中文本助手：preview-first
 

@@ -1,4 +1,4 @@
-import { MaynPillPreview } from "./MaynPillPreview";
+import { MainPillPreview } from "./MainPillPreview";
 import { ParticleText } from "../ReactBits/ParticleText";
 import { useI18n } from "../../lib/i18n";
 
@@ -7,7 +7,7 @@ export function WelcomeStep() {
   return (
     <div className="flex min-h-[420px] flex-col justify-center">
       <div className="mb-14 flex h-[60px] w-full items-center justify-center">
-        <MaynPillPreview live compact />
+        <MainPillPreview live compact />
       </div>
       <div className="w-full max-w-[620px]">
         <div className="space-y-1">

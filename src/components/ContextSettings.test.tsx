@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
+import { I18nProvider } from "../lib/i18n";
 import { ContextSettings } from "./ContextSettings";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
@@ -47,6 +48,22 @@ describe("ContextSettings", () => {
           return undefined;
       }
     });
+  });
+
+  it("uses WeChat-style help for mapping examples", async () => {
+    render(<ContextSettings />);
+
+    expect(await screen.findByPlaceholderText("贴一条你平时微信怎么打")).toBeInTheDocument();
+  });
+
+  it("translates WeChat-style mapping help", async () => {
+    render(
+      <I18nProvider initialLanguage="en">
+        <ContextSettings />
+      </I18nProvider>,
+    );
+
+    expect(await screen.findByPlaceholderText("Paste a typical WeChat message")).toBeInTheDocument();
   });
 
   it("lets users choose an app without exposing native identifiers", async () => {

@@ -81,9 +81,17 @@ fn send_command_shortcut(keycode: u16) -> Result<(), PasteError> {
     Ok(())
 }
 
+/// Hold ABC until the target can consume Cmd+V. `CGEvent::post` is async; the
+/// pre-switch settle is 30 ms, so the post-paste hold stays in the same band.
+#[cfg(target_os = "macos")]
+const PASTE_CONSUME_SETTLE: Duration = Duration::from_millis(40);
+
 #[cfg(target_os = "macos")]
 fn simulate_paste() -> Result<(), PasteError> {
-    send_command_shortcut(COMMAND_PASTE_KEYCODE)
+    let _latin_layout = crate::input_source::AbcLayoutGuard::acquire();
+    send_command_shortcut(COMMAND_PASTE_KEYCODE)?;
+    thread::sleep(PASTE_CONSUME_SETTLE);
+    Ok(())
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -189,16 +197,22 @@ pub struct CapturedSelection {
     pub fingerprint: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InsertOutcome {
-    /// The platform shortcut was posted successfully.
+    /// The platform shortcut was posted, or a safe AX insert was applied.
     pub shortcut_sent: bool,
-    /// Reserved for a future AX direct-insertion adapter. Cmd+V alone cannot
-    /// prove that the target application accepted the clipboard contents.
+    /// True only if Cmd+V was posted. AX value sets are often not on the
+    /// target undo stack, so a 3s Cmd+Z must never be armed for that path.
+    pub used_keyboard_paste: bool,
+    /// Best-effort proof that the focused field now contains the delivered text.
+    /// Cmd+V or AX set alone cannot prove that the target application accepted it.
     pub verified: bool,
     /// In-memory fingerprint of the complete focused input value immediately
     /// after a verified paste. Undo uses this to avoid undoing later user edits.
     pub post_insert_input_fingerprint: Option<u64>,
+    /// Focused field value immediately after a successful insert. Dictionary
+    /// learning diffs this baseline against a later same-field read.
+    pub value_after: Option<String>,
 }
 
 pub fn selection_fingerprint(text: &str) -> u64 {
@@ -278,8 +292,35 @@ impl PasteAttempt {
     }
 }
 
+/// AX insert that we could not verify must still leave the text copyable.
+/// Verified AX must not touch the clipboard. Keyboard paste already wrote it.
+fn should_copy_clipboard_fallback(outcome: &InsertOutcome) -> bool {
+    !outcome.used_keyboard_paste && !outcome.verified
+}
+
 fn should_restore_clipboard(attempt: &PasteAttempt) -> bool {
+    // Restore whenever Cmd+V was never posted (cancelled, target changed, or
+    // any other path that did not inject the shortcut).
     !attempt.shortcut_sent
+}
+
+fn build_insert_outcome(
+    used_keyboard_paste: bool,
+    value_before: Option<&str>,
+    value_after: Option<String>,
+    expected: &str,
+) -> InsertOutcome {
+    let verified =
+        input_value_verifies_delivery(value_before, value_after.as_deref(), expected);
+    InsertOutcome {
+        shortcut_sent: true,
+        used_keyboard_paste,
+        verified,
+        post_insert_input_fingerprint: verified
+            .then(|| value_after.as_deref().map(selection_fingerprint))
+            .flatten(),
+        value_after,
+    }
 }
 
 /// Run the irreversible keyboard injection only after the last cancellation and
@@ -340,7 +381,7 @@ fn input_value_verifies_delivery(
     after: Option<&str>,
     expected: &str,
 ) -> bool {
-    if expected.is_empty() || expected.chars().count() < 2 {
+    if expected.is_empty() {
         return false;
     }
     let Some(after) = after else {
@@ -354,10 +395,293 @@ fn input_value_verifies_delivery(
     let after_chars = after.chars().count();
     match before {
         Some(before) => {
-            after_count > before.matches(expected).count()
+            let before_count = before.matches(expected).count();
+            if expected_chars == 1 && before_count > 0 {
+                return false;
+            }
+            after_count > before_count
                 && after_chars >= before.chars().count().saturating_add(expected_chars)
         }
-        None => after_chars >= expected_chars,
+        None => {
+            if expected_chars == 1 {
+                false
+            } else {
+                after_chars >= expected_chars
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AxInsertDecision {
+    SkipSecure,
+    SkipWrongRole,
+    SkipWouldReplaceAll,
+    SkipNeedsKeystrokeTyper,
+    AttemptSelectedText,
+    AttemptValueSplice,
+}
+
+fn ax_insert_decision(
+    role: &str,
+    subrole: &str,
+    selected_text_settable: bool,
+    value_settable: bool,
+    selected_range: Option<(i64, i64)>,
+    field_empty: bool,
+) -> AxInsertDecision {
+    let role_blob = format!("{role} {subrole}").to_ascii_lowercase();
+    if role_blob.contains("securetextfield") || role_blob.contains("secure text field") {
+        return AxInsertDecision::SkipSecure;
+    }
+    let editable = ["textfield", "textarea", "combobox", "searchfield"]
+        .iter()
+        .any(|marker| role_blob.contains(marker));
+    if !editable {
+        return AxInsertDecision::SkipWrongRole;
+    }
+    if selected_text_settable {
+        return AxInsertDecision::AttemptSelectedText;
+    }
+    if value_settable && (selected_range.is_some() || field_empty) {
+        return AxInsertDecision::AttemptValueSplice;
+    }
+    if value_settable {
+        return AxInsertDecision::SkipWouldReplaceAll;
+    }
+    AxInsertDecision::SkipNeedsKeystrokeTyper
+}
+
+/// AX selected-text ranges are UTF-16 units. Refuse out-of-range edits rather
+/// than guessing a byte or `char` index, which would corrupt CJK text.
+fn utf16_splice(current: &str, location: i64, length: i64, insert: &str) -> Option<String> {
+    if location < 0 || length < 0 {
+        return None;
+    }
+    let units: Vec<u16> = current.encode_utf16().collect();
+    let start = usize::try_from(location).ok()?;
+    let span = usize::try_from(length).ok()?;
+    let end = start.checked_add(span)?;
+    if end > units.len() {
+        return None;
+    }
+    let mut next = Vec::with_capacity(units.len() - span + insert.encode_utf16().count());
+    next.extend_from_slice(&units[..start]);
+    next.extend(insert.encode_utf16());
+    next.extend_from_slice(&units[end..]);
+    String::from_utf16(&next).ok()
+}
+
+fn try_ax_insert_if_safe(
+    cancellation: &CancellationToken,
+    verify_target: impl Fn() -> Result<(), PasteError>,
+    text: &str,
+) -> bool {
+    if cancellation.is_cancelled() || verify_target().is_err() || text.is_empty() {
+        return false;
+    }
+    try_ax_insert(text)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn try_ax_insert(_text: &str) -> bool {
+    false
+}
+
+#[cfg(target_os = "macos")]
+fn try_ax_insert(text: &str) -> bool {
+    macos_ax::try_insert(text)
+}
+
+#[cfg(target_os = "macos")]
+mod macos_ax {
+    use super::{ax_insert_decision, utf16_splice, AxInsertDecision};
+    use core::ffi::c_void;
+    use core_foundation::base::{CFRange, CFRelease, CFType, CFTypeRef, TCFType};
+    use core_foundation::string::{CFString, CFStringRef};
+
+    type AXUIElementRef = *const c_void;
+    type AXValueRef = *const c_void;
+    const AX_SUCCESS: i32 = 0;
+    const AX_VALUE_CF_RANGE: u32 = 4;
+
+    #[link(name = "ApplicationServices", kind = "framework")]
+    unsafe extern "C" {
+        fn AXUIElementCreateSystemWide() -> AXUIElementRef;
+        fn AXUIElementCopyAttributeValue(
+            element: AXUIElementRef,
+            attribute: CFStringRef,
+            value: *mut CFTypeRef,
+        ) -> i32;
+        fn AXUIElementSetAttributeValue(
+            element: AXUIElementRef,
+            attribute: CFStringRef,
+            value: CFTypeRef,
+        ) -> i32;
+        fn AXUIElementIsAttributeSettable(
+            element: AXUIElementRef,
+            attribute: CFStringRef,
+            settable: *mut u8,
+        ) -> i32;
+        fn AXUIElementSetMessagingTimeout(element: AXUIElementRef, timeout_in_seconds: f32) -> i32;
+        fn AXValueCreate(the_type: u32, value_ptr: *const c_void) -> AXValueRef;
+        fn AXValueGetValue(value: AXValueRef, the_type: u32, value_ptr: *mut c_void) -> u8;
+    }
+
+    struct AxElement(AXUIElementRef);
+
+    impl Drop for AxElement {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe { CFRelease(self.0 as CFTypeRef) };
+                self.0 = std::ptr::null();
+            }
+        }
+    }
+
+    pub(super) fn try_insert(text: &str) -> bool {
+        if !crate::permissions::accessibility_is_trusted() {
+            return false;
+        }
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| try_insert_inner(text)))
+            .unwrap_or(false)
+    }
+
+    fn try_insert_inner(text: &str) -> bool {
+        let system = AxElement(unsafe { AXUIElementCreateSystemWide() });
+        if system.0.is_null() {
+            return false;
+        }
+        unsafe {
+            let _ = AXUIElementSetMessagingTimeout(system.0, 0.35);
+        }
+        let Some(focused) = copy_element_attr(&system, "AXFocusedUIElement") else {
+            return false;
+        };
+        unsafe {
+            let _ = AXUIElementSetMessagingTimeout(focused.0, 0.35);
+        }
+
+        let role = copy_string_attr(&focused, "AXRole").unwrap_or_default();
+        let subrole = copy_string_attr(&focused, "AXSubrole").unwrap_or_default();
+        let selected_text_settable = is_settable(&focused, "AXSelectedText");
+        let value_settable = is_settable(&focused, "AXValue");
+        let current_value = copy_string_attr(&focused, "AXValue");
+        let selected_range = copy_range_attr(&focused, "AXSelectedTextRange");
+        let field_empty = current_value.as_deref().is_none_or(str::is_empty);
+
+        match ax_insert_decision(
+            &role,
+            &subrole,
+            selected_text_settable,
+            value_settable,
+            selected_range,
+            field_empty,
+        ) {
+            AxInsertDecision::AttemptSelectedText => {
+                set_string_attr(&focused, "AXSelectedText", text)
+            }
+            AxInsertDecision::AttemptValueSplice => {
+                let current = current_value.unwrap_or_default();
+                let (location, length) = selected_range.unwrap_or((0, 0));
+                let Some(next) = utf16_splice(&current, location, length, text) else {
+                    return false;
+                };
+                if !set_string_attr(&focused, "AXValue", &next) {
+                    return false;
+                }
+                let caret = location.saturating_add(text.encode_utf16().count() as i64);
+                let _ = set_range_attr(&focused, "AXSelectedTextRange", caret, 0);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn copy_element_attr(element: &AxElement, name: &str) -> Option<AxElement> {
+        let value = copy_raw_attr(element, name)?;
+        Some(AxElement(value as AXUIElementRef))
+    }
+
+    fn copy_raw_attr(element: &AxElement, name: &str) -> Option<CFTypeRef> {
+        let attr = CFString::new(name);
+        let mut value: CFTypeRef = std::ptr::null();
+        let err = unsafe {
+            AXUIElementCopyAttributeValue(element.0, attr.as_concrete_TypeRef(), &mut value)
+        };
+        if err != AX_SUCCESS || value.is_null() {
+            None
+        } else {
+            Some(value)
+        }
+    }
+
+    fn copy_string_attr(element: &AxElement, name: &str) -> Option<String> {
+        let value = copy_raw_attr(element, name)?;
+        let cf_type = unsafe { CFType::wrap_under_create_rule(value) };
+        if cf_type.type_of() != CFString::type_id() {
+            return None;
+        }
+        Some(unsafe { CFString::wrap_under_get_rule(cf_type.as_CFTypeRef() as _) }.to_string())
+    }
+
+    fn copy_range_attr(element: &AxElement, name: &str) -> Option<(i64, i64)> {
+        let value = copy_raw_attr(element, name)?;
+        let mut range = CFRange {
+            location: 0,
+            length: 0,
+        };
+        let ok = unsafe {
+            AXValueGetValue(
+                value as AXValueRef,
+                AX_VALUE_CF_RANGE,
+                &mut range as *mut _ as *mut c_void,
+            )
+        };
+        unsafe { CFRelease(value) };
+        if ok == 0 {
+            return None;
+        }
+        Some((range.location as i64, range.length as i64))
+    }
+
+    fn is_settable(element: &AxElement, name: &str) -> bool {
+        let attr = CFString::new(name);
+        let mut settable: u8 = 0;
+        let err = unsafe {
+            AXUIElementIsAttributeSettable(element.0, attr.as_concrete_TypeRef(), &mut settable)
+        };
+        err == AX_SUCCESS && settable != 0
+    }
+
+    fn set_string_attr(element: &AxElement, name: &str, text: &str) -> bool {
+        let attr = CFString::new(name);
+        let value = CFString::new(text);
+        unsafe {
+            AXUIElementSetAttributeValue(
+                element.0,
+                attr.as_concrete_TypeRef(),
+                value.as_CFTypeRef(),
+            ) == AX_SUCCESS
+        }
+    }
+
+    fn set_range_attr(element: &AxElement, name: &str, location: i64, length: i64) -> bool {
+        let range = CFRange {
+            location: location as isize,
+            length: length as isize,
+        };
+        let value = unsafe { AXValueCreate(AX_VALUE_CF_RANGE, &range as *const _ as *const c_void) };
+        if value.is_null() {
+            return false;
+        }
+        let attr = CFString::new(name);
+        let ok = unsafe {
+            AXUIElementSetAttributeValue(element.0, attr.as_concrete_TypeRef(), value as CFTypeRef)
+                == AX_SUCCESS
+        };
+        unsafe { CFRelease(value as CFTypeRef) };
+        ok
     }
 }
 
@@ -387,6 +711,28 @@ pub fn insert(
     verify_target()?;
     let value_before = crate::context::focused_input_value();
     check_before_clipboard(&cancellation)?;
+    // Prefer a safe in-process AX insert before touching the clipboard. Verified
+    // AX success must not leave VoiceFlow text on the system clipboard, and AX
+    // must not be treated as a posted Cmd+V (no 3s undo). Unverified AX copies
+    // the text as the fail-closed manual fallback.
+    if try_ax_insert_if_safe(&cancellation, &verify_target, text) {
+        thread::sleep(Duration::from_millis(250));
+        let outcome = build_insert_outcome(
+            false,
+            value_before.as_deref(),
+            crate::context::focused_input_value(),
+            text,
+        );
+        if should_copy_clipboard_fallback(&outcome) {
+            // Previous clipboard was never overwritten. Leave the text as the
+            // same fail-closed manual fallback used after a posted Cmd+V.
+            let _ = app.clipboard().write_text(text);
+        }
+        return Ok(outcome);
+    }
+    if cancellation.is_cancelled() {
+        return Err(PasteError::Cancelled);
+    }
     // Images and files cannot be restored as text. Continue the paste instead
     // of aborting the whole delivery because the previous clipboard was not
     // a string.
@@ -400,6 +746,7 @@ pub fn insert(
         let _ = restore_clipboard(app, previous_clipboard.as_deref());
         return Err(PasteError::Cancelled);
     }
+    // Fall through to Cmd+V with a CJK→ABC input-source switch.
     // Suppress the modifier event-tap while we synthesize the paste keystroke:
     // our own keystroke must not be read as a physical hotkey tap, and re-entrant
     // event delivery during the paste aborts the main runloop (uncaught
@@ -416,16 +763,12 @@ pub fn insert(
         thread::sleep(Duration::from_millis(250));
     }
     attempt.result.map(|()| {
-        let value_after = crate::context::focused_input_value();
-        let verified =
-            input_value_verifies_delivery(value_before.as_deref(), value_after.as_deref(), text);
-        InsertOutcome {
-            shortcut_sent: true,
-            verified,
-            post_insert_input_fingerprint: verified
-                .then(|| value_after.as_deref().map(selection_fingerprint))
-                .flatten(),
-        }
+        build_insert_outcome(
+            true,
+            value_before.as_deref(),
+            crate::context::focused_input_value(),
+            text,
+        )
     })
 }
 
@@ -656,10 +999,169 @@ mod tests {
             Some("hi hello"),
             "hello"
         ));
+    }
+
+    #[test]
+    fn input_verification_accepts_single_ascii_and_cjk_characters() {
+        assert!(input_value_verifies_delivery(
+            Some("before"),
+            Some("beforex"),
+            "x"
+        ));
+        assert!(input_value_verifies_delivery(
+            Some("开头"),
+            Some("开头字"),
+            "字"
+        ));
         assert!(!input_value_verifies_delivery(
             None,
             Some("inserted"),
             "i"
+        ));
+        assert!(!input_value_verifies_delivery(None, Some("x"), "x"));
+        assert!(!input_value_verifies_delivery(None, Some("字"), "字"));
+        assert!(input_value_verifies_delivery(
+            None,
+            Some("inserted"),
+            "inserted"
+        ));
+    }
+
+    #[test]
+    fn unverified_ax_insert_copies_clipboard_fallback_without_arming_undo() {
+        let verified_ax = build_insert_outcome(false, Some(""), Some("hello".into()), "hello");
+        assert!(!verified_ax.used_keyboard_paste);
+        assert!(verified_ax.verified);
+        assert!(!should_copy_clipboard_fallback(&verified_ax));
+
+        let unverified_ax = build_insert_outcome(false, None, None, "hello");
+        assert!(!unverified_ax.used_keyboard_paste);
+        assert!(!unverified_ax.verified);
+        assert!(should_copy_clipboard_fallback(&unverified_ax));
+
+        let keyboard = build_insert_outcome(true, Some(""), Some("hello".into()), "hello");
+        assert!(keyboard.used_keyboard_paste);
+        assert!(!should_copy_clipboard_fallback(&keyboard));
+
+        let keyboard_unverified = build_insert_outcome(true, None, Some("x".into()), "x");
+        assert!(keyboard_unverified.used_keyboard_paste);
+        assert!(!keyboard_unverified.verified);
+        assert!(!should_copy_clipboard_fallback(&keyboard_unverified));
+    }
+
+    #[test]
+    fn ax_success_outcome_is_not_a_keyboard_paste() {
+        let ax = build_insert_outcome(false, Some(""), Some("hello".into()), "hello");
+        assert!(ax.shortcut_sent);
+        assert!(!ax.used_keyboard_paste);
+        assert!(ax.verified);
+        assert_eq!(ax.value_after.as_deref(), Some("hello"));
+
+        let keyboard = build_insert_outcome(true, Some(""), Some("hello".into()), "hello");
+        assert!(keyboard.used_keyboard_paste);
+        assert!(keyboard.verified);
+    }
+
+    #[test]
+    fn single_char_unknown_before_is_unverified_even_for_keyboard_paste() {
+        let outcome = build_insert_outcome(true, None, Some("x".into()), "x");
+        assert!(outcome.used_keyboard_paste);
+        assert!(!outcome.verified);
+        assert!(outcome.post_insert_input_fingerprint.is_none());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn paste_layout_is_held_until_cmd_v_can_be_consumed() {
+        assert!(PASTE_CONSUME_SETTLE >= Duration::from_millis(30));
+        assert!(PASTE_CONSUME_SETTLE <= Duration::from_millis(50));
+    }
+
+    #[test]
+    fn ax_insert_skips_secure_and_non_text_roles() {
+        assert_eq!(
+            ax_insert_decision("AXTextField", "AXSecureTextField", true, true, Some((0, 0)), true),
+            AxInsertDecision::SkipSecure
+        );
+        assert_eq!(
+            ax_insert_decision("AXWebArea", "", true, true, Some((0, 0)), true),
+            AxInsertDecision::SkipWrongRole
+        );
+        assert_eq!(
+            ax_insert_decision("AXGroup", "", false, false, None, false),
+            AxInsertDecision::SkipWrongRole
+        );
+    }
+
+    #[test]
+    fn ax_insert_uses_selected_text_when_settable() {
+        assert_eq!(
+            ax_insert_decision("AXTextField", "", true, false, None, false),
+            AxInsertDecision::AttemptSelectedText
+        );
+        assert_eq!(
+            ax_insert_decision("AXTextArea", "", true, true, Some((2, 0)), false),
+            AxInsertDecision::AttemptSelectedText
+        );
+        assert_eq!(
+            ax_insert_decision("AXComboBox", "", true, true, None, false),
+            AxInsertDecision::AttemptSelectedText
+        );
+        assert_eq!(
+            ax_insert_decision("AXSearchField", "", true, false, Some((0, 0)), true),
+            AxInsertDecision::AttemptSelectedText
+        );
+    }
+
+    #[test]
+    fn ax_insert_splices_value_only_with_a_known_range() {
+        assert_eq!(
+            ax_insert_decision("AXTextField", "", false, true, Some((1, 0)), false),
+            AxInsertDecision::AttemptValueSplice
+        );
+        assert_eq!(
+            ax_insert_decision("AXTextArea", "", false, true, None, false),
+            AxInsertDecision::SkipWouldReplaceAll
+        );
+        assert_eq!(
+            ax_insert_decision("AXTextField", "", false, true, None, true),
+            AxInsertDecision::AttemptValueSplice
+        );
+    }
+
+    #[test]
+    fn ax_insert_does_not_fall_back_to_a_keystroke_typer() {
+        assert_eq!(
+            ax_insert_decision("AXTextField", "", false, false, Some((0, 0)), false),
+            AxInsertDecision::SkipNeedsKeystrokeTyper
+        );
+    }
+
+    #[test]
+    fn utf16_splice_inserts_cjk_at_utf16_range() {
+        assert_eq!(
+            utf16_splice("hello", 5, 0, "世界").as_deref(),
+            Some("hello世界")
+        );
+        assert_eq!(utf16_splice("你好", 2, 0, "世界").as_deref(), Some("你好世界"));
+        assert_eq!(utf16_splice("hello", 0, 5, "hi").as_deref(), Some("hi"));
+        assert_eq!(utf16_splice("hello", 1, 3, "i").as_deref(), Some("hio"));
+        assert_eq!(utf16_splice("hello", 6, 0, "x"), None);
+        assert_eq!(utf16_splice("hello", 2, 10, "x"), None);
+        assert_eq!(utf16_splice("hello", -1, 0, "x"), None);
+    }
+
+    #[test]
+    fn ax_insert_is_skipped_when_cancelled_or_target_changed() {
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        assert!(!try_ax_insert_if_safe(&cancellation, || Ok(()), "hello"));
+
+        let cancellation = CancellationToken::new();
+        assert!(!try_ax_insert_if_safe(
+            &cancellation,
+            || Err(PasteError::TargetChanged),
+            "hello"
         ));
     }
 }

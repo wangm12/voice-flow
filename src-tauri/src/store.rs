@@ -1,4 +1,8 @@
 use crate::queue::QuotaView;
+use chacha20poly1305::{
+    aead::{Aead, AeadCore, KeyInit, OsRng, Payload},
+    XChaCha20Poly1305, XNonce,
+};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
@@ -6,9 +10,34 @@ use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 pub const SETTINGS_SCHEMA_VERSION: u32 = 13;
 const HISTORY_SCHEMA_VERSION: i32 = 5;
+
+fn ensure_private_dir(path: &Path) -> anyhow::Result<()> {
+    fs::create_dir_all(path)?;
+    #[cfg(unix)]
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
+fn restrict_file_mode(path: &Path) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
+fn restrict_history_sidecars(dir: &Path) -> anyhow::Result<()> {
+    for suffix in ["", "-wal", "-shm"] {
+        let path = dir.join(format!("history.sqlite{suffix}"));
+        if path.exists() {
+            restrict_file_mode(&path)?;
+        }
+    }
+    Ok(())
+}
 
 fn current_settings_schema_version() -> u32 {
     SETTINGS_SCHEMA_VERSION
@@ -32,6 +61,10 @@ pub struct Settings {
     #[serde(default = "current_settings_schema_version")]
     pub schema_version: u32,
     pub api_key: String,
+    #[serde(default)]
+    pub asr_api_key: String,
+    #[serde(default)]
+    pub asr_base_url: String,
     pub language: String,
     #[serde(default = "default_ui_language")]
     pub ui_language: String,
@@ -69,8 +102,12 @@ pub struct Settings {
     pub selected_action_hotkey: String,
     #[serde(default = "default_selected_actions_enabled")]
     pub selected_actions_enabled: bool,
+    #[serde(default = "default_dictionary_learn_enabled")]
+    pub dictionary_learn_enabled: bool,
     #[serde(default)]
     pub input_device: String,
+    #[serde(default = "default_input_gain")]
+    pub input_gain: f32,
 }
 
 fn default_cleanup_model() -> String {
@@ -107,11 +144,21 @@ fn default_selected_actions_enabled() -> bool {
     true
 }
 
+fn default_dictionary_learn_enabled() -> bool {
+    true
+}
+
+fn default_input_gain() -> f32 {
+    1.0
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
             schema_version: SETTINGS_SCHEMA_VERSION,
             api_key: String::new(),
+            asr_api_key: String::new(),
+            asr_base_url: String::new(),
             language: "auto".into(),
             ui_language: default_ui_language(),
             theme: default_theme(),
@@ -137,7 +184,9 @@ impl Default for Settings {
             translation_target_language: default_translation_target_language(),
             selected_action_hotkey: default_selected_action_hotkey(),
             selected_actions_enabled: default_selected_actions_enabled(),
+            dictionary_learn_enabled: default_dictionary_learn_enabled(),
             input_device: String::new(),
+            input_gain: default_input_gain(),
         }
     }
 }
@@ -209,11 +258,14 @@ impl Settings {
             self.activation_mode = if crate::modifier_hotkey::is_modifier_only(&self.hotkey) {
                 "double_tap"
             } else {
-                "tap"
+                "hybrid"
             }
             .into();
         }
-        if !matches!(self.activation_mode.as_str(), "tap" | "double_tap") {
+        if !matches!(
+            self.activation_mode.as_str(),
+            "tap" | "double_tap" | "hybrid"
+        ) {
             self.activation_mode = "tap".into();
         }
         // Modifier-only shortcuts are implemented by the macOS event tap,
@@ -263,6 +315,15 @@ impl Settings {
             self.selected_action_hotkey.clear();
         }
         self.input_device = self.input_device.trim().chars().take(512).collect();
+        self.input_gain = if self.input_gain.is_finite() {
+            self.input_gain.clamp(0.5, 4.0)
+        } else {
+            default_input_gain()
+        };
+        self.asr_base_url = self.asr_base_url.trim().chars().take(2_048).collect();
+        if self.asr_api_key.len() > 512 {
+            self.asr_api_key.truncate(512);
+        }
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
@@ -308,7 +369,10 @@ impl Settings {
         if self.hotkey.is_empty() || self.hotkey.len() > 128 {
             anyhow::bail!("hotkey must contain between 1 and 128 characters");
         }
-        if !matches!(self.activation_mode.as_str(), "tap" | "double_tap") {
+        if !matches!(
+            self.activation_mode.as_str(),
+            "tap" | "double_tap" | "hybrid"
+        ) {
             anyhow::bail!("unsupported activation mode");
         }
         if crate::modifier_hotkey::is_modifier_only(&self.hotkey)
@@ -326,6 +390,12 @@ impl Settings {
         }
         if self.api_key.len() > 512 {
             anyhow::bail!("API key is too long");
+        }
+        if self.asr_api_key.len() > 512 {
+            anyhow::bail!("ASR API key is too long");
+        }
+        if self.asr_base_url.len() > 2_048 {
+            anyhow::bail!("ASR base URL is too long");
         }
         for mapping in &self.context_mappings {
             mapping.validate().map_err(|error| anyhow::anyhow!(error))?;
@@ -355,18 +425,46 @@ impl Settings {
         if self.input_device.len() > 512 {
             anyhow::bail!("input device name is too long");
         }
+        if !self.input_gain.is_finite() || !(0.5..=4.0).contains(&self.input_gain) {
+            anyhow::bail!("input gain must be between 0.5 and 4.0");
+        }
         Ok(())
+    }
+
+    /// Prefer a dedicated ASR key when set. Reuse the Groq key only for the
+    /// Groq default or `api.groq.com`; custom hosts must supply `asr_api_key`.
+    pub fn asr_credential(&self) -> &str {
+        let asr_key = self.asr_api_key.trim();
+        if !asr_key.is_empty() {
+            asr_key
+        } else if crate::asr::groq_key_fallback_allowed(&self.asr_base_url) {
+            self.api_key.as_str()
+        } else {
+            ""
+        }
     }
 }
 
 /// Settings exposed to the webview. The backend keeps the real credential in
 /// memory/keychain, while the UI only receives whether one is configured and a
 /// non-sensitive hint for display.
+fn credential_hint(key: &str) -> Option<String> {
+    let key = key.trim();
+    if key.is_empty() {
+        return None;
+    }
+    let tail: String = key.chars().rev().take(4).collect();
+    Some(format!("••••{}", tail.chars().rev().collect::<String>()))
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct SettingsView {
     pub schema_version: u32,
     pub api_key_configured: bool,
     pub api_key_hint: Option<String>,
+    pub asr_api_key_configured: bool,
+    pub asr_api_key_hint: Option<String>,
+    pub asr_base_url: String,
     pub asr_model: String,
     pub cleanup_model: String,
     pub language: String,
@@ -394,21 +492,20 @@ pub struct SettingsView {
     pub translation_target_language: String,
     pub selected_action_hotkey: String,
     pub selected_actions_enabled: bool,
+    pub dictionary_learn_enabled: bool,
     pub input_device: String,
+    pub input_gain: f32,
 }
 
 impl From<&Settings> for SettingsView {
     fn from(settings: &Settings) -> Self {
-        let api_key_hint = if settings.api_key.is_empty() {
-            None
-        } else {
-            let tail: String = settings.api_key.chars().rev().take(4).collect();
-            Some(format!("••••{}", tail.chars().rev().collect::<String>()))
-        };
         Self {
             schema_version: settings.schema_version,
             api_key_configured: !settings.api_key.is_empty(),
-            api_key_hint,
+            api_key_hint: credential_hint(&settings.api_key),
+            asr_api_key_configured: !settings.asr_api_key.trim().is_empty(),
+            asr_api_key_hint: credential_hint(&settings.asr_api_key),
+            asr_base_url: settings.asr_base_url.clone(),
             asr_model: crate::asr::MODEL.to_owned(),
             cleanup_model: settings.cleanup_model.clone(),
             language: settings.language.clone(),
@@ -436,7 +533,9 @@ impl From<&Settings> for SettingsView {
             translation_target_language: settings.translation_target_language.clone(),
             selected_action_hotkey: settings.selected_action_hotkey.clone(),
             selected_actions_enabled: settings.selected_actions_enabled,
+            dictionary_learn_enabled: settings.dictionary_learn_enabled,
             input_device: settings.input_device.clone(),
+            input_gain: settings.input_gain,
         }
     }
 }
@@ -490,6 +589,9 @@ pub const LLM_DAILY_LIMIT: i64 = 1000;
 pub const MAX_SPOOL_BYTES: u64 = 256 * 1024 * 1024;
 const SPOOL_MANIFEST_VERSION: u32 = 1;
 const AUDIO_SAMPLE_RATE: usize = 16_000;
+const SPOOL_ENVELOPE_MAGIC: &[u8; 8] = b"VFSPOOL1";
+const SPOOL_ENVELOPE_VERSION: u8 = 1;
+const SPOOL_ENVELOPE_HEADER_LEN: usize = SPOOL_ENVELOPE_MAGIC.len() + 1 + 24;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SpoolChunkManifest {
@@ -546,10 +648,119 @@ fn spool_size(path: &Path) -> anyhow::Result<u64> {
     Ok(total)
 }
 
+fn spool_encryption_enabled() -> bool {
+    cfg!(feature = "encrypted-spool")
+        && std::env::var("VOICEFLOW_ENCRYPT_SPOOL")
+            .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+}
+
+fn history_encryption_key_for_write() -> anyhow::Result<[u8; 32]> {
+    if let Some(key) = crate::keychain::get_history_key().map_err(anyhow::Error::msg)? {
+        return key
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("stored history key must be exactly 32 bytes"));
+    }
+
+    // Generate the key only after encryption has been explicitly enabled.
+    // If the credential store cannot persist it, the verification read below
+    // fails and no plaintext fallback is allowed.
+    let generated = XChaCha20Poly1305::generate_key(&mut OsRng);
+    crate::keychain::set_history_key(Some(generated.as_slice())).map_err(anyhow::Error::msg)?;
+    crate::keychain::get_history_key()
+        .map_err(anyhow::Error::msg)?
+        .ok_or_else(|| anyhow::anyhow!("history encryption key is unavailable"))?
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("stored history key must be exactly 32 bytes"))
+}
+
+fn cipher_for_key(key: &[u8]) -> anyhow::Result<XChaCha20Poly1305> {
+    XChaCha20Poly1305::new_from_slice(key)
+        .map_err(|_| anyhow::anyhow!("history encryption key must be exactly 32 bytes"))
+}
+
+fn encrypt_spool_bytes(bytes: &[u8], key: &[u8]) -> anyhow::Result<Vec<u8>> {
+    let cipher = cipher_for_key(key)?;
+    let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
+    let mut header = Vec::with_capacity(SPOOL_ENVELOPE_HEADER_LEN);
+    header.extend_from_slice(SPOOL_ENVELOPE_MAGIC);
+    header.push(SPOOL_ENVELOPE_VERSION);
+    header.extend_from_slice(nonce.as_slice());
+    let ciphertext = cipher
+        .encrypt(
+            &nonce,
+            Payload {
+                msg: bytes,
+                aad: &header,
+            },
+        )
+        .map_err(|_| anyhow::anyhow!("failed to encrypt audio spool"))?;
+    header.extend_from_slice(&ciphertext);
+    Ok(header)
+}
+
+fn decrypt_spool_bytes(bytes: &[u8], key: &[u8]) -> anyhow::Result<Vec<u8>> {
+    if bytes.len() < SPOOL_ENVELOPE_HEADER_LEN
+        || &bytes[..SPOOL_ENVELOPE_MAGIC.len()] != SPOOL_ENVELOPE_MAGIC
+        || bytes[SPOOL_ENVELOPE_MAGIC.len()] != SPOOL_ENVELOPE_VERSION
+    {
+        anyhow::bail!("unsupported audio spool envelope");
+    }
+    let header = &bytes[..SPOOL_ENVELOPE_HEADER_LEN];
+    let nonce = XNonce::from_slice(
+        &header[SPOOL_ENVELOPE_MAGIC.len() + 1..SPOOL_ENVELOPE_HEADER_LEN],
+    );
+    cipher_for_key(key)?
+        .decrypt(
+            nonce,
+            Payload {
+                msg: &bytes[SPOOL_ENVELOPE_HEADER_LEN..],
+                aad: header,
+            },
+        )
+        .map_err(|_| anyhow::anyhow!("failed to decrypt audio spool"))
+}
+
+/// Read a recovery artifact. Plaintext artifacts from older versions remain
+/// readable; encrypted artifacts require the history key and are never
+/// returned as ciphertext.
+pub fn read_spool_file(path: &Path) -> anyhow::Result<Vec<u8>> {
+    let bytes = fs::read(path)?;
+    if bytes.starts_with(SPOOL_ENVELOPE_MAGIC) {
+        let key = crate::keychain::get_history_key()
+            .map_err(anyhow::Error::msg)?
+            .ok_or_else(|| anyhow::anyhow!("history encryption key is unavailable"))?;
+        return decrypt_spool_bytes(&bytes, &key);
+    }
+    Ok(bytes)
+}
+
 /// Persist a retry/recovery audio file without exposing paths outside the
 /// app-owned spool directory. The quota is checked before writing and the
 /// final filename is installed with an atomic rename.
 pub fn write_spool_file(dir: &Path, relative: &Path, bytes: &[u8]) -> anyhow::Result<PathBuf> {
+    let encryption_enabled = spool_encryption_enabled();
+    let encryption_key = if encryption_enabled {
+        Some(history_encryption_key_for_write()?)
+    } else {
+        None
+    };
+    write_spool_file_internal(
+        dir,
+        relative,
+        bytes,
+        encryption_enabled,
+        encryption_key.as_ref().map(|key| key.as_slice()),
+    )
+}
+
+fn write_spool_file_internal(
+    dir: &Path,
+    relative: &Path,
+    bytes: &[u8],
+    encryption_enabled: bool,
+    encryption_key: Option<&[u8]>,
+) -> anyhow::Result<PathBuf> {
     if relative.as_os_str().is_empty()
         || relative.is_absolute()
         || relative
@@ -560,13 +771,20 @@ pub fn write_spool_file(dir: &Path, relative: &Path, bytes: &[u8]) -> anyhow::Re
     }
     let root = dir.join("spool");
     let path = root.join(relative);
+    let stored_bytes = if encryption_enabled {
+        let key = encryption_key
+            .ok_or_else(|| anyhow::anyhow!("history encryption key is unavailable"))?;
+        encrypt_spool_bytes(bytes, key)?
+    } else {
+        bytes.to_vec()
+    };
     let current = spool_size(&root)?;
     let existing = fs::symlink_metadata(&path)
         .map(|metadata| metadata.len())
         .unwrap_or(0);
     if current
         .saturating_sub(existing)
-        .saturating_add(bytes.len() as u64)
+        .saturating_add(stored_bytes.len() as u64)
         > MAX_SPOOL_BYTES
     {
         anyhow::bail!("audio spool quota exceeded");
@@ -574,8 +792,8 @@ pub fn write_spool_file(dir: &Path, relative: &Path, bytes: &[u8]) -> anyhow::Re
     let parent = path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("invalid spool path"))?;
-    fs::create_dir_all(parent)?;
-    write_atomic_bytes(&path, bytes)?;
+    ensure_private_dir(parent)?;
+    write_atomic_bytes(&path, &stored_bytes)?;
     Ok(path)
 }
 
@@ -583,7 +801,7 @@ fn write_atomic_bytes(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("invalid atomic path"))?;
-    fs::create_dir_all(parent)?;
+    ensure_private_dir(parent)?;
     let name = path
         .file_name()
         .ok_or_else(|| anyhow::anyhow!("invalid atomic filename"))?
@@ -591,9 +809,11 @@ fn write_atomic_bytes(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     let tmp = parent.join(format!(".{name}.tmp-{}", std::process::id()));
     let write_result = (|| -> anyhow::Result<()> {
         let mut file = File::create(&tmp)?;
+        restrict_file_mode(&tmp)?;
         file.write_all(bytes)?;
         file.sync_all()?;
         fs::rename(&tmp, path)?;
+        restrict_file_mode(path)?;
         Ok(())
     })();
     if write_result.is_err() {
@@ -626,7 +846,7 @@ pub fn begin_spool_session(root: &Path, session_id: &str) -> anyhow::Result<Path
         anyhow::bail!("invalid spool session id");
     }
     let session_dir = root.join("spool").join(session_id);
-    fs::create_dir_all(&session_dir)?;
+    ensure_private_dir(&session_dir)?;
     save_manifest(
         &session_dir,
         &SpoolManifest {
@@ -699,7 +919,7 @@ fn read_recovery_samples(session_dir: &Path) -> anyhow::Result<Vec<f32>> {
 
     let mut samples = Vec::new();
     for (_, path) in chunks {
-        let bytes = fs::read(path)?;
+        let bytes = read_spool_file(&path)?;
         if bytes.len() % std::mem::size_of::<f32>() != 0 {
             anyhow::bail!("recovery audio chunk is truncated");
         }
@@ -715,11 +935,25 @@ fn read_recovery_samples(session_dir: &Path) -> anyhow::Result<Vec<f32>> {
     Ok(samples)
 }
 
+fn write_spool_session_file(
+    session_dir: &Path,
+    file_name: &str,
+    bytes: &[u8],
+) -> anyhow::Result<PathBuf> {
+    let session_id = session_dir
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("invalid spool session path"))?;
+    let root = session_dir
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| anyhow::anyhow!("invalid spool session path"))?;
+    write_spool_file(root, &PathBuf::from(session_id).join(file_name), bytes)
+}
+
 fn rebuild_recovery_wav(session_dir: &Path) -> anyhow::Result<RecoveredSpool> {
     let samples = read_recovery_samples(session_dir)?;
     let wav = crate::chunker::encode_wav(&samples).map_err(|error| anyhow::anyhow!(error))?;
-    let audio_path = session_dir.join("recovery.wav");
-    write_atomic_bytes(&audio_path, &wav)?;
+    let audio_path = write_spool_session_file(session_dir, "recovery.wav", &wav)?;
     Ok(RecoveredSpool {
         audio_path,
         duration_secs: samples.len() as f64 / AUDIO_SAMPLE_RATE as f64,
@@ -820,7 +1054,8 @@ pub fn load_settings(dir: &Path) -> (Settings, bool) {
         .and_then(|bytes| serde_json::from_slice(bytes).ok())
         .unwrap_or_default();
     let schema_needs_persist = settings.schema_version < SETTINGS_SCHEMA_VERSION;
-    let needs_backup = schema_needs_persist || !settings.api_key.is_empty();
+    let needs_backup =
+        schema_needs_persist || !settings.api_key.is_empty() || !settings.asr_api_key.is_empty();
     if needs_backup {
         if let Some(raw) = raw.as_deref() {
             if let Err(error) = backup_legacy_settings(&path, raw) {
@@ -836,6 +1071,9 @@ pub fn load_settings(dir: &Path) -> (Settings, bool) {
     let plaintext_key = settings.api_key.clone();
     let had_plaintext = !plaintext_key.is_empty();
     let key_state = crate::keychain::resolve_api_key(&plaintext_key);
+    let plaintext_asr_key = settings.asr_api_key.clone();
+    let had_plaintext_asr = !plaintext_asr_key.is_empty();
+    let asr_key_state = crate::keychain::resolve_asr_api_key(&plaintext_asr_key);
     let mut needs_persist = schema_needs_persist;
     match key_state {
         crate::keychain::ApiKeyState::Configured(key) => {
@@ -859,6 +1097,26 @@ pub fn load_settings(dir: &Path) -> (Settings, bool) {
             }
         }
     }
+    match asr_key_state {
+        crate::keychain::ApiKeyState::Configured(key) => {
+            settings.asr_api_key = key;
+            if had_plaintext_asr {
+                needs_persist = true;
+            }
+        }
+        crate::keychain::ApiKeyState::Missing => {
+            settings.asr_api_key.clear();
+            if had_plaintext_asr {
+                needs_persist = true;
+            }
+        }
+        crate::keychain::ApiKeyState::Unavailable(error) => {
+            log::warn!("ASR API key state unavailable during startup: {error}");
+            if had_plaintext_asr {
+                settings.asr_api_key = plaintext_asr_key;
+            }
+        }
+    }
     (settings, needs_persist)
 }
 
@@ -875,13 +1133,12 @@ fn backup_legacy_settings(path: &Path, raw: &[u8]) -> anyhow::Result<()> {
         .as_object_mut()
         .ok_or_else(|| anyhow::anyhow!("legacy settings must be a JSON object"))?;
     object.insert("api_key".into(), serde_json::Value::String(String::new()));
-    let temp = path.with_file_name(format!(
-        ".settings.json.pre-migration.tmp-{}",
-        std::process::id()
-    ));
+    object.insert(
+        "asr_api_key".into(),
+        serde_json::Value::String(String::new()),
+    );
     let bytes = serde_json::to_vec_pretty(&value)?;
-    fs::write(&temp, bytes)?;
-    fs::rename(temp, backup)?;
+    write_atomic_bytes(&backup, &bytes)?;
     Ok(())
 }
 /// Persist settings to `settings.json`. The API key is stored in the OS
@@ -891,7 +1148,7 @@ pub fn save_settings(dir: &Path, settings: &Settings) -> anyhow::Result<()> {
     settings.validate()?;
     let lock = SETTINGS_WRITE_LOCK.get_or_init(|| Mutex::new(()));
     let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    std::fs::create_dir_all(dir)?;
+    ensure_private_dir(dir)?;
     // Write a new key into the keychain first; only persist the file (without
     // the key) once the secret is safely stored. An empty in-memory key can
     // also mean that a non-interactive keychain read timed out during startup,
@@ -902,15 +1159,17 @@ pub fn save_settings(dir: &Path, settings: &Settings) -> anyhow::Result<()> {
             anyhow::anyhow!("credential_storage: failed to store API key securely: {e}")
         })?;
     }
+    if !settings.asr_api_key.trim().is_empty() {
+        crate::keychain::set_asr_api_key(&settings.asr_api_key).map_err(|e| {
+            anyhow::anyhow!("credential_storage: failed to store ASR API key securely: {e}")
+        })?;
+    }
     let mut on_disk = settings.clone();
     on_disk.api_key = String::new();
+    on_disk.asr_api_key = String::new();
     let bytes = serde_json::to_vec_pretty(&on_disk)?;
     let path = dir.join("settings.json");
-    let tmp_path = dir.join(format!(".settings.json.tmp-{}", std::process::id()));
-    let mut file = File::create(&tmp_path)?;
-    file.write_all(&bytes)?;
-    file.sync_all()?;
-    fs::rename(&tmp_path, &path)?;
+    write_atomic_bytes(&path, &bytes)?;
     Ok(())
 }
 static SETTINGS_WRITE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -928,10 +1187,11 @@ fn schema(c: &Connection) -> anyhow::Result<()> {
 }
 
 fn open_history(dir: &Path) -> anyhow::Result<Connection> {
-    fs::create_dir_all(dir)?;
+    ensure_private_dir(dir)?;
     let path = dir.join("history.sqlite");
     let existed = path.exists();
     let connection = Connection::open(&path)?;
+    restrict_file_mode(&path)?;
     connection.execute_batch("PRAGMA foreign_keys = ON;")?;
     // History writes can overlap with a completion, recovery scan, or the
     // settings window loading its list. Let SQLite briefly wait for the
@@ -947,10 +1207,12 @@ fn open_history(dir: &Path) -> anyhow::Result<Connection> {
     if existed && previous_version < HISTORY_SCHEMA_VERSION {
         let backup = dir.join(format!("history.sqlite.v{previous_version}.bak"));
         if !backup.exists() {
-            fs::copy(&path, backup)?;
+            fs::copy(&path, &backup)?;
+            restrict_file_mode(&backup)?;
         }
     }
     schema(&connection)?;
+    restrict_history_sidecars(dir)?;
     Ok(connection)
 }
 
@@ -1229,26 +1491,49 @@ pub fn get_history_page(
     dir: &Path,
     limit: i64,
     before_id: Option<i64>,
+    query: Option<&str>,
 ) -> anyhow::Result<HistoryPage> {
     let c = open_history(dir)?;
     let spool_root = dir.join("spool");
     let limit = limit.clamp(1, 100);
     let fetch_limit = limit + 1;
-    let sql = if before_id.is_some() {
-        "SELECT id,created_at,COALESCE(raw_text,''),COALESCE((SELECT final_text FROM dictation_revisions WHERE dictation_id=dictations.id ORDER BY revision_id DESC LIMIT 1),final_text,''),COALESCE(duration_secs,0),COALESCE(degraded,0),degraded_reason,COALESCE(status,'ok'),delivery_method,fallback_reason,context_profile_id,raw_audio_path,COALESCE(cleanup_status,'unknown'),(SELECT COUNT(*) FROM dictation_revisions WHERE dictation_id=dictations.id) FROM dictations WHERE id < ? ORDER BY id DESC LIMIT ?"
-    } else {
-        "SELECT id,created_at,COALESCE(raw_text,''),COALESCE((SELECT final_text FROM dictation_revisions WHERE dictation_id=dictations.id ORDER BY revision_id DESC LIMIT 1),final_text,''),COALESCE(duration_secs,0),COALESCE(degraded,0),degraded_reason,COALESCE(status,'ok'),delivery_method,fallback_reason,context_profile_id,raw_audio_path,COALESCE(cleanup_status,'unknown'),(SELECT COUNT(*) FROM dictation_revisions WHERE dictation_id=dictations.id) FROM dictations ORDER BY id DESC LIMIT ?"
+    let search_pattern = query
+        .filter(|value| !value.is_empty())
+        .map(|value| format!("%{}%", escape_history_search(value)));
+    let sql = match (before_id.is_some(), search_pattern.is_some()) {
+        (true, true) => "SELECT id,created_at,COALESCE(raw_text,''),COALESCE((SELECT final_text FROM dictation_revisions WHERE dictation_id=dictations.id ORDER BY revision_id DESC LIMIT 1),final_text,''),COALESCE(duration_secs,0),COALESCE(degraded,0),degraded_reason,COALESCE(status,'ok'),delivery_method,fallback_reason,context_profile_id,raw_audio_path,COALESCE(cleanup_status,'unknown'),(SELECT COUNT(*) FROM dictation_revisions WHERE dictation_id=dictations.id) FROM dictations WHERE id < ? AND (COALESCE(raw_text,'') LIKE ? ESCAPE '\\' OR COALESCE((SELECT final_text FROM dictation_revisions WHERE dictation_id=dictations.id ORDER BY revision_id DESC LIMIT 1),final_text,'') LIKE ? ESCAPE '\\') ORDER BY id DESC LIMIT ?",
+        (true, false) => "SELECT id,created_at,COALESCE(raw_text,''),COALESCE((SELECT final_text FROM dictation_revisions WHERE dictation_id=dictations.id ORDER BY revision_id DESC LIMIT 1),final_text,''),COALESCE(duration_secs,0),COALESCE(degraded,0),degraded_reason,COALESCE(status,'ok'),delivery_method,fallback_reason,context_profile_id,raw_audio_path,COALESCE(cleanup_status,'unknown'),(SELECT COUNT(*) FROM dictation_revisions WHERE dictation_id=dictations.id) FROM dictations WHERE id < ? ORDER BY id DESC LIMIT ?",
+        (false, true) => "SELECT id,created_at,COALESCE(raw_text,''),COALESCE((SELECT final_text FROM dictation_revisions WHERE dictation_id=dictations.id ORDER BY revision_id DESC LIMIT 1),final_text,''),COALESCE(duration_secs,0),COALESCE(degraded,0),degraded_reason,COALESCE(status,'ok'),delivery_method,fallback_reason,context_profile_id,raw_audio_path,COALESCE(cleanup_status,'unknown'),(SELECT COUNT(*) FROM dictation_revisions WHERE dictation_id=dictations.id) FROM dictations WHERE (COALESCE(raw_text,'') LIKE ? ESCAPE '\\' OR COALESCE((SELECT final_text FROM dictation_revisions WHERE dictation_id=dictations.id ORDER BY revision_id DESC LIMIT 1),final_text,'') LIKE ? ESCAPE '\\') ORDER BY id DESC LIMIT ?",
+        (false, false) => "SELECT id,created_at,COALESCE(raw_text,''),COALESCE((SELECT final_text FROM dictation_revisions WHERE dictation_id=dictations.id ORDER BY revision_id DESC LIMIT 1),final_text,''),COALESCE(duration_secs,0),COALESCE(degraded,0),degraded_reason,COALESCE(status,'ok'),delivery_method,fallback_reason,context_profile_id,raw_audio_path,COALESCE(cleanup_status,'unknown'),(SELECT COUNT(*) FROM dictation_revisions WHERE dictation_id=dictations.id) FROM dictations ORDER BY id DESC LIMIT ?",
     };
     let mut s = c.prepare(sql)?;
-    let rows = if let Some(before_id) = before_id {
-        s.query_map(params![before_id, fetch_limit], history_row(&spool_root))?
-    } else {
-        s.query_map([fetch_limit], history_row(&spool_root))?
+    let mut items = match (before_id, search_pattern.as_deref()) {
+        (Some(before_id), Some(pattern)) => s
+            .query_map(
+                params![before_id, pattern, pattern, fetch_limit],
+                history_row(&spool_root),
+            )?
+            .collect::<Result<Vec<_>, _>>()?,
+        (Some(before_id), None) => s
+            .query_map(params![before_id, fetch_limit], history_row(&spool_root))?
+            .collect::<Result<Vec<_>, _>>()?,
+        (None, Some(pattern)) => s
+            .query_map(params![pattern, pattern, fetch_limit], history_row(&spool_root))?
+            .collect::<Result<Vec<_>, _>>()?,
+        (None, None) => s
+            .query_map([fetch_limit], history_row(&spool_root))?
+            .collect::<Result<Vec<_>, _>>()?,
     };
-    let mut items = rows.collect::<Result<Vec<_>, _>>()?;
     let has_more = items.len() > limit as usize;
     items.truncate(limit as usize);
     Ok(HistoryPage { items, has_more })
+}
+
+fn escape_history_search(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
 }
 
 fn history_row<'a>(
@@ -1281,7 +1566,7 @@ fn history_row<'a>(
 
 #[cfg(test)]
 pub fn get_history(dir: &Path, limit: i64) -> anyhow::Result<Vec<HistoryItem>> {
-    Ok(get_history_page(dir, limit, None)?.items)
+    Ok(get_history_page(dir, limit, None, None)?.items)
 }
 
 pub fn purge_history(dir: &Path, keep_history_days: u64) -> anyhow::Result<usize> {
@@ -1324,7 +1609,7 @@ pub fn export_history_json(dir: &Path) -> anyhow::Result<String> {
     let mut items = Vec::new();
     let mut before_id = None;
     loop {
-        let page = get_history_page(dir, 100, before_id)?;
+        let page = get_history_page(dir, 100, before_id, None)?;
         if let Some(last) = page.items.last() {
             before_id = Some(last.id);
         }
@@ -1630,7 +1915,11 @@ mod tests {
         assert_eq!(settings.long_output_mode, "paste");
         assert_eq!(settings.selected_action_hotkey, "CmdOrControl+Shift+Slash");
         assert!(settings.selected_actions_enabled);
+        assert!(settings.dictionary_learn_enabled);
         assert!(settings.input_device.is_empty());
+        assert_eq!(settings.input_gain, 1.0);
+        assert!(settings.asr_base_url.is_empty());
+        assert!(settings.asr_api_key.is_empty());
         assert!(settings
             .writing_modes
             .iter()
@@ -1641,6 +1930,52 @@ mod tests {
         .unwrap();
         assert_eq!(backup["api_key"], "");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn hold_combo_hotkey_migrates_to_hybrid() {
+        let mut settings = Settings {
+            activation_mode: "hold".into(),
+            hotkey: "CmdOrControl+Shift+Space".into(),
+            ..Settings::default()
+        };
+        settings.normalize();
+        assert_eq!(settings.activation_mode, "hybrid");
+        settings.validate().unwrap();
+    }
+
+    #[test]
+    fn hold_modifier_hotkey_still_migrates_to_double_tap() {
+        let mut settings = Settings {
+            activation_mode: "hold".into(),
+            hotkey: "Fn".into(),
+            ..Settings::default()
+        };
+        settings.normalize();
+        assert_eq!(settings.activation_mode, "double_tap");
+    }
+
+    #[test]
+    fn hybrid_combo_survives_normalize_and_validate() {
+        let mut settings = Settings {
+            activation_mode: "hybrid".into(),
+            hotkey: "CmdOrControl+Shift+Space".into(),
+            ..Settings::default()
+        };
+        settings.normalize();
+        assert_eq!(settings.activation_mode, "hybrid");
+        settings.validate().unwrap();
+    }
+
+    #[test]
+    fn hybrid_modifier_only_is_forced_to_double_tap() {
+        let mut settings = Settings {
+            activation_mode: "hybrid".into(),
+            hotkey: "Command".into(),
+            ..Settings::default()
+        };
+        settings.normalize();
+        assert_eq!(settings.activation_mode, "double_tap");
     }
 
     #[test]
@@ -1853,6 +2188,74 @@ mod tests {
         assert_eq!(std::fs::read(path).unwrap(), b"audio");
         assert!(write_spool_file(&dir, Path::new("../escape.wav"), b"nope").is_err());
         assert!(!dir.join("escape.wav").exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dir.join("spool/session/chunk.wav"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600);
+            let dir_mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+            assert_eq!(dir_mode, 0o700);
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn encrypted_spool_round_trip_and_plaintext_compatibility() {
+        let key = [7_u8; 32];
+        let plaintext = b"audio bytes";
+        let encrypted = encrypt_spool_bytes(plaintext, &key).unwrap();
+        assert_ne!(encrypted, plaintext);
+        assert_eq!(decrypt_spool_bytes(&encrypted, &key).unwrap(), plaintext);
+
+        let dir = temp_dir("plaintext-compatibility");
+        let path = dir.join("legacy.wav");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&path, plaintext).unwrap();
+        assert_eq!(read_spool_file(&path).unwrap(), plaintext);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn encrypted_spool_requires_a_key_for_write_and_read() {
+        let dir = temp_dir("encrypted-missing-key");
+        let result = write_spool_file_internal(
+            &dir,
+            Path::new("missing-key.wav"),
+            b"secret audio",
+            true,
+            None,
+        );
+        assert!(result.is_err());
+        assert!(!dir.join("spool/missing-key.wav").exists());
+
+        let path = dir.join("encrypted.wav");
+        let encrypted = encrypt_spool_bytes(b"secret audio", &[9_u8; 32]).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&path, encrypted).unwrap();
+        assert!(read_spool_file(&path).is_err());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn recovery_wav_uses_the_encrypted_spool_envelope_when_enabled() {
+        let dir = temp_dir("encrypted-recovery");
+        let wav = b"RIFF recovery";
+        write_spool_file_internal(
+            &dir,
+            Path::new("session/recovery.wav"),
+            wav,
+            true,
+            Some(&[3_u8; 32]),
+        )
+        .unwrap();
+        let on_disk = std::fs::read(dir.join("spool/session/recovery.wav")).unwrap();
+        assert!(on_disk.starts_with(SPOOL_ENVELOPE_MAGIC));
+        assert_ne!(on_disk.as_slice(), wav);
+        assert_eq!(decrypt_spool_bytes(&on_disk, &[3_u8; 32]).unwrap(), wav);
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -1870,6 +2273,7 @@ mod tests {
         let recovered = recover_spool(&dir, 7).unwrap();
         assert_eq!(recovered.len(), 1);
         assert!(recovered[0].audio_path.is_file());
+        assert!(!read_spool_file(&recovered[0].audio_path).unwrap().is_empty());
         let manifest: SpoolManifest =
             serde_json::from_slice(&std::fs::read(session.join("manifest.json")).unwrap()).unwrap();
         assert_eq!(manifest.status, "recoverable");
@@ -2132,21 +2536,161 @@ mod tests {
     }
 
     #[test]
+    fn input_gain_defaults_to_one_and_clamps() {
+        assert_eq!(Settings::default().input_gain, 1.0);
+        let parsed: Settings = serde_json::from_str(r#"{"api_key":"x"}"#).unwrap();
+        assert_eq!(parsed.input_gain, 1.0);
+        assert_eq!(SettingsView::from(&parsed).input_gain, 1.0);
+        let mut quiet = Settings {
+            input_gain: 0.1,
+            ..Settings::default()
+        };
+        quiet.normalize();
+        assert_eq!(quiet.input_gain, 0.5);
+        let mut loud = Settings {
+            input_gain: 9.0,
+            ..Settings::default()
+        };
+        loud.normalize();
+        assert_eq!(loud.input_gain, 4.0);
+        let mut invalid = Settings {
+            input_gain: f32::NAN,
+            ..Settings::default()
+        };
+        invalid.normalize();
+        assert_eq!(invalid.input_gain, 1.0);
+    }
+
+    #[test]
+    fn dictionary_learn_enabled_defaults_true() {
+        assert!(Settings::default().dictionary_learn_enabled);
+        let parsed: Settings = serde_json::from_str(r#"{"api_key":"x"}"#).unwrap();
+        assert!(parsed.dictionary_learn_enabled);
+        let view = SettingsView::from(&parsed);
+        assert!(view.dictionary_learn_enabled);
+    }
+
+    #[test]
+    fn asr_base_url_defaults_empty_and_falls_back_to_groq_key() {
+        assert!(Settings::default().asr_base_url.is_empty());
+        let parsed: Settings = serde_json::from_str(r#"{"api_key":"gsk_fallback"}"#).unwrap();
+        assert!(parsed.asr_base_url.is_empty());
+        assert!(parsed.asr_api_key.is_empty());
+        assert_eq!(parsed.asr_credential(), "gsk_fallback");
+        let groq_url = Settings {
+            api_key: "gsk_fallback".into(),
+            asr_base_url: "https://api.groq.com/openai/v1".into(),
+            ..Settings::default()
+        };
+        assert_eq!(groq_url.asr_credential(), "gsk_fallback");
+        let custom_without_asr_key = Settings {
+            api_key: "gsk_fallback".into(),
+            asr_base_url: "http://127.0.0.1:8000/v1".into(),
+            ..Settings::default()
+        };
+        assert_eq!(custom_without_asr_key.asr_credential(), "");
+        let with_asr_key = Settings {
+            api_key: "gsk_fallback".into(),
+            asr_api_key: "asr_only".into(),
+            asr_base_url: "http://127.0.0.1:8000/v1".into(),
+            ..Settings::default()
+        };
+        assert_eq!(with_asr_key.asr_credential(), "asr_only");
+        let view = SettingsView::from(&with_asr_key);
+        assert_eq!(view.asr_base_url, "http://127.0.0.1:8000/v1");
+        assert!(view.asr_api_key_configured);
+        assert_eq!(view.asr_api_key_hint.as_deref(), Some("••••only"));
+        let json = serde_json::to_string(&view).unwrap();
+        assert!(!json.contains("asr_only"));
+        assert!(!json.contains("gsk_fallback"));
+    }
+
+    #[test]
+    fn save_settings_never_writes_plaintext_asr_key() {
+        let dir = temp_dir("asr-keyblank");
+        let settings = Settings {
+            asr_api_key: "asr_secret_should_not_be_on_disk".into(),
+            asr_base_url: "http://127.0.0.1:8000/v1".into(),
+            ..Settings::default()
+        };
+        save_settings(&dir, &settings).unwrap();
+        let on_disk = std::fs::read_to_string(dir.join("settings.json")).unwrap();
+        assert!(
+            !on_disk.contains("asr_secret_should_not_be_on_disk"),
+            "plaintext ASR API key must never be written to settings.json"
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&on_disk).unwrap();
+        assert_eq!(parsed["asr_api_key"].as_str().unwrap_or(""), "");
+        assert_eq!(
+            parsed["asr_base_url"].as_str().unwrap_or(""),
+            "http://127.0.0.1:8000/v1"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn history_page_uses_a_cursor_and_reports_more_rows() {
         let dir = temp_dir("history-page");
         insert_history(&dir, "one", "one", 1.0, false).unwrap();
         insert_history(&dir, "two", "two", 1.0, false).unwrap();
         insert_history(&dir, "three", "three", 1.0, false).unwrap();
 
-        let first = get_history_page(&dir, 2, None).unwrap();
+        let first = get_history_page(&dir, 2, None, None).unwrap();
         assert_eq!(first.items.len(), 2);
         assert!(first.has_more);
         let before_id = first.items.last().unwrap().id;
 
-        let second = get_history_page(&dir, 2, Some(before_id)).unwrap();
+        let second = get_history_page(&dir, 2, Some(before_id), None).unwrap();
         assert_eq!(second.items.len(), 1);
         assert!(!second.has_more);
         assert!(second.items[0].id < before_id);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn history_page_filters_both_text_columns_before_cursor_pagination() {
+        let dir = temp_dir("history-search");
+        insert_history(&dir, "first raw", "VoiceFlow first", 1.0, false).unwrap();
+        insert_history(&dir, "unrelated", "other", 1.0, false).unwrap();
+        insert_history(&dir, "VoiceFlow second", "cleaned", 1.0, false).unwrap();
+
+        let first = get_history_page(&dir, 1, None, Some("VoiceFlow")).unwrap();
+        assert_eq!(first.items.len(), 1);
+        assert_eq!(first.items[0].raw_text, "VoiceFlow second");
+        assert!(first.has_more);
+
+        let second = get_history_page(
+            &dir,
+            1,
+            Some(first.items[0].id),
+            Some("VoiceFlow"),
+        )
+        .unwrap();
+        assert_eq!(second.items.len(), 1);
+        assert_eq!(second.items[0].final_text, "VoiceFlow first");
+        assert!(!second.has_more);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn history_search_escapes_like_wildcards() {
+        let dir = temp_dir("history-search-escape");
+        insert_history(&dir, "plain", "plain", 1.0, false).unwrap();
+        insert_history(&dir, "100% complete", "done", 1.0, false).unwrap();
+        insert_history(&dir, "under_score", "other", 1.0, false).unwrap();
+        insert_history(&dir, r"path\to\file", "slash", 1.0, false).unwrap();
+
+        let percent = get_history_page(&dir, 10, None, Some("%")).unwrap();
+        assert_eq!(percent.items.len(), 1);
+        assert_eq!(percent.items[0].raw_text, "100% complete");
+
+        let underscore = get_history_page(&dir, 10, None, Some("_")).unwrap();
+        assert_eq!(underscore.items.len(), 1);
+        assert_eq!(underscore.items[0].raw_text, "under_score");
+
+        let slash = get_history_page(&dir, 10, None, Some("\\")).unwrap();
+        assert_eq!(slash.items.len(), 1);
+        assert_eq!(slash.items[0].raw_text, r"path\to\file");
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -2165,7 +2709,7 @@ mod tests {
         drop(connection);
 
         assert_eq!(purge_history(&dir, 365).unwrap(), 1);
-        let page = get_history_page(&dir, 10, None).unwrap();
+        let page = get_history_page(&dir, 10, None, None).unwrap();
         assert_eq!(page.items.len(), 1);
         assert_eq!(page.items[0].raw_text, "new");
         let _ = std::fs::remove_dir_all(dir);
@@ -2185,7 +2729,7 @@ mod tests {
         drop(connection);
 
         assert_eq!(purge_history(&dir, 0).unwrap(), 0);
-        let page = get_history_page(&dir, 10, None).unwrap();
+        let page = get_history_page(&dir, 10, None, None).unwrap();
         assert_eq!(page.items.len(), 1);
         assert_eq!(page.items[0].raw_text, "old");
         let _ = std::fs::remove_dir_all(dir);
@@ -2199,7 +2743,10 @@ mod tests {
 
         clear_all_data(&dir).unwrap();
 
-        assert!(get_history_page(&dir, 10, None).unwrap().items.is_empty());
+        assert!(get_history_page(&dir, 10, None, None)
+            .unwrap()
+            .items
+            .is_empty());
         assert_eq!(
             get_usage(&dir, crate::queue::RequestGate::new(None).snapshots())
                 .unwrap()

@@ -1,7 +1,8 @@
 import { HotkeyRecorder } from "../HotkeyRecorder";
 import { HotkeyUsageGuide } from "../HotkeyUsageGuide";
+import { ActivationModeSelector } from "../ActivationModeSelector";
 import type { ActivationMode } from "../../lib/activationCopy";
-import { formatHotkeyDisplay } from "../../lib/hotkeyFormat";
+import { formatHotkeyDisplay, isModifierOnlyHotkey } from "../../lib/hotkeyFormat";
 import { useI18n } from "../../lib/i18n";
 import { TryItStep } from "./TryItStep";
 
@@ -62,6 +63,15 @@ export function HotkeyStep({
             }}
           />
         </div>
+        {isDictation && (
+          <div className="mt-4">
+            <ActivationModeSelector
+              value={isModifierOnlyHotkey(currentHotkey) ? "double_tap" : activationMode}
+              modifierOnly={isModifierOnlyHotkey(currentHotkey)}
+              onChange={(mode) => onHotkeyChange(currentHotkey, mode, { persist: true })}
+            />
+          </div>
+        )}
         <HotkeyUsageGuide hotkey={currentHotkey} activationMode={isDictation ? activationMode : "tap"} />
       </div>
 

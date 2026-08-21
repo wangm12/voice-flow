@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { Trash2 } from "lucide-react";
-import { colors, radius, buttonClass } from "../lib/theme";
+import { colors, radius, buttonClass, focusRingClass } from "../lib/theme";
 import { useI18n } from "../lib/i18n";
 import { SettingsGroup, SettingsPageHeader, SettingsShell } from "./SettingsLayout";
 import { ConfirmDialog } from "./ConfirmDialog";
@@ -58,7 +58,7 @@ export function SnippetsSettings({ snippets, onChange }: { snippets: Snippet[]; 
                 value={trigger}
                 onChange={(event) => setTrigger(event.target.value)}
                 placeholder={t("说出的完整短语…")}
-                className={`mt-3 w-full ${radius.control} h-9 border ${colors.border} ${colors.bg.elevated} ${colors.text.primary} px-3 text-sm outline-none transition-colors focus:border-accent`}
+                className={`mt-3 w-full ${radius.control} h-9 border ${colors.border} ${colors.bg.elevated} ${colors.text.primary} px-3 text-sm outline-none transition-colors focus:border-accent ${focusRingClass}`}
               />
             </label>
             <label className="min-w-0">
@@ -70,7 +70,7 @@ export function SnippetsSettings({ snippets, onChange }: { snippets: Snippet[]; 
                 onChange={(event) => setExpansion(event.target.value)}
                 rows={3}
                 placeholder={t("要插入的文字…")}
-                className={`mt-3 min-h-20 w-full resize-y ${radius.control} border ${colors.border} ${colors.bg.elevated} ${colors.text.primary} px-3 py-2 text-sm outline-none transition-colors focus:border-accent`}
+                className={`mt-3 min-h-20 w-full resize-y ${radius.control} border ${colors.border} ${colors.bg.elevated} ${colors.text.primary} px-3 py-2 text-sm outline-none transition-colors focus:border-accent ${focusRingClass}`}
               />
             </label>
           </div>

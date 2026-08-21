@@ -3,7 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { useEffect, useRef, useState, type SyntheticEvent } from "react";
 import { tryItHint } from "../../lib/activationCopy";
-import { radius } from "../../lib/theme";
+import { radius, focusRingClass } from "../../lib/theme";
 import { iconPropsLg } from "../../lib/icons";
 import { useI18n } from "../../lib/i18n";
 
@@ -106,7 +106,9 @@ export function TryItStep({
   const dictationStatus = recording
     ? activationMode === "double_tap"
       ? t("正在录音… 再双击功能键结束")
-      : t("正在录音… 再按一次热键结束")
+      : activationMode === "hybrid"
+        ? t("正在录音… 再按一次或松开结束")
+        : t("正在录音… 再按一次热键结束")
     : processing && activeTrialRef.current === "dictation"
       ? t("正在处理… 请稍候")
       : t("等待你按语音输入快捷键开始");
@@ -161,7 +163,7 @@ export function TryItStep({
           onChange={(event) => setInputText(event.target.value)}
           placeholder={t("把光标放在这里，然后按语音输入快捷键开始…")}
           rows={3}
-          className={`mt-3 w-full resize-none ${radius.control} border border-border bg-base p-3 text-sm text-primary outline-none transition-colors placeholder:text-tertiary focus:border-accent`}
+          className={`mt-3 w-full resize-none ${radius.control} border border-border bg-base p-3 text-sm text-primary outline-none transition-colors placeholder:text-tertiary focus:border-accent ${focusRingClass}`}
         />
         <TrialStatus active={recording && activeTrialRef.current === "dictation"} processing={processing && activeTrialRef.current === "dictation"} text={dictationStatus} />
       </section>}
@@ -181,7 +183,7 @@ export function TryItStep({
           onChange={(event) => setSelectedActionText(event.target.value)}
           onSelect={captureSelectedText}
           rows={3}
-          className={`mt-3 w-full resize-none ${radius.control} border border-border bg-base p-3 text-sm text-primary outline-none transition-colors focus:border-accent`}
+          className={`mt-3 w-full resize-none ${radius.control} border border-border bg-base p-3 text-sm text-primary outline-none transition-colors focus:border-accent ${focusRingClass}`}
         />
         <TrialStatus active={selectedActionState === "listening" || (recording && activeTrialRef.current === "selected_action")} processing={selectedActionState === "preparing_rewrite" || (processing && activeTrialRef.current === "selected_action")} text={selectedActionStatus} />
       </section>}

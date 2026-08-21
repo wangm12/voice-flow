@@ -119,10 +119,21 @@ impl ContextPolicy {
                     .forbidden_additions
                     .push("search context not spoken by the user".into());
             }
-            ContextFamily::WorkChat | ContextFamily::PersonalChat => {
+            ContextFamily::WorkChat => {
                 policy.artifact_kind = "chat_message".into();
+                policy.formality = "neutral".into();
                 policy.density = "concise".into();
                 policy.sentence_completeness = "natural_sentences".into();
+            }
+            ContextFamily::PersonalChat => {
+                policy.artifact_kind = "chat_message".into();
+                policy.formality = "casual".into();
+                policy.density = "concise".into();
+                policy.sentence_completeness = "preserve_fragments_when_intentional".into();
+                policy.forbidden_additions.extend([
+                    "greetings not spoken".into(),
+                    "swear-word sanitization".into(),
+                ]);
             }
             ContextFamily::Document => {
                 policy.artifact_kind = "document_text".into();
@@ -298,9 +309,10 @@ pub fn display_label(snapshot: &ContextSnapshot) -> String {
     }
     let style = match snapshot.profile.family {
         ContextFamily::PromptOrCode | ContextFamily::DeveloperCollaboration => "Code",
-        ContextFamily::Email => "Professional",
+        ContextFamily::Email => "邮件",
         ContextFamily::BrowserSearch => "Search",
-        ContextFamily::WorkChat | ContextFamily::PersonalChat => "Concise",
+        ContextFamily::WorkChat => "工作短讯",
+        ContextFamily::PersonalChat => "口语",
         ContextFamily::Document => "Clear",
         ContextFamily::Terminal => "Command",
         ContextFamily::FormFilling => "Form",
@@ -367,11 +379,14 @@ pub fn family_label(family: ContextFamily) -> &'static str {
     }
 }
 
+const OLD_SHARED_CHAT_PROMPT: &str = "Keep the message natural, short, and conversational. Do not turn it into an email or add greetings/sign-offs.";
+
 pub fn default_writing_prompt(family: ContextFamily) -> &'static str {
     match family {
         ContextFamily::Email => "Write a natural, polite email body. Organize spoken greeting, request, timing, and closing only when they were spoken. Do not create a subject line or signature.",
         ContextFamily::BrowserSearch => "Prefer a concise search query or clear web-field value. Keep named entities, dates, numbers, and URLs exact. Do not add search background.",
-        ContextFamily::WorkChat | ContextFamily::PersonalChat => "Keep the message natural, short, and conversational. Do not turn it into an email or add greetings/sign-offs.",
+        ContextFamily::PersonalChat => "Keep the user's casual chat voice. Do not add greetings or sign-offs such as 您好, 你好, Hello, or Best. Do not expand fragments into full formal sentences. Do not sanitize swearing, slang, or particles like 哈哈. Prefer light punctuation. Never turn the message into an email.",
+        ContextFamily::WorkChat => "Keep the message short and conversational for workplace chat. Do not add greetings, sign-offs, or email structure. Keep names and project terms exact. Do not add emoji unless spoken.",
         ContextFamily::ProjectManagement => "Keep owners, status, blockers, dates, and next actions explicit. Do not invent a person, deadline, or project fact.",
         ContextFamily::CalendarTask => "Keep dates, times, durations, reminders, attendees, locations, and next actions exact. Return a concise entry and do not invent scheduling details.",
         ContextFamily::DeveloperCollaboration | ContextFamily::PromptOrCode => "Preserve code, identifiers, paths, commands, API names, versions, and error text exactly. Organize a spoken coding request without generating code unless it was spoken.",
@@ -441,7 +456,11 @@ pub fn normalize_writing_modes(modes: &mut Vec<WritingMode>) {
     let mut normalized = defaults.clone();
     for mode in &mut normalized {
         if let Some(saved) = stored.iter().find(|candidate| candidate.id == mode.id) {
-            if !saved.prompt.trim().is_empty() {
+            let migrate_old_shared_chat = matches!(
+                mode.family,
+                ContextFamily::WorkChat | ContextFamily::PersonalChat
+            ) && saved.prompt == OLD_SHARED_CHAT_PROMPT;
+            if !saved.prompt.trim().is_empty() && !migrate_old_shared_chat {
                 mode.prompt = saved
                     .prompt
                     .chars()
@@ -2271,14 +2290,123 @@ mod tests {
             &[],
             false,
         );
-        assert_eq!(display_label(&outlook), "Outlook · Professional");
+        assert_eq!(display_label(&outlook), "Outlook · 邮件");
 
         let slack = snapshot_for_signal(
             &signal("com.tinyspeck.slackmacgap", "Slack", None),
             &[],
             false,
         );
-        assert_eq!(display_label(&slack), "Slack · Concise");
+        assert_eq!(display_label(&slack), "Slack · 工作短讯");
+
+        let wechat = snapshot_for_signal(
+            &signal("com.tencent.xinWeChat", "WeChat", None),
+            &[],
+            false,
+        );
+        assert_eq!(wechat.profile.app_label, "WeChat");
+        assert_eq!(display_label(&wechat), "WeChat · 口语");
+    }
+
+    #[test]
+    fn personal_and_work_chat_writing_prompts_differ() {
+        let personal = default_writing_prompt(ContextFamily::PersonalChat);
+        let work = default_writing_prompt(ContextFamily::WorkChat);
+        assert_ne!(personal, work);
+        assert_eq!(
+            personal,
+            "Keep the user's casual chat voice. Do not add greetings or sign-offs such as 您好, 你好, Hello, or Best. Do not expand fragments into full formal sentences. Do not sanitize swearing, slang, or particles like 哈哈. Prefer light punctuation. Never turn the message into an email."
+        );
+        assert_eq!(
+            work,
+            "Keep the message short and conversational for workplace chat. Do not add greetings, sign-offs, or email structure. Keep names and project terms exact. Do not add emoji unless spoken."
+        );
+        assert_eq!(
+            default_writing_prompt(ContextFamily::Email),
+            "Write a natural, polite email body. Organize spoken greeting, request, timing, and closing only when they were spoken. Do not create a subject line or signature."
+        );
+    }
+
+    #[test]
+    fn personal_and_work_chat_policies_split_tone() {
+        let personal = ContextPolicy::for_family(ContextFamily::PersonalChat);
+        let work = ContextPolicy::for_family(ContextFamily::WorkChat);
+
+        assert_eq!(personal.formality, "casual");
+        assert_eq!(
+            personal.sentence_completeness,
+            "preserve_fragments_when_intentional"
+        );
+        assert!(personal
+            .forbidden_additions
+            .iter()
+            .any(|item| item == "greetings not spoken"));
+        assert!(personal
+            .forbidden_additions
+            .iter()
+            .any(|item| item == "swear-word sanitization"));
+
+        assert_eq!(work.formality, "neutral");
+        assert_eq!(work.density, "concise");
+        assert!(work
+            .forbidden_additions
+            .iter()
+            .any(|item| item.contains("greetings")));
+    }
+
+    #[test]
+    fn normalize_migrates_the_old_shared_chat_prompt() {
+        let mut modes = builtin_writing_modes();
+        for mode in &mut modes {
+            if mode.id == "work_chat" || mode.id == "personal_chat" {
+                mode.prompt = OLD_SHARED_CHAT_PROMPT.into();
+            }
+        }
+        modes.push(WritingMode {
+            id: "custom.keep".into(),
+            label: "Keep".into(),
+            family: ContextFamily::General,
+            prompt: OLD_SHARED_CHAT_PROMPT.into(),
+            builtin: false,
+        });
+
+        normalize_writing_modes(&mut modes);
+
+        let personal = modes
+            .iter()
+            .find(|mode| mode.id == "personal_chat")
+            .unwrap();
+        let work = modes.iter().find(|mode| mode.id == "work_chat").unwrap();
+        let custom = modes.iter().find(|mode| mode.id == "custom.keep").unwrap();
+        assert_eq!(
+            personal.prompt,
+            default_writing_prompt(ContextFamily::PersonalChat)
+        );
+        assert_eq!(work.prompt, default_writing_prompt(ContextFamily::WorkChat));
+        assert_ne!(personal.prompt, work.prompt);
+        assert_eq!(custom.prompt, OLD_SHARED_CHAT_PROMPT);
+    }
+
+    #[test]
+    fn normalize_keeps_customized_builtin_chat_prompts() {
+        let custom_work = "Keep Slack messages punchy and never add emoji.";
+        let mut modes = builtin_writing_modes();
+        modes
+            .iter_mut()
+            .find(|mode| mode.id == "work_chat")
+            .unwrap()
+            .prompt = custom_work.into();
+
+        normalize_writing_modes(&mut modes);
+
+        assert_eq!(
+            modes
+                .iter()
+                .find(|mode| mode.id == "work_chat")
+                .unwrap()
+                .prompt,
+            custom_work
+        );
     }
 
     #[test]

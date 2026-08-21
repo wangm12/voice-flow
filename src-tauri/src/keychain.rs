@@ -4,9 +4,9 @@
 //! - Windows: Credential Manager
 //! - Linux: Secret Service (e.g. GNOME Keyring / KWallet)
 //!
-//! The key is stored under a fixed service/account so it never touches
-//! `settings.json` in plaintext. A one-time migration moves any legacy
-//! plaintext key from the settings file into the keychain.
+//! Credentials are stored under fixed service/account pairs so they never
+//! touch `settings.json` in plaintext. A one-time migration moves any legacy
+//! plaintext API key from the settings file into the keychain.
 
 #[cfg(not(target_os = "macos"))]
 use keyring::Entry;
@@ -50,6 +50,22 @@ const FALLBACK_SERVICE: &str = "com.voiceflow.desktop.credentials.dev.v5";
 #[cfg(not(target_os = "macos"))]
 const PREVIOUS_SERVICE: &str = "com.voiceflow.desktop.credentials.v2";
 const ACCOUNT: &str = "groq_api_key";
+const ASR_ACCOUNT: &str = "asr_api_key";
+#[cfg(all(target_os = "macos", not(debug_assertions)))]
+const API_SERVICE: &str = SERVICE;
+#[cfg(all(target_os = "macos", not(debug_assertions)))]
+const API_FALLBACK_SERVICE: &str = FALLBACK_SERVICE;
+#[cfg(all(target_os = "macos", debug_assertions))]
+const API_SERVICE: &str = FALLBACK_SERVICE;
+#[cfg(all(target_os = "macos", debug_assertions))]
+const API_FALLBACK_SERVICE: &str = FALLBACK_SERVICE;
+#[cfg(not(target_os = "macos"))]
+const API_SERVICE: &str = SERVICE;
+#[cfg(not(target_os = "macos"))]
+const API_FALLBACK_SERVICE: &str = PREVIOUS_SERVICE;
+const HISTORY_KEY_ACCOUNT: &str = "history-key";
+const HISTORY_KEY_SERVICE: &str = "com.voiceflow.desktop.history-key.v1";
+const HISTORY_KEY_FALLBACK_SERVICE: &str = "com.voiceflow.desktop.history-key.dev.v1";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApiKeyState {
@@ -68,13 +84,13 @@ fn keychain_disabled() -> bool {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn entry(service: &str) -> Result<Entry, keyring::Error> {
-    Entry::new(service, ACCOUNT)
+fn entry(service: &str, account: &str) -> Result<Entry, keyring::Error> {
+    Entry::new(service, account)
 }
 
 #[cfg(not(target_os = "macos"))]
-fn read_keyring(service: &str) -> Result<Option<String>, keyring::Error> {
-    match entry(service)?.get_password() {
+fn read_keyring(service: &str, account: &str) -> Result<Option<String>, keyring::Error> {
+    match entry(service, account)?.get_password() {
         Ok(key) if !key.is_empty() => Ok(Some(key)),
         Ok(_) | Err(keyring::Error::NoEntry) => Ok(None),
         Err(error) => Err(error),
@@ -82,13 +98,13 @@ fn read_keyring(service: &str) -> Result<Option<String>, keyring::Error> {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn read(service: &str) -> Result<Option<String>, keyring::Error> {
-    read_keyring(service)
+fn read(service: &str, account: &str) -> Result<Option<String>, keyring::Error> {
+    read_keyring(service, account)
 }
 
 #[cfg(all(target_os = "macos", not(debug_assertions)))]
-fn protected_options(service: &str) -> PasswordOptions {
-    let mut options = PasswordOptions::new_generic_password(service, ACCOUNT);
+fn protected_options(service: &str, account: &str) -> PasswordOptions {
+    let mut options = PasswordOptions::new_generic_password(service, account);
     // The modern data-protection keychain does not attach a per-build legacy
     // ACL to the item. This is important for `tauri dev`, where Cargo creates
     // a new ad-hoc code signature after a rebuild and the legacy API prompts
@@ -103,7 +119,7 @@ fn protected_options(service: &str) -> PasswordOptions {
 }
 
 #[cfg(all(target_os = "macos", not(debug_assertions)))]
-fn read_protected(service: &str) -> Result<Option<String>, SecurityError> {
+fn read_protected(service: &str, account: &str) -> Result<Option<String>, SecurityError> {
     // Keep startup and background settings reconciliation completely
     // non-interactive. `skip_authenticated_items` is encoded into the query
     // too, but the thread-local Security.framework guard is the final
@@ -117,7 +133,7 @@ fn read_protected(service: &str) -> Result<Option<String>, SecurityError> {
     options
         .class(ItemClass::generic_password())
         .service(service)
-        .account(ACCOUNT)
+        .account(account)
         .load_data(true)
         .ignore_legacy_keychains();
 
@@ -134,13 +150,13 @@ fn read_protected(service: &str) -> Result<Option<String>, SecurityError> {
 }
 
 #[cfg(target_os = "macos")]
-fn read_fallback(service: &str) -> Result<Option<String>, SecurityError> {
+fn read_fallback(service: &str, account: &str) -> Result<Option<String>, SecurityError> {
     let _interaction_lock = SecKeychain::disable_user_interaction()?;
 
     // Use the same PasswordOptions query used by set_fallback. ItemSearchOptions
     // does not reliably locate login-keychain items created through
     // set_generic_password_options on current macOS releases.
-    match generic_password(PasswordOptions::new_generic_password(service, ACCOUNT)) {
+    match generic_password(PasswordOptions::new_generic_password(service, account)) {
         Ok(bytes) => Ok(String::from_utf8(bytes).ok().filter(|key| !key.is_empty())),
         Err(error) if error.code() == ERR_SEC_ITEM_NOT_FOUND => Ok(None),
         Err(error) => Err(error),
@@ -148,14 +164,14 @@ fn read_fallback(service: &str) -> Result<Option<String>, SecurityError> {
 }
 
 #[cfg(all(target_os = "macos", not(debug_assertions)))]
-fn delete_protected(service: &str) -> Result<(), SecurityError> {
+fn delete_protected(service: &str, account: &str) -> Result<(), SecurityError> {
     let _interaction_lock = SecKeychain::disable_user_interaction()?;
 
     let mut options = ItemSearchOptions::new();
     options
         .class(ItemClass::generic_password())
         .service(service)
-        .account(ACCOUNT)
+        .account(account)
         .skip_authenticated_items(true)
         .ignore_legacy_keychains();
 
@@ -167,10 +183,10 @@ fn delete_protected(service: &str) -> Result<(), SecurityError> {
 }
 
 #[cfg(target_os = "macos")]
-fn delete_fallback(service: &str) -> Result<(), SecurityError> {
+fn delete_fallback(service: &str, account: &str) -> Result<(), SecurityError> {
     let _interaction_lock = SecKeychain::disable_user_interaction()?;
 
-    match delete_generic_password_options(PasswordOptions::new_generic_password(service, ACCOUNT)) {
+    match delete_generic_password_options(PasswordOptions::new_generic_password(service, account)) {
         Ok(()) => Ok(()),
         Err(error) if error.code() == ERR_SEC_ITEM_NOT_FOUND => Ok(()), // errSecItemNotFound
         Err(error) => Err(error),
@@ -178,17 +194,17 @@ fn delete_fallback(service: &str) -> Result<(), SecurityError> {
 }
 
 #[cfg(all(target_os = "macos", not(debug_assertions)))]
-fn set_protected(service: &str, key: &str) -> Result<(), SecurityError> {
+fn set_protected(service: &str, account: &str, key: &str) -> Result<(), SecurityError> {
     // A credential-store operation must never be allowed to open an
     // interactive login-keychain prompt. If an item needs authentication,
     // fail softly and let the settings UI ask the user to configure the key
     // again instead.
     let _interaction_lock = SecKeychain::disable_user_interaction()?;
-    set_generic_password_options(key.as_bytes(), protected_options(service))
+    set_generic_password_options(key.as_bytes(), protected_options(service, account))
 }
 
 #[cfg(target_os = "macos")]
-fn set_fallback(service: &str, key: &str) -> Result<(), SecurityError> {
+fn set_fallback(service: &str, account: &str, key: &str) -> Result<(), SecurityError> {
     // This path is used by unsigned/ad-hoc `tauri dev` builds, which cannot
     // address the Data Protection Keychain because they have no stable team
     // identity entitlement. It still uses SecItem APIs and never enables UI.
@@ -196,9 +212,9 @@ fn set_fallback(service: &str, key: &str) -> Result<(), SecurityError> {
     // item carries an ACL tied to the ad-hoc code signature, which changes on
     // every Cargo rebuild. The explicit accessibility class keeps the item
     // protected by the unlocked user keychain without that per-build ACL.
-    delete_fallback(service)?;
+    delete_fallback(service, account)?;
     let _interaction_lock = SecKeychain::disable_user_interaction()?;
-    let mut options = PasswordOptions::new_generic_password(service, ACCOUNT);
+    let mut options = PasswordOptions::new_generic_password(service, account);
     #[allow(deprecated)]
     unsafe {
         options.query.push((
@@ -237,44 +253,78 @@ where
 }
 
 #[allow(clippy::needless_return)]
-fn read_stored_api_key() -> Result<Option<String>, String> {
+fn read_stored_secret(
+    service: &str,
+    fallback_service: &str,
+    account: &str,
+) -> Result<Option<String>, String> {
     if keychain_disabled() {
         return Ok(None);
     }
     #[cfg(target_os = "macos")]
     {
+        #[cfg(debug_assertions)]
+        let _ = service;
         // `tauri dev` is ad-hoc signed and cannot use the Data Protection
         // Keychain's application identity. Keep its credential in a separate
         // service instead of probing a production item and turning a normal
         // development launch into a missing-entitlement error.
         #[cfg(debug_assertions)]
         {
-            return read_fallback(FALLBACK_SERVICE).map_err(|error| error.to_string());
+            return read_fallback(fallback_service, account).map_err(|error| error.to_string());
         }
 
         #[cfg(not(debug_assertions))]
         {
-            let primary = read_protected(SERVICE);
+            let primary = read_protected(service, account);
             return match primary {
                 Ok(Some(key)) => Ok(Some(key)),
-                Ok(None) => read_fallback(FALLBACK_SERVICE).map_err(|error| error.to_string()),
-                Err(primary_error) if missing_entitlement(primary_error) => {
-                    read_fallback(FALLBACK_SERVICE).map_err(|error| error.to_string())
+                Ok(None) => {
+                    read_fallback(fallback_service, account).map_err(|error| error.to_string())
                 }
-                Err(primary_error) => read_fallback(FALLBACK_SERVICE).map_err(|fallback_error| {
-                    format!("{primary_error}; fallback: {fallback_error}")
-                }),
+                Err(primary_error) if missing_entitlement(primary_error) => {
+                    read_fallback(fallback_service, account).map_err(|error| error.to_string())
+                }
+                Err(primary_error) => {
+                    read_fallback(fallback_service, account).map_err(|fallback_error| {
+                        format!("{primary_error}; fallback: {fallback_error}")
+                    })
+                }
             };
         }
     }
     #[cfg(not(target_os = "macos"))]
     {
-        match read(SERVICE) {
+        match read(service, account) {
             Ok(Some(key)) => Ok(Some(key)),
-            Ok(None) => read(PREVIOUS_SERVICE).map_err(|error| error.to_string()),
-            Err(primary_error) => read(PREVIOUS_SERVICE)
-                .map_err(|fallback_error| format!("{primary_error}; fallback: {fallback_error}")),
+            Ok(None) => read(fallback_service, account).map_err(|error| error.to_string()),
+            Err(primary_error) => read(fallback_service, account).map_err(|fallback_error| {
+                format!("{primary_error}; fallback: {fallback_error}")
+            }),
         }
+    }
+}
+
+fn read_stored_api_key() -> Result<Option<String>, String> {
+    read_stored_secret(API_SERVICE, API_FALLBACK_SERVICE, ACCOUNT)
+}
+
+fn read_stored_asr_api_key() -> Result<Option<String>, String> {
+    read_stored_secret(API_SERVICE, API_FALLBACK_SERVICE, ASR_ACCOUNT)
+}
+
+fn secret_state<F>(read: F) -> ApiKeyState
+where
+    F: FnOnce() -> Result<Option<String>, String> + Send + 'static,
+{
+    if keychain_disabled() {
+        return ApiKeyState::Missing;
+    }
+    match with_timeout(read) {
+        Some(Ok(Some(key))) => ApiKeyState::Configured(key),
+        Some(Ok(None)) => ApiKeyState::Missing,
+        Some(Err(error)) => ApiKeyState::Unavailable(error),
+        None => ApiKeyState::Unavailable("keychain read timed out".into()),
     }
 }
 
@@ -282,16 +332,7 @@ fn read_stored_api_key() -> Result<Option<String>, String> {
 /// and a credential-store failure. In particular, a timeout must not be
 /// persisted as "the user has no API key" during startup.
 pub fn get_api_key_state() -> ApiKeyState {
-    if keychain_disabled() {
-        return ApiKeyState::Missing;
-    }
-    let result = with_timeout(read_stored_api_key);
-    match result {
-        Some(Ok(Some(key))) => ApiKeyState::Configured(key),
-        Some(Ok(None)) => ApiKeyState::Missing,
-        Some(Err(error)) => ApiKeyState::Unavailable(error),
-        None => ApiKeyState::Unavailable("keychain read timed out".into()),
-    }
+    secret_state(read_stored_api_key)
 }
 
 /// Read the API key from the OS credential store.
@@ -305,56 +346,69 @@ pub fn get_api_key() -> Option<String> {
 
 /// Store the API key in the OS credential store.
 /// An empty key deletes the stored credential.
-pub fn set_api_key(key: &str) -> Result<(), String> {
+fn set_secret(
+    service: &str,
+    fallback_service: &str,
+    account: &str,
+    key: &str,
+) -> Result<(), String> {
     if keychain_disabled() {
         return Ok(());
     }
     let key = key.to_string();
+    let service = service.to_string();
+    let fallback_service = fallback_service.to_string();
+    let account = account.to_string();
+    #[cfg(all(target_os = "macos", debug_assertions))]
+    let _ = &service;
     let result = with_timeout(move || -> Result<(), String> {
         #[cfg(target_os = "macos")]
         {
             if key.is_empty() {
                 #[cfg(debug_assertions)]
                 {
-                    delete_fallback(FALLBACK_SERVICE).map_err(|error| error.to_string())
+                    delete_fallback(&fallback_service, &account)
+                        .map_err(|error| error.to_string())
                 }
 
                 #[cfg(not(debug_assertions))]
                 {
-                    return match delete_protected(SERVICE) {
+                    return match delete_protected(&service, &account) {
                         Ok(()) => {
-                            let _ = delete_fallback(FALLBACK_SERVICE);
+                            let _ = delete_fallback(&fallback_service, &account);
                             Ok(())
                         }
                         Err(error) => {
                             log::warn!(
                                 "protected keychain delete unavailable; using login keychain fallback: {error}"
                             );
-                            delete_fallback(FALLBACK_SERVICE).map_err(|error| error.to_string())
+                            delete_fallback(&fallback_service, &account)
+                                .map_err(|error| error.to_string())
                         }
                     };
                 }
             } else {
                 #[cfg(debug_assertions)]
                 {
-                    set_fallback(FALLBACK_SERVICE, &key).map_err(|error| error.to_string())?;
+                    set_fallback(&fallback_service, &account, &key)
+                        .map_err(|error| error.to_string())?;
                 }
 
                 #[cfg(not(debug_assertions))]
                 {
-                    match set_protected(SERVICE, &key) {
+                    match set_protected(&service, &account, &key) {
                         Ok(()) => {}
                         Err(error) => {
                             log::warn!(
                                 "protected keychain write unavailable; using login keychain fallback: {error}"
                             );
-                            set_fallback(FALLBACK_SERVICE, &key)
+                            set_fallback(&fallback_service, &account, &key)
                                 .map_err(|error| error.to_string())?;
                         }
                     }
                 }
 
-                match read_stored_api_key() {
+                match read_stored_secret(&service, &fallback_service, &account) {
                     Ok(Some(stored)) if stored == key => Ok(()),
                     Ok(Some(_)) => Err("credential write verification failed".into()),
                     Ok(None) => {
@@ -367,12 +421,12 @@ pub fn set_api_key(key: &str) -> Result<(), String> {
 
         #[cfg(not(target_os = "macos"))]
         {
-            let current_entry = entry(SERVICE).map_err(|e| e.to_string())?;
+            let current_entry = entry(&service, &account).map_err(|e| e.to_string())?;
             if key.is_empty() {
                 // Best-effort delete; NoEntry just means nothing was stored.
                 match current_entry.delete_credential() {
                     Ok(()) | Err(keyring::Error::NoEntry) => {
-                        if let Ok(previous) = entry(PREVIOUS_SERVICE) {
+                        if let Ok(previous) = entry(&fallback_service, &account) {
                             let _ = previous.delete_credential();
                         }
                         return Ok(());
@@ -383,10 +437,10 @@ pub fn set_api_key(key: &str) -> Result<(), String> {
             current_entry
                 .set_password(&key)
                 .map_err(|e| e.to_string())?;
-            if let Ok(previous) = entry(PREVIOUS_SERVICE) {
+            if let Ok(previous) = entry(&fallback_service, &account) {
                 let _ = previous.delete_credential();
             }
-            match read_stored_api_key() {
+            match read_stored_secret(&service, &fallback_service, &account) {
                 Ok(Some(stored)) if stored == key => Ok(()),
                 Ok(Some(_)) => Err("credential write verification failed".into()),
                 Ok(None) => Err("credential write succeeded but no credential was readable".into()),
@@ -398,6 +452,108 @@ pub fn set_api_key(key: &str) -> Result<(), String> {
         Some(res) => res,
         None => Err("keychain write timed out".into()),
     }
+}
+
+/// Store the API key in the OS credential store.
+/// An empty key deletes the stored credential.
+pub fn set_api_key(key: &str) -> Result<(), String> {
+    set_secret(API_SERVICE, API_FALLBACK_SERVICE, ACCOUNT, key)
+}
+
+pub fn get_asr_api_key_state() -> ApiKeyState {
+    secret_state(read_stored_asr_api_key)
+}
+
+#[allow(dead_code)]
+pub fn get_asr_api_key() -> Option<String> {
+    match get_asr_api_key_state() {
+        ApiKeyState::Configured(key) => Some(key),
+        ApiKeyState::Missing | ApiKeyState::Unavailable(_) => None,
+    }
+}
+
+pub fn set_asr_api_key(key: &str) -> Result<(), String> {
+    set_secret(API_SERVICE, API_FALLBACK_SERVICE, ASR_ACCOUNT, key)
+}
+
+pub fn resolve_asr_api_key(plaintext: &str) -> ApiKeyState {
+    if !plaintext.is_empty() {
+        if keychain_disabled() {
+            return ApiKeyState::Configured(plaintext.to_owned());
+        }
+        return match set_asr_api_key(plaintext) {
+            Ok(()) => ApiKeyState::Configured(plaintext.to_owned()),
+            Err(error) => ApiKeyState::Unavailable(error),
+        };
+    }
+    get_asr_api_key_state()
+}
+
+/// Read the optional application-layer history encryption key.
+pub fn get_history_key() -> Result<Option<Vec<u8>>, String> {
+    if keychain_disabled() {
+        return Ok(None);
+    }
+    let result = with_timeout(|| {
+        read_stored_secret(
+            HISTORY_KEY_SERVICE,
+            HISTORY_KEY_FALLBACK_SERVICE,
+            HISTORY_KEY_ACCOUNT,
+        )
+    });
+    match result {
+        Some(Ok(Some(value))) => {
+            decode_history_key(&value).map(Some)
+        }
+        Some(Ok(None)) => Ok(None),
+        Some(Err(error)) => Err(error),
+        None => Err("keychain read timed out".into()),
+    }
+}
+
+/// Store or remove the optional application-layer history encryption key.
+pub fn set_history_key(key: Option<&[u8]>) -> Result<(), String> {
+    if let Some(key) = key {
+        if key.len() != 32 {
+            return Err("history key must be exactly 32 bytes".into());
+        }
+        let value = encode_history_key(key);
+        set_secret(
+            HISTORY_KEY_SERVICE,
+            HISTORY_KEY_FALLBACK_SERVICE,
+            HISTORY_KEY_ACCOUNT,
+            &value,
+        )
+    } else {
+        set_secret(
+            HISTORY_KEY_SERVICE,
+            HISTORY_KEY_FALLBACK_SERVICE,
+            HISTORY_KEY_ACCOUNT,
+            "",
+        )
+    }
+}
+
+fn encode_history_key(key: &[u8]) -> String {
+    let mut encoded = String::with_capacity(key.len() * 2);
+    for byte in key {
+        use std::fmt::Write;
+        let _ = write!(encoded, "{byte:02x}");
+    }
+    encoded
+}
+
+fn decode_history_key(value: &str) -> Result<Vec<u8>, String> {
+    if value.len() != 64 || !value.is_ascii() {
+        return Err("stored history key must be 32-byte hex".into());
+    }
+    (0..value.len())
+        .step_by(2)
+        .map(|offset| {
+            u8::from_str_radix(&value[offset..offset + 2], 16)
+                .map_err(|_| "stored history key must be 32-byte hex".to_string())
+        })
+        .collect()
 }
 
 /// Migrate a legacy plaintext key (from `settings.json`) into the keychain.
@@ -460,5 +616,15 @@ mod tests {
 
         assert_eq!(stored.as_deref(), Some(key.as_str()));
         assert_eq!(cleared, None);
+    }
+
+    #[test]
+    fn history_key_encoding_is_binary_safe_and_exactly_32_bytes() {
+        let key = (0_u8..32).collect::<Vec<_>>();
+        let encoded = encode_history_key(&key);
+        assert_eq!(encoded.len(), 64);
+        assert_eq!(decode_history_key(&encoded).unwrap(), key);
+        assert!(decode_history_key("00").is_err());
+        assert!(decode_history_key(&"zz".repeat(32)).is_err());
     }
 }

@@ -133,6 +133,10 @@
   color: rgba(255, 220, 220, 0.98);
 }
 
+.voice-pill-caption--partial {
+  max-width: 360px;
+}
+
 .voice-pill {
   position: relative;
   display: flex;

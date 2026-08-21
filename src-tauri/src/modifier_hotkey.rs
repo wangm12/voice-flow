@@ -1,5 +1,5 @@
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -39,6 +39,12 @@ static APP_HANDLE: OnceLock<AppHandle> = OnceLock::new();
 /// be misread as a physical double-tap and re-enter the event system (which crashes
 /// the main runloop with an uncaught NSException).
 static PASTE_SUPPRESS: AtomicBool = AtomicBool::new(false);
+
+fn lock_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 pub fn set_paste_suppressed(suppressed: bool) {
     PASTE_SUPPRESS.store(suppressed, Ordering::SeqCst);
@@ -135,7 +141,7 @@ fn schedule_tap_timeout(generation: u64) {
     thread::spawn(move || {
         thread::sleep(Duration::from_millis(DOUBLE_TAP_MS));
         let store = gesture_store();
-        let mut state = store.lock().unwrap();
+        let mut state = lock_recover(&store);
         if state.timer_generation == generation && state.awaiting_second_tap {
             state.awaiting_second_tap = false;
             state.last_release_at = None;
@@ -145,9 +151,9 @@ fn schedule_tap_timeout(generation: u64) {
 
 fn on_modifier_press(app: &AppHandle) {
     let store = gesture_store();
-    let mut state = store.lock().unwrap();
+    let mut state = lock_recover(&store);
     let now = Instant::now();
-    if config_store().lock().unwrap().activation_mode != "double_tap" || state.key_down {
+    if lock_recover(&config_store()).activation_mode != "double_tap" || state.key_down {
         return;
     }
 
@@ -169,7 +175,7 @@ fn on_modifier_press(app: &AppHandle) {
 
 fn on_modifier_release(_app: &AppHandle) {
     let store = gesture_store();
-    let mut state = store.lock().unwrap();
+    let mut state = lock_recover(&store);
     if !state.key_down {
         return;
     }
@@ -217,7 +223,7 @@ fn ensure_listener_on_main() -> Result<(), String> {
                 return None;
             }
 
-            let config = config_store().lock().unwrap().clone();
+            let config = lock_recover(&config_store()).clone();
             let binding = config.binding?;
 
             let code = event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE) as u16;
@@ -290,30 +296,22 @@ fn ensure_listener(_app: AppHandle) -> Result<(), String> {
 pub fn register(app: &AppHandle, hotkey: &str, activation_mode: &str) -> Result<(), String> {
     let binding = parse_modifier_hotkey(hotkey)
         .ok_or_else(|| format!("unknown modifier-only hotkey `{hotkey}`"))?;
-    if let Ok(mut state) = gesture_store().lock() {
-        reset_gesture_state(&mut state);
-    }
+    reset_gesture_state(&mut lock_recover(&gesture_store()));
     ensure_listener(app.clone())?;
     let store = config_store();
-    let mut state = store.lock().unwrap();
+    let mut state = lock_recover(&store);
     state.binding = Some(binding);
     state.activation_mode = activation_mode.to_owned();
     Ok(())
 }
 
 pub fn reset_state() {
-    if let Ok(mut state) = gesture_store().lock() {
-        reset_gesture_state(&mut state);
-    }
+    reset_gesture_state(&mut lock_recover(&gesture_store()));
 }
 
 pub fn unregister() {
-    if let Ok(mut state) = gesture_store().lock() {
-        reset_gesture_state(&mut state);
-    }
-    if let Ok(mut state) = config_store().lock() {
-        state.binding = None;
-    }
+    reset_gesture_state(&mut lock_recover(&gesture_store()));
+    lock_recover(&config_store()).binding = None;
 }
 
 #[cfg(test)]
@@ -349,5 +347,18 @@ mod tests {
         assert!(!state.awaiting_second_tap);
         assert!(state.last_release_at.is_none());
         assert_eq!(state.timer_generation, 4);
+    }
+
+    #[test]
+    fn production_lock_helper_recovers_poisoned_state() {
+        let state = Arc::new(Mutex::new(7));
+        let poisoned = state.clone();
+        let _ = thread::spawn(move || {
+            let _guard = poisoned.lock().expect("initial lock");
+            panic!("poison modifier state");
+        })
+        .join();
+
+        assert_eq!(*lock_recover(&state), 7);
     }
 }

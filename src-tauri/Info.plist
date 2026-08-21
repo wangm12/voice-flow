@@ -4,6 +4,8 @@
 <dict>
   <key>NSMicrophoneUsageDescription</key>
   <string>VoiceFlow 只会在录音时使用麦克风，将你的语音转换为文字。</string>
+  <key>NSAccessibilityUsageDescription</key>
+  <string>VoiceFlow 只使用辅助功能权限，将文字插入当前获得焦点的输入框。</string>
   <key>NSAppleEventsUsageDescription</key>
   <string>启用浏览器上下文检测后，VoiceFlow 才会读取当前站点信息，并仅将结果保存在本机。</string>
 </dict>

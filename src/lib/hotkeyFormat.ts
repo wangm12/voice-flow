@@ -27,6 +27,13 @@ export function isModifierOnlyHotkey(hotkey: string): boolean {
   return !trimmed.includes("+") && MODIFIER_ONLY.has(trimmed);
 }
 
+const FN_KEYS = new Set(["Fn", "Function", "Globe"]);
+
+export function isFnOnlyHotkey(hotkey: string): boolean {
+  const trimmed = hotkey.trim();
+  return isModifierOnlyHotkey(trimmed) && FN_KEYS.has(trimmed);
+}
+
 export function toTauriHotkey(tanstack: string): string {
   const parts = tanstack.split("+").map((part) => part.trim()).filter(Boolean);
   if (parts.length === 0) return tanstack;

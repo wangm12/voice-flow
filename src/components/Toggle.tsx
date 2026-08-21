@@ -19,8 +19,8 @@ export function Toggle({ checked, onChange, label, className = "", ...props }: T
       onClick={() => onChange(!checked)}
       className={`relative inline-flex h-7 w-12 shrink-0 items-center ${radius.pill} outline-none transition-colors duration-150 focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2 focus-visible:ring-offset-base disabled:cursor-not-allowed disabled:opacity-50 ${className}`}
     >
-      <span className={`absolute inset-0 ${radius.pill} transition-colors duration-150 ${checked ? "bg-success" : "bg-elevated"}`} aria-hidden="true" />
-      <span className={`absolute left-1 h-5 w-5 rounded-full bg-zinc-300 transition-transform duration-150 ${checked ? "translate-x-5 bg-success-foreground shadow-sm" : ""}`} aria-hidden="true" />
+      <span className={`absolute inset-0 ${radius.pill} transition-colors duration-150 motion-reduce:transition-none ${checked ? "bg-success" : "bg-elevated"}`} aria-hidden="true" />
+      <span className={`absolute left-1 h-5 w-5 rounded-full bg-card transition-transform duration-150 motion-reduce:transition-none ${checked ? "translate-x-5 bg-success-foreground shadow-sm" : ""}`} aria-hidden="true" />
     </button>
   );
 }

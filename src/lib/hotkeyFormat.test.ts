@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   formatHotkeyDisplay,
   hotkeyDisplayParts,
+  isFnOnlyHotkey,
   isModifierOnlyHotkey,
   toTauriHotkey,
   toTanStackHotkey,
@@ -21,6 +22,14 @@ describe("hotkey formatting", () => {
     expect(isModifierOnlyHotkey("Fn")).toBe(true);
     expect(formatHotkeyDisplay("Fn")).toBe("fn");
     expect(isModifierOnlyHotkey("CmdOrControl+Shift")).toBe(false);
+  });
+
+  it("treats Fn, Function, and Globe as the Fn hint hotkey", () => {
+    expect(isFnOnlyHotkey("Fn")).toBe(true);
+    expect(isFnOnlyHotkey("Function")).toBe(true);
+    expect(isFnOnlyHotkey("Globe")).toBe(true);
+    expect(isFnOnlyHotkey("Command")).toBe(false);
+    expect(isFnOnlyHotkey("CmdOrControl+Shift+Space")).toBe(false);
   });
 
   it("keeps the slash shortcut canonical internally but symbolic in the UI", () => {

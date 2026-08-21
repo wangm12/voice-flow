@@ -4,7 +4,7 @@ import { Archive, ArrowUp, Check, CircleAlert, Clipboard, Clock3, Sparkles, Squa
 import { VoiceWaveform } from "./VoiceWaveform";
 import { IconButton } from "../IconButton";
 import { useI18n } from "../../lib/i18n";
-import { pillCaption } from "./voicePillTokens";
+import { pillCaption, hasSelectedActionCaption, voicePillCaptionMaxWidthForPartial } from "./voicePillTokens";
 
 type DictationState = "idle" | "starting" | "recording" | "recording_limited" | "processing" | "rate_limited" | "done" | "unverified" | "copied" | "degraded" | "history" | "error";
 type ProcessingPhase = "finalizing_audio" | "asr" | "cleanup" | "delivery" | "waiting_retry" | "idle";
@@ -39,8 +39,13 @@ export const VoicePill = memo(function VoicePill({
   phase = "idle",
   retryAfterSecs = null,
   undoAvailable = false,
+  contextLabel,
+  fallbackReason = null,
+  selectedActionState = null,
   waveformLevels,
   progress,
+  chunkProgress,
+  partialText = null,
   reduced,
 }: {
   state: DictationState;
@@ -52,6 +57,11 @@ export const VoicePill = memo(function VoicePill({
   selectedActionState?: string | null;
   waveformLevels: number[];
   progress: number;
+  chunkProgress?: {
+    completed: number;
+    total: number;
+  } | null;
+  partialText?: string | null;
   reduced: boolean;
 }) {
   const { t } = useI18n();
@@ -79,10 +89,20 @@ export const VoicePill = memo(function VoicePill({
   const progressValue = Math.max(0, Math.min(1, progress));
   const showProgress = isLoading;
   const indeterminateProgress = showProgress && state !== "processing";
+  const caption = pillCaption(
+    state,
+    t,
+    state === "rate_limited" ? retryRemaining : retryAfterSecs,
+    { fallbackReason, selectedActionState, chunkProgress, contextLabel, partialText },
+  );
+  const showingPartial = Boolean(partialText?.trim())
+    && ["recording", "recording_limited", "starting", "processing"].includes(state);
+  const stackHidden = state === "idle" && !caption;
+  const showStackExit = isTerminal && !(caption && hasSelectedActionCaption(selectedActionState));
   const stackClassName = [
     "voice-pill-stack",
-    state === "idle" ? "voice-pill-stack--hidden" : "",
-    isTerminal ? "voice-pill-stack--exit" : "",
+    stackHidden ? "voice-pill-stack--hidden" : "",
+    showStackExit ? "voice-pill-stack--exit" : "",
     reduced ? "voice-pill-stack--reduced" : "",
   ].filter(Boolean).join(" ");
   const progressClassName = [
@@ -106,15 +126,21 @@ export const VoicePill = memo(function VoicePill({
     if (undoBusy) return;
     setUndoBusy(true);
     try {
-      await invoke("undo_last_delivery");
+      const result = await invoke<string>("undo_last_delivery");
+      if (result !== "success") {
+        console.warn("Undo insertion unavailable", result);
+      }
     } catch (error) {
       console.error("Failed to undo delivery", error);
     } finally {
       setUndoBusy(false);
     }
   }
-  const caption = pillCaption(state, t, state === "rate_limited" ? retryRemaining : retryAfterSecs);
-  const captionTone = state === "error" ? "error" : "warning";
+  const captionTone = state === "error"
+    ? "error"
+    : state === "degraded" || fallbackReason || selectedActionState === "accessibility_required"
+      ? "warning"
+      : "status";
   const statusLabel = stateAriaLabel(state, t);
   const liveLabel = caption ? `${statusLabel}。${caption}` : statusLabel;
   const pillClassName = [
@@ -124,7 +150,7 @@ export const VoicePill = memo(function VoicePill({
   ].filter(Boolean).join(" ");
 
   return (
-    <div className={stackClassName} aria-hidden={state === "idle"}>
+    <div className={stackClassName} aria-hidden={stackHidden}>
       <div className={pillClassName} role="status" aria-label={liveLabel} aria-live="polite">
         <span
           className={progressClassName}
@@ -219,7 +245,14 @@ export const VoicePill = memo(function VoicePill({
         )}
       </div>
       {caption && (
-        <p className={`voice-pill-caption voice-pill-caption--${captionTone}`}>
+        <p
+          className={[
+            "voice-pill-caption",
+            `voice-pill-caption--${captionTone}`,
+            showingPartial ? "voice-pill-caption--partial" : "",
+          ].filter(Boolean).join(" ")}
+          style={showingPartial ? { maxWidth: voicePillCaptionMaxWidthForPartial(true) } : undefined}
+        >
           <span className="voice-pill-caption__dot" aria-hidden="true" />
           <span className="voice-pill-caption__text">{caption}</span>
         </p>

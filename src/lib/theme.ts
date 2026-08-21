@@ -78,8 +78,11 @@ export const textClass = {
   caption: "text-xs font-normal text-tertiary",
 } as const;
 
+export const focusRingClass =
+  "focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent focus-visible:outline-offset-2";
+
 const buttonBase =
-  "inline-flex items-center justify-center gap-1.5 text-sm font-medium transition-colors duration-150 active:scale-[0.98] focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent focus-visible:outline-offset-2 disabled:cursor-not-allowed";
+  `inline-flex items-center justify-center gap-1.5 text-sm font-medium transition-colors duration-150 active:scale-[0.98] motion-reduce:active:scale-100 ${focusRingClass} disabled:cursor-not-allowed`;
 
 export const buttonClass = `${radius.control} ${controlSize.button} ${buttonBase} ${colors.accent.background} ${colors.accent.foreground} px-4 hover:opacity-90 disabled:opacity-40`;
 
@@ -87,7 +90,7 @@ export const secondaryButtonClass = `${radius.control} ${controlSize.button} ${b
 
 export const ghostButtonClass = `${radius.control} ${controlSize.button} ${buttonBase} px-3 ${colors.text.tertiary} hover:text-primary hover:bg-elevated/60`;
 
-export const compactButtonClass = `${radius.control} ${controlSize.button} inline-flex items-center justify-center gap-1 px-3 text-xs font-medium border ${colors.border} ${colors.text.secondary} transition-colors hover:bg-elevated hover:text-primary focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent focus-visible:outline-offset-2`;
+export const compactButtonClass = `${radius.control} ${controlSize.button} inline-flex items-center justify-center gap-1 px-3 text-xs font-medium border ${colors.border} ${colors.text.secondary} transition-colors hover:bg-elevated hover:text-primary ${focusRingClass}`;
 
 export const tagClass = `${radius.pill} inline-flex h-7 items-center gap-1.5 px-2.5 text-xs font-medium`;
 

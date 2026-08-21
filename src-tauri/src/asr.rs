@@ -7,6 +7,58 @@ use std::time::Duration;
 use thiserror::Error;
 
 pub const MODEL: &str = "whisper-large-v3-turbo";
+pub const DEFAULT_ASR_BASE_URL: &str = "https://api.groq.com/openai/v1";
+
+/// Resolve an OpenAI-compatible transcription URL from a user-supplied base.
+/// Empty values use Groq. A value that already contains `audio/transcriptions`
+/// is used as-is; a `/v1` base appends `/audio/transcriptions`; otherwise
+/// `/v1/audio/transcriptions` is appended.
+pub fn resolve_transcription_url(base: &str) -> String {
+    let trimmed = base.trim().trim_end_matches('/');
+    let value = if trimmed.is_empty() {
+        DEFAULT_ASR_BASE_URL
+    } else {
+        trimmed
+    };
+    if value.contains("audio/transcriptions") {
+        value.to_owned()
+    } else if value.ends_with("/v1") {
+        format!("{value}/audio/transcriptions")
+    } else {
+        format!("{value}/v1/audio/transcriptions")
+    }
+}
+
+/// Reuse the Groq chat key only for the Groq default or `api.groq.com`.
+pub fn groq_key_fallback_allowed(base_url: &str) -> bool {
+    if base_url.trim().is_empty() {
+        return true;
+    }
+    transcription_host(base_url).as_deref() == Some("api.groq.com")
+}
+
+pub fn transcription_host(base_url: &str) -> Option<String> {
+    host_from_url(&resolve_transcription_url(base_url))
+}
+
+fn host_from_url(url: &str) -> Option<String> {
+    let rest = url.split_once("://")?.1;
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    let hostport = authority.rsplit_once('@').map(|(_, host)| host).unwrap_or(authority);
+    let host = if let Some(end) = hostport.strip_prefix('[') {
+        end.split_once(']')?.0
+    } else {
+        match hostport.rsplit_once(':') {
+            Some((candidate, port)) if port.chars().all(|ch| ch.is_ascii_digit()) => candidate,
+            _ => hostport,
+        }
+    };
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_ascii_lowercase())
+    }
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct RateLimits {
@@ -54,8 +106,8 @@ pub struct AsrCapabilities {
 pub type AsrFuture = Pin<Box<dyn Future<Output = Result<Transcript, AsrError>> + Send>>;
 
 /// Internal seam for ASR providers. Groq currently accepts completed audio
-/// uploads, so prefetching is silent background work rather than a partial
-/// transcript stream.
+/// uploads, so prefetching is silent batch work, not streaming ASR, and never
+/// exposes partial transcripts.
 pub trait AsrProvider: Send + Sync {
     fn transcribe_batch(&self, audio: Vec<u8>, options: AsrOptions) -> AsrFuture;
 
@@ -99,18 +151,27 @@ pub struct GroqAsrProvider {
 
 impl Default for GroqAsrProvider {
     fn default() -> Self {
-        Self {
-            endpoint: "https://api.groq.com/openai/v1/audio/transcriptions".into(),
-        }
+        Self::from_base_url("")
     }
 }
 
 impl GroqAsrProvider {
+    pub fn from_base_url(base_url: impl AsRef<str>) -> Self {
+        Self {
+            endpoint: resolve_transcription_url(base_url.as_ref()),
+        }
+    }
+
     #[cfg(test)]
     fn with_endpoint(endpoint: impl Into<String>) -> Self {
         Self {
             endpoint: endpoint.into(),
         }
+    }
+
+    #[cfg(test)]
+    fn endpoint(&self) -> &str {
+        &self.endpoint
     }
 }
 
@@ -446,6 +507,74 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn empty_base_url_resolves_to_groq_transcriptions() {
+        assert_eq!(
+            resolve_transcription_url(""),
+            "https://api.groq.com/openai/v1/audio/transcriptions"
+        );
+        assert_eq!(
+            resolve_transcription_url("   "),
+            "https://api.groq.com/openai/v1/audio/transcriptions"
+        );
+        assert_eq!(
+            GroqAsrProvider::default().endpoint(),
+            "https://api.groq.com/openai/v1/audio/transcriptions"
+        );
+    }
+
+    #[test]
+    fn resolves_host_v1_and_full_transcriptions_urls() {
+        assert_eq!(
+            resolve_transcription_url("http://127.0.0.1:8000"),
+            "http://127.0.0.1:8000/v1/audio/transcriptions"
+        );
+        assert_eq!(
+            resolve_transcription_url("http://127.0.0.1:8000/"),
+            "http://127.0.0.1:8000/v1/audio/transcriptions"
+        );
+        assert_eq!(
+            resolve_transcription_url("http://127.0.0.1:8000/v1"),
+            "http://127.0.0.1:8000/v1/audio/transcriptions"
+        );
+        assert_eq!(
+            resolve_transcription_url("http://127.0.0.1:8000/v1/"),
+            "http://127.0.0.1:8000/v1/audio/transcriptions"
+        );
+        assert_eq!(
+            resolve_transcription_url("https://api.groq.com/openai/v1"),
+            "https://api.groq.com/openai/v1/audio/transcriptions"
+        );
+        assert_eq!(
+            resolve_transcription_url("http://127.0.0.1:8000/audio/transcriptions"),
+            "http://127.0.0.1:8000/audio/transcriptions"
+        );
+        assert_eq!(
+            resolve_transcription_url(
+                "http://127.0.0.1:8000/v1/audio/transcriptions/"
+            ),
+            "http://127.0.0.1:8000/v1/audio/transcriptions"
+        );
+    }
+
+    #[test]
+    fn groq_key_fallback_is_limited_to_groq_hosts() {
+        assert!(groq_key_fallback_allowed(""));
+        assert!(groq_key_fallback_allowed("   "));
+        assert!(groq_key_fallback_allowed("https://api.groq.com/openai/v1"));
+        assert!(groq_key_fallback_allowed("https://API.GROQ.COM/openai/v1"));
+        assert!(!groq_key_fallback_allowed("http://127.0.0.1:8000/v1"));
+        assert!(!groq_key_fallback_allowed("https://asr.example.com/v1"));
+        assert_eq!(
+            transcription_host("https://api.groq.com/openai/v1").as_deref(),
+            Some("api.groq.com")
+        );
+        assert_eq!(
+            transcription_host("http://127.0.0.1:8000/v1").as_deref(),
+            Some("127.0.0.1")
+        );
+    }
+
     #[tokio::test]
     async fn groq_provider_exposes_batch_and_prefetch_capabilities() {
         let endpoint = crate::test_http::spawn_response(
@@ -470,6 +599,33 @@ mod tests {
         assert!(provider.capabilities().batch_transcription);
         assert!(provider.capabilities().background_prefetch);
         assert!(!provider.capabilities().realtime_streaming);
+    }
+
+    #[tokio::test]
+    async fn provider_from_base_url_posts_to_resolved_mock_endpoint() {
+        let host = crate::test_http::spawn_response(
+            200,
+            "application/json",
+            br#"{"text":"compatible asr","segments":[],"words":[]}"#.to_vec(),
+            &[],
+        )
+        .await;
+        let provider = GroqAsrProvider::from_base_url(&host);
+        assert_eq!(
+            provider.endpoint(),
+            format!("{host}/v1/audio/transcriptions")
+        );
+        let result = provider
+            .transcribe_batch(
+                b"wav".to_vec(),
+                AsrOptions {
+                    api_key: "compat-key".into(),
+                    ..AsrOptions::default()
+                },
+            )
+            .await
+            .expect("compatible ASR request should succeed");
+        assert_eq!(result.text, "compatible asr");
     }
 
     #[tokio::test]

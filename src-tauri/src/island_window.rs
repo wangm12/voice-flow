@@ -15,6 +15,7 @@ static ISLAND_PANEL_WARM: AtomicBool = AtomicBool::new(false);
 static ISLAND_VISIBLE: AtomicBool = AtomicBool::new(false);
 static ISLAND_RECONCILE_SCHEDULED: AtomicBool = AtomicBool::new(false);
 static ISLAND_DESIRED_VISIBLE: AtomicBool = AtomicBool::new(false);
+static ISLAND_HAS_PARTIAL: AtomicBool = AtomicBool::new(false);
 
 pub fn ensure_panel(window: &WebviewWindow) {
     if ISLAND_PANEL_READY.load(Ordering::Acquire) {
@@ -54,6 +55,26 @@ pub fn set_interactive(app: &AppHandle, interactive: bool) {
     };
     if let Err(error) = window.set_ignore_cursor_events(!interactive) {
         log::debug!("failed to update island mouse mode: {error}");
+    }
+}
+
+/// Expand the transparent island surface while HUD partials are visible, then
+/// shrink it again so idle does not keep a 400px hit target in WindowServer.
+pub fn set_has_partial(app: &AppHandle, has_partial: bool) {
+    let previous = ISLAND_HAS_PARTIAL.swap(has_partial, Ordering::AcqRel);
+    if previous == has_partial {
+        return;
+    }
+    let Some(window) = app.get_webview_window("island") else {
+        return;
+    };
+    let app = app.clone();
+    if let Err(error) = window.run_on_main_thread(move || {
+        if let Some(window) = app.get_webview_window("island") {
+            position_overlay_on_main(&window, &app);
+        }
+    }) {
+        log::debug!("failed to resize island for partial: {error}");
     }
 }
 
@@ -113,7 +134,10 @@ fn show_overlay_on_main(window: &tauri::WebviewWindow, _app: &AppHandle) {
 }
 
 fn position_overlay_on_main(window: &tauri::WebviewWindow, app: &AppHandle) {
-    let placement = crate::notch::placement_for_cursor_screen(app);
+    let placement = crate::notch::placement_for_cursor_screen_with_width(
+        app,
+        crate::notch::pill_window_width(ISLAND_HAS_PARTIAL.load(Ordering::Acquire)),
+    );
     let _ = window.set_position(tauri::Position::Physical(tauri::PhysicalPosition {
         x: placement.x.round() as i32,
         y: placement.y.round() as i32,

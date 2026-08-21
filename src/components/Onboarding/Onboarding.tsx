@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { useCallback, useEffect, useRef, useState } from "react";
-import type { ActivationMode } from "../../lib/activationCopy";
+import { resolveCapturedActivationMode, type ActivationMode } from "../../lib/activationCopy";
 import { formatHotkeyDisplay } from "../../lib/hotkeyFormat";
 import { EngineConfigStep } from "./EngineConfigStep";
 import { PermissionsStep } from "./PermissionsStep";
@@ -293,7 +293,7 @@ export function Onboarding({
         activation_mode: activationMode,
         selected_action_hotkey: selectedActionHotkey,
         selected_actions_enabled: true,
-        ui_language: "system",
+        ...(settings.ui_language ? { ui_language: settings.ui_language } : {}),
         onboarded: true,
         ...(key.trim() ? { api_key: key.trim() } : {}),
       };
@@ -354,10 +354,16 @@ export function Onboarding({
                   recording={recording}
                   processing={processing}
                   error={hotkeyError}
-                  onHotkeyChange={(value, mode) => {
+                  onHotkeyChange={(value, mode, options) => {
+                    const nextMode = resolveCapturedActivationMode(activationMode, value, mode);
                     setHotkey(value);
                     setHotkeyError(null);
-                    if (mode) setActivationMode(mode);
+                    if (nextMode) setActivationMode(nextMode);
+                    if (options?.persist) {
+                      void invoke("update_settings_patch", {
+                        patch: { hotkey: value, activation_mode: nextMode ?? activationMode },
+                      }).catch(() => setHotkeyError(t("快捷键保存失败，请换一个快捷键后重试")));
+                    }
                   }}
                   onSelectedActionHotkeyChange={(value) => {
                     setSelectedActionHotkey(value);

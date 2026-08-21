@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { Eye, EyeOff } from "lucide-react";
-import { colors, controlSize, radius } from "../lib/theme";
+import { colors, controlSize, radius, focusRingClass } from "../lib/theme";
 import { iconPropsSm } from "../lib/icons";
 import { IconButton } from "./IconButton";
 import { useI18n } from "../lib/i18n";
@@ -35,7 +35,7 @@ export function PasswordInput({ value, onChange, id, ariaLabel, placeholder, cla
         placeholder={placeholder}
         autoComplete="off"
         spellCheck={false}
-        className={`w-full ${controlSize.input} ${radius.control} border py-0 pl-3.5 pr-10 text-sm ${colors.text.primary} outline-none transition-[border-color,background-color,box-shadow] duration-200 ${
+        className={`w-full ${controlSize.input} ${radius.control} border py-0 pl-3.5 pr-10 text-sm ${colors.text.primary} outline-none transition-[border-color,background-color,box-shadow] duration-200 ${focusRingClass} ${
           valid
             ? "border-success/60 bg-success/5 shadow-[0_0_0_3px_rgb(16_185_129_/_0.12)]"
             : focused

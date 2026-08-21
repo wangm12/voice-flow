@@ -14,17 +14,25 @@ function modifierRows(t: (source: string) => string): UsageRow[] {
   return [{ gesture: t("双击功能键"), trigger: t("开始录音"), stop: t("再双击 → 结束并转换成文字"), preferred: true }];
 }
 
-function comboRows(hotkeyDisplay: string, t: (source: string) => string): UsageRow[] {
+function comboRows(hotkeyDisplay: string, activationMode: string | undefined, t: (source: string) => string): UsageRow[] {
+  if (activationMode === "hybrid") {
+    return [{
+      gesture: `${t("短按或按住")} ${hotkeyDisplay}`,
+      trigger: t("开始录音"),
+      stop: t("再按一次结束；按住则松开后转换成文字"),
+      preferred: true,
+    }];
+  }
   return [{ gesture: `${t("按")} ${hotkeyDisplay}`, trigger: t("开始录音"), stop: `${t("再按一次")} ${hotkeyDisplay} → ${t("结束并转换成文字")}`, preferred: true }];
 }
 
-export function hotkeyUsageRows(hotkey: string, _activationMode?: ActivationMode | string, translate: (source: string) => string = (source) => source): UsageRow[] {
+export function hotkeyUsageRows(hotkey: string, activationMode?: ActivationMode | string, translate: (source: string) => string = (source) => source): UsageRow[] {
   const normalized = sanitizeTauriHotkey(hotkey);
   const display = formatHotkeyDisplay(normalized);
   if (isModifierOnlyHotkey(normalized)) {
     return modifierRows(translate);
   }
-  return comboRows(display, translate);
+  return comboRows(display, activationMode, translate);
 }
 
 export function HotkeyUsageGuide({

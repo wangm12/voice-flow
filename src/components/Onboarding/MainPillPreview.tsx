@@ -8,7 +8,7 @@ import {
 } from "../Island/voicePillTokens";
 import "../../island.css";
 
-export function MaynPillPreview({ live = false, compact = false }: { live?: boolean; compact?: boolean }) {
+export function MainPillPreview({ live = false, compact = false }: { live?: boolean; compact?: boolean }) {
   const pillWidth = voicePillWidthForState("recording") - (compact ? 12 : 0);
 
   return (

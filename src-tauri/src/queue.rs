@@ -3,13 +3,19 @@
 use serde::Serialize;
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter};
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
 const UNKNOWN_QUOTA_RESET_MS: i64 = 60_000;
+
+fn lock_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RequestKind {
@@ -83,7 +89,7 @@ impl RequestGate {
         self.session_generation.store(generation, Ordering::Release);
     }
     pub fn snapshots(&self) -> QuotaView {
-        let q = self.quotas.lock().unwrap();
+        let q = lock_recover(&self.quotas);
         QuotaView {
             asr: q.0.snapshot.clone(),
             llm: q.1.snapshot.clone(),
@@ -121,7 +127,7 @@ impl RequestGate {
         reset_requests: Option<&str>,
         reset_tokens: Option<&str>,
     ) {
-        let mut q = self.quotas.lock().unwrap();
+        let mut q = lock_recover(&self.quotas);
         let quota = if kind == RequestKind::Asr {
             &mut q.0
         } else {
@@ -160,7 +166,7 @@ impl RequestGate {
     /// when the server returns 429 before any successful response updates the
     /// remaining-* headers.
     pub fn mark_rate_limited(&self, kind: RequestKind, retry_after_secs: f64) {
-        let mut q = self.quotas.lock().unwrap();
+        let mut q = lock_recover(&self.quotas);
         let quota = if kind == RequestKind::Asr {
             &mut q.0
         } else {
@@ -173,7 +179,7 @@ impl RequestGate {
     async fn wait_for_quota(&self, kind: RequestKind, cancellation: &CancellationToken) -> bool {
         loop {
             let until = {
-                let q = self.quotas.lock().unwrap();
+                let q = lock_recover(&self.quotas);
                 let quota = if kind == RequestKind::Asr { &q.0 } else { &q.1 };
                 if quota.snapshot.remaining_requests_rpd >= 2 {
                     None
@@ -211,22 +217,28 @@ pub enum ExecuteError<E> {
     Cancelled,
 }
 
+impl<E: std::fmt::Display> std::fmt::Display for ExecuteError<E> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Operation(error) => error.fmt(formatter),
+            Self::Cancelled => formatter.write_str("request cancelled"),
+        }
+    }
+}
+
+impl<E: std::error::Error + 'static> std::error::Error for ExecuteError<E> {}
+
 pub async fn execute_with_retry<F, Fut, T, E>(
     gate: &RequestGate,
     kind: RequestKind,
     operation: F,
-) -> Result<T, E>
+) -> Result<T, ExecuteError<E>>
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<T, E>>,
     E: RetryError,
 {
-    execute_with_retry_cancelled(gate, kind, operation, CancellationToken::new())
-        .await
-        .map_err(|error| match error {
-            ExecuteError::Operation(error) => error,
-            ExecuteError::Cancelled => unreachable!(),
-        })
+    execute_with_retry_cancelled(gate, kind, operation, CancellationToken::new()).await
 }
 
 pub async fn execute_with_retry_cancelled<F, Fut, T, E>(
@@ -459,5 +471,28 @@ mod tests {
         .await;
         assert!(matches!(result, Err(ExecuteError::Cancelled)));
         assert!(!called.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn non_cancelled_retry_api_returns_a_typed_operation_error() {
+        let gate = RequestGate::new(None);
+        let result = execute_with_retry(&gate, RequestKind::Asr, || async {
+            Err::<(), _>(TestError)
+        })
+        .await;
+        assert!(matches!(result, Err(ExecuteError::Operation(TestError))));
+    }
+
+    #[test]
+    fn quota_reads_recover_after_mutex_poisoning() {
+        let gate = RequestGate::new(None);
+        let quotas = gate.quotas.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = quotas.lock().expect("initial quota lock");
+            panic!("poison quota mutex");
+        })
+        .join();
+
+        assert_eq!(gate.snapshots().asr_requests_limit, 2000);
     }
 }

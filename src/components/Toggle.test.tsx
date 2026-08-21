@@ -27,6 +27,14 @@ describe("Toggle", () => {
     expect(toggle.lastElementChild).toHaveClass("bg-success-foreground", "translate-x-5");
   });
 
+  it("uses the semantic card color for the unchecked thumb", () => {
+    render(<Toggle checked={false} onChange={vi.fn()} label="自动识别" />);
+
+    const toggle = screen.getByRole("switch", { name: "自动识别" });
+    expect(toggle.lastElementChild).toHaveClass("bg-card");
+    expect(toggle.lastElementChild).not.toHaveClass("bg-zinc-300");
+  });
+
   it("does not emit changes while disabled", () => {
     const onChange = vi.fn();
     render(<Toggle checked onChange={onChange} label="自动识别" disabled />);

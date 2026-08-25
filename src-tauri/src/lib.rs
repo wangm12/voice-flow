@@ -7,6 +7,8 @@ mod context;
 mod delivery;
 mod dictation;
 mod dictionary_learn;
+mod engine;
+mod lexicon;
 mod groq;
 mod history_commands;
 mod hotkey;
@@ -24,6 +26,7 @@ mod queue;
 mod prefetch_asr;
 mod selected_action;
 mod snippets;
+mod spoken_layout;
 mod spoken_punctuation;
 mod store;
 #[cfg(test)]
@@ -221,6 +224,12 @@ fn cleanup_policy_for(
     policy
 }
 
+pub(crate) fn spoken_translation_target(settings: &store::Settings) -> Option<&str> {
+    (settings.output_mode == "translation")
+        .then_some(settings.translation_target_language.as_str())
+        .filter(|value| !value.trim().is_empty() && *value != "auto")
+}
+
 fn delivery_fallback_reason(target_current: bool, paste_error: &str) -> &'static str {
     if paste_error.contains("Accessibility permission") {
         "accessibility_required"
@@ -263,13 +272,20 @@ fn error_fallback_reason(message: &str) -> &'static str {
     }
 }
 
+fn hud_accepts_mouse(state: &str, delivery_method: &str, paste_yielding: bool) -> bool {
+    if paste_yielding {
+        return false;
+    }
+    matches!(
+        state,
+        "starting" | "recording" | "recording_limited" | "rate_limited"
+    ) || (delivery_method == "paste" && matches!(state, "done" | "unverified" | "degraded"))
+}
+
 fn emit_state(app: &tauri::AppHandle, state: &str) {
     island_window::set_interactive(
         app,
-        matches!(
-            state,
-            "starting" | "recording" | "recording_limited" | "processing" | "rate_limited"
-        ),
+        hud_accepts_mouse(state, "pending", island_window::is_yielding_for_paste()),
     );
     let session_generation = current_session_generation(app);
     let _ = app.emit(
@@ -290,7 +306,8 @@ fn emit_state(app: &tauri::AppHandle, state: &str) {
 
 /// HUD-only in-progress words. Never clipboard, History, or paste.
 fn emit_hud_partial(app: &tauri::AppHandle, session_generation: u64, text: &str) {
-    let _ = app.emit(
+    let _ = app.emit_to(
+        "island",
         "dictation://partial",
         serde_json::json!({
             "session_generation": session_generation,
@@ -324,6 +341,24 @@ fn hud_partial_expands_window(
             phase,
             Phase::Starting | Phase::Recording | Phase::Stopping | Phase::Processing
         )
+}
+
+fn hud_caption_expands_window(state: &str, fallback_reason: Option<&str>) -> bool {
+    fallback_reason.is_some()
+        || matches!(
+            state,
+            "error" | "degraded" | "copied" | "unverified" | "rate_limited"
+        )
+}
+
+fn attach_context_fields(payload: &mut serde_json::Value, context: &context::ContextSnapshot) {
+    payload["context_id"] = serde_json::json!(context.profile.id);
+    payload["context_label"] = serde_json::json!(context::display_label(context));
+    payload["context_app"] = match context::display_app_name(context) {
+        Some(name) => serde_json::Value::from(name),
+        None => serde_json::Value::Null,
+    };
+    payload["context_style"] = serde_json::json!(context::hud_style_id(context));
 }
 
 fn emit_selected_action_state(app: &tauri::AppHandle, state: &str) {
@@ -431,18 +466,18 @@ fn emit_state_with_delivery_and_input_device(
 ) {
     island_window::set_interactive(
         app,
-        matches!(
+        hud_accepts_mouse(
             state,
-            "starting" | "recording" | "recording_limited" | "processing" | "rate_limited"
-        ) || (delivery_method == "paste" && matches!(state, "done" | "unverified" | "degraded")),
+            delivery_method,
+            island_window::is_yielding_for_paste(),
+        ),
     );
     let mut payload = serde_json::json!({
         "state": state,
         "session_generation": current_session_generation(app),
     });
     if let Some(context) = context {
-        payload["context_id"] = serde_json::json!(context.profile.id);
-        payload["context_label"] = serde_json::json!(context::display_label(context));
+        attach_context_fields(&mut payload, context);
     }
     payload["delivery_method"] = serde_json::json!(delivery_method);
     payload["phase"] = serde_json::json!(match state {
@@ -461,6 +496,10 @@ fn emit_state_with_delivery_and_input_device(
     if let Some(input_device) = input_device {
         payload["input_device"] = serde_json::Value::from(input_device);
     }
+    island_window::set_has_wide_caption(
+        app,
+        hud_caption_expands_window(state, fallback_reason),
+    );
     let _ = app.emit("dictation://state", payload);
 }
 
@@ -507,9 +546,10 @@ fn emit_processing_phase(
         "cleanup_status": serde_json::Value::Null,
     });
     if let Some(context) = context {
-        payload["context_id"] = serde_json::json!(context.profile.id);
-        payload["context_label"] = serde_json::json!(context::display_label(context));
+        attach_context_fields(&mut payload, context);
     }
+    island_window::set_interactive(app, false);
+    island_window::set_has_wide_caption(app, false);
     if let Some(seconds) = retry_after_secs {
         payload["retry_after_secs"] = serde_json::json!(seconds.ceil() as u64);
     }
@@ -995,6 +1035,17 @@ pub(crate) async fn start_claimed(
             "A valid API key is required before dictation can start",
         ));
     }
+    if !asr::groq_key_fallback_allowed(&settings_snapshot.asr_base_url)
+        && settings_snapshot.asr_api_key.trim().is_empty()
+    {
+        let Some(failure_generation) = reset_starting(state, session_generation) else {
+            return Ok(());
+        };
+        return Err(StartError::new(
+            failure_generation,
+            "自定义 ASR 地址需要填写 ASR 密钥。",
+        ));
+    }
     // Always refresh immediately before starting audio. A stale check is not
     // enough here: the user may have switched apps within the freshness
     // window.
@@ -1081,9 +1132,10 @@ pub(crate) async fn start_claimed(
         };
         let asr_language =
             asr::normalize_language(Some(settings_snapshot.language.as_str())).map(str::to_owned);
-        let asr_prompt = build_asr_prompt(
+        let asr_prompt = asr_prompt_for_snapshot(
+            app.path().app_data_dir().ok().as_deref(),
             &settings_snapshot.dictionary,
-            Some(&recording_context.policy),
+            &recording_context,
         );
         // This is silent batch prefetch of completed files, not streaming ASR.
         let hud_app = app.clone();
@@ -1096,6 +1148,11 @@ pub(crate) async fn start_claimed(
                 api_key: settings_snapshot.asr_credential().to_owned(),
                 language: asr_language,
                 prompt: asr_prompt,
+                model: asr::resolve_recognition_model(
+                    &settings_snapshot.asr_model,
+                    Some(settings_snapshot.language.as_str()),
+                )
+                .to_owned(),
             },
             state.metrics.clone(),
             prefetch_cancellation,
@@ -1149,6 +1206,13 @@ async fn start_with_error_feedback(app: &tauri::AppHandle, state: &AppState) -> 
 }
 fn show_island(app: &tauri::AppHandle) {
     island_window::show_overlay(app);
+}
+
+#[tauri::command]
+fn hide_island_if_idle(app: tauri::AppHandle, state: State<'_, AppState>) {
+    if lock_recover(&state.manager).phase == Phase::Idle {
+        island_window::hide_overlay(&app);
+    }
 }
 
 async fn handle_audio_error(app: &tauri::AppHandle, state: &AppState, message: String) {
@@ -1208,6 +1272,7 @@ async fn paste_text(
     expected_target: &context::TargetAppGuard,
     accessibility: bool,
     cancellation: CancellationToken,
+    recording_context: Option<&context::ContextSnapshot>,
 ) -> Result<paste::InsertOutcome, String> {
     let worker_app = app.clone();
     let worker_text = text.to_owned();
@@ -1216,7 +1281,18 @@ async fn paste_text(
         (current.mappings.clone(), current.browser_access_enabled)
     };
     let expected_target_owned = expected_target.clone();
+    let restore_pid = expected_target.pid;
+    let restore_window = expected_target.window_id;
     let outcome = tokio::task::spawn_blocking(move || {
+        struct PasteYieldGuard;
+        impl Drop for PasteYieldGuard {
+            fn drop(&mut self) {
+                crate::island_window::end_paste_yield();
+            }
+        }
+        let _yield = PasteYieldGuard;
+        crate::island_window::prepare_for_paste(&worker_app);
+        let _ = paste::restore_delivery_target_if_needed(restore_pid, restore_window);
         let verify_target = move || {
             verify_delivery_target(&expected_target_owned, &mappings, browser_access_enabled)
         };
@@ -1226,6 +1302,7 @@ async fn paste_text(
             accessibility,
             cancellation,
             verify_target,
+            restore_pid,
         )
     })
     .await
@@ -1237,6 +1314,7 @@ async fn paste_text(
         outcome.value_after.as_deref(),
         outcome.verified,
         expected_target,
+        recording_context,
     );
     Ok(outcome)
 }
@@ -1373,18 +1451,21 @@ async fn undo_last_delivery(
 
 fn onboarding_delivery_target_matches(
     enabled: bool,
-    recording_context: &context::ContextSnapshot,
-    frontmost: (i32, Option<String>),
+    _recording_context: &context::ContextSnapshot,
+    _frontmost: (i32, Option<String>),
 ) -> bool {
-    if !enabled {
-        return false;
+    // Trial steps turn this mode on only while the onboarding window is
+    // showing the try-it box. Requiring com.voiceflow.desktop fails in
+    // `tauri dev`, where the process often reports as Cursor or Terminal.
+    enabled
+}
+
+fn completion_hud_dwell_ms(phase: &str) -> u64 {
+    match phase {
+        "done" | "unverified" | "history" | "degraded" => 3_000,
+        "copied" | "error" => 4_500,
+        _ => 1_500,
     }
-    if recording_context.target_guard.bundle_id.as_deref() != Some("com.voiceflow.desktop") {
-        return false;
-    }
-    let (pid, bundle_id) = frontmost;
-    pid == recording_context.target_guard.pid
-        && bundle_id.as_deref() == Some("com.voiceflow.desktop")
 }
 
 fn should_use_onboarding_delivery(
@@ -1668,49 +1749,6 @@ fn verify_delivery_target(
     }
 }
 
-async fn paste_selected_text(
-    app: &tauri::AppHandle,
-    state: &AppState,
-    text: &str,
-    session: &SelectedActionSession,
-    accessibility: bool,
-    cancellation: CancellationToken,
-) -> Result<paste::InsertOutcome, String> {
-    let app = app.clone();
-    let text = text.to_owned();
-    let expected_target = session.target_guard.clone();
-    let expected_text = session.selected_text.clone();
-    let expected_fingerprint = session.selection_fingerprint;
-    let (mappings, browser_access_enabled) = {
-        let current = lock_recover(&state.context);
-        (current.mappings.clone(), current.browser_access_enabled)
-    };
-    tokio::task::spawn_blocking(move || {
-        let capture_app = app.clone();
-        let verify_target = move || {
-            verify_delivery_target(&expected_target, &mappings, browser_access_enabled)?;
-            let selection =
-                paste::capture_selected_text(&capture_app, accessibility).map_err(|error| {
-                    match error {
-                        paste::PasteError::Accessibility => paste::PasteError::Accessibility,
-                        paste::PasteError::SelectionUnavailable => {
-                            paste::PasteError::SelectionChanged
-                        }
-                        other => other,
-                    }
-                })?;
-            if selection.fingerprint != expected_fingerprint || selection.text != expected_text {
-                return Err(paste::PasteError::SelectionChanged);
-            }
-            Ok(())
-        };
-        paste::insert(&app, &text, accessibility, cancellation, verify_target)
-    })
-    .await
-    .map_err(|error| format!("selected text paste worker failed: {error}"))?
-    .map_err(|error| error.to_string())
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn process_selected_action(
     app: &tauri::AppHandle,
@@ -1728,7 +1766,16 @@ async fn process_selected_action(
     let options = asr::AsrOptions {
         api_key: settings.asr_credential().to_owned(),
         language: asr::normalize_language(Some(settings.language.as_str())).map(str::to_owned),
-        prompt: build_asr_prompt(&settings.dictionary, Some(&recording_context.policy)),
+        prompt: asr_prompt_for_snapshot(
+            app.path().app_data_dir().ok().as_deref(),
+            &settings.dictionary,
+            recording_context,
+        ),
+        model: asr::resolve_recognition_model(
+            &settings.asr_model,
+            Some(settings.language.as_str()),
+        )
+        .to_owned(),
     };
     let transcript = {
         let _latency = state.metrics.timer(metrics::MetricKind::FinalAsr);
@@ -1763,6 +1810,9 @@ async fn process_selected_action(
         return Err(message);
     }
 
+    let cleanup_endpoint = settings.cleanup_endpoint();
+    let cleanup_model = settings.cleanup_request_model();
+    let cleanup_key = settings.cleanup_credential().to_owned();
     let cleanup = {
         let _latency = state.metrics.timer(metrics::MetricKind::Cleanup);
         queue::execute_with_retry_cancelled(
@@ -1770,13 +1820,14 @@ async fn process_selected_action(
             queue::RequestKind::Llm,
             || {
                 llm::selected_text_action_with_limits(
-                    &settings.cleanup_model,
+                    &cleanup_endpoint,
+                    &cleanup_model,
                     &selected_action.selected_text,
                     &transcript,
-                    &settings.api_key,
+                    &cleanup_key,
                     Some(&recording_context.policy),
                     Some(&recording_context.profile),
-                    Some(settings.translation_target_language.as_str()),
+                    spoken_translation_target(settings),
                 )
             },
             cancellation.clone(),
@@ -1897,12 +1948,21 @@ async fn process_short(
 ) -> Result<(), String> {
     emit_processing_phase(app, "asr", Some(recording_context), None, None);
     let language = asr::normalize_language(Some(settings.language.as_str())).map(str::to_owned);
-    let asr_prompt = build_asr_prompt(&settings.dictionary, Some(&recording_context.policy));
+    let asr_prompt = asr_prompt_for_snapshot(
+        app.path().app_data_dir().ok().as_deref(),
+        &settings.dictionary,
+        recording_context,
+    );
     let asr_provider = current_asr_provider(state);
     let asr_options = asr::AsrOptions {
         api_key: settings.asr_credential().to_owned(),
         language,
         prompt: asr_prompt,
+        model: asr::resolve_recognition_model(
+            &settings.asr_model,
+            Some(settings.language.as_str()),
+        )
+        .to_owned(),
     };
     let cleanup_policy = cleanup_policy_for(settings, recording_context);
     let mut raw = None;
@@ -1996,10 +2056,16 @@ async fn process_short(
         };
         transcript.text
     };
-    let raw = spoken_punctuation::apply(&raw);
+    let raw = spoken_layout::apply_after_punctuation(
+        &raw,
+        recording_context.profile.family,
+        recording_context.profile.confidence,
+    );
+    let app_dir = app.path().app_data_dir().ok();
+    let (raw, pairs_hint) =
+        prepare_lexicon_transcript(app_dir.as_deref(), &settings.dictionary, &raw);
     let spoken_raw = raw.clone();
-    let intent =
-        llm::parse_cleanup_intent(&raw, Some(settings.translation_target_language.as_str()));
+    let intent = llm::parse_cleanup_intent(&raw, spoken_translation_target(settings));
     let clipboard = snippets::read_clipboard_if_needed(&settings.snippets, &raw, || {
         clipboard_text_for_snippets(app)
     });
@@ -2021,8 +2087,16 @@ async fn process_short(
         return Err(message);
     }
     emit_progress(app, 0.45);
-    let cleanup_decision = if settings.cleanup_enabled && !snippet_expanded {
+    let cleanup_route = cleanup_route_for(settings, Some(recording_context), &intent);
+    let cleanup_decision = if !snippet_expanded {
+        match cleanup_route {
+        lexicon::CleanupRoute::LocalOnly => CleanupDecision::Disabled,
+        lexicon::CleanupRoute::Provider(effort) => {
         emit_processing_phase(app, "cleanup", Some(recording_context), None, None);
+        let pairs_hint = pairs_hint.clone();
+        let cleanup_endpoint = settings.cleanup_endpoint();
+        let cleanup_model = settings.cleanup_request_model();
+        let cleanup_key = settings.cleanup_credential().to_owned();
         let cleanup_result = {
             let _latency = state.metrics.timer(metrics::MetricKind::Cleanup);
             queue::execute_with_retry_cancelled(
@@ -2030,15 +2104,18 @@ async fn process_short(
                 queue::RequestKind::Llm,
                 || {
                     llm::cleanup_with_model_and_limits_and_language_and_profile_and_intent(
-                        &settings.cleanup_model,
+                        &cleanup_endpoint,
+                        &cleanup_model,
                         &cleanup_input,
-                        &settings.api_key,
-                        &settings.dictionary,
+                        &cleanup_key,
+                        &[],
                         None,
                         Some(&cleanup_policy),
                         Some(settings.language.as_str()),
                         cleanup_profile_for(recording_context),
                         Some(&intent),
+                        pairs_hint.as_deref(),
+                        effort,
                     )
                 },
                 cancellation.clone(),
@@ -2055,6 +2132,8 @@ async fn process_short(
                 log::warn!("LLM cleanup failed, using the raw transcript: {error}");
                 CleanupDecision::Failed
             }
+        }
+        }
         }
     } else {
         CleanupDecision::Disabled
@@ -2137,7 +2216,7 @@ async fn process_short(
                     Ok(paste::InsertOutcome {
                         shortcut_sent: true,
                         used_keyboard_paste: false,
-                        verified: false,
+                        verified: true,
                         post_insert_input_fingerprint: None,
                         value_after: None,
                     })
@@ -2149,6 +2228,7 @@ async fn process_short(
                         &recording_context.target_guard,
                         permissions::check().accessibility,
                         cancellation.clone(),
+                        Some(recording_context),
                     )
                     .await
                 }
@@ -2156,23 +2236,19 @@ async fn process_short(
             match paste_result {
                 Ok(outcome) => {
                     debug_assert!(outcome.shortcut_sent);
-                    let method = if outcome.verified {
-                        delivery::DeliveryMethod::Paste
-                    } else {
-                        delivery::DeliveryMethod::PasteUnverified
-                    };
+                    let result = delivery::DeliveryResult::from_insert_verified(outcome.verified);
                     arm_undo_transaction(
                         state,
                         session_generation,
                         &recording_context.target_guard,
                         outcome.post_insert_input_fingerprint,
-                        method.as_str(),
+                        result.method.as_str(),
                         outcome.used_keyboard_paste,
                     );
                     (
-                        true,
-                        (!outcome.verified).then_some("paste_unverified"),
-                        method.as_str(),
+                        outcome.verified,
+                        result.fallback_reason,
+                        result.method.as_str(),
                     )
                 }
                 Err(e) => {
@@ -2390,7 +2466,16 @@ async fn process_long(
     let asr_options = asr::AsrOptions {
         api_key: settings.asr_credential().to_owned(),
         language: asr::normalize_language(Some(settings.language.as_str())).map(str::to_owned),
-        prompt: build_asr_prompt(&settings.dictionary, Some(&recording_context.policy)),
+        prompt: asr_prompt_for_snapshot(
+            app.path().app_data_dir().ok().as_deref(),
+            &settings.dictionary,
+            recording_context,
+        ),
+        model: asr::resolve_recognition_model(
+            &settings.asr_model,
+            Some(settings.language.as_str()),
+        )
+        .to_owned(),
     };
     let cleanup_policy = cleanup_policy_for(settings, recording_context);
     let worker_prefetch = prefetched_transcripts.unwrap_or_default();
@@ -2580,11 +2665,17 @@ async fn process_long(
         fail_for_generation(app, state, message.clone(), session_generation).await;
         return Err(message);
     }
-    let raw_text = spoken_punctuation::apply(&chunker::merge_transcripts(raw_texts));
-    let intent = llm::parse_cleanup_intent(
-        &raw_text,
-        Some(settings.translation_target_language.as_str()),
+    let app_dir = app.path().app_data_dir().ok();
+    let (raw_text, pairs_hint) = prepare_lexicon_transcript(
+        app_dir.as_deref(),
+        &settings.dictionary,
+        &spoken_layout::apply_after_punctuation(
+            &chunker::merge_transcripts(raw_texts),
+            recording_context.profile.family,
+            recording_context.profile.confidence,
+        ),
     );
+    let intent = llm::parse_cleanup_intent(&raw_text, spoken_translation_target(settings));
     let clipboard = snippets::read_clipboard_if_needed(&settings.snippets, &raw_text, || {
         clipboard_text_for_snippets(app)
     });
@@ -2597,10 +2688,11 @@ async fn process_long(
         .clone()
         .unwrap_or_else(|| intent.content.clone());
     let cleanup_status;
+    let cleanup_route = cleanup_route_for(settings, Some(recording_context), &intent);
     let final_text = if let Some(expansion) = snippet_expansion {
         cleanup_status = CLEANUP_STATUS_SNIPPET_BYPASS;
         expansion
-    } else if settings.cleanup_enabled {
+    } else if let lexicon::CleanupRoute::Provider(effort) = cleanup_route {
         // Long recordings are cleaned only after every ASR chunk has been
         // merged. This gives the model the complete spoken structure instead
         // of asking it to make independent decisions at chunk boundaries.
@@ -2612,6 +2704,10 @@ async fn process_long(
             None,
             Some((total, total)),
         );
+        let pairs_hint = pairs_hint.clone();
+        let cleanup_endpoint = settings.cleanup_endpoint();
+        let cleanup_model = settings.cleanup_request_model();
+        let cleanup_key = settings.cleanup_credential().to_owned();
         let cleanup_result = {
             let _latency = state.metrics.timer(metrics::MetricKind::Cleanup);
             queue::execute_with_retry_cancelled(
@@ -2619,15 +2715,18 @@ async fn process_long(
                 queue::RequestKind::Llm,
                 || {
                     llm::cleanup_with_model_and_limits_and_language_and_profile_and_intent(
-                        &settings.cleanup_model,
+                        &cleanup_endpoint,
+                        &cleanup_model,
                         &cleanup_input,
-                        &settings.api_key,
-                        &settings.dictionary,
+                        &cleanup_key,
+                        &[],
                         None,
                         Some(&cleanup_policy),
                         Some(settings.language.as_str()),
                         cleanup_profile_for(recording_context),
                         Some(&intent),
+                        pairs_hint.as_deref(),
+                        effort,
                     )
                 },
                 cancellation.clone(),
@@ -2735,27 +2834,27 @@ async fn process_long(
                     &recording_context.target_guard,
                     permissions::check().accessibility,
                     cancellation.clone(),
+                    Some(recording_context),
                 )
                 .await
             };
             match paste_result {
                 Ok(outcome) => {
                     debug_assert!(outcome.shortcut_sent);
-                    let method = if outcome.verified {
-                        delivery::DeliveryMethod::Paste
-                    } else {
-                        delivery::DeliveryMethod::PasteUnverified
-                    };
+                    let result = delivery::DeliveryResult::from_insert_verified(outcome.verified);
                     arm_undo_transaction(
                         state,
                         session_generation,
                         &recording_context.target_guard,
                         outcome.post_insert_input_fingerprint,
-                        method.as_str(),
+                        result.method.as_str(),
                         outcome.used_keyboard_paste,
                     );
-                    delivered_via_paste = true;
-                    delivery_method = method.as_str();
+                    delivered_via_paste = outcome.verified;
+                    delivery_method = result.method.as_str();
+                    if fallback_reason.is_none() {
+                        fallback_reason = result.fallback_reason;
+                    }
                 }
                 Err(e) => {
                     if processing_aborted(state, session_generation) || cancellation.is_cancelled()
@@ -3109,28 +3208,72 @@ fn record_delivery_failure(
     }
 }
 
-fn build_asr_prompt(
+pub(crate) fn build_asr_prompt(
     dictionary: &[String],
     policy: Option<&context::ContextPolicy>,
+    pairs: &[store::LearnPairRecord],
+    scope: Option<&lexicon::PromptScope>,
 ) -> Option<String> {
-    let mut hints = dictionary
-        .iter()
-        .map(|word| word.trim())
-        .filter(|word| !word.is_empty())
-        .take(32)
-        .collect::<Vec<_>>();
-    if policy.is_some_and(|policy| policy.preserve_technical_tokens) {
-        hints.push("preserve technical terms, identifiers, paths, commands, URLs, and versions");
+    lexicon::build_asr_prompt(dictionary, policy, pairs, scope)
+}
+
+fn load_learn_pairs(dir: Option<&Path>) -> Vec<store::LearnPairRecord> {
+    dir.and_then(|path| store::list_learn_pairs(path).ok())
+        .unwrap_or_default()
+}
+
+pub(crate) fn prepare_lexicon_transcript(
+    dir: Option<&Path>,
+    dictionary: &[String],
+    raw: &str,
+) -> (String, Option<String>) {
+    let pairs = load_learn_pairs(dir);
+    let replaceable = lexicon::replaceable_pairs(&pairs, dictionary);
+    let hits = lexicon::hit_pairs(raw, &replaceable, dictionary);
+    let replaced = lexicon::apply_lexicon_replacements(raw, &replaceable, dictionary);
+    if let Some(path) = dir {
+        let used = lexicon::used_pair_keys(&replaced, &pairs);
+        let _ = store::bump_learn_pairs_used(path, &used);
     }
-    if hints.is_empty() {
-        None
-    } else {
-        let prompt = format!(
-            "Recognize these terms exactly when spoken: {}",
-            hints.join(", ")
-        );
-        Some(prompt.chars().take(2_000).collect())
-    }
+    (replaced, lexicon::format_cleanup_pairs(&hits))
+}
+
+fn asr_prompt_for_snapshot(
+    dir: Option<&Path>,
+    dictionary: &[String],
+    snapshot: &context::ContextSnapshot,
+) -> Option<String> {
+    let pairs = load_learn_pairs(dir);
+    let scope = lexicon::PromptScope::from_snapshot(snapshot);
+    build_asr_prompt(
+        dictionary,
+        Some(&snapshot.policy),
+        &pairs,
+        Some(&scope),
+    )
+}
+
+fn cleanup_route_for(
+    settings: &store::Settings,
+    recording_context: Option<&context::ContextSnapshot>,
+    intent: &llm::CleanupIntent,
+) -> lexicon::CleanupRoute {
+    let mapping = recording_context.and_then(|snapshot| {
+        lexicon::mapping_for_profile(&settings.context_mappings, &snapshot.profile.id)
+    });
+    let family = recording_context
+        .map(|snapshot| snapshot.profile.family)
+        .unwrap_or(context::ContextFamily::General);
+    let confidence = recording_context
+        .map(|snapshot| snapshot.profile.confidence)
+        .unwrap_or(0.0);
+    lexicon::decide_cleanup(
+        settings.cleanup_enabled,
+        mapping,
+        family,
+        intent,
+        confidence,
+    )
 }
 #[cfg(test)]
 fn abort_processing_manager(manager: &mut DictationManager) -> bool {
@@ -3275,12 +3418,7 @@ async fn finish_with_delivery(
         }
         completion_generation
     };
-    let dwell_ms = match phase {
-        "done" | "unverified" | "history" => 3_000,
-        "copied" => 1800,
-        "degraded" => 3_000,
-        _ => 1500,
-    };
+    let dwell_ms = completion_hud_dwell_ms(phase);
     tokio::time::sleep(std::time::Duration::from_millis(dwell_ms)).await;
     let should_hide = {
         let m = lock_recover(&state.manager);
@@ -3319,6 +3457,7 @@ async fn set_hotkeys_suspended(
     let previous = lock_recover(&state.settings).clone();
     let mut settings = previous.clone();
     if let Some(hotkey) = captured_hotkey {
+        let hotkey = hotkey::canonicalize_hotkey(&hotkey);
         if capture_target.as_deref() == Some("selected_action") {
             settings.selected_action_hotkey = hotkey;
             settings.selected_actions_enabled = true;
@@ -3588,11 +3727,28 @@ async fn apply_settings(
     let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
     clamp_double_tap_activation(&mut settings);
     settings.normalize();
-    settings.validate().map_err(|error| error.to_string())?;
     let prev = lock_recover(&state.settings).clone();
-    if settings.asr_api_key.trim().is_empty() {
-        settings.asr_api_key = prev.asr_api_key.clone();
-    }
+    let incoming_asr_key = settings.asr_api_key.clone();
+    settings.asr_api_key = store::bind_asr_key_to_host(
+        &prev.asr_base_url,
+        &settings.asr_base_url,
+        &incoming_asr_key,
+        &prev.asr_api_key,
+    );
+    let incoming_cleanup_key = settings.cleanup_api_key.clone();
+    settings.cleanup_api_key = store::bind_cleanup_key_to_host(
+        &prev.cleanup_base_url,
+        &settings.cleanup_base_url,
+        &incoming_cleanup_key,
+        &prev.cleanup_api_key,
+    );
+    let asr_host_changed = crate::asr::asr_host_changed(&prev.asr_base_url, &settings.asr_base_url);
+    let asr_key_cleared = asr_host_changed && incoming_asr_key.trim().is_empty();
+    let cleanup_host_changed =
+        crate::llm::chat_host_changed(&prev.cleanup_base_url, &settings.cleanup_base_url);
+    let cleanup_key_cleared = cleanup_host_changed && incoming_cleanup_key.trim().is_empty();
+    settings.repair_incomplete_engine_sides();
+    settings.validate().map_err(|error| error.to_string())?;
     let needs_api_key_validation =
         settings.onboarded && (!prev.onboarded || prev.api_key != settings.api_key);
     if needs_api_key_validation {
@@ -3661,6 +3817,14 @@ async fn apply_settings(
         }
         return Err(error.to_string());
     }
+    if asr_key_cleared {
+        crate::keychain::set_asr_api_key("")
+            .map_err(|error| format!("failed to remove ASR API key securely: {error}"))?;
+    }
+    if cleanup_key_cleared {
+        crate::keychain::set_cleanup_api_key("")
+            .map_err(|error| format!("failed to remove cleanup API key securely: {error}"))?;
+    }
     if prev.keep_history_days != settings.keep_history_days {
         if let Err(error) = store::purge_history(&dir, settings.keep_history_days) {
             log::warn!("history retention cleanup after settings change failed: {error}");
@@ -3669,7 +3833,11 @@ async fn apply_settings(
     let asr_provider_changed =
         prev.asr_base_url != settings.asr_base_url || prev.asr_api_key != settings.asr_api_key;
     let next_asr_base_url = settings.asr_base_url.clone();
+    let settings_view = store::SettingsView::from(&settings);
     *lock_recover(&state.settings) = settings;
+    if asr_key_cleared || cleanup_key_cleared {
+        let _ = app.emit("settings://changed", settings_view);
+    }
     if asr_provider_changed {
         rebuild_asr_provider(state, &next_asr_base_url);
     }
@@ -3747,17 +3915,46 @@ async fn update_settings_patch(
         "input_gain",
         "asr_base_url",
         "asr_api_key",
+        "asr_model",
+        "asr_provider",
+        "cleanup_provider",
+        "cleanup_base_url",
+        "cleanup_api_key",
     ];
     if let Some(unknown) = object.keys().find(|key| !ALLOWED.contains(&key.as_str())) {
         return Err(format!("unsupported settings field: {unknown}"));
     }
     let current = lock_recover(&state.settings).clone();
-    let mut merged = serde_json::to_value(current).map_err(|error| error.to_string())?;
+    let mut merged = serde_json::to_value(&current).map_err(|error| error.to_string())?;
     let merged_object = merged
         .as_object_mut()
         .ok_or_else(|| "settings serialization failed".to_owned())?;
     for (key, value) in object {
         merged_object.insert(key.clone(), value.clone());
+    }
+    if object.contains_key("asr_base_url") && !object.contains_key("asr_api_key") {
+        let next_url = merged_object
+            .get("asr_base_url")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        if crate::asr::asr_host_changed(&current.asr_base_url, next_url) {
+            merged_object.insert(
+                "asr_api_key".into(),
+                serde_json::Value::String(String::new()),
+            );
+        }
+    }
+    if object.contains_key("cleanup_base_url") && !object.contains_key("cleanup_api_key") {
+        let next_url = merged_object
+            .get("cleanup_base_url")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        if crate::llm::chat_host_changed(&current.cleanup_base_url, next_url) {
+            merged_object.insert(
+                "cleanup_api_key".into(),
+                serde_json::Value::String(String::new()),
+            );
+        }
     }
     let settings = serde_json::from_value(merged).map_err(|error| error.to_string())?;
     apply_settings(app, &state, settings).await
@@ -3804,6 +4001,25 @@ async fn remove_asr_api_key(
     Ok(store::SettingsView::from(&settings))
 }
 
+#[tauri::command]
+async fn remove_cleanup_api_key(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<store::SettingsView, String> {
+    let _guard = state.settings_gate.lock().await;
+    keychain::set_cleanup_api_key("")
+        .map_err(|error| format!("failed to remove cleanup API key securely: {error}"))?;
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| error.to_string())?;
+    let mut settings = lock_recover(&state.settings).clone();
+    settings.cleanup_api_key.clear();
+    store::save_settings(&dir, &settings).map_err(|error| error.to_string())?;
+    *lock_recover(&state.settings) = settings.clone();
+    Ok(store::SettingsView::from(&settings))
+}
+
 fn apply_captured_activation_mode(settings: &mut store::Settings, captured: &str) {
     if !matches!(captured, "tap" | "double_tap" | "hybrid") {
         return;
@@ -3846,6 +4062,15 @@ fn clear_all_data(app: tauri::AppHandle) -> Result<(), String> {
     let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
     store::clear_all_data(&dir).map_err(|e| e.to_string())
 }
+#[tauri::command]
+async fn probe_engine_draft(
+    state: State<'_, AppState>,
+    draft: engine::EngineDraft,
+) -> Result<engine::ProbeResult, String> {
+    let stored = lock_recover(&state.settings).clone();
+    Ok(engine::probe_engine_draft(&draft, &stored).await)
+}
+
 #[tauri::command]
 async fn validate_api_key(key: String) -> Result<String, String> {
     Ok(groq::validate_key(&key).await)
@@ -4180,6 +4405,17 @@ pub fn run() {
             dictation::cancel_dictation,
             get_settings,
             dictionary_learn::suggest_dictionary_entries,
+            dictionary_learn::add_dictionary_entries,
+            dictionary_learn::remove_dictionary_word,
+            dictionary_learn::list_learn_pairs,
+            dictionary_learn::promote_learn_pair,
+            dictionary_learn::ignore_learn_pair,
+            dictionary_learn::undo_learn_pair,
+            dictionary_learn::pin_dictionary_term,
+            dictionary_learn::list_pinned_terms,
+            dictionary_learn::list_style_drafts,
+            dictionary_learn::confirm_style_draft,
+            dictionary_learn::dismiss_style_draft,
             read_dictionary_file,
             get_context_snapshot,
             get_context_mappings,
@@ -4195,12 +4431,14 @@ pub fn run() {
             update_settings_patch,
             remove_api_key,
             remove_asr_api_key,
+            remove_cleanup_api_key,
             get_usage,
             get_latency_metrics,
             history_commands::get_history,
             history_commands::export_history,
             clear_all_data,
             history_commands::retry_dictation,
+            probe_engine_draft,
             validate_api_key,
             validate_configured_api_key,
             history_commands::repaste_history,
@@ -4218,6 +4456,7 @@ pub fn run() {
             request_microphone_permission,
             open_privacy_settings,
             request_accessibility_permission,
+            hide_island_if_idle,
             set_hotkeys_suspended,
             set_onboarding_test_mode,
             set_onboarding_selected_text,
@@ -4244,6 +4483,7 @@ pub fn run() {
 mod tests {
     use super::{
         claim_processing_timeout, completion_state, completion_state_for_delivery, context,
+        hud_accepts_mouse,
         delivery_fallback_reason, error_completion_is_current, error_fallback_reason,
         finalize_text, long_completion_state, process_bounded_chunk_jobs,
         processing_completion_is_current,
@@ -4347,6 +4587,16 @@ mod tests {
         ] {
             let _ = fs::remove_file(path);
         }
+    }
+
+    #[test]
+    fn hud_caption_expands_window_for_delivery_failures() {
+        assert!(super::hud_caption_expands_window("copied", Some("paste_failed")));
+        assert!(super::hud_caption_expands_window("degraded", Some("target_changed")));
+        assert!(super::hud_caption_expands_window("error", None));
+        assert!(super::hud_caption_expands_window("copied", None));
+        assert!(!super::hud_caption_expands_window("recording", None));
+        assert!(!super::hud_caption_expands_window("idle", None));
     }
 
     #[test]
@@ -4566,6 +4816,16 @@ mod tests {
         assert_eq!(long_completion_state(true, "clipboard", true), "degraded");
         assert_eq!(long_completion_state(false, "clipboard", true), "copied");
         assert_eq!(long_completion_state(false, "paste", false), "done");
+    }
+
+    #[test]
+    fn hud_stays_click_through_during_processing_and_paste_yield() {
+        assert!(hud_accepts_mouse("recording", "pending", false));
+        assert!(!hud_accepts_mouse("processing", "pending", false));
+        assert!(!hud_accepts_mouse("recording", "pending", true));
+        assert!(!hud_accepts_mouse("done", "paste", true));
+        assert!(hud_accepts_mouse("done", "paste", false));
+        assert!(!hud_accepts_mouse("done", "clipboard", false));
     }
 
     #[test]
@@ -4954,26 +5214,30 @@ mod tests {
     }
 
     #[test]
-    fn onboarding_delivery_only_targets_the_frontmost_voiceflow_window() {
+    fn onboarding_delivery_follows_test_mode_regardless_of_frontmost_app() {
         let mut snapshot = context::ContextSnapshot::general();
         snapshot.target_guard.pid = 42;
-        snapshot.target_guard.bundle_id = Some("com.voiceflow.desktop".into());
+        snapshot.target_guard.bundle_id = Some("com.todesktop.230313mzl4w4u92".into());
 
         assert!(super::onboarding_delivery_target_matches(
             true,
             &snapshot,
-            (42, Some("com.voiceflow.desktop".into()))
+            (99, Some("com.todesktop.230313mzl4w4u92".into()))
         ));
+        assert!(super::onboarding_delivery_target_matches(true, &snapshot, (1, None)));
         assert!(!super::onboarding_delivery_target_matches(
             false,
             &snapshot,
             (42, Some("com.voiceflow.desktop".into()))
         ));
-        assert!(!super::onboarding_delivery_target_matches(
-            true,
-            &snapshot,
-            (42, Some("com.example.other-app".into()))
-        ));
+    }
+
+    #[test]
+    fn completion_hud_dwells_long_enough_to_read_copied_and_error() {
+        assert!(super::completion_hud_dwell_ms("copied") >= 4_000);
+        assert!(super::completion_hud_dwell_ms("error") >= 4_000);
+        assert_eq!(super::completion_hud_dwell_ms("done"), 3_000);
+        assert_eq!(super::completion_hud_dwell_ms("degraded"), 3_000);
     }
 
     #[test]
@@ -5153,6 +5417,26 @@ mod tests {
         assert_eq!(
             super::cleanup_policy_for(&settings, &snapshot).output_mode,
             Some("email".into())
+        );
+    }
+
+    #[test]
+    fn automatic_output_mode_does_not_arm_a_default_english_translation() {
+        let snapshot = context::ContextSnapshot::general();
+        let settings = store::Settings::default();
+        assert_eq!(settings.output_mode, "auto");
+        assert_eq!(settings.translation_target_language, "en");
+        assert_eq!(
+            super::cleanup_policy_for(&settings, &snapshot).translation_target_language,
+            None
+        );
+        assert_eq!(super::spoken_translation_target(&settings), None);
+
+        let mut translating = settings;
+        translating.output_mode = "translation".into();
+        assert_eq!(
+            super::spoken_translation_target(&translating),
+            Some("en")
         );
     }
 }

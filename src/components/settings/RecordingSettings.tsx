@@ -96,6 +96,11 @@ export function RecordingSettings({ settings, save }: { settings: Settings; save
             onCommit={(input_gain) => save({ input_gain })}
           />
         </SettingsRow>
+        {(settings.input_gain ?? 1) > 1 && (
+          <p role="note" className="px-4 pb-3 text-xs leading-5 text-tertiary sm:px-5">
+            {t("增益大于 1 时，过大的声音会被压限，避免削波。说话很轻再提高。")}
+          </p>
+        )}
       </SettingsGroup>
       <SettingsGroup title={t("输出方式")} description={t("短录音和长录音都先尝试写入当前输入框；如果目标没有接收，会保留文字并复制到剪贴板。你也可以改成只复制或仅保存历史。")}>
         <SettingsRow title={t("默认行为")} description={t("自动会先粘贴；目标没有接收时保留文字并复制到剪贴板。")}>

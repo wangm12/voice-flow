@@ -205,7 +205,7 @@ const CASES: &[CleanupCase] = &[
     CleanupCase {
         name: "document_paragraph",
         raw: "第一点我们需要先验证数据第二点再发布结果",
-        expected: "第一点，我们需要先验证数据；第二点，再发布结果。",
+        expected: "1. 我们需要先验证数据\n2. 再发布结果",
         protected_tokens: &[],
         context_family: "document",
         allow_rewrite: false,
@@ -349,7 +349,7 @@ const CASES: &[CleanupCase] = &[
     CleanupCase {
         name: "bullet_like_actions",
         raw: "第一完成设计第二写测试第三发布",
-        expected: "第一，完成设计；第二，写测试；第三，发布。",
+        expected: "1. 完成设计\n2. 写测试\n3. 发布",
         protected_tokens: &[],
         context_family: "project_management",
         allow_rewrite: true,
@@ -454,6 +454,141 @@ const CASES: &[CleanupCase] = &[
         allow_rewrite: true,
         preserve_structure: true,
     },
+    CleanupCase {
+        name: "work_chat_thanks_stays_chat",
+        raw: "thanks Maya can you ping the launch when you have a minute",
+        expected: "Thanks Maya, can you ping the launch when you have a minute?",
+        protected_tokens: &["Maya"],
+        context_family: "work_chat",
+        allow_rewrite: true,
+        preserve_structure: true,
+    },
+    CleanupCase {
+        name: "spoken_newline",
+        raw: "the reading club new line should be tomorrow",
+        expected: "The reading club\nshould be tomorrow.",
+        protected_tokens: &[],
+        context_family: "general",
+        allow_rewrite: false,
+        preserve_structure: true,
+    },
+    CleanupCase {
+        name: "spoken_new_paragraph",
+        raw: "第一段内容 新段落 第二段内容",
+        expected: "第一段内容\n\n第二段内容。",
+        protected_tokens: &[],
+        context_family: "document",
+        allow_rewrite: false,
+        preserve_structure: true,
+    },
+    CleanupCase {
+        name: "list_false_positive_first_thought",
+        raw: "我第一个想到的是先验证数据",
+        expected: "我第一个想到的是先验证数据。",
+        protected_tokens: &[],
+        context_family: "document",
+        allow_rewrite: false,
+        preserve_structure: true,
+    },
+    CleanupCase {
+        name: "list_incomplete_only_first",
+        raw: "第一我们先验证数据",
+        expected: "第一我们先验证数据。",
+        protected_tokens: &[],
+        context_family: "document",
+        allow_rewrite: false,
+        preserve_structure: true,
+    },
+    CleanupCase {
+        name: "email_with_spoken_greeting",
+        raw: "Hi John looking forward to chatting tomorrow Best Allan",
+        expected: "Hi John\nlooking forward to chatting tomorrow\nBest\nAllan",
+        protected_tokens: &["John", "Allan"],
+        context_family: "email",
+        allow_rewrite: false,
+        preserve_structure: true,
+    },
+    CleanupCase {
+        name: "email_without_greeting",
+        raw: "looking forward to chatting tomorrow",
+        expected: "Looking forward to chatting tomorrow.",
+        protected_tokens: &[],
+        context_family: "email",
+        allow_rewrite: false,
+        preserve_structure: true,
+    },
+    CleanupCase {
+        name: "wechat_with_ordinals",
+        raw: "第一完成设计第二写测试",
+        expected: "1. 完成设计\n2. 写测试。",
+        protected_tokens: &[],
+        context_family: "personal_chat",
+        allow_rewrite: false,
+        preserve_structure: true,
+    },
+    CleanupCase {
+        name: "wechat_keeps_spoken_newline",
+        raw: "先发你 换行 明天再改",
+        expected: "先发你\n明天再改",
+        protected_tokens: &[],
+        context_family: "personal_chat",
+        allow_rewrite: false,
+        preserve_structure: true,
+    },
+    CleanupCase {
+        name: "zh_restatement_after_bu_dui",
+        raw: "做一个完整的 cloud 测试，不对，不对，不对。做一个完整的 cursor 测试",
+        expected: "做一个完整的 cursor 测试。",
+        protected_tokens: &[],
+        context_family: "prompt_or_code",
+        allow_rewrite: false,
+        preserve_structure: true,
+    },
+    CleanupCase {
+        name: "zh_bu_dui_as_question",
+        raw: "看上它对不对",
+        expected: "看它对不对？",
+        protected_tokens: &[],
+        context_family: "prompt_or_code",
+        allow_rewrite: false,
+        preserve_structure: true,
+    },
+    CleanupCase {
+        name: "zh_bu_dui_as_topic",
+        raw: "你看我说不对的时候应该把之前的删了",
+        expected: "你看我说不对的时候应该把之前的删了。",
+        protected_tokens: &[],
+        context_family: "prompt_or_code",
+        allow_rewrite: false,
+        preserve_structure: true,
+    },
+    CleanupCase {
+        name: "en_scratch_that_restate",
+        raw: "write a cloud test scratch that write a cursor test",
+        expected: "Write a cursor test.",
+        protected_tokens: &[],
+        context_family: "prompt_or_code",
+        allow_rewrite: false,
+        preserve_structure: true,
+    },
+    CleanupCase {
+        name: "en_actually_is_content",
+        raw: "I actually enjoyed the movie",
+        expected: "I actually enjoyed the movie.",
+        protected_tokens: &[],
+        context_family: "prompt_or_code",
+        allow_rewrite: false,
+        preserve_structure: true,
+    },
+    CleanupCase {
+        name: "zh_oh_bu_dui_list_backtrack",
+        raw: "我们来测试一下,看一下具体的 ASR 流程。1. 是 prompt。看一下 prompt 到底怎么样。哦,不对, 2. 是 system。哦,不对, 3. 是 system prompt,看一下具体的流程怎么样。4. 是看一下 style,和它的逻辑是怎么样。5. 是看一下它整个的识别率怎么样。",
+        expected: "我们来测试一下，看一下具体的 ASR 流程。\n1. 是 system prompt，看一下具体的流程怎么样。\n2. 是看一下 style 和它的逻辑是怎么样。\n3. 是看一下它整个的识别率怎么样。",
+        protected_tokens: &["ASR"],
+        context_family: "prompt_or_code",
+        allow_rewrite: false,
+        preserve_structure: true,
+    },
 ];
 
 #[cfg(test)]
@@ -472,6 +607,80 @@ mod tests {
             .any(|case| case.context_family == "personal_chat"));
         assert!(CASES.iter().any(|case| case.name == "zh_self_correction"));
         assert!(CASES.iter().any(|case| case.name == "long_chunk_boundary"));
+        assert!(CASES.iter().any(|case| case.name == "spoken_newline"));
+        assert!(CASES.iter().any(|case| case.name == "wechat_with_ordinals"));
+        assert!(CASES
+            .iter()
+            .any(|case| case.name == "work_chat_thanks_stays_chat"));
+        assert!(CASES
+            .iter()
+            .any(|case| case.name == "email_with_spoken_greeting"));
+        assert!(CASES
+            .iter()
+            .any(|case| case.name == "zh_restatement_after_bu_dui"));
+        assert!(CASES
+            .iter()
+            .any(|case| case.name == "zh_bu_dui_as_question"));
+        assert!(CASES.iter().any(|case| case.name == "en_scratch_that_restate"));
+    }
+
+    #[test]
+    fn self_correction_fixtures_drop_restatement_but_keep_bu_dui_as_content() {
+        let restatement = CASES
+            .iter()
+            .find(|case| case.name == "zh_restatement_after_bu_dui")
+            .expect("zh_restatement_after_bu_dui");
+        assert_eq!(restatement.context_family, "prompt_or_code");
+        assert!(!restatement.expected.contains("cloud"));
+        assert!(!restatement.expected.contains("不对"));
+        assert!(restatement.expected.contains("cursor"));
+
+        let question = CASES
+            .iter()
+            .find(|case| case.name == "zh_bu_dui_as_question")
+            .expect("zh_bu_dui_as_question");
+        assert!(question.expected.contains("不对"));
+        assert!(question.expected.contains('？'));
+
+        let topic = CASES
+            .iter()
+            .find(|case| case.name == "zh_bu_dui_as_topic")
+            .expect("zh_bu_dui_as_topic");
+        assert!(topic.expected.contains("不对"));
+        assert!(topic.expected.contains("删了"));
+
+        let contrast = CASES
+            .iter()
+            .find(|case| case.name == "amount_preservation")
+            .expect("amount_preservation");
+        assert!(contrast.expected.contains("1250"));
+        assert!(contrast.expected.contains("不是"));
+        assert!(contrast.expected.contains("1500"));
+
+        let scratch = CASES
+            .iter()
+            .find(|case| case.name == "en_scratch_that_restate")
+            .expect("en_scratch_that_restate");
+        assert!(!scratch.expected.to_ascii_lowercase().contains("cloud"));
+        assert!(!scratch.expected.to_ascii_lowercase().contains("scratch"));
+        assert!(scratch.expected.to_ascii_lowercase().contains("cursor"));
+
+        let actually = CASES
+            .iter()
+            .find(|case| case.name == "en_actually_is_content")
+            .expect("en_actually_is_content");
+        assert!(actually.expected.to_ascii_lowercase().contains("actually"));
+        assert!(actually.expected.to_ascii_lowercase().contains("enjoyed"));
+
+        let list_backtrack = CASES
+            .iter()
+            .find(|case| case.name == "zh_oh_bu_dui_list_backtrack")
+            .expect("zh_oh_bu_dui_list_backtrack");
+        assert!(!list_backtrack.expected.contains("哦"));
+        assert!(!list_backtrack.expected.contains("不对"));
+        assert!(!list_backtrack.expected.contains("是 prompt"));
+        assert!(list_backtrack.expected.contains("system prompt"));
+        assert!(list_backtrack.expected.contains("ASR"));
     }
 
     #[test]
@@ -506,6 +715,97 @@ mod tests {
         assert!(!lower.contains("best regards"));
         assert!(!lower.starts_with("hello"));
         assert!(!lower.starts_with("hi "));
+
+        let thanks = CASES
+            .iter()
+            .find(|case| case.name == "work_chat_thanks_stays_chat")
+            .expect("work_chat_thanks_stays_chat");
+        assert_eq!(thanks.context_family, "work_chat");
+        assert!(thanks.raw.to_ascii_lowercase().contains("thanks"));
+        assert!(!thanks.expected.contains('\n'));
+        assert!(!thanks.expected.to_ascii_lowercase().contains("best regards"));
+
+        let ordinals = CASES
+            .iter()
+            .find(|case| case.name == "wechat_with_ordinals")
+            .expect("wechat_with_ordinals");
+        assert_eq!(ordinals.context_family, "personal_chat");
+        assert!(ordinals.expected.contains("1. "));
+        assert!(ordinals.expected.contains('\n'));
+        assert!(!ordinals.expected.contains("您好"));
+    }
+
+    #[test]
+    fn layout_regression_cases_follow_spoken_structure() {
+        use crate::context::{builtin_family_for_id, ContextFamily};
+        use crate::spoken_layout::apply_after_punctuation;
+
+        let layout = |name: &str, confidence: f32| {
+            let case = CASES
+                .iter()
+                .find(|item| item.name == name)
+                .unwrap_or_else(|| panic!("missing case {name}"));
+            let family =
+                builtin_family_for_id(case.context_family).unwrap_or(ContextFamily::General);
+            apply_after_punctuation(case.raw, family, confidence)
+        };
+
+        assert_eq!(
+            layout("spoken_newline", 1.0),
+            "the reading club\nshould be tomorrow"
+        );
+        assert_eq!(
+            layout("spoken_new_paragraph", 1.0),
+            "第一段内容\n\n第二段内容"
+        );
+        assert_eq!(
+            layout("document_paragraph", 0.9),
+            "1. 我们需要先验证数据\n2. 再发布结果"
+        );
+        assert_eq!(
+            layout("bullet_like_actions", 0.9),
+            "1. 完成设计\n2. 写测试\n3. 发布"
+        );
+        assert_eq!(
+            layout("list_false_positive_first_thought", 0.9),
+            "我第一个想到的是先验证数据"
+        );
+        assert_eq!(
+            layout("list_incomplete_only_first", 0.9),
+            "第一我们先验证数据"
+        );
+        assert_eq!(
+            layout("chunk_boundary_punctuation", 0.9),
+            "第一部分是数据库迁移。第二部分，嗯，是回滚方案"
+        );
+        assert_eq!(
+            layout("email_with_spoken_greeting", 0.9),
+            "Hi John\nlooking forward to chatting tomorrow\nBest\nAllan"
+        );
+        assert_eq!(
+            layout("email_without_greeting", 0.9),
+            "looking forward to chatting tomorrow"
+        );
+        let wechat_list = layout("wechat_with_ordinals", 0.9);
+        assert_eq!(wechat_list, "1. 完成设计\n2. 写测试");
+        assert!(!wechat_list.contains("您好"));
+        assert_eq!(
+            layout("wechat_keeps_spoken_newline", 0.9),
+            "先发你\n明天再改"
+        );
+        assert_eq!(layout("zh_wechat_casual", 0.9), "好的哈哈我晚点回你");
+        assert_eq!(
+            layout("work_chat_not_email", 0.9),
+            "can you ping Maya about the launch when you have a minute"
+        );
+        assert_eq!(
+            layout("work_chat_thanks_stays_chat", 0.9),
+            "thanks Maya can you ping the launch when you have a minute"
+        );
+        assert_eq!(
+            layout("zh_oh_bu_dui_list_backtrack", 1.0),
+            "我们来测试一下,看一下具体的 ASR 流程。\n1. 是 system prompt,看一下具体的流程怎么样。\n2. 是看一下 style,和它的逻辑是怎么样。\n3. 是看一下它整个的识别率怎么样。"
+        );
     }
 
     #[test]

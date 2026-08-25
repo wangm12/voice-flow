@@ -12,6 +12,25 @@ static SELECTED_ACTION_REGISTERED: Mutex<Option<String>> = Mutex::new(None);
 
 pub const HYBRID_HOLD_MS: u64 = 280;
 
+/// macOS Option+/ emits `÷`. muda only accepts the physical `Slash` key name.
+pub(crate) fn canonicalize_hotkey(hotkey: &str) -> String {
+    let mut parts: Vec<String> = hotkey
+        .split('+')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(str::to_owned)
+        .collect();
+    if let Some(last) = parts.last_mut() {
+        *last = match last.as_str() {
+            "÷" | "/" => "Slash".into(),
+            "Dead" => "Space".into(),
+            "\\" => "Backslash".into(),
+            _ => last.clone(),
+        };
+    }
+    parts.join("+")
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HybridReleaseAction {
     Stop,
@@ -158,6 +177,8 @@ pub fn is_suspended() -> bool {
 }
 
 pub fn register(app: &AppHandle, hotkey: &str, activation_mode: &str) -> Result<(), String> {
+    let hotkey = canonicalize_hotkey(hotkey);
+    let hotkey = hotkey.as_str();
     let signature = (hotkey.to_string(), activation_mode.to_string());
     if LAST_REGISTERED
         .lock()
@@ -250,7 +271,7 @@ pub async fn apply_settings_hotkey(
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clone();
-    let requested = (hotkey.to_owned(), mode.to_owned());
+    let requested = (canonicalize_hotkey(hotkey), mode.to_owned());
     // `register` unregisters the current binding before installing the new
     // one. Clear the cache first so a failed install can actually restore the
     // old binding instead of being short-circuited by the cache.
@@ -293,6 +314,7 @@ fn unregister_selected_action_on_main(app: &AppHandle) {
 /// cannot replace the ordinary dictation shortcut.
 pub fn register_selected_action(app: &AppHandle, hotkey: &str) -> Result<(), String> {
     unregister_selected_action_on_main(app);
+    let hotkey = canonicalize_hotkey(hotkey);
     if hotkey.trim().is_empty() {
         return Ok(());
     }
@@ -387,6 +409,21 @@ mod tests {
             Some("hotkey://toggle")
         );
         assert_eq!(combo_hotkey_event("tap", ShortcutState::Released), None);
+    }
+
+    #[test]
+    fn option_slash_is_canonicalized_to_slash_not_divide() {
+        assert_eq!(
+            canonicalize_hotkey("CmdOrControl+Alt+÷"),
+            "CmdOrControl+Alt+Slash"
+        );
+        assert_eq!(
+            canonicalize_hotkey("CmdOrControl+Alt+/"),
+            "CmdOrControl+Alt+Slash"
+        );
+        assert!(canonicalize_hotkey("CmdOrControl+Alt+÷")
+            .parse::<Shortcut>()
+            .is_ok());
     }
 
     #[test]

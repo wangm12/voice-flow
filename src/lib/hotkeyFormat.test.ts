@@ -1,9 +1,13 @@
 import { describe, expect, it } from "vitest";
 import {
+  DEFAULT_DICTATION_HOTKEY,
+  DEFAULT_SELECTED_ACTION_HOTKEY,
   formatHotkeyDisplay,
   hotkeyDisplayParts,
+  hotkeyFromKeyboardEvent,
   isFnOnlyHotkey,
   isModifierOnlyHotkey,
+  sanitizeTauriHotkey,
   toTauriHotkey,
   toTanStackHotkey,
 } from "./hotkeyFormat";
@@ -44,5 +48,23 @@ describe("hotkey formatting", () => {
     const parts = hotkeyDisplayParts("CmdOrControl+Shift+Space");
     expect(parts).toHaveLength(3);
     expect(parts[parts.length - 1]).toBe("Space");
+  });
+
+  it("defaults to Command-Option-Space and Command-Option-Slash", () => {
+    expect(DEFAULT_DICTATION_HOTKEY).toBe("CmdOrControl+Alt+Space");
+    expect(DEFAULT_SELECTED_ACTION_HOTKEY).toBe("CmdOrControl+Alt+Slash");
+    expect(formatHotkeyDisplay(DEFAULT_SELECTED_ACTION_HOTKEY)).toContain("/");
+    expect(formatHotkeyDisplay(DEFAULT_SELECTED_ACTION_HOTKEY)).not.toContain("Slash");
+  });
+
+  it("keeps Option+Slash as Slash instead of the ÷ character macOS emits", () => {
+    const event = new KeyboardEvent("keydown", {
+      key: "÷",
+      code: "Slash",
+      metaKey: true,
+      altKey: true,
+    });
+    expect(hotkeyFromKeyboardEvent(event)).toBe("CmdOrControl+Alt+Slash");
+    expect(sanitizeTauriHotkey("CmdOrControl+Alt+÷")).toBe("CmdOrControl+Alt+Slash");
   });
 });

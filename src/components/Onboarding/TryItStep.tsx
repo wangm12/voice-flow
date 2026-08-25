@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { useEffect, useRef, useState, type SyntheticEvent } from "react";
 import { tryItHint } from "../../lib/activationCopy";
+import { shouldClearTrialDeliveryNote, trialDeliveryNote } from "../../lib/trialDeliveryNote";
 import { radius, focusRingClass } from "../../lib/theme";
 import { iconPropsLg } from "../../lib/icons";
 import { useI18n } from "../../lib/i18n";
@@ -35,6 +36,7 @@ export function TryItStep({
   const initialSelectedActionPromptRef = useRef(selectedActionPrompt);
   const [selectedActionText, setSelectedActionText] = useState(selectedActionPrompt);
   const [selectedActionState, setSelectedActionState] = useState("idle");
+  const [deliveryNote, setDeliveryNote] = useState<string | null>(null);
 
   useEffect(() => {
     setSelectedActionText((current) => current === initialSelectedActionPromptRef.current ? selectedActionPrompt : current);
@@ -122,9 +124,28 @@ export function TryItStep({
 
   useEffect(() => {
     let active = true;
+    const subscription = listen<{ state: string; fallback_reason?: string | null }>("dictation://state", (event) => {
+      if (!active) return;
+      const next = event.payload.state;
+      if (shouldClearTrialDeliveryNote(next)) {
+        setDeliveryNote(null);
+        return;
+      }
+      const note = trialDeliveryNote(next, event.payload.fallback_reason, t);
+      if (note) setDeliveryNote(note);
+    });
+    return () => {
+      active = false;
+      void subscription.then((unlisten) => unlisten()).catch(() => undefined);
+    };
+  }, [t]);
+
+  useEffect(() => {
+    let active = true;
     const subscription = listen<{ final_text: string }>("dictation://onboarding-result", (event) => {
       if (!active || !event.payload.final_text) return;
       const insertedText = event.payload.final_text;
+      setDeliveryNote(null);
       setInputText((current) => {
         const input = inputRef.current;
         const start = input?.selectionStart ?? current.length;
@@ -166,6 +187,9 @@ export function TryItStep({
           className={`mt-3 w-full resize-none ${radius.control} border border-border bg-base p-3 text-sm text-primary outline-none transition-colors placeholder:text-tertiary focus:border-accent ${focusRingClass}`}
         />
         <TrialStatus active={recording && activeTrialRef.current === "dictation"} processing={processing && activeTrialRef.current === "dictation"} text={dictationStatus} />
+        {deliveryNote && trial === "dictation" && (
+          <p role="status" className="mt-3 text-xs text-warning">{deliveryNote}</p>
+        )}
       </section>}
 
       {trial === "selected_action" && <section className="mt-6 border-y border-border py-4" aria-labelledby="selected-action-trial-heading">
@@ -186,6 +210,9 @@ export function TryItStep({
           className={`mt-3 w-full resize-none ${radius.control} border border-border bg-base p-3 text-sm text-primary outline-none transition-colors focus:border-accent ${focusRingClass}`}
         />
         <TrialStatus active={selectedActionState === "listening" || (recording && activeTrialRef.current === "selected_action")} processing={selectedActionState === "preparing_rewrite" || (processing && activeTrialRef.current === "selected_action")} text={selectedActionStatus} />
+        {deliveryNote && trial === "selected_action" && (
+          <p role="status" className="mt-3 text-xs text-warning">{deliveryNote}</p>
+        )}
       </section>}
       {error && <p role="alert" className="mt-3 text-xs text-error">{error}</p>}
     </div>

@@ -1,6 +1,6 @@
 import { SettingsGroup, SettingsPageHeader, SettingsRow, SettingsShell, SettingsStatus } from "../SettingsLayout";
 import { Toggle } from "../Toggle";
-import { useI18n } from "../../lib/i18n";
+import { type UiLanguagePreference, useI18n } from "../../lib/i18n";
 import { colors, focusRingClass, radius } from "../../lib/theme";
 import type { AudioInputDevice, SaveSettings, Settings } from "../../types/settings";
 
@@ -11,11 +11,13 @@ export function SystemSettings({
   audioInputDevice,
   audioInputDevices,
   save,
+  onUiLanguageChange,
 }: {
   settings: Settings;
   audioInputDevice: string | null;
   audioInputDevices: AudioInputDevice[];
   save: SaveSettings;
+  onUiLanguageChange: (uiLanguage: UiLanguagePreference) => void;
 }) {
   const { t } = useI18n();
   const selectedInputDevice = settings.input_device?.trim() ?? "";
@@ -24,7 +26,23 @@ export function SystemSettings({
 
   return (
     <SettingsShell>
-      <SettingsPageHeader title={t("系统设置")} description={t("菜单栏图标、音频输入和系统级应用行为。")} />
+      <SettingsPageHeader title={t("系统设置")} description={t("主题、语言、菜单栏图标和音频输入。")} />
+      <SettingsGroup title={t("外观")}>
+        <SettingsRow title={t("主题")} description={t("设置窗口使用浅色、深色，或跟随 macOS。")}>
+          <select aria-label={t("主题")} value={settings.theme} onChange={(event) => save({ theme: event.target.value as Settings["theme"] })} className={`${controlClass} w-40 max-w-full`}>
+            <option value="system">{t("跟随系统")}</option>
+            <option value="light">{t("浅色")}</option>
+            <option value="dark">{t("深色")}</option>
+          </select>
+        </SettingsRow>
+        <SettingsRow title={t("语言")} description={t("设置窗口和界面文案的语言。")}>
+          <select aria-label={t("语言")} value={settings.ui_language} onChange={(event) => onUiLanguageChange(event.target.value as UiLanguagePreference)} className={`${controlClass} w-40 max-w-full`}>
+            <option value="system">{t("跟随系统")}</option>
+            <option value="zh">{t("中文")}</option>
+            <option value="en">{t("English")}</option>
+          </select>
+        </SettingsRow>
+      </SettingsGroup>
       <SettingsGroup title={t("音频输入")} description={t("选择录音使用的麦克风；默认跟随 macOS 系统设置。")}>
         <SettingsRow title={t("输入设备")} description={t("默认会跟随 macOS 当前输入设备；选择具体设备后，录音会固定使用它。")}>
           <div className="flex max-w-full flex-wrap items-center justify-end gap-2">

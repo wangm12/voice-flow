@@ -112,4 +112,11 @@ describe("RecordingSettings", () => {
     fireEvent.blur(screen.getByRole("spinbutton", { name: "输入增益" }));
     expect(save).toHaveBeenCalledWith({ input_gain: 2 });
   });
+
+  it("warns that gain above 1 is limited to avoid clipping", () => {
+    render(<RecordingSettings settings={{ ...settings, input_gain: 2 }} save={vi.fn()} />);
+    expect(
+      screen.getByText("增益大于 1 时，过大的声音会被压限，避免削波。说话很轻再提高。"),
+    ).toBeTruthy();
+  });
 });

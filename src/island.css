@@ -32,6 +32,41 @@
   contain: size layout paint;
 }
 
+.island-learn-toast {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  max-width: min(280px, 92vw);
+  padding: 6px 8px 6px 10px;
+  border: 1px solid var(--voice-hud-border);
+  border-radius: 999px;
+  background: linear-gradient(180deg, var(--voice-hud-top), var(--voice-hud-bottom));
+  color: var(--voice-hud-text);
+  font-size: 11px;
+  line-height: 1.2;
+  pointer-events: auto;
+}
+
+.island-learn-toast__text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.island-learn-toast__action {
+  flex-shrink: 0;
+  border: 0;
+  background: transparent;
+  color: var(--voice-hud-muted);
+  font: inherit;
+  cursor: pointer;
+}
+
+.island-learn-toast__action:hover {
+  color: var(--voice-hud-text);
+}
+
 .voice-pill-stack {
   display: flex;
   flex-direction: column;
@@ -133,8 +168,15 @@
   color: rgba(255, 220, 220, 0.98);
 }
 
-.voice-pill-caption--partial {
+.voice-pill-caption--partial,
+.voice-pill-caption--wide {
   max-width: 360px;
+}
+
+.voice-pill-caption--wide {
+  font-size: 12px;
+  line-height: 1.35;
+  letter-spacing: 0;
 }
 
 .voice-pill {

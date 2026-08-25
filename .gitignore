@@ -33,3 +33,10 @@ task_plan.md
 
 # Accidental local artifacts
 :-
+
+# Local signing material and staged DMGs
+.build/
+*.p12
+*.p12.base64
+*.pem
+*.key

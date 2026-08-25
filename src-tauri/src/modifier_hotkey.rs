@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -38,7 +38,24 @@ static APP_HANDLE: OnceLock<AppHandle> = OnceLock::new();
 /// the event tap must ignore modifier events — our own synthetic keys would otherwise
 /// be misread as a physical double-tap and re-enter the event system (which crashes
 /// the main runloop with an uncaught NSException).
-static PASTE_SUPPRESS: AtomicBool = AtomicBool::new(false);
+static PASTE_SUPPRESS: AtomicU32 = AtomicU32::new(0);
+
+pub struct PasteSuppressGuard {
+    _private: (),
+}
+
+impl PasteSuppressGuard {
+    pub fn new() -> Self {
+        set_paste_suppressed(true);
+        Self { _private: () }
+    }
+}
+
+impl Drop for PasteSuppressGuard {
+    fn drop(&mut self) {
+        set_paste_suppressed(false);
+    }
+}
 
 fn lock_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
@@ -47,13 +64,33 @@ fn lock_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 pub fn set_paste_suppressed(suppressed: bool) {
-    PASTE_SUPPRESS.store(suppressed, Ordering::SeqCst);
     if suppressed {
-        reset_state();
+        let previous = PASTE_SUPPRESS.fetch_add(1, Ordering::SeqCst);
+        if previous == 0 {
+            reset_state();
+        }
+        return;
+    }
+    loop {
+        let current = PASTE_SUPPRESS.load(Ordering::SeqCst);
+        if current == 0 {
+            return;
+        }
+        if PASTE_SUPPRESS
+            .compare_exchange(current, current - 1, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            return;
+        }
     }
 }
 
 pub fn is_paste_suppressed() -> bool {
+    PASTE_SUPPRESS.load(Ordering::SeqCst) > 0
+}
+
+#[cfg(test)]
+fn paste_suppress_depth() -> u32 {
     PASTE_SUPPRESS.load(Ordering::SeqCst)
 }
 
@@ -360,5 +397,20 @@ mod tests {
         .join();
 
         assert_eq!(*lock_recover(&state), 7);
+    }
+
+    #[test]
+    fn nested_paste_suppress_keeps_the_outer_window() {
+        let baseline = paste_suppress_depth();
+        let outer = PasteSuppressGuard::new();
+        assert_eq!(paste_suppress_depth(), baseline + 1);
+        {
+            let inner = PasteSuppressGuard::new();
+            assert_eq!(paste_suppress_depth(), baseline + 2);
+            drop(inner);
+            assert_eq!(paste_suppress_depth(), baseline + 1);
+        }
+        drop(outer);
+        assert_eq!(paste_suppress_depth(), baseline);
     }
 }

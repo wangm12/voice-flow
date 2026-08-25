@@ -1,8 +1,18 @@
+function settingsErrorMessage(reason: unknown): string {
+  if (typeof reason === "string") return reason;
+  if (reason instanceof Error) return reason.message;
+  if (reason && typeof reason === "object" && "message" in reason) {
+    const message = (reason as { message: unknown }).message;
+    if (typeof message === "string" && message.trim()) return message;
+  }
+  return String(reason);
+}
+
 export function friendlySettingsError(
   reason: unknown,
   translate: (source: string) => string,
 ): string {
-  const message = reason instanceof Error ? reason.message : String(reason);
+  const message = settingsErrorMessage(reason);
   const normalized = message.toLowerCase();
   if (
     normalized.includes("credential_storage")

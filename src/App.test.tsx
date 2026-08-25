@@ -6,6 +6,11 @@ import App from "./App";
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 const { listenMock } = vi.hoisted(() => ({ listenMock: vi.fn() }));
 vi.mock("@tauri-apps/api/event", () => ({ emit: vi.fn(), listen: listenMock }));
+vi.mock("@tauri-apps/api/webview", () => ({
+  getCurrentWebview: () => ({
+    onDragDropEvent: () => Promise.resolve(() => undefined),
+  }),
+}));
 
 const invokeMock = vi.mocked(invoke);
 
@@ -76,15 +81,15 @@ describe("settings navigation", () => {
     expect(screen.getByText("自动粘贴")).toBeInTheDocument();
   });
 
-  it("splits smart formatting and writing modes into separate settings pages", async () => {
+  it("splits smart formatting and tone into separate settings pages", async () => {
     render(<App />);
 
     fireEvent.click(await screen.findByRole("button", { name: "智能整理" }));
     expect(await screen.findByRole("heading", { name: "智能整理" })).toBeInTheDocument();
-    expect(screen.queryByRole("heading", { name: "写作模式" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "语气" })).not.toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: "写作模式" }));
-    expect(await screen.findByRole("heading", { name: "写作模式" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "语气" }));
+    expect(await screen.findByRole("heading", { name: "语气" })).toBeInTheDocument();
   });
 
   it("shows and lets the user choose the input device in system settings", async () => {
@@ -111,18 +116,31 @@ describe("settings navigation", () => {
     expect(screen.queryByRole("button", { name: "上下文" })).not.toBeInTheDocument();
     expect(screen.getByRole("combobox", { name: "输出模式" })).toHaveValue("auto");
     expect(screen.getByRole("switch", { name: "App 上下文适配" })).toBeInTheDocument();
-    expect(screen.queryByRole("textbox", { name: "写作模式 Prompt" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("textbox", { name: "语气 Prompt" })).not.toBeInTheDocument();
     expect(screen.queryByText("App / 网站映射")).not.toBeInTheDocument();
     expect(screen.getByText("自动根据当前 App、输入框和你说的内容选择整理方式；手动模式会覆盖自动判断。")).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: "写作模式" }));
-    expect(await screen.findByRole("heading", { name: "写作模式" })).toBeInTheDocument();
-    expect(screen.getByRole("textbox", { name: "写作模式 Prompt" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "语气" }));
+    expect(await screen.findByRole("heading", { name: "语气" })).toBeInTheDocument();
+    expect(screen.getByRole("textbox", { name: "语气 Prompt" })).toBeInTheDocument();
     expect(screen.getByText("App / 网站映射")).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "录音与输出" }));
     await waitFor(() => expect(screen.getByRole("heading", { name: "录音与输出" })).toBeInTheDocument());
     expect(screen.queryByRole("combobox", { name: "输出模式" })).not.toBeInTheDocument();
+  });
+
+  it("moves theme and language into system settings", async () => {
+    render(<App />);
+
+    expect(await screen.findByRole("heading", { name: "录音与输出" })).toBeInTheDocument();
+    expect(screen.queryByRole("combobox", { name: "主题" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("combobox", { name: "语言" })).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "系统设置" }));
+    await waitFor(() => expect(screen.getByRole("heading", { name: "系统设置" })).toBeInTheDocument());
+    expect(screen.getByRole("combobox", { name: "主题" })).toHaveValue("system");
+    expect(screen.getByRole("combobox", { name: "语言" })).toHaveValue("zh");
   });
 
   it("moves the menu bar icon setting into system settings", async () => {
@@ -179,6 +197,22 @@ describe("settings navigation", () => {
 
     expect(await screen.findByRole("dialog", { name: "预览选中文本操作" })).toBeInTheDocument();
     expect(screen.getByRole("textbox", { name: "VoiceFlow 生成结果" })).toHaveValue("整理后的文本");
+  });
+
+  it("refreshes dictionary when backend settings change", async () => {
+    let settingsHandler: ((event: { payload: typeof settings & { dictionary: string[] } }) => void) | undefined;
+    listenMock.mockImplementation((event: string, handler: (event: { payload: typeof settings & { dictionary: string[] } }) => void) => {
+      if (event === "settings://changed") settingsHandler = handler;
+      return Promise.resolve(vi.fn());
+    });
+
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "个人词典" }));
+    expect(await screen.findByText("还没有词条。添加后，VoiceFlow 会更准确地识别人名和专业术语。")).toBeInTheDocument();
+    await waitFor(() => expect(settingsHandler).toBeDefined());
+
+    settingsHandler?.({ payload: { ...settings, dictionary: ["知乎"] } as typeof settings & { dictionary: string[] } });
+    expect(await screen.findByText("知乎")).toBeInTheDocument();
   });
 
   it("lets the user choose activation mode and does not persist empty chunk values", async () => {

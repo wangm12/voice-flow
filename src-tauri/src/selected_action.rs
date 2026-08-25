@@ -144,7 +144,18 @@ async fn paste_selected_text(
         let current = lock_recover(&state.context);
         (current.mappings.clone(), current.browser_access_enabled)
     };
+    let restore_pid = expected_target.pid;
+    let restore_window = expected_target.window_id;
     tokio::task::spawn_blocking(move || {
+        struct PasteYieldGuard;
+        impl Drop for PasteYieldGuard {
+            fn drop(&mut self) {
+                crate::island_window::end_paste_yield();
+            }
+        }
+        let _yield = PasteYieldGuard;
+        crate::island_window::prepare_for_paste(&app);
+        let _ = paste::restore_delivery_target_if_needed(restore_pid, restore_window);
         let capture_app = app.clone();
         let verify_target = move || {
             verify_delivery_target(&expected_target, &mappings, browser_access_enabled)?;
@@ -163,7 +174,14 @@ async fn paste_selected_text(
             }
             Ok(())
         };
-        paste::insert(&app, &text, accessibility, cancellation, verify_target)
+        paste::insert(
+            &app,
+            &text,
+            accessibility,
+            cancellation,
+            verify_target,
+            restore_pid,
+        )
     })
     .await
     .map_err(|error| format!("selected text paste worker failed: {error}"))?
@@ -189,7 +207,10 @@ pub(crate) async fn confirm_selected_action_preview(
     }
 
     let pid = preview.session.target_guard.pid;
-    let activation = tokio::task::spawn_blocking(move || paste::activate_target(pid))
+    let window_id = preview.session.target_guard.window_id;
+    let activation = tokio::task::spawn_blocking(move || {
+        paste::restore_delivery_target_if_needed(pid, window_id)
+    })
         .await
         .map_err(|error| format!("target activation worker failed: {error}"))
         .and_then(|result| result.map_err(|error| error.to_string()));
@@ -214,17 +235,13 @@ pub(crate) async fn confirm_selected_action_preview(
     .await;
     match paste_result {
         Ok(outcome) => {
-            let method = if outcome.verified {
-                delivery::DeliveryMethod::Paste
-            } else {
-                delivery::DeliveryMethod::PasteUnverified
-            };
+            let result = delivery::DeliveryResult::from_insert_verified(outcome.verified);
             arm_undo_transaction(
                 &state,
                 preview.session_generation,
                 &preview.session.target_guard,
                 outcome.post_insert_input_fingerprint,
-                method.as_str(),
+                result.method.as_str(),
                 outcome.used_keyboard_paste,
             );
             dictionary_learn::maybe_observe_after_paste(
@@ -233,19 +250,16 @@ pub(crate) async fn confirm_selected_action_preview(
                 outcome.value_after.as_deref(),
                 outcome.verified,
                 &preview.session.target_guard,
+                Some(&preview.context),
             );
             emit_selected_action_state(&app, "replaced");
             finish_with_delivery(
                 &app,
                 &state,
-                if outcome.verified {
-                    "done"
-                } else {
-                    "unverified"
-                },
+                if outcome.verified { "done" } else { "copied" },
                 Some(&preview.context),
-                method.as_str(),
-                (!outcome.verified).then_some("paste_unverified"),
+                result.method.as_str(),
+                result.fallback_reason,
                 Some(CLEANUP_STATUS_AI_SUCCESS),
                 Some(preview.session_generation),
             )

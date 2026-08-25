@@ -1,0 +1,1034 @@
+diff --git a/src-tauri/src/asr.rs b/src-tauri/src/asr.rs
+index 9dd705c..392f822 100644
+--- a/src-tauri/src/asr.rs
++++ b/src-tauri/src/asr.rs
+@@ -41,6 +41,38 @@ pub fn transcription_host(base_url: &str) -> Option<String> {
+     host_from_url(&resolve_transcription_url(base_url))
+ }
+ 
++pub fn asr_host_changed(previous: &str, next: &str) -> bool {
++    transcription_host(previous) != transcription_host(next)
++}
++
++const ASR_URL_SCHEME_ERROR: &str = "ASR 地址必须是 http:// 或 https:// 开头的完整 URL。";
++const ASR_URL_HTTPS_ERROR: &str = "非本机地址必须使用 https://。";
++
++pub fn validate_asr_base_url(base_url: &str) -> Result<(), &'static str> {
++    let trimmed = base_url.trim();
++    if trimmed.is_empty() {
++        return Ok(());
++    }
++    let Some((scheme, rest)) = trimmed.split_once("://") else {
++        return Err(ASR_URL_SCHEME_ERROR);
++    };
++    let scheme = scheme.to_ascii_lowercase();
++    if (scheme != "http" && scheme != "https") || rest.is_empty() || rest.starts_with('/') {
++        return Err(ASR_URL_SCHEME_ERROR);
++    }
++    let Some(host) = host_from_url(trimmed) else {
++        return Err(ASR_URL_SCHEME_ERROR);
++    };
++    if scheme == "http" && !is_loopback_host(&host) {
++        return Err(ASR_URL_HTTPS_ERROR);
++    }
++    Ok(())
++}
++
++fn is_loopback_host(host: &str) -> bool {
++    matches!(host, "127.0.0.1" | "::1" | "localhost")
++}
++
+ fn host_from_url(url: &str) -> Option<String> {
+     let rest = url.split_once("://")?.1;
+     let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+@@ -74,8 +106,8 @@ pub enum AsrError {
+     Network(String),
+     #[error("request timed out")]
+     Timeout,
+-    #[error("Groq authorization failed")]
+-    Unauthorized,
++    #[error("ASR authorization failed ({0})")]
++    Unauthorized(String),
+     #[error("rate limited{0}")]
+     RateLimited(String),
+     #[error("server error: {0}")]
+@@ -319,7 +351,8 @@ async fn transcribe_at(
+     let limits = parse_rate_limits(response.headers());
+     let status = response.status();
+     if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+-        return Err(AsrError::Unauthorized);
++        let host = host_from_url(endpoint).unwrap_or_else(|| "unknown".into());
++        return Err(AsrError::Unauthorized(host));
+     }
+     if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+         return Err(AsrError::RateLimited(
+@@ -385,7 +418,7 @@ impl crate::queue::RetryError for AsrError {
+             Self::RateLimited(v) => crate::queue::RetryClass::RateLimited(parse_retry_after(v)),
+             Self::Network(_) | Self::Timeout => crate::queue::RetryClass::Network,
+             Self::Server(_) => crate::queue::RetryClass::Server,
+-            Self::Unauthorized => crate::queue::RetryClass::Unauthorized,
++            Self::Unauthorized(_) => crate::queue::RetryClass::Unauthorized,
+             Self::Other(_) | Self::EmptyResult => crate::queue::RetryClass::Other,
+         }
+     }
+@@ -463,9 +496,22 @@ mod tests {
+     async fn provider_auth_rate_limit_and_server_errors_are_classified() {
+         let unauthorized =
+             crate::test_http::spawn_response(401, "application/json", b"{}", &[]).await;
++        let unauthorized_error =
++            transcribe_at(&unauthorized, b"wav".to_vec(), "bad-key", None, None)
++                .await
++                .expect_err("401 must be unauthorized");
++        let unauthorized_message = unauthorized_error.to_string();
++        assert!(
++            unauthorized_message.starts_with("ASR authorization failed"),
++            "{unauthorized_message}"
++        );
++        assert!(
++            !unauthorized_message.contains("Groq"),
++            "{unauthorized_message}"
++        );
+         assert!(matches!(
+-            transcribe_at(&unauthorized, b"wav".to_vec(), "bad-key", None, None).await,
+-            Err(AsrError::Unauthorized)
++            unauthorized_error,
++            AsrError::Unauthorized(host) if host == "127.0.0.1"
+         ));
+ 
+         let limited = crate::test_http::spawn_response(
+@@ -573,6 +619,40 @@ mod tests {
+             transcription_host("http://127.0.0.1:8000/v1").as_deref(),
+             Some("127.0.0.1")
+         );
++        assert!(!asr_host_changed(
++            "",
++            "https://api.groq.com/openai/v1"
++        ));
++        assert!(asr_host_changed(
++            "https://api.groq.com/openai/v1",
++            "https://asr.example.com/v1"
++        ));
++        assert!(!asr_host_changed(
++            "http://127.0.0.1:8000/v1",
++            "http://127.0.0.1:9000/v1"
++        ));
++    }
++
++    #[test]
++    fn asr_base_url_requires_absolute_http_or_https_and_https_off_loopback() {
++        assert!(validate_asr_base_url("").is_ok());
++        assert!(validate_asr_base_url("   ").is_ok());
++        assert!(validate_asr_base_url("https://asr.example.com/v1").is_ok());
++        assert!(validate_asr_base_url("http://127.0.0.1:8000/v1").is_ok());
++        assert!(validate_asr_base_url("http://localhost:8000/v1").is_ok());
++        assert!(validate_asr_base_url("http://[::1]:8000/v1").is_ok());
++        assert_eq!(
++            validate_asr_base_url("asr.example.com/v1"),
++            Err("ASR 地址必须是 http:// 或 https:// 开头的完整 URL。")
++        );
++        assert_eq!(
++            validate_asr_base_url("ftp://asr.example.com/v1"),
++            Err("ASR 地址必须是 http:// 或 https:// 开头的完整 URL。")
++        );
++        assert_eq!(
++            validate_asr_base_url("http://asr.example.com/v1"),
++            Err("非本机地址必须使用 https://。")
++        );
+     }
+ 
+     #[tokio::test]
+diff --git a/src-tauri/src/dictionary_learn.rs b/src-tauri/src/dictionary_learn.rs
+index dd0d3f2..d3aa6a6 100644
+--- a/src-tauri/src/dictionary_learn.rs
++++ b/src-tauri/src/dictionary_learn.rs
+@@ -2,14 +2,15 @@
+ //!
+ //! History uses this for confirm-to-add suggestions. After a verified paste,
+ //! `observe_after_paste` watches only the same focused field for a short
+-//! window and silently appends an unambiguous single-token correction.
++//! window and silently appends an unambiguous single-token *correction*.
++//! Pure insertions (append-only typing) are never learned.
+ //! Never install a global key event tap.
+ 
+ use std::collections::HashSet;
+ use std::time::Duration;
+ 
+ use crate::{context, lock_recover, store, AppState};
+-use tauri::{Manager, State};
++use tauri::{Emitter, Manager, State};
+ 
+ const MAX_CANDIDATES: usize = 3;
+ const MAX_LENGTH_DELTA: usize = 12;
+@@ -29,6 +30,9 @@ pub fn single_token_candidates(before: &str, after: &str) -> Vec<String> {
+     }
+ 
+     let (before_span, after_span) = changed_spans(before, after);
++    if before_span.is_empty() {
++        return Vec::new();
++    }
+     let before_keys: HashSet<String> = extract_tokens(&before_span)
+         .into_iter()
+         .map(|token| token.key)
+@@ -255,7 +259,12 @@ async fn persist_learned_word_locked(app: &tauri::AppHandle, word: &str) {
+     };
+     if let Err(error) = store::save_settings(&dir, &snapshot) {
+         log::warn!("dictionary learn persist failed: {error}");
++        return;
+     }
++    let _ = app.emit(
++        "settings://changed",
++        store::SettingsView::from(&snapshot),
++    );
+ }
+ 
+ fn is_blocked(token: &str) -> bool {
+@@ -459,6 +468,19 @@ mod tests {
+         assert!(single_token_candidates("python", "Python").is_empty());
+     }
+ 
++    #[test]
++    fn pure_insertion_is_not_a_candidate() {
++        assert!(single_token_candidates("好的", "好的明天见").is_empty());
++        assert_eq!(
++            single_token_candidates("知呼", "知乎"),
++            vec!["知乎".to_string()]
++        );
++        assert_eq!(
++            single_token_candidates("OK 知呼", "OK 知乎"),
++            vec!["知乎".to_string()]
++        );
++    }
++
+     #[test]
+     fn observe_learns_zhihu_correction() {
+         let expected = test_target(42, false);
+@@ -473,6 +495,20 @@ mod tests {
+         assert_eq!(learned.as_deref(), Some("知乎"));
+     }
+ 
++    #[test]
++    fn observe_does_not_learn_pure_insertion_after_paste() {
++        let expected = test_target(42, false);
++        let learned = observe_with(
++            "好的",
++            &expected,
++            true,
++            vec![Some("好的明天见".into())],
++            vec![expected.clone()],
++            1,
++        );
++        assert!(learned.is_none());
++    }
++
+     #[test]
+     fn observe_diffs_post_insert_field_not_the_pasted_snippet() {
+         let expected = test_target(42, false);
+diff --git a/src-tauri/src/lib.rs b/src-tauri/src/lib.rs
+index b9ba481..eb20dbc 100644
+--- a/src-tauri/src/lib.rs
++++ b/src-tauri/src/lib.rs
+@@ -995,6 +995,17 @@ pub(crate) async fn start_claimed(
+             "A valid API key is required before dictation can start",
+         ));
+     }
++    if !asr::groq_key_fallback_allowed(&settings_snapshot.asr_base_url)
++        && settings_snapshot.asr_api_key.trim().is_empty()
++    {
++        let Some(failure_generation) = reset_starting(state, session_generation) else {
++            return Ok(());
++        };
++        return Err(StartError::new(
++            failure_generation,
++            "自定义 ASR 地址需要填写 ASR 密钥。",
++        ));
++    }
+     // Always refresh immediately before starting audio. A stale check is not
+     // enough here: the user may have switched apps within the freshness
+     // window.
+@@ -3588,11 +3599,17 @@ async fn apply_settings(
+     let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+     clamp_double_tap_activation(&mut settings);
+     settings.normalize();
+-    settings.validate().map_err(|error| error.to_string())?;
+     let prev = lock_recover(&state.settings).clone();
+-    if settings.asr_api_key.trim().is_empty() {
+-        settings.asr_api_key = prev.asr_api_key.clone();
+-    }
++    let incoming_asr_key = settings.asr_api_key.clone();
++    settings.asr_api_key = store::bind_asr_key_to_host(
++        &prev.asr_base_url,
++        &settings.asr_base_url,
++        &incoming_asr_key,
++        &prev.asr_api_key,
++    );
++    let asr_host_changed = crate::asr::asr_host_changed(&prev.asr_base_url, &settings.asr_base_url);
++    let asr_key_cleared = asr_host_changed && incoming_asr_key.trim().is_empty();
++    settings.validate().map_err(|error| error.to_string())?;
+     let needs_api_key_validation =
+         settings.onboarded && (!prev.onboarded || prev.api_key != settings.api_key);
+     if needs_api_key_validation {
+@@ -3661,6 +3678,10 @@ async fn apply_settings(
+         }
+         return Err(error.to_string());
+     }
++    if asr_key_cleared {
++        crate::keychain::set_asr_api_key("")
++            .map_err(|error| format!("failed to remove ASR API key securely: {error}"))?;
++    }
+     if prev.keep_history_days != settings.keep_history_days {
+         if let Err(error) = store::purge_history(&dir, settings.keep_history_days) {
+             log::warn!("history retention cleanup after settings change failed: {error}");
+@@ -3669,7 +3690,11 @@ async fn apply_settings(
+     let asr_provider_changed =
+         prev.asr_base_url != settings.asr_base_url || prev.asr_api_key != settings.asr_api_key;
+     let next_asr_base_url = settings.asr_base_url.clone();
++    let settings_view = store::SettingsView::from(&settings);
+     *lock_recover(&state.settings) = settings;
++    if asr_key_cleared {
++        let _ = app.emit("settings://changed", settings_view);
++    }
+     if asr_provider_changed {
+         rebuild_asr_provider(state, &next_asr_base_url);
+     }
+@@ -3752,13 +3777,25 @@ async fn update_settings_patch(
+         return Err(format!("unsupported settings field: {unknown}"));
+     }
+     let current = lock_recover(&state.settings).clone();
+-    let mut merged = serde_json::to_value(current).map_err(|error| error.to_string())?;
++    let mut merged = serde_json::to_value(&current).map_err(|error| error.to_string())?;
+     let merged_object = merged
+         .as_object_mut()
+         .ok_or_else(|| "settings serialization failed".to_owned())?;
+     for (key, value) in object {
+         merged_object.insert(key.clone(), value.clone());
+     }
++    if object.contains_key("asr_base_url") && !object.contains_key("asr_api_key") {
++        let next_url = merged_object
++            .get("asr_base_url")
++            .and_then(|value| value.as_str())
++            .unwrap_or("");
++        if crate::asr::asr_host_changed(&current.asr_base_url, next_url) {
++            merged_object.insert(
++                "asr_api_key".into(),
++                serde_json::Value::String(String::new()),
++            );
++        }
++    }
+     let settings = serde_json::from_value(merged).map_err(|error| error.to_string())?;
+     apply_settings(app, &state, settings).await
+ }
+diff --git a/src-tauri/src/modifier_hotkey.rs b/src-tauri/src/modifier_hotkey.rs
+index d5a292e..95120ce 100644
+--- a/src-tauri/src/modifier_hotkey.rs
++++ b/src-tauri/src/modifier_hotkey.rs
+@@ -1,4 +1,4 @@
+-use std::sync::atomic::{AtomicBool, Ordering};
++use std::sync::atomic::{AtomicU32, Ordering};
+ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+ use std::thread;
+ use std::time::{Duration, Instant};
+@@ -38,7 +38,24 @@ static APP_HANDLE: OnceLock<AppHandle> = OnceLock::new();
+ /// the event tap must ignore modifier events — our own synthetic keys would otherwise
+ /// be misread as a physical double-tap and re-enter the event system (which crashes
+ /// the main runloop with an uncaught NSException).
+-static PASTE_SUPPRESS: AtomicBool = AtomicBool::new(false);
++static PASTE_SUPPRESS: AtomicU32 = AtomicU32::new(0);
++
++pub struct PasteSuppressGuard {
++    _private: (),
++}
++
++impl PasteSuppressGuard {
++    pub fn new() -> Self {
++        set_paste_suppressed(true);
++        Self { _private: () }
++    }
++}
++
++impl Drop for PasteSuppressGuard {
++    fn drop(&mut self) {
++        set_paste_suppressed(false);
++    }
++}
+ 
+ fn lock_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+     mutex
+@@ -47,13 +64,33 @@ fn lock_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+ }
+ 
+ pub fn set_paste_suppressed(suppressed: bool) {
+-    PASTE_SUPPRESS.store(suppressed, Ordering::SeqCst);
+     if suppressed {
+-        reset_state();
++        let previous = PASTE_SUPPRESS.fetch_add(1, Ordering::SeqCst);
++        if previous == 0 {
++            reset_state();
++        }
++        return;
++    }
++    loop {
++        let current = PASTE_SUPPRESS.load(Ordering::SeqCst);
++        if current == 0 {
++            return;
++        }
++        if PASTE_SUPPRESS
++            .compare_exchange(current, current - 1, Ordering::SeqCst, Ordering::SeqCst)
++            .is_ok()
++        {
++            return;
++        }
+     }
+ }
+ 
+ pub fn is_paste_suppressed() -> bool {
++    PASTE_SUPPRESS.load(Ordering::SeqCst) > 0
++}
++
++#[cfg(test)]
++fn paste_suppress_depth() -> u32 {
+     PASTE_SUPPRESS.load(Ordering::SeqCst)
+ }
+ 
+@@ -361,4 +398,19 @@ mod tests {
+ 
+         assert_eq!(*lock_recover(&state), 7);
+     }
++
++    #[test]
++    fn nested_paste_suppress_keeps_the_outer_window() {
++        let baseline = paste_suppress_depth();
++        let outer = PasteSuppressGuard::new();
++        assert_eq!(paste_suppress_depth(), baseline + 1);
++        {
++            let inner = PasteSuppressGuard::new();
++            assert_eq!(paste_suppress_depth(), baseline + 2);
++            drop(inner);
++            assert_eq!(paste_suppress_depth(), baseline + 1);
++        }
++        drop(outer);
++        assert_eq!(paste_suppress_depth(), baseline);
++    }
+ }
+diff --git a/src-tauri/src/paste.rs b/src-tauri/src/paste.rs
+index 8446b45..c04e16e 100644
+--- a/src-tauri/src/paste.rs
++++ b/src-tauri/src/paste.rs
+@@ -233,7 +233,7 @@ pub fn capture_selected_text(
+         return Err(PasteError::Accessibility);
+     }
+     let previous = app.clipboard().read_text().ok();
+-    crate::modifier_hotkey::set_paste_suppressed(true);
++    let _suppress = crate::modifier_hotkey::PasteSuppressGuard::new();
+     let copy_result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+         simulate_copy()?;
+         thread::sleep(Duration::from_millis(80));
+@@ -247,7 +247,7 @@ pub fn capture_selected_text(
+         Ok(selected)
+     }))
+     .unwrap_or_else(|_| Err(PasteError::Input("selection capture panicked".into())));
+-    crate::modifier_hotkey::set_paste_suppressed(false);
++    drop(_suppress);
+ 
+     match previous {
+         Some(previous) => {
+@@ -336,16 +336,8 @@ fn run_paste_attempt(
+         return PasteAttempt::not_sent(PasteError::Cancelled);
+     }
+ 
+-    crate::modifier_hotkey::set_paste_suppressed(true);
+-    struct PasteSuppressionGuard;
+-    impl Drop for PasteSuppressionGuard {
+-        fn drop(&mut self) {
+-            crate::modifier_hotkey::set_paste_suppressed(false);
+-        }
+-    }
+-
+     let shortcut_attempted = std::sync::atomic::AtomicBool::new(false);
+-    let _suppression_guard = PasteSuppressionGuard;
++    let _suppression_guard = crate::modifier_hotkey::PasteSuppressGuard::new();
+     let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+         if cancellation.is_cancelled() {
+             return Err(PasteError::Cancelled);
+@@ -476,20 +468,20 @@ fn try_ax_insert_if_safe(
+     cancellation: &CancellationToken,
+     verify_target: impl Fn() -> Result<(), PasteError>,
+     text: &str,
+-) -> bool {
++) -> Option<String> {
+     if cancellation.is_cancelled() || verify_target().is_err() || text.is_empty() {
+-        return false;
++        return None;
+     }
+     try_ax_insert(text)
+ }
+ 
+ #[cfg(not(target_os = "macos"))]
+-fn try_ax_insert(_text: &str) -> bool {
+-    false
++fn try_ax_insert(_text: &str) -> Option<String> {
++    None
+ }
+ 
+ #[cfg(target_os = "macos")]
+-fn try_ax_insert(text: &str) -> bool {
++fn try_ax_insert(text: &str) -> Option<String> {
+     macos_ax::try_insert(text)
+ }
+ 
+@@ -539,24 +531,24 @@ mod macos_ax {
+         }
+     }
+ 
+-    pub(super) fn try_insert(text: &str) -> bool {
++    pub(super) fn try_insert(text: &str) -> Option<String> {
+         if !crate::permissions::accessibility_is_trusted() {
+-            return false;
++            return None;
+         }
+         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| try_insert_inner(text)))
+-            .unwrap_or(false)
++            .unwrap_or(None)
+     }
+ 
+-    fn try_insert_inner(text: &str) -> bool {
++    fn try_insert_inner(text: &str) -> Option<String> {
+         let system = AxElement(unsafe { AXUIElementCreateSystemWide() });
+         if system.0.is_null() {
+-            return false;
++            return None;
+         }
+         unsafe {
+             let _ = AXUIElementSetMessagingTimeout(system.0, 0.35);
+         }
+         let Some(focused) = copy_element_attr(&system, "AXFocusedUIElement") else {
+-            return false;
++            return None;
+         };
+         unsafe {
+             let _ = AXUIElementSetMessagingTimeout(focused.0, 0.35);
+@@ -579,22 +571,30 @@ mod macos_ax {
+             field_empty,
+         ) {
+             AxInsertDecision::AttemptSelectedText => {
+-                set_string_attr(&focused, "AXSelectedText", text)
++                if !set_string_attr(&focused, "AXSelectedText", text) {
++                    return None;
++                }
++                Some(copy_string_attr(&focused, "AXValue").unwrap_or_else(|| {
++                    let current = current_value.unwrap_or_default();
++                    selected_range
++                        .and_then(|(location, length)| utf16_splice(&current, location, length, text))
++                        .unwrap_or_else(|| text.to_string())
++                }))
+             }
+             AxInsertDecision::AttemptValueSplice => {
+                 let current = current_value.unwrap_or_default();
+                 let (location, length) = selected_range.unwrap_or((0, 0));
+                 let Some(next) = utf16_splice(&current, location, length, text) else {
+-                    return false;
++                    return None;
+                 };
+                 if !set_string_attr(&focused, "AXValue", &next) {
+-                    return false;
++                    return None;
+                 }
+                 let caret = location.saturating_add(text.encode_utf16().count() as i64);
+                 let _ = set_range_attr(&focused, "AXSelectedTextRange", caret, 0);
+-                true
++                Some(copy_string_attr(&focused, "AXValue").unwrap_or(next))
+             }
+-            _ => false,
++            _ => None,
+         }
+     }
+ 
+@@ -715,12 +715,11 @@ pub fn insert(
+     // AX success must not leave VoiceFlow text on the system clipboard, and AX
+     // must not be treated as a posted Cmd+V (no 3s undo). Unverified AX copies
+     // the text as the fail-closed manual fallback.
+-    if try_ax_insert_if_safe(&cancellation, &verify_target, text) {
+-        thread::sleep(Duration::from_millis(250));
++    if let Some(ax_value) = try_ax_insert_if_safe(&cancellation, &verify_target, text) {
+         let outcome = build_insert_outcome(
+             false,
+             value_before.as_deref(),
+-            crate::context::focused_input_value(),
++            Some(ax_value),
+             text,
+         );
+         if should_copy_clipboard_fallback(&outcome) {
+@@ -1062,6 +1061,16 @@ mod tests {
+         assert!(keyboard.verified);
+     }
+ 
++    #[test]
++    fn ax_path_verifies_against_the_returned_ax_value() {
++        let ax_read = Some("你好世界".into());
++        let outcome = build_insert_outcome(false, Some("你好"), ax_read.clone(), "世界");
++        assert!(!outcome.used_keyboard_paste);
++        assert!(outcome.verified);
++        assert_eq!(outcome.value_after, ax_read);
++        assert!(!should_copy_clipboard_fallback(&outcome));
++    }
++
+     #[test]
+     fn single_char_unknown_before_is_unverified_even_for_keyboard_paste() {
+         let outcome = build_insert_outcome(true, None, Some("x".into()), "x");
+@@ -1155,13 +1164,38 @@ mod tests {
+     fn ax_insert_is_skipped_when_cancelled_or_target_changed() {
+         let cancellation = CancellationToken::new();
+         cancellation.cancel();
+-        assert!(!try_ax_insert_if_safe(&cancellation, || Ok(()), "hello"));
++        assert!(try_ax_insert_if_safe(&cancellation, || Ok(()), "hello").is_none());
+ 
+         let cancellation = CancellationToken::new();
+-        assert!(!try_ax_insert_if_safe(
++        assert!(try_ax_insert_if_safe(
+             &cancellation,
+             || Err(PasteError::TargetChanged),
+             "hello"
+-        ));
++        )
++        .is_none());
++    }
++
++    #[test]
++    fn nested_selection_capture_does_not_clear_outer_paste_suppress() {
++        use crate::modifier_hotkey::{is_paste_suppressed, PasteSuppressGuard};
++        let cancellation = CancellationToken::new();
++        let mut saw_suppressed_cmd_v = false;
++        let attempt = run_paste_attempt(
++            &cancellation,
++            || {
++                let _inner = PasteSuppressGuard::new();
++                assert!(is_paste_suppressed());
++                Ok(())
++            },
++            || {
++                saw_suppressed_cmd_v = is_paste_suppressed();
++                Ok(())
++            },
++        );
++        assert!(attempt.result.is_ok());
++        assert!(
++            saw_suppressed_cmd_v,
++            "Cmd+V must stay suppressed after nested capture"
++        );
+     }
+ }
+diff --git a/src-tauri/src/store.rs b/src-tauri/src/store.rs
+index 7110883..30118e1 100644
+--- a/src-tauri/src/store.rs
++++ b/src-tauri/src/store.rs
+@@ -397,6 +397,13 @@ impl Settings {
+         if self.asr_base_url.len() > 2_048 {
+             anyhow::bail!("ASR base URL is too long");
+         }
++        crate::asr::validate_asr_base_url(&self.asr_base_url)
++            .map_err(|error| anyhow::anyhow!(error))?;
++        if !crate::asr::groq_key_fallback_allowed(&self.asr_base_url)
++            && self.asr_api_key.trim().is_empty()
++        {
++            anyhow::bail!("自定义 ASR 地址需要填写 ASR 密钥。");
++        }
+         for mapping in &self.context_mappings {
+             mapping.validate().map_err(|error| anyhow::anyhow!(error))?;
+         }
+@@ -445,6 +452,22 @@ impl Settings {
+     }
+ }
+ 
++pub(crate) fn bind_asr_key_to_host(
++    previous_url: &str,
++    next_url: &str,
++    incoming_key: &str,
++    previous_key: &str,
++) -> String {
++    if !incoming_key.trim().is_empty() {
++        return incoming_key.to_string();
++    }
++    if crate::asr::asr_host_changed(previous_url, next_url) {
++        String::new()
++    } else {
++        previous_key.to_string()
++    }
++}
++
+ /// Settings exposed to the webview. The backend keeps the real credential in
+ /// memory/keychain, while the UI only receives whether one is configured and a
+ /// non-sensitive hint for display.
+@@ -2197,7 +2220,11 @@ mod tests {
+                 .mode()
+                 & 0o777;
+             assert_eq!(mode, 0o600);
+-            let dir_mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
++            let dir_mode = std::fs::metadata(dir.join("spool/session"))
++                .unwrap()
++                .permissions()
++                .mode()
++                & 0o777;
+             assert_eq!(dir_mode, 0o700);
+         }
+         let _ = std::fs::remove_dir_all(dir);
+@@ -2605,6 +2632,98 @@ mod tests {
+         assert!(!json.contains("gsk_fallback"));
+     }
+ 
++    #[test]
++    fn asr_base_url_validate_rejects_bad_scheme_plaintext_and_keyless_custom() {
++        assert!(Settings::default().validate().is_ok());
++        let groq = Settings {
++            asr_base_url: "https://api.groq.com/openai/v1".into(),
++            ..Settings::default()
++        };
++        assert!(groq.validate().is_ok());
++        let loopback_with_key = Settings {
++            asr_api_key: "local-key".into(),
++            asr_base_url: "http://127.0.0.1:8000/v1".into(),
++            ..Settings::default()
++        };
++        assert!(loopback_with_key.validate().is_ok());
++        let relative = Settings {
++            asr_base_url: "asr.example.com/v1".into(),
++            asr_api_key: "k".into(),
++            ..Settings::default()
++        };
++        assert!(relative
++            .validate()
++            .unwrap_err()
++            .to_string()
++            .contains("http:// 或 https://"));
++        let plaintext = Settings {
++            asr_base_url: "http://asr.example.com/v1".into(),
++            asr_api_key: "k".into(),
++            ..Settings::default()
++        };
++        assert!(plaintext
++            .validate()
++            .unwrap_err()
++            .to_string()
++            .contains("https://"));
++        let custom_without_key = Settings {
++            asr_base_url: "https://asr.example.com/v1".into(),
++            ..Settings::default()
++        };
++        assert_eq!(
++            custom_without_key.validate().unwrap_err().to_string(),
++            "自定义 ASR 地址需要填写 ASR 密钥。"
++        );
++        let loopback_without_key = Settings {
++            asr_base_url: "http://127.0.0.1:8000/v1".into(),
++            ..Settings::default()
++        };
++        assert_eq!(
++            loopback_without_key.validate().unwrap_err().to_string(),
++            "自定义 ASR 地址需要填写 ASR 密钥。"
++        );
++    }
++
++    #[test]
++    fn bind_asr_key_clears_on_host_change_unless_a_new_key_is_supplied() {
++        assert_eq!(
++            bind_asr_key_to_host(
++                "https://api.groq.com/openai/v1",
++                "https://asr.example.com/v1",
++                "",
++                "old-key"
++            ),
++            ""
++        );
++        assert_eq!(
++            bind_asr_key_to_host(
++                "https://api.groq.com/openai/v1",
++                "https://asr.example.com/v1",
++                "new-key",
++                "old-key"
++            ),
++            "new-key"
++        );
++        assert_eq!(
++            bind_asr_key_to_host(
++                "",
++                "https://api.groq.com/openai/v1",
++                "",
++                "old-key"
++            ),
++            "old-key"
++        );
++        assert_eq!(
++            bind_asr_key_to_host(
++                "https://asr.example.com/v1",
++                "https://asr.example.com/v1",
++                "",
++                "old-key"
++            ),
++            "old-key"
++        );
++    }
++
+     #[test]
+     fn save_settings_never_writes_plaintext_asr_key() {
+         let dir = temp_dir("asr-keyblank");
+diff --git a/src/App.test.tsx b/src/App.test.tsx
+index 51f493b..2d2556e 100644
+--- a/src/App.test.tsx
++++ b/src/App.test.tsx
+@@ -6,6 +6,11 @@ import App from "./App";
+ vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
+ const { listenMock } = vi.hoisted(() => ({ listenMock: vi.fn() }));
+ vi.mock("@tauri-apps/api/event", () => ({ emit: vi.fn(), listen: listenMock }));
++vi.mock("@tauri-apps/api/webview", () => ({
++  getCurrentWebview: () => ({
++    onDragDropEvent: () => Promise.resolve(() => undefined),
++  }),
++}));
+ 
+ const invokeMock = vi.mocked(invoke);
+ 
+@@ -181,6 +186,22 @@ describe("settings navigation", () => {
+     expect(screen.getByRole("textbox", { name: "VoiceFlow 生成结果" })).toHaveValue("整理后的文本");
+   });
+ 
++  it("refreshes dictionary when backend settings change", async () => {
++    let settingsHandler: ((event: { payload: typeof settings & { dictionary: string[] } }) => void) | undefined;
++    listenMock.mockImplementation((event: string, handler: (event: { payload: typeof settings & { dictionary: string[] } }) => void) => {
++      if (event === "settings://changed") settingsHandler = handler;
++      return Promise.resolve(vi.fn());
++    });
++
++    render(<App />);
++    fireEvent.click(await screen.findByRole("button", { name: "个人词典" }));
++    expect(await screen.findByText("还没有词条。添加后，VoiceFlow 会更准确地识别人名和专业术语。")).toBeInTheDocument();
++    await waitFor(() => expect(settingsHandler).toBeDefined());
++
++    settingsHandler?.({ payload: { ...settings, dictionary: ["知乎"] } as typeof settings & { dictionary: string[] } });
++    expect(await screen.findByText("知乎")).toBeInTheDocument();
++  });
++
+   it("lets the user choose activation mode and does not persist empty chunk values", async () => {
+     render(<App />);
+ 
+diff --git a/src/App.tsx b/src/App.tsx
+index 8a3528d..21793ee 100644
+--- a/src/App.tsx
++++ b/src/App.tsx
+@@ -130,6 +130,18 @@ export default function App() {
+     };
+   }, []);
+ 
++  useEffect(() => {
++    let active = true;
++    const subscription = listen<Settings>("settings://changed", (event) => {
++      if (!active) return;
++      setSettings((current) => (current ? { ...current, ...event.payload } : event.payload));
++    });
++    return () => {
++      active = false;
++      void subscription.then((unlisten) => unlisten()).catch(() => undefined);
++    };
++  }, []);
++
+   const refreshAudioInputDevice = useCallback(async (selectedDevice: string) => {
+     if (audioDeviceCheckInFlight.current) return;
+     audioDeviceCheckInFlight.current = true;
+@@ -358,10 +370,12 @@ export default function App() {
+     setSettings(next);
+     setSaveError(null);
+   };
+-  const saveAsrApiKey = async (apiKey: string) => {
++  const saveAsrApiKey = async (apiKey: string, asrBaseUrl?: string) => {
+     try {
+       await flushPendingSave();
+-      await invoke("update_settings_patch", { patch: { asr_api_key: apiKey.trim() } });
++      const patch: Record<string, string> = { asr_api_key: apiKey.trim() };
++      if (asrBaseUrl !== undefined) patch.asr_base_url = asrBaseUrl;
++      await invoke("update_settings_patch", { patch });
+       const next = await invoke<Settings>("get_settings");
+       setSettings(next);
+       setSaveError(null);
+diff --git a/src/components/DictionarySettings.test.tsx b/src/components/DictionarySettings.test.tsx
+index 067d88e..63196fb 100644
+--- a/src/components/DictionarySettings.test.tsx
++++ b/src/components/DictionarySettings.test.tsx
+@@ -50,8 +50,12 @@ describe("DictionarySettings", () => {
+     const save = vi.fn();
+     render(<DictionarySettings settings={settings} save={save} />);
+ 
+-    const toggle = screen.getByRole("switch", { name: "从历史编辑学习词条" });
++    const toggle = screen.getByRole("switch", { name: "学习词条" });
+     expect(toggle).toHaveAttribute("aria-checked", "true");
++    expect(
++      screen.getByText(/粘贴后 3 秒内在同一输入框里改正错词/),
++    ).toBeInTheDocument();
++    expect(screen.getByText(/继续打字不会学习/)).toBeInTheDocument();
+ 
+     fireEvent.click(toggle);
+     expect(save).toHaveBeenCalledWith({ dictionary_learn_enabled: false });
+diff --git a/src/components/DictionarySettings.tsx b/src/components/DictionarySettings.tsx
+index 1a72fd4..7a0b2e8 100644
+--- a/src/components/DictionarySettings.tsx
++++ b/src/components/DictionarySettings.tsx
+@@ -153,8 +153,8 @@ export function DictionarySettings({ settings, save }: { settings: Settings; sav
+     <SettingsShell>
+       <SettingsPageHeader title={t("个人词典")} description={t("把人名、产品名和专业术语添加到这里，识别时会优先保留正确拼写。")} />
+       <SettingsGroup title={t("词典学习")}>
+-        <SettingsRow title={t("从历史编辑学习词条")} description={t("在历史里改正识别结果后，建议把新词加入个人词典，需确认后才会写入。关闭后不再显示这些建议。")}>
+-          <Toggle checked={settings.dictionary_learn_enabled !== false} onChange={(checked) => save({ dictionary_learn_enabled: checked })} label={t("从历史编辑学习词条")} />
++        <SettingsRow title={t("学习词条")} description={t("两种方式会写入个人词典：在历史里改正识别结果后确认添加；以及粘贴后 3 秒内在同一输入框里改正错词。继续打字不会学习。关闭后两种方式都停用。")}>
++          <Toggle checked={settings.dictionary_learn_enabled !== false} onChange={(checked) => save({ dictionary_learn_enabled: checked })} label={t("学习词条")} />
+         </SettingsRow>
+       </SettingsGroup>
+       <SettingsGroup title={t("添加词条")}>
+diff --git a/src/components/SelectedPreviewDialog.test.tsx b/src/components/SelectedPreviewDialog.test.tsx
+index d919955..cea0eb9 100644
+--- a/src/components/SelectedPreviewDialog.test.tsx
++++ b/src/components/SelectedPreviewDialog.test.tsx
+@@ -83,6 +83,7 @@ describe("SelectedPreviewDialog", () => {
+     expect(textarea).toHaveFocus();
+     fireEvent.change(textarea, { target: { value: "Edited twice" } });
+     expect(textarea).toHaveFocus();
++    expect(screen.getByRole("button", { name: "关闭" })).toBeInTheDocument();
+     fireEvent.click(screen.getByRole("button", { name: "取消" }));
+     await flushAnimationFrames(1);
+     expect(opener).toHaveFocus();
+diff --git a/src/components/SelectedPreviewDialog.tsx b/src/components/SelectedPreviewDialog.tsx
+index 991298d..9cb6206 100644
+--- a/src/components/SelectedPreviewDialog.tsx
++++ b/src/components/SelectedPreviewDialog.tsx
+@@ -63,7 +63,7 @@ export function SelectedPreviewDialog({
+           </div>
+           <button
+             type="button"
+-            aria-label={t("取消")}
++            aria-label={t("关闭")}
+             onClick={onCancel}
+             className={`rounded-lg p-1.5 text-tertiary transition-colors hover:bg-elevated hover:text-primary ${focusRingClass}`}
+           >
+diff --git a/src/components/settings/EngineSettings.test.tsx b/src/components/settings/EngineSettings.test.tsx
+index 856d8c1..4ff4bbb 100644
+--- a/src/components/settings/EngineSettings.test.tsx
++++ b/src/components/settings/EngineSettings.test.tsx
+@@ -59,6 +59,8 @@ describe("EngineSettings ASR BYOK", () => {
+ 
+     const url = screen.getByRole("textbox", { name: "ASR 兼容地址" });
+     fireEvent.change(url, { target: { value: "http://127.0.0.1:8000/v1" } });
++    expect(save).not.toHaveBeenCalled();
++    fireEvent.blur(url);
+     expect(save).toHaveBeenCalledWith({ asr_base_url: "http://127.0.0.1:8000/v1" });
+ 
+     rerender(
+@@ -74,6 +76,7 @@ describe("EngineSettings ASR BYOK", () => {
+     fireEvent.change(screen.getByRole("textbox", { name: "ASR 兼容地址" }), {
+       target: { value: "" },
+     });
++    fireEvent.blur(screen.getByRole("textbox", { name: "ASR 兼容地址" }));
+     expect(save).toHaveBeenCalledWith({ asr_base_url: "" });
+   });
+ 
+@@ -110,6 +113,6 @@ describe("EngineSettings ASR BYOK", () => {
+       target: { value: "sk-compat" },
+     });
+     fireEvent.click(screen.getByRole("button", { name: "保存 ASR 密钥" }));
+-    expect(saveAsrApiKey).toHaveBeenCalledWith("sk-compat");
++    expect(saveAsrApiKey).toHaveBeenCalledWith("sk-compat", "");
+   });
+ });
+diff --git a/src/components/settings/EngineSettings.tsx b/src/components/settings/EngineSettings.tsx
+index 888dfc5..d4f68a7 100644
+--- a/src/components/settings/EngineSettings.tsx
++++ b/src/components/settings/EngineSettings.tsx
+@@ -1,4 +1,4 @@
+-import { useState } from "react";
++import { useEffect, useState } from "react";
+ import { invoke } from "@tauri-apps/api/core";
+ import { KeyRound } from "lucide-react";
+ import { ConfirmDialog } from "../ConfirmDialog";
+@@ -36,7 +36,7 @@ export function EngineSettings({
+   save: SaveSettings;
+   saveApiKey: (apiKey: string) => Promise<void>;
+   removeApiKey: () => Promise<void>;
+-  saveAsrApiKey: (apiKey: string) => Promise<void>;
++  saveAsrApiKey: (apiKey: string, asrBaseUrl?: string) => Promise<void>;
+   removeAsrApiKey: () => Promise<void>;
+ }) {
+   const { t } = useI18n();
+@@ -50,8 +50,13 @@ export function EngineSettings({
+   const [asrKeySaveError, setAsrKeySaveError] = useState<string | null>(null);
+   const [removingAsrKey, setRemovingAsrKey] = useState(false);
+   const [confirmRemoveAsrKey, setConfirmRemoveAsrKey] = useState(false);
++  const [asrUrlDraft, setAsrUrlDraft] = useState(settings.asr_base_url ?? "");
+   const asrKeyConfigured = Boolean(settings.asr_api_key_configured);
+ 
++  useEffect(() => {
++    setAsrUrlDraft(settings.asr_base_url ?? "");
++  }, [settings.asr_base_url]);
++
+   const validate = async () => {
+     setValidating(true);
+     try {
+@@ -97,13 +102,22 @@ export function EngineSettings({
+     if (!asrKeyDraft.trim()) return;
+     setAsrKeySaveError(null);
+     try {
+-      await saveAsrApiKey(asrKeyDraft);
++      await saveAsrApiKey(asrKeyDraft, asrUrlDraft);
+       setAsrKeyDraft("");
+     } catch (reason) {
+       setAsrKeySaveError(friendlySettingsError(reason, t));
+     }
+   };
+ 
++  const commitAsrBaseUrl = () => {
++    if (asrUrlDraft === (settings.asr_base_url ?? "")) return;
++    if (asrKeyDraft.trim()) {
++      void commitAsrApiKey();
++      return;
++    }
++    save({ asr_base_url: asrUrlDraft });
++  };
++
+   const commitRemoveAsrApiKey = async () => {
+     setConfirmRemoveAsrKey(false);
+     setRemovingAsrKey(true);
+@@ -159,8 +173,14 @@ export function EngineSettings({
+           <input
+             id="settings-asr-base-url"
+             aria-label={t("ASR 兼容地址")}
+-            value={settings.asr_base_url ?? ""}
+-            onChange={(event) => save({ asr_base_url: event.target.value })}
++            value={asrUrlDraft}
++            onChange={(event) => setAsrUrlDraft(event.target.value)}
++            onBlur={commitAsrBaseUrl}
++            onKeyDown={(event) => {
++              if (event.key === "Enter") {
++                event.currentTarget.blur();
++              }
++            }}
+             placeholder="https://api.groq.com/openai/v1"
+             autoComplete="off"
+             spellCheck={false}
+diff --git a/src/lib/i18n.tsx b/src/lib/i18n.tsx
+index 43b34da..0956d87 100644
+--- a/src/lib/i18n.tsx
++++ b/src/lib/i18n.tsx
+@@ -205,6 +205,7 @@ const englishTranslations: Record<string, string> = {
+   "VoiceFlow 生成结果": "VoiceFlow result",
+   "语音指令": "Voice instruction",
+   "取消": "Cancel",
++  "关闭": "Close",
+   "只复制": "Copy only",
+   "替换原文": "Replace original",
+   "仅保存到历史": "Save to history only",
+@@ -435,7 +436,11 @@ const englishTranslations: Record<string, string> = {
+   "确认": "Confirm",
+   "词典学习": "Dictionary learning",
+   "从历史编辑学习词条": "Learn entries from history edits",
+-  "在历史里改正识别结果后，建议把新词加入个人词典，需确认后才会写入。关闭后不再显示这些建议。": "After you correct a history result, VoiceFlow can suggest new dictionary entries. They are added only after you confirm. Turn this off to hide those suggestions.",
++  "学习词条": "Learn dictionary entries",
++  "两种方式会写入个人词典：在历史里改正识别结果后确认添加；以及粘贴后 3 秒内在同一输入框里改正错词。继续打字不会学习。关闭后两种方式都停用。": "Entries are added in two ways: confirm a suggestion after you correct a history result, or a same-field correction within 3 seconds after paste. Continued typing is not learned. Turn this off to disable both.",
++  "ASR 地址必须是 http:// 或 https:// 开头的完整 URL。": "The ASR URL must be an absolute http:// or https:// address.",
++  "非本机地址必须使用 https://。": "Non-local ASR addresses must use https://.",
++  "自定义 ASR 地址需要填写 ASR 密钥。": "A custom ASR address requires an ASR API key.",
+   "确认后的 App 风格样例会发送给当前配置的 LLM 服务。": "Confirmed App style examples are sent to the currently configured LLM service.",
+   "语音识别失败，没有生成可用文字，可重试": "Speech recognition failed; no usable text was generated. Try again.",
+   "上次录音未完成，已保留音频，可重试": "The previous recording was incomplete; its audio was kept. Try again.",

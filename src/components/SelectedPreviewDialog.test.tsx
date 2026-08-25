@@ -83,6 +83,7 @@ describe("SelectedPreviewDialog", () => {
     expect(textarea).toHaveFocus();
     fireEvent.change(textarea, { target: { value: "Edited twice" } });
     expect(textarea).toHaveFocus();
+    expect(screen.getByRole("button", { name: "关闭" })).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "取消" }));
     await flushAnimationFrames(1);
     expect(opener).toHaveFocus();

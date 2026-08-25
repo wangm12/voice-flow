@@ -66,6 +66,15 @@ describe("ContextSettings", () => {
     expect(await screen.findByPlaceholderText("Paste a typical WeChat message")).toBeInTheDocument();
   });
 
+  it("exposes per-app cleanup effort and learning controls", async () => {
+    render(<ContextSettings />);
+
+    fireEvent.change(await screen.findByRole("combobox", { name: "选择 App" }), { target: { value: "com.todesktop.230313mzl4w4u92" } });
+    expect(screen.getByRole("combobox", { name: "整理力度" })).toHaveValue("auto");
+    expect(screen.getByRole("switch", { name: "这个 App 使用 AI 整理" })).toHaveAttribute("aria-checked", "true");
+    expect(screen.getByRole("switch", { name: "在这个 App 学习词条" })).toHaveAttribute("aria-checked", "true");
+  });
+
   it("lets users choose an app without exposing native identifiers", async () => {
     render(<ContextSettings />);
 
@@ -86,7 +95,7 @@ describe("ContextSettings", () => {
 
     const applicationSelect = await screen.findByRole("combobox", { name: "选择 App" });
     fireEvent.change(applicationSelect, { target: { value: "com.todesktop.230313mzl4w4u92" } });
-    fireEvent.change(screen.getByRole("combobox", { name: "应用映射写作模式" }), { target: { value: "prompt_or_code" } });
+    fireEvent.change(screen.getByRole("combobox", { name: "应用映射语气" }), { target: { value: "prompt_or_code" } });
     fireEvent.click(screen.getByRole("button", { name: "保存 App 设置" }));
 
     await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("save_context_mapping", {
@@ -99,6 +108,9 @@ describe("ContextSettings", () => {
         executable: null,
         browser_host: null,
         enabled: true,
+        cleanup_effort: null,
+        cleanup_enabled: true,
+        dictionary_learn_enabled: true,
       },
     }));
   });
@@ -110,7 +122,7 @@ describe("ContextSettings", () => {
     ]} />);
 
     fireEvent.change(await screen.findByRole("combobox", { name: "选择 App" }), { target: { value: "com.todesktop.230313mzl4w4u92" } });
-    fireEvent.change(screen.getByRole("combobox", { name: "应用映射写作模式" }), { target: { value: "custom.reply" } });
+    fireEvent.change(screen.getByRole("combobox", { name: "应用映射语气" }), { target: { value: "custom.reply" } });
     fireEvent.click(screen.getByRole("button", { name: "保存 App 设置" }));
 
     await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("save_context_mapping", {
@@ -125,19 +137,19 @@ describe("ContextSettings", () => {
     const onWritingModesChange = vi.fn();
     render(<ContextSettings onWritingModesChange={onWritingModesChange} />);
 
-    const prompt = await screen.findByRole("textbox", { name: "写作模式 Prompt" });
+    const prompt = await screen.findByRole("textbox", { name: "语气 Prompt" });
     fireEvent.change(prompt, { target: { value: "保留我的语气，只修正明显的语病。" } });
-    fireEvent.click(screen.getByRole("button", { name: "保存模式" }));
+    fireEvent.click(screen.getByRole("button", { name: "保存语气" }));
 
     expect(onWritingModesChange).toHaveBeenCalledWith(expect.arrayContaining([
       expect.objectContaining({ id: "general", prompt: "保留我的语气，只修正明显的语病。" }),
     ]));
 
-    fireEvent.change(screen.getByRole("combobox", { name: "编辑写作模式" }), { target: { value: "__add_custom_mode__" } });
+    fireEvent.change(screen.getByRole("combobox", { name: "编辑语气" }), { target: { value: "__add_custom_mode__" } });
     expect(onWritingModesChange).toHaveBeenCalledTimes(1);
-    fireEvent.click(screen.getByRole("button", { name: "保存模式" }));
+    fireEvent.click(screen.getByRole("button", { name: "保存语气" }));
     expect(onWritingModesChange).toHaveBeenLastCalledWith(expect.arrayContaining([
-      expect.objectContaining({ label: "自定义模式", builtin: false }),
+      expect.objectContaining({ label: "自定义语气", builtin: false }),
     ]));
   });
 
@@ -159,7 +171,7 @@ describe("ContextSettings", () => {
 
     fireEvent.change(await screen.findByRole("combobox", { name: "选择 App" }), { target: { value: "com.google.Chrome" } });
     fireEvent.change(screen.getByRole("combobox", { name: "应用映射网站" }), { target: { value: "mail.google.com" } });
-    fireEvent.change(screen.getByRole("combobox", { name: "应用映射写作模式" }), { target: { value: "email" } });
+    fireEvent.change(screen.getByRole("combobox", { name: "应用映射语气" }), { target: { value: "email" } });
     fireEvent.click(screen.getByRole("button", { name: "保存 App 设置" }));
 
     await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("save_context_mapping", {
@@ -172,6 +184,9 @@ describe("ContextSettings", () => {
         executable: null,
         browser_host: "mail.google.com",
         enabled: true,
+        cleanup_effort: null,
+        cleanup_enabled: true,
+        dictionary_learn_enabled: true,
       },
     }));
   });

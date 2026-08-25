@@ -157,8 +157,25 @@ describe("History", () => {
       />,
     );
 
-    expect(screen.getByRole("img", { name: "已尝试写入" })).toBeInTheDocument();
-    expect(screen.getByText("已尝试写入输入框，请确认目标内容")).toBeInTheDocument();
+    expect(screen.getByRole("img", { name: "已复制" })).toBeInTheDocument();
+    expect(screen.getByText("已复制，请按 ⌘V")).toBeInTheDocument();
+  });
+
+  it("translates unverified paste copy in English instead of mixing languages", () => {
+    render(
+      <I18nProvider initialLanguage="en">
+        <History
+          items={[{ ...item, status: "unverified", fallback_reason: "paste_unverified" }]}
+          reload={vi.fn()}
+          hasMore={false}
+          loading={false}
+          onLoadMore={vi.fn()}
+        />
+      </I18nProvider>,
+    );
+
+    expect(screen.getByText("Copied. Press ⌘V.")).toBeInTheDocument();
+    expect(screen.queryByText("已复制，请按 ⌘V")).not.toBeInTheDocument();
   });
 
   it("keeps loading older records available while searching", () => {
@@ -247,9 +264,12 @@ describe("History", () => {
     expect(screen.queryByText("还没有记录，按热键说一句吧")).not.toBeInTheDocument();
   });
 
+  const zhihuSuggestion = { pair_key: "知呼\u001e知乎", before_span: "知呼", after: "知乎" };
+  const pythonSuggestion = { pair_key: "配森\u001epython", before_span: "配森", after: "Python" };
+
   it("shows CJK dictionary candidates from Rust after saving an edit", async () => {
     invokeMock.mockImplementation(async (command) => {
-      if (command === "suggest_dictionary_entries") return ["知乎"];
+      if (command === "suggest_dictionary_entries") return [zhihuSuggestion];
       return undefined;
     });
     render(
@@ -269,13 +289,13 @@ describe("History", () => {
     await waitFor(() =>
       expect(invokeMock).toHaveBeenCalledWith("suggest_dictionary_entries", { before: "知呼", after: "知乎" }),
     );
-    expect(await screen.findByRole("button", { name: '确认 “知乎”' })).toBeInTheDocument();
+    expect(await screen.findByRole("button", { name: '确认 “知呼 → 知乎”' })).toBeInTheDocument();
   });
 
   it("confirms a dictionary candidate into settings and respects the 256 cap", async () => {
     const existing = Array.from({ length: 256 }, (_, index) => `word-${index}`);
     invokeMock.mockImplementation(async (command) => {
-      if (command === "suggest_dictionary_entries") return ["知乎"];
+      if (command === "suggest_dictionary_entries") return [zhihuSuggestion];
       if (command === "get_settings") return { dictionary: existing };
       return undefined;
     });
@@ -292,10 +312,43 @@ describe("History", () => {
     fireEvent.click(screen.getByRole("button", { name: "编辑这条历史记录" }));
     fireEvent.change(screen.getByRole("textbox", { name: "编辑整理结果" }), { target: { value: "知乎" } });
     fireEvent.click(screen.getByRole("button", { name: "保存历史版本" }));
-    fireEvent.click(await screen.findByRole("button", { name: '确认 “知乎”' }));
+    fireEvent.click(await screen.findByRole("button", { name: '确认 “知呼 → 知乎”' }));
 
     await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("get_settings"));
+    expect(invokeMock.mock.calls.some(([command]) => command === "promote_learn_pair")).toBe(false);
     expect(invokeMock.mock.calls.some(([command]) => command === "update_settings_patch")).toBe(false);
+    expect(await screen.findByRole("alert")).toHaveTextContent("词条无效或已达到上限。");
+  });
+
+  it("promotes a second before when the after is already in the dictionary", async () => {
+    invokeMock.mockImplementation(async (command) => {
+      if (command === "suggest_dictionary_entries") return [pythonSuggestion];
+      if (command === "get_settings") return { dictionary: ["Python"] };
+      return undefined;
+    });
+    render(
+      <History
+        items={[{ ...item, raw_text: "配森", final_text: "配森", context_profile_id: "chat.personal" }]}
+        reload={vi.fn()}
+        hasMore={false}
+        loading={false}
+        onLoadMore={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "编辑这条历史记录" }));
+    fireEvent.change(screen.getByRole("textbox", { name: "编辑整理结果" }), { target: { value: "Python" } });
+    fireEvent.click(screen.getByRole("button", { name: "保存历史版本" }));
+    fireEvent.click(await screen.findByRole("button", { name: '确认 “配森 → Python”' }));
+
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("promote_learn_pair", {
+        pairKey: pythonSuggestion.pair_key,
+        beforeSurface: "配森",
+        afterSurface: "Python",
+        historyId: item.id,
+      }),
+    );
   });
 
   it("hides dictionary suggestions when learning is disabled", async () => {
@@ -326,7 +379,7 @@ describe("History", () => {
 
   it("writes a confirmed candidate into the dictionary", async () => {
     invokeMock.mockImplementation(async (command) => {
-      if (command === "suggest_dictionary_entries") return ["Python"];
+      if (command === "suggest_dictionary_entries") return [pythonSuggestion];
       if (command === "get_settings") return { dictionary: ["VoiceFlow"] };
       return undefined;
     });
@@ -343,11 +396,14 @@ describe("History", () => {
     fireEvent.click(screen.getByRole("button", { name: "编辑这条历史记录" }));
     fireEvent.change(screen.getByRole("textbox", { name: "编辑整理结果" }), { target: { value: "Python" } });
     fireEvent.click(screen.getByRole("button", { name: "保存历史版本" }));
-    fireEvent.click(await screen.findByRole("button", { name: '确认 “Python”' }));
+    fireEvent.click(await screen.findByRole("button", { name: '确认 “配森 → Python”' }));
 
     await waitFor(() =>
-      expect(invokeMock).toHaveBeenCalledWith("update_settings_patch", {
-        patch: { dictionary: ["VoiceFlow", "Python"] },
+      expect(invokeMock).toHaveBeenCalledWith("promote_learn_pair", {
+        pairKey: pythonSuggestion.pair_key,
+        beforeSurface: "配森",
+        afterSurface: "Python",
+        historyId: item.id,
       }),
     );
   });

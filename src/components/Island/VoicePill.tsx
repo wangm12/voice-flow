@@ -4,7 +4,7 @@ import { Archive, ArrowUp, Check, CircleAlert, Clipboard, Clock3, Sparkles, Squa
 import { VoiceWaveform } from "./VoiceWaveform";
 import { IconButton } from "../IconButton";
 import { useI18n } from "../../lib/i18n";
-import { pillCaption, hasSelectedActionCaption, voicePillCaptionMaxWidthForPartial } from "./voicePillTokens";
+import { CONTEXT_LABEL_VISIBLE_MS, pillCaption, visibleContextLabel, voicePillCaptionMaxWidthForPartial, voicePillCaptionNeedsWide } from "./voicePillTokens";
 
 type DictationState = "idle" | "starting" | "recording" | "recording_limited" | "processing" | "rate_limited" | "done" | "unverified" | "copied" | "degraded" | "history" | "error";
 type ProcessingPhase = "finalizing_audio" | "asr" | "cleanup" | "delivery" | "waiting_retry" | "idle";
@@ -24,7 +24,7 @@ function stateAriaLabel(state: DictationState, t: (source: string) => string): s
     case "history":
       return t("已保存到历史");
     case "unverified":
-      return t("已尝试写入，请确认输入框内容");
+      return t("已复制，请按 ⌘V");
     case "degraded":
       return t("部分结果");
     case "error":
@@ -73,6 +73,20 @@ export const VoicePill = memo(function VoicePill({
   const showWaveform = visualState === "recording" || state === "recording_limited";
   const [undoBusy, setUndoBusy] = useState(false);
   const [retryRemaining, setRetryRemaining] = useState(retryAfterSecs);
+  const [contextShown, setContextShown] = useState<{ label: string; at: number } | null>(null);
+  const [contextNowMs, setContextNowMs] = useState(() => Date.now());
+  const nextContextLabel = contextLabel?.trim() || null;
+  if (nextContextLabel && contextShown?.label !== nextContextLabel) {
+    setContextShown({ label: nextContextLabel, at: Date.now() });
+    setContextNowMs(Date.now());
+  } else if (!nextContextLabel && contextShown != null) {
+    setContextShown(null);
+  }
+  const visibleContext = visibleContextLabel(
+    nextContextLabel,
+    contextShown?.at ?? null,
+    contextNowMs,
+  );
   useEffect(() => {
     setRetryRemaining(retryAfterSecs);
   }, [retryAfterSecs, state]);
@@ -83,6 +97,12 @@ export const VoicePill = memo(function VoicePill({
     }, 1_000);
     return () => window.clearInterval(timer);
   }, [state, retryAfterSecs]);
+  useEffect(() => {
+    if (contextShown == null) return;
+    const remaining = CONTEXT_LABEL_VISIBLE_MS - (Date.now() - contextShown.at);
+    const timer = window.setTimeout(() => setContextNowMs(Date.now()), Math.max(0, remaining));
+    return () => window.clearTimeout(timer);
+  }, [contextShown]);
   const canCancel = ["starting", "recording", "recording_limited", "processing", "rate_limited"].includes(state);
   const canStop = isStarting || state === "recording" || state === "recording_limited";
   const canCancelProcessing = state === "processing" || state === "rate_limited";
@@ -93,12 +113,13 @@ export const VoicePill = memo(function VoicePill({
     state,
     t,
     state === "rate_limited" ? retryRemaining : retryAfterSecs,
-    { fallbackReason, selectedActionState, chunkProgress, contextLabel, partialText },
+    { fallbackReason, selectedActionState, chunkProgress, contextLabel: visibleContext, partialText },
   );
   const showingPartial = Boolean(partialText?.trim())
     && ["recording", "recording_limited", "starting", "processing"].includes(state);
+  const wideCaption = voicePillCaptionNeedsWide(state, { fallbackReason, partialText });
   const stackHidden = state === "idle" && !caption;
-  const showStackExit = isTerminal && !(caption && hasSelectedActionCaption(selectedActionState));
+  const showStackExit = isTerminal && !caption;
   const stackClassName = [
     "voice-pill-stack",
     stackHidden ? "voice-pill-stack--hidden" : "",
@@ -198,7 +219,7 @@ export const VoicePill = memo(function VoicePill({
               className={`voice-pill__center-state${state === "unverified" ? " voice-pill__center-state--active" : ""}`}
               aria-hidden={state !== "unverified"}
             >
-              <Check className="voice-pill__caution-icon" size={14} strokeWidth={2.5} absoluteStrokeWidth aria-hidden="true" />
+              <CircleAlert className="voice-pill__caution-icon" size={14} strokeWidth={2.5} absoluteStrokeWidth aria-hidden="true" />
             </span>
             <span
               className={`voice-pill__center-state${state === "copied" ? " voice-pill__center-state--active" : ""}`}
@@ -250,8 +271,9 @@ export const VoicePill = memo(function VoicePill({
             "voice-pill-caption",
             `voice-pill-caption--${captionTone}`,
             showingPartial ? "voice-pill-caption--partial" : "",
+            wideCaption ? "voice-pill-caption--wide" : "",
           ].filter(Boolean).join(" ")}
-          style={showingPartial ? { maxWidth: voicePillCaptionMaxWidthForPartial(true) } : undefined}
+          style={wideCaption ? { maxWidth: voicePillCaptionMaxWidthForPartial(true) } : undefined}
         >
           <span className="voice-pill-caption__dot" aria-hidden="true" />
           <span className="voice-pill-caption__text">{caption}</span>

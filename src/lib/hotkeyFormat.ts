@@ -1,5 +1,8 @@
 import { formatForDisplay } from "@tanstack/react-hotkeys";
 
+export const DEFAULT_DICTATION_HOTKEY = "CmdOrControl+Alt+Space";
+export const DEFAULT_SELECTED_ACTION_HOTKEY = "CmdOrControl+Alt+Slash";
+
 const TAURI_PRIMARY = new Set(["CmdOrControl", "CommandOrControl", "CmdOrCtrl"]);
 const MODIFIER_ONLY = new Set([
   "CmdOrControl",
@@ -48,7 +51,7 @@ export function toTauriHotkey(tanstack: string): string {
   }
 
   const key = parts[parts.length - 1]!;
-  const tauriKey = key === "/" ? "Slash" : key;
+  const tauriKey = key === "/" ? "Slash" : key === "\\" ? "Backslash" : key;
   const modifiers = new Set<string>();
 
   for (const part of parts.slice(0, -1)) {
@@ -78,7 +81,7 @@ export function toTanStackHotkey(tauri: string): string {
   }
 
   const key = parts[parts.length - 1]!;
-  const displayKey = key === "Slash" ? "/" : key;
+  const displayKey = key === "Slash" ? "/" : key === "Backslash" ? "\\" : key;
   const modifiers: string[] = [];
 
   for (const part of parts.slice(0, -1)) {
@@ -126,6 +129,8 @@ export function hotkeyDisplayParts(tauriHotkey: string): string[] {
 
 function codeToKeyName(code: string): string | null {
   if (code === "Space") return "Space";
+  if (code === "Slash") return "Slash";
+  if (code === "Backslash") return "Backslash";
   if (code === "Enter" || code === "NumpadEnter") return "Enter";
   if (code === "Tab") return "Tab";
   if (code === "Backspace") return "Backspace";
@@ -139,6 +144,8 @@ function codeToKeyName(code: string): string | null {
 }
 
 function normalizeMainKey(event: KeyboardEvent): string {
+  if (event.code === "Slash") return "Slash";
+  if (event.code === "Backslash") return "Backslash";
   if (event.key === " " || event.code === "Space") return "Space";
 
   if (event.key === "Dead" || event.key === "Unidentified" || event.key.length === 0) {
@@ -161,7 +168,8 @@ export function sanitizeTauriHotkey(hotkey: string): string {
     .map((part, index) => {
       const trimmed = part.trim();
       if (trimmed === "Dead") return "Space";
-      if (index === parts.length - 1 && trimmed === "/") return "Slash";
+      if (index === parts.length - 1 && (trimmed === "/" || trimmed === "÷")) return "Slash";
+      if (index === parts.length - 1 && trimmed === "\\") return "Backslash";
       return trimmed;
     })
     .join("+");

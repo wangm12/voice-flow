@@ -14,9 +14,10 @@ type PasswordInputProps = {
   className?: string;
   valid?: boolean;
   monospace?: boolean;
+  plain?: boolean;
 };
 
-export function PasswordInput({ value, onChange, id, ariaLabel, placeholder, className = "", valid = false, monospace = false }: PasswordInputProps) {
+export function PasswordInput({ value, onChange, id, ariaLabel, placeholder, className = "", valid = false, monospace = false, plain = false }: PasswordInputProps) {
   const { t } = useI18n();
   const [visible, setVisible] = useState(false);
   const [focused, setFocused] = useState(false);
@@ -29,9 +30,12 @@ export function PasswordInput({ value, onChange, id, ariaLabel, placeholder, cla
         aria-label={accessibleName}
         value={value}
         onChange={(event) => onChange(event.target.value)}
-        onFocus={() => setFocused(true)}
+        onFocus={(event) => {
+          setFocused(true);
+          if (plain) event.currentTarget.select();
+        }}
         onBlur={() => setFocused(false)}
-        type={visible ? "text" : "password"}
+        type={plain || visible ? "text" : "password"}
         placeholder={placeholder}
         autoComplete="off"
         spellCheck={false}

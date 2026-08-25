@@ -36,6 +36,52 @@ describe("Onboarding", () => {
     listenMock.mockReset();
   });
 
+  it("shows a keychain error when the API key cannot be saved", async () => {
+    invokeMock.mockImplementation(async (command) => {
+      if (command === "check_permissions") {
+        return { microphone: true, microphone_status: "authorized", accessibility: false };
+      }
+      if (command === "validate_api_key") return "valid";
+      if (command === "update_settings_patch") {
+        throw new Error("credential_storage: failed to store API key securely: keychain write timed out");
+      }
+      return undefined;
+    });
+    render(<Onboarding settings={baseSettings} onFinish={vi.fn()} onSkipToSettings={vi.fn()} />);
+    fireEvent.click(screen.getByRole("button", { name: "继续" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "继续" })).toBeEnabled());
+    fireEvent.click(screen.getByRole("button", { name: "继续" }));
+    fireEvent.change(await screen.findByLabelText("Groq API Key"), { target: { value: "gsk_test" } });
+    fireEvent.click(screen.getByRole("button", { name: "验证 API Key" }));
+    await waitFor(() => expect(screen.getByText("访问密钥有效")).toBeInTheDocument());
+    fireEvent.click(screen.getByRole("button", { name: "继续" }));
+    await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent("无法保存到这台 Mac 的钥匙串"));
+    expect(screen.getByRole("heading", { name: "连接语音服务" })).toBeInTheDocument();
+  });
+
+  it("shows the engine validation error when leftover custom ASR blocks the save", async () => {
+    invokeMock.mockImplementation(async (command) => {
+      if (command === "check_permissions") {
+        return { microphone: true, microphone_status: "authorized", accessibility: false };
+      }
+      if (command === "validate_api_key") return "valid";
+      if (command === "update_settings_patch") {
+        throw new Error("自定义 ASR 地址需要填写 ASR 密钥。");
+      }
+      return undefined;
+    });
+    render(<Onboarding settings={baseSettings} onFinish={vi.fn()} onSkipToSettings={vi.fn()} />);
+    fireEvent.click(screen.getByRole("button", { name: "继续" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "继续" })).toBeEnabled());
+    fireEvent.click(screen.getByRole("button", { name: "继续" }));
+    fireEvent.change(await screen.findByLabelText("Groq API Key"), { target: { value: "gsk_test" } });
+    fireEvent.click(screen.getByRole("button", { name: "验证 API Key" }));
+    await waitFor(() => expect(screen.getByText("访问密钥有效")).toBeInTheDocument());
+    fireEvent.click(screen.getByRole("button", { name: "继续" }));
+    await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent("自定义 ASR 地址需要填写 ASR 密钥"));
+    expect(screen.getByRole("heading", { name: "连接语音服务" })).toBeInTheDocument();
+  });
+
   it("does not allow onboarding to finish without an API key", async () => {
     render(<Onboarding settings={baseSettings} onFinish={vi.fn()} onSkipToSettings={vi.fn()} />);
 
@@ -47,6 +93,37 @@ describe("Onboarding", () => {
     expect(await screen.findByRole("heading", { name: "连接语音服务" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "继续" })).toBeDisabled();
     expect(screen.queryByRole("button", { name: "开始使用" })).not.toBeInTheDocument();
+  });
+
+  it("uses the full main pane on the voice input trial", async () => {
+    invokeMock.mockImplementation(async (command) => {
+      if (command === "check_permissions") {
+        return { microphone: true, microphone_status: "authorized", accessibility: false };
+      }
+      if (command === "validate_configured_api_key") return "valid";
+      return undefined;
+    });
+    render(
+      <Onboarding
+        settings={{ ...baseSettings, api_key_configured: true }}
+        onFinish={vi.fn()}
+        onSkipToSettings={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "继续" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "继续" })).toBeEnabled());
+    fireEvent.click(screen.getByRole("button", { name: "继续" }));
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("validate_configured_api_key"));
+    await waitFor(() => expect(screen.getByRole("button", { name: "继续" })).toBeEnabled());
+    fireEvent.click(screen.getByRole("button", { name: "继续" }));
+    await screen.findByRole("heading", { name: "设置语音输入快捷键" });
+
+    const pane = screen.getByRole("heading", { name: "设置语音输入快捷键" }).closest(".overflow-y-auto");
+    expect(pane).toBeTruthy();
+    expect(pane?.className).not.toMatch(/max-w-\[480px\]/);
+    expect(pane?.className).toMatch(/max-w-none|max-w-3xl|max-w-\[7/);
+    expect(pane?.className).not.toMatch(/px-8/);
   });
 
   it("uses the settings skip callback without finishing onboarding", () => {

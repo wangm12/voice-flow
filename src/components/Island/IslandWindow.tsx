@@ -1,8 +1,11 @@
 import { useEffect, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { listen, type EventCallback, type UnlistenFn } from "@tauri-apps/api/event";
 import { VoicePill } from "./VoicePill";
 import { WAVEFORM_BAR_COUNT } from "./VoiceWaveform";
 import { useReducedMotionPreference } from "./springs";
+import { formatHudContextLabel } from "../../lib/hudContextLabel";
+import { useI18n } from "../../lib/i18n";
 
 type DictationState = "idle" | "starting" | "recording" | "recording_limited" | "processing" | "rate_limited" | "done" | "unverified" | "copied" | "degraded" | "history" | "error";
 type ProcessingPhase = "finalizing_audio" | "asr" | "cleanup" | "delivery" | "waiting_retry" | "idle";
@@ -12,6 +15,8 @@ type HudState = {
   phase: ProcessingPhase;
   retryAfterSecs: number | null;
   undoAvailable: boolean;
+  contextApp: string | null;
+  contextStyle: string | null;
   contextLabel: string | null;
   fallbackReason: string | null;
   waveformLevels: number[];
@@ -87,13 +92,19 @@ export function selectedActionStateForDictation(
   return current;
 }
 
+type LearnToast = { pair_key: string; before: string; after: string };
+
 export function IslandWindow() {
+  const { t } = useI18n();
+  const [learnToast, setLearnToast] = useState<LearnToast | null>(null);
   const [hud, setHud] = useState<HudState>({
     sessionGeneration: 0,
     state: "idle",
     phase: "idle",
     retryAfterSecs: null,
     undoAvailable: false,
+    contextApp: null,
+    contextStyle: null,
     contextLabel: null,
     fallbackReason: null,
     waveformLevels: emptyWaveform(),
@@ -145,6 +156,8 @@ export function IslandWindow() {
             phase,
             retryAfterSecs: event.payload.retry_after_secs ?? null,
             undoAvailable: event.payload.undo_available ?? false,
+            contextApp: next === "idle" ? null : event.payload.context_app ?? null,
+            contextStyle: next === "idle" ? null : event.payload.context_style ?? null,
             contextLabel: next === "idle" ? null : event.payload.context_label ?? null,
             fallbackReason: next === "idle" ? null : event.payload.fallback_reason ?? null,
             // Audio starts before the final recording state is committed. Keep
@@ -166,6 +179,8 @@ export function IslandWindow() {
             && current.phase === nextHud.phase
             && current.retryAfterSecs === nextHud.retryAfterSecs
             && current.undoAvailable === nextHud.undoAvailable
+            && current.contextApp === nextHud.contextApp
+            && current.contextStyle === nextHud.contextStyle
             && current.contextLabel === nextHud.contextLabel
             && current.fallbackReason === nextHud.fallbackReason
             && current.waveformLevels === nextHud.waveformLevels
@@ -277,6 +292,9 @@ export function IslandWindow() {
         selectedActionState: event.payload.state && event.payload.state !== "idle" ? event.payload.state : null,
       }));
     });
+    register<LearnToast>("learn_pairs://promoted", (event) => {
+      setLearnToast(event.payload);
+    });
 
     return () => {
       disposed = true;
@@ -285,11 +303,33 @@ export function IslandWindow() {
     };
   }, []);
 
+  const dismissLearnToast = () => {
+    setLearnToast(null);
+    void invoke("hide_island_if_idle");
+  };
+
   return (
     <div className="voice-pill-stage">
-      <VoicePill state={hud.state} phase={hud.phase} retryAfterSecs={hud.retryAfterSecs} undoAvailable={hud.undoAvailable} contextLabel={hud.contextLabel} fallbackReason={hud.fallbackReason} selectedActionState={hud.selectedActionState} waveformLevels={hud.waveformLevels} progress={hud.progress} chunkProgress={hud.completedChunks != null && hud.totalChunks != null ? { completed: hud.completedChunks, total: hud.totalChunks } : null} partialText={hud.partialText} reduced={reduced} />
+      <VoicePill state={hud.state} phase={hud.phase} retryAfterSecs={hud.retryAfterSecs} undoAvailable={hud.undoAvailable} contextLabel={formatHudContextLabel(hud.contextApp, hud.contextStyle, hud.contextLabel, t)} fallbackReason={hud.fallbackReason} selectedActionState={hud.selectedActionState} waveformLevels={hud.waveformLevels} progress={hud.progress} chunkProgress={hud.completedChunks != null && hud.totalChunks != null ? { completed: hud.completedChunks, total: hud.totalChunks } : null} partialText={hud.partialText} reduced={reduced} />
+      {learnToast && (
+        <div role="status" className="island-learn-toast">
+          <span className="island-learn-toast__text">{t("已学")} {learnToast.before}→{learnToast.after}</span>
+          <button
+            type="button"
+            className="island-learn-toast__action"
+            onClick={() => {
+              void Promise.resolve(invoke("undo_learn_pair", { pairKey: learnToast.pair_key }))
+                .catch(() => undefined)
+                .then(() => dismissLearnToast());
+            }}
+          >
+            {t("撤销")}
+          </button>
+          <button type="button" className="island-learn-toast__action" onClick={dismissLearnToast}>{t("关闭")}</button>
+        </div>
+      )}
     </div>
   );
 }
 
-type DictationStatePayload = { state: DictationState; session_generation?: number; phase?: ProcessingPhase; retry_after_secs?: number; completed_chunks?: number; total_chunks?: number; cleanup_status?: string | null; undo_available?: boolean; context_id?: string; context_label?: string; delivery_method?: string; fallback_reason?: string | null };
+type DictationStatePayload = { state: DictationState; session_generation?: number; phase?: ProcessingPhase; retry_after_secs?: number; completed_chunks?: number; total_chunks?: number; cleanup_status?: string | null; undo_available?: boolean; context_id?: string; context_app?: string | null; context_style?: string | null; context_label?: string; delivery_method?: string; fallback_reason?: string | null };

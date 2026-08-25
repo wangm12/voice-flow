@@ -26,6 +26,12 @@ export type HistoryItem = {
   revision_count?: number;
 };
 
+type DictionarySuggestion = {
+  pair_key: string;
+  before_span: string;
+  after: string;
+};
+
 type HistoryRevision = {
   revision_id: number;
   created_at: string;
@@ -144,7 +150,7 @@ function HistoryRow({ item, reload, windowed = false }: { item: HistoryItem; rel
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(item.final_text || item.raw_text);
   const [operation, setOperation] = useState("cleanup");
-  const [dictionaryCandidates, setDictionaryCandidates] = useState<string[]>([]);
+  const [dictionaryCandidates, setDictionaryCandidates] = useState<DictionarySuggestion[]>([]);
   const status = statusPresentation(item.status, t);
   const StatusIcon = status.icon;
   const reason = displayReason(item, t);
@@ -189,23 +195,34 @@ function HistoryRow({ item, reload, windowed = false }: { item: HistoryItem; rel
 
   const suggestDictionaryCandidates = async (before: string, after: string) => {
     try {
-      const candidates = await invoke<string[]>("suggest_dictionary_entries", { before, after });
+      const candidates = await invoke<DictionarySuggestion[]>("suggest_dictionary_entries", { before, after });
       setDictionaryCandidates(Array.isArray(candidates) ? candidates.slice(0, 3) : []);
     } catch {
       setDictionaryCandidates([]);
     }
   };
 
-  const confirmDictionaryCandidate = async (candidate: string) => {
+  const confirmDictionaryCandidate = async (candidate: DictionarySuggestion) => {
     setBusy(true);
     setError(null);
     try {
       const settings = await invoke<{ dictionary: string[] }>("get_settings");
-      const result = mergeDictionary(settings.dictionary ?? [], [candidate]);
-      if (result.added > 0) {
-        await invoke("update_settings_patch", { patch: { dictionary: result.words } });
+      const dictionary = settings.dictionary ?? [];
+      const alreadyPresent = dictionary.some((word) => word === candidate.after);
+      if (!alreadyPresent) {
+        const result = mergeDictionary(dictionary, [candidate.after]);
+        if (result.added === 0) {
+          setError(t("词条无效或已达到上限。"));
+          return;
+        }
       }
-      setDictionaryCandidates((current) => current.filter((value) => value !== candidate));
+      await invoke("promote_learn_pair", {
+        pairKey: candidate.pair_key,
+        beforeSurface: candidate.before_span,
+        afterSurface: candidate.after,
+        historyId: item.id,
+      });
+      setDictionaryCandidates((current) => current.filter((value) => value.pair_key !== candidate.pair_key));
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
     } finally {
@@ -228,7 +245,7 @@ function HistoryRow({ item, reload, windowed = false }: { item: HistoryItem; rel
         {showRaw && item.raw_text && <div className="mt-2 space-y-1 rounded-lg bg-elevated px-3 py-2 text-xs"><p className="text-tertiary">{t("清理前")}</p><p className="whitespace-pre-wrap text-secondary">{item.raw_text}</p><p className="pt-1 text-tertiary">{t("清理后")}</p><p className="text-tertiary">{t("当前版本")}</p><p className="whitespace-pre-wrap text-primary">{item.final_text || item.raw_text}</p></div>}
         {showRevisions && revisions && <RevisionList rawText={item.raw_text} revisions={revisions} t={t} />}
         {reason && <p className={`mt-1 text-xs ${status.detailClass}`}>{reason}</p>}
-        {dictionaryCandidates.length > 0 && !editing && <div className="mt-2 flex flex-wrap items-center gap-1.5 text-xs"><span className="text-tertiary">{t("可能的词典建议")}</span>{dictionaryCandidates.map((candidate) => <button key={candidate} type="button" className="rounded-md border border-border px-2 py-1 text-secondary hover:bg-elevated hover:text-primary" disabled={busy} onClick={() => void confirmDictionaryCandidate(candidate)}>{t("确认")} “{candidate}”</button>)}</div>}
+        {dictionaryCandidates.length > 0 && !editing && <div className="mt-2 flex flex-wrap items-center gap-1.5 text-xs"><span className="text-tertiary">{t("可能的词典建议")}</span>{dictionaryCandidates.map((candidate) => <button key={candidate.pair_key} type="button" className="rounded-md border border-border px-2 py-1 text-secondary hover:bg-elevated hover:text-primary" disabled={busy} onClick={() => void confirmDictionaryCandidate(candidate)}>{t("确认")} “{candidate.before_span} → {candidate.after}”</button>)}</div>}
       </div>
       <div className="flex shrink-0 items-center gap-1">
         {editing ? (
@@ -298,7 +315,7 @@ function statusPresentation(status: string, t: (source: string) => string) {
     return { label: t("已保留原文"), icon: TriangleAlert, surfaceClass: "bg-warning/10", iconClass: "text-warning", detailClass: "text-warning" };
   }
   if (status === "unverified") {
-    return { label: t("已尝试写入"), icon: TriangleAlert, surfaceClass: "bg-warning/10", iconClass: "text-warning", detailClass: "text-warning" };
+    return { label: t("已复制"), icon: TriangleAlert, surfaceClass: "bg-warning/10", iconClass: "text-warning", detailClass: "text-warning" };
   }
   if (status === "copied") {
     return { label: t("已复制"), icon: CheckCircle2, surfaceClass: "bg-success/10", iconClass: "text-success", detailClass: "text-secondary" };
@@ -319,7 +336,7 @@ function displayReason(item: HistoryItem, t: (source: string) => string): string
     return t("处理失败，请检查结果或重试");
   }
   if (item.status === "failed") return t("处理失败，没有生成可用文字，可重试");
-  if (item.status === "unverified") return t("已发送粘贴快捷键，但无法确认目标输入框是否接收，可检查后重试");
+  if (item.status === "unverified") return t("已复制，请按 ⌘V");
   if (item.status === "degraded" || item.degraded) return t("处理未完成，原始转录已保留，可重试");
   return null;
 }

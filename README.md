@@ -183,12 +183,141 @@ cargo clippy --all-targets --all-features -- -D warnings
 构建 macOS 安装包：
 
 ```bash
-make release
-# 或只构建 DMG
 make dmg
 ```
 
-公开分发还需要 Developer ID 签名、notarization 和相应的 CI secrets。具体清单见 [`docs/release-checklist.md`](docs/release-checklist.md)。
+产物写到 `.build/release/VoiceFlow.dmg`（不用仓库根目录的 `dist/`，那是 Vite 前端输出）。把 `VoiceFlow.app` 拖进 `/Applications`。
+
+签名、第一次打开被拦截、以及为什么以前每次更新都要在系统设置里移出再添加权限，见下面的 [签名与权限](#签名与权限)。
+
+## 签名与权限
+
+macOS 的 TCC（辅助功能等）绑的是**代码签名身份**，不是 bundle id，也不是「看起来还叫 VoiceFlow」。未签名或 ad-hoc（`codesign -s -`）的包按**这一份二进制的哈希**识别。一重新编译或换包，哈希就变了。系统设置里旧条目可能还是开着的，但已经对不上新 copy，只能移出再添加。
+
+这就是以前每次 update 都要重新授权的原因。
+
+### 这个仓库怎么做
+
+默认走**稳定自签证书**（不是 Apple Developer Program，也不是公证）。
+
+| 做法 | 结果 |
+|---|---|
+| 未签名 / ad-hoc | 绕过 Gatekeeper 后能跑。每次更新权限都会丢。 |
+| **稳定自签（本仓库默认）** | 每次 `make dmg`、以及导入同一张 `.p12` 的 GitHub Release，都是同一个身份。权限能保住。第一次打开仍要自己放行。 |
+| Apple Development | Xcode 免费证。只在**你这台 Mac**上稳。不能公证。除非导出去，否则不能当 GitHub Release 的身份。 |
+| Developer ID + 公证（`make notarize`） | 别人双击就能开，权限也能保住。需要每年 $99 的 Developer Program。 |
+
+不把 ad-hoc 当默认。它最多把「已损坏」变成「无法验证开发者」，**保不住** TCC。
+
+证书名称是 `VoiceFlow`，Team ID 是 `VOICEFLOW1`。designated requirement 变成这张叶子证书，之后用同一张证签的包会继承授权。
+
+**这不是公证。** 别人第一次打开仍会被 Gatekeeper 拦。自签解决不了双击即用。
+
+不要和别的 app 共用这张证。Mac Clippy 用的是另一套身份（`Mac Clippy` / `MCLIPPY001`）。
+
+### 生成一次证书
+
+```bash
+make signing-cert
+```
+
+macOS 可能会要登录钥匙串密码，以便信任这张证。私钥写在 gitignore 里：
+
+```text
+.build/signing/VoiceFlow.p12
+.build/signing/VoiceFlow.p12.base64
+.build/signing/password.txt
+```
+
+不要把这些文件提交进仓库。如果钥匙串里已经有 `VoiceFlow`，脚本会直接退出，不会再做一张新的。
+
+`make dmg` 发现没有这张身份时也会走同一条创建路径，所以第一次打 DMG 也可以顺便建证。
+
+### 构建并安装签过名的 DMG
+
+```bash
+make dmg
+```
+
+未设置 `APPLE_SIGNING_IDENTITY` 时的选择顺序：
+
+1. `VoiceFlow` 自签（保证本地包和 GitHub Release 是同一个身份）
+2. Developer ID Application
+3. Apple Development
+
+可用 `APPLE_SIGNING_IDENTITY` / `APPLE_TEAM_ID` 覆盖。`make release` 默认打 `app,dmg`；`make dmg` 只打 DMG。
+
+只保留一份：把权限授给 `/Applications/VoiceFlow.app`。`npm run tauri dev` 仍是未签名。日常用 dev 覆盖运行，权限还是会丢。
+
+### 第一次打开（Gatekeeper）
+
+浏览器或 GitHub 下来的包会带 `com.apple.quarantine`。没有公证时，系统可能说无法验证开发者；若完全未签名，还可能说「已损坏」。
+
+1. 系统设置 → 隐私与安全性 → 仍要打开
+2. 或只清这一个 app 的隔离属性：
+
+```bash
+xattr -dr com.apple.quarantine /Applications/VoiceFlow.app
+```
+
+不要关全机 Gatekeeper。
+
+### 从旧的未签名 copy 迁过来
+
+如果辅助功能开关是开的，但签过名的新包仍说没权限，那是旧的哈希条目还在。清一次再授：
+
+```bash
+tccutil reset Accessibility com.voiceflow.desktop
+```
+
+用 `VoiceFlow` 这张证签出来的 DMG 覆盖 `/Applications/VoiceFlow.app`，打开后再授权。之后同一张证的更新应能保住。
+
+### GitHub Release
+
+推送 `v*` tag（或在 **Actions → macOS Release** 手动跑）会构建并上传 `.build/release/VoiceFlow.dmg`。
+
+要让别人更新时权限还在，Actions 必须用**同一张**证：
+
+```bash
+make signing-cert
+gh secret set MACOS_CERT_P12 < .build/signing/VoiceFlow.p12.base64
+gh secret set MACOS_CERT_PASSWORD --body "$(cat .build/signing/password.txt)"
+```
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+没有这两个 secrets 时，workflow 仍会发 DMG，但是未签名，每次下载更新都可能要重加辅助功能。
+
+CI **不会**在 runner 上现做一张新证。每次新证都会让所有人的 TCC 悄悄失效。
+
+### 可选：Developer ID + 公证
+
+别人双击、无警告，仍然需要付费账号：
+
+```bash
+APPLE_SIGNING_IDENTITY="Developer ID Application: Your Name" \
+APPLE_TEAM_ID="TEAM_ID" \
+make notarize
+```
+
+这会走 `scripts/release-macos.sh`（可再加 `VOICEFLOW_NOTARIZE=1` 以及 `APPLE_ID` / `APPLE_PASSWORD`）。和默认的自签 `make dmg` 是两条路。完整勾选见 [`docs/release-checklist.md`](docs/release-checklist.md)。
+
+### 相关脚本
+
+| 脚本 | 作用 |
+|---|---|
+| `scripts/make-signing-cert.sh` | 生成一次 `VoiceFlow` 身份并导出 `.p12` |
+| `scripts/select-codesign-identity.sh` | 优先自签，然后 Developer ID，然后 Apple Development |
+| `scripts/resolve-dmg-signing.sh` | 本地缺证就创建；打印 `APPLE_SIGNING_IDENTITY` 和 `APPLE_TEAM_ID` |
+| `scripts/import-signing-cert.sh` | Release runner 导入 `MACOS_CERT_P12` |
+| `scripts/stage-dmg.sh` | 把 Tauri 打出来的 DMG 拷到 `.build/release/VoiceFlow.dmg` |
+| `scripts/select-codesign-identity-test.sh` | 身份优先级的 fixture 测试 |
+| `scripts/release-macos.sh` | 可选的 Developer ID / 公证 |
+
+CI 的 macOS job 会跑身份选择测试。
 
 ## 项目结构
 
@@ -198,7 +327,7 @@ make dmg
 ├── src-tauri/src/       # 音频、ASR、LLM、权限、Keychain、历史记录
 ├── src-tauri/icons/     # 应用和菜单栏图标
 ├── public/              # 前端静态资源
-├── scripts/             # 发布脚本
+├── scripts/             # 自签、DMG 发布、可选公证
 ├── docs/                # 隐私、发布和技术说明
 ├── package.json         # 前端脚本和依赖
 └── src-tauri/Cargo.toml # Rust 依赖和 Tauri 配置
@@ -210,7 +339,7 @@ make dmg
 - Groq ASR 当前采用批量音频上传，不提供逐字实时转录。
 - 自动粘贴依赖 macOS Accessibility 权限；没有权限时仍可复制到剪贴板。
 - 浏览器上下文能力依赖用户明确授权。
-- 本项目处于早期版本，发布签名、notarization 和真实硬件验收需要在授权的 macOS 机器上完成。
+- 本项目处于早期版本。默认 DMG 使用稳定自签；Developer ID 公证仍是可选的公开分发路径。
 
 ## License
 

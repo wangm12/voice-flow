@@ -30,6 +30,10 @@ jobs:
         with:
           toolchain: stable
           components: rustfmt, clippy
+      - name: Signing identity selector tests
+        run: ./scripts/select-codesign-identity-test.sh
+      - name: VoiceFlow DMG mount listing tests
+        run: ./scripts/list-voiceflow-dmg-mounts-test.sh
       - run: cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
       - run: cargo test --manifest-path src-tauri/Cargo.toml
       - run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --all-features -- -D warnings

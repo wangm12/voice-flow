@@ -9,8 +9,13 @@ export type Settings = {
   asr_api_key_configured?: boolean;
   asr_api_key_hint?: string | null;
   asr_base_url?: string;
+  asr_provider?: "groq" | "custom";
   asr_model: string;
   cleanup_model: string;
+  cleanup_provider?: "groq" | "custom";
+  cleanup_base_url?: string;
+  cleanup_api_key_configured?: boolean;
+  cleanup_api_key_hint?: string | null;
   language: string;
   ui_language: UiLanguagePreference;
   theme: "system" | "light" | "dark";

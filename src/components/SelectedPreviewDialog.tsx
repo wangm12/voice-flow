@@ -63,7 +63,7 @@ export function SelectedPreviewDialog({
           </div>
           <button
             type="button"
-            aria-label={t("取消")}
+            aria-label={t("关闭")}
             onClick={onCancel}
             className={`rounded-lg p-1.5 text-tertiary transition-colors hover:bg-elevated hover:text-primary ${focusRingClass}`}
           >

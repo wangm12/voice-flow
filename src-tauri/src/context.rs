@@ -143,7 +143,7 @@ impl ContextPolicy {
             ContextFamily::ProjectManagement => {
                 policy.artifact_kind = "task_update".into();
                 policy.density = "concise".into();
-                policy.list_behavior = "use_only_when_explicit".into();
+                policy.list_behavior = "only_when_explicit".into();
             }
             ContextFamily::CalendarTask => {
                 policy.artifact_kind = "calendar_or_task_entry".into();
@@ -303,30 +303,103 @@ impl ContextSnapshot {
     }
 }
 
-pub fn display_label(snapshot: &ContextSnapshot) -> String {
-    if snapshot.profile.confidence < 0.75 {
-        return "未知 App · 通用".into();
-    }
-    let style = match snapshot.profile.family {
-        ContextFamily::PromptOrCode | ContextFamily::DeveloperCollaboration => "Code",
+const UNKNOWN_APP_LABEL: &str = "未知应用";
+
+pub fn display_style_label(family: ContextFamily) -> &'static str {
+    match family {
+        ContextFamily::PromptOrCode | ContextFamily::DeveloperCollaboration => "代码",
         ContextFamily::Email => "邮件",
-        ContextFamily::BrowserSearch => "Search",
+        ContextFamily::BrowserSearch => "搜索",
         ContextFamily::WorkChat => "工作短讯",
         ContextFamily::PersonalChat => "口语",
-        ContextFamily::Document => "Clear",
-        ContextFamily::Terminal => "Command",
-        ContextFamily::FormFilling => "Form",
-        ContextFamily::NotesJournaling => "Notes",
-        ContextFamily::SocialMedia => "Social",
-        ContextFamily::CustomerSupport => "Support",
-        ContextFamily::ProjectManagement => "Actionable",
-        ContextFamily::CalendarTask => "Planning",
-        _ => "General",
-    };
-    format!("{} · {style}", snapshot.profile.app_label)
+        ContextFamily::Document => "文档",
+        ContextFamily::Terminal => "命令",
+        ContextFamily::FormFilling => "表单",
+        ContextFamily::NotesJournaling => "笔记",
+        ContextFamily::SocialMedia => "社交",
+        ContextFamily::CustomerSupport => "客服",
+        ContextFamily::ProjectManagement => "待办",
+        ContextFamily::CalendarTask => "日程",
+        ContextFamily::General => "通用",
+    }
 }
 
-fn family_id(family: ContextFamily) -> &'static str {
+pub fn display_app_name(snapshot: &ContextSnapshot) -> Option<&str> {
+    let label = snapshot.profile.app_label.trim();
+    if !is_placeholder_app_label(label) && short_browser_name_for_label(label).is_none() {
+        return Some(label);
+    }
+    if let Some(name) =
+        short_browser_display_name(snapshot.target_guard.bundle_id.as_deref(), label)
+    {
+        return Some(name);
+    }
+    if is_placeholder_app_label(label) {
+        return None;
+    }
+    Some(label)
+}
+
+fn is_placeholder_app_label(label: &str) -> bool {
+    label.is_empty()
+        || label.eq_ignore_ascii_case("General")
+        || label.eq_ignore_ascii_case("Unknown App")
+        || label.eq_ignore_ascii_case("Browser")
+        || label == "未知 App"
+        || label == UNKNOWN_APP_LABEL
+}
+
+fn short_browser_display_name(bundle_id: Option<&str>, label: &str) -> Option<&'static str> {
+    short_browser_name_for_bundle(bundle_id).or_else(|| short_browser_name_for_label(label))
+}
+
+fn short_browser_name_for_bundle(bundle_id: Option<&str>) -> Option<&'static str> {
+    match bundle_id {
+        Some("com.google.Chrome") => Some("Chrome"),
+        Some("com.google.Chrome.canary") => Some("Chrome Canary"),
+        Some("com.apple.Safari") => Some("Safari"),
+        Some("company.thebrowser.Browser") => Some("Arc"),
+        Some("com.brave.Browser") => Some("Brave"),
+        Some("com.microsoft.edgemac") => Some("Edge"),
+        Some("org.mozilla.firefox") => Some("Firefox"),
+        Some("com.vivaldi.Vivaldi") => Some("Vivaldi"),
+        Some("com.operasoftware.Opera") => Some("Opera"),
+        Some("com.kagi.kagimacOS") => Some("Orion"),
+        _ => None,
+    }
+}
+
+fn short_browser_name_for_label(label: &str) -> Option<&'static str> {
+    match label {
+        "Google Chrome" => Some("Chrome"),
+        "Google Chrome Canary" => Some("Chrome Canary"),
+        "Brave Browser" => Some("Brave"),
+        "Microsoft Edge" => Some("Edge"),
+        _ => None,
+    }
+}
+
+pub fn hud_style_id(snapshot: &ContextSnapshot) -> &'static str {
+    if snapshot.profile.confidence < 0.75 {
+        "general"
+    } else {
+        family_id(snapshot.profile.family)
+    }
+}
+
+pub fn display_label(snapshot: &ContextSnapshot) -> String {
+    let style = if snapshot.profile.confidence < 0.75 {
+        "通用"
+    } else {
+        display_style_label(snapshot.profile.family)
+    };
+    match display_app_name(snapshot) {
+        Some(app) => format!("{app} · {style}"),
+        None => format!("{UNKNOWN_APP_LABEL} · {style}"),
+    }
+}
+
+pub fn family_id(family: ContextFamily) -> &'static str {
     match family {
         ContextFamily::Email => "email",
         ContextFamily::BrowserSearch => "browser_search",
@@ -385,11 +458,11 @@ pub fn default_writing_prompt(family: ContextFamily) -> &'static str {
     match family {
         ContextFamily::Email => "Write a natural, polite email body. Organize spoken greeting, request, timing, and closing only when they were spoken. Do not create a subject line or signature.",
         ContextFamily::BrowserSearch => "Prefer a concise search query or clear web-field value. Keep named entities, dates, numbers, and URLs exact. Do not add search background.",
-        ContextFamily::PersonalChat => "Keep the user's casual chat voice. Do not add greetings or sign-offs such as 您好, 你好, Hello, or Best. Do not expand fragments into full formal sentences. Do not sanitize swearing, slang, or particles like 哈哈. Prefer light punctuation. Never turn the message into an email.",
+        ContextFamily::PersonalChat => "Keep the user's casual chat voice. Do not add greetings or sign-offs such as 您好, 你好, Hello, or Best. Do not expand fragments into full formal sentences. Do not sanitize swearing, slang, or particles like 哈哈. Add a question mark for a clear question and a period or 。 for a clear sentence end. Do not strip existing periods. Never turn the message into an email.",
         ContextFamily::WorkChat => "Keep the message short and conversational for workplace chat. Do not add greetings, sign-offs, or email structure. Keep names and project terms exact. Do not add emoji unless spoken.",
         ContextFamily::ProjectManagement => "Keep owners, status, blockers, dates, and next actions explicit. Do not invent a person, deadline, or project fact.",
         ContextFamily::CalendarTask => "Keep dates, times, durations, reminders, attendees, locations, and next actions exact. Return a concise entry and do not invent scheduling details.",
-        ContextFamily::DeveloperCollaboration | ContextFamily::PromptOrCode => "Preserve code, identifiers, paths, commands, API names, versions, and error text exactly. Organize a spoken coding request without generating code unless it was spoken.",
+        ContextFamily::DeveloperCollaboration | ContextFamily::PromptOrCode => "Preserve code, identifiers, paths, commands, API names, versions, and error text exactly. Organize a spoken coding request without generating code unless it was spoken. Drop spoken false starts; do not treat 不对 as an instruction to execute.",
         ContextFamily::Terminal => "Treat command syntax as exact content. Preserve flags, paths, quoting, casing, variables, and punctuation. Never translate a command into prose.",
         ContextFamily::FormFilling => "Return only the concise value appropriate for the focused field. Preserve dates, amounts, addresses, names, and email addresses.",
         ContextFamily::NotesJournaling => "Keep the user's personal voice and structure. Improve readability lightly without summarizing or evaluating.",
@@ -574,6 +647,12 @@ pub struct AppMapping {
     pub style_example_output: Option<String>,
     #[serde(default = "default_true")]
     pub enabled: bool,
+    #[serde(default)]
+    pub cleanup_effort: Option<crate::llm::CleanupEffort>,
+    #[serde(default = "default_true")]
+    pub cleanup_enabled: bool,
+    #[serde(default = "default_true")]
+    pub dictionary_learn_enabled: bool,
 }
 
 /// A user-facing application choice. Native code generates the selector so the
@@ -1330,9 +1409,16 @@ pub fn target_matches(guard: &TargetAppGuard, current: &TargetAppGuard) -> bool 
     target_mismatch_reason(guard, current).is_none()
 }
 
-/// Return a safe, non-sensitive reason for rejecting delivery. Raw window
-/// titles, URLs, PIDs, and accessibility data never leave this module.
-pub fn target_mismatch_reason(
+/// Same-field observation after paste only needs app/window/input identity.
+/// Skip the browser URL probe — that is for writing policy, not learning.
+pub fn focus_mismatch_reason(
+    guard: &TargetAppGuard,
+    current: &TargetAppGuard,
+) -> Option<&'static str> {
+    target_mismatch_without_browser(guard, current)
+}
+
+fn target_mismatch_without_browser(
     guard: &TargetAppGuard,
     current: &TargetAppGuard,
 ) -> Option<&'static str> {
@@ -1349,28 +1435,38 @@ pub fn target_mismatch_reason(
     if guard.secure_input || current.secure_input {
         return Some("secure_input");
     }
-    // Window metadata is best-effort on macOS. Some apps do not expose a
-    // stable AX window title/bounds pair, and CGWindowList can temporarily
-    // omit a window while the app is changing spaces. A missing optional
-    // value must not disable paste; only two concrete, different identities
-    // prove that the user changed targets.
-    if guard.window_token.is_some()
-        && current.window_token.is_some()
-        && guard.window_token != current.window_token
-    {
-        return Some("target_changed");
-    }
     if guard.window_id.is_some()
         && current.window_id.is_some()
         && guard.window_id != current.window_id
     {
         return Some("target_changed");
     }
-    if guard.input_token.is_some()
-        && current.input_token.is_some()
-        && guard.input_token != current.input_token
-    {
-        return Some("input_changed");
+    None
+}
+
+/// Frontmost app/window/input tokens without the browser AppleScript query.
+pub fn probe_focus_guard() -> TargetAppGuard {
+    let signal = frontmost_signal(false);
+    TargetAppGuard {
+        pid: signal.pid,
+        bundle_id: signal.bundle_id,
+        browser_host: None,
+        browser_target_token: None,
+        window_token: signal.window_token,
+        window_id: signal.window_id,
+        input_token: signal.input_token,
+        secure_input: signal.focus_kind.is_secure(),
+    }
+}
+
+/// Return a safe, non-sensitive reason for rejecting delivery. Raw window
+/// titles, URLs, PIDs, and accessibility data never leave this module.
+pub fn target_mismatch_reason(
+    guard: &TargetAppGuard,
+    current: &TargetAppGuard,
+) -> Option<&'static str> {
+    if let Some(reason) = target_mismatch_without_browser(guard, current) {
+        return Some(reason);
     }
     // Browser URL/tab metadata is only needed for context-aware writing
     // policy. It is optional for delivery: without the separate browser
@@ -1715,6 +1811,63 @@ fn query_window_id(pid: i32, title: &str, position: &str, size: &str) -> Option<
         return Some(matching_bounds[0].id);
     }
     (candidates.len() == 1).then(|| candidates[0].id)
+}
+
+/// Look up the on-screen bounds for a recorded CoreGraphics window number so
+/// delivery can AXRaise that window instead of a different window of the same app.
+#[cfg(target_os = "macos")]
+pub fn window_bounds_for_id(pid: i32, window_id: u64) -> Option<(f64, f64, f64, f64)> {
+    use core_foundation::base::TCFType;
+    use core_foundation::string::CFString;
+    use core_graphics::window::{
+        copy_window_info, kCGNullWindowID, kCGWindowBounds, kCGWindowLayer,
+        kCGWindowListExcludeDesktopElements, kCGWindowListOptionOnScreenOnly, kCGWindowNumber,
+        kCGWindowOwnerPID,
+    };
+
+    if pid <= 0 || window_id == 0 {
+        return None;
+    }
+    let dictionaries = copy_window_info(
+        kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
+        kCGNullWindowID,
+    )?;
+    let owner_pid_key = unsafe { CFString::wrap_under_get_rule(kCGWindowOwnerPID) };
+    let window_number_key = unsafe { CFString::wrap_under_get_rule(kCGWindowNumber) };
+    let layer_key = unsafe { CFString::wrap_under_get_rule(kCGWindowLayer) };
+    let bounds_key = unsafe { CFString::wrap_under_get_rule(kCGWindowBounds) };
+    let x_key = CFString::from("X");
+    let y_key = CFString::from("Y");
+    let width_key = CFString::from("Width");
+    let height_key = CFString::from("Height");
+    for raw in dictionaries.get_all_values() {
+        if raw.is_null() {
+            continue;
+        }
+        let dictionary = unsafe { WindowDictionary::wrap_under_get_rule(raw as _) };
+        if cf_number(&dictionary, &owner_pid_key) != Some(pid as i64)
+            || cf_number(&dictionary, &layer_key).unwrap_or(0) != 0
+        {
+            continue;
+        }
+        if cf_number(&dictionary, &window_number_key).map(|id| id as u64) != Some(window_id) {
+            continue;
+        }
+        return window_bounds(
+            &dictionary,
+            &bounds_key,
+            &x_key,
+            &y_key,
+            &width_key,
+            &height_key,
+        );
+    }
+    None
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn window_bounds_for_id(_pid: i32, _window_id: u64) -> Option<(f64, f64, f64, f64)> {
+    None
 }
 
 fn focus_marker(value: &str, marker: &str) -> bool {
@@ -2242,14 +2395,28 @@ pub fn detect_snapshot_for_state_with_modes(
     browser_access_enabled: bool,
     writing_modes: &[WritingMode],
 ) -> ContextSnapshot {
-    let detected = detect_snapshot_with_modes(mappings, browser_access_enabled, writing_modes);
+    snapshot_for_enabled_state(
+        detect_snapshot_with_modes(mappings, browser_access_enabled, writing_modes),
+        enabled,
+        writing_modes,
+    )
+}
+
+fn snapshot_for_enabled_state(
+    detected: ContextSnapshot,
+    enabled: bool,
+    writing_modes: &[WritingMode],
+) -> ContextSnapshot {
     if enabled {
         return detected;
     }
-    let mut general = ContextSnapshot::general();
-    general.target_guard = detected.target_guard;
-    general.browser_access_status = detected.browser_access_status;
-    general
+    let mut snapshot = detected;
+    snapshot.policy = policy_for_mode(ContextFamily::General, Some("general"), writing_modes);
+    snapshot.profile.family = ContextFamily::General;
+    snapshot.profile.writing_mode_id = Some("general".into());
+    snapshot.profile.id = "general".into();
+    snapshot.profile.confidence = 0.4;
+    snapshot
 }
 
 #[cfg(test)]
@@ -2281,6 +2448,87 @@ mod tests {
         );
         assert_eq!(snapshot.profile.id, "code.cursor");
         assert!(snapshot.policy.preserve_technical_tokens);
+        assert_eq!(display_label(&snapshot), "Cursor · 代码");
+        assert_eq!(hud_style_id(&snapshot), "prompt_or_code");
+        assert_eq!(display_app_name(&snapshot), Some("Cursor"));
+    }
+
+    #[test]
+    fn display_label_keeps_a_known_app_when_confidence_is_low() {
+        let snapshot = snapshot_for_signal(
+            &signal("com.apple.Safari", "Safari", None),
+            &[],
+            false,
+        );
+        assert!(snapshot.profile.confidence < 0.75);
+        assert_eq!(display_label(&snapshot), "Safari · 通用");
+        assert_eq!(hud_style_id(&snapshot), "general");
+        assert_eq!(display_app_name(&snapshot), Some("Safari"));
+    }
+
+    #[test]
+    fn chrome_without_a_mapped_site_shows_chrome_not_unknown_app() {
+        let chrome = snapshot_for_signal(
+            &signal("com.google.Chrome", "Google Chrome", None),
+            &[],
+            false,
+        );
+        assert!(chrome.profile.confidence < 0.75);
+        assert_eq!(display_label(&chrome), "Chrome · 通用");
+        assert_eq!(display_app_name(&chrome), Some("Chrome"));
+
+        let canary = snapshot_for_signal(
+            &signal("com.google.Chrome.canary", "Google Chrome Canary", None),
+            &[],
+            false,
+        );
+        assert_eq!(display_label(&canary), "Chrome Canary · 通用");
+        assert_eq!(display_app_name(&canary), Some("Chrome Canary"));
+
+        let unknown_site = snapshot_for_signal(
+            &signal("com.google.Chrome", "Google Chrome", Some("example.com")),
+            &[],
+            true,
+        );
+        assert_eq!(unknown_site.profile.id, "browser.general");
+        assert_eq!(display_label(&unknown_site), "Chrome · 通用");
+
+        let mut placeholder = ContextSnapshot::general();
+        placeholder.target_guard.bundle_id = Some("com.google.Chrome".into());
+        assert_eq!(display_label(&placeholder), "Chrome · 通用");
+    }
+
+    #[test]
+    fn chrome_on_gmail_keeps_the_site_label() {
+        let gmail = snapshot_for_signal(
+            &signal("com.google.Chrome", "Google Chrome", Some("gmail.com")),
+            &[],
+            true,
+        );
+        assert_eq!(display_label(&gmail), "Gmail · 邮件");
+        assert_eq!(display_app_name(&gmail), Some("Gmail"));
+    }
+
+    #[test]
+    fn display_label_hides_placeholder_general_app_names() {
+        assert_eq!(display_label(&ContextSnapshot::general()), "未知应用 · 通用");
+        assert_eq!(display_app_name(&ContextSnapshot::general()), None);
+    }
+
+    #[test]
+    fn disabled_context_keeps_detected_app_with_general_style() {
+        let detected = snapshot_for_signal(
+            &signal("com.todesktop.230313mzl4w4u92", "Cursor", None),
+            &[],
+            false,
+        );
+        let snapshot = snapshot_for_enabled_state(detected, false, &builtin_writing_modes());
+        assert_eq!(snapshot.profile.app_label, "Cursor");
+        assert_eq!(snapshot.profile.family, ContextFamily::General);
+        assert!(snapshot.profile.confidence < 0.75);
+        assert!(!snapshot.policy.preserve_technical_tokens);
+        assert_eq!(display_label(&snapshot), "Cursor · 通用");
+        assert_eq!(hud_style_id(&snapshot), "general");
     }
 
     #[test]
@@ -2315,7 +2563,7 @@ mod tests {
         assert_ne!(personal, work);
         assert_eq!(
             personal,
-            "Keep the user's casual chat voice. Do not add greetings or sign-offs such as 您好, 你好, Hello, or Best. Do not expand fragments into full formal sentences. Do not sanitize swearing, slang, or particles like 哈哈. Prefer light punctuation. Never turn the message into an email."
+            "Keep the user's casual chat voice. Do not add greetings or sign-offs such as 您好, 你好, Hello, or Best. Do not expand fragments into full formal sentences. Do not sanitize swearing, slang, or particles like 哈哈. Add a question mark for a clear question and a period or 。 for a clear sentence end. Do not strip existing periods. Never turn the message into an email."
         );
         assert_eq!(
             work,
@@ -2324,6 +2572,10 @@ mod tests {
         assert_eq!(
             default_writing_prompt(ContextFamily::Email),
             "Write a natural, polite email body. Organize spoken greeting, request, timing, and closing only when they were spoken. Do not create a subject line or signature."
+        );
+        assert_eq!(
+            default_writing_prompt(ContextFamily::PromptOrCode),
+            "Preserve code, identifiers, paths, commands, API names, versions, and error text exactly. Organize a spoken coding request without generating code unless it was spoken. Drop spoken false starts; do not treat 不对 as an instruction to execute."
         );
     }
 
@@ -2352,6 +2604,15 @@ mod tests {
             .forbidden_additions
             .iter()
             .any(|item| item.contains("greetings")));
+
+        assert_eq!(
+            ContextPolicy::for_family(ContextFamily::ProjectManagement).list_behavior,
+            "only_when_explicit"
+        );
+        assert_eq!(
+            ContextPolicy::for_family(ContextFamily::Document).list_behavior,
+            "only_when_explicit"
+        );
     }
 
     #[test]
@@ -2453,7 +2714,7 @@ mod tests {
             true,
         );
         assert_eq!(todoist.profile.id, "task.todoist");
-        assert_eq!(display_label(&todoist), "Todoist · Planning");
+        assert_eq!(display_label(&todoist), "Todoist · 日程");
     }
 
     #[test]
@@ -2484,6 +2745,9 @@ mod tests {
             style_example_input: None,
             style_example_output: None,
             enabled: true,
+            cleanup_effort: None,
+            cleanup_enabled: true,
+            dictionary_learn_enabled: true,
         };
         let snapshot = snapshot_for_signal(
             &signal("com.todesktop.230313mzl4w4u92", "Cursor", None),
@@ -2514,6 +2778,9 @@ mod tests {
             style_example_input: None,
             style_example_output: None,
             enabled: true,
+            cleanup_effort: None,
+            cleanup_enabled: true,
+            dictionary_learn_enabled: true,
         };
         let snapshot = snapshot_for_signal_with_modes(
             &signal("com.todesktop.230313mzl4w4u92", "Cursor", None),
@@ -2577,6 +2844,9 @@ mod tests {
             style_example_input: None,
             style_example_output: None,
             enabled: true,
+            cleanup_effort: None,
+            cleanup_enabled: true,
+            dictionary_learn_enabled: true,
         };
         let snapshot = snapshot_for_signal(
             &signal("com.google.Chrome", "Google Chrome", Some("gmail.com")),
@@ -2733,10 +3003,11 @@ mod tests {
                 ..original.clone()
             }
         ));
-        assert!(!target_matches(
+        assert!(target_matches(
             &original,
             &TargetAppGuard {
                 window_token: Some(11),
+                input_token: Some(21),
                 ..original.clone()
             }
         ));
@@ -2753,13 +3024,6 @@ mod tests {
                 ..original.clone()
             },
             &original
-        ));
-        assert!(!target_matches(
-            &original,
-            &TargetAppGuard {
-                input_token: Some(21),
-                ..original.clone()
-            }
         ));
         assert_eq!(
             target_mismatch_reason(
@@ -2791,6 +3055,42 @@ mod tests {
             ),
             Some("secure_input")
         );
+    }
+
+    #[test]
+    fn delivery_guard_ignores_title_and_input_tokens() {
+        let original = TargetAppGuard {
+            pid: 1,
+            bundle_id: Some("com.todesktop.230313mzl4w4u92".into()),
+            browser_host: None,
+            browser_target_token: None,
+            window_token: Some(10),
+            window_id: Some(100),
+            input_token: Some(20),
+            secure_input: false,
+        };
+        assert!(target_matches(
+            &original,
+            &TargetAppGuard {
+                window_token: Some(11),
+                input_token: Some(21),
+                ..original.clone()
+            }
+        ));
+        assert!(!target_matches(
+            &original,
+            &TargetAppGuard {
+                window_id: Some(101),
+                ..original.clone()
+            }
+        ));
+        assert!(!target_matches(
+            &original,
+            &TargetAppGuard {
+                pid: 2,
+                ..original.clone()
+            }
+        ));
     }
 
     #[test]
@@ -2886,10 +3186,7 @@ mod tests {
             input_token: Some(21),
             ..browser.clone()
         };
-        assert_eq!(
-            target_mismatch_reason(&browser, &input_changed),
-            Some("input_changed")
-        );
+        assert_eq!(target_mismatch_reason(&browser, &input_changed), None);
     }
 
     #[test]

@@ -8,25 +8,47 @@ use thiserror::Error;
 
 pub const MODEL: &str = "whisper-large-v3-turbo";
 pub const DEFAULT_ASR_BASE_URL: &str = "https://api.groq.com/openai/v1";
+pub const GROQ_ASR_MODELS: &[&str] = &[
+    "whisper-large-v3-turbo",
+    "whisper-large-v3",
+    "distil-whisper-large-v3-en",
+];
+
+pub fn is_groq_asr_model(model: &str) -> bool {
+    GROQ_ASR_MODELS.contains(&model.trim())
+}
+
+/// Resolve an OpenAI-compatible path from a user-supplied base.
+/// Empty values use `default_base`. A value that already contains `marker`
+/// is used as-is (trailing slash stripped); a `/v1` base appends `/{suffix}`;
+/// otherwise `/{v1}/{suffix}` is appended.
+pub fn resolve_compat_url(base: &str, default_base: &str, marker: &str, suffix: &str) -> String {
+    let trimmed = base.trim().trim_end_matches('/');
+    let value = if trimmed.is_empty() {
+        default_base
+    } else {
+        trimmed
+    };
+    if value.contains(marker) {
+        value.to_owned()
+    } else if value.ends_with("/v1") {
+        format!("{value}/{suffix}")
+    } else {
+        format!("{value}/v1/{suffix}")
+    }
+}
 
 /// Resolve an OpenAI-compatible transcription URL from a user-supplied base.
 /// Empty values use Groq. A value that already contains `audio/transcriptions`
 /// is used as-is; a `/v1` base appends `/audio/transcriptions`; otherwise
 /// `/v1/audio/transcriptions` is appended.
 pub fn resolve_transcription_url(base: &str) -> String {
-    let trimmed = base.trim().trim_end_matches('/');
-    let value = if trimmed.is_empty() {
-        DEFAULT_ASR_BASE_URL
-    } else {
-        trimmed
-    };
-    if value.contains("audio/transcriptions") {
-        value.to_owned()
-    } else if value.ends_with("/v1") {
-        format!("{value}/audio/transcriptions")
-    } else {
-        format!("{value}/v1/audio/transcriptions")
-    }
+    resolve_compat_url(
+        base,
+        DEFAULT_ASR_BASE_URL,
+        "audio/transcriptions",
+        "audio/transcriptions",
+    )
 }
 
 /// Reuse the Groq chat key only for the Groq default or `api.groq.com`.
@@ -41,7 +63,39 @@ pub fn transcription_host(base_url: &str) -> Option<String> {
     host_from_url(&resolve_transcription_url(base_url))
 }
 
-fn host_from_url(url: &str) -> Option<String> {
+pub fn asr_host_changed(previous: &str, next: &str) -> bool {
+    transcription_host(previous) != transcription_host(next)
+}
+
+const ASR_URL_SCHEME_ERROR: &str = "ASR 地址必须是 http:// 或 https:// 开头的完整 URL。";
+const ASR_URL_HTTPS_ERROR: &str = "非本机地址必须使用 https://。";
+
+pub fn validate_asr_base_url(base_url: &str) -> Result<(), &'static str> {
+    let trimmed = base_url.trim();
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+    let Some((scheme, rest)) = trimmed.split_once("://") else {
+        return Err(ASR_URL_SCHEME_ERROR);
+    };
+    let scheme = scheme.to_ascii_lowercase();
+    if (scheme != "http" && scheme != "https") || rest.is_empty() || rest.starts_with('/') {
+        return Err(ASR_URL_SCHEME_ERROR);
+    }
+    let Some(host) = host_from_url(trimmed) else {
+        return Err(ASR_URL_SCHEME_ERROR);
+    };
+    if scheme == "http" && !is_loopback_host(&host) {
+        return Err(ASR_URL_HTTPS_ERROR);
+    }
+    Ok(())
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    matches!(host, "127.0.0.1" | "::1" | "localhost")
+}
+
+pub(crate) fn host_from_url(url: &str) -> Option<String> {
     let rest = url.split_once("://")?.1;
     let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
     let hostport = authority.rsplit_once('@').map(|(_, host)| host).unwrap_or(authority);
@@ -74,8 +128,8 @@ pub enum AsrError {
     Network(String),
     #[error("request timed out")]
     Timeout,
-    #[error("Groq authorization failed")]
-    Unauthorized,
+    #[error("ASR authorization failed ({0})")]
+    Unauthorized(String),
     #[error("rate limited{0}")]
     RateLimited(String),
     #[error("server error: {0}")]
@@ -86,11 +140,44 @@ pub enum AsrError {
     Other(String),
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct AsrOptions {
     pub api_key: String,
     pub language: Option<String>,
     pub prompt: Option<String>,
+    pub model: String,
+}
+
+impl Default for AsrOptions {
+    fn default() -> Self {
+        Self {
+            api_key: String::new(),
+            language: None,
+            prompt: None,
+            model: MODEL.to_owned(),
+        }
+    }
+}
+
+pub fn resolve_asr_model(model: &str) -> &str {
+    let trimmed = model.trim();
+    if trimmed.is_empty() {
+        MODEL
+    } else {
+        trimmed
+    }
+}
+
+const ENGLISH_ONLY_ASR_MODEL: &str = "distil-whisper-large-v3-en";
+
+/// Automatic / Chinese recognition must not use the English-only distil model.
+pub fn resolve_recognition_model<'a>(model: &'a str, language: Option<&str>) -> &'a str {
+    let resolved = resolve_asr_model(model);
+    if resolved == ENGLISH_ONLY_ASR_MODEL && normalize_language(language) != Some("en") {
+        MODEL
+    } else {
+        resolved
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -185,6 +272,7 @@ impl AsrProvider for GroqAsrProvider {
                 &options.api_key,
                 options.language.as_deref(),
                 options.prompt.as_deref(),
+                resolve_asr_model(&options.model),
             )
             .await
         })
@@ -278,9 +366,22 @@ pub async fn transcribe(
                 api_key: key.to_owned(),
                 language: language.map(str::to_owned),
                 prompt: prompt.map(str::to_owned),
+                model: MODEL.to_owned(),
             },
         )
         .await
+}
+
+pub(crate) async fn probe_transcription(
+    endpoint: &str,
+    wav: Vec<u8>,
+    key: &str,
+    model: &str,
+) -> Result<(), AsrError> {
+    match transcribe_at(endpoint, wav, key, None, None, model).await {
+        Ok(_) | Err(AsrError::EmptyResult) => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 async fn transcribe_at(
@@ -289,11 +390,12 @@ async fn transcribe_at(
     key: &str,
     language: Option<&str>,
     prompt: Option<&str>,
+    model: &str,
 ) -> Result<Transcript, AsrError> {
     let client = http_client()?;
     let mut form = Form::new()
         .part("file", Part::bytes(wav).file_name("audio.wav"))
-        .text("model", MODEL)
+        .text("model", resolve_asr_model(model).to_owned())
         .text("response_format", "verbose_json")
         .text("timestamp_granularities[]", "word")
         .text("timestamp_granularities[]", "segment");
@@ -319,7 +421,8 @@ async fn transcribe_at(
     let limits = parse_rate_limits(response.headers());
     let status = response.status();
     if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-        return Err(AsrError::Unauthorized);
+        let host = host_from_url(endpoint).unwrap_or_else(|| "unknown".into());
+        return Err(AsrError::Unauthorized(host));
     }
     if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
         return Err(AsrError::RateLimited(
@@ -385,7 +488,7 @@ impl crate::queue::RetryError for AsrError {
             Self::RateLimited(v) => crate::queue::RetryClass::RateLimited(parse_retry_after(v)),
             Self::Network(_) | Self::Timeout => crate::queue::RetryClass::Network,
             Self::Server(_) => crate::queue::RetryClass::Server,
-            Self::Unauthorized => crate::queue::RetryClass::Unauthorized,
+            Self::Unauthorized(_) => crate::queue::RetryClass::Unauthorized,
             Self::Other(_) | Self::EmptyResult => crate::queue::RetryClass::Other,
         }
     }
@@ -425,6 +528,50 @@ mod tests {
     }
 
     #[test]
+    fn resolve_asr_model_falls_back_to_whisper_turbo() {
+        assert_eq!(resolve_asr_model(""), MODEL);
+        assert_eq!(resolve_asr_model("   "), MODEL);
+        assert_eq!(resolve_asr_model("whisper-1"), "whisper-1");
+    }
+
+    #[test]
+    fn english_only_model_is_kept_only_when_recognition_is_pinned_english() {
+        assert_eq!(
+            resolve_recognition_model("distil-whisper-large-v3-en", Some("en")),
+            "distil-whisper-large-v3-en"
+        );
+        assert_eq!(
+            resolve_recognition_model("distil-whisper-large-v3-en", Some("auto")),
+            MODEL
+        );
+        assert_eq!(
+            resolve_recognition_model("distil-whisper-large-v3-en", Some("zh")),
+            MODEL
+        );
+        assert_eq!(
+            resolve_recognition_model("whisper-large-v3-turbo", Some("auto")),
+            "whisper-large-v3-turbo"
+        );
+    }
+
+    #[test]
+    fn transcription_url_never_uses_the_english_translation_endpoint() {
+        assert!(!resolve_transcription_url("").contains("translations"));
+        assert!(!resolve_transcription_url("https://api.groq.com/openai/v1").contains("translations"));
+        assert!(resolve_transcription_url("").contains("transcriptions"));
+    }
+
+    #[test]
+    fn groq_asr_allowlist_excludes_openai_whisper_one() {
+        assert!(is_groq_asr_model("whisper-large-v3-turbo"));
+        assert!(is_groq_asr_model(" whisper-large-v3 "));
+        assert!(is_groq_asr_model("distil-whisper-large-v3-en"));
+        assert!(!is_groq_asr_model("whisper-1"));
+        assert!(!is_groq_asr_model("my-local-whisper"));
+        assert!(!is_groq_asr_model(""));
+    }
+
+    #[test]
     fn auto_language_is_omitted() {
         assert_eq!(normalize_language(Some("auto")), None);
         assert_eq!(normalize_language(Some(" AUTO ")), None);
@@ -441,7 +588,7 @@ mod tests {
             &[],
         )
         .await;
-        let result = transcribe_at(&endpoint, b"wav".to_vec(), "test-key", Some("auto"), None)
+        let result = transcribe_at(&endpoint, b"wav".to_vec(), "test-key", Some("auto"), None, MODEL)
             .await
             .expect("ASR success");
         assert_eq!(result.text, "hello world");
@@ -454,7 +601,7 @@ mod tests {
         )
         .await;
         assert!(matches!(
-            transcribe_at(&empty, b"wav".to_vec(), "test-key", None, None).await,
+            transcribe_at(&empty, b"wav".to_vec(), "test-key", None, None, MODEL).await,
             Err(AsrError::EmptyResult)
         ));
     }
@@ -463,9 +610,22 @@ mod tests {
     async fn provider_auth_rate_limit_and_server_errors_are_classified() {
         let unauthorized =
             crate::test_http::spawn_response(401, "application/json", b"{}", &[]).await;
+        let unauthorized_error =
+            transcribe_at(&unauthorized, b"wav".to_vec(), "bad-key", None, None, MODEL)
+                .await
+                .expect_err("401 must be unauthorized");
+        let unauthorized_message = unauthorized_error.to_string();
+        assert!(
+            unauthorized_message.starts_with("ASR authorization failed"),
+            "{unauthorized_message}"
+        );
+        assert!(
+            !unauthorized_message.contains("Groq"),
+            "{unauthorized_message}"
+        );
         assert!(matches!(
-            transcribe_at(&unauthorized, b"wav".to_vec(), "bad-key", None, None).await,
-            Err(AsrError::Unauthorized)
+            unauthorized_error,
+            AsrError::Unauthorized(host) if host == "127.0.0.1"
         ));
 
         let limited = crate::test_http::spawn_response(
@@ -476,13 +636,13 @@ mod tests {
         )
         .await;
         assert!(matches!(
-            transcribe_at(&limited, b"wav".to_vec(), "test-key", None, None).await,
+            transcribe_at(&limited, b"wav".to_vec(), "test-key", None, None, MODEL).await,
             Err(AsrError::RateLimited(value)) if value == "2"
         ));
 
         let server = crate::test_http::spawn_response(500, "application/json", b"{}", &[]).await;
         assert!(matches!(
-            transcribe_at(&server, b"wav".to_vec(), "test-key", None, None).await,
+            transcribe_at(&server, b"wav".to_vec(), "test-key", None, None, MODEL).await,
             Err(AsrError::Server(_))
         ));
 
@@ -490,7 +650,7 @@ mod tests {
             crate::test_http::spawn_response(200, "application/json", b"not-json".to_vec(), &[])
                 .await;
         assert!(matches!(
-            transcribe_at(&invalid, b"wav".to_vec(), "test-key", None, None).await,
+            transcribe_at(&invalid, b"wav".to_vec(), "test-key", None, None, MODEL).await,
             Err(AsrError::Other(_))
         ));
 
@@ -501,6 +661,7 @@ mod tests {
                 "test-key",
                 None,
                 None,
+                MODEL,
             )
             .await,
             Err(AsrError::Network(_))
@@ -572,6 +733,40 @@ mod tests {
         assert_eq!(
             transcription_host("http://127.0.0.1:8000/v1").as_deref(),
             Some("127.0.0.1")
+        );
+        assert!(!asr_host_changed(
+            "",
+            "https://api.groq.com/openai/v1"
+        ));
+        assert!(asr_host_changed(
+            "https://api.groq.com/openai/v1",
+            "https://asr.example.com/v1"
+        ));
+        assert!(!asr_host_changed(
+            "http://127.0.0.1:8000/v1",
+            "http://127.0.0.1:9000/v1"
+        ));
+    }
+
+    #[test]
+    fn asr_base_url_requires_absolute_http_or_https_and_https_off_loopback() {
+        assert!(validate_asr_base_url("").is_ok());
+        assert!(validate_asr_base_url("   ").is_ok());
+        assert!(validate_asr_base_url("https://asr.example.com/v1").is_ok());
+        assert!(validate_asr_base_url("http://127.0.0.1:8000/v1").is_ok());
+        assert!(validate_asr_base_url("http://localhost:8000/v1").is_ok());
+        assert!(validate_asr_base_url("http://[::1]:8000/v1").is_ok());
+        assert_eq!(
+            validate_asr_base_url("asr.example.com/v1"),
+            Err("ASR 地址必须是 http:// 或 https:// 开头的完整 URL。")
+        );
+        assert_eq!(
+            validate_asr_base_url("ftp://asr.example.com/v1"),
+            Err("ASR 地址必须是 http:// 或 https:// 开头的完整 URL。")
+        );
+        assert_eq!(
+            validate_asr_base_url("http://asr.example.com/v1"),
+            Err("非本机地址必须使用 https://。")
         );
     }
 

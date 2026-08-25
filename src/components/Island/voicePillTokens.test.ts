@@ -1,8 +1,11 @@
 import { describe, expect, it } from "vitest";
 import {
+  CONTEXT_LABEL_VISIBLE_MS,
   pillCaption,
   selectedActionCaption,
+  visibleContextLabel,
   voicePillCaptionMaxWidthForPartial,
+  voicePillCaptionNeedsWide,
   voicePillWidthForState,
   voicePillWindowWidth,
   voicePillWindowWidthForPartial,
@@ -19,8 +22,8 @@ describe("voice pill state tokens", () => {
     expect(pillCaption("error")).toBe("语音输入失败，请重试");
   });
 
-  it("does not surface clipboard delivery as HUD copy", () => {
-    expect(pillCaption("copied")).toBeNull();
+  it("surfaces clipboard delivery so the user can read what happened", () => {
+    expect(pillCaption("copied")).toBe("已复制到剪贴板，请手动粘贴");
   });
 
   it("appends a retry countdown to the rate-limit caption", () => {
@@ -40,6 +43,14 @@ describe("voice pill state tokens", () => {
       pillCaption("recording", undefined, undefined, { selectedActionState: "listening" }),
     ).toBe("正在听取操作");
     expect(pillCaption("recording")).toBeNull();
+  });
+
+  it("keeps the template caption visible for a couple of seconds then dismisses it", () => {
+    expect(CONTEXT_LABEL_VISIBLE_MS).toBeGreaterThanOrEqual(2_000);
+    expect(CONTEXT_LABEL_VISIBLE_MS).toBeLessThanOrEqual(3_000);
+    expect(visibleContextLabel("Chrome · 通用", 1_000, 1_000 + 2_499)).toBe("Chrome · 通用");
+    expect(visibleContextLabel("Chrome · 通用", 1_000, 1_000 + CONTEXT_LABEL_VISIBLE_MS)).toBeNull();
+    expect(visibleContextLabel("Chrome · 通用", null, 1_000)).toBeNull();
   });
 
   it("surfaces the context label while recording, starting, or processing", () => {
@@ -87,6 +98,15 @@ describe("voice pill state tokens", () => {
     expect(voicePillCaptionMaxWidthForPartial(true)).toBeGreaterThanOrEqual(360);
     expect(voicePillCaptionMaxWidthForPartial(true)).toBeGreaterThan(164);
     expect(voicePillCaptionMaxWidthForPartial(false)).toBe(164);
+  });
+
+  it("widens the island caption for paste failures and other long status copy", () => {
+    expect(voicePillCaptionNeedsWide("copied", { fallbackReason: "paste_failed" })).toBe(true);
+    expect(voicePillCaptionNeedsWide("degraded", { fallbackReason: "target_changed" })).toBe(true);
+    expect(voicePillCaptionNeedsWide("error")).toBe(true);
+    expect(voicePillCaptionNeedsWide("copied")).toBe(true);
+    expect(voicePillCaptionNeedsWide("recording")).toBe(false);
+    expect(voicePillCaptionNeedsWide("recording", { partialText: "你好" })).toBe(true);
   });
 
   it("uses a wider island window while in-progress words are present", () => {
@@ -151,7 +171,7 @@ describe("voice pill state tokens", () => {
         fallbackReason: "selected_action_clipboard_fallback",
       }),
     ).toBe("目标变化，结果已复制");
-    expect(pillCaption("copied")).toBeNull();
+    expect(pillCaption("copied")).toBe("已复制到剪贴板，请手动粘贴");
   });
 
   it("surfaces replaced caption on done state", () => {

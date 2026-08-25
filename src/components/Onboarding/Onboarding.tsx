@@ -2,7 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { resolveCapturedActivationMode, type ActivationMode } from "../../lib/activationCopy";
-import { formatHotkeyDisplay } from "../../lib/hotkeyFormat";
+import { DEFAULT_DICTATION_HOTKEY, DEFAULT_SELECTED_ACTION_HOTKEY, formatHotkeyDisplay } from "../../lib/hotkeyFormat";
 import { EngineConfigStep } from "./EngineConfigStep";
 import { PermissionsStep } from "./PermissionsStep";
 import { OnboardingFooter } from "./OnboardingFooter";
@@ -12,6 +12,7 @@ import { FinishStep } from "./FinishStep";
 import { HotkeyStep } from "./HotkeyStep";
 import { AnimatedContent } from "../ReactBits/AnimatedContent";
 import { useI18n } from "../../lib/i18n";
+import { friendlySettingsError } from "../../lib/settingsError";
 
 type Permissions = { microphone: boolean; microphone_status: string; accessibility: boolean };
 type Settings = {
@@ -47,12 +48,12 @@ export function Onboarding({
   const [step, setStep] = useState(0);
   const [permissions, setPermissions] = useState<Permissions | null>(null);
   const [key, setKey] = useState("");
-  const [hotkey, setHotkey] = useState(String(settings.hotkey ?? "CmdOrControl+Shift+Space"));
+  const [hotkey, setHotkey] = useState(String(settings.hotkey ?? DEFAULT_DICTATION_HOTKEY));
   const [activationMode, setActivationMode] = useState<ActivationMode | string>(
     String(settings.activation_mode ?? "tap"),
   );
   const [selectedActionHotkey, setSelectedActionHotkey] = useState(
-    String(settings.selected_action_hotkey ?? "CmdOrControl+Shift+Slash").trim() || "CmdOrControl+Shift+Slash",
+    String(settings.selected_action_hotkey ?? DEFAULT_SELECTED_ACTION_HOTKEY).trim() || DEFAULT_SELECTED_ACTION_HOTKEY,
   );
   const [validating, setValidating] = useState(false);
   const [valid, setValid] = useState<string | null>(null);
@@ -249,7 +250,7 @@ export function Onboarding({
         try {
           await invoke("update_settings_patch", { patch: { api_key: key.trim() } });
         } catch (reason) {
-          setEngineError(t("访问密钥保存失败，请重试"));
+          setEngineError(friendlySettingsError(reason, t) || t("访问密钥保存失败，请重试"));
           return;
         }
       }
@@ -319,7 +320,7 @@ export function Onboarding({
     <main className="flex h-screen overflow-hidden bg-base text-primary">
       <OnboardingSidebar step={step} />
       <section className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
-        <div className={`mx-auto flex min-h-0 w-full flex-1 items-center overflow-y-auto px-8 py-8 ${step === 0 ? "max-w-[620px]" : "max-w-[480px]"}`}>
+        <div className={`mx-auto flex min-h-0 w-full flex-1 overflow-y-auto py-8 ${step === 0 ? "max-w-[620px] items-center px-8" : "max-w-none items-start px-6"}`}>
           <AnimatedContent key={step} className="w-full">
               {step === 0 && <WelcomeStep />}
               {step === 1 && (

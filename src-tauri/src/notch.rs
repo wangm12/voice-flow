@@ -9,6 +9,9 @@ pub const PILL_WIDTH_WITH_PARTIAL: f64 = 400.0;
 const PILL_HEIGHT: f64 = 60.0;
 /// Gap between pill bottom edge and top of dock / screen edge.
 const BOTTOM_GAP: f64 = 12.0;
+/// Used only when the reported work area is the full frame and does not
+/// subtract the Dock. Default macOS Dock + padding is about this tall.
+const MIN_DOCK_INSET: f64 = 70.0;
 
 pub fn pill_window_width(has_partial: bool) -> f64 {
     if has_partial {
@@ -184,20 +187,37 @@ fn placement_for_monitor_at_scale_with_width(
     )
 }
 
+fn work_area_above_dock(frame: ScreenRect, reported: ScreenRect, scale: f64) -> ScreenRect {
+    let frame_bottom = frame.y + frame.height;
+    let reported_bottom = reported.y + reported.height;
+    let bottom_inset = (frame_bottom - reported_bottom).max(0.0);
+    if bottom_inset > scale {
+        return reported;
+    }
+    let inset = MIN_DOCK_INSET * scale;
+    ScreenRect {
+        x: reported.x,
+        y: reported.y,
+        width: reported.width,
+        height: (reported.height - inset).max(0.0),
+    }
+}
+
 fn placement_for_monitor_rect(
     frame: ScreenRect,
     work_area: ScreenRect,
     scale: f64,
     pill_width: f64,
 ) -> IslandPlacement {
+    let work_area = work_area_above_dock(frame, work_area, scale);
     let width = pill_width * scale;
     let height = PILL_HEIGHT * scale;
     let raw_x = work_area.x + (work_area.width - width) / 2.0;
     let raw_y = work_area.y + work_area.height - height - BOTTOM_GAP * scale;
     let min_x = frame.x;
     let min_y = frame.y;
-    let max_x = (frame.x + frame.width - width).max(min_x);
-    let max_y = (frame.y + frame.height - height).max(min_y);
+    let max_x = (work_area.x + work_area.width - width).max(min_x);
+    let max_y = (work_area.y + work_area.height - height - BOTTOM_GAP * scale).max(min_y);
     IslandPlacement {
         x: raw_x.clamp(min_x, max_x),
         y: raw_y.clamp(min_y, max_y),
@@ -244,6 +264,22 @@ mod tests {
         assert_eq!(
             (p.x, p.y, p.width, p.height),
             (1340.0, 1708.0, 344.0, 120.0)
+        );
+    }
+
+    #[test]
+    fn keeps_pill_above_the_dock_when_work_area_matches_the_full_frame() {
+        let frame = ScreenRect {
+            x: 0.0,
+            y: 0.0,
+            width: 1440.0,
+            height: 900.0,
+        };
+        let p = placement_for_monitor_rect(frame, frame, 1.0, PILL_WIDTH);
+        let pill_bottom = p.y + p.height;
+        assert!(
+            900.0 - pill_bottom >= 70.0,
+            "pill bottom {pill_bottom} overlaps the dock"
         );
     }
 

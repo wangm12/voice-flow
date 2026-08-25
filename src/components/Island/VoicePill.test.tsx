@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
 import { I18nProvider } from "../../lib/i18n";
 import { VoicePill } from "./VoicePill";
+import { CONTEXT_LABEL_VISIBLE_MS } from "./voicePillTokens";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 
@@ -103,6 +104,52 @@ describe("VoicePill", () => {
     expect(document.querySelector(".voice-pill-caption")).toHaveTextContent("Chrome Canary · General");
   });
 
+  it("dismisses the template caption after a couple of seconds", () => {
+    vi.useFakeTimers();
+    render(
+      <VoicePill
+        state="recording"
+        contextLabel="Chrome · 通用"
+        selectedActionState={null}
+        waveformLevels={[]}
+        progress={0}
+        reduced
+      />,
+    );
+
+    expect(document.querySelector(".voice-pill-caption")).toHaveTextContent("Chrome · 通用");
+    act(() => {
+      vi.advanceTimersByTime(CONTEXT_LABEL_VISIBLE_MS - 1);
+    });
+    expect(document.querySelector(".voice-pill-caption")).toHaveTextContent("Chrome · 通用");
+    act(() => {
+      vi.advanceTimersByTime(1);
+    });
+    expect(document.querySelector(".voice-pill-caption")).not.toBeInTheDocument();
+  });
+
+  it("keeps in-progress words after the template caption dismisses", () => {
+    vi.useFakeTimers();
+    render(
+      <VoicePill
+        state="recording"
+        contextLabel="WeChat · 口语"
+        partialText="你好世界"
+        selectedActionState={null}
+        waveformLevels={[]}
+        progress={0}
+        reduced
+      />,
+    );
+
+    expect(document.querySelector(".voice-pill-caption")).toHaveTextContent("WeChat · 口语 · 你好世界");
+    act(() => {
+      vi.advanceTimersByTime(CONTEXT_LABEL_VISIBLE_MS);
+    });
+    expect(document.querySelector(".voice-pill-caption")).toHaveTextContent("你好世界");
+    expect(document.querySelector(".voice-pill-caption")?.textContent ?? "").not.toContain("WeChat · 口语");
+  });
+
   it("shows the context label while starting", () => {
     render(
       <VoicePill
@@ -129,8 +176,8 @@ describe("VoicePill", () => {
       />,
     );
 
-    expect(screen.getByRole("status")).toHaveAttribute("aria-label", "已尝试写入，请确认输入框内容");
-    expect(screen.queryByText("已尝试写入，请确认输入框内容")).not.toBeInTheDocument();
+    expect(screen.getByRole("status")).toHaveAttribute("aria-label", "已复制，请按 ⌘V");
+    expect(screen.queryByText("已复制，请按 ⌘V")).not.toBeInTheDocument();
     expect(document.querySelector(".voice-pill--unverified")).toBeInTheDocument();
     expect(document.querySelector(".voice-pill__center-state--active .voice-pill__caution-icon")).toBeInTheDocument();
     expect(document.querySelector(".voice-pill__center-state--active .voice-pill__status-icon")).not.toBeInTheDocument();
@@ -395,7 +442,9 @@ describe("VoicePill", () => {
       />,
     );
 
-    expect(document.querySelector(".voice-pill-caption")).toHaveTextContent("输入目标已变化");
+    expect(document.querySelector(".voice-pill-caption")).toHaveTextContent("输入目标已变化，文字已复制到剪贴板，请手动粘贴");
+    expect(document.querySelector(".voice-pill-caption")).toHaveClass("voice-pill-caption--wide");
+    expect(document.querySelector(".voice-pill-caption")).toHaveStyle({ maxWidth: "360px" });
     expect(screen.getByRole("status").getAttribute("aria-label") ?? "").toContain("输入目标已变化");
   });
 
@@ -431,7 +480,7 @@ describe("VoicePill", () => {
     expect(document.querySelector(".voice-pill-stack")).not.toHaveClass("voice-pill-stack--exit");
   });
 
-  it("still exits ordinary copied state without selected-action caption", () => {
+  it("keeps ordinary copied state readable instead of exiting immediately", () => {
     render(
       <VoicePill
         state="copied"
@@ -443,7 +492,9 @@ describe("VoicePill", () => {
       />,
     );
 
-    expect(document.querySelector(".voice-pill-caption")).not.toBeInTheDocument();
-    expect(document.querySelector(".voice-pill-stack")).toHaveClass("voice-pill-stack--exit");
+    expect(document.querySelector(".voice-pill-caption")).toHaveTextContent(
+      "已复制到剪贴板，请手动粘贴",
+    );
+    expect(document.querySelector(".voice-pill-stack")).not.toHaveClass("voice-pill-stack--exit");
   });
 });

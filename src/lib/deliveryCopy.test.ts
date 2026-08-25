@@ -8,6 +8,10 @@ describe("deliveryCopy", () => {
     );
   });
 
+  it("tells the user to press Cmd+V after an unverified insert", () => {
+    expect(deliveryReasonMessage("paste_unverified", (source) => source)).toBe("已复制，请按 ⌘V");
+  });
+
   it("maps selected-action clipboard fallback to friendly copy", () => {
     expect(deliveryReasonMessage("selected_action_clipboard_fallback", (source) => source)).toBe(
       "目标变化，结果已复制",

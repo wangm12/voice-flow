@@ -1099,8 +1099,17 @@ fn apply_input_gain(samples: &mut [f32], gain: f32) {
         return;
     }
     for sample in samples.iter_mut() {
-        *sample *= gain;
+        *sample = soft_limit_sample(*sample * gain);
     }
+}
+
+fn soft_limit_sample(sample: f32) -> f32 {
+    if sample.abs() <= 1.0 {
+        return sample;
+    }
+    let sign = sample.signum();
+    let over = sample.abs() - 1.0;
+    sign * (1.0 - (-2.0 * over).exp())
 }
 
 fn append_bounded(samples: &mut Vec<f32>, produced: &[f32], max_samples: usize) -> bool {
@@ -1157,6 +1166,14 @@ mod tests {
         assert_eq!(samples, vec![1.0, -0.5, 0.0]);
         apply_input_gain(&mut samples, 1.0);
         assert_eq!(samples, vec![1.0, -0.5, 0.0]);
+    }
+
+    #[test]
+    fn input_gain_soft_limits_samples_above_full_scale() {
+        let mut samples = vec![0.6, -0.8];
+        apply_input_gain(&mut samples, 4.0);
+        assert!(samples[0] > 0.9 && samples[0] <= 1.0, "{:?}", samples[0]);
+        assert!(samples[1] < -0.9 && samples[1] >= -1.0, "{:?}", samples[1]);
     }
 
     #[test]

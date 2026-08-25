@@ -46,15 +46,18 @@ const SERVICE: &str = "com.voiceflow.desktop.credentials.v3";
 // entries may carry an ACL that requires login-keychain authentication; the
 // non-interactive dev path intentionally skips those entries and must use a
 // fresh service instead.
-const FALLBACK_SERVICE: &str = "com.voiceflow.desktop.credentials.dev.v5";
+const FALLBACK_SERVICE: &str = "com.voiceflow.desktop.credentials.dev.v6";
+#[cfg(all(target_os = "macos", not(debug_assertions)))]
+const LOGIN_FALLBACK_SERVICE: &str = "com.voiceflow.desktop.credentials.login.v3";
 #[cfg(not(target_os = "macos"))]
 const PREVIOUS_SERVICE: &str = "com.voiceflow.desktop.credentials.v2";
 const ACCOUNT: &str = "groq_api_key";
 const ASR_ACCOUNT: &str = "asr_api_key";
+const CLEANUP_ACCOUNT: &str = "cleanup_api_key";
 #[cfg(all(target_os = "macos", not(debug_assertions)))]
 const API_SERVICE: &str = SERVICE;
 #[cfg(all(target_os = "macos", not(debug_assertions)))]
-const API_FALLBACK_SERVICE: &str = FALLBACK_SERVICE;
+const API_FALLBACK_SERVICE: &str = LOGIN_FALLBACK_SERVICE;
 #[cfg(all(target_os = "macos", debug_assertions))]
 const API_SERVICE: &str = FALLBACK_SERVICE;
 #[cfg(all(target_os = "macos", debug_assertions))]
@@ -212,7 +215,9 @@ fn set_fallback(service: &str, account: &str, key: &str) -> Result<(), SecurityE
     // item carries an ACL tied to the ad-hoc code signature, which changes on
     // every Cargo rebuild. The explicit accessibility class keeps the item
     // protected by the unlocked user keychain without that per-build ACL.
-    delete_fallback(service, account)?;
+    if let Err(error) = delete_fallback(service, account) {
+        log::warn!("could not replace login keychain item before write: {error}");
+    }
     let _interaction_lock = SecKeychain::disable_user_interaction()?;
     let mut options = PasswordOptions::new_generic_password(service, account);
     #[allow(deprecated)]
@@ -240,7 +245,7 @@ fn missing_entitlement(error: SecurityError) -> bool {
 /// credential store can block (e.g. authorization prompts, or when the process
 /// is launched outside a full GUI session), and we must never let that stall
 /// app startup. On timeout we return `None` / a soft error and continue.
-fn with_timeout<T, F>(op: F) -> Option<T>
+fn with_timeout_for<T, F>(timeout: std::time::Duration, op: F) -> Option<T>
 where
     T: Send + 'static,
     F: FnOnce() -> T + Send + 'static,
@@ -249,7 +254,23 @@ where
     std::thread::spawn(move || {
         let _ = tx.send(op());
     });
-    rx.recv_timeout(std::time::Duration::from_millis(800)).ok()
+    rx.recv_timeout(timeout).ok()
+}
+
+fn with_timeout<T, F>(op: F) -> Option<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    with_timeout_for(std::time::Duration::from_millis(800), op)
+}
+
+fn with_write_timeout<T, F>(op: F) -> Option<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    with_timeout_for(std::time::Duration::from_secs(5), op)
 }
 
 #[allow(clippy::needless_return)]
@@ -313,6 +334,10 @@ fn read_stored_asr_api_key() -> Result<Option<String>, String> {
     read_stored_secret(API_SERVICE, API_FALLBACK_SERVICE, ASR_ACCOUNT)
 }
 
+fn read_stored_cleanup_api_key() -> Result<Option<String>, String> {
+    read_stored_secret(API_SERVICE, API_FALLBACK_SERVICE, CLEANUP_ACCOUNT)
+}
+
 fn secret_state<F>(read: F) -> ApiKeyState
 where
     F: FnOnce() -> Result<Option<String>, String> + Send + 'static,
@@ -361,7 +386,7 @@ fn set_secret(
     let account = account.to_string();
     #[cfg(all(target_os = "macos", debug_assertions))]
     let _ = &service;
-    let result = with_timeout(move || -> Result<(), String> {
+    let result = with_write_timeout(move || -> Result<(), String> {
         #[cfg(target_os = "macos")]
         {
             if key.is_empty() {
@@ -474,6 +499,27 @@ pub fn get_asr_api_key() -> Option<String> {
 
 pub fn set_asr_api_key(key: &str) -> Result<(), String> {
     set_secret(API_SERVICE, API_FALLBACK_SERVICE, ASR_ACCOUNT, key)
+}
+
+pub fn get_cleanup_api_key_state() -> ApiKeyState {
+    secret_state(read_stored_cleanup_api_key)
+}
+
+pub fn set_cleanup_api_key(key: &str) -> Result<(), String> {
+    set_secret(API_SERVICE, API_FALLBACK_SERVICE, CLEANUP_ACCOUNT, key)
+}
+
+pub fn resolve_cleanup_api_key(plaintext: &str) -> ApiKeyState {
+    if !plaintext.is_empty() {
+        if keychain_disabled() {
+            return ApiKeyState::Configured(plaintext.to_owned());
+        }
+        return match set_cleanup_api_key(plaintext) {
+            Ok(()) => ApiKeyState::Configured(plaintext.to_owned()),
+            Err(error) => ApiKeyState::Unavailable(error),
+        };
+    }
+    get_cleanup_api_key_state()
 }
 
 pub fn resolve_asr_api_key(plaintext: &str) -> ApiKeyState {

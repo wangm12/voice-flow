@@ -9,18 +9,15 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: voiceflow-release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   release:
     runs-on: macos-14
+    timeout-minutes: 60
     env:
-      APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-      APPLE_ID: ${{ secrets.APPLE_ID }}
-      APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-      APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-      APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@v4
@@ -31,19 +28,30 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: stable
-          components: rustfmt, clippy
-      - name: Validate release secrets
-        run: |
-          test -n "${APPLE_SIGNING_IDENTITY}"
-          test -n "${APPLE_TEAM_ID}"
-          test -n "${APPLE_CERTIFICATE}"
-          test -n "${APPLE_CERTIFICATE_PASSWORD}"
-          test -n "${TAURI_SIGNING_PRIVATE_KEY}"
-          test -n "${TAURI_SIGNING_PRIVATE_KEY_PASSWORD}"
       - run: npm ci
-      - run: npm audit --registry=https://registry.npmjs.org --audit-level=high
-      - run: cargo install cargo-audit --locked
-      - run: cargo audit --manifest-path src-tauri/Cargo.toml
-      - run: bash scripts/release-macos.sh
+      - name: Import stable signing certificate
         env:
-          VOICEFLOW_NOTARIZE: "1"
+          MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+        run: ./scripts/import-signing-cert.sh
+      - name: Package Release DMG
+        run: make dmg
+      - name: Upload DMG artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: VoiceFlow.dmg
+          path: .build/release/VoiceFlow.dmg
+          if-no-files-found: error
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" .build/release/VoiceFlow.dmg --clobber
+          else
+            gh release create "$tag" .build/release/VoiceFlow.dmg \
+              --title "VoiceFlow ${tag#v}" \
+              --generate-notes \
+              --verify-tag
+          fi

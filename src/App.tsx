@@ -2,7 +2,7 @@ import "./App.css";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { emit, listen } from "@tauri-apps/api/event";
-import { AudioLines, BookMarked, ChevronDown, CloudCog, FileText, History as HistoryIcon, Languages, Monitor, Moon, PenLine, ShieldCheck, Sparkles, Sun } from "lucide-react";
+import { AudioLines, BookMarked, CloudCog, FileText, History as HistoryIcon, Monitor, PenLine, ShieldCheck, Sparkles } from "lucide-react";
 import { History, type HistoryItem } from "./components/History/History";
 import { Onboarding } from "./components/Onboarding/Onboarding";
 import { ContextSettings } from "./components/ContextSettings";
@@ -31,7 +31,7 @@ const navigationGroups: { label: string; items: { id: View; label: string; icon:
     items: [
       { id: "general", label: "录音与输出", icon: AudioLines },
       { id: "smart", label: "智能整理", icon: Sparkles },
-      { id: "writing", label: "写作模式", icon: PenLine },
+      { id: "writing", label: "语气", icon: PenLine },
       { id: "engine", label: "语音服务", icon: CloudCog },
     ],
   },
@@ -68,6 +68,7 @@ export default function App() {
   const [audioInputDevices, setAudioInputDevices] = useState<AudioInputDevice[]>([]);
   const [loadingError, setLoadingError] = useState<string | null>(null);
   const [runtimeError, setRuntimeError] = useState<string | null>(null);
+  const [learnToast, setLearnToast] = useState<{ pair_key: string; before: string; after: string } | null>(null);
   const [selectedPreview, setSelectedPreview] = useState<SelectedActionPreview | null>(null);
   const [selectedPreviewDraft, setSelectedPreviewDraft] = useState("");
   const selectedPreviewRestoreRef = useRef<HTMLElement | null>(null);
@@ -123,6 +124,30 @@ export default function App() {
       selectedPreviewRestoreRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
       setSelectedPreview(event.payload);
       setSelectedPreviewDraft(event.payload.final_text);
+    });
+    return () => {
+      active = false;
+      void subscription.then((unlisten) => unlisten()).catch(() => undefined);
+    };
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+    const subscription = listen<{ pair_key: string; before: string; after: string }>("learn_pairs://promoted", (event) => {
+      if (!active) return;
+      setLearnToast(event.payload);
+    });
+    return () => {
+      active = false;
+      void subscription.then((unlisten) => unlisten()).catch(() => undefined);
+    };
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+    const subscription = listen<Settings>("settings://changed", (event) => {
+      if (!active) return;
+      setSettings((current) => (current ? { ...current, ...event.payload } : event.payload));
     });
     return () => {
       active = false;
@@ -358,10 +383,12 @@ export default function App() {
     setSettings(next);
     setSaveError(null);
   };
-  const saveAsrApiKey = async (apiKey: string) => {
+  const saveAsrApiKey = async (apiKey: string, asrBaseUrl?: string) => {
     try {
       await flushPendingSave();
-      await invoke("update_settings_patch", { patch: { asr_api_key: apiKey.trim() } });
+      const patch: Record<string, string> = { asr_api_key: apiKey.trim() };
+      if (asrBaseUrl !== undefined) patch.asr_base_url = asrBaseUrl;
+      await invoke("update_settings_patch", { patch });
       const next = await invoke<Settings>("get_settings");
       setSettings(next);
       setSaveError(null);
@@ -373,6 +400,19 @@ export default function App() {
   const removeAsrApiKey = async () => {
     await flushPendingSave();
     const next = await invoke<Settings>("remove_asr_api_key");
+    setSettings(next);
+    setSaveError(null);
+  };
+  const removeCleanupApiKey = async () => {
+    await flushPendingSave();
+    const next = await invoke<Settings>("remove_cleanup_api_key");
+    setSettings(next);
+    setSaveError(null);
+  };
+  const commitEngine = async (patch: Record<string, string>) => {
+    await flushPendingSave();
+    await invoke("update_settings_patch", { patch });
+    const next = await invoke<Settings>("get_settings");
     setSettings(next);
     setSaveError(null);
   };
@@ -434,39 +474,6 @@ export default function App() {
               </div>
             ))}
           </nav>
-
-          <div className="mt-auto border-t border-border px-1 pt-3">
-            <div className="space-y-0.5">
-              <label htmlFor="settings-theme" className="group relative flex min-h-8 cursor-pointer items-center gap-2 rounded-md px-2 text-xs text-secondary transition-colors hover:bg-card hover:text-primary focus-within:bg-card">
-                {settings.theme === "light" ? <Sun size={13} aria-hidden="true" /> : settings.theme === "dark" ? <Moon size={13} aria-hidden="true" /> : <Monitor size={13} aria-hidden="true" />}
-                {t("主题")}
-                <span className="ml-auto flex items-center gap-1 text-xs text-secondary">
-                  {settings.theme === "system" ? t("跟随系统") : settings.theme === "light" ? t("浅色") : t("深色")}
-                  <ChevronDown size={13} strokeWidth={1.8} aria-hidden="true" />
-                </span>
-                <select id="settings-theme" aria-label={t("主题")} value={settings.theme} onChange={(event) => save({ theme: event.target.value as Settings["theme"] })} className="absolute inset-0 z-10 h-full w-full cursor-pointer opacity-0">
-                  <option value="system">{t("跟随系统")}</option>
-                  <option value="light">{t("浅色")}</option>
-                  <option value="dark">{t("深色")}</option>
-                </select>
-              </label>
-            </div>
-            <div className="space-y-0.5">
-              <label htmlFor="settings-ui-language" className="group relative flex min-h-8 cursor-pointer items-center gap-2 rounded-md px-2 text-xs text-secondary transition-colors hover:bg-card hover:text-primary focus-within:bg-card">
-                <Languages size={13} aria-hidden="true" />
-                {t("语言")}
-                <span className="ml-auto flex items-center gap-1 text-xs text-secondary">
-                  {settings.ui_language === "system" ? t("跟随系统") : settings.ui_language === "zh" ? t("中文") : t("English")}
-                  <ChevronDown size={13} strokeWidth={1.8} aria-hidden="true" />
-                </span>
-                <select id="settings-ui-language" aria-label={t("语言")} value={settings.ui_language} onChange={(event) => changeInterfaceLanguage(event.target.value as UiLanguagePreference)} className="absolute inset-0 z-10 h-full w-full cursor-pointer opacity-0">
-                  <option value="system">{t("跟随系统")}</option>
-                  <option value="zh">{t("中文")}</option>
-                  <option value="en">{t("English")}</option>
-                </select>
-              </label>
-            </div>
-          </div>
         </aside>
 
         <section className="settings-scrollbar min-h-0 min-w-0 flex-1 overflow-y-auto">
@@ -475,6 +482,19 @@ export default function App() {
               <SettingsAlert onRetry={retryPendingSave} retryLabel={t("重试")}>{t("设置保存失败：")}{saveError}</SettingsAlert>
             )}
             {runtimeError && <SettingsAlert>{t("语音输入失败：")}{runtimeError}</SettingsAlert>}
+            {learnToast && (
+              <div role="status" className="mb-4 flex items-center gap-3 rounded-lg border border-border bg-elevated px-4 py-3 text-sm text-primary">
+                <span className="min-w-0 flex-1">{t("已学")} {learnToast.before}→{learnToast.after}</span>
+                <button type="button" className={buttonClass} onClick={() => {
+                  void invoke("undo_learn_pair", { pairKey: learnToast.pair_key }).then(async () => {
+                    const next = await invoke<Settings>("get_settings");
+                    setSettings(next);
+                    setLearnToast(null);
+                  });
+                }}>{t("撤销")}</button>
+                <button type="button" className="rounded-lg px-2 py-1 text-xs text-tertiary" onClick={() => setLearnToast(null)}>{t("关闭")}</button>
+              </div>
+            )}
             <AnimatedContent key={view} className="w-full">
               {view === "history" ? <History items={history} reload={() => reloadHistory()} hasMore={historyHasMore} loading={historyLoading} onLoadMore={loadMoreHistory} error={historyError} onRetry={() => reloadHistory()} onQueryChange={searchHistory} />
                 : view === "smart" ? <ContextSettings automationOnly writingModes={settings.writing_modes} onWritingModesChange={(writingModes) => save({ writing_modes: writingModes })} outputMode={settings.output_mode} translationTargetLanguage={settings.translation_target_language} onOutputModeChange={(outputMode) => save({ output_mode: outputMode })} onTranslationTargetLanguageChange={(language) => save({ translation_target_language: language })} />
@@ -482,8 +502,8 @@ export default function App() {
                     : view === "snippets" ? <SnippetsSettings snippets={settings.snippets} onChange={(snippets) => save({ snippets })} />
                       : view === "dictionary" ? <DictionarySettings settings={settings} save={save} />
                         : view === "permissions" ? <PermissionsSettings permissions={permissions} onRefresh={refreshPermissions} />
-                          : view === "system" ? <SystemSettings settings={settings} audioInputDevice={audioInputDevice} audioInputDevices={audioInputDevices} save={save} />
-                            : view === "engine" ? <EngineSettings settings={settings} save={save} saveApiKey={saveApiKey} removeApiKey={removeApiKey} saveAsrApiKey={saveAsrApiKey} removeAsrApiKey={removeAsrApiKey} />
+                          : view === "system" ? <SystemSettings settings={settings} audioInputDevice={audioInputDevice} audioInputDevices={audioInputDevices} save={save} onUiLanguageChange={changeInterfaceLanguage} />
+                            : view === "engine" ? <EngineSettings settings={settings} save={save} saveApiKey={saveApiKey} removeApiKey={removeApiKey} saveAsrApiKey={saveAsrApiKey} removeAsrApiKey={removeAsrApiKey} removeCleanupApiKey={removeCleanupApiKey} commitEngine={commitEngine} />
                               : <RecordingSettings settings={settings} save={save} />}
             </AnimatedContent>
           </div>

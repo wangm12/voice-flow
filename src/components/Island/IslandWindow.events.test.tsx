@@ -1,4 +1,4 @@
-import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
 import { IslandWindow } from "./IslandWindow";
@@ -71,5 +71,39 @@ describe("IslandWindow HUD partials", () => {
     });
 
     expect(screen.queryByText("你好世界")).not.toBeInTheDocument();
+  });
+
+  it("composes a Chinese HUD context label from app and style parts", async () => {
+    await renderHud();
+    act(() => {
+      handlers.get("dictation://state")!({
+        payload: {
+          state: "recording",
+          session_generation: 3,
+          context_app: "Cursor",
+          context_style: "prompt_or_code",
+          context_label: "Cursor · Code",
+        },
+      });
+    });
+
+    expect(document.querySelector(".voice-pill-caption")).toHaveTextContent("Cursor · 代码");
+  });
+
+  it("shows a promotion undo toast on the island", async () => {
+    invokeMock.mockResolvedValue(undefined);
+    await renderHud();
+    await waitFor(() => expect(handlers.has("learn_pairs://promoted")).toBe(true));
+    act(() => {
+      handlers.get("learn_pairs://promoted")!({
+        payload: { pair_key: "知呼\u001e知乎", before: "知呼", after: "知乎" },
+      });
+    });
+
+    expect(await screen.findByRole("status")).toHaveTextContent("已学 知呼→知乎");
+    fireEvent.click(screen.getByRole("button", { name: "撤销" }));
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("undo_learn_pair", { pairKey: "知呼\u001e知乎" }),
+    );
   });
 });

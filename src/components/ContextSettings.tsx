@@ -43,6 +43,9 @@ type ContextMapping = {
   style_example_input?: string | null;
   style_example_output?: string | null;
   enabled: boolean;
+  cleanup_effort?: "light" | "standard" | null;
+  cleanup_enabled?: boolean;
+  dictionary_learn_enabled?: boolean;
 };
 
 type ApplicationOption = {
@@ -177,6 +180,9 @@ export function ContextSettings({
   const [selectedModeId, setSelectedModeId] = useState("general");
   const [styleExampleInput, setStyleExampleInput] = useState("");
   const [styleExampleOutput, setStyleExampleOutput] = useState("");
+  const [cleanupEffort, setCleanupEffort] = useState<"auto" | "light" | "standard">("auto");
+  const [mappingCleanupEnabled, setMappingCleanupEnabled] = useState(true);
+  const [mappingLearnEnabled, setMappingLearnEnabled] = useState(true);
   const [writingModes, setWritingModes] = useState<WritingMode[]>(managedWritingModes);
   const [draftModeId, setDraftModeId] = useState<string | null>(null);
   const [editingModeId, setEditingModeId] = useState("general");
@@ -322,7 +328,7 @@ export function ContextSettings({
     if (modeIsDirty) {
       setPendingConfirm({
         title: t("放弃未保存修改"),
-        description: t("当前模式有未保存修改，确定放弃吗？"),
+        description: t("当前语气有未保存修改，确定放弃吗？"),
         confirmLabel: t("放弃修改"),
         action: () => applySelectEditingMode(modeId),
       });
@@ -335,7 +341,7 @@ export function ContextSettings({
     const id = `custom.${Date.now()}.${Math.random().toString(36).slice(2, 8)}`;
     const mode: WritingMode = {
       id,
-      label: t("自定义模式"),
+      label: t("自定义语气"),
       family: "general",
       prompt: t("根据我说的内容整理文字，保留事实、语气和具体信息，不要添加我没有说过的内容。"),
       builtin: false,
@@ -354,7 +360,7 @@ export function ContextSettings({
     if (modeIsDirty) {
       setPendingConfirm({
         title: t("放弃未保存修改"),
-        description: t("当前模式有未保存修改，确定放弃吗？"),
+        description: t("当前语气有未保存修改，确定放弃吗？"),
         confirmLabel: t("放弃修改"),
         action: applyAddCustomMode,
       });
@@ -368,7 +374,7 @@ export function ContextSettings({
     const label = editingMode.builtin ? editingMode.label : modeLabelDraft.trim();
     const prompt = modePromptDraft.trim();
     if (!label) {
-      setError(t("请填写模式名称"));
+      setError(t("请填写语气名称"));
       return;
     }
     if (!prompt) {
@@ -387,11 +393,11 @@ export function ContextSettings({
   const deleteEditingMode = () => {
     if (!editingMode || editingMode.builtin) return;
     if (mappings.some((mapping) => mapping.mode_id === editingMode.id)) {
-      setError(t("请先删除使用这个模式的 App 映射"));
+      setError(t("请先删除使用这个语气的 App 映射"));
       return;
     }
     setPendingConfirm({
-      title: t("删除自定义模式"),
+      title: t("删除自定义语气"),
       description: t("确定删除“{name}”吗？").replace("{name}", editingMode.label),
       confirmLabel: t("删除"),
       action: () => {
@@ -421,6 +427,9 @@ export function ContextSettings({
     setSelectedModeId(existing?.mode_id ?? familyModeId(existing?.family ?? "general"));
     setStyleExampleInput(existing?.style_example_input ?? "");
     setStyleExampleOutput(existing?.style_example_output ?? "");
+    setCleanupEffort(existing?.cleanup_effort ?? "auto");
+    setMappingCleanupEnabled(existing?.cleanup_enabled !== false);
+    setMappingLearnEnabled(existing?.dictionary_learn_enabled !== false);
     setError(null);
   };
 
@@ -430,6 +439,9 @@ export function ContextSettings({
     if (existing) setSelectedModeId(existing.mode_id ?? familyModeId(existing.family));
     setStyleExampleInput(existing?.style_example_input ?? "");
     setStyleExampleOutput(existing?.style_example_output ?? "");
+    setCleanupEffort(existing?.cleanup_effort ?? "auto");
+    setMappingCleanupEnabled(existing?.cleanup_enabled !== false);
+    setMappingLearnEnabled(existing?.dictionary_learn_enabled !== false);
     setError(null);
   };
 
@@ -483,7 +495,7 @@ export function ContextSettings({
       return;
     }
     if (!mode) {
-      setError(t("请先选择一个写作模式"));
+      setError(t("请先选择一个语气"));
       return;
     }
     const browserHost = selectedWebsite || null;
@@ -504,6 +516,9 @@ export function ContextSettings({
           executable: null,
           browser_host: browserHost,
           enabled: true,
+          cleanup_effort: cleanupEffort === "auto" ? null : cleanupEffort,
+          cleanup_enabled: mappingCleanupEnabled,
+          dictionary_learn_enabled: mappingLearnEnabled,
         };
       const styleInput = styleExampleInput.trim();
       const styleOutput = styleExampleOutput.trim();
@@ -516,6 +531,9 @@ export function ContextSettings({
       setSelectedModeId("general");
       setStyleExampleInput("");
       setStyleExampleOutput("");
+      setCleanupEffort("auto");
+      setMappingCleanupEnabled(true);
+      setMappingLearnEnabled(true);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
     } finally {
@@ -543,8 +561,8 @@ export function ContextSettings({
   return (
     <SettingsShell>
       <SettingsPageHeader
-        title={t(automationOnly || combined ? "智能整理" : "写作模式")}
-        description={t(combined ? "根据当前 App、输入框和你说的内容整理文字，也可以编辑 Prompt 和 App / 网站规则。" : automationOnly ? "根据当前 App、输入框和你说的内容，自动选择合适的 Prompt 和输出格式。" : "编辑写作 Prompt，并为 App 或网站配置固定模式。")}
+        title={t(automationOnly || combined ? "智能整理" : "语气")}
+        description={t(combined ? "根据当前 App、输入框和你说的内容整理文字，也可以编辑 Prompt 和 App / 网站规则。" : automationOnly ? "根据当前 App、输入框和你说的内容，自动选择合适的 Prompt 和输出格式。" : "编辑语气 Prompt，并为 App 或网站指定固定语气。")}
       />
       {(automationOnly || combined) && (
         <>
@@ -586,36 +604,36 @@ export function ContextSettings({
       )}
 
       {(!automationOnly || combined) && <>
-      <SettingsGroup title={t("编辑 Prompt")} description={t("编辑 Prompt，或创建只属于你的模式。")}> 
+      <SettingsGroup title={t("编辑 Prompt")} description={t("编辑 Prompt，或创建只属于你的语气。")}> 
         <div className="px-4 py-4 sm:px-5">
           <p className="max-w-xl text-xs leading-5 text-tertiary">{t("Prompt 只作为写作指导，不会覆盖 VoiceFlow 的事实保护规则。")} </p>
         </div>
         <div className="border-t border-border px-4 py-4 sm:px-5">
           <label className="block text-xs text-secondary">
-            {t("编辑模式")}
-            <select aria-label={t("编辑写作模式")} value={editingMode?.id ?? ""} onChange={(event) => event.target.value === ADD_CUSTOM_MODE_OPTION ? addCustomMode() : selectEditingMode(event.target.value)} disabled={busy || !editingMode} className={`mt-1 w-full ${fieldClass}`}>
+            {t("编辑语气")}
+            <select aria-label={t("编辑语气")} value={editingMode?.id ?? ""} onChange={(event) => event.target.value === ADD_CUSTOM_MODE_OPTION ? addCustomMode() : selectEditingMode(event.target.value)} disabled={busy || !editingMode} className={`mt-1 w-full ${fieldClass}`}>
               {writingModes.map((mode) => <option key={mode.id} value={mode.id}>{t(mode.label)}{mode.builtin ? "" : ` · ${t("自定义")}`}</option>)}
-              <option value={ADD_CUSTOM_MODE_OPTION}>＋ {t("添加自定义模式")}</option>
+              <option value={ADD_CUSTOM_MODE_OPTION}>＋ {t("添加自定义语气")}</option>
             </select>
           </label>
-          {!editingMode?.builtin && <label className="mt-4 block text-xs text-secondary">{t("模式名称")}<input aria-label={t("自定义模式名称")} value={modeLabelDraft} onChange={(event) => setModeLabelDraft(event.target.value)} disabled={busy} maxLength={64} className={`mt-1 w-full ${fieldClass}`} /></label>}
+          {!editingMode?.builtin && <label className="mt-4 block text-xs text-secondary">{t("语气名称")}<input aria-label={t("自定义语气名称")} value={modeLabelDraft} onChange={(event) => setModeLabelDraft(event.target.value)} disabled={busy} maxLength={64} className={`mt-1 w-full ${fieldClass}`} /></label>}
           <label className="mt-4 block text-xs text-secondary">
             {t("Prompt")}
-            <textarea aria-label={t("写作模式 Prompt")} value={modePromptDraft} onChange={(event) => setModePromptDraft(event.target.value)} disabled={busy} maxLength={8_000} rows={6} className={`mt-1 w-full resize-y rounded-lg border ${colors.border} ${colors.bg.elevated} ${colors.text.primary} px-3 py-2.5 text-sm leading-6 outline-none transition-[border-color,box-shadow] focus:border-accent focus:ring-2 focus:ring-accent/10`} />
+            <textarea aria-label={t("语气 Prompt")} value={modePromptDraft} onChange={(event) => setModePromptDraft(event.target.value)} disabled={busy} maxLength={8_000} rows={6} className={`mt-1 w-full resize-y rounded-lg border ${colors.border} ${colors.bg.elevated} ${colors.text.primary} px-3 py-2.5 text-sm leading-6 outline-none transition-[border-color,box-shadow] focus:border-accent focus:ring-2 focus:ring-accent/10`} />
             <span className="mt-1 block text-xs text-tertiary">{t("可以用中文或英文描述希望保留什么、如何组织，以及明确禁止添加什么。")} </span>
           </label>
           <div className="mt-4 rounded-lg bg-elevated/60 px-3 py-2.5 text-xs text-secondary">
             <p className="font-medium text-primary">{t("预览")}{modeIsDirty ? ` · ${t("未保存")}` : ""}</p>
-            <p className="mt-1 leading-5">{t("去掉口头禅和重复，保留事实与技术词；语气、标点和结构会按当前模式处理。")}</p>
+            <p className="mt-1 leading-5">{t("去掉口头禅和重复，保留事实与技术词；语气、标点和结构会按当前语气处理。")}</p>
           </div>
           <div className="mt-4 flex flex-wrap items-center gap-2">
-            <button type="button" onClick={saveEditingMode} disabled={busy || !editingMode} className={buttonClass}>{t("保存模式")}</button>
-            {!editingMode?.builtin && <button type="button" onClick={deleteEditingMode} disabled={busy} className="rounded-lg px-3 py-2 text-xs text-error transition-colors hover:bg-error/10 disabled:opacity-50">{t("删除自定义模式")}</button>}
+            <button type="button" onClick={saveEditingMode} disabled={busy || !editingMode} className={buttonClass}>{t("保存语气")}</button>
+            {!editingMode?.builtin && <button type="button" onClick={deleteEditingMode} disabled={busy} className="rounded-lg px-3 py-2 text-xs text-error transition-colors hover:bg-error/10 disabled:opacity-50">{t("删除自定义语气")}</button>}
           </div>
         </div>
       </SettingsGroup>
 
-      <SettingsGroup title={t("App / 网站映射")} description={t("为某个 App 选择固定写作模式；也可以细分到浏览器网站。")}>
+      <SettingsGroup title={t("App / 网站映射")} description={t("为某个 App 选择固定语气；也可以细分到浏览器网站。")}>
         <div className="space-y-4 px-4 py-4 sm:px-5">
           <div className="flex flex-wrap items-end gap-2">
             <label className="min-w-0 flex-1 text-xs text-secondary">{t("选择 App")}
@@ -628,8 +646,8 @@ export function ContextSettings({
             <IconButton size="md" label={t("刷新 App 列表")} icon={<RefreshCw size={16} aria-hidden="true" />} onClick={() => void refreshApplications()} disabled={applicationsLoading || busy} />
           </div>
           <p className="flex items-center gap-1.5 text-xs text-tertiary"><AppWindowMac size={14} aria-hidden="true" />{t("运行中的 App 会随刷新更新；手动添加的 App 即使未打开也能生效。")} </p>
-          {selectedApplicationIsBrowser && <label className="block text-xs text-secondary">{t("网站（可选）")}<select aria-label={t("应用映射网站")} value={selectedWebsite} onChange={(event) => selectWebsite(event.target.value)} disabled={busy} className={`mt-1 w-full ${fieldClass}`}><option value="">{t("整个浏览器")}</option>{websiteOptions.map((website) => <option key={website.host} value={website.host}>{t(website.label)}</option>)}</select><span className="mt-1 block text-xs text-tertiary">{t("选择网站后，只在这个网站使用此模式；不选择则对整个浏览器生效。")} </span></label>}
-          <label className="block text-xs text-secondary">{t("写作模式")}<select aria-label={t("应用映射写作模式")} value={selectedMappingMode?.id ?? ""} onChange={(event) => setSelectedModeId(event.target.value)} disabled={busy || savedWritingModes.length === 0} className={`mt-1 w-full ${fieldClass}`}>{savedWritingModes.map((mode) => <option key={mode.id} value={mode.id}>{t(mode.label)}{mode.builtin ? "" : ` · ${t("自定义")}`}</option>)}</select></label>
+          {selectedApplicationIsBrowser && <label className="block text-xs text-secondary">{t("网站（可选）")}<select aria-label={t("应用映射网站")} value={selectedWebsite} onChange={(event) => selectWebsite(event.target.value)} disabled={busy} className={`mt-1 w-full ${fieldClass}`}><option value="">{t("整个浏览器")}</option>{websiteOptions.map((website) => <option key={website.host} value={website.host}>{t(website.label)}</option>)}</select><span className="mt-1 block text-xs text-tertiary">{t("选择网站后，只在这个网站使用此语气；不选择则对整个浏览器生效。")} </span></label>}
+          <label className="block text-xs text-secondary">{t("语气")}<select aria-label={t("应用映射语气")} value={selectedMappingMode?.id ?? ""} onChange={(event) => setSelectedModeId(event.target.value)} disabled={busy || savedWritingModes.length === 0} className={`mt-1 w-full ${fieldClass}`}>{savedWritingModes.map((mode) => <option key={mode.id} value={mode.id}>{t(mode.label)}{mode.builtin ? "" : ` · ${t("自定义")}`}</option>)}</select></label>
           <div className="grid gap-3 sm:grid-cols-2">
             <label className="block text-xs text-secondary">{t("示例输入")}
               <textarea aria-label={t("App 风格示例输入")} value={styleExampleInput} onChange={(event) => setStyleExampleInput(event.target.value)} maxLength={2_000} rows={3} disabled={busy || !selectedApplicationId} placeholder={t("贴一条你平时微信怎么打")} className={`mt-1 w-full resize-y rounded-lg border ${colors.border} ${colors.bg.elevated} ${colors.text.primary} px-3 py-2 text-sm outline-none focus:border-accent ${focusRingClass}`} />
@@ -638,8 +656,21 @@ export function ContextSettings({
               <textarea aria-label={t("App 风格期望输出")} value={styleExampleOutput} onChange={(event) => setStyleExampleOutput(event.target.value)} maxLength={2_000} rows={3} disabled={busy || !selectedApplicationId} placeholder={t("希望 VoiceFlow 输出的样子…")} className={`mt-1 w-full resize-y rounded-lg border ${colors.border} ${colors.bg.elevated} ${colors.text.primary} px-3 py-2 text-sm outline-none focus:border-accent ${focusRingClass}`} />
             </label>
           </div>
+          <label className="block text-xs text-secondary">{t("整理力度")}
+            <select aria-label={t("整理力度")} value={cleanupEffort} onChange={(event) => setCleanupEffort(event.target.value as "auto" | "light" | "standard")} disabled={busy || !selectedApplicationId} className={`mt-1 w-full ${fieldClass}`}>
+              <option value="auto">{t("跟随场景")}</option>
+              <option value="light">{t("轻度：去口头禅，保持口语")}</option>
+              <option value="standard">{t("标准整理")}</option>
+            </select>
+          </label>
+          <SettingsRow title={t("这个 App 使用 AI 整理")} description={t("关闭后仍会去掉 um / 嗯，但不请求整理服务。")}>
+            <Toggle checked={mappingCleanupEnabled} onChange={setMappingCleanupEnabled} disabled={busy || !selectedApplicationId} label={t("这个 App 使用 AI 整理")} />
+          </SettingsRow>
+          <SettingsRow title={t("在这个 App 学习词条")} description={t("关闭后不会从该 App 的输入框学习纠正。")}>
+            <Toggle checked={mappingLearnEnabled} onChange={setMappingLearnEnabled} disabled={busy || !selectedApplicationId} label={t("在这个 App 学习词条")} />
+          </SettingsRow>
           <p className="text-xs text-tertiary">{t("保存后只作为这个 App 的本地整理参考，不会自动从历史记录学习。")} {t("确认后的 App 风格样例会发送给当前配置的 LLM 服务。")} </p>
-          {selectedExistingMapping && <p className="text-xs text-secondary">{t("这个目标已有设置；保存后会更新它的写作模式。")} </p>}
+          {selectedExistingMapping && <p className="text-xs text-secondary">{t("这个目标已有设置；保存后会更新它的语气。")} </p>}
           <button type="button" onClick={() => void saveMapping()} disabled={busy || applicationsLoading || !selectedApplicationId} className={buttonClass}><Plus size={16} aria-hidden="true" />{t("保存 App 设置")}</button>
         </div>
         {mappings.length > 0 && <div className="border-t border-border px-4 sm:px-5"><p className="py-3 text-xs font-medium text-tertiary">{t("已保存的 App 设置")}</p>{mappings.map((mapping) => <div key={mapping.id} className="flex items-center gap-3 border-t border-border py-3"><span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-elevated text-xs font-semibold text-primary">{mapping.label.slice(0, 1)}</span><div className="min-w-0 flex-1"><p className="truncate text-sm font-medium text-primary">{mapping.label}</p><p className="mt-0.5 truncate text-xs text-tertiary">{t(writingModes.find((mode) => mode.id === mapping.mode_id)?.label ?? familyLabels[mapping.family])} · {mapping.browser_host ? t("按网站匹配") : t("按 App 匹配")}</p></div><IconButton size="sm" label={t("删除映射")} aria-label={`${t("删除应用映射")} ${mapping.label}`} tone="danger" icon={<Trash2 size={15} aria-hidden="true" />} onClick={() => setPendingConfirm({ title: t("删除映射"), description: t("确定删除“{name}”吗？").replace("{name}", mapping.label), confirmLabel: t("删除"), action: () => void deleteMapping(mapping.id) })} disabled={busy} /></div>)}</div>}

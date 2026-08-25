@@ -54,6 +54,30 @@ type PillCaptionOptions = {
 
 const CONTEXT_LABEL_STATES = new Set(["recording", "recording_limited", "starting", "processing"]);
 
+/** How long the App · template chip stays before it dismisses. */
+export const CONTEXT_LABEL_VISIBLE_MS = 2_500;
+
+export function visibleContextLabel(
+  contextLabel: string | null | undefined,
+  shownAtMs: number | null,
+  nowMs: number,
+  ttlMs = CONTEXT_LABEL_VISIBLE_MS,
+): string | null {
+  const label = contextLabel?.trim() || null;
+  if (!label || shownAtMs == null) return null;
+  if (nowMs - shownAtMs >= ttlMs) return null;
+  return label;
+}
+
+export function voicePillCaptionNeedsWide(
+  state: string,
+  options?: Pick<PillCaptionOptions, "fallbackReason" | "partialText">,
+): boolean {
+  if (options?.fallbackReason) return true;
+  if (options?.partialText?.trim() && CONTEXT_LABEL_STATES.has(state)) return true;
+  return ["error", "degraded", "copied", "unverified", "rate_limited"].includes(state);
+}
+
 export function pillCaption(
   state: string,
   translate: (source: string) => string = (source) => source,
@@ -99,6 +123,9 @@ export function pillCaption(
   }
   if (!statusCaption && selectedState && ["copied", "done", "unverified"].includes(state)) {
     statusCaption = selectedActionCaption(selectedState, translate);
+  }
+  if (!statusCaption && state === "copied") {
+    statusCaption = translate("已复制到剪贴板，请手动粘贴");
   }
 
   const contextLabel = CONTEXT_LABEL_STATES.has(state) ? options?.contextLabel?.trim() || null : null;

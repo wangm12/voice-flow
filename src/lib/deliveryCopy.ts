@@ -9,7 +9,7 @@ export const deliveryReasonLabels: Record<string, string> = {
   target_unavailable: "未能确认输入目标，文字已复制到剪贴板，请手动粘贴",
   paste_failed: "自动粘贴未完成，文字已复制到剪贴板，请手动粘贴",
   retry_clipboard_only: "自动插入失败，文字已复制到剪贴板",
-  paste_unverified: "已尝试写入输入框，请确认目标内容",
+  paste_unverified: "已复制，请按 ⌘V",
   selected_action_clipboard_fallback: "目标变化，结果已复制",
 };
 

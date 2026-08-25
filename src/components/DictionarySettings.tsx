@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type React from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { FileText, Upload } from "lucide-react";
 import { ConfirmDialog } from "./ConfirmDialog";
@@ -13,6 +14,24 @@ import type { SaveSettings, Settings } from "../types/settings";
 
 const controlClass = `${radius.control} h-9 border ${colors.border} ${colors.bg.elevated} ${colors.text.primary} px-3 py-0 text-sm outline-none transition-colors duration-150 focus:border-accent ${focusRingClass}`;
 
+type LearnPair = {
+  pair_key: string;
+  before_surface: string;
+  after_surface: string;
+  hits: number;
+  promoted: boolean;
+  ignored?: boolean;
+};
+
+type StyleDraft = {
+  draft_key: string;
+  mapping_id: string;
+  style_key: string;
+  excerpt: string;
+  before_excerpt: string;
+  after_excerpt: string;
+};
+
 export function DictionarySettings({ settings, save }: { settings: Settings; save: SaveSettings }) {
   const { t } = useI18n();
   const [newWord, setNewWord] = useState("");
@@ -20,13 +39,48 @@ export function DictionarySettings({ settings, save }: { settings: Settings; sav
   const [dictionaryDragging, setDictionaryDragging] = useState(false);
   const [dictionaryImporting, setDictionaryImporting] = useState(false);
   const [pendingDeleteWord, setPendingDeleteWord] = useState<string | null>(null);
+  const [pendingPairs, setPendingPairs] = useState<LearnPair[]>([]);
+  const [styleDrafts, setStyleDrafts] = useState<StyleDraft[]>([]);
+  const [pinnedTerms, setPinnedTerms] = useState<string[]>([]);
+  const [pendingStyleDraft, setPendingStyleDraft] = useState<StyleDraft | null>(null);
   const dictionaryFileInput = useRef<HTMLInputElement | null>(null);
   const dictionaryDropZone = useRef<HTMLDivElement | null>(null);
   const importingRef = useRef(false);
   const settingsRef = useRef(settings);
-  const saveRef = useRef(save);
   settingsRef.current = settings;
-  saveRef.current = save;
+
+  const loadPendingPairs = useCallback(async () => {
+    try {
+      const [rows, drafts, pinned] = await Promise.all([
+        invoke<LearnPair[]>("list_learn_pairs"),
+        invoke<StyleDraft[]>("list_style_drafts"),
+        invoke<string[]>("list_pinned_terms"),
+      ]);
+      setPendingPairs(Array.isArray(rows) ? rows.filter((row) => !row.promoted && !row.ignored) : []);
+      setStyleDrafts(Array.isArray(drafts) ? drafts : []);
+      setPinnedTerms(Array.isArray(pinned) ? pinned : []);
+    } catch {
+      setPendingPairs([]);
+      setStyleDrafts([]);
+      setPinnedTerms([]);
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadPendingPairs();
+    let active = true;
+    const subscription = listen("learn_pairs://changed", () => {
+      if (active) void loadPendingPairs();
+    });
+    const drafts = listen("style_drafts://changed", () => {
+      if (active) void loadPendingPairs();
+    });
+    return () => {
+      active = false;
+      void subscription.then((unlisten) => unlisten()).catch(() => undefined);
+      void drafts.then((unlisten) => unlisten()).catch(() => undefined);
+    };
+  }, [loadPendingPairs]);
 
   const importText = useCallback(async (text: string, fileName: string) => {
     const extension = fileName.toLowerCase().split(".").pop();
@@ -41,7 +95,9 @@ export function DictionarySettings({ settings, save }: { settings: Settings; sav
     setDictionaryMessage(null);
     try {
       const result = mergeDictionary(settingsRef.current.dictionary, parseDictionaryText(text, fileName));
-      if (result.added > 0) saveRef.current({ dictionary: result.words });
+      if (result.added > 0) {
+        await invoke("add_dictionary_entries", { words: result.words });
+      }
       const details = [
         `${t("已导入")} ${result.added} ${t("条")}`,
         result.duplicates > 0 ? `${t("重复")} ${result.duplicates} ${t("条")}` : null,
@@ -136,9 +192,14 @@ export function DictionarySettings({ settings, save }: { settings: Settings; sav
       setDictionaryMessage(result.duplicates > 0 ? t("这个词条已经存在。") : t("词条无效或已达到上限。"));
       return;
     }
-    save({ dictionary: result.words });
-    setNewWord("");
-    setDictionaryMessage(null);
+    void invoke("add_dictionary_entries", { words: result.words })
+      .then(() => {
+        setNewWord("");
+        setDictionaryMessage(null);
+      })
+      .catch(() => {
+        setDictionaryMessage(t("词条无效或已达到上限。"));
+      });
   };
 
   const openDictionaryFilePicker = () => dictionaryFileInput.current?.click();
@@ -153,10 +214,32 @@ export function DictionarySettings({ settings, save }: { settings: Settings; sav
     <SettingsShell>
       <SettingsPageHeader title={t("个人词典")} description={t("把人名、产品名和专业术语添加到这里，识别时会优先保留正确拼写。")} />
       <SettingsGroup title={t("词典学习")}>
-        <SettingsRow title={t("从历史编辑学习词条")} description={t("在历史里改正识别结果后，建议把新词加入个人词典，需确认后才会写入。关闭后不再显示这些建议。")}>
-          <Toggle checked={settings.dictionary_learn_enabled !== false} onChange={(checked) => save({ dictionary_learn_enabled: checked })} label={t("从历史编辑学习词条")} />
+        <SettingsRow title={t("学习词条")} description={t("第 3 次静默纠正，或历史/设置确认。继续打字不会学习。")}>
+          <Toggle checked={settings.dictionary_learn_enabled !== false} onChange={(checked) => save({ dictionary_learn_enabled: checked })} label={t("学习词条")} />
         </SettingsRow>
       </SettingsGroup>
+      {pendingPairs.length > 0 && (
+        <SettingsGroup title={t("待晋升")}>
+          {pendingPairs.map((pair) => (
+            <div key={pair.pair_key} className="flex items-center gap-3 px-4 py-3.5 text-sm sm:px-5">
+              <span className="min-w-0 flex-1 text-primary">{pair.before_surface} → {pair.after_surface} · {pair.hits}/3</span>
+              <button type="button" onClick={() => void invoke("promote_learn_pair", { pairKey: pair.pair_key, beforeSurface: pair.before_surface, afterSurface: pair.after_surface }).then(() => loadPendingPairs())} className="rounded-lg px-2 py-1 text-xs text-secondary transition-colors hover:bg-elevated hover:text-primary">{t("确认")}</button>
+              <button type="button" onClick={() => void invoke("ignore_learn_pair", { pairKey: pair.pair_key }).then(() => loadPendingPairs())} className="rounded-lg px-2 py-1 text-xs text-tertiary transition-colors hover:bg-error/10 hover:text-error">{t("忽略")}</button>
+            </div>
+          ))}
+        </SettingsGroup>
+      )}
+      {styleDrafts.length > 0 && (
+        <SettingsGroup title={t("待确认口癖")} description={t("确认后会覆盖该 App 现有的风格样例。")}>
+          {styleDrafts.map((draft) => (
+            <div key={draft.draft_key} className="flex items-center gap-3 px-4 py-3.5 text-sm sm:px-5">
+              <span className="min-w-0 flex-1 text-primary">{draft.mapping_id} · {t(draft.style_key === "fewer_periods" ? "少用句号" : draft.style_key === "more_questions" ? "爱用问号" : "标点密度")} · {draft.excerpt}</span>
+              <button type="button" onClick={() => setPendingStyleDraft(draft)} className="rounded-lg px-2 py-1 text-xs text-secondary transition-colors hover:bg-elevated hover:text-primary">{t("确认")}</button>
+              <button type="button" onClick={() => void invoke("dismiss_style_draft", { draftKey: draft.draft_key }).then(() => loadPendingPairs())} className="rounded-lg px-2 py-1 text-xs text-tertiary transition-colors hover:bg-error/10 hover:text-error">{t("忽略")}</button>
+            </div>
+          ))}
+        </SettingsGroup>
+      )}
       <SettingsGroup title={t("添加词条")}>
         <SettingsRow title={t("添加个人词典词条")} description={t("输入一个词条，或从 CSV、TXT、TSV 文件导入。")}>
           <div className="flex w-full min-w-0 gap-2 sm:w-auto">
@@ -191,10 +274,25 @@ export function DictionarySettings({ settings, save }: { settings: Settings; sav
         {settings.dictionary.length > 0 ? settings.dictionary.map((word) => (
           <div key={word} className="flex items-center gap-3 px-4 py-3.5 text-sm sm:px-5">
             <span className="flex-1 text-primary">{word}</span>
+            <button type="button" aria-label={`${pinnedTerms.includes(word) ? t("取消置顶") : t("置顶")} ${word}`} onClick={() => void invoke("pin_dictionary_term", { word, pinned: !pinnedTerms.includes(word) }).then(() => loadPendingPairs())} className="rounded-lg px-2 py-1 text-xs text-secondary transition-colors hover:bg-elevated hover:text-primary">{pinnedTerms.includes(word) ? t("已置顶") : t("置顶")}</button>
             <button type="button" aria-label={`${t("删除")} ${word}`} onClick={() => setPendingDeleteWord(word)} className="rounded-lg px-2 py-1 text-xs text-tertiary transition-colors hover:bg-error/10 hover:text-error">{t("删除")}</button>
           </div>
         )) : <p className="px-4 py-5 text-sm text-tertiary sm:px-5">{t("还没有词条。添加后，VoiceFlow 会更准确地识别人名和专业术语。")}</p>}
       </SettingsGroup>
+      <ConfirmDialog
+        open={pendingStyleDraft != null}
+        title={t("确认口癖样例")}
+        description={t("会覆盖该 App 现有的风格样例。")}
+        confirmLabel={t("确认")}
+        cancelLabel={t("取消")}
+        onCancel={() => setPendingStyleDraft(null)}
+        onConfirm={() => {
+          if (pendingStyleDraft) {
+            void invoke("confirm_style_draft", { draftKey: pendingStyleDraft.draft_key }).then(() => loadPendingPairs());
+          }
+          setPendingStyleDraft(null);
+        }}
+      />
       <ConfirmDialog
         open={pendingDeleteWord != null}
         title={t("删除词条")}
@@ -203,7 +301,9 @@ export function DictionarySettings({ settings, save }: { settings: Settings; sav
         cancelLabel={t("取消")}
         onCancel={() => setPendingDeleteWord(null)}
         onConfirm={() => {
-          if (pendingDeleteWord) save({ dictionary: settings.dictionary.filter((item) => item !== pendingDeleteWord) });
+          if (pendingDeleteWord) {
+            void invoke("remove_dictionary_word", { word: pendingDeleteWord });
+          }
           setPendingDeleteWord(null);
         }}
       />

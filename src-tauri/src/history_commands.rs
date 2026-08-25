@@ -2,9 +2,10 @@
 
 use crate::{
     asr, build_asr_prompt, chrono_like_id, cleanup_failure_status, clipboard_text_for_snippets,
-    current_asr_provider, finalize_text, llm, local_cleanup_or_raw, lock_recover, metrics, paste,
-    queue, snippets, store, try_claim_operation, release_operation, AppState, CleanupDecision,
-    OperationLease, CLEANUP_STATUS_AI_SUCCESS, CLEANUP_STATUS_LOCAL_ONLY,
+    context, current_asr_provider, finalize_text, lexicon, llm, local_cleanup_or_raw, lock_recover,
+    metrics, paste, queue, snippets, spoken_translation_target, store, try_claim_operation,
+    release_operation, AppState,
+    CleanupDecision, OperationLease, CLEANUP_STATUS_AI_SUCCESS, CLEANUP_STATUS_LOCAL_ONLY,
     CLEANUP_STATUS_SNIPPET_BYPASS,
 };
 use tauri::{Emitter, Manager, State};
@@ -107,6 +108,8 @@ pub(crate) async fn reclean_history(
     if settings.output_mode == "translation" {
         policy.translation_target_language = Some(settings.translation_target_language.clone());
     }
+    let (raw_text, pairs_hint) =
+        crate::prepare_lexicon_transcript(Some(&dir), &settings.dictionary, &raw_text);
     let intent = llm::CleanupIntent::selected_text(operation, &raw_text);
     if !try_claim_operation(&state, OperationLease::HistoryReclean) {
         return Err("Dictation is active; try history cleanup again after it finishes".into());
@@ -119,17 +122,23 @@ pub(crate) async fn reclean_history(
             CLEANUP_STATUS_LOCAL_ONLY,
         )
     } else {
+        let cleanup_endpoint = settings.cleanup_endpoint();
+        let cleanup_model = settings.cleanup_request_model();
+        let cleanup_key = settings.cleanup_credential().to_owned();
         let result = queue::execute_with_retry(&state.gate, queue::RequestKind::HistoryLlm, || {
             llm::cleanup_with_model_and_limits_and_language_and_profile_and_intent(
-                &settings.cleanup_model,
+                &cleanup_endpoint,
+                &cleanup_model,
                 &raw_text,
-                &settings.api_key,
-                &settings.dictionary,
+                &cleanup_key,
+                &[],
                 None,
                 Some(&policy),
                 Some(settings.language.as_str()),
                 None,
                 Some(&intent),
+                pairs_hint.as_deref(),
+                llm::CleanupEffort::Command,
             )
         })
         .await;
@@ -230,9 +239,20 @@ async fn retry_dictation_inner(
     let wav = store::read_spool_file(std::path::Path::new(&path))
         .map_err(|_| "Audio spool is no longer available".to_owned())?;
     let settings = lock_recover(&state.settings).clone();
-    let history_policy = store::history_context(&dir, id).map_err(|e| e.to_string())?;
-    let asr_prompt = build_asr_prompt(&settings.dictionary, history_policy.as_ref());
-    let mut retry_policy = history_policy.clone().unwrap_or_default();
+    let scene = store::history_scene(&dir, id).map_err(|e| e.to_string())?;
+    let pairs = store::list_learn_pairs(&dir).unwrap_or_default();
+    let scope = lexicon::PromptScope::from_history(
+        scene.profile_id.as_deref(),
+        scene.family.as_deref(),
+        scene.browser_host.as_deref(),
+    );
+    let asr_prompt = build_asr_prompt(
+        &settings.dictionary,
+        scene.policy.as_ref(),
+        &pairs,
+        Some(&scope),
+    );
+    let mut retry_policy = scene.policy.clone().unwrap_or_default();
     if settings.output_mode != "auto" {
         retry_policy.output_mode = Some(settings.output_mode.clone());
     }
@@ -245,6 +265,11 @@ async fn retry_dictation_inner(
         api_key: settings.asr_credential().to_owned(),
         language: asr::normalize_language(Some(settings.language.as_str())).map(str::to_owned),
         prompt: asr_prompt,
+        model: asr::resolve_recognition_model(
+            &settings.asr_model,
+            Some(settings.language.as_str()),
+        )
+        .to_owned(),
     };
     let transcript = {
         let _latency = state.metrics.timer(metrics::MetricKind::FinalAsr);
@@ -255,49 +280,80 @@ async fn retry_dictation_inner(
         .map_err(|e| e.to_string())?
     };
     state.gate.update_asr(&transcript.limits);
-    let raw_text = crate::spoken_punctuation::apply(&transcript.text);
+    let family = scene
+        .family
+        .as_deref()
+        .and_then(context::builtin_family_for_id)
+        .unwrap_or_else(|| {
+            scene
+                .profile_id
+                .as_deref()
+                .map(|id| lexicon::family_from_profile_id(id, &settings.context_mappings))
+                .unwrap_or(context::ContextFamily::General)
+        });
+    let mapping = scene
+        .profile_id
+        .as_deref()
+        .and_then(|id| lexicon::mapping_for_profile(&settings.context_mappings, id));
+    let confidence = if scene.profile_id.is_some() { 0.88 } else { 0.0 };
+    let (raw_text, pairs_hint) = crate::prepare_lexicon_transcript(
+        Some(&dir),
+        &settings.dictionary,
+        &crate::spoken_layout::apply_after_punctuation(&transcript.text, family, confidence),
+    );
     let clipboard = snippets::read_clipboard_if_needed(&settings.snippets, &raw_text, || {
         clipboard_text_for_snippets(&app)
     });
     let snippet_expansion =
         snippets::resolve_exact_with_clipboard(&settings.snippets, &raw_text, clipboard.as_deref());
-    let intent = llm::parse_cleanup_intent(
-        &raw_text,
-        Some(settings.translation_target_language.as_str()),
-    );
+    let intent = llm::parse_cleanup_intent(&raw_text, spoken_translation_target(&settings));
     let cleanup_input = snippet_expansion
         .clone()
         .unwrap_or_else(|| intent.content.clone());
-    let cleanup_decision = if settings.cleanup_enabled && snippet_expansion.is_none() {
-        let cleanup_result = {
-            let _latency = state.metrics.timer(metrics::MetricKind::Cleanup);
-            queue::execute_with_retry(&state.gate, queue::RequestKind::Llm, || {
-                llm::cleanup_with_model_and_limits_and_language_and_profile_and_intent(
-                    &settings.cleanup_model,
-                    &cleanup_input,
-                    &settings.api_key,
-                    &settings.dictionary,
-                    None,
-                    Some(&retry_policy),
-                    Some(settings.language.as_str()),
-                    None,
-                    Some(&intent),
-                )
-            })
-            .await
-        };
-        match cleanup_result {
-            Ok((text, limits)) => {
-                state.gate.update_llm(&limits);
-                CleanupDecision::Provider(text)
-            }
-            Err(error) => {
-                log::warn!("history retry cleanup failed, copying raw transcript: {error}");
-                CleanupDecision::Failed
+    let cleanup_route = lexicon::decide_cleanup(
+        settings.cleanup_enabled,
+        mapping,
+        family,
+        &intent,
+        confidence,
+    );
+    let cleanup_decision = match cleanup_route {
+        lexicon::CleanupRoute::Provider(effort) if snippet_expansion.is_none() => {
+            let cleanup_result = {
+                let _latency = state.metrics.timer(metrics::MetricKind::Cleanup);
+                let cleanup_endpoint = settings.cleanup_endpoint();
+                let cleanup_model = settings.cleanup_request_model();
+                let cleanup_key = settings.cleanup_credential().to_owned();
+                queue::execute_with_retry(&state.gate, queue::RequestKind::Llm, || {
+                    llm::cleanup_with_model_and_limits_and_language_and_profile_and_intent(
+                        &cleanup_endpoint,
+                        &cleanup_model,
+                        &cleanup_input,
+                        &cleanup_key,
+                        &[],
+                        None,
+                        Some(&retry_policy),
+                        Some(settings.language.as_str()),
+                        None,
+                        Some(&intent),
+                        pairs_hint.as_deref(),
+                        effort,
+                    )
+                })
+                .await
+            };
+            match cleanup_result {
+                Ok((text, limits)) => {
+                    state.gate.update_llm(&limits);
+                    CleanupDecision::Provider(text)
+                }
+                Err(error) => {
+                    log::warn!("history retry cleanup failed, copying raw transcript: {error}");
+                    CleanupDecision::Failed
+                }
             }
         }
-    } else {
-        CleanupDecision::Disabled
+        _ => CleanupDecision::Disabled,
     };
     let cleanup_status = match &cleanup_decision {
         CleanupDecision::Provider(text) if text.trim().is_empty() => {

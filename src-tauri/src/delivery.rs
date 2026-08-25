@@ -84,6 +84,24 @@ pub struct DeliveryResult {
 }
 
 impl DeliveryResult {
+    /// Verified insert is a paste. Anything else keeps the clipboard and asks
+    /// the user to press ⌘V — including when VoiceFlow stole frontmost.
+    pub fn from_insert_verified(verified: bool) -> Self {
+        if verified {
+            Self {
+                method: DeliveryMethod::Paste,
+                verified: true,
+                fallback_reason: None,
+            }
+        } else {
+            Self {
+                method: DeliveryMethod::Clipboard,
+                verified: true,
+                fallback_reason: Some("paste_unverified"),
+            }
+        }
+    }
+
     pub fn for_method(method: &str, fallback_reason: Option<&'static str>) -> Self {
         let method = match method {
             "paste" => DeliveryMethod::Paste,
@@ -126,6 +144,17 @@ mod tests {
             DeliveryPolicy::HistoryOnly
         );
         assert_eq!(DeliveryPolicy::parse("unknown"), DeliveryPolicy::Auto);
+    }
+
+    #[test]
+    fn insert_without_frontmost_target_is_a_copy_fallback() {
+        let verified = DeliveryResult::from_insert_verified(true);
+        assert_eq!(verified.method, DeliveryMethod::Paste);
+        assert!(verified.fallback_reason.is_none());
+
+        let copied = DeliveryResult::from_insert_verified(false);
+        assert_eq!(copied.method, DeliveryMethod::Clipboard);
+        assert_eq!(copied.fallback_reason, Some("paste_unverified"));
     }
 
     #[test]

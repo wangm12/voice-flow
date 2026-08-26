@@ -249,6 +249,12 @@ impl GroqAsrProvider {
         }
     }
 
+    pub fn from_resolved_endpoint(endpoint: impl Into<String>) -> Self {
+        Self {
+            endpoint: endpoint.into(),
+        }
+    }
+
     #[cfg(test)]
     fn with_endpoint(endpoint: impl Into<String>) -> Self {
         Self {
@@ -392,6 +398,9 @@ async fn transcribe_at(
     prompt: Option<&str>,
     model: &str,
 ) -> Result<Transcript, AsrError> {
+    if endpoint.contains("api.deepgram.com") || endpoint.contains("/listen") {
+        return transcribe_deepgram(endpoint, wav, key, language, model).await;
+    }
     let client = http_client()?;
     let mut form = Form::new()
         .part("file", Part::bytes(wav).file_name("audio.wav"))
@@ -444,6 +453,79 @@ async fn transcribe_at(
         return Err(AsrError::EmptyResult);
     }
     Ok(result)
+}
+
+async fn transcribe_deepgram(
+    endpoint: &str,
+    wav: Vec<u8>,
+    key: &str,
+    language: Option<&str>,
+    model: &str,
+) -> Result<Transcript, AsrError> {
+    let mut url = endpoint.to_owned();
+    if !url.contains('?') {
+        url.push_str("?smart_format=true");
+    }
+    if !url.contains("model=") {
+        url.push_str(&format!(
+            "{}model={}",
+            if url.contains('?') { "&" } else { "?" },
+            resolve_asr_model(model)
+        ));
+    }
+    if let Some(language) = normalize_language(language) {
+        url.push_str("&language=");
+        url.push_str(language);
+    }
+    let client = http_client()?;
+    let response = client
+        .post(&url)
+        .header("Authorization", format!("Token {key}"))
+        .header("Content-Type", "audio/wav")
+        .body(wav)
+        .send()
+        .await
+        .map_err(|error| {
+            if error.is_timeout() {
+                AsrError::Timeout
+            } else {
+                AsrError::Network(error.to_string())
+            }
+        })?;
+    let limits = parse_rate_limits(response.headers());
+    let status = response.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        return Err(AsrError::Unauthorized(
+            host_from_url(endpoint).unwrap_or_else(|| "deepgram".into()),
+        ));
+    }
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        return Err(AsrError::RateLimited(
+            limits.retry_after.unwrap_or_default(),
+        ));
+    }
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        return Err(AsrError::Other(format!("HTTP status {status} {body}")));
+    }
+    let parsed: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|error| AsrError::Other(error.to_string()))?;
+    let text = parsed
+        .pointer("/results/channels/0/alternatives/0/transcript")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_owned();
+    if text.trim().is_empty() {
+        return Err(AsrError::EmptyResult);
+    }
+    Ok(Transcript {
+        text,
+        segments: Vec::new(),
+        words: Vec::new(),
+        limits,
+    })
 }
 
 fn http_client() -> Result<&'static reqwest::Client, AsrError> {

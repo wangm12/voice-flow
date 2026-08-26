@@ -1,6 +1,12 @@
 import type { WritingMode } from "../components/ContextSettings";
 import type { Snippet } from "../components/SnippetsSettings";
 import type { UiLanguagePreference } from "../lib/i18n";
+import type { ProviderId } from "../lib/providers";
+
+export type ProviderKeyView = {
+  configured: boolean;
+  hint?: string | null;
+};
 
 export type Settings = {
   schema_version: number;
@@ -9,13 +15,19 @@ export type Settings = {
   asr_api_key_configured?: boolean;
   asr_api_key_hint?: string | null;
   asr_base_url?: string;
-  asr_provider?: "groq" | "custom";
+  asr_provider?: ProviderId;
   asr_model: string;
   cleanup_model: string;
-  cleanup_provider?: "groq" | "custom";
+  cleanup_provider?: ProviderId;
   cleanup_base_url?: string;
   cleanup_api_key_configured?: boolean;
   cleanup_api_key_hint?: string | null;
+  custom_base_url?: string;
+  custom_asr?: boolean;
+  custom_llm?: boolean;
+  ollama_base_url?: string;
+  local_whisper_base_url?: string;
+  provider_keys?: Partial<Record<ProviderId, ProviderKeyView>>;
   language: string;
   ui_language: UiLanguagePreference;
   theme: "system" | "light" | "dark";

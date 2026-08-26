@@ -409,10 +409,16 @@ export default function App() {
     setSettings(next);
     setSaveError(null);
   };
-  const commitEngine = async (patch: Record<string, string>) => {
+  const commitEngine = async (patch: Record<string, unknown>) => {
     await flushPendingSave();
     await invoke("update_settings_patch", { patch });
     const next = await invoke<Settings>("get_settings");
+    setSettings(next);
+    setSaveError(null);
+  };
+  const removeProviderKey = async (provider: string) => {
+    await flushPendingSave();
+    const next = await invoke<Settings>("remove_provider_key", { provider });
     setSettings(next);
     setSaveError(null);
   };
@@ -503,7 +509,7 @@ export default function App() {
                       : view === "dictionary" ? <DictionarySettings settings={settings} save={save} />
                         : view === "permissions" ? <PermissionsSettings permissions={permissions} onRefresh={refreshPermissions} />
                           : view === "system" ? <SystemSettings settings={settings} audioInputDevice={audioInputDevice} audioInputDevices={audioInputDevices} save={save} onUiLanguageChange={changeInterfaceLanguage} />
-                            : view === "engine" ? <EngineSettings settings={settings} save={save} saveApiKey={saveApiKey} removeApiKey={removeApiKey} saveAsrApiKey={saveAsrApiKey} removeAsrApiKey={removeAsrApiKey} removeCleanupApiKey={removeCleanupApiKey} commitEngine={commitEngine} />
+                            : view === "engine" ? <EngineSettings settings={settings} save={save} saveApiKey={saveApiKey} removeApiKey={removeApiKey} saveAsrApiKey={saveAsrApiKey} removeAsrApiKey={removeAsrApiKey} removeCleanupApiKey={removeCleanupApiKey} removeProviderKey={removeProviderKey} commitEngine={commitEngine} />
                               : <RecordingSettings settings={settings} save={save} />}
             </AnimatedContent>
           </div>

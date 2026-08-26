@@ -884,6 +884,9 @@ async fn complete_at(
     key: &str,
     messages: Vec<Message<'_>>,
 ) -> Result<(String, RateLimits), LlmError> {
+    if endpoint.contains("api.anthropic.com") || endpoint.contains("/messages") {
+        return complete_anthropic(endpoint, model, key, messages).await;
+    }
     let body = Request {
         model,
         messages,
@@ -944,6 +947,91 @@ async fn complete_at(
             "cleanup response was truncated before completion".into(),
         ));
     }
+    if output.trim().is_empty() {
+        return Err(LlmError::Other("empty completion".into()));
+    }
+    Ok((output, limits))
+}
+
+async fn complete_anthropic(
+    endpoint: &str,
+    model: &str,
+    key: &str,
+    messages: Vec<Message<'_>>,
+) -> Result<(String, RateLimits), LlmError> {
+    let system = messages
+        .iter()
+        .find(|message| message.role == "system")
+        .map(|message| message.content.clone())
+        .unwrap_or_default();
+    let user_messages: Vec<serde_json::Value> = messages
+        .into_iter()
+        .filter(|message| message.role != "system")
+        .map(|message| {
+            serde_json::json!({
+                "role": message.role,
+                "content": message.content,
+            })
+        })
+        .collect();
+    let body = serde_json::json!({
+        "model": model,
+        "max_tokens": 4096,
+        "system": system,
+        "messages": user_messages,
+    });
+    let response = http_client()?
+        .post(endpoint)
+        .header("x-api-key", key)
+        .header("anthropic-version", "2023-06-01")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|error| {
+            if error.is_timeout() {
+                LlmError::Timeout
+            } else {
+                LlmError::Network(error.to_string())
+            }
+        })?;
+    let limits = crate::asr::parse_rate_limits(response.headers());
+    let status = response.status();
+    if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+        return Err(LlmError::Unauthorized);
+    }
+    if status == StatusCode::TOO_MANY_REQUESTS {
+        return Err(LlmError::RateLimited(
+            limits.retry_after.clone().unwrap_or_default(),
+        ));
+    }
+    if !status.is_success() {
+        let detail = response
+            .text()
+            .await
+            .ok()
+            .and_then(|body| provider_error_detail(&body));
+        let message = format_status_with_detail(status, detail.as_deref());
+        if status.is_server_error() {
+            return Err(LlmError::Server(message));
+        }
+        return Err(LlmError::Other(message));
+    }
+    let parsed: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|error| LlmError::Other(error.to_string()))?;
+    let output = parsed
+        .get("content")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|block| {
+            (block.get("type").and_then(serde_json::Value::as_str) == Some("text"))
+                .then(|| block.get("text").and_then(serde_json::Value::as_str))
+                .flatten()
+        })
+        .collect::<Vec<_>>()
+        .join("");
     if output.trim().is_empty() {
         return Err(LlmError::Other("empty completion".into()));
     }

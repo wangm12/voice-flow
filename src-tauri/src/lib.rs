@@ -22,6 +22,7 @@ mod modifier_hotkey;
 mod notch;
 mod paste;
 mod permissions;
+mod providers;
 mod queue;
 mod prefetch_asr;
 mod selected_action;
@@ -61,8 +62,8 @@ fn current_asr_provider(state: &AppState) -> Arc<dyn asr::AsrProvider> {
     lock_recover(&state.asr_provider).clone()
 }
 
-fn rebuild_asr_provider(state: &AppState, base_url: &str) {
-    *lock_recover(&state.asr_provider) = Arc::new(asr::GroqAsrProvider::from_base_url(base_url));
+fn rebuild_asr_provider(state: &AppState, endpoint: &str) {
+    *lock_recover(&state.asr_provider) = Arc::new(asr::GroqAsrProvider::from_resolved_endpoint(endpoint));
 }
 
 #[derive(Debug, Clone)]
@@ -1029,16 +1030,19 @@ pub(crate) async fn start_claimed(
             "A valid API key is required before dictation can start",
         ));
     }
-    if !asr::groq_key_fallback_allowed(&settings_snapshot.asr_base_url)
-        && settings_snapshot.asr_api_key.trim().is_empty()
-    {
+    let asr_url = settings_snapshot.resolved_provider_base(settings_snapshot.asr_provider);
+    let asr_empty_ok = settings_snapshot.asr_provider.allows_empty_key()
+        && crate::providers::is_loopback_url(&asr_url);
+    if settings_snapshot.asr_credential().trim().is_empty() && !asr_empty_ok {
         let Some(failure_generation) = reset_starting(state, session_generation) else {
             return Ok(());
         };
-        return Err(StartError::new(
-            failure_generation,
-            "自定义 ASR 地址需要填写 ASR 密钥。",
-        ));
+        let message = if settings_snapshot.asr_provider.is_custom() {
+            "自定义 ASR 地址需要填写 ASR 密钥。"
+        } else {
+            "缺少所选服务商的密钥。"
+        };
+        return Err(StartError::new(failure_generation, message));
     }
     // Always refresh immediately before starting audio. A stale check is not
     // enough here: the user may have switched apps within the freshness
@@ -3830,16 +3834,20 @@ async fn apply_settings(
             log::warn!("history retention cleanup after settings change failed: {error}");
         }
     }
-    let asr_provider_changed =
-        prev.asr_base_url != settings.asr_base_url || prev.asr_api_key != settings.asr_api_key;
-    let next_asr_base_url = settings.asr_base_url.clone();
+    let asr_provider_changed = prev.asr_provider != settings.asr_provider
+        || prev.asr_base_url != settings.asr_base_url
+        || prev.custom_base_url != settings.custom_base_url
+        || prev.local_whisper_base_url != settings.local_whisper_base_url
+        || prev.asr_api_key != settings.asr_api_key
+        || prev.asr_endpoint() != settings.asr_endpoint();
+    let next_asr_endpoint = settings.asr_endpoint();
     let settings_view = store::SettingsView::from(&settings);
     *lock_recover(&state.settings) = settings;
     if asr_key_cleared || cleanup_key_cleared {
         let _ = app.emit("settings://changed", settings_view);
     }
     if asr_provider_changed {
-        rebuild_asr_provider(state, &next_asr_base_url);
+        rebuild_asr_provider(state, &next_asr_endpoint);
     }
     if tray_visibility_changed {
         if let Some(tray) = app.tray_by_id("voiceflow-status") {
@@ -3920,6 +3928,13 @@ async fn update_settings_patch(
         "cleanup_provider",
         "cleanup_base_url",
         "cleanup_api_key",
+        "custom_base_url",
+        "custom_asr",
+        "custom_llm",
+        "ollama_base_url",
+        "local_whisper_base_url",
+        "provider_keys",
+        "provider_api_keys",
     ];
     if let Some(unknown) = object.keys().find(|key| !ALLOWED.contains(&key.as_str())) {
         return Err(format!("unsupported settings field: {unknown}"));
@@ -3956,7 +3971,39 @@ async fn update_settings_patch(
             );
         }
     }
-    let settings = serde_json::from_value(merged).map_err(|error| error.to_string())?;
+    if let Some(incoming) = object.get("provider_keys").or_else(|| object.get("provider_api_keys"))
+    {
+        let mut keys = current.provider_api_keys.clone();
+        if let Some(map) = incoming.as_object() {
+            for (id, value) in map {
+                if let Some(secret) = value.as_str().filter(|item| !item.trim().is_empty()) {
+                    keys.insert(id.clone(), secret.to_owned());
+                } else if let Some(secret) = value.get("key").and_then(|item| item.as_str()) {
+                    if !secret.trim().is_empty() {
+                        keys.insert(id.clone(), secret.to_owned());
+                    }
+                }
+            }
+        }
+        merged_object.insert(
+            "provider_api_keys".into(),
+            serde_json::to_value(keys).unwrap_or(serde_json::json!({})),
+        );
+        merged_object.remove("provider_keys");
+    }
+    let mut settings: store::Settings =
+        serde_json::from_value(merged).map_err(|error| error.to_string())?;
+    if let Some(groq) = settings.provider_api_keys.get("groq").cloned() {
+        if !groq.trim().is_empty() {
+            settings.api_key = groq;
+        }
+    }
+    if let Some(custom) = settings.provider_api_keys.get("custom").cloned() {
+        if !custom.trim().is_empty() {
+            settings.asr_api_key = custom.clone();
+            settings.cleanup_api_key = custom;
+        }
+    }
     apply_settings(app, &state, settings).await
 }
 
@@ -3995,9 +4042,9 @@ async fn remove_asr_api_key(
     let mut settings = lock_recover(&state.settings).clone();
     settings.asr_api_key.clear();
     store::save_settings(&dir, &settings).map_err(|error| error.to_string())?;
-    let asr_base_url = settings.asr_base_url.clone();
+    let asr_endpoint = settings.asr_endpoint();
     *lock_recover(&state.settings) = settings.clone();
-    rebuild_asr_provider(&state, &asr_base_url);
+    rebuild_asr_provider(&state, &asr_endpoint);
     Ok(store::SettingsView::from(&settings))
 }
 
@@ -4015,6 +4062,35 @@ async fn remove_cleanup_api_key(
         .map_err(|error| error.to_string())?;
     let mut settings = lock_recover(&state.settings).clone();
     settings.cleanup_api_key.clear();
+    store::save_settings(&dir, &settings).map_err(|error| error.to_string())?;
+    *lock_recover(&state.settings) = settings.clone();
+    Ok(store::SettingsView::from(&settings))
+}
+
+#[tauri::command]
+async fn remove_provider_key(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    provider: String,
+) -> Result<store::SettingsView, String> {
+    let _guard = state.settings_gate.lock().await;
+    let parsed = crate::providers::EngineProvider::parse(&provider)
+        .ok_or_else(|| format!("unknown provider: {provider}"))?;
+    keychain::set_provider_api_key(parsed, "")
+        .map_err(|error| format!("failed to remove provider key securely: {error}"))?;
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| error.to_string())?;
+    let mut settings = lock_recover(&state.settings).clone();
+    settings.provider_api_keys.remove(parsed.as_str());
+    if parsed.is_groq() {
+        settings.api_key.clear();
+    }
+    if parsed.is_custom() {
+        settings.asr_api_key.clear();
+        settings.cleanup_api_key.clear();
+    }
     store::save_settings(&dir, &settings).map_err(|error| error.to_string())?;
     *lock_recover(&state.settings) = settings.clone();
     Ok(store::SettingsView::from(&settings))
@@ -4200,8 +4276,8 @@ pub fn run() {
                 selected_preview: Mutex::new(None),
                 undo: Mutex::new(None),
                 operation_lease: Mutex::new(OperationLease::Idle),
-                asr_provider: Mutex::new(Arc::new(asr::GroqAsrProvider::from_base_url(
-                    &settings.asr_base_url,
+                asr_provider: Mutex::new(Arc::new(asr::GroqAsrProvider::from_resolved_endpoint(
+                    settings.asr_endpoint(),
                 ))),
                 settings: Mutex::new(settings.clone()),
                 context: Mutex::new(context::ContextState::new_with_modes(
@@ -4432,6 +4508,7 @@ pub fn run() {
             remove_api_key,
             remove_asr_api_key,
             remove_cleanup_api_key,
+            remove_provider_key,
             get_usage,
             get_latency_metrics,
             history_commands::get_history,

@@ -1,17 +1,18 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
+import { I18nProvider } from "../../lib/i18n";
 import type { Settings } from "../../types/settings";
 import { EngineSettings } from "./EngineSettings";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 
 const settings: Settings = {
-  schema_version: 16,
+  schema_version: 17,
   api_key_configured: true,
   api_key_hint: "••••yabcd",
   asr_model: "whisper-large-v3-turbo",
-  cleanup_model: "openai/gpt-oss-20b",
+  cleanup_model: "gpt-4o-mini",
   language: "auto",
   ui_language: "zh",
   theme: "system",
@@ -35,10 +36,14 @@ const settings: Settings = {
   output_mode: "auto",
   translation_target_language: "en",
   input_device: "",
-  asr_base_url: "",
   asr_provider: "groq",
+  cleanup_provider: "openai",
   asr_api_key_configured: false,
   asr_api_key_hint: null,
+  provider_keys: {
+    groq: { configured: true, hint: "••••yabcd" },
+    openai: { configured: true, hint: "••••i-key" },
+  },
 };
 
 const unused = {
@@ -47,6 +52,7 @@ const unused = {
   saveAsrApiKey: vi.fn(),
   removeAsrApiKey: vi.fn(),
   removeCleanupApiKey: vi.fn(),
+  removeProviderKey: vi.fn(),
 };
 
 function renderEngine(overrides: Partial<Settings> = {}, handlers: Partial<Parameters<typeof EngineSettings>[0]> = {}) {
@@ -67,59 +73,69 @@ describe("EngineSettings form", () => {
     vi.mocked(invoke).mockReset();
   });
 
-  it("shows providers and Groq fields on one page", () => {
+  it("keeps ASR and cleanup dropdowns filtered by capability", () => {
+    renderEngine();
+    const asr = screen.getByRole("combobox", { name: "转写服务" });
+    const cleanup = screen.getByRole("combobox", { name: "整理服务" });
+    expect(asr).toHaveValue("groq");
+    expect(cleanup).toHaveValue("openai");
+    expect(within(asr).queryByRole("option", { name: "DeepSeek" })).not.toBeInTheDocument();
+    expect(within(asr).queryByRole("option", { name: "Anthropic" })).not.toBeInTheDocument();
+    expect(within(cleanup).queryByRole("option", { name: "Deepgram" })).not.toBeInTheDocument();
+    expect(within(cleanup).queryByRole("option", { name: "Local Whisper" })).not.toBeInTheDocument();
+    expect(within(asr).getByRole("option", { name: "Deepgram" })).toBeInTheDocument();
+    expect(within(cleanup).getByRole("option", { name: "DeepSeek" })).toBeInTheDocument();
+  });
+
+  it("shows one key field each for Groq and OpenAI", () => {
+    renderEngine();
+    expect(screen.getByLabelText("Groq API Key")).toHaveValue("••••yabcd");
+    expect(screen.getByLabelText("OpenAI API Key")).toHaveValue("••••i-key");
+    expect(screen.queryByLabelText("Deepgram API Key")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "删除本机密钥" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "删除 ASR 密钥" })).not.toBeInTheDocument();
+    expect(screen.getAllByRole("button", { name: "删除密钥" })).toHaveLength(2);
+  });
+
+  it("keeps model notes in the interface language", () => {
+    renderEngine();
+    expect(screen.getByRole("option", { name: "Whisper Large v3 Turbo · 默认 · 更快" })).toBeInTheDocument();
+    cleanup();
+    render(
+      <I18nProvider initialLanguage="en">
+        <EngineSettings settings={settings} save={vi.fn()} commitEngine={vi.fn()} {...unused} />
+      </I18nProvider>,
+    );
+    expect(screen.getByRole("option", { name: "Whisper Large v3 Turbo · Default · Faster" })).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: "GPT-4o mini · Default · Faster" })).toBeInTheDocument();
+    expect(screen.queryByRole("option", { name: /默认/ })).not.toBeInTheDocument();
+  });
+
+  it("places provider controls under each title and keeps test in its own box", () => {
+    renderEngine();
+    const asrTitle = screen.getByText("转写", { selector: "p.text-sm" });
+    const asrSelect = screen.getByRole("combobox", { name: "转写服务" });
+    expect(asrTitle.compareDocumentPosition(asrSelect) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    const testButton = screen.getByRole("button", { name: "测试当前配置" });
+    expect(screen.getByText("正在使用").closest("section")).not.toContainElement(testButton);
+    expect(testButton.parentElement?.className).not.toMatch(/border/);
+  });
+
+  it("uses a quiet ready status instead of a green key-valid line", () => {
+    renderEngine();
+    expect(screen.getAllByText("已就绪")).toHaveLength(2);
+    expect(screen.queryByText(/已就绪 ·/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/密钥有效/)).not.toBeInTheDocument();
+    expect(screen.getAllByText("已就绪")[0].className).toContain("text-success");
+    expect(screen.getAllByText("使用中")[0].className).toContain("text-accent");
+    expect(screen.getAllByText("未添加")[0].className).toContain("text-tertiary");
+  });
+
+  it("saves a known Groq model immediately", () => {
     const save = vi.fn();
     renderEngine({}, { save });
-    expect(screen.getByRole("combobox", { name: "转写服务" })).toHaveValue("groq");
-    expect(screen.getByRole("combobox", { name: "整理服务" })).toHaveValue("groq");
-    expect(screen.queryByRole("button", { name: "下一步" })).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "上一步" })).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "重新配置" })).not.toBeInTheDocument();
-    expect(screen.queryByRole("textbox", { name: "ASR 兼容地址" })).not.toBeInTheDocument();
-    expect(screen.getByRole("combobox", { name: "ASR 模型" })).toHaveValue("whisper-large-v3-turbo");
-    expect(screen.queryByRole("option", { name: /whisper-1/i })).not.toBeInTheDocument();
-    expect(screen.getByRole("combobox", { name: "AI 文字整理模型" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "开始测试" })).toBeInTheDocument();
-    expect(screen.queryByRole("heading", { name: "测试整条链路" })).not.toBeInTheDocument();
-    expect(screen.getByLabelText("Groq API Key（访问密钥）")).toHaveValue("••••yabcd");
     fireEvent.change(screen.getByRole("combobox", { name: "ASR 模型" }), { target: { value: "whisper-large-v3" } });
     expect(save).toHaveBeenCalledWith({ asr_model: "whisper-large-v3" });
-  });
-
-  it("reveals custom fields when the user picks another provider", () => {
-    renderEngine({ api_key_configured: false });
-    expect(screen.queryByRole("textbox", { name: "ASR 兼容地址" })).not.toBeInTheDocument();
-    fireEvent.change(screen.getByRole("combobox", { name: "转写服务" }), { target: { value: "custom" } });
-    expect(screen.getByRole("textbox", { name: "ASR 兼容地址" })).toBeInTheDocument();
-    expect(screen.getByRole("textbox", { name: "ASR 模型名" })).toBeInTheDocument();
-    expect(screen.getByLabelText("ASR API Key")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "开始测试" })).toBeDisabled();
-    fireEvent.change(screen.getByRole("textbox", { name: "ASR 兼容地址" }), { target: { value: "http://127.0.0.1:8000/v1" } });
-    fireEvent.change(screen.getByRole("textbox", { name: "ASR 模型名" }), { target: { value: "whisper-1" } });
-    fireEvent.change(screen.getByLabelText("ASR API Key"), { target: { value: "local-key" } });
-    fireEvent.change(screen.getByLabelText("Groq API Key（访问密钥）"), { target: { value: "gsk_test" } });
-    expect(screen.getByRole("button", { name: "开始测试" })).toBeEnabled();
-  });
-
-  it("clears a custom model when switching back to Groq", () => {
-    renderEngine({ api_key_configured: false });
-    fireEvent.change(screen.getByRole("combobox", { name: "转写服务" }), { target: { value: "custom" } });
-    fireEvent.change(screen.getByRole("textbox", { name: "ASR 模型名" }), { target: { value: "whisper-1" } });
-    fireEvent.change(screen.getByRole("combobox", { name: "转写服务" }), { target: { value: "groq" } });
-    expect(screen.getByRole("combobox", { name: "ASR 模型" })).toHaveValue("whisper-large-v3-turbo");
-    expect(screen.queryByRole("textbox", { name: "ASR 模型名" })).not.toBeInTheDocument();
-  });
-
-  it("shows a friendly message for unclassified provider errors", async () => {
-    vi.mocked(invoke).mockResolvedValue({
-      asr: { ok: false, skipped: false, error_kind: "provider", message: "Groq error: HTTP status 400 Bad Request" },
-      cleanup: { ok: true, skipped: false },
-    });
-    renderEngine({ api_key_configured: false });
-    fireEvent.change(screen.getByLabelText("Groq API Key（访问密钥）"), { target: { value: "gsk_test" } });
-    fireEvent.click(screen.getByRole("button", { name: "开始测试" }));
-    await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent("服务返回错误"));
-    expect(screen.getByRole("alert")).not.toHaveTextContent("HTTP status 400");
   });
 
   it("does not persist when the probe fails", async () => {
@@ -128,12 +144,10 @@ describe("EngineSettings form", () => {
       asr: { ok: false, skipped: false, error_kind: "model", message: "nope" },
       cleanup: { ok: true, skipped: false },
     });
-    renderEngine({ api_key_configured: false }, { commitEngine });
-    fireEvent.change(screen.getByLabelText("Groq API Key（访问密钥）"), { target: { value: "gsk_test" } });
-    fireEvent.click(screen.getByRole("button", { name: "开始测试" }));
+    renderEngine({}, { commitEngine });
+    fireEvent.click(screen.getByRole("button", { name: "测试当前配置" }));
     await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent("模型名不被这个接口接受"));
     expect(commitEngine).not.toHaveBeenCalled();
-    expect(screen.getByRole("button", { name: "开始测试" })).toBeInTheDocument();
   });
 
   it("persists the draft once after a successful probe", async () => {
@@ -142,30 +156,36 @@ describe("EngineSettings form", () => {
       asr: { ok: true, skipped: false },
       cleanup: { ok: true, skipped: false },
     });
-    renderEngine({ api_key_configured: false }, { commitEngine });
+    renderEngine({
+      cleanup_provider: "groq",
+      cleanup_model: "openai/gpt-oss-20b",
+      provider_keys: { groq: { configured: true, hint: "••••yabcd" } },
+    }, { commitEngine });
     fireEvent.change(screen.getByRole("combobox", { name: "转写服务" }), { target: { value: "custom" } });
-    fireEvent.change(screen.getByRole("textbox", { name: "ASR 兼容地址" }), { target: { value: "http://127.0.0.1:8000/v1" } });
-    fireEvent.change(screen.getByRole("textbox", { name: "ASR 模型名" }), { target: { value: "whisper-1" } });
-    fireEvent.change(screen.getByLabelText("ASR API Key"), { target: { value: "local-key" } });
-    fireEvent.change(screen.getByLabelText("Groq API Key（访问密钥）"), { target: { value: "gsk_test" } });
-    fireEvent.click(screen.getByRole("button", { name: "开始测试" }));
+    fireEvent.change(screen.getByLabelText("兼容地址"), { target: { value: "http://127.0.0.1:8000/v1" } });
+    fireEvent.change(screen.getByRole("textbox", { name: "ASR 模型" }), { target: { value: "whisper-1" } });
+    fireEvent.change(screen.getByLabelText("OpenAI Compatible API Key"), { target: { value: "local-key" } });
+    fireEvent.click(screen.getByRole("button", { name: "测试当前配置" }));
     await waitFor(() => expect(commitEngine).toHaveBeenCalledTimes(1));
     expect(screen.getByRole("status")).toHaveTextContent("测试通过，设置已保存");
-    expect(screen.getByLabelText("Groq API Key（访问密钥）")).toHaveValue("••••_test");
-    expect(screen.getByLabelText("ASR API Key")).toHaveValue("••••l-key");
     expect(commitEngine).toHaveBeenCalledWith(expect.objectContaining({
       asr_provider: "custom",
-      asr_base_url: "http://127.0.0.1:8000/v1",
+      custom_base_url: "http://127.0.0.1:8000/v1",
       asr_model: "whisper-1",
-      asr_api_key: "local-key",
-      api_key: "gsk_test",
-      cleanup_provider: "groq",
+      provider_keys: { custom: "local-key" },
     }));
   });
 
-  it("mentions api.groq.com when confirming ASR key removal", () => {
-    renderEngine({ asr_api_key_configured: true });
-    fireEvent.click(screen.getByRole("button", { name: "删除 ASR 密钥" }));
-    expect(screen.getByRole("dialog")).toHaveTextContent("api.groq.com");
+  it("warns and disables the primary action when a routed provider has no key", () => {
+    renderEngine({
+      cleanup_provider: "openai",
+      provider_keys: {
+        groq: { configured: true, hint: "••••yabcd" },
+        openai: { configured: false, hint: null },
+      },
+    });
+    expect(screen.getAllByText("未配置密钥").length).toBeGreaterThan(0);
+    expect(screen.getByRole("button", { name: "测试当前配置" })).toBeDisabled();
+    expect(screen.getByLabelText("OpenAI API Key")).toBeInTheDocument();
   });
 });

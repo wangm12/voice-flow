@@ -58,12 +58,26 @@ export function SettingsRow({
   );
 }
 
-export function SettingsStatus({ label, tone = "neutral" }: { label: string; tone?: "success" | "warning" | "error" | "neutral" }) {
-  const toneClass = tone === "success" ? "bg-success" : tone === "warning" ? "bg-warning" : tone === "error" ? "bg-error" : "bg-tertiary";
-  const textClass = tone === "success" ? "text-success" : tone === "warning" ? "text-warning" : tone === "error" ? "text-error" : "text-secondary";
+const statusToneClass = {
+  success: { dot: "bg-success", text: "text-success" },
+  accent: { dot: "bg-accent", text: "text-accent" },
+  warning: { dot: "bg-warning", text: "text-warning" },
+  error: { dot: "bg-error", text: "text-error" },
+  unused: { dot: "bg-tertiary", text: "text-tertiary" },
+  neutral: { dot: "bg-tertiary", text: "text-secondary" },
+} as const;
+
+export function SettingsStatus({
+  label,
+  tone = "neutral",
+}: {
+  label: string;
+  tone?: keyof typeof statusToneClass;
+}) {
+  const toneClass = statusToneClass[tone];
   return (
-    <span className={`inline-flex items-center gap-1.5 text-xs font-medium ${textClass}`}>
-      <span aria-hidden="true" className={`h-1.5 w-1.5 rounded-full ${toneClass}`} />
+    <span className={`inline-flex items-center gap-1.5 text-xs font-medium ${toneClass.text}`}>
+      <span aria-hidden="true" className={`h-1.5 w-1.5 rounded-full ${toneClass.dot}`} />
       {label}
     </span>
   );

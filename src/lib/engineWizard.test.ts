@@ -9,11 +9,12 @@ import {
   persistPatch,
   step2Ready,
   switchProvider,
+  type EngineDraft,
 } from "./engineWizard";
 import type { Settings } from "../types/settings";
 
 const groqConnected: Settings = {
-  schema_version: 16,
+  schema_version: 17,
   api_key_configured: true,
   api_key_hint: "••••abcd",
   asr_model: DEFAULT_ASR_MODEL,
@@ -41,12 +42,33 @@ const groqConnected: Settings = {
   output_mode: "auto",
   translation_target_language: "en",
   input_device: "",
+  asr_provider: "groq",
+  cleanup_provider: "groq",
+  provider_keys: {
+    groq: { configured: true, hint: "••••abcd" },
+  },
 };
+
+function emptyDraft(overrides: Partial<EngineDraft> = {}): EngineDraft {
+  return {
+    asrProvider: "groq",
+    cleanupProvider: "groq",
+    asrModel: DEFAULT_ASR_MODEL,
+    cleanupModel: DEFAULT_CLEANUP_MODEL,
+    customBaseUrl: "",
+    customAsr: true,
+    customLlm: true,
+    ollamaBaseUrl: "http://127.0.0.1:11434/v1",
+    localWhisperBaseUrl: "http://127.0.0.1:9000/v1",
+    providerKeys: {},
+    ...overrides,
+  };
+}
 
 describe("engine wizard rules", () => {
   it("treats an onboarded Groq key as connected", () => {
     expect(isEngineConnected(groqConnected)).toBe(true);
-    expect(isEngineConnected({ ...groqConnected, api_key_configured: false })).toBe(false);
+    expect(isEngineConnected({ ...groqConnected, api_key_configured: false, provider_keys: {} })).toBe(false);
   });
 
   it("allows ASR-only when cleanup is disabled", () => {
@@ -54,71 +76,71 @@ describe("engine wizard rules", () => {
       isEngineConnected({
         ...groqConnected,
         api_key_configured: false,
+        provider_keys: { custom: { configured: true, hint: "••••ocal" } },
         asr_provider: "custom",
-        asr_base_url: "http://127.0.0.1:8000/v1",
+        custom_base_url: "http://127.0.0.1:8000/v1",
         asr_api_key_configured: true,
         cleanup_enabled: false,
       }),
     ).toBe(true);
   });
 
-  it("requires a cleanup key when cleanup is custom and enabled", () => {
+  it("requires a cleanup key when cleanup is OpenAI and enabled", () => {
     expect(
       isEngineConnected({
         ...groqConnected,
-        cleanup_provider: "custom",
-        cleanup_base_url: "https://api.openai.com/v1",
-        cleanup_api_key_configured: false,
+        cleanup_provider: "openai",
+        cleanup_model: "gpt-4o-mini",
+        provider_keys: {
+          groq: { configured: true, hint: "••••abcd" },
+          openai: { configured: false, hint: null },
+        },
       }),
     ).toBe(false);
   });
 
-  it("clears custom URL and model when switching a side back to Groq", () => {
+  it("resets the model and keeps pool keys when switching a side", () => {
     const draft = switchProvider(
-      {
+      emptyDraft({
         asrProvider: "custom",
-        cleanupProvider: "custom",
-        asrBaseUrl: "http://127.0.0.1:8000/v1",
-        cleanupBaseUrl: "https://api.openai.com/v1",
+        cleanupProvider: "openai",
         asrModel: "whisper-1",
         cleanupModel: "gpt-4o-mini",
-        apiKey: "",
-        asrApiKey: "",
-        cleanupApiKey: "",
-      },
+        providerKeys: { groq: "gsk_keep", openai: "sk-keep" },
+      }),
       "asr",
       "groq",
     );
     expect(draft.asrProvider).toBe("groq");
-    expect(draft.asrBaseUrl).toBe("");
     expect(draft.asrModel).toBe(DEFAULT_ASR_MODEL);
     expect(draft.cleanupModel).toBe("gpt-4o-mini");
+    expect(draft.providerKeys.groq).toBe("gsk_keep");
+    expect(draft.providerKeys.openai).toBe("sk-keep");
   });
 
   it("does not copy Groq model ids when switching to custom", () => {
     const draft = switchProvider(draftFromSettings(groqConnected), "cleanup", "custom");
     expect(draft.cleanupProvider).toBe("custom");
-    expect(draft.cleanupBaseUrl).toBe("");
     expect(draft.cleanupModel).toBe("");
   });
 
   it("requires URL, model, and key for custom step 2", () => {
-    const draft = {
-      asrProvider: "custom" as const,
-      cleanupProvider: "groq" as const,
-      asrBaseUrl: "",
-      cleanupBaseUrl: "",
+    const draft = emptyDraft({
+      asrProvider: "custom",
       asrModel: "",
-      cleanupModel: DEFAULT_CLEANUP_MODEL,
-      apiKey: "gsk_test",
-      asrApiKey: "",
-      cleanupApiKey: "",
-    };
+      providerKeys: { groq: "gsk_test" },
+    });
     expect(step2Ready(draft, groqConnected)).toBe(false);
-    expect(step2Ready({ ...draft, asrBaseUrl: "http://127.0.0.1:8000/v1", asrModel: "whisper-1" }, groqConnected)).toBe(false);
+    expect(step2Ready({ ...draft, customBaseUrl: "https://relay.example.com/v1", asrModel: "whisper-1" }, groqConnected)).toBe(false);
     expect(
       step2Ready(
-        { ...draft, asrBaseUrl: "http://127.0.0.1:8000/v1", asrModel: "whisper-1", asrApiKey: "local" },
+        { ...draft, customBaseUrl: "https://relay.example.com/v1", asrModel: "whisper-1", providerKeys: { custom: "local" } },
+        groqConnected,
+      ),
+    ).toBe(true);
+    expect(
+      step2Ready(
+        { ...draft, customBaseUrl: "http://127.0.0.1:8000/v1", asrModel: "whisper-1" },
         groqConnected,
       ),
     ).toBe(true);
@@ -126,23 +148,20 @@ describe("engine wizard rules", () => {
 
   it("omits cleanup fields from persist when cleanup is disabled", () => {
     const patch = persistPatch(
-      {
+      emptyDraft({
         asrProvider: "custom",
         cleanupProvider: "custom",
-        asrBaseUrl: "http://127.0.0.1:8000/v1",
-        cleanupBaseUrl: "https://api.openai.com/v1",
+        customBaseUrl: "http://127.0.0.1:8000/v1",
         asrModel: "whisper-1",
         cleanupModel: "gpt-4o-mini",
-        apiKey: "",
-        asrApiKey: "local",
-        cleanupApiKey: "sk",
-      },
+        providerKeys: { custom: "local" },
+      }),
       { ...groqConnected, cleanup_enabled: false },
     );
     expect(patch.asr_provider).toBe("custom");
-    expect(patch.asr_base_url).toBe("http://127.0.0.1:8000/v1");
+    expect(patch.custom_base_url).toBe("http://127.0.0.1:8000/v1");
     expect(patch.cleanup_provider).toBeUndefined();
-    expect(patch.cleanup_api_key).toBeUndefined();
+    expect(patch.provider_keys).toEqual({ custom: "local" });
   });
 
   it("masks a secret with bullets and the last five characters", () => {

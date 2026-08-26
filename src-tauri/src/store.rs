@@ -13,7 +13,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
-pub const SETTINGS_SCHEMA_VERSION: u32 = 16;
+pub const SETTINGS_SCHEMA_VERSION: u32 = 17;
 const HISTORY_SCHEMA_VERSION: i32 = 8;
 const LEARN_PAIRS_PENDING_CAP: i64 = 256;
 
@@ -97,6 +97,18 @@ pub struct Settings {
     pub cleanup_base_url: String,
     #[serde(default)]
     pub cleanup_api_key: String,
+    #[serde(default)]
+    pub custom_base_url: String,
+    #[serde(default = "default_true")]
+    pub custom_asr: bool,
+    #[serde(default = "default_true")]
+    pub custom_llm: bool,
+    #[serde(default)]
+    pub ollama_base_url: String,
+    #[serde(default)]
+    pub local_whisper_base_url: String,
+    #[serde(default)]
+    pub provider_api_keys: std::collections::BTreeMap<String, String>,
     #[serde(default = "default_show_tray_icon")]
     pub show_tray_icon: bool,
     pub context_enabled: bool,
@@ -172,6 +184,10 @@ fn default_asr_model() -> String {
     crate::asr::MODEL.to_owned()
 }
 
+fn default_true() -> bool {
+    true
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -199,6 +215,16 @@ impl Default for Settings {
             cleanup_provider: crate::engine::EngineProvider::Groq,
             cleanup_base_url: String::new(),
             cleanup_api_key: String::new(),
+            custom_base_url: String::new(),
+            custom_asr: true,
+            custom_llm: true,
+            ollama_base_url: crate::providers::EngineProvider::Ollama
+                .default_base_url()
+                .to_owned(),
+            local_whisper_base_url: crate::providers::EngineProvider::LocalWhisper
+                .default_base_url()
+                .to_owned(),
+            provider_api_keys: std::collections::BTreeMap::new(),
             show_tray_icon: true,
             context_enabled: true,
             browser_access_enabled: false,
@@ -273,6 +299,9 @@ impl Settings {
                 self.cleanup_provider = crate::engine::EngineProvider::Groq;
                 self.cleanup_base_url.clear();
                 self.cleanup_api_key.clear();
+            }
+            if self.schema_version < 17 {
+                self.migrate_provider_pool();
             }
             self.schema_version = SETTINGS_SCHEMA_VERSION;
         }
@@ -393,10 +422,16 @@ impl Settings {
         // wipe a working custom URL during load_settings, before credentials
         // are rebound. Empty-key repair happens in
         // `repair_incomplete_engine_sides` after keys are in memory.
-        if self.asr_provider.is_custom() && self.asr_base_url.trim().is_empty() {
+        if self.asr_provider.is_custom()
+            && self.custom_base_url.trim().is_empty()
+            && self.asr_base_url.trim().is_empty()
+        {
             self.asr_provider = crate::engine::EngineProvider::Groq;
         }
-        if self.cleanup_provider.is_custom() && self.cleanup_base_url.trim().is_empty() {
+        if self.cleanup_provider.is_custom()
+            && self.custom_base_url.trim().is_empty()
+            && self.cleanup_base_url.trim().is_empty()
+        {
             self.cleanup_provider = crate::engine::EngineProvider::Groq;
         }
         if self.asr_provider.is_groq() {
@@ -404,12 +439,84 @@ impl Settings {
             if !crate::asr::is_groq_asr_model(&self.asr_model) {
                 self.asr_model = default_asr_model();
             }
+        } else if self.asr_model.trim().is_empty() {
+            self.asr_model = self.asr_provider.default_asr_model().to_owned();
         }
         if self.cleanup_provider.is_groq() {
             self.cleanup_base_url.clear();
             if !crate::llm::is_supported_model(&self.cleanup_model) {
                 self.cleanup_model = default_cleanup_model();
             }
+        } else if self.cleanup_model.trim().is_empty() {
+            self.cleanup_model = self.cleanup_provider.default_llm_model().to_owned();
+        }
+        if self.ollama_base_url.trim().is_empty() {
+            self.ollama_base_url = crate::providers::EngineProvider::Ollama
+                .default_base_url()
+                .to_owned();
+        }
+        if self.local_whisper_base_url.trim().is_empty() {
+            self.local_whisper_base_url = crate::providers::EngineProvider::LocalWhisper
+                .default_base_url()
+                .to_owned();
+        }
+    }
+
+    fn migrate_provider_pool(&mut self) {
+        if self.asr_provider.is_custom() {
+            if let Some(named) = crate::providers::infer_provider_from_host(&self.asr_base_url) {
+                self.asr_provider = named;
+                if !self.asr_api_key.trim().is_empty() {
+                    self.provider_api_keys
+                        .insert(named.as_str().to_owned(), self.asr_api_key.clone());
+                }
+                if named == crate::providers::EngineProvider::Ollama {
+                    self.ollama_base_url = self.asr_base_url.clone();
+                }
+                if named == crate::providers::EngineProvider::LocalWhisper {
+                    self.local_whisper_base_url = self.asr_base_url.clone();
+                }
+                if !named.is_custom() {
+                    self.asr_base_url.clear();
+                }
+            } else if !self.asr_base_url.trim().is_empty() {
+                self.custom_base_url = self.asr_base_url.clone();
+                self.custom_asr = true;
+                if !self.asr_api_key.trim().is_empty() {
+                    self.provider_api_keys
+                        .insert("custom".into(), self.asr_api_key.clone());
+                }
+            }
+        }
+        if self.cleanup_provider.is_custom() {
+            if let Some(named) = crate::providers::infer_provider_from_host(&self.cleanup_base_url) {
+                self.cleanup_provider = named;
+                if !self.cleanup_api_key.trim().is_empty() {
+                    self.provider_api_keys
+                        .insert(named.as_str().to_owned(), self.cleanup_api_key.clone());
+                }
+                if named == crate::providers::EngineProvider::Ollama {
+                    self.ollama_base_url = self.cleanup_base_url.clone();
+                }
+                if !named.is_custom() {
+                    self.cleanup_base_url.clear();
+                }
+            } else if !self.cleanup_base_url.trim().is_empty() {
+                if self.custom_base_url.trim().is_empty() {
+                    self.custom_base_url = self.cleanup_base_url.clone();
+                }
+                self.custom_llm = true;
+                if !self.cleanup_api_key.trim().is_empty() {
+                    self.provider_api_keys
+                        .entry("custom".into())
+                        .or_insert_with(|| self.cleanup_api_key.clone());
+                }
+            }
+        }
+        if !self.api_key.trim().is_empty() {
+            self.provider_api_keys
+                .entry("groq".into())
+                .or_insert_with(|| self.api_key.clone());
         }
     }
 
@@ -422,9 +529,16 @@ impl Settings {
     }
 
     fn repair_incomplete_asr(&mut self) -> bool {
-        if !self.asr_provider.is_custom()
-            || (!self.asr_base_url.trim().is_empty() && !self.asr_api_key.trim().is_empty())
-        {
+        if !self.asr_provider.is_custom() {
+            return false;
+        }
+        let url = if self.custom_base_url.trim().is_empty() {
+            self.asr_base_url.trim()
+        } else {
+            self.custom_base_url.trim()
+        };
+        let key = self.provider_secret(self.asr_provider);
+        if !url.is_empty() && (!key.is_empty() || crate::providers::is_loopback_url(url)) {
             return false;
         }
         self.asr_provider = crate::engine::EngineProvider::Groq;
@@ -436,9 +550,16 @@ impl Settings {
     }
 
     fn repair_incomplete_cleanup(&mut self) -> bool {
-        if !self.cleanup_provider.is_custom()
-            || (!self.cleanup_base_url.trim().is_empty() && !self.cleanup_api_key.trim().is_empty())
-        {
+        if !self.cleanup_provider.is_custom() {
+            return false;
+        }
+        let url = if self.custom_base_url.trim().is_empty() {
+            self.cleanup_base_url.trim()
+        } else {
+            self.custom_base_url.trim()
+        };
+        let key = self.provider_secret(self.cleanup_provider);
+        if !url.is_empty() && (!key.is_empty() || crate::providers::is_loopback_url(url)) {
             return false;
         }
         self.cleanup_provider = crate::engine::EngineProvider::Groq;
@@ -537,21 +658,15 @@ impl Settings {
             .map_err(|error| anyhow::anyhow!(error))?;
         crate::asr::validate_asr_base_url(&self.cleanup_base_url)
             .map_err(|error| anyhow::anyhow!(error))?;
-        if (self.asr_provider.is_custom() || !crate::asr::groq_key_fallback_allowed(&self.asr_base_url))
-            && self.asr_api_key.trim().is_empty()
-        {
-            anyhow::bail!("自定义 ASR 地址需要填写 ASR 密钥。");
-        }
-        if self.asr_provider.is_custom() && self.asr_base_url.trim().is_empty() {
-            anyhow::bail!("自定义 ASR 需要填写兼容地址。");
-        }
-        if self.cleanup_provider.is_custom() {
-            if self.cleanup_base_url.trim().is_empty() {
-                anyhow::bail!("自定义整理需要填写兼容地址。");
-            }
-            if self.cleanup_api_key.trim().is_empty() {
-                anyhow::bail!("自定义整理地址需要填写整理密钥。");
-            }
+        crate::asr::validate_asr_base_url(&self.custom_base_url)
+            .map_err(|error| anyhow::anyhow!(error))?;
+        crate::asr::validate_asr_base_url(&self.ollama_base_url)
+            .map_err(|error| anyhow::anyhow!(error))?;
+        crate::asr::validate_asr_base_url(&self.local_whisper_base_url)
+            .map_err(|error| anyhow::anyhow!(error))?;
+        self.validate_provider_side(self.asr_provider, true)?;
+        if self.cleanup_enabled {
+            self.validate_provider_side(self.cleanup_provider, false)?;
         }
         for mapping in &self.context_mappings {
             mapping.validate().map_err(|error| anyhow::anyhow!(error))?;
@@ -587,45 +702,129 @@ impl Settings {
         Ok(())
     }
 
+    fn validate_provider_side(
+        &self,
+        provider: crate::engine::EngineProvider,
+        asr: bool,
+    ) -> anyhow::Result<()> {
+        let url = self.resolved_provider_base(provider);
+        if provider.is_custom() && url.trim().is_empty() {
+            anyhow::bail!(if asr {
+                "自定义 ASR 需要填写兼容地址。"
+            } else {
+                "自定义整理需要填写兼容地址。"
+            });
+        }
+        let key = self.provider_secret(provider);
+        let empty_ok = provider.allows_empty_key() && crate::providers::is_loopback_url(&url);
+        if key.is_empty() && !empty_ok {
+            if provider.is_groq() && !self.onboarded {
+                return Ok(());
+            }
+            if provider.is_custom() {
+                anyhow::bail!(if asr {
+                    "自定义 ASR 地址需要填写 ASR 密钥。"
+                } else {
+                    "自定义整理地址需要填写整理密钥。"
+                });
+            }
+            anyhow::bail!("缺少所选服务商的密钥。");
+        }
+        Ok(())
+    }
+
+    pub fn provider_secret(&self, provider: crate::engine::EngineProvider) -> &str {
+        if let Some(key) = self
+            .provider_api_keys
+            .get(provider.as_str())
+            .map(String::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            return key;
+        }
+        match provider {
+            crate::engine::EngineProvider::Groq => self.api_key.trim(),
+            crate::engine::EngineProvider::Custom => {
+                let asr = self.asr_api_key.trim();
+                if !asr.is_empty() {
+                    asr
+                } else {
+                    self.cleanup_api_key.trim()
+                }
+            }
+            _ => "",
+        }
+    }
+
+    pub fn resolved_provider_base(&self, provider: crate::engine::EngineProvider) -> String {
+        match provider {
+            crate::engine::EngineProvider::Groq => String::new(),
+            crate::engine::EngineProvider::Ollama => {
+                let url = self.ollama_base_url.trim();
+                if url.is_empty() {
+                    provider.default_base_url().to_owned()
+                } else {
+                    url.to_owned()
+                }
+            }
+            crate::engine::EngineProvider::LocalWhisper => {
+                let url = self.local_whisper_base_url.trim();
+                if url.is_empty() {
+                    provider.default_base_url().to_owned()
+                } else {
+                    url.to_owned()
+                }
+            }
+            crate::engine::EngineProvider::Custom => {
+                let custom = self.custom_base_url.trim();
+                if !custom.is_empty() {
+                    custom.to_owned()
+                } else if !self.asr_base_url.trim().is_empty() {
+                    self.asr_base_url.trim().to_owned()
+                } else {
+                    self.cleanup_base_url.trim().to_owned()
+                }
+            }
+            other => other.default_base_url().to_owned(),
+        }
+    }
+
+    pub fn asr_endpoint(&self) -> String {
+        crate::providers::resolve_asr_endpoint(self.asr_provider, &self.resolved_provider_base(self.asr_provider))
+    }
+
     /// Prefer a dedicated ASR key when set. Reuse the Groq key only for the
     /// Groq default or `api.groq.com`; custom hosts must supply `asr_api_key`.
     pub fn asr_credential(&self) -> &str {
-        let asr_key = self.asr_api_key.trim();
-        if !asr_key.is_empty() {
-            asr_key
-        } else if self.asr_provider.is_custom() {
-            ""
-        } else if crate::asr::groq_key_fallback_allowed(&self.asr_base_url) {
-            self.api_key.as_str()
-        } else {
-            ""
-        }
+        self.provider_secret(self.asr_provider)
     }
 
     pub fn cleanup_credential(&self) -> &str {
-        if self.cleanup_provider.is_custom() {
-            self.cleanup_api_key.trim()
-        } else {
-            self.api_key.as_str()
-        }
+        self.provider_secret(self.cleanup_provider)
     }
 
     pub fn cleanup_endpoint(&self) -> String {
-        crate::llm::resolve_chat_url(&self.cleanup_base_url)
+        crate::providers::resolve_llm_endpoint(
+            self.cleanup_provider,
+            &self.resolved_provider_base(self.cleanup_provider),
+        )
     }
 
     pub fn cleanup_request_model(&self) -> String {
-        if self.cleanup_provider.is_custom() {
+        if self.cleanup_provider.is_groq() {
+            if crate::llm::is_supported_model(&self.cleanup_model) {
+                self.cleanup_model.clone()
+            } else {
+                crate::llm::MODEL.to_owned()
+            }
+        } else {
             let model = self.cleanup_model.trim();
             if model.is_empty() {
-                crate::llm::MODEL.to_owned()
+                self.cleanup_provider.default_llm_model().to_owned()
             } else {
                 model.to_owned()
             }
-        } else if crate::llm::is_supported_model(&self.cleanup_model) {
-            self.cleanup_model.clone()
-        } else {
-            crate::llm::MODEL.to_owned()
         }
     }
 }
@@ -665,6 +864,12 @@ pub(crate) fn bind_cleanup_key_to_host(
 /// Settings exposed to the webview. The backend keeps the real credential in
 /// memory/keychain, while the UI only receives whether one is configured and a
 /// non-sensitive hint for display.
+#[derive(Debug, Clone, Serialize)]
+pub struct ProviderKeyView {
+    pub configured: bool,
+    pub hint: Option<String>,
+}
+
 fn credential_hint(key: &str) -> Option<String> {
     let key = key.trim();
     if key.is_empty() {
@@ -689,6 +894,12 @@ pub struct SettingsView {
     pub cleanup_base_url: String,
     pub cleanup_api_key_configured: bool,
     pub cleanup_api_key_hint: Option<String>,
+    pub custom_base_url: String,
+    pub custom_asr: bool,
+    pub custom_llm: bool,
+    pub ollama_base_url: String,
+    pub local_whisper_base_url: String,
+    pub provider_keys: std::collections::BTreeMap<String, ProviderKeyView>,
     pub language: String,
     pub ui_language: String,
     pub theme: String,
@@ -719,6 +930,22 @@ pub struct SettingsView {
     pub input_gain: f32,
 }
 
+fn provider_key_views(settings: &Settings) -> std::collections::BTreeMap<String, ProviderKeyView> {
+    crate::providers::EngineProvider::ALL
+        .into_iter()
+        .map(|provider| {
+            let secret = settings.provider_secret(provider);
+            (
+                provider.as_str().to_owned(),
+                ProviderKeyView {
+                    configured: !secret.is_empty(),
+                    hint: credential_hint(secret),
+                },
+            )
+        })
+        .collect()
+}
+
 impl From<&Settings> for SettingsView {
     fn from(settings: &Settings) -> Self {
         Self {
@@ -735,6 +962,12 @@ impl From<&Settings> for SettingsView {
             cleanup_base_url: settings.cleanup_base_url.clone(),
             cleanup_api_key_configured: !settings.cleanup_api_key.trim().is_empty(),
             cleanup_api_key_hint: credential_hint(&settings.cleanup_api_key),
+            custom_base_url: settings.custom_base_url.clone(),
+            custom_asr: settings.custom_asr,
+            custom_llm: settings.custom_llm,
+            ollama_base_url: settings.ollama_base_url.clone(),
+            local_whisper_base_url: settings.local_whisper_base_url.clone(),
+            provider_keys: provider_key_views(settings),
             language: settings.language.clone(),
             ui_language: settings.ui_language.clone(),
             theme: settings.theme.clone(),
@@ -1443,6 +1676,18 @@ pub fn load_settings(dir: &Path) -> (Settings, bool) {
     fill_empty_secret_from_sidecar(dir, "api_key", &mut settings.api_key);
     fill_empty_secret_from_sidecar(dir, "asr_api_key", &mut settings.asr_api_key);
     fill_empty_secret_from_sidecar(dir, "cleanup_api_key", &mut settings.cleanup_api_key);
+    for provider in crate::providers::EngineProvider::ALL {
+        match crate::keychain::get_provider_api_key_state(provider) {
+            crate::keychain::ApiKeyState::Configured(key) => {
+                settings
+                    .provider_api_keys
+                    .entry(provider.as_str().to_owned())
+                    .or_insert(key);
+            }
+            _ => {}
+        }
+    }
+    bind_legacy_keys_into_pool(&mut settings);
     if api_key_missing && settings.api_key.trim().is_empty() {
         if settings.onboarded {
             needs_persist = true;
@@ -1464,6 +1709,27 @@ pub fn load_settings(dir: &Path) -> (Settings, bool) {
         needs_persist = true;
     }
     (settings, needs_persist)
+}
+
+fn bind_legacy_keys_into_pool(settings: &mut Settings) {
+    if !settings.api_key.trim().is_empty() {
+        settings
+            .provider_api_keys
+            .entry("groq".into())
+            .or_insert_with(|| settings.api_key.clone());
+    }
+    if !settings.asr_provider.is_groq() && !settings.asr_api_key.trim().is_empty() {
+        settings
+            .provider_api_keys
+            .entry(settings.asr_provider.as_str().to_owned())
+            .or_insert_with(|| settings.asr_api_key.clone());
+    }
+    if !settings.cleanup_provider.is_groq() && !settings.cleanup_api_key.trim().is_empty() {
+        settings
+            .provider_api_keys
+            .entry(settings.cleanup_provider.as_str().to_owned())
+            .or_insert_with(|| settings.cleanup_api_key.clone());
+    }
 }
 
 /// Keep a rollback point for settings migrations without copying a legacy API
@@ -1523,10 +1789,25 @@ pub fn save_settings(dir: &Path, settings: &Settings) -> anyhow::Result<()> {
             crate::keychain::set_cleanup_api_key,
         )?;
     }
+    for (id, key) in &settings.provider_api_keys {
+        let Some(provider) = crate::providers::EngineProvider::parse(id) else {
+            continue;
+        };
+        if key.trim().is_empty() {
+            continue;
+        }
+        persist_secret_to_keychain_or_sidecar(
+            dir,
+            provider.keychain_account(),
+            key,
+            |value| crate::keychain::set_provider_api_key(provider, value),
+        )?;
+    }
     let mut on_disk = settings.clone();
     on_disk.api_key = String::new();
     on_disk.asr_api_key = String::new();
     on_disk.cleanup_api_key = String::new();
+    on_disk.provider_api_keys.clear();
     let bytes = serde_json::to_vec_pretty(&on_disk)?;
     let path = dir.join("settings.json");
     write_atomic_bytes(&path, &bytes)?;
@@ -2954,7 +3235,8 @@ mod tests {
     fn repair_incomplete_custom_asr_so_a_groq_key_can_be_saved() {
         let mut settings = Settings {
             asr_provider: crate::engine::EngineProvider::Custom,
-            asr_base_url: "http://127.0.0.1:8000/v1".into(),
+            asr_base_url: "https://relay.example.com/v1".into(),
+            custom_base_url: "https://relay.example.com/v1".into(),
             asr_api_key: String::new(),
             asr_model: "whisper-1".into(),
             api_key: "gsk_test".into(),
@@ -2977,7 +3259,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("settings.json"),
-            r#"{"schema_version":16,"asr_provider":"custom","asr_base_url":"http://127.0.0.1:8000/v1","asr_model":"whisper-1"}"#,
+            r#"{"schema_version":16,"asr_provider":"custom","asr_base_url":"https://relay.example.com/v1","asr_model":"whisper-1"}"#,
         )
         .unwrap();
         let (settings, needs_persist) = load_settings(&dir);
@@ -3608,14 +3890,18 @@ mod tests {
         assert_eq!(groq_url.asr_credential(), "gsk_fallback");
         let custom_without_asr_key = Settings {
             api_key: "gsk_fallback".into(),
+            asr_provider: crate::engine::EngineProvider::Custom,
             asr_base_url: "http://127.0.0.1:8000/v1".into(),
+            custom_base_url: "http://127.0.0.1:8000/v1".into(),
             ..Settings::default()
         };
         assert_eq!(custom_without_asr_key.asr_credential(), "");
         let with_asr_key = Settings {
             api_key: "gsk_fallback".into(),
+            asr_provider: crate::engine::EngineProvider::Custom,
             asr_api_key: "asr_only".into(),
             asr_base_url: "http://127.0.0.1:8000/v1".into(),
+            custom_base_url: "http://127.0.0.1:8000/v1".into(),
             ..Settings::default()
         };
         assert_eq!(with_asr_key.asr_credential(), "asr_only");
@@ -3663,7 +3949,9 @@ mod tests {
             .to_string()
             .contains("https://"));
         let custom_without_key = Settings {
+            asr_provider: crate::engine::EngineProvider::Custom,
             asr_base_url: "https://asr.example.com/v1".into(),
+            custom_base_url: "https://asr.example.com/v1".into(),
             ..Settings::default()
         };
         assert_eq!(
@@ -3671,13 +3959,55 @@ mod tests {
             "自定义 ASR 地址需要填写 ASR 密钥。"
         );
         let loopback_without_key = Settings {
+            asr_provider: crate::engine::EngineProvider::Custom,
             asr_base_url: "http://127.0.0.1:8000/v1".into(),
+            custom_base_url: "http://127.0.0.1:8000/v1".into(),
             ..Settings::default()
         };
+        assert!(loopback_without_key.validate().is_ok());
+    }
+
+    #[test]
+    fn schema_17_promotes_openai_cleanup_host_into_the_provider_pool() {
+        let mut settings = Settings {
+            schema_version: 16,
+            api_key: "gsk_keep".into(),
+            asr_provider: crate::engine::EngineProvider::Groq,
+            cleanup_provider: crate::engine::EngineProvider::Custom,
+            cleanup_base_url: "https://api.openai.com/v1".into(),
+            cleanup_api_key: "sk-openai".into(),
+            cleanup_model: "gpt-4o-mini".into(),
+            ..Settings::default()
+        };
+        settings.normalize();
+        assert_eq!(settings.schema_version, SETTINGS_SCHEMA_VERSION);
         assert_eq!(
-            loopback_without_key.validate().unwrap_err().to_string(),
-            "自定义 ASR 地址需要填写 ASR 密钥。"
+            settings.cleanup_provider,
+            crate::engine::EngineProvider::OpenAi
         );
+        assert_eq!(
+            settings.provider_api_keys.get("openai").map(String::as_str),
+            Some("sk-openai")
+        );
+        assert_eq!(
+            settings.provider_api_keys.get("groq").map(String::as_str),
+            Some("gsk_keep")
+        );
+        assert!(settings.cleanup_base_url.is_empty());
+        assert_eq!(settings.cleanup_model, "gpt-4o-mini");
+        assert_eq!(settings.cleanup_credential(), "sk-openai");
+        assert_eq!(settings.asr_credential(), "gsk_keep");
+    }
+
+    #[test]
+    fn named_asr_does_not_reuse_the_groq_key() {
+        let settings = Settings {
+            api_key: "gsk_keep".into(),
+            asr_provider: crate::engine::EngineProvider::OpenAi,
+            ..Settings::default()
+        };
+        assert!(settings.asr_credential().is_empty());
+        assert_eq!(settings.provider_secret(crate::engine::EngineProvider::Groq), "gsk_keep");
     }
 
     #[test]

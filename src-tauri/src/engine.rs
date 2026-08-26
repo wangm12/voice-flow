@@ -1,26 +1,12 @@
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 use crate::asr::{self, AsrError};
 use crate::llm::{self, CleanupEffort, LlmError};
+use crate::providers;
 use crate::store::Settings;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum EngineProvider {
-    #[default]
-    Groq,
-    Custom,
-}
-
-impl EngineProvider {
-    pub fn is_custom(self) -> bool {
-        matches!(self, Self::Custom)
-    }
-
-    pub fn is_groq(self) -> bool {
-        matches!(self, Self::Groq)
-    }
-}
+pub use crate::providers::EngineProvider;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EngineDraft {
@@ -36,12 +22,51 @@ pub struct EngineDraft {
     pub asr_api_key: String,
     #[serde(default)]
     pub cleanup_api_key: String,
+    #[serde(default)]
+    pub provider_keys: BTreeMap<String, String>,
+    #[serde(default)]
+    pub custom_base_url: String,
+    #[serde(default = "default_true")]
+    pub custom_asr: bool,
+    #[serde(default = "default_true")]
+    pub custom_llm: bool,
+    #[serde(default)]
+    pub ollama_base_url: String,
+    #[serde(default)]
+    pub local_whisper_base_url: String,
     #[serde(default = "default_cleanup_enabled")]
     pub cleanup_enabled: bool,
 }
 
 fn default_cleanup_enabled() -> bool {
     true
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for EngineDraft {
+    fn default() -> Self {
+        Self {
+            asr_provider: EngineProvider::Groq,
+            cleanup_provider: EngineProvider::Groq,
+            asr_base_url: String::new(),
+            cleanup_base_url: String::new(),
+            asr_model: asr::MODEL.to_owned(),
+            cleanup_model: llm::MODEL.to_owned(),
+            api_key: String::new(),
+            asr_api_key: String::new(),
+            cleanup_api_key: String::new(),
+            provider_keys: BTreeMap::new(),
+            custom_base_url: String::new(),
+            custom_asr: true,
+            custom_llm: true,
+            ollama_base_url: EngineProvider::Ollama.default_base_url().to_owned(),
+            local_whisper_base_url: EngineProvider::LocalWhisper.default_base_url().to_owned(),
+            cleanup_enabled: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -149,95 +174,208 @@ fn missing_key() -> ProbeStageResult {
     ProbeStageResult::failure(ProbeErrorKind::MissingKey, "missing key")
 }
 
-fn resolve_asr_key(draft: &EngineDraft, stored: &Settings) -> Result<String, ProbeStageResult> {
-    if draft.asr_provider.is_groq() {
-        if !draft.api_key.trim().is_empty() {
-            return Ok(draft.api_key.trim().to_owned());
-        }
-        if !stored.api_key.trim().is_empty() {
-            return Ok(stored.api_key.clone());
-        }
-        return Err(missing_key());
+fn typed_provider_key(draft: &EngineDraft, provider: EngineProvider) -> String {
+    draft
+        .provider_keys
+        .get(provider.as_str())
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_default()
+}
+
+fn resolve_side_key(
+    draft: &EngineDraft,
+    stored: &Settings,
+    provider: EngineProvider,
+    fallback_typed: &str,
+    stored_legacy: &str,
+) -> Result<String, ProbeStageResult> {
+    let typed = typed_provider_key(draft, provider);
+    if !typed.is_empty() {
+        return Ok(typed);
     }
-    if !draft.asr_api_key.trim().is_empty() {
-        return Ok(draft.asr_api_key.trim().to_owned());
+    if provider.is_groq() && !draft.api_key.trim().is_empty() {
+        return Ok(draft.api_key.trim().to_owned());
     }
-    if !asr::asr_host_changed(&stored.asr_base_url, &draft.asr_base_url)
-        && !stored.asr_api_key.trim().is_empty()
+    if !fallback_typed.trim().is_empty() {
+        return Ok(fallback_typed.trim().to_owned());
+    }
+    let stored_key = stored.provider_secret(provider);
+    if !stored_key.is_empty() {
+        return Ok(stored_key.to_owned());
+    }
+    if !stored_legacy.trim().is_empty() {
+        return Ok(stored_legacy.trim().to_owned());
+    }
+    if provider.allows_empty_key() && providers::is_loopback_url(&draft_provider_base(draft, provider))
     {
-        return Ok(stored.asr_api_key.clone());
+        return Ok(String::new());
     }
     Err(missing_key())
+}
+
+fn resolve_asr_key(draft: &EngineDraft, stored: &Settings) -> Result<String, ProbeStageResult> {
+    resolve_side_key(
+        draft,
+        stored,
+        draft.asr_provider,
+        &draft.asr_api_key,
+        stored.asr_api_key.as_str(),
+    )
 }
 
 fn resolve_cleanup_key(draft: &EngineDraft, stored: &Settings) -> Result<String, ProbeStageResult> {
-    if draft.cleanup_provider.is_groq() {
-        if !draft.api_key.trim().is_empty() {
-            return Ok(draft.api_key.trim().to_owned());
-        }
-        if !stored.api_key.trim().is_empty() {
-            return Ok(stored.api_key.clone());
-        }
-        return Err(missing_key());
+    resolve_side_key(
+        draft,
+        stored,
+        draft.cleanup_provider,
+        &draft.cleanup_api_key,
+        stored.cleanup_api_key.as_str(),
+    )
+}
+
+fn draft_provider_base(draft: &EngineDraft, provider: EngineProvider) -> String {
+    match provider {
+        EngineProvider::Ollama => nonempty(
+            &draft.ollama_base_url,
+            provider.default_base_url(),
+        ),
+        EngineProvider::LocalWhisper => nonempty(
+            &draft.local_whisper_base_url,
+            provider.default_base_url(),
+        ),
+        EngineProvider::Custom => nonempty(
+            &draft.custom_base_url,
+            nonempty(&draft.asr_base_url, &draft.cleanup_base_url),
+        ),
+        EngineProvider::Groq => String::new(),
+        other => other.default_base_url().to_owned(),
     }
-    if !draft.cleanup_api_key.trim().is_empty() {
-        return Ok(draft.cleanup_api_key.trim().to_owned());
+}
+
+fn nonempty(value: &str, fallback: impl Into<String>) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        fallback.into()
+    } else {
+        trimmed.to_owned()
     }
-    if !llm::chat_host_changed(&stored.cleanup_base_url, &draft.cleanup_base_url)
-        && !stored.cleanup_api_key.trim().is_empty()
-    {
-        return Ok(stored.cleanup_api_key.clone());
-    }
-    Err(missing_key())
 }
 
 fn draft_asr_url(draft: &EngineDraft) -> String {
-    if draft.asr_provider.is_groq() {
-        asr::resolve_transcription_url("")
+    let override_base = draft.asr_base_url.trim();
+    let base = if !override_base.is_empty() {
+        override_base.to_owned()
     } else {
-        asr::resolve_transcription_url(&draft.asr_base_url)
-    }
+        draft_provider_base(draft, draft.asr_provider)
+    };
+    providers::resolve_asr_endpoint(draft.asr_provider, &base)
 }
 
 fn draft_cleanup_url(draft: &EngineDraft) -> String {
-    if draft.cleanup_provider.is_groq() {
-        llm::resolve_chat_url("")
+    let override_base = draft.cleanup_base_url.trim();
+    let base = if !override_base.is_empty() {
+        override_base.to_owned()
     } else {
-        llm::resolve_chat_url(&draft.cleanup_base_url)
+        draft_provider_base(draft, draft.cleanup_provider)
+    };
+    providers::resolve_llm_endpoint(draft.cleanup_provider, &base)
+}
+
+pub fn apply_engine_draft(settings: &mut Settings, draft: &EngineDraft) {
+    settings.asr_provider = draft.asr_provider;
+    settings.asr_model = draft_asr_model(draft);
+    settings.cleanup_provider = draft.cleanup_provider;
+    settings.cleanup_model = draft_cleanup_model(draft);
+    settings.custom_asr = draft.custom_asr;
+    settings.custom_llm = draft.custom_llm;
+    settings.cleanup_enabled = draft.cleanup_enabled;
+    let custom = nonempty(
+        &draft.custom_base_url,
+        nonempty(&draft.asr_base_url, &draft.cleanup_base_url),
+    );
+    if !custom.is_empty() {
+        settings.custom_base_url = custom;
+    }
+    if !draft.ollama_base_url.trim().is_empty() {
+        settings.ollama_base_url = draft.ollama_base_url.trim().to_owned();
+    }
+    if !draft.local_whisper_base_url.trim().is_empty() {
+        settings.local_whisper_base_url = draft.local_whisper_base_url.trim().to_owned();
+    }
+    if draft.asr_provider.is_custom() {
+        settings.asr_base_url = settings.custom_base_url.clone();
+    } else {
+        settings.asr_base_url.clear();
+    }
+    if draft.cleanup_provider.is_custom() {
+        settings.cleanup_base_url = settings.custom_base_url.clone();
+    } else {
+        settings.cleanup_base_url.clear();
+    }
+    for (id, key) in &draft.provider_keys {
+        if key.trim().is_empty() {
+            continue;
+        }
+        settings
+            .provider_api_keys
+            .insert(id.clone(), key.trim().to_owned());
+        if id == "groq" {
+            settings.api_key = key.trim().to_owned();
+        }
+        if id == "custom" {
+            settings.asr_api_key = key.trim().to_owned();
+            settings.cleanup_api_key = key.trim().to_owned();
+        }
+    }
+    if draft.asr_provider.is_groq() && !draft.api_key.trim().is_empty() {
+        settings.api_key = draft.api_key.trim().to_owned();
+        settings
+            .provider_api_keys
+            .insert("groq".into(), settings.api_key.clone());
+    }
+    if !draft.asr_api_key.trim().is_empty() && draft.asr_provider.is_custom() {
+        settings.asr_api_key = draft.asr_api_key.trim().to_owned();
+        settings
+            .provider_api_keys
+            .insert("custom".into(), settings.asr_api_key.clone());
+    }
+    if !draft.cleanup_api_key.trim().is_empty() && draft.cleanup_provider.is_custom() {
+        settings.cleanup_api_key = draft.cleanup_api_key.trim().to_owned();
+        settings
+            .provider_api_keys
+            .entry("custom".into())
+            .or_insert_with(|| settings.cleanup_api_key.clone());
     }
 }
 
 fn draft_asr_model(draft: &EngineDraft) -> String {
+    let model = draft.asr_model.trim();
     if draft.asr_provider.is_groq() {
-        if asr::is_groq_asr_model(&draft.asr_model) {
-            draft.asr_model.trim().to_owned()
-        } else {
-            asr::MODEL.to_owned()
-        }
-    } else {
-        let model = draft.asr_model.trim();
-        if model.is_empty() {
-            asr::MODEL.to_owned()
-        } else {
+        if asr::is_groq_asr_model(model) {
             model.to_owned()
+        } else {
+            asr::MODEL.to_owned()
         }
+    } else if model.is_empty() {
+        draft.asr_provider.default_asr_model().to_owned()
+    } else {
+        model.to_owned()
     }
 }
 
 fn draft_cleanup_model(draft: &EngineDraft) -> String {
+    let model = draft.cleanup_model.trim();
     if draft.cleanup_provider.is_groq() {
-        if llm::is_supported_model(&draft.cleanup_model) {
-            draft.cleanup_model.clone()
-        } else {
-            llm::MODEL.to_owned()
-        }
-    } else {
-        let model = draft.cleanup_model.trim();
-        if model.is_empty() {
-            llm::MODEL.to_owned()
-        } else {
+        if llm::is_supported_model(model) {
             model.to_owned()
+        } else {
+            llm::MODEL.to_owned()
         }
+    } else if model.is_empty() {
+        draft.cleanup_provider.default_llm_model().to_owned()
+    } else {
+        model.to_owned()
     }
 }
 
@@ -322,15 +460,12 @@ mod tests {
     fn custom_asr_draft(url: &str, model: &str) -> EngineDraft {
         EngineDraft {
             asr_provider: EngineProvider::Custom,
-            cleanup_provider: EngineProvider::Groq,
             asr_base_url: url.to_owned(),
-            cleanup_base_url: String::new(),
+            custom_base_url: url.to_owned(),
             asr_model: model.to_owned(),
-            cleanup_model: llm::MODEL.to_owned(),
-            api_key: String::new(),
             asr_api_key: "probe-key".into(),
-            cleanup_api_key: String::new(),
             cleanup_enabled: false,
+            ..EngineDraft::default()
         }
     }
 
@@ -451,18 +586,110 @@ mod tests {
         let draft = EngineDraft {
             asr_provider: EngineProvider::Custom,
             cleanup_provider: EngineProvider::Custom,
-            asr_base_url: asr_endpoint,
+            asr_base_url: asr_endpoint.clone(),
             cleanup_base_url: chat_endpoint,
+            custom_base_url: asr_endpoint,
             asr_model: "whisper-1".into(),
             cleanup_model: "gpt-4o-mini".into(),
-            api_key: String::new(),
             asr_api_key: "asr".into(),
             cleanup_api_key: "sk-openai".into(),
             cleanup_enabled: true,
+            ..EngineDraft::default()
         };
         let result = probe_engine_draft(&draft, &Settings::default()).await;
         assert!(result.asr.ok, "{}", result.asr.message);
         assert!(result.cleanup.ok, "{}", result.cleanup.message);
         assert!(result.succeeded());
+    }
+
+    #[tokio::test]
+    async fn probe_accepts_deepgram_listen_json() {
+        let endpoint = crate::test_http::spawn_response(
+            200,
+            "application/json",
+            br#"{"results":{"channels":[{"alternatives":[{"transcript":"hello"}]}]}}"#,
+            &[],
+        )
+        .await;
+        let mut keys = BTreeMap::new();
+        keys.insert("deepgram".into(), "dg-token".into());
+        let draft = EngineDraft {
+            asr_provider: EngineProvider::Deepgram,
+            asr_base_url: endpoint,
+            asr_model: "nova-3".into(),
+            provider_keys: keys,
+            cleanup_enabled: false,
+            ..EngineDraft::default()
+        };
+        let result = probe_engine_draft(&draft, &Settings::default()).await;
+        assert!(result.asr.ok, "{}", result.asr.message);
+        assert!(result.succeeded());
+    }
+
+    #[tokio::test]
+    async fn probe_accepts_anthropic_messages_json() {
+        let asr_endpoint = crate::test_http::spawn_response(
+            200,
+            "application/json",
+            br#"{"text":"hello","segments":[],"words":[]}"#,
+            &[],
+        )
+        .await;
+        let chat_endpoint = crate::test_http::spawn_response(
+            200,
+            "application/json",
+            r#"{"content":[{"type":"text","text":"嗯 那个 你好"}]}"#.as_bytes(),
+            &[],
+        )
+        .await;
+        let mut keys = BTreeMap::new();
+        keys.insert("custom".into(), "asr".into());
+        keys.insert("anthropic".into(), "sk-ant".into());
+        let draft = EngineDraft {
+            asr_provider: EngineProvider::Custom,
+            cleanup_provider: EngineProvider::Anthropic,
+            asr_base_url: asr_endpoint.clone(),
+            cleanup_base_url: chat_endpoint,
+            custom_base_url: asr_endpoint,
+            asr_model: "whisper-1".into(),
+            cleanup_model: "claude-sonnet-4-5".into(),
+            provider_keys: keys,
+            cleanup_enabled: true,
+            ..EngineDraft::default()
+        };
+        let result = probe_engine_draft(&draft, &Settings::default()).await;
+        assert!(result.asr.ok, "{}", result.asr.message);
+        assert!(result.cleanup.ok, "{}", result.cleanup.message);
+        assert!(result.succeeded());
+    }
+
+    #[test]
+    fn apply_engine_draft_keeps_unused_pool_keys() {
+        let mut settings = Settings {
+            api_key: "gsk_keep".into(),
+            ..Settings::default()
+        };
+        settings
+            .provider_api_keys
+            .insert("groq".into(), "gsk_keep".into());
+        let mut keys = BTreeMap::new();
+        keys.insert("openai".into(), "sk-new".into());
+        let draft = EngineDraft {
+            asr_provider: EngineProvider::Groq,
+            cleanup_provider: EngineProvider::OpenAi,
+            cleanup_model: "gpt-4o-mini".into(),
+            provider_keys: keys,
+            ..EngineDraft::default()
+        };
+        apply_engine_draft(&mut settings, &draft);
+        assert_eq!(settings.cleanup_provider, EngineProvider::OpenAi);
+        assert_eq!(
+            settings.provider_api_keys.get("groq").map(String::as_str),
+            Some("gsk_keep")
+        );
+        assert_eq!(
+            settings.provider_api_keys.get("openai").map(String::as_str),
+            Some("sk-new")
+        );
     }
 }

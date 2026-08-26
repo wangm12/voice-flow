@@ -509,6 +509,34 @@ pub fn set_cleanup_api_key(key: &str) -> Result<(), String> {
     set_secret(API_SERVICE, API_FALLBACK_SERVICE, CLEANUP_ACCOUNT, key)
 }
 
+pub fn get_provider_api_key_state(provider: crate::providers::EngineProvider) -> ApiKeyState {
+    if provider.is_groq() {
+        return get_api_key_state();
+    }
+    if provider.is_custom() {
+        let custom = secret_state(move || {
+            read_stored_secret(API_SERVICE, API_FALLBACK_SERVICE, provider.keychain_account())
+        });
+        if matches!(custom, ApiKeyState::Configured(_)) {
+            return custom;
+        }
+        match get_asr_api_key_state() {
+            ApiKeyState::Configured(key) => return ApiKeyState::Configured(key),
+            _ => {}
+        }
+        return get_cleanup_api_key_state();
+    }
+    let account = provider.keychain_account();
+    secret_state(move || read_stored_secret(API_SERVICE, API_FALLBACK_SERVICE, account))
+}
+
+pub fn set_provider_api_key(provider: crate::providers::EngineProvider, key: &str) -> Result<(), String> {
+    if provider.is_groq() {
+        return set_api_key(key);
+    }
+    set_secret(API_SERVICE, API_FALLBACK_SERVICE, provider.keychain_account(), key)
+}
+
 pub fn resolve_cleanup_api_key(plaintext: &str) -> ApiKeyState {
     if !plaintext.is_empty() {
         if keychain_disabled() {

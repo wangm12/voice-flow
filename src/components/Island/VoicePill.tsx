@@ -1,13 +1,31 @@
-import { memo, useEffect, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
-import { Archive, ArrowUp, Check, CircleAlert, Clipboard, Clock3, Sparkles, Square, Undo2, X } from "lucide-react";
-import { VoiceWaveform } from "./VoiceWaveform";
-import { IconButton } from "../IconButton";
+import { memo, useEffect, useRef, useState, type CSSProperties } from "react";
+import { BorderBeam } from "border-beam";
 import { useI18n } from "../../lib/i18n";
+import { VoiceHudOrb } from "./VoiceHudOrb";
+import {
+  HUD_CAPTION_REVEAL_DELAY_MS,
+  HUD_CAPTION_REVEAL_MS,
+  HUD_LABEL_FADE_MS,
+  HUD_LABEL_IN_DELAY_MS,
+  HUD_LABEL_IN_DURATION_MS,
+  HUD_LABEL_OUT_MS,
+  HUD_ORB_FADE_MS,
+  HUD_THINK_BEAM_FADE_MS,
+  HUD_PILL_RADIUS_PX,
+  HUD_LISTENING_BEAM,
+  HUD_THINKING_BEAM,
+  hudBorderBeamFor,
+  hudOrbFor,
+  hudStatusLabel,
+  perceptualLevel,
+  shouldMountHudOrb,
+  type DictationState,
+  type HudBorderBeamConfig,
+  type HudOrbConfig,
+  type ProcessingPhase,
+} from "./hudOrb";
+import { useSmoothLineBeam, type LineBeamMode } from "./hudLineBeam";
 import { CONTEXT_LABEL_VISIBLE_MS, pillCaption, visibleContextLabel, voicePillCaptionMaxWidthForPartial, voicePillCaptionNeedsWide } from "./voicePillTokens";
-
-type DictationState = "idle" | "starting" | "recording" | "recording_limited" | "processing" | "rate_limited" | "done" | "unverified" | "copied" | "degraded" | "history" | "error";
-type ProcessingPhase = "finalizing_audio" | "asr" | "cleanup" | "delivery" | "waiting_retry" | "idle";
 
 function stateAriaLabel(state: DictationState, t: (source: string) => string): string {
   switch (state) {
@@ -34,11 +52,55 @@ function stateAriaLabel(state: DictationState, t: (source: string) => string): s
   }
 }
 
+function useHudLabel(
+  next: string | null,
+  reduced: boolean,
+): { text: string | null; outgoing: string | null; entering: boolean } {
+  const [text, setText] = useState(next);
+  const [outgoing, setOutgoing] = useState<string | null>(null);
+  const [entering, setEntering] = useState(false);
+
+  if (next !== text) {
+    if (!reduced && text != null && next != null) {
+      setOutgoing(text);
+      setEntering(true);
+    } else {
+      setOutgoing(null);
+      setEntering(false);
+    }
+    setText(next);
+  } else if (reduced && (outgoing != null || entering)) {
+    setOutgoing(null);
+    setEntering(false);
+  }
+
+  useEffect(() => {
+    if (outgoing == null) return undefined;
+    const timer = window.setTimeout(() => setOutgoing(null), HUD_LABEL_OUT_MS);
+    return () => window.clearTimeout(timer);
+  }, [outgoing, text]);
+
+  useEffect(() => {
+    if (!entering) return undefined;
+    const timer = window.setTimeout(() => setEntering(false), HUD_LABEL_FADE_MS);
+    return () => window.clearTimeout(timer);
+  }, [entering, text]);
+
+  return { text, outgoing, entering };
+}
+
+const HUD_BEAM_OVERLAY_STYLE: CSSProperties = {
+  position: "absolute",
+  inset: 0,
+  width: "100%",
+  height: "100%",
+};
+
 export const VoicePill = memo(function VoicePill({
   state,
   phase = "idle",
   retryAfterSecs = null,
-  undoAvailable = false,
+  undoAvailable: _undoAvailable = false,
   contextLabel,
   fallbackReason = null,
   selectedActionState = null,
@@ -69,18 +131,15 @@ export const VoicePill = memo(function VoicePill({
   const isTerminal = state === "done" || state === "copied" || state === "history";
   const visualState = isStarting ? "recording" : state;
   const isLoading = ["processing", "rate_limited"].includes(state);
-  const isStatus = state === "degraded" || state === "error";
-  const showWaveform = visualState === "recording" || state === "recording_limited";
-  const [undoBusy, setUndoBusy] = useState(false);
   const [retryRemaining, setRetryRemaining] = useState(retryAfterSecs);
   const [contextShown, setContextShown] = useState<{ label: string; at: number } | null>(null);
   const [contextNowMs, setContextNowMs] = useState(() => Date.now());
   const nextContextLabel = contextLabel?.trim() || null;
-  if (nextContextLabel && contextShown?.label !== nextContextLabel) {
+  if (state === "idle") {
+    if (contextShown != null) setContextShown(null);
+  } else if (nextContextLabel && contextShown?.label !== nextContextLabel) {
     setContextShown({ label: nextContextLabel, at: Date.now() });
     setContextNowMs(Date.now());
-  } else if (!nextContextLabel && contextShown != null) {
-    setContextShown(null);
   }
   const visibleContext = visibleContextLabel(
     nextContextLabel,
@@ -103,11 +162,8 @@ export const VoicePill = memo(function VoicePill({
     const timer = window.setTimeout(() => setContextNowMs(Date.now()), Math.max(0, remaining));
     return () => window.clearTimeout(timer);
   }, [contextShown]);
-  const canCancel = ["starting", "recording", "recording_limited", "processing", "rate_limited"].includes(state);
-  const canStop = isStarting || state === "recording" || state === "recording_limited";
-  const canCancelProcessing = state === "processing" || state === "rate_limited";
   const progressValue = Math.max(0, Math.min(1, progress));
-  const showProgress = isLoading;
+  const showProgress = isLoading && (reduced || hudBorderBeamFor(state)?.size !== "line");
   const indeterminateProgress = showProgress && state !== "processing";
   const caption = pillCaption(
     state,
@@ -132,31 +188,6 @@ export const VoicePill = memo(function VoicePill({
     indeterminateProgress ? "voice-pill__progress--indeterminate" : "",
   ].filter(Boolean).join(" ");
 
-  function cancelDictation() {
-    void invoke("cancel_dictation").catch((error) => {
-      console.error("Failed to cancel dictation", error);
-    });
-  }
-
-  function stopDictation() {
-    void invoke(isStarting ? "cancel_dictation" : "stop_dictation").catch((error) => {
-      console.error("Failed to stop dictation", error);
-    });
-  }
-  async function undoDelivery() {
-    if (undoBusy) return;
-    setUndoBusy(true);
-    try {
-      const result = await invoke<string>("undo_last_delivery");
-      if (result !== "success") {
-        console.warn("Undo insertion unavailable", result);
-      }
-    } catch (error) {
-      console.error("Failed to undo delivery", error);
-    } finally {
-      setUndoBusy(false);
-    }
-  }
   const captionTone = state === "error"
     ? "error"
     : state === "degraded" || fallbackReason || selectedActionState === "accessibility_required"
@@ -164,119 +195,186 @@ export const VoicePill = memo(function VoicePill({
       : "status";
   const statusLabel = stateAriaLabel(state, t);
   const liveLabel = caption ? `${statusLabel}。${caption}` : statusLabel;
+  const orbConfig = hudOrbFor(state, phase, {
+    reduced,
+    level: perceptualLevel(waveformLevels),
+    selectedActionState,
+  });
+  const showOrb = shouldMountHudOrb(state, Boolean(caption)) && orbConfig != null;
+  const lastOrbRef = useRef<HudOrbConfig | null>(orbConfig);
+  if (orbConfig) lastOrbRef.current = orbConfig;
+  const [orbVisible, setOrbVisible] = useState(showOrb);
+  useEffect(() => {
+    if (showOrb) {
+      setOrbVisible(true);
+      return undefined;
+    }
+    if (reduced) {
+      setOrbVisible(false);
+      return undefined;
+    }
+    const timer = window.setTimeout(() => setOrbVisible(false), HUD_ORB_FADE_MS);
+    return () => window.clearTimeout(timer);
+  }, [showOrb, reduced]);
+  const paintedOrb = orbVisible ? (orbConfig ?? lastOrbRef.current) : null;
+  const statusCopy = hudStatusLabel(state, showOrb ? orbConfig : null);
+  const { text: labelText, outgoing: labelOutgoing, entering: labelEntering } = useHudLabel(statusCopy, reduced);
+  const captionReveal = !reduced && [
+    "copied",
+    "unverified",
+    "done",
+    "degraded",
+    "error",
+    "history",
+  ].includes(state);
+  const liveCaptionRef = useRef<string | null>(null);
+  if (!captionReveal) liveCaptionRef.current = caption;
+  const [terminalCaptionOn, setTerminalCaptionOn] = useState(false);
+  if (!captionReveal && terminalCaptionOn) setTerminalCaptionOn(false);
+  else if (captionReveal && reduced && !terminalCaptionOn) setTerminalCaptionOn(true);
+  useEffect(() => {
+    if (!captionReveal || reduced) return undefined;
+    const timer = window.setTimeout(() => setTerminalCaptionOn(true), HUD_LABEL_OUT_MS);
+    return () => window.clearTimeout(timer);
+  }, [captionReveal, reduced, state]);
+  const holdTerminalChrome = captionReveal && !terminalCaptionOn && !reduced;
+  const paintedCaption = holdTerminalChrome ? liveCaptionRef.current : caption;
+  const paintedTone = holdTerminalChrome ? "status" : captionTone;
+  const captionExiting = holdTerminalChrome && Boolean(liveCaptionRef.current);
+  const showCaptionReveal = captionReveal && terminalCaptionOn && !reduced;
+  const beam = hudBorderBeamFor(state);
+  const thinkOn = beam?.size === "line" && !reduced;
+  const [thinkLinger, setThinkLinger] = useState(false);
+  const wasThinkOn = useRef(thinkOn);
+  if (thinkOn && thinkLinger) setThinkLinger(false);
+  else if (wasThinkOn.current && !thinkOn && !thinkLinger && !reduced) setThinkLinger(true);
+  wasThinkOn.current = thinkOn;
+  useEffect(() => {
+    if (!thinkLinger) return undefined;
+    const timer = window.setTimeout(() => setThinkLinger(false), HUD_THINK_BEAM_FADE_MS);
+    return () => window.clearTimeout(timer);
+  }, [thinkLinger]);
+  const thinkFx = thinkOn || thinkLinger;
+  const beamRef = useRef<HudBorderBeamConfig>(HUD_LISTENING_BEAM);
+  const previousBeam = beamRef.current;
+  if (beam) beamRef.current = beam;
+  const beamElRef = useRef<HTMLDivElement>(null);
+  const lineMode: LineBeamMode = thinkFx && (beam?.size === "line" || previousBeam.size === "line")
+    ? "scrub"
+    : "off";
+  useSmoothLineBeam(beamElRef, lineMode, progressValue);
+  const chromeState = holdTerminalChrome ? "processing" : visualState;
   const pillClassName = [
     "voice-pill",
-    `voice-pill--${visualState}`,
+    `voice-pill--${chromeState}`,
+    labelText ? "voice-pill--labeled" : "",
+    paintedOrb ? "voice-pill--orb" : "",
     reduced ? "voice-pill--reduced" : "",
   ].filter(Boolean).join(" ");
+  const indicatorClassName = "voice-pill__indicator";
 
   return (
-    <div className={stackClassName} aria-hidden={stackHidden}>
-      <div className={pillClassName} role="status" aria-label={liveLabel} aria-live="polite">
-        <span
-          className={progressClassName}
-          style={indeterminateProgress ? undefined : { transform: `scaleX(${progressValue})` }}
-          aria-hidden="true"
-        />
-        {canCancel && (
-          <IconButton
-            unstyled
-            tooltip={false}
-            label={t("取消录音")}
-            className="voice-pill__side voice-pill__side--cancel"
-            onClick={cancelDictation}
-            icon={<X size={13} strokeWidth={2.25} absoluteStrokeWidth aria-hidden="true" />}
+    <div
+      className={stackClassName}
+      aria-hidden={stackHidden}
+      style={{
+        ["--hud-label-in-delay" as string]: `${HUD_LABEL_IN_DELAY_MS}ms`,
+        ["--hud-label-in-duration" as string]: `${HUD_LABEL_IN_DURATION_MS}ms`,
+        ["--hud-label-out-duration" as string]: `${HUD_LABEL_OUT_MS}ms`,
+        ["--hud-caption-reveal-delay" as string]: `${HUD_CAPTION_REVEAL_DELAY_MS}ms`,
+        ["--hud-caption-reveal-duration" as string]: `${HUD_CAPTION_REVEAL_MS}ms`,
+      }}
+    >
+      <div className="voice-pill__beam-host">
+        <div className={pillClassName} role="status" aria-label={liveLabel} aria-live="polite">
+          <span
+            className={progressClassName}
+            style={indeterminateProgress ? undefined : { transform: `scaleX(${progressValue})` }}
+            aria-hidden="true"
           />
-        )}
-        <div className="voice-pill__content">
-          <span className="voice-pill__center-region">
-            <span
-              className={`voice-pill__center-state${isLoading ? " voice-pill__center-state--active" : ""}`}
-              aria-hidden={!isLoading}
-            >
-              {phase === "cleanup" ? <Sparkles size={14} strokeWidth={2.2} aria-hidden="true" />
-                : phase === "delivery" ? <ArrowUp size={14} strokeWidth={2.35} aria-hidden="true" />
-                : phase === "waiting_retry" ? <Clock3 size={14} strokeWidth={2.2} aria-hidden="true" />
-                : <span className="voice-pill__dots voice-pill__dots--thinking"><i /><i /><i /></span>}
+          <div className="voice-pill__content">
+            <span className={indicatorClassName}>
+              <span
+                className={`voice-pill__center-state${showOrb ? " voice-pill__center-state--active" : ""}`}
+                aria-hidden={!showOrb}
+              >
+                {paintedOrb && (
+                  <VoiceHudOrb
+                    key="hud-orb"
+                    state={paintedOrb.state}
+                    paused={paintedOrb.paused}
+                    speed={paintedOrb.speed}
+                    dim={paintedOrb.dim}
+                    caution={state === "unverified" || state === "degraded" || state === "error"}
+                  />
+                )}
+              </span>
             </span>
-            <span
-              className={`voice-pill__center-state${showWaveform ? " voice-pill__center-state--active" : ""}`}
-              aria-hidden={!showWaveform}
-            >
-              <VoiceWaveform
-                active={visualState === "recording"}
-                dim={state === "recording_limited"}
-                levels={visualState === "recording" ? waveformLevels : undefined}
-              />
-            </span>
-            <span
-              className={`voice-pill__center-state${state === "done" ? " voice-pill__center-state--active" : ""}`}
-              aria-hidden={state !== "done"}
-            >
-              <Check className="voice-pill__terminal-icon" size={14} strokeWidth={2.5} absoluteStrokeWidth aria-hidden="true" />
-            </span>
-            <span
-              className={`voice-pill__center-state${state === "unverified" ? " voice-pill__center-state--active" : ""}`}
-              aria-hidden={state !== "unverified"}
-            >
-              <CircleAlert className="voice-pill__caution-icon" size={14} strokeWidth={2.5} absoluteStrokeWidth aria-hidden="true" />
-            </span>
-            <span
-              className={`voice-pill__center-state${state === "copied" ? " voice-pill__center-state--active" : ""}`}
-              aria-hidden={state !== "copied"}
-            >
-              <Clipboard className="voice-pill__terminal-icon" size={14} strokeWidth={2.3} absoluteStrokeWidth aria-hidden="true" />
-            </span>
-            <span
-              className={`voice-pill__center-state${state === "history" ? " voice-pill__center-state--active" : ""}`}
-              aria-hidden={state !== "history"}
-            >
-              <Archive className="voice-pill__terminal-icon" size={14} strokeWidth={2.3} absoluteStrokeWidth aria-hidden="true" />
-            </span>
-            <span
-              className={`voice-pill__center-state${isStatus ? " voice-pill__center-state--active" : ""}`}
-              aria-hidden={!isStatus}
-            >
-              <CircleAlert className="voice-pill__status-icon" size={14} strokeWidth={2.25} absoluteStrokeWidth aria-hidden="true" />
-            </span>
-          </span>
+            {(labelText || labelOutgoing) && (
+              <span className="voice-pill__label-stack" aria-hidden="true">
+                {labelText && (
+                  <span
+                    key={labelText}
+                    className={`voice-pill__label${labelEntering ? " voice-pill__label--in" : ""}`}
+                  >
+                    {labelText}
+                  </span>
+                )}
+                {labelOutgoing && (
+                  <span key={`out-${labelOutgoing}`} className="voice-pill__label voice-pill__label--out">
+                    {labelOutgoing}
+                  </span>
+                )}
+              </span>
+            )}
+          </div>
         </div>
-        {(canStop || canCancelProcessing) && (
-          <IconButton
-            unstyled
-            tooltip={false}
-            label={isStarting ? t("取消录音") : canStop ? t("停止录音") : t("取消转写")}
-            className="voice-pill__side voice-pill__side--action"
-            onClick={canStop ? stopDictation : cancelDictation}
-            icon={canCancelProcessing
-              ? <Square size={12} strokeWidth={2.5} absoluteStrokeWidth aria-hidden="true" />
-              : <ArrowUp size={14} strokeWidth={2.35} absoluteStrokeWidth aria-hidden="true" />}
-          />
-        )}
-        {undoAvailable && !canStop && !canCancelProcessing && (
-          <IconButton
-            unstyled
-            tooltip={false}
-            label={t("撤销插入")}
-            className="voice-pill__side voice-pill__side--action"
-            disabled={undoBusy}
-            onClick={() => void undoDelivery()}
-            icon={<Undo2 size={13} strokeWidth={2.35} absoluteStrokeWidth aria-hidden="true" />}
-          />
-        )}
+        <BorderBeam
+          className="voice-pill__beam-fx"
+          size={HUD_LISTENING_BEAM.size}
+          colorVariant={HUD_LISTENING_BEAM.colorVariant}
+          strength={HUD_LISTENING_BEAM.strength}
+          duration={HUD_LISTENING_BEAM.duration}
+          theme="dark"
+          borderRadius={HUD_PILL_RADIUS_PX}
+          active={beam?.size === "md" && !reduced}
+          style={HUD_BEAM_OVERLAY_STYLE}
+        >
+          <div className="voice-pill__beam-ghost" />
+        </BorderBeam>
+        <div
+          className={`voice-pill__beam-layer${thinkOn ? "" : " voice-pill__beam-layer--exit"}`}
+        >
+          <BorderBeam
+            ref={beamElRef}
+            className="voice-pill__beam-fx"
+            size={HUD_THINKING_BEAM.size}
+            colorVariant={HUD_THINKING_BEAM.colorVariant}
+            strength={HUD_THINKING_BEAM.strength}
+            theme="dark"
+            borderRadius={HUD_PILL_RADIUS_PX}
+            active={thinkFx}
+            style={HUD_BEAM_OVERLAY_STYLE}
+          >
+            <div className="voice-pill__beam-ghost" />
+          </BorderBeam>
+        </div>
       </div>
-      {caption && (
+      {paintedCaption && (
         <p
+          key={showCaptionReveal ? state : "live"}
           className={[
             "voice-pill-caption",
-            `voice-pill-caption--${captionTone}`,
-            showingPartial ? "voice-pill-caption--partial" : "",
-            wideCaption ? "voice-pill-caption--wide" : "",
+            `voice-pill-caption--${paintedTone}`,
+            showingPartial && !holdTerminalChrome ? "voice-pill-caption--partial" : "",
+            wideCaption && !holdTerminalChrome ? "voice-pill-caption--wide" : "",
+            showCaptionReveal ? "voice-pill-caption--reveal" : "",
+            captionExiting ? "voice-pill-caption--exit" : "",
           ].filter(Boolean).join(" ")}
-          style={wideCaption ? { maxWidth: voicePillCaptionMaxWidthForPartial(true) } : undefined}
+          style={wideCaption && !holdTerminalChrome ? { maxWidth: voicePillCaptionMaxWidthForPartial(true) } : undefined}
         >
           <span className="voice-pill-caption__dot" aria-hidden="true" />
-          <span className="voice-pill-caption__text">{caption}</span>
+          <span className="voice-pill-caption__text">{paintedCaption}</span>
         </p>
       )}
     </div>

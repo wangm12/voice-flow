@@ -9,6 +9,11 @@ import {
   voicePillWidthForState,
   voicePillWindowWidth,
   voicePillWindowWidthForPartial,
+  voicePillWindowHeight,
+  voicePillHeight,
+  voicePillCaptionHeight,
+  voicePillCaptionGap,
+  voicePillStagePaddingTop,
 } from "./voicePillTokens";
 import { waveformScaleForLevel } from "./VoiceWaveform";
 
@@ -16,6 +21,7 @@ describe("voice pill state tokens", () => {
   it("surfaces the recording limit without relying on hover", () => {
     expect(pillCaption("recording_limited")).toBe("已达上限 · 按热键结束");
     expect(voicePillWidthForState("recording_limited")).toBeGreaterThan(104);
+    expect(voicePillWidthForState("recording")).toBe(132);
   });
 
   it("keeps error guidance available as persistent state copy", () => {
@@ -113,6 +119,13 @@ describe("voice pill state tokens", () => {
     expect(voicePillWindowWidthForPartial(false)).toBe(voicePillWindowWidth);
     expect(voicePillWindowWidthForPartial(false)).toBe(172);
     expect(voicePillWindowWidthForPartial(true)).toBe(400);
+  });
+
+  it("reserves a downward caption band so the pill does not shift upward", () => {
+    expect(voicePillStagePaddingTop).toBe(6);
+    expect(
+      voicePillStagePaddingTop + voicePillHeight + voicePillCaptionGap + voicePillCaptionHeight,
+    ).toBe(voicePillWindowHeight);
   });
 
   it("shows prefetch partial text during processing instead of chunk progress", () => {

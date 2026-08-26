@@ -37,6 +37,13 @@ fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
         .any(|window| window.eq_ignore_ascii_case(needle.as_bytes()))
 }
 
+/// macOS 26 HIToolbox asserts the main dispatch queue inside
+/// `TISGetInputSourceProperty` for IME sources. Paste runs on a tokio
+/// blocking worker, so TIS must hop when this is true.
+pub fn should_hop_tis_to_main_queue(on_main_thread: bool) -> bool {
+    !on_main_thread
+}
+
 /// Switch to a Latin layout around `paste` when the current source looks CJK.
 /// `select_latin` must return true only if the source actually changed.
 /// `restore` then runs on the way out, including when `paste` fails.
@@ -118,6 +125,21 @@ mod macos {
 
     type TISInputSourceRef = *const c_void;
 
+    #[repr(C)]
+    struct DispatchQueue {
+        _opaque: [usize; 0],
+    }
+
+    #[link(name = "System", kind = "dylib")]
+    unsafe extern "C" {
+        static _dispatch_main_q: DispatchQueue;
+        fn dispatch_sync_f(
+            queue: *const DispatchQueue,
+            context: *mut c_void,
+            work: unsafe extern "C" fn(*mut c_void),
+        );
+    }
+
     #[link(name = "Carbon", kind = "framework")]
     unsafe extern "C" {
         fn TISCopyCurrentKeyboardInputSource() -> TISInputSourceRef;
@@ -138,42 +160,71 @@ mod macos {
     const ABC_LAYOUT_ID: &str = "com.apple.keylayout.ABC";
     const US_LAYOUT_ID: &str = "com.apple.keylayout.US";
 
-    pub(super) fn acquire_guard() -> AbcLayoutGuard {
-        let Some(current) = copy_current_source() else {
-            return AbcLayoutGuard {
-                _private: (),
-                previous: None,
-            };
+    fn is_main_thread() -> bool {
+        unsafe { libc::pthread_main_np() != 0 }
+    }
+
+    fn on_main_queue<T, F: FnOnce() -> T>(f: F) -> T {
+        if !super::should_hop_tis_to_main_queue(is_main_thread()) {
+            return f();
+        }
+        struct Job<T, F> {
+            work: Option<F>,
+            result: Option<T>,
+        }
+        unsafe extern "C" fn run<T, F: FnOnce() -> T>(ctx: *mut c_void) {
+            let job = unsafe { &mut *(ctx as *mut Job<T, F>) };
+            let work = job.work.take().expect("main-queue job missing work");
+            job.result = Some(work());
+        }
+        let mut job = Job {
+            work: Some(f),
+            result: None,
         };
+        unsafe {
+            dispatch_sync_f(
+                &_dispatch_main_q,
+                &mut job as *mut Job<T, F> as *mut c_void,
+                run::<T, F>,
+            );
+        }
+        job.result.expect("main-queue job did not complete")
+    }
+
+    pub(super) fn acquire_guard() -> AbcLayoutGuard {
+        // TIS/IME queries must run on the main dispatch queue. The 30 ms
+        // settle stays on the paste worker so we do not freeze AppKit.
+        let previous = on_main_queue(switch_to_latin_if_cjk);
+        if previous.is_some() {
+            thread::sleep(Duration::from_millis(30));
+        }
+        AbcLayoutGuard {
+            _private: (),
+            previous,
+        }
+    }
+
+    fn switch_to_latin_if_cjk() -> Option<RetainedInputSource> {
+        let current = copy_current_source()?;
         let id = source_property(current.0, unsafe { kTISPropertyInputSourceID }).unwrap_or_default();
         let name =
             source_property(current.0, unsafe { kTISPropertyLocalizedName }).unwrap_or_default();
         if !should_switch_input_source(&id, &name) {
-            return AbcLayoutGuard {
-                _private: (),
-                previous: None,
-            };
+            return None;
         }
         if !select_latin_layout() {
-            return AbcLayoutGuard {
-                _private: (),
-                previous: None,
-            };
+            return None;
         }
-        thread::sleep(Duration::from_millis(30));
-        AbcLayoutGuard {
-            _private: (),
-            previous: Some(current),
-        }
+        Some(current)
     }
 
     pub(super) fn select_source(source: TISInputSourceRef) {
         if source.is_null() {
             return;
         }
-        unsafe {
+        on_main_queue(|| unsafe {
             let _ = TISSelectInputSource(source);
-        }
+        });
     }
 
     fn copy_current_source() -> Option<RetainedInputSource> {
@@ -254,6 +305,16 @@ mod tests {
     use std::panic::AssertUnwindSafe;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
+
+    #[test]
+    fn tis_input_source_calls_hop_off_the_tokio_paste_worker() {
+        // Crash 2026-08-25: AbcLayoutGuard::acquire on a tokio blocking worker
+        // called TISGetInputSourceProperty → islGetInputSourceListWithAdditions
+        // → dispatch_assert_queue_fail (EXC_BREAKPOINT / SIGTRAP). Cursor paste
+        // now reaches simulate_paste; TIS must run on the main dispatch queue.
+        assert!(super::should_hop_tis_to_main_queue(false));
+        assert!(!super::should_hop_tis_to_main_queue(true));
+    }
 
     #[test]
     fn abc_and_us_layouts_do_not_switch() {

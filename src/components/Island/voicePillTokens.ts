@@ -1,11 +1,15 @@
 import { deliveryReasonMessage } from "../../lib/deliveryCopy";
 
-export const voicePillHeight = 34;
+export const voicePillHeight = 40;
 // Keep the transparent native surface close to the visible HUD. A large
 // transparent WebView still participates in WindowServer composition.
 export const voicePillWindowWidth = 172;
 export const voicePillWindowWidthWithPartial = 400;
-export const voicePillWindowHeight = 60;
+export const voicePillWindowHeight = 68;
+export const voicePillCaptionHeight = 18;
+export const voicePillCaptionGap = 4;
+export const voicePillStagePaddingTop =
+  voicePillWindowHeight - voicePillHeight - voicePillCaptionGap - voicePillCaptionHeight;
 export const voicePillCaptionMaxWidth = 164;
 export const voicePillCaptionMaxWidthWithPartial = 360;
 

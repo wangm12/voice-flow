@@ -21,6 +21,8 @@ static ISLAND_WIDE_APPLIED: AtomicBool = AtomicBool::new(false);
 /// While VoiceFlow is delivering text, the HUD must stay click-through and
 /// must not order itself in front of the target app's key window.
 static ISLAND_PASTE_YIELD: AtomicBool = AtomicBool::new(false);
+/// The dictionary learn toast is the only HUD surface that needs mouse hits.
+static ISLAND_LEARN_TOAST: AtomicBool = AtomicBool::new(false);
 
 pub fn ensure_panel(window: &WebviewWindow) {
     if ISLAND_PANEL_READY.load(Ordering::Acquire) {
@@ -52,8 +54,8 @@ pub fn hide_overlay(app: &AppHandle) {
     schedule_reconcile(app);
 }
 
-/// The HUD is click-through while idle, but its action buttons need the native
-/// panel to accept mouse events during an active dictation session.
+/// The HUD is click-through by default. The dictionary learn toast is the only
+/// surface that needs the native panel to accept mouse events.
 pub fn set_interactive(app: &AppHandle, interactive: bool) {
     if ISLAND_PASTE_YIELD.load(Ordering::Acquire) && interactive {
         return;
@@ -68,6 +70,15 @@ pub fn set_interactive(app: &AppHandle, interactive: bool) {
 
 pub fn is_yielding_for_paste() -> bool {
     ISLAND_PASTE_YIELD.load(Ordering::Acquire)
+}
+
+pub fn is_learn_toast_interactive() -> bool {
+    ISLAND_LEARN_TOAST.load(Ordering::Acquire)
+}
+
+pub fn set_learn_toast_interactive(app: &AppHandle, interactive: bool) {
+    ISLAND_LEARN_TOAST.store(interactive, Ordering::Release);
+    set_interactive(app, interactive);
 }
 
 /// Make the HUD click-through and resign key before synthesized Cmd+V.
@@ -403,5 +414,14 @@ mod tests {
         end_paste_yield();
         assert!(should_order_front_overlay());
         ISLAND_PASTE_YIELD.store(previous, Ordering::Release);
+    }
+
+    #[test]
+    fn learn_toast_is_the_only_interactive_hud_surface() {
+        let previous = super::ISLAND_LEARN_TOAST.swap(false, Ordering::AcqRel);
+        assert!(!super::is_learn_toast_interactive());
+        super::ISLAND_LEARN_TOAST.store(true, Ordering::Release);
+        assert!(super::is_learn_toast_interactive());
+        super::ISLAND_LEARN_TOAST.store(previous, Ordering::Release);
     }
 }

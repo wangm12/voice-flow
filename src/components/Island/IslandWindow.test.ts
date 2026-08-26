@@ -1,8 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
   acceptsSessionGeneration,
+  hudContextFromEvent,
   hudPartialAfterState,
   hudPartialFromEvent,
+  hudProgressForState,
   normalizeChunkProgress,
   selectedActionStateForDictation,
 } from "./IslandWindow";
@@ -41,6 +43,28 @@ describe("IslandWindow session generations", () => {
     expect(hudPartialFromEvent(4, 4, "recording", "  hello world  ")).toBe("hello world");
     expect(hudPartialFromEvent(4, 3, "recording", "stale")).toBeUndefined();
     expect(hudPartialFromEvent(4, 4, "idle", "too late")).toBeUndefined();
+  });
+
+  it("keeps thinking progress across a rate-limit wait instead of snapping to zero", () => {
+    expect(hudProgressForState("rate_limited", "waiting_retry", 0.65)).toBe(0.65);
+    expect(hudProgressForState("processing", "cleanup", 0.2)).toBe(0.65);
+    expect(hudProgressForState("copied", "idle", 0.65)).toBe(1);
+    expect(hudProgressForState("recording", "idle", 0.65)).toBe(0);
+  });
+
+  it("keeps the active-app context when a thinking event omits it", () => {
+    const current = { contextApp: "Cursor", contextStyle: "prompt_or_code", contextLabel: "Cursor · Code" };
+    expect(hudContextFromEvent("processing", current, {})).toEqual(current);
+    expect(hudContextFromEvent("processing", current, { context_app: "Cursor", context_style: "prompt_or_code" })).toEqual({
+      contextApp: "Cursor",
+      contextStyle: "prompt_or_code",
+      contextLabel: "Cursor · Code",
+    });
+    expect(hudContextFromEvent("idle", current, { context_app: "Cursor" })).toEqual({
+      contextApp: null,
+      contextStyle: null,
+      contextLabel: null,
+    });
   });
 
   it("clears HUD partials on idle or a newer session generation", () => {

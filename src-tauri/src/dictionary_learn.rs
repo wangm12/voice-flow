@@ -219,6 +219,7 @@ pub(crate) async fn promote_learn_pair(
             "after": after,
         }),
     );
+    crate::island_window::set_learn_toast_interactive(&app, true);
     Ok(view)
 }
 
@@ -997,6 +998,7 @@ async fn persist_learn_pair_locked(
                 }),
             );
             crate::island_window::show_overlay(app);
+            crate::island_window::set_learn_toast_interactive(app, true);
         }
         RecordPairResult::Pending { .. } => {
             let _ = app.emit("learn_pairs://changed", ());

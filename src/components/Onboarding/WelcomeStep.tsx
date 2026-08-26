@@ -6,7 +6,7 @@ export function WelcomeStep() {
   const { t } = useI18n();
   return (
     <div className="flex min-h-[420px] flex-col justify-center">
-      <div className="mb-14 flex h-[60px] w-full items-center justify-center">
+      <div className="mb-14 flex h-[68px] w-full items-center justify-center">
         <MainPillPreview live compact />
       </div>
       <div className="w-full max-w-[620px]">

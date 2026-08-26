@@ -8,8 +8,11 @@
   --voice-enter-duration: 150ms;
   --voice-exit-duration: 120ms;
   --voice-pill-width: 132px;
-  --voice-pill-height: 34px;
-  --voice-center-width: 44px;
+  --voice-pill-height: 40px;
+  --voice-center-width: 24px;
+  --voice-caption-height: 18px;
+  --voice-caption-gap: 4px;
+  --voice-hud-top-pad: 6px;
 }
 
 *,
@@ -22,10 +25,11 @@
   display: flex;
   flex-direction: column;
   align-items: center;
-  justify-content: center;
+  justify-content: flex-start;
   gap: 5px;
   width: 100%;
   height: 100%;
+  padding-top: var(--voice-hud-top-pad);
   background: transparent;
   pointer-events: none;
   user-select: none;
@@ -71,46 +75,52 @@
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 4px;
+  gap: var(--voice-caption-gap);
+  width: 100%;
   opacity: 1;
   visibility: visible;
   /* Keep the animated stack isolated from the transparent WebView surface. */
   contain: layout paint;
-  transform: scale(1);
-  transform-origin: center;
-  /* The reference keeps the pill spatially fixed. Opacity-only entrance and
-     exit avoids resampling the whole transparent NSPanel surface. The tiny
-     scale is only a visual settle, never a layout change. */
-  transition: opacity var(--voice-enter-duration) var(--voice-ease), transform var(--voice-enter-duration) var(--voice-ease), visibility 0s linear 0s;
+  /* Opacity only — never scale the HUD stack; scaling the transparent overlay hitchs. */
+  transform-origin: top center;
+  transition: opacity var(--voice-enter-duration) var(--voice-ease), visibility 0s linear 0s;
 }
 
 .voice-pill-stack--hidden {
   visibility: hidden;
   opacity: 0;
-  transform: scale(0.985);
   pointer-events: none;
   transition-delay: 0s, var(--voice-enter-duration);
 }
 
 .voice-pill-stack--exit {
   opacity: 0;
-  transform: scale(0.985);
   transition-duration: var(--voice-exit-duration);
 }
 
 .voice-pill-stack--reduced,
 .voice-pill-stack--reduced.voice-pill-stack--exit {
-  transform: none;
   transition-duration: 80ms;
+}
+
+.voice-pill-stack--reduced .voice-pill-caption,
+.voice-pill-stack--reduced .voice-pill__label {
+  animation: none;
+  transition: none;
+}
+
+.voice-pill-stack--reduced .voice-pill__label--in,
+.voice-pill-stack--reduced .voice-pill-caption--reveal {
+  opacity: 1;
 }
 
 .voice-pill-caption {
   width: fit-content;
   max-width: 164px;
   min-width: 0;
-  margin: 0;
+  margin: 0 auto;
   padding: 0 9px;
-  height: 18px;
+  height: var(--voice-caption-height);
   display: flex;
   align-items: center;
   justify-content: flex-start;
@@ -127,6 +137,27 @@
   white-space: nowrap;
   pointer-events: none;
   contain: layout paint;
+  animation: voice-caption-enter 220ms var(--voice-ease);
+}
+
+.voice-pill-caption--reveal {
+  opacity: 0;
+  animation: voice-caption-enter var(--hud-caption-reveal-duration, 420ms) ease-in var(--hud-caption-reveal-delay, 160ms) both;
+}
+
+.voice-pill-caption--exit {
+  opacity: 0;
+  transition: opacity 280ms ease-out;
+}
+
+.voice-pill-stack--reduced .voice-pill-caption--exit {
+  opacity: 1;
+  transition: none;
+}
+
+@keyframes voice-caption-enter {
+  from { opacity: 0; }
+  to { opacity: 1; }
 }
 
 .voice-pill-caption__dot {
@@ -179,15 +210,69 @@
   letter-spacing: 0;
 }
 
+.voice-pill__beam-host {
+  position: relative;
+  isolation: isolate;
+  flex: 0 0 auto;
+  width: var(--voice-pill-width);
+  height: var(--voice-pill-height);
+  margin-inline: auto;
+  overflow: visible;
+}
+
+.voice-pill__beam-fx {
+  /* Library injects [data-beam] { position: relative }. Without a same-size
+     overlay the empty ghost collapses to 0×0 and the rotate/line beam vanishes. */
+  position: absolute !important;
+  inset: 0 !important;
+  width: var(--voice-pill-width) !important;
+  height: var(--voice-pill-height) !important;
+  pointer-events: none;
+  z-index: 2;
+}
+
+.voice-pill__beam-layer {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  pointer-events: none;
+  opacity: 1;
+}
+
+.voice-pill__beam-layer--exit {
+  opacity: 0;
+  transition: opacity 480ms var(--voice-ease);
+}
+
+.voice-pill-stack--reduced .voice-pill__beam-layer--exit {
+  transition: none;
+}
+
+.voice-pill__beam-ghost {
+  width: var(--voice-pill-width);
+  height: var(--voice-pill-height);
+  border-radius: 999px;
+}
+
+.voice-pill__beam {
+  display: block;
+  flex: 0 0 auto;
+  width: var(--voice-pill-width);
+  height: var(--voice-pill-height);
+  margin-inline: auto;
+  border-radius: 999px;
+}
+
 .voice-pill {
   position: relative;
+  z-index: 1;
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  justify-content: center;
   width: var(--voice-pill-width);
   height: var(--voice-pill-height);
   flex-shrink: 0;
-  padding: 0 5px;
+  padding: 0 14px;
   overflow: hidden;
   border: 1px solid var(--voice-hud-border);
   border-radius: 999px;
@@ -195,17 +280,15 @@
   color: var(--voice-hud-text);
   box-shadow: 0 2px 6px rgba(15, 16, 20, 0.16), inset 0 1px 0 rgba(255, 255, 255, 0.12);
   contain: layout paint;
-  transition: background 220ms var(--voice-ease), border-color 220ms var(--voice-ease), box-shadow 220ms var(--voice-ease);
+  transition: background 280ms var(--voice-ease), border-color 280ms var(--voice-ease), box-shadow 280ms var(--voice-ease);
 }
 
 .voice-pill--onboarding-compact {
   padding-inline: 3px;
 }
 
-.voice-pill--starting,
-.voice-pill--processing,
-.voice-pill--rate_limited,
-.voice-pill--recording_limited {
+.voice-pill--recording_limited,
+.voice-pill--rate_limited {
   border-color: rgba(255, 255, 255, 0.22);
   background: linear-gradient(180deg, #232323, #0e0e0e);
 }
@@ -235,7 +318,7 @@
   opacity: 0;
   pointer-events: none;
   transform-origin: left center;
-  transition: transform 180ms linear, opacity 160ms var(--voice-ease);
+  transition: transform 180ms linear, opacity 220ms var(--voice-ease);
 }
 
 .voice-pill__progress--visible {
@@ -253,75 +336,106 @@
   100% { transform: translateX(235%); }
 }
 
-.voice-pill__side {
-  position: relative;
-  display: grid;
-  width: 24px;
-  height: 24px;
-  flex: 0 0 24px;
-  place-items: center;
-  z-index: 1;
-  border-radius: 50%;
-}
-
-button.voice-pill__side {
-  border: 0;
-  padding: 0;
-  font: inherit;
-  cursor: pointer;
-  pointer-events: auto;
-  appearance: none;
-  transition: transform 100ms var(--voice-ease), background 100ms var(--voice-ease), border-color 100ms var(--voice-ease);
-}
-
-.voice-pill__side--cancel {
-  color: rgba(255, 255, 255, 0.8);
-  background: rgba(255, 255, 255, 0.1);
-  border: 1px solid rgba(255, 255, 255, 0.08);
-}
-
-.voice-pill__side--action {
-  color: #08080a;
-  background: #fff;
-}
-
-.voice-pill__side svg,
-.voice-pill__terminal-icon,
-.voice-pill__status-icon {
-  display: block;
-  flex: 0 0 auto;
-}
-
-button.voice-pill__side:hover {
-  transform: scale(1.06);
-}
-
-button.voice-pill__side:active {
-  transform: scale(0.94);
-}
-
-button.voice-pill__side:focus-visible {
-  outline: 2px solid rgba(255, 255, 255, 0.9);
-  outline-offset: 2px;
-}
-
 .voice-pill__content {
   position: relative;
   display: flex;
   align-items: center;
   justify-content: center;
+  gap: 0;
   min-width: 0;
-  flex: 1 1 auto;
+  width: 100%;
   height: 100%;
   z-index: 1;
-  contain: layout paint;
+  contain: layout;
 }
 
-.voice-pill__center-region {
+.voice-pill--orb .voice-pill__content,
+.voice-pill--labeled .voice-pill__content {
+  justify-content: flex-start;
+  gap: 6px;
+}
+
+.voice-pill__indicator {
   position: relative;
+  width: 0;
+  height: var(--voice-center-width);
+  flex: 0 0 0;
+  overflow: visible;
+}
+
+.voice-pill--orb .voice-pill__indicator,
+.voice-pill--labeled .voice-pill__indicator {
   width: var(--voice-center-width);
-  height: 100%;
+  flex-basis: var(--voice-center-width);
+  flex-shrink: 0;
+}
+
+.voice-pill__indicator--overlay {
+  position: absolute;
+  left: 0;
+  top: 50%;
+  width: var(--voice-center-width);
   flex: 0 0 var(--voice-center-width);
+  overflow: visible;
+  transform: translateY(-50%);
+  pointer-events: none;
+  z-index: 2;
+}
+
+.voice-pill__label-stack {
+  position: relative;
+  flex: 0 1 auto;
+  min-width: 0;
+}
+
+.voice-pill__label {
+  display: block;
+  flex: 0 1 auto;
+  min-width: 0;
+  padding-bottom: 1px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: center;
+  font-size: 12px;
+  font-weight: 500;
+  letter-spacing: 0.01em;
+  color: rgba(255, 255, 255, 0.82);
+  line-height: 1.25;
+  opacity: 1;
+}
+
+.voice-pill--orb .voice-pill__label-stack,
+.voice-pill--orb .voice-pill__label,
+.voice-pill--labeled .voice-pill__label-stack,
+.voice-pill--labeled .voice-pill__label {
+  flex: 1 1 auto;
+  min-width: 0;
+  text-align: left;
+}
+
+@keyframes voice-label-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes voice-label-out {
+  from { opacity: 1; }
+  to { opacity: 0; }
+}
+
+.voice-pill__label--in {
+  opacity: 0;
+  animation: voice-label-in var(--hud-label-in-duration, 400ms) ease-in var(--hud-label-in-delay, 120ms) both;
+}
+
+.voice-pill__label--out {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 0;
+  pointer-events: none;
+  animation: voice-label-out var(--hud-label-out-duration, 320ms) ease-out both;
 }
 
 .voice-pill__center-state {
@@ -333,106 +447,41 @@ button.voice-pill__side:focus-visible {
   opacity: 0;
   visibility: hidden;
   pointer-events: none;
-  transition: opacity 80ms var(--voice-ease);
+  transition: opacity 420ms var(--voice-ease), visibility 0s linear 420ms;
 }
 
 .voice-pill__center-state--active {
   opacity: 1;
   visibility: visible;
+  transition: opacity 420ms var(--voice-ease), visibility 0s;
 }
 
-.voice-pill__wave {
+.voice-pill__orb {
+  position: relative;
   display: flex;
   align-items: center;
   justify-content: center;
-  gap: 2.5px;
   width: var(--voice-center-width);
-  height: 26px;
-  contain: layout paint;
+  height: var(--voice-center-width);
+  overflow: visible;
+  pointer-events: none;
+  transition: opacity 200ms var(--voice-ease);
 }
 
-.voice-pill__wave-bar {
+.voice-pill__orb canvas {
+  position: absolute;
+  left: 50%;
+  top: 50%;
   display: block;
-  width: 2.5px;
-  height: 24px;
-  border-radius: 999px;
-  background: currentColor;
-  opacity: 0.9;
-  transform: scaleY(0.2);
-  transform-origin: center;
-  transition: transform 80ms var(--voice-ease);
+  transform: translate(-50%, -50%) scale(0.375);
 }
 
-.voice-pill__wave--preview .voice-pill__wave-bar {
-  animation: voice-wave-bounce 1.2s ease-in-out infinite alternate;
-}
-
-.voice-pill__wave-bar--1 { height: 6px; animation-delay: 100ms; }
-.voice-pill__wave-bar--2 { height: 12px; animation-delay: 300ms; }
-.voice-pill__wave-bar--3 { height: 8px; animation-delay: 200ms; }
-.voice-pill__wave-bar--4 { height: 16px; animation-delay: 500ms; }
-.voice-pill__wave-bar--5 { height: 10px; animation-delay: 150ms; }
-.voice-pill__wave-bar--6 { height: 14px; animation-delay: 400ms; }
-.voice-pill__wave-bar--7 { height: 10px; animation-delay: 250ms; }
-.voice-pill__wave-bar--8 { height: 6px; animation-delay: 350ms; }
-
-.voice-pill__wave--dim .voice-pill__wave-bar {
+.voice-pill__orb--dim {
   opacity: 0.48;
 }
 
-@keyframes voice-wave-bounce {
-  from { transform: scaleY(0.32); }
-  to { transform: scaleY(1); }
-}
-
-.voice-pill__dots {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-}
-
-.voice-pill__dots--thinking {
-  gap: 4px;
-}
-
-.voice-pill__dots--thinking i {
-  width: 4px;
-  height: 4px;
-  border-radius: 50%;
-  background: currentColor;
-  opacity: 0.72;
-  transform: scale(0.6);
-  animation: voice-thinking-pulse 1.25s ease-in-out infinite;
-}
-
-.voice-pill__center-state:not(.voice-pill__center-state--active) .voice-pill__dots--thinking i {
-  animation-play-state: paused;
-}
-
-.voice-pill__dots--thinking i:nth-child(2) { animation-delay: 160ms; }
-.voice-pill__dots--thinking i:nth-child(3) { animation-delay: 320ms; }
-
-@keyframes voice-thinking-pulse {
-  0%, 100% { transform: scale(0.68); }
-  50% { transform: scale(1); }
-}
-
-.voice-pill--reduced .voice-pill__dots--thinking i {
-  animation: none;
-  opacity: 0.7;
-  transform: scale(0.8);
-}
-
-.voice-pill--degraded .voice-pill__status-icon {
-  color: rgba(255, 211, 123, 0.95);
-}
-
-.voice-pill--error .voice-pill__status-icon {
-  color: rgba(255, 147, 147, 0.96);
-}
-
-.voice-pill--unverified .voice-pill__caution-icon {
-  color: rgba(255, 211, 123, 0.95);
+.voice-pill__orb--caution {
+  opacity: 0.55;
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -442,6 +491,11 @@ button.voice-pill__side:focus-visible {
     transition-duration: 0.08s !important;
   }
 
+  .voice-pill__label--in,
+  .voice-pill-caption--reveal {
+    opacity: 1 !important;
+  }
+
   .voice-pill-stack,
   .voice-pill-stack--exit {
     transition-duration: 0.08s !important;
@@ -449,21 +503,6 @@ button.voice-pill__side:focus-visible {
 
   .voice-pill-stack--hidden {
     transition-delay: 0s !important;
-  }
-
-  .voice-pill__wave-bar {
-    animation: none !important;
-    transform: scaleY(0.68) !important;
-  }
-
-  .voice-pill__wave--dim .voice-pill__wave-bar {
-    transform: scaleY(0.32) !important;
-  }
-
-  .voice-pill__dots--thinking i {
-    animation: none !important;
-    opacity: 0.7;
-    transform: scale(0.8);
   }
 
   .voice-pill__progress--indeterminate {

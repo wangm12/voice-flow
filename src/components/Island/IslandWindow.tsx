@@ -76,6 +76,36 @@ export function normalizeChunkProgress(
   return { completed, total };
 }
 
+export function hudProgressForState(
+  next: string,
+  phase: string,
+  currentProgress: number,
+): number {
+  if (next === "idle" || next === "recording" || next === "starting") return 0;
+  if (["done", "unverified", "copied", "degraded", "history"].includes(next)) return 1;
+  if (next === "rate_limited") return currentProgress;
+  if (next !== "processing") return currentProgress;
+  if (phase === "asr") return 0.35;
+  if (phase === "cleanup") return 0.65;
+  if (phase === "delivery") return 0.9;
+  return 0.05;
+}
+
+export function hudContextFromEvent(
+  nextState: string,
+  current: { contextApp: string | null; contextStyle: string | null; contextLabel: string | null },
+  incoming: { context_app?: string | null; context_style?: string | null; context_label?: string | null },
+): { contextApp: string | null; contextStyle: string | null; contextLabel: string | null } {
+  if (nextState === "idle") {
+    return { contextApp: null, contextStyle: null, contextLabel: null };
+  }
+  return {
+    contextApp: incoming.context_app !== undefined ? incoming.context_app ?? null : current.contextApp,
+    contextStyle: incoming.context_style !== undefined ? incoming.context_style ?? null : current.contextStyle,
+    contextLabel: incoming.context_label !== undefined ? incoming.context_label ?? null : current.contextLabel,
+  };
+}
+
 export function selectedActionStateForDictation(
   current: string | null,
   next: DictationState,
@@ -143,27 +173,27 @@ export function IslandWindow() {
         if (!acceptsSessionGeneration(0, eventGeneration)) return;
         const next = event.payload.state;
         const phase = event.payload.phase ?? (next === "processing" ? "cleanup" : next === "idle" ? "idle" : "finalizing_audio");
-          const nextProgress = next === "idle" || next === "recording" ? 0 : ["done", "unverified", "copied", "degraded", "history"].includes(next) ? 1 : next === "processing" ? phase === "asr" ? 0.35 : phase === "cleanup" ? 0.65 : phase === "delivery" ? 0.9 : 0.05 : 0;
         setHud((current) => {
           if (!acceptsSessionGeneration(current.sessionGeneration, eventGeneration)) return current;
           const chunkProgress = normalizeChunkProgress(
             event.payload.completed_chunks,
             event.payload.total_chunks,
           );
+          const context = hudContextFromEvent(next, current, event.payload);
           const nextHud = {
             sessionGeneration: eventGeneration,
             state: next,
             phase,
             retryAfterSecs: event.payload.retry_after_secs ?? null,
             undoAvailable: event.payload.undo_available ?? false,
-            contextApp: next === "idle" ? null : event.payload.context_app ?? null,
-            contextStyle: next === "idle" ? null : event.payload.context_style ?? null,
-            contextLabel: next === "idle" ? null : event.payload.context_label ?? null,
+            contextApp: context.contextApp,
+            contextStyle: context.contextStyle,
+            contextLabel: context.contextLabel,
             fallbackReason: next === "idle" ? null : event.payload.fallback_reason ?? null,
             // Audio starts before the final recording state is committed. Keep
             // the live waveform continuous through that short starting phase.
             waveformLevels: next === "starting" || next === "recording" ? current.waveformLevels : emptyWaveform(),
-            progress: nextProgress,
+            progress: hudProgressForState(next, phase, current.progress),
             completedChunks: next === "processing" ? chunkProgress?.completed ?? null : null,
             totalChunks: next === "processing" ? chunkProgress?.total ?? null : null,
             selectedActionState: selectedActionStateForDictation(current.selectedActionState, next),
@@ -302,6 +332,14 @@ export function IslandWindow() {
       unlisteners.clear();
     };
   }, []);
+
+  useEffect(() => {
+    if (!learnToast) return;
+    void invoke("set_island_learn_interactive", { interactive: true }).catch(() => undefined);
+    return () => {
+      void invoke("set_island_learn_interactive", { interactive: false }).catch(() => undefined);
+    };
+  }, [learnToast]);
 
   const dismissLearnToast = () => {
     setLearnToast(null);

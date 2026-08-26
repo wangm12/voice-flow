@@ -33,6 +33,7 @@ describe("IslandWindow HUD partials", () => {
     cleanup();
     invokeMock.mockReset();
     listenMock.mockReset();
+    vi.useRealTimers();
   });
 
   async function renderHud() {
@@ -90,6 +91,48 @@ describe("IslandWindow HUD partials", () => {
     expect(document.querySelector(".voice-pill-caption")).toHaveTextContent("Cursor · 代码");
   });
 
+  it("keeps the active app on thinking when a later processing event omits context", async () => {
+    await renderHud();
+    vi.useFakeTimers();
+    act(() => {
+      handlers.get("dictation://state")!({
+        payload: {
+          state: "recording",
+          session_generation: 3,
+          context_app: "Cursor",
+          context_style: "prompt_or_code",
+        },
+      });
+    });
+    expect(document.querySelector(".voice-pill-caption")).toHaveTextContent("Cursor · 代码");
+
+    act(() => {
+      handlers.get("dictation://state")!({
+        payload: { state: "processing", phase: "waiting_retry", session_generation: 3 },
+      });
+    });
+    expect(document.querySelector(".voice-pill-caption")).toHaveTextContent("Cursor · 代码");
+
+    act(() => {
+      vi.advanceTimersByTime(2_500);
+    });
+    expect(document.querySelector(".voice-pill-caption")).not.toBeInTheDocument();
+
+    act(() => {
+      handlers.get("dictation://state")!({
+        payload: {
+          state: "processing",
+          phase: "cleanup",
+          session_generation: 3,
+          context_app: "Cursor",
+          context_style: "prompt_or_code",
+        },
+      });
+    });
+    expect(document.querySelector(".voice-pill-caption")).not.toBeInTheDocument();
+    vi.useRealTimers();
+  });
+
   it("shows a promotion undo toast on the island", async () => {
     invokeMock.mockResolvedValue(undefined);
     await renderHud();
@@ -101,9 +144,15 @@ describe("IslandWindow HUD partials", () => {
     });
 
     expect(await screen.findByRole("status")).toHaveTextContent("已学 知呼→知乎");
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("set_island_learn_interactive", { interactive: true }),
+    );
     fireEvent.click(screen.getByRole("button", { name: "撤销" }));
     await waitFor(() =>
       expect(invokeMock).toHaveBeenCalledWith("undo_learn_pair", { pairKey: "知呼\u001e知乎" }),
+    );
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("set_island_learn_interactive", { interactive: false }),
     );
   });
 });

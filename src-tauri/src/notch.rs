@@ -6,7 +6,7 @@ use tauri::{AppHandle, Monitor};
 /// Logical window size in points (pill animates inside, centered).
 const PILL_WIDTH: f64 = 172.0;
 pub const PILL_WIDTH_WITH_PARTIAL: f64 = 400.0;
-const PILL_HEIGHT: f64 = 60.0;
+const PILL_HEIGHT: f64 = 68.0;
 /// Gap between pill bottom edge and top of dock / screen edge.
 const BOTTOM_GAP: f64 = 12.0;
 /// Used only when the reported work area is the full frame and does not
@@ -238,7 +238,7 @@ mod tests {
     #[test]
     fn centers_pill_above_dock() {
         let p = placement_for_monitor_at_scale(100.0, 20.0, 1440.0, 900.0, 1.0, 56.0);
-        assert_eq!((p.x, p.y, p.width, p.height), (734.0, 792.0, 172.0, 60.0));
+        assert_eq!((p.x, p.y, p.width, p.height), (734.0, 784.0, 172.0, 68.0));
         assert_eq!(pill_window_width(false), PILL_WIDTH);
     }
 
@@ -255,7 +255,7 @@ mod tests {
             56.0,
             pill_window_width(true),
         );
-        assert_eq!((p.x, p.y, p.width, p.height), (620.0, 792.0, 400.0, 60.0));
+        assert_eq!((p.x, p.y, p.width, p.height), (620.0, 784.0, 400.0, 68.0));
     }
 
     #[test]
@@ -263,7 +263,7 @@ mod tests {
         let p = placement_for_monitor_at_scale(0.0, 0.0, 3024.0, 1964.0, 2.0, 56.0);
         assert_eq!(
             (p.x, p.y, p.width, p.height),
-            (1340.0, 1708.0, 344.0, 120.0)
+            (1340.0, 1692.0, 344.0, 136.0)
         );
     }
 

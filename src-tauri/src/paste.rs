@@ -61,8 +61,21 @@ fn map_enigo_connection_error(error: NewConError) -> PasteError {
     }
 }
 
+pub fn should_post_shortcut_to_pid(expected_pid: i32, own_pid: i32) -> bool {
+    expected_pid > 0 && expected_pid != own_pid
+}
+
+pub fn ax_insert_is_final(outcome: &InsertOutcome) -> bool {
+    outcome.verified
+}
+
 #[cfg(target_os = "macos")]
 fn send_command_shortcut(keycode: u16) -> Result<(), PasteError> {
+    send_command_shortcut_targeting(keycode, None)
+}
+
+#[cfg(target_os = "macos")]
+fn send_command_shortcut_targeting(keycode: u16, target_pid: Option<i32>) -> Result<(), PasteError> {
     if !crate::permissions::accessibility_is_trusted() {
         return Err(PasteError::Accessibility);
     }
@@ -72,13 +85,23 @@ fn send_command_shortcut(keycode: u16) -> Result<(), PasteError> {
         PasteError::Input("failed to create Command shortcut key-down event".into())
     })?;
     key_down.set_flags(CGEventFlags::CGEventFlagCommand);
-    key_down.post(CGEventTapLocation::HID);
+    post_command_event(&key_down, target_pid);
 
     let key_up = CGEvent::new_keyboard_event(source, keycode, false)
         .map_err(|_| PasteError::Input("failed to create Command shortcut key-up event".into()))?;
     key_up.set_flags(CGEventFlags::CGEventFlagCommand);
-    key_up.post(CGEventTapLocation::HID);
+    post_command_event(&key_up, target_pid);
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn post_command_event(event: &CGEvent, target_pid: Option<i32>) {
+    let own_pid = std::process::id() as i32;
+    if let Some(pid) = target_pid.filter(|pid| should_post_shortcut_to_pid(*pid, own_pid)) {
+        event.post_to_pid(pid);
+    } else {
+        event.post(CGEventTapLocation::HID);
+    }
 }
 
 /// Hold ABC until the target can consume Cmd+V. `CGEvent::post` is async; the
@@ -94,15 +117,15 @@ const APPLESCRIPT_PASTE: &str =
     r#"tell application "System Events" to key code 9 using command down"#;
 
 #[cfg(target_os = "macos")]
-fn simulate_paste() -> Result<(), PasteError> {
+fn simulate_paste(expected_pid: i32) -> Result<(), PasteError> {
     let _latin_layout = crate::input_source::AbcLayoutGuard::acquire();
-    send_command_shortcut(COMMAND_PASTE_KEYCODE)?;
+    send_command_shortcut_targeting(COMMAND_PASTE_KEYCODE, Some(expected_pid))?;
     thread::sleep(PASTE_CONSUME_SETTLE);
     Ok(())
 }
 
 fn simulate_paste_with_fallback(expected_pid: i32) -> Result<(), PasteError> {
-    simulate_paste()?;
+    simulate_paste(expected_pid)?;
     let own_pid = std::process::id() as i32;
     if should_retry_paste_with_applescript(current_frontmost_pid(), expected_pid, own_pid) {
         let _ = activate_target_now(expected_pid);
@@ -131,7 +154,7 @@ fn simulate_paste_applescript() -> Result<(), PasteError> {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn simulate_paste() -> Result<(), PasteError> {
+fn simulate_paste(_expected_pid: i32) -> Result<(), PasteError> {
     let mut enigo = Enigo::new(&Settings::default()).map_err(map_enigo_connection_error)?;
     enigo
         .key(PRIMARY_MODIFIER, Direction::Press)
@@ -968,12 +991,11 @@ pub fn insert(
             text,
             delivery_target_is_frontmost(expected_pid),
         );
-        if should_copy_clipboard_fallback(&outcome) {
-            // Previous clipboard was never overwritten. Leave the text as the
-            // same fail-closed manual fallback used after a posted Cmd+V.
-            let _ = app.clipboard().write_text(text);
+        if ax_insert_is_final(&outcome) {
+            return Ok(outcome);
         }
-        return Ok(outcome);
+        // Cursor/VS Code often expose a settable AX stub that does not update
+        // the visible Monaco input. Fall through to a process-targeted Cmd+V.
     }
     if cancellation.is_cancelled() {
         return Err(PasteError::Cancelled);
@@ -1348,6 +1370,24 @@ mod tests {
             Some("inserted"),
             "inserted"
         ));
+    }
+
+    #[test]
+    fn unverified_ax_insert_is_not_final_so_keyboard_paste_can_still_run() {
+        let unverified = build_insert_outcome(false, None, None, "hello", true);
+        assert!(!ax_insert_is_final(&unverified));
+        let stub_empty = build_insert_outcome(false, Some(""), Some(String::new()), "hello", true);
+        assert!(!ax_insert_is_final(&stub_empty));
+        let verified = build_insert_outcome(false, Some(""), Some("hello".into()), "hello", false);
+        assert!(ax_insert_is_final(&verified));
+    }
+
+    #[test]
+    fn command_shortcuts_target_the_recorded_pid() {
+        assert!(should_post_shortcut_to_pid(4242, 99));
+        assert!(!should_post_shortcut_to_pid(99, 99));
+        assert!(!should_post_shortcut_to_pid(0, 99));
+        assert!(!should_post_shortcut_to_pid(-3, 99));
     }
 
     #[test]

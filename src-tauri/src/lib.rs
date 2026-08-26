@@ -272,21 +272,22 @@ fn error_fallback_reason(message: &str) -> &'static str {
     }
 }
 
-fn hud_accepts_mouse(state: &str, delivery_method: &str, paste_yielding: bool) -> bool {
-    if paste_yielding {
-        return false;
-    }
-    matches!(
-        state,
-        "starting" | "recording" | "recording_limited" | "rate_limited"
-    ) || (delivery_method == "paste" && matches!(state, "done" | "unverified" | "degraded"))
+fn hud_accepts_mouse(paste_yielding: bool, learn_toast: bool) -> bool {
+    !paste_yielding && learn_toast
+}
+
+fn sync_island_mouse(app: &tauri::AppHandle) {
+    island_window::set_interactive(
+        app,
+        hud_accepts_mouse(
+            island_window::is_yielding_for_paste(),
+            island_window::is_learn_toast_interactive(),
+        ),
+    );
 }
 
 fn emit_state(app: &tauri::AppHandle, state: &str) {
-    island_window::set_interactive(
-        app,
-        hud_accepts_mouse(state, "pending", island_window::is_yielding_for_paste()),
-    );
+    sync_island_mouse(app);
     let session_generation = current_session_generation(app);
     let _ = app.emit(
         "dictation://state",
@@ -464,14 +465,7 @@ fn emit_state_with_delivery_and_input_device(
     cleanup_status: Option<&str>,
     input_device: Option<&str>,
 ) {
-    island_window::set_interactive(
-        app,
-        hud_accepts_mouse(
-            state,
-            delivery_method,
-            island_window::is_yielding_for_paste(),
-        ),
-    );
+    sync_island_mouse(app);
     let mut payload = serde_json::json!({
         "state": state,
         "session_generation": current_session_generation(app),
@@ -548,7 +542,7 @@ fn emit_processing_phase(
     if let Some(context) = context {
         attach_context_fields(&mut payload, context);
     }
-    island_window::set_interactive(app, false);
+    sync_island_mouse(app);
     island_window::set_has_wide_caption(app, false);
     if let Some(seconds) = retry_after_secs {
         payload["retry_after_secs"] = serde_json::json!(seconds.ceil() as u64);
@@ -1210,9 +1204,15 @@ fn show_island(app: &tauri::AppHandle) {
 
 #[tauri::command]
 fn hide_island_if_idle(app: tauri::AppHandle, state: State<'_, AppState>) {
+    island_window::set_learn_toast_interactive(&app, false);
     if lock_recover(&state.manager).phase == Phase::Idle {
         island_window::hide_overlay(&app);
     }
+}
+
+#[tauri::command]
+fn set_island_learn_interactive(app: tauri::AppHandle, interactive: bool) {
+    island_window::set_learn_toast_interactive(&app, interactive);
 }
 
 async fn handle_audio_error(app: &tauri::AppHandle, state: &AppState, message: String) {
@@ -4457,6 +4457,7 @@ pub fn run() {
             open_privacy_settings,
             request_accessibility_permission,
             hide_island_if_idle,
+            set_island_learn_interactive,
             set_hotkeys_suspended,
             set_onboarding_test_mode,
             set_onboarding_selected_text,
@@ -4820,12 +4821,10 @@ mod tests {
 
     #[test]
     fn hud_stays_click_through_during_processing_and_paste_yield() {
-        assert!(hud_accepts_mouse("recording", "pending", false));
-        assert!(!hud_accepts_mouse("processing", "pending", false));
-        assert!(!hud_accepts_mouse("recording", "pending", true));
-        assert!(!hud_accepts_mouse("done", "paste", true));
-        assert!(hud_accepts_mouse("done", "paste", false));
-        assert!(!hud_accepts_mouse("done", "clipboard", false));
+        assert!(!hud_accepts_mouse(false, false));
+        assert!(!hud_accepts_mouse(true, false));
+        assert!(!hud_accepts_mouse(true, true));
+        assert!(hud_accepts_mouse(false, true));
     }
 
     #[test]

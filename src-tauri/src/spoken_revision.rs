@@ -1,8 +1,8 @@
 //! Deterministic restatement, hallucination, and repeat cleanup.
 //!
-//! Runs after spoken punctuation/layout and before lexicon / LLM. Chat
-//! families skip the LLM, so this layer must resolve the high-value
-//! “假开头 + 不对 + 重说” cases locally.
+//! Runs after spoken punctuation/layout and before lexicon / LLM. Terminal
+//! and form-filling stay LocalOnly; prose still needs these markers when the
+//! LLM is skipped or fails.
 
 const HALLUCINATIONS: &[&str] = &[
     "thanks for watching",
@@ -30,6 +30,8 @@ const MARKERS: &[&str] = &[
     "我是说",
     "不对",
 ];
+
+const REPLACEMENT_REQUIRED_MARKERS: &[&str] = &["i meant", "删掉", "算了"];
 
 #[derive(Clone, Copy)]
 struct Protect {
@@ -290,15 +292,15 @@ fn match_one_marker(text: &str, lower: &str, start: usize) -> Option<(usize, usi
     if start >= text.len() || !text.is_char_boundary(start) {
         return None;
     }
-    for marker in MARKERS {
-        if marker.is_ascii() {
-            if lower[start..].starts_with(marker)
-                && ascii_boundaries(text, start, start + marker.len())
-            {
-                return Some((start, start + marker.len()));
+    for marker in REPLACEMENT_REQUIRED_MARKERS {
+        if let Some(end) = match_plain_marker(text, lower, start, marker) {
+            if has_replacement_after(text, end) {
+                return Some((start, end));
             }
-        } else if text[start..].starts_with(marker) {
-            let end = start + marker.len();
+        }
+    }
+    for marker in MARKERS {
+        if let Some(end) = match_plain_marker(text, lower, start, marker) {
             if *marker == "不对" && !cjk_bu_dui_right_ok(text, end) {
                 continue;
             }
@@ -312,6 +314,29 @@ fn match_one_marker(text: &str, lower: &str, start: usize) -> Option<(usize, usi
         return Some((start, end));
     }
     None
+}
+
+fn match_plain_marker(text: &str, lower: &str, start: usize, marker: &str) -> Option<usize> {
+    if marker.is_ascii() {
+        if lower[start..].starts_with(marker)
+            && ascii_boundaries(text, start, start + marker.len())
+        {
+            return Some(start + marker.len());
+        }
+        return None;
+    }
+    if text[start..].starts_with(marker) {
+        return Some(start + marker.len());
+    }
+    None
+}
+
+fn has_replacement_after(text: &str, end: usize) -> bool {
+    let after = skip_junk(text, end);
+    if after >= text.len() {
+        return false;
+    }
+    !is_blank_or_markers(&text[after..])
 }
 
 fn match_no_capital_replacement(text: &str, start: usize) -> Option<usize> {
@@ -512,6 +537,19 @@ mod tests {
             apply("write a cloud test, scratch that, write a cursor test"),
             "write a cursor test"
         );
+        assert_eq!(
+            apply("write a cloud test, I meant write a cursor test"),
+            "write a cursor test"
+        );
+    }
+
+    #[test]
+    fn revision_markers_need_a_replacement() {
+        assert_eq!(apply("写 cloud 测试，删掉，写 cursor 测试"), "写 cursor 测试");
+        assert_eq!(apply("写 cloud 测试，算了，写 cursor 测试"), "写 cursor 测试");
+        assert_eq!(apply("这件事删掉"), "这件事删掉");
+        assert_eq!(apply("算了"), "算了");
+        assert!(apply("I actually enjoyed the movie").contains("actually"));
     }
 
     #[test]

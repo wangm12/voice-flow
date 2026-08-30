@@ -93,7 +93,7 @@ export function EngineSettings({
   const [probeError, setProbeError] = useState<string | null>(null);
   const [probeSuccess, setProbeSuccess] = useState(false);
   const [commitError, setCommitError] = useState<string | null>(null);
-  const [failed, setFailed] = useState<Set<ProviderId>>(new Set());
+  const [stageFail, setStageFail] = useState<{ asr?: string | null; cleanup?: string | null }>({});
   const [expanded, setExpanded] = useState<Set<ProviderId>>(() => {
     const next = new Set<ProviderId>([providerOf(settings.asr_provider, settings.asr_base_url)]);
     if (settings.cleanup_enabled) next.add(providerOf(settings.cleanup_provider, settings.cleanup_base_url));
@@ -131,13 +131,10 @@ export function EngineSettings({
     && draft.localWhisperBaseUrl.trim() === (settings.local_whisper_base_url ?? providerById("local_whisper")?.defaultBaseUrl ?? "").trim()
     && !Object.values(draft.providerKeys).some((value) => value?.trim());
 
-  const markFailed = (id: ProviderId, failedNow: boolean) => {
-    setFailed((current) => {
-      const next = new Set(current);
-      if (failedNow) next.add(id);
-      else next.delete(id);
-      return next;
-    });
+  const failKind = (kind: string | null | undefined) => {
+    if (kind === "key" || kind === "missing_key") return t("密钥无效");
+    if (kind) return probeCopy(kind, undefined, t);
+    return null;
   };
 
   const runProbe = async () => {
@@ -148,17 +145,16 @@ export function EngineSettings({
     try {
       const result = await invoke<ProbeResult>("probe_engine_draft", { draft: probePayload(draft, settings) });
       if (!result.asr.ok) {
-        markFailed(draft.asrProvider, true);
+        setStageFail({ asr: result.asr.error_kind, cleanup: undefined });
         setProbeError(`${t("转写")}：${probeCopy(result.asr.error_kind, result.asr.message, t)}`);
         return;
       }
-      markFailed(draft.asrProvider, false);
       if (!result.cleanup.ok) {
-        markFailed(draft.cleanupProvider, true);
+        setStageFail({ asr: undefined, cleanup: result.cleanup.error_kind });
         setProbeError(`${t("文字整理")}：${probeCopy(result.cleanup.error_kind, result.cleanup.message, t)}`);
         return;
       }
-      markFailed(draft.cleanupProvider, false);
+      setStageFail({});
       await commitEngine(persistPatch(draft, settings));
       setDraft((current) => ({ ...current, providerKeys: {} }));
       setProbeSuccess(true);
@@ -183,11 +179,15 @@ export function EngineSettings({
       });
       const stage = asrOnly ? result.asr : result.cleanup;
       if (!stage.ok) {
-        markFailed(id, true);
+        setStageFail((current) => (
+          asrOnly ? { ...current, asr: stage.error_kind } : { ...current, cleanup: stage.error_kind }
+        ));
         setProbeError(`${definition.label}：${probeCopy(stage.error_kind, stage.message, t)}`);
         return;
       }
-      markFailed(id, false);
+      setStageFail((current) => (
+        asrOnly ? { ...current, asr: undefined } : { ...current, cleanup: undefined }
+      ));
       const typed = draft.providerKeys[id]?.trim();
       if (typed) {
         await commitEngine({ provider_keys: { [id]: typed } });
@@ -208,7 +208,7 @@ export function EngineSettings({
     try {
       await removeProviderKey(id);
       setDraft((current) => ({ ...current, providerKeys: { ...current.providerKeys, [id]: "" } }));
-      markFailed(id, false);
+      setStageFail({});
     } finally {
       setRemoving(false);
     }
@@ -235,6 +235,7 @@ export function EngineSettings({
 
   const changeCleanupModel = (cleanupModel: string) => {
     setDraft({ ...draft, cleanupModel });
+    setStageFail((current) => ({ ...current, cleanup: undefined }));
     if (routingLive && isKnownModel(draft.cleanupProvider, "llm", cleanupModel)) {
       save({ cleanup_model: cleanupModel });
     }
@@ -251,17 +252,19 @@ export function EngineSettings({
 
   const asrOptions = providersFor("asr", draft.customAsr, draft.customLlm);
   const cleanupOptions = providersFor("llm", draft.customAsr, draft.customLlm);
+  const asrFailLabel = failKind(stageFail.asr);
   const asrStatus = asrMissing
     ? { label: t("未配置密钥"), tone: "warning" as const }
-    : failed.has(draft.asrProvider)
-      ? { label: t("密钥无效"), tone: "error" as const }
+    : asrFailLabel
+      ? { label: asrFailLabel, tone: "error" as const }
       : { label: t("已就绪"), tone: "success" as const };
+  const cleanupFailLabel = failKind(stageFail.cleanup);
   const cleanupStatus = !settings.cleanup_enabled
     ? { label: t("关闭 · 只用本地规则"), tone: "unused" as const }
     : cleanupMissing
       ? { label: t("未配置密钥"), tone: "warning" as const }
-      : failed.has(draft.cleanupProvider)
-        ? { label: t("密钥无效"), tone: "error" as const }
+      : cleanupFailLabel
+        ? { label: cleanupFailLabel, tone: "error" as const }
         : { label: t("已就绪"), tone: "success" as const };
 
   return (
@@ -335,8 +338,15 @@ export function EngineSettings({
           const inUse = draft.asrProvider === provider.id || (settings.cleanup_enabled && draft.cleanupProvider === provider.id);
           const configured = providerConfigured(settings, provider.id) || Boolean(draft.providerKeys[provider.id]?.trim());
           const open = expanded.has(provider.id);
-          const rowTone = failed.has(provider.id)
-            ? { label: t("密钥无效"), tone: "error" as const }
+          const rowKind = [
+            draft.asrProvider === provider.id ? stageFail.asr : undefined,
+            settings.cleanup_enabled && draft.cleanupProvider === provider.id
+              ? stageFail.cleanup
+              : undefined,
+          ].find((kind) => kind);
+          const rowFail = failKind(rowKind);
+          const rowTone = rowFail
+            ? { label: rowFail, tone: "error" as const }
             : inUse
               ? { label: t("使用中"), tone: "accent" as const }
               : providerConfigured(settings, provider.id)

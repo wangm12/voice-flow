@@ -338,6 +338,24 @@ fn read_stored_cleanup_api_key() -> Result<Option<String>, String> {
     read_stored_secret(API_SERVICE, API_FALLBACK_SERVICE, CLEANUP_ACCOUNT)
 }
 
+fn is_keychain_auth_failure(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    lower.contains("passphrase")
+        || lower.contains("errsecauthfailed")
+        || lower.contains("(-25293)")
+}
+
+fn keychain_read_error_state(error: String) -> ApiKeyState {
+    if is_keychain_auth_failure(&error) {
+        log::warn!(
+            "keychain credential unreadable ({error}); treating as missing so an app-data sidecar can load"
+        );
+        ApiKeyState::Missing
+    } else {
+        ApiKeyState::Unavailable(error)
+    }
+}
+
 fn secret_state<F>(read: F) -> ApiKeyState
 where
     F: FnOnce() -> Result<Option<String>, String> + Send + 'static,
@@ -348,7 +366,7 @@ where
     match with_timeout(read) {
         Some(Ok(Some(key))) => ApiKeyState::Configured(key),
         Some(Ok(None)) => ApiKeyState::Missing,
-        Some(Err(error)) => ApiKeyState::Unavailable(error),
+        Some(Err(error)) => keychain_read_error_state(error),
         None => ApiKeyState::Unavailable("keychain read timed out".into()),
     }
 }
@@ -690,6 +708,20 @@ mod tests {
 
         assert_eq!(stored.as_deref(), Some(key.as_str()));
         assert_eq!(cleared, None);
+    }
+
+    #[test]
+    fn keychain_auth_failure_is_missing_so_sidecar_can_load() {
+        assert_eq!(
+            keychain_read_error_state(
+                "The user name or passphrase you entered is not correct.".into()
+            ),
+            ApiKeyState::Missing
+        );
+        assert!(matches!(
+            keychain_read_error_state("keychain read timed out".into()),
+            ApiKeyState::Unavailable(_)
+        ));
     }
 
     #[test]

@@ -2,7 +2,7 @@
 
 use crate::context::{AppMapping, ContextFamily, ContextPolicy, ContextSnapshot};
 use crate::dictionary_learn::{is_cjk, is_latin_cont, is_latin_start, pair_key};
-use crate::llm::{CleanupEffort, CleanupIntent, CleanupOperation, IntentSource};
+use crate::llm::{CleanupEffort, CleanupIntent, IntentSource};
 use crate::store::LearnPairRecord;
 use std::collections::HashSet;
 
@@ -123,12 +123,13 @@ pub fn decide_cleanup(
     if intent.source == IntentSource::SpokenCommand {
         return CleanupRoute::Provider(CleanupEffort::Command);
     }
+    if intent.content.trim().is_empty() {
+        return CleanupRoute::LocalOnly;
+    }
     if let Some(effort) = mapping.and_then(|item| item.cleanup_effort) {
         return CleanupRoute::Provider(effort);
     }
-    if intent.operation == CleanupOperation::Cleanup
-        && (is_short_cleanup_text(&intent.content) || skips_llm_scene(family, profile_confidence))
-    {
+    if skips_llm_scene(family) {
         return CleanupRoute::LocalOnly;
     }
     if profile_confidence < 0.75 {
@@ -137,25 +138,11 @@ pub fn decide_cleanup(
     CleanupRoute::Provider(CleanupEffort::default_for_family(family))
 }
 
-fn skips_llm_scene(family: ContextFamily, profile_confidence: f32) -> bool {
-    profile_confidence >= 0.75
-        && matches!(
-            family,
-            ContextFamily::PersonalChat
-                | ContextFamily::SocialMedia
-                | ContextFamily::BrowserSearch
-                | ContextFamily::FormFilling
-                | ContextFamily::Terminal
-        )
-}
-
-fn is_short_cleanup_text(text: &str) -> bool {
-    let cjk = text.chars().filter(|ch| is_cjk(*ch)).count();
-    let latin_words = text
-        .split_whitespace()
-        .filter(|word| word.chars().any(|ch| ch.is_ascii_alphabetic()))
-        .count();
-    cjk < 12 && latin_words < 8
+fn skips_llm_scene(family: ContextFamily) -> bool {
+    matches!(
+        family,
+        ContextFamily::FormFilling | ContextFamily::Terminal
+    )
 }
 
 pub fn mapping_for_profile<'a>(
@@ -774,18 +761,22 @@ mod tests {
     }
 
     #[test]
-    fn decide_cleanup_skips_chat_and_short_text() {
-        let short = CleanupIntent::implicit("嗯今天去知乎");
+    fn decide_cleanup_sends_prose_including_short_chat_to_provider() {
+        let short = CleanupIntent::implicit("好的哈哈我晚点回你");
         let long = CleanupIntent::implicit(
             "请帮我看一下这份季度报告里的几个数字然后在周五之前把意见发我",
         );
         assert_eq!(
+            decide_cleanup(true, None, ContextFamily::PersonalChat, &short, 0.9),
+            CleanupRoute::Provider(CleanupEffort::Light)
+        );
+        assert_eq!(
             decide_cleanup(true, None, ContextFamily::PersonalChat, &long, 0.9),
-            CleanupRoute::LocalOnly
+            CleanupRoute::Provider(CleanupEffort::Light)
         );
         assert_eq!(
             decide_cleanup(true, None, ContextFamily::Email, &short, 0.9),
-            CleanupRoute::LocalOnly
+            CleanupRoute::Provider(CleanupEffort::Standard)
         );
         assert_eq!(
             decide_cleanup(true, None, ContextFamily::Email, &long, 0.9),
@@ -794,6 +785,46 @@ mod tests {
         assert_eq!(
             decide_cleanup(true, None, ContextFamily::WorkChat, &long, 0.9),
             CleanupRoute::Provider(CleanupEffort::Light)
+        );
+        assert_eq!(
+            decide_cleanup(true, None, ContextFamily::SocialMedia, &short, 0.9),
+            CleanupRoute::Provider(CleanupEffort::Light)
+        );
+        assert_eq!(
+            decide_cleanup(true, None, ContextFamily::BrowserSearch, &short, 0.9),
+            CleanupRoute::Provider(CleanupEffort::Standard)
+        );
+        assert_eq!(
+            decide_cleanup(true, None, ContextFamily::Terminal, &long, 0.9),
+            CleanupRoute::LocalOnly
+        );
+        assert_eq!(
+            decide_cleanup(true, None, ContextFamily::FormFilling, &short, 0.9),
+            CleanupRoute::LocalOnly
+        );
+        assert_eq!(
+            decide_cleanup(true, None, ContextFamily::PromptOrCode, &long, 0.9),
+            CleanupRoute::Provider(CleanupEffort::Light)
+        );
+        assert_eq!(
+            decide_cleanup(
+                true,
+                None,
+                ContextFamily::DeveloperCollaboration,
+                &long,
+                0.9
+            ),
+            CleanupRoute::Provider(CleanupEffort::Light)
+        );
+        assert_eq!(
+            decide_cleanup(
+                true,
+                None,
+                ContextFamily::PersonalChat,
+                &CleanupIntent::implicit("   "),
+                0.9
+            ),
+            CleanupRoute::LocalOnly
         );
         let spoken = CleanupIntent {
             source: IntentSource::SpokenCommand,
@@ -812,7 +843,7 @@ mod tests {
             label: "微信".into(),
             family: ContextFamily::PersonalChat,
             mode_id: None,
-            bundle_id: Some("com.tencent.xinWeChat".into()),
+            bundle_id: None,
             executable: None,
             browser_host: None,
             style_example_input: None,
@@ -826,10 +857,25 @@ mod tests {
             decide_cleanup(true, Some(&mapping), ContextFamily::PersonalChat, &long, 0.9),
             CleanupRoute::Provider(CleanupEffort::Standard)
         );
+        let mapping_off = AppMapping {
+            cleanup_enabled: false,
+            cleanup_effort: None,
+            ..mapping
+        };
+        assert_eq!(
+            decide_cleanup(
+                true,
+                Some(&mapping_off),
+                ContextFamily::PersonalChat,
+                &long,
+                0.9
+            ),
+            CleanupRoute::LocalOnly
+        );
     }
 
     #[test]
-    fn history_scene_skips_wechat_llm_and_stays_scoped() {
+    fn history_personal_chat_still_routes_to_light() {
         let intent = CleanupIntent::implicit(
             "请帮我看一下这份季度报告里的几个数字然后在周五之前把意见发我",
         );
@@ -847,7 +893,7 @@ mod tests {
                 &intent,
                 0.9,
             ),
-            CleanupRoute::LocalOnly
+            CleanupRoute::Provider(CleanupEffort::Light)
         );
     }
 

@@ -83,18 +83,21 @@ Custom provider 已经能接 OpenAI-compatible `/v1/audio/transcriptions`（engi
 2. **口述版式**（`spoken_layout.rs`）：`换行/新段落/第一/first/bullet`；`1.` `2.` `3.` 最近才部分覆盖。没说结构词就不分段。
 3. **词典替换**（`lexicon.rs`）：最长优先、拉丁词边界、CJK 不嵌进 blocker。只应用 **已晋升且 after 在 dictionary 里** 的 pair。
 
-`local_cleanup`（LLM 失败或 LocalOnly 时）：英文 `uh/um/you know/I mean`，中文独立 `嗯/啊`。没有 `那个/就是/然后`，没有连续句去重，没有 YouTube 片尾袋，没有 ITN（四十二 → 42）。
+`local_cleanup`（LLM 失败或 LocalOnly 时）：英文 `uh/um/you know/I mean`，中文独立 `嗯/啊`，以及独立的 `那个/就是说`（不吃掉「那个项目」「我就是这个意思」）。没有 `然后`，没有 ITN（四十二 → 42）。
 
-### 2.4 Cleanup 路由：计划里的 scene skip 没上船
+### 2.4 Cleanup 路由（2026-08-30）
 
 `lexicon::decide_cleanup`：
 
 - 全局或 per-mapping 关整理 → `LocalOnly`
+- 空白 transcript → `LocalOnly`
 - 口述命令 → `Command`
+- mapping.effort 若设置则覆盖
+- **Terminal / FormFilling → `LocalOnly`**
 - context 置信 <0.75 → `Light`
-- 否则 mapping.effort 或 family 默认（聊天/笔记/终端 = Light，其余 Standard）
+- 否则 family 默认：聊天/笔记/社交/代码 = Light，邮件/搜索等 = Standard
 
-**没有「PersonalChat / Search / Form / Terminal 跳过 LLM」。** 微信只要开着智能整理，就会打一轮 gpt-oss。这是延迟和「微信写成邮件」的双重来源。
+**短句不再 LocalOnly。** 微信 `好的哈哈我晚点回你` 走 Light，和邮件同一套 punct/filler/不对。不要把微信当成特例。
 
 ### 2.5 LLM 层
 
@@ -330,8 +333,8 @@ P0 具体建议：
 1. **默认 cleanup 不要再用 gpt-oss。** 推理模型不适合「100 token 内出可粘贴文本」。
 2. **SYSTEM_PROMPT 砍到 1/3。** 改口规则放到确定性层；prompt 只剩：保 token、保语种、按 Effort、按 family、few-shot。
 3. **每个 family 3–6 条中英 few-shot。** 微信必须是「好的哈哈我晚点回你」，不是「好的，我会稍后回复您。」Cursor 必须是改口删除 + 保留 `1. 2. 3.`。
-4. **Scene skip 落地。** PersonalChat / Social / Search / Form / Terminal：默认 LocalOnly。Email / Document / Support：Standard。PromptOrCode：Light + 改口状态机，不要 Standard 长文。
-5. **短文本跳过**（VoiceInk）：低于 ~12 个汉字 / ~8 个英文词，只走本地层。
+4. **Scene skip（已改，2026-08-30）。** 只有 Terminal / FormFilling 默认 LocalOnly。PersonalChat / Social / Search 走 LLM。PromptOrCode 为 Light，禁止发明列表/`##`。
+5. **短文本不再跳过。** 低于 12 个汉字的聊天也整理。空白才 LocalOnly。
 
 不要：把「更强模型」理解成换成 gpt-oss-120b。那只会更慢、更爱总结。Wispr 赢在 **小而专 + 很快**。
 

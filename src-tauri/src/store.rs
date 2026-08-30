@@ -1498,11 +1498,20 @@ pub fn recover_spool(dir: &Path, keep_audio_days: u64) -> anyhow::Result<Vec<Rec
     Ok(recovered)
 }
 
-fn secret_sidecar_slot(slot: &str) -> Option<&'static str> {
+fn is_safe_secret_sidecar_slot(slot: &str) -> bool {
+    !slot.is_empty()
+        && slot.len() <= 64
+        && slot
+            .chars()
+            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_')
+}
+
+fn secret_sidecar_slot(slot: &str) -> Option<&str> {
     match slot {
-        "api_key" => Some("api_key"),
+        "api_key" | "groq_api_key" => Some("api_key"),
         "asr_api_key" => Some("asr_api_key"),
         "cleanup_api_key" => Some("cleanup_api_key"),
+        other if is_safe_secret_sidecar_slot(other) => Some(other),
         _ => None,
     }
 }
@@ -1546,7 +1555,17 @@ fn persist_secret_to_keychain_or_sidecar(
 ) -> anyhow::Result<()> {
     match store(key) {
         Ok(()) => {
-            clear_secret_sidecar(dir, slot);
+            if cfg!(debug_assertions) {
+                // `make run` / `tauri dev` is ad-hoc signed. A write can succeed
+                // in this process and become unreadable after the next Cargo
+                // rebuild. Keep the sidecar so the next debug launch still has
+                // the key.
+                if !key.trim().is_empty() {
+                    write_secret_sidecar(dir, slot, key)?;
+                }
+            } else {
+                clear_secret_sidecar(dir, slot);
+            }
             Ok(())
         }
         Err(error) => {
@@ -1685,6 +1704,17 @@ pub fn load_settings(dir: &Path) -> (Settings, bool) {
                     .or_insert(key);
             }
             _ => {}
+        }
+        let mut key = settings
+            .provider_api_keys
+            .get(provider.as_str())
+            .cloned()
+            .unwrap_or_default();
+        fill_empty_secret_from_sidecar(dir, provider.keychain_account(), &mut key);
+        if !key.trim().is_empty() {
+            settings
+                .provider_api_keys
+                .insert(provider.as_str().to_owned(), key);
         }
     }
     bind_legacy_keys_into_pool(&mut settings);
@@ -3398,11 +3428,56 @@ mod tests {
     }
 
     #[test]
-    fn persist_secret_clears_sidecar_after_keychain_succeeds() {
-        let dir = temp_dir("sidecar-clear");
-        write_secret_sidecar(&dir, "api_key", "old").unwrap();
-        persist_secret_to_keychain_or_sidecar(&dir, "api_key", "new", |_| Ok(())).unwrap();
-        assert!(!secret_sidecar_path(&dir, "api_key").exists());
+    fn persist_secret_keeps_debug_sidecar_after_keychain_succeeds() {
+        let dir = temp_dir("sidecar-debug-backup");
+        persist_secret_to_keychain_or_sidecar(&dir, "api_key", "gsk_debug", |_| Ok(())).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(secret_sidecar_path(&dir, "api_key")).unwrap(),
+            "gsk_debug"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn persist_groq_provider_account_survives_keychain_auth_failure() {
+        let dir = temp_dir("sidecar-groq-account");
+        persist_secret_to_keychain_or_sidecar(&dir, "groq_api_key", "gsk_from_dev", |_| {
+            Err("The user name or passphrase you entered is not correct.".into())
+        })
+        .unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("settings.json"),
+            r#"{"onboarded":true,"api_key":""}"#,
+        )
+        .unwrap();
+        let (settings, _) = load_settings(&dir);
+        assert_eq!(settings.api_key, "gsk_from_dev");
+        assert_eq!(
+            settings.provider_secret(crate::engine::EngineProvider::Groq),
+            "gsk_from_dev"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn persist_openai_provider_account_survives_keychain_auth_failure() {
+        let dir = temp_dir("sidecar-openai-account");
+        persist_secret_to_keychain_or_sidecar(&dir, "provider_openai", "sk-from-dev", |_| {
+            Err("The user name or passphrase you entered is not correct.".into())
+        })
+        .unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("settings.json"),
+            r#"{"onboarded":true,"api_key":""}"#,
+        )
+        .unwrap();
+        let (settings, _) = load_settings(&dir);
+        assert_eq!(
+            settings.provider_secret(crate::engine::EngineProvider::OpenAi),
+            "sk-from-dev"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 

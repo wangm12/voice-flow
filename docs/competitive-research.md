@@ -273,6 +273,8 @@ HUD 应显示「微信 · 口语」。微信 few-shot 应是「好的哈哈我�
 
 会议笔记、日历自动开录、MCP 笔记、iOS / Android 完整产品、联网 Ask Anything、插件市场、把用户风格上传云端、Command Mode 控电脑、聊天默认表情包、聊天默认屏蔽脏话、全局击键监听、在密码框或 Secure Input 里学习、用用户录音微调 FunASR 权重、在 Tauri 里嵌 Python FunASR 全家桶。
 
+2026-08-30 研究后的完整边界（以后再做 vs 明确不做，含 Daisy 控 Mac、流式 HUD、Wispr 四档滑条、改正即学、TypeWhisper workflow、按住说话、Volcengine、500ms 预滚）见 [asr-cleanup-later-and-wont.md](asr-cleanup-later-and-wont.md)。质量标杆改为 Typeless 中英混合，不把「跳过微信 LLM」当长期方向。
+
 ---
 
 ## 若开始做，改哪里

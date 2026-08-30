@@ -12,11 +12,17 @@ const FIXED_TOKENS: &[(&str, &str)] = &[
     ("句号", "。"),
     ("问号", "？"),
     ("感叹号", "！"),
+    ("破折号", "——"),
+    ("冒号", "："),
+    ("分号", "；"),
     ("question mark", "?"),
     ("exclamation point", "!"),
     ("exclamation mark", "!"),
     ("comma", ","),
     ("period", "."),
+    ("semicolon", ";"),
+    ("colon", ":"),
+    ("dash", "—"),
 ];
 
 struct TokenMatch {
@@ -386,6 +392,18 @@ mod tests {
         assert_eq!(apply("watch out exclamation point"), "watch out!");
         assert_eq!(apply("watch out exclamation mark"), "watch out!");
         assert_eq!(apply("hello comma world"), "hello, world");
+        assert_eq!(apply("meeting colon agenda"), "meeting: agenda");
+        assert_eq!(apply("risk semicolon dependency"), "risk; dependency");
+        assert_eq!(apply("pause dash continue"), "pause— continue");
+    }
+
+    #[test]
+    fn maps_standalone_colon_semicolon_and_dash() {
+        assert_eq!(apply("会议纪要冒号预算"), "会议纪要：预算");
+        assert_eq!(apply("风险分号依赖"), "风险；依赖");
+        assert_eq!(apply("停顿破折号继续"), "停顿——继续");
+        assert_eq!(apply("画个冒号"), "画个冒号");
+        assert_eq!(apply("colonial rule"), "colonial rule");
     }
 
     #[test]

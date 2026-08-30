@@ -52,4 +52,15 @@ describe("provider catalog", () => {
     const model = groq?.llmModels.find((item) => item.value === "openai/gpt-oss-120b");
     expect(model?.note).toBe("较慢 · 不是质量升级");
   });
+
+  it("recommends SenseVoice for Chinese and labels Groq Whisper as weaker on Chinese", () => {
+    const siliconflow = PROVIDERS.find((provider) => provider.id === "siliconflow");
+    expect(siliconflow?.asrModels[0]).toMatchObject({
+      value: "FunAudioLLM/SenseVoiceSmall",
+      note: "中文推荐",
+    });
+    expect(PROVIDERS.find((provider) => provider.id === "groq")?.asrModels[0]?.note).toMatch(
+      /英文更快.*中文较弱/,
+    );
+  });
 });

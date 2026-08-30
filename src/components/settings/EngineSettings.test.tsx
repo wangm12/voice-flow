@@ -97,6 +97,15 @@ describe("EngineSettings form", () => {
     expect(screen.getAllByRole("button", { name: "删除密钥" })).toHaveLength(2);
   });
 
+  it("tells Groq users to prefer SenseVoice or Qwen3-ASR for Chinese", () => {
+    renderEngine();
+    expect(
+      screen.getByText(
+        "Groq Whisper 英文更快，中文人名和专有名词较弱。中文推荐 SiliconFlow SenseVoice 或兼容接口的 Qwen3-ASR。",
+      ),
+    ).toBeInTheDocument();
+  });
+
   it("keeps model notes in the interface language", () => {
     renderEngine();
     expect(screen.getByRole("option", { name: "Whisper Large v3 Turbo · 默认 · 英文更快，中文较弱" })).toBeInTheDocument();
@@ -136,6 +145,23 @@ describe("EngineSettings form", () => {
     renderEngine({}, { save });
     fireEvent.change(screen.getByRole("combobox", { name: "ASR 模型" }), { target: { value: "whisper-large-v3" } });
     expect(save).toHaveBeenCalledWith({ asr_model: "whisper-large-v3" });
+  });
+
+  it("does not call a cleanup provider error an invalid key", async () => {
+    vi.mocked(invoke).mockResolvedValue({
+      asr: { ok: true, skipped: false },
+      cleanup: { ok: false, skipped: false, error_kind: "provider", message: "HTTP status 503" },
+    });
+    renderEngine({
+      cleanup_provider: "groq",
+      cleanup_model: "openai/gpt-oss-120b",
+      provider_keys: { groq: { configured: true, hint: "••••yabcd" } },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "测试当前配置" }));
+    await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent("文字整理：服务返回错误"));
+    expect(screen.getByText("转写", { selector: "p.text-sm" }).closest("div")).toHaveTextContent("已就绪");
+    expect(screen.getByText("AI 文字整理").closest("div")).toHaveTextContent("服务返回错误");
+    expect(screen.queryByText("密钥无效")).not.toBeInTheDocument();
   });
 
   it("does not persist when the probe fails", async () => {

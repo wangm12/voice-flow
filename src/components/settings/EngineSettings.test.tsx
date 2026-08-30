@@ -99,14 +99,14 @@ describe("EngineSettings form", () => {
 
   it("keeps model notes in the interface language", () => {
     renderEngine();
-    expect(screen.getByRole("option", { name: "Whisper Large v3 Turbo · 默认 · 更快" })).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: "Whisper Large v3 Turbo · 默认 · 英文更快，中文较弱" })).toBeInTheDocument();
     cleanup();
     render(
       <I18nProvider initialLanguage="en">
         <EngineSettings settings={settings} save={vi.fn()} commitEngine={vi.fn()} {...unused} />
       </I18nProvider>,
     );
-    expect(screen.getByRole("option", { name: "Whisper Large v3 Turbo · Default · Faster" })).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: "Whisper Large v3 Turbo · Default · Faster English, weaker Chinese" })).toBeInTheDocument();
     expect(screen.getByRole("option", { name: "GPT-4o mini · Default · Faster" })).toBeInTheDocument();
     expect(screen.queryByRole("option", { name: /默认/ })).not.toBeInTheDocument();
   });

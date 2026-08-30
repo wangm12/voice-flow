@@ -4432,6 +4432,7 @@ mod tests {
         assert_eq!(scene.profile_id.as_deref(), Some("chat.personal"));
         assert_eq!(scene.family.as_deref(), Some("personal_chat"));
         assert_eq!(scene.native_bundle.as_deref(), Some("com.tencent.xinWeChat"));
+        assert!(history_context(&dir, id).unwrap().is_some());
         let key = crate::dictionary_learn::pair_key("派森", "Python");
         ensure_learn_pair_promoted(
             &dir,

@@ -449,10 +449,7 @@ async fn transcribe_at(
         .await
         .map_err(|e| AsrError::Other(e.to_string()))?;
     result.limits = limits;
-    if result.text.trim().is_empty() || is_silence(&result.segments) {
-        return Err(AsrError::EmptyResult);
-    }
-    Ok(result)
+    sanitize_transcript(result)
 }
 
 async fn transcribe_deepgram(
@@ -517,10 +514,7 @@ async fn transcribe_deepgram(
         .and_then(serde_json::Value::as_str)
         .unwrap_or("")
         .to_owned();
-    if text.trim().is_empty() {
-        return Err(AsrError::EmptyResult);
-    }
-    Ok(Transcript {
+    sanitize_transcript(Transcript {
         text,
         segments: Vec::new(),
         words: Vec::new(),
@@ -549,21 +543,49 @@ pub fn normalize_language(language: Option<&str>) -> Option<&str> {
         .filter(|value| !value.is_empty() && !value.eq_ignore_ascii_case("auto"))
 }
 
-/// Treat the transcript as silence only when the overwhelming majority of
-/// segments are flagged as non-speech. A single quiet segment in an otherwise
-/// normal dictation must not fail the whole recording.
-fn is_silence(segments: &[Segment]) -> bool {
-    if segments.is_empty() {
+fn sanitize_transcript(mut result: Transcript) -> Result<Transcript, AsrError> {
+    if result.segments.is_empty() {
+        result.text = strip_hallucination_sentences(&result.text);
+        if result.text.trim().is_empty() {
+            return Err(AsrError::EmptyResult);
+        }
+        return Ok(result);
+    }
+    let kept: Vec<Segment> = result
+        .segments
+        .iter()
+        .filter(|segment| keep_segment(segment))
+        .cloned()
+        .collect();
+    if kept.is_empty() {
+        return Err(AsrError::EmptyResult);
+    }
+    result.text = kept.iter().map(|segment| segment.text.as_str()).collect();
+    result.segments = kept;
+    if result.text.trim().is_empty() {
+        return Err(AsrError::EmptyResult);
+    }
+    Ok(result)
+}
+
+fn keep_segment(segment: &Segment) -> bool {
+    let no_speech = segment.no_speech_prob.unwrap_or(0.0);
+    let avg_logprob = segment.avg_logprob.unwrap_or(0.0);
+    if no_speech > 0.8 {
         return false;
     }
-    let non_speech = segments
-        .iter()
-        .filter(|s| s.no_speech_prob.unwrap_or(0.0) > 0.9)
-        .count();
-    // Silence only if every segment is non-speech, or >80% are (long dictation
-    // with a few pauses still succeeds).
-    non_speech == segments.len() || (non_speech as f32 / segments.len() as f32) > 0.8
+    if no_speech > 0.6 && avg_logprob < -1.0 {
+        return false;
+    }
+    !crate::spoken_revision::is_hallucination_text(segment.text.trim())
 }
+
+fn strip_hallucination_sentences(text: &str) -> String {
+    text.split_inclusive(['.', '!', '?', '。', '！', '？', '\n'])
+        .filter(|sentence| !crate::spoken_revision::is_hallucination_text(sentence.trim()))
+        .collect::<String>()
+}
+
 impl crate::queue::RetryError for AsrError {
     fn retry_kind(&self) -> crate::queue::RetryClass {
         match self {
@@ -659,6 +681,69 @@ mod tests {
         assert_eq!(normalize_language(Some(" AUTO ")), None);
         assert_eq!(normalize_language(Some("zh")), Some("zh"));
         assert_eq!(normalize_language(None), None);
+    }
+
+    #[test]
+    fn drops_silent_and_hallucinated_segments() {
+        let cleaned = sanitize_transcript(Transcript {
+            text: "hello Thanks for watching".into(),
+            segments: vec![
+                Segment {
+                    text: "hello".into(),
+                    avg_logprob: Some(-0.2),
+                    no_speech_prob: Some(0.1),
+                },
+                Segment {
+                    text: " Thanks for watching".into(),
+                    avg_logprob: Some(-0.4),
+                    no_speech_prob: Some(0.2),
+                },
+                Segment {
+                    text: " ...".into(),
+                    avg_logprob: Some(-0.1),
+                    no_speech_prob: Some(0.92),
+                },
+            ],
+            words: Vec::new(),
+            limits: RateLimits::default(),
+        })
+        .expect("kept speech");
+        assert_eq!(cleaned.text.trim(), "hello");
+        assert_eq!(cleaned.segments.len(), 1);
+    }
+
+    #[test]
+    fn drops_hallucination_outro_without_a_space_after_fold() {
+        assert!(matches!(
+            sanitize_transcript(Transcript {
+                text: "Thanks for watching the show.".into(),
+                segments: vec![Segment {
+                    text: "Thanks for watching the show.".into(),
+                    avg_logprob: Some(-0.2),
+                    no_speech_prob: Some(0.1),
+                }],
+                words: Vec::new(),
+                limits: RateLimits::default(),
+            }),
+            Err(AsrError::EmptyResult)
+        ));
+    }
+
+    #[test]
+    fn all_hallucinated_segments_are_empty() {
+        assert!(matches!(
+            sanitize_transcript(Transcript {
+                text: "Thanks for watching!".into(),
+                segments: vec![Segment {
+                    text: "Thanks for watching!".into(),
+                    avg_logprob: Some(-0.2),
+                    no_speech_prob: Some(0.1),
+                }],
+                words: Vec::new(),
+                limits: RateLimits::default(),
+            }),
+            Err(AsrError::EmptyResult)
+        ));
     }
 
     #[tokio::test]

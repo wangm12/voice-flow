@@ -809,6 +809,44 @@ mod tests {
     }
 
     #[test]
+    fn prepare_spoken_transcript_keeps_restatement_and_content_bu_dui_invariants() {
+        use crate::context::{builtin_family_for_id, ContextFamily};
+        use crate::prepare_spoken_transcript;
+
+        let prepared = |name: &str, confidence: f32| {
+            let case = CASES
+                .iter()
+                .find(|item| item.name == name)
+                .unwrap_or_else(|| panic!("missing case {name}"));
+            let family =
+                builtin_family_for_id(case.context_family).unwrap_or(ContextFamily::General);
+            prepare_spoken_transcript(case.raw, family, confidence)
+        };
+
+        let restatement = prepared("zh_restatement_after_bu_dui", 1.0);
+        assert!(!restatement.contains("cloud"), "{restatement}");
+        assert!(restatement.contains("cursor"), "{restatement}");
+
+        let self_correction = prepared("zh_self_correction", 1.0);
+        assert!(!self_correction.contains("周四"), "{self_correction}");
+        assert!(self_correction.contains("周五"), "{self_correction}");
+
+        let topic = prepared("zh_bu_dui_as_topic", 1.0);
+        assert!(topic.contains("不对"), "{topic}");
+        assert!(topic.contains("删了") || topic.contains("之前"), "{topic}");
+
+        let wechat = prepared("zh_wechat_casual", 0.9);
+        assert_eq!(wechat, "好的哈哈我晚点回你");
+
+        let list = prepared("zh_oh_bu_dui_list_backtrack", 1.0);
+        assert!(list.contains("1. "), "{list}");
+        assert!(list.contains("2. "), "{list}");
+        assert!(list.contains("3. "), "{list}");
+        assert!(list.contains("ASR"), "{list}");
+        assert!(!list.contains("cloud"), "{list}");
+    }
+
+    #[test]
     fn corpus_expected_text_preserves_declared_tokens() {
         for case in CASES {
             assert!(!case.raw.trim().is_empty(), "{} has no raw text", case.name);

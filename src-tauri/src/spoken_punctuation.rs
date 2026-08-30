@@ -1,5 +1,8 @@
 //! Spoken Chinese punctuation tokens applied to ASR text before cleanup.
 
+use crate::context::ContextFamily;
+use crate::dictionary_learn::is_cjk;
+
 const FIXED_TOKENS: &[(&str, &str)] = &[
     ("左括号", "（"),
     ("右括号", "）"),
@@ -54,6 +57,89 @@ pub fn apply(text: &str) -> String {
     }
     out.push_str(&text[last..]);
     out
+}
+
+/// Add a light terminal mark on local-only cleanup. Skip command-like scenes.
+pub fn ensure_terminal(text: &str, family: ContextFamily) -> String {
+    if matches!(
+        family,
+        ContextFamily::Terminal
+            | ContextFamily::BrowserSearch
+            | ContextFamily::FormFilling
+            | ContextFamily::PromptOrCode
+    ) {
+        return text.to_owned();
+    }
+    let trimmed = text.trim();
+    if trimmed.is_empty() || has_terminal_mark(trimmed) {
+        return text.to_owned();
+    }
+    if is_question(trimmed) {
+        let mark = if cjk_count(trimmed) > 0 { "？" } else { "?" };
+        return format!("{trimmed}{mark}");
+    }
+    if cjk_count(trimmed) >= 4 && cjk_count(trimmed) >= latin_letter_count(trimmed) {
+        return format!("{trimmed}。");
+    }
+    if looks_like_latin_sentence(trimmed) {
+        return format!("{trimmed}.");
+    }
+    text.to_owned()
+}
+
+fn has_terminal_mark(text: &str) -> bool {
+    text.ends_with(['。', '！', '？', '.', '!', '?', '…'])
+}
+
+fn is_question(text: &str) -> bool {
+    let not_a_me_question = text.ends_with("没什么")
+        || text.ends_with("那么")
+        || text.ends_with("要么");
+    if !not_a_me_question
+        && (text.ends_with('吗')
+            || text.ends_with(['呢', '嘛'])
+            || text.ends_with("什么")
+            || text.ends_with("怎么")
+            || text.ends_with("为什么")
+            || text.ends_with("干什么"))
+    {
+        return true;
+    }
+    let lower = text.to_ascii_lowercase();
+    lower.starts_with("what ")
+        || lower.starts_with("why ")
+        || lower.starts_with("how ")
+        || lower.starts_with("when ")
+        || lower.starts_with("where ")
+        || lower.starts_with("who ")
+        || lower.starts_with("is ")
+        || lower.starts_with("are ")
+        || lower.starts_with("do ")
+        || lower.starts_with("does ")
+        || lower.starts_with("can ")
+        || lower.starts_with("could ")
+        || lower.starts_with("would ")
+        || lower.starts_with("will ")
+}
+
+fn cjk_count(text: &str) -> usize {
+    text.chars().filter(|ch| is_cjk(*ch)).count()
+}
+
+fn latin_letter_count(text: &str) -> usize {
+    text.chars().filter(|ch| ch.is_ascii_alphabetic()).count()
+}
+
+fn looks_like_latin_sentence(text: &str) -> bool {
+    let words = text
+        .split_whitespace()
+        .filter(|word| word.chars().any(|ch| ch.is_ascii_alphabetic()))
+        .count();
+    words >= 5
+        && text
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_ascii_uppercase())
 }
 
 fn skip_leading_whitespace(text: &str, start: usize) -> usize {
@@ -241,7 +327,8 @@ fn is_boundary_char(value: char) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::apply;
+    use super::{apply, ensure_terminal};
+    use crate::context::ContextFamily;
 
     #[test]
     fn maps_standalone_spoken_punctuation() {
@@ -308,6 +395,51 @@ mod tests {
         assert_eq!(
             apply("during this period we should wait"),
             "during this period we should wait"
+        );
+    }
+
+    #[test]
+    fn adds_light_terminal_punctuation_except_command_scenes() {
+        assert_eq!(
+            ensure_terminal("今晚吃饭吗", ContextFamily::PersonalChat),
+            "今晚吃饭吗？"
+        );
+        assert_eq!(
+            ensure_terminal("我晚点回你", ContextFamily::PersonalChat),
+            "我晚点回你。"
+        );
+        assert_eq!(ensure_terminal("hello", ContextFamily::General), "hello");
+        assert_eq!(
+            ensure_terminal("ls -la", ContextFamily::Terminal),
+            "ls -la"
+        );
+        assert_eq!(
+            ensure_terminal("今晚吃饭吗。", ContextFamily::PersonalChat),
+            "今晚吃饭吗。"
+        );
+        assert_eq!(
+            ensure_terminal("没什么", ContextFamily::PersonalChat),
+            "没什么"
+        );
+        assert_eq!(
+            ensure_terminal("那么", ContextFamily::WorkChat),
+            "那么"
+        );
+        assert_eq!(
+            ensure_terminal("要么", ContextFamily::General),
+            "要么"
+        );
+        assert_eq!(
+            ensure_terminal("为什么", ContextFamily::PersonalChat),
+            "为什么？"
+        );
+        assert_eq!(
+            ensure_terminal("怎么", ContextFamily::PersonalChat),
+            "怎么？"
+        );
+        assert_eq!(
+            ensure_terminal("什么", ContextFamily::PersonalChat),
+            "什么？"
         );
     }
 }

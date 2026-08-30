@@ -124,7 +124,7 @@ impl EngineProvider {
 
     pub fn default_llm_model(self) -> &'static str {
         match self {
-            Self::Groq => "openai/gpt-oss-20b",
+            Self::Groq => crate::llm::MODEL,
             Self::OpenAi => "gpt-4o-mini",
             Self::SiliconFlow => "deepseek-ai/DeepSeek-V3",
             Self::DeepSeek => "deepseek-chat",

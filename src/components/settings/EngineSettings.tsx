@@ -290,6 +290,11 @@ export function EngineSettings({
               onChange={changeAsrModel}
             />
           </div>
+          {draft.asrProvider === "groq" && (
+            <p className="mt-2 text-xs leading-5 text-tertiary">
+              {t("Groq Whisper 英文更快，中文人名和专有名词较弱。中文推荐 SiliconFlow SenseVoice 或兼容接口的 Qwen3-ASR。")}
+            </p>
+          )}
         </div>
         <div className="px-4 py-4 sm:px-5">
           <div className="flex items-center justify-between gap-3">
@@ -369,6 +374,35 @@ export function EngineSettings({
                           className={`${controlClass} mt-1 w-full font-mono text-xs`}
                         />
                       </label>
+                      <div className="flex flex-wrap gap-2">
+                        <p className="w-full text-xs text-tertiary">{t("中文转写预设")}</p>
+                        <button
+                          type="button"
+                          className="rounded-lg px-2 py-1 text-xs text-secondary hover:bg-elevated"
+                          onClick={() => setDraft((current) => ({
+                            ...current,
+                            asrProvider: "custom",
+                            customAsr: true,
+                            customBaseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+                            asrModel: "qwen3-asr-flash",
+                          }))}
+                        >
+                          {t("阿里云百炼 Qwen3-ASR")}
+                        </button>
+                        <button
+                          type="button"
+                          className="rounded-lg px-2 py-1 text-xs text-secondary hover:bg-elevated"
+                          onClick={() => setDraft((current) => ({
+                            ...current,
+                            asrProvider: "custom",
+                            customAsr: true,
+                            customBaseUrl: "http://127.0.0.1:10095/v1",
+                            asrModel: "paraformer-zh",
+                          }))}
+                        >
+                          {t("本机 FunASR")}
+                        </button>
+                      </div>
                       <label className="flex items-center gap-2 text-xs text-secondary">
                         <input type="checkbox" checked={draft.customAsr} onChange={(event) => {
                           const customAsr = event.target.checked;

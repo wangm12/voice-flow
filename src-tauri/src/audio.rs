@@ -34,7 +34,7 @@ pub enum AudioError {
     NotRecording,
     #[error("audio encoding failed: {0}")]
     Encode(String),
-    #[error("recording contains no audio samples")]
+    #[error("No speech detected")]
     EmptyRecording,
 }
 
@@ -929,7 +929,7 @@ fn finalize(rec: ActiveRec) -> Result<(Vec<u8>, Vec<AudioChunk>), AudioError> {
     if let Err(error) = capture.spool_result {
         log::warn!("audio spool finalization was partial: {error}");
     }
-    let samples = capture.samples;
+    let samples = crate::silence::trim_and_compress(&capture.samples);
     if samples.is_empty() {
         return Err(AudioError::EmptyRecording);
     }
@@ -1155,7 +1155,7 @@ fn encode(input: Vec<f32>, spool: PathBuf) -> Result<Vec<u8>, AudioError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        append_bounded, apply_input_gain, normalized_audio_level, smooth_audio_level,
+        append_bounded, apply_input_gain, normalized_audio_level, smooth_audio_level, AudioError,
         StreamResampler, TARGET_RATE,
     };
 
@@ -1207,5 +1207,10 @@ mod tests {
         assert!(rising < 1.0);
         assert!(falling > 0.0);
         assert!(falling > rising);
+    }
+
+    #[test]
+    fn empty_recording_uses_the_same_no_speech_copy_as_asr() {
+        assert_eq!(AudioError::EmptyRecording.to_string(), "No speech detected");
     }
 }

@@ -26,9 +26,11 @@ mod providers;
 mod queue;
 mod prefetch_asr;
 mod selected_action;
+mod silence;
 mod snippets;
 mod spoken_layout;
 mod spoken_punctuation;
+mod spoken_revision;
 mod store;
 #[cfg(test)]
 mod test_http;
@@ -163,16 +165,24 @@ struct FinalText {
     degraded_reason: Option<&'static str>,
 }
 
-fn finalize_text(raw: &str, decision: CleanupDecision) -> Result<FinalText, &'static str> {
+fn finalize_text(
+    raw: &str,
+    decision: CleanupDecision,
+    family: context::ContextFamily,
+) -> Result<FinalText, &'static str> {
     let (candidate, mut degraded, mut degraded_reason) = match decision {
         CleanupDecision::Provider(text) => (text, false, None),
-        CleanupDecision::Disabled => (local_cleanup_or_raw(raw), false, None),
-        CleanupDecision::Failed => (local_cleanup_or_raw(raw), true, Some("llm_cleanup_failed")),
+        CleanupDecision::Disabled => (local_cleanup_or_raw(raw, family), false, None),
+        CleanupDecision::Failed => (
+            local_cleanup_or_raw(raw, family),
+            true,
+            Some("llm_cleanup_failed"),
+        ),
     };
     let text = if candidate.trim().is_empty() {
         degraded = true;
         degraded_reason = Some("llm_cleanup_empty");
-        local_cleanup_or_raw(raw)
+        local_cleanup_or_raw(raw, family)
     } else {
         candidate
     };
@@ -198,13 +208,14 @@ fn cleanup_profile_for(snapshot: &context::ContextSnapshot) -> Option<&context::
     (snapshot.profile.confidence >= 0.75).then_some(&snapshot.profile)
 }
 
-fn local_cleanup_or_raw(raw: &str) -> String {
+fn local_cleanup_or_raw(raw: &str, family: context::ContextFamily) -> String {
     let cleaned = llm::local_cleanup(raw);
-    if cleaned.trim().is_empty() {
+    let text = if cleaned.trim().is_empty() {
         raw.to_owned()
     } else {
         cleaned
-    }
+    };
+    spoken_punctuation::ensure_terminal(&text, family)
 }
 
 fn cleanup_policy_for(
@@ -2060,7 +2071,7 @@ async fn process_short(
         };
         transcript.text
     };
-    let raw = spoken_layout::apply_after_punctuation(
+    let raw = prepare_spoken_transcript(
         &raw,
         recording_context.profile.family,
         recording_context.profile.confidence,
@@ -2144,11 +2155,17 @@ async fn process_short(
     };
     let cleanup_status = match &cleanup_decision {
         CleanupDecision::Provider(text) if text.trim().is_empty() => {
-            cleanup_failure_status(&cleanup_input, &local_cleanup_or_raw(&cleanup_input))
+            cleanup_failure_status(
+                &cleanup_input,
+                &local_cleanup_or_raw(&cleanup_input, recording_context.profile.family),
+            )
         }
         CleanupDecision::Provider(_) => CLEANUP_STATUS_AI_SUCCESS,
         CleanupDecision::Failed => {
-            cleanup_failure_status(&cleanup_input, &local_cleanup_or_raw(&cleanup_input))
+            cleanup_failure_status(
+                &cleanup_input,
+                &local_cleanup_or_raw(&cleanup_input, recording_context.profile.family),
+            )
         }
         CleanupDecision::Disabled if snippet_expanded => CLEANUP_STATUS_SNIPPET_BYPASS,
         CleanupDecision::Disabled => CLEANUP_STATUS_LOCAL_ONLY,
@@ -2157,7 +2174,11 @@ async fn process_short(
         return Ok(());
     }
     emit_progress(app, 0.70);
-    let resolved_text = match finalize_text(&cleanup_input, cleanup_decision) {
+    let resolved_text = match finalize_text(
+        &cleanup_input,
+        cleanup_decision,
+        recording_context.profile.family,
+    ) {
         Ok(value) => value,
         Err("no_speech") => {
             let message = "No speech detected".to_string();
@@ -2673,7 +2694,7 @@ async fn process_long(
     let (raw_text, pairs_hint) = prepare_lexicon_transcript(
         app_dir.as_deref(),
         &settings.dictionary,
-        &spoken_layout::apply_after_punctuation(
+        &prepare_spoken_transcript(
             &chunker::merge_transcripts(raw_texts),
             recording_context.profile.family,
             recording_context.profile.confidence,
@@ -2746,7 +2767,7 @@ async fn process_long(
             Ok((_text, limits)) => {
                 state.gate.update_llm(&limits);
                 cleanup_failure_reason = Some("llm_cleanup_empty");
-                let fallback = local_cleanup_or_raw(&cleanup_input);
+                let fallback = local_cleanup_or_raw(&cleanup_input, recording_context.profile.family);
                 cleanup_status = cleanup_failure_status(&cleanup_input, &fallback);
                 fallback
             }
@@ -2759,14 +2780,14 @@ async fn process_long(
                 log::warn!(
                     "long-recording LLM cleanup failed after transcript merge, using local cleanup: {error:?}"
                 );
-                let fallback = local_cleanup_or_raw(&cleanup_input);
+                let fallback = local_cleanup_or_raw(&cleanup_input, recording_context.profile.family);
                 cleanup_status = cleanup_failure_status(&cleanup_input, &fallback);
                 fallback
             }
         }
     } else {
         cleanup_status = CLEANUP_STATUS_LOCAL_ONLY;
-        local_cleanup_or_raw(&cleanup_input)
+        local_cleanup_or_raw(&cleanup_input, recording_context.profile.family)
     };
     if final_text.trim().is_empty() {
         let message = "No speech detected".to_string();
@@ -3224,6 +3245,16 @@ pub(crate) fn build_asr_prompt(
 fn load_learn_pairs(dir: Option<&Path>) -> Vec<store::LearnPairRecord> {
     dir.and_then(|path| store::list_learn_pairs(path).ok())
         .unwrap_or_default()
+}
+
+pub(crate) fn prepare_spoken_transcript(
+    raw: &str,
+    family: context::ContextFamily,
+    confidence: f32,
+) -> String {
+    spoken_revision::apply(&spoken_layout::apply_after_punctuation(
+        raw, family, confidence,
+    ))
 }
 
 pub(crate) fn prepare_lexicon_transcript(
@@ -5204,7 +5235,12 @@ mod tests {
     #[test]
     fn cleanup_failure_preserves_raw_transcript_and_marks_degraded() {
         let result =
-            finalize_text("uh deploy v2 /Users/mingjie/app", CleanupDecision::Failed).unwrap();
+            finalize_text(
+                "uh deploy v2 /Users/mingjie/app",
+                CleanupDecision::Failed,
+                context::ContextFamily::PromptOrCode,
+            )
+            .unwrap();
         assert_eq!(result.text, "deploy v2 /Users/mingjie/app");
         assert!(result.degraded);
         assert_eq!(result.degraded_reason, Some("llm_cleanup_failed"));
@@ -5212,21 +5248,36 @@ mod tests {
 
     #[test]
     fn disabled_cleanup_never_drops_a_filler_only_transcript() {
-        let result = finalize_text("嗯 uh", CleanupDecision::Disabled).unwrap();
+        let result = finalize_text(
+            "嗯 uh",
+            CleanupDecision::Disabled,
+            context::ContextFamily::PersonalChat,
+        )
+        .unwrap();
         assert_eq!(result.text, "嗯 uh");
         assert!(!result.degraded);
     }
 
     #[test]
     fn provider_cleanup_is_used_when_non_empty() {
-        let result = finalize_text("uh hello", CleanupDecision::Provider("hello".into())).unwrap();
+        let result = finalize_text(
+            "uh hello",
+            CleanupDecision::Provider("hello".into()),
+            context::ContextFamily::General,
+        )
+        .unwrap();
         assert_eq!(result.text, "hello");
         assert!(!result.degraded);
     }
 
     #[test]
     fn empty_provider_cleanup_falls_back_to_raw_and_is_degraded() {
-        let result = finalize_text("uh hello", CleanupDecision::Provider("  ".into())).unwrap();
+        let result = finalize_text(
+            "uh hello",
+            CleanupDecision::Provider("  ".into()),
+            context::ContextFamily::General,
+        )
+        .unwrap();
         assert_eq!(result.text, "hello");
         assert!(result.degraded);
         assert_eq!(result.degraded_reason, Some("llm_cleanup_empty"));

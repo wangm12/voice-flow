@@ -59,16 +59,18 @@ export const PROVIDERS: readonly ProviderDefinition[] = [
     asrModelField: "select",
     llmModelField: "select",
     asrModels: [
-      { value: "whisper-large-v3-turbo", label: "Whisper Large v3 Turbo", note: "默认 · 更快" },
-      { value: "whisper-large-v3", label: "Whisper Large v3", note: "质量更高 · 较慢" },
+      { value: "whisper-large-v3-turbo", label: "Whisper Large v3 Turbo", note: "默认 · 英文更快，中文较弱" },
+      { value: "whisper-large-v3", label: "Whisper Large v3", note: "英文更快，中文较弱" },
       { value: "distil-whisper-large-v3-en", label: "Distil-Whisper", note: "仅英语 · 更快" },
     ],
     llmModels: [
-      { value: "openai/gpt-oss-20b", label: "GPT-OSS 20B", note: "默认 · 更快" },
-      { value: "openai/gpt-oss-120b", label: "GPT-OSS 120B", note: "质量更高 · 较慢" },
+      { value: "llama-3.1-8b-instant", label: "Llama 3.1 8B Instant", note: "默认 · 更快" },
+      { value: "llama-3.3-70b-versatile", label: "Llama 3.3 70B", note: "质量更高 · 较慢" },
+      { value: "openai/gpt-oss-20b", label: "GPT-OSS 20B" },
+      { value: "openai/gpt-oss-120b", label: "GPT-OSS 120B", note: "较慢 · 不是质量升级" },
     ],
     defaultAsrModel: "whisper-large-v3-turbo",
-    defaultLlmModel: "openai/gpt-oss-20b",
+    defaultLlmModel: "llama-3.1-8b-instant",
   },
   {
     id: "openai",
@@ -120,7 +122,7 @@ export const PROVIDERS: readonly ProviderDefinition[] = [
     asrModelField: "text",
     llmModelField: "text",
     asrModels: [
-      { value: "FunAudioLLM/SenseVoiceSmall", label: "SenseVoice Small" },
+      { value: "FunAudioLLM/SenseVoiceSmall", label: "SenseVoice Small", note: "中文推荐" },
     ],
     llmModels: [
       { value: "deepseek-ai/DeepSeek-V3", label: "DeepSeek V3" },

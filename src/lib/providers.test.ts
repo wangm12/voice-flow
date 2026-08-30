@@ -4,6 +4,7 @@ import {
   inferProviderFromHost,
   isKnownModel,
   isLoopbackUrl,
+  PROVIDERS,
   providersFor,
 } from "./providers";
 
@@ -42,6 +43,13 @@ describe("provider catalog", () => {
     expect(isKnownModel("groq", "asr", "whisper-1")).toBe(false);
     expect(isKnownModel("siliconflow", "llm", "Qwen/Qwen2.5-7B-Instruct")).toBe(true);
     expect(defaultModel("openai", "llm")).toBe("gpt-4o-mini");
+    expect(defaultModel("groq", "llm")).toBe("llama-3.1-8b-instant");
     expect(defaultModel("deepgram", "asr")).toBe("nova-3");
+  });
+
+  it("does not label GPT-OSS 120B as a quality upgrade", () => {
+    const groq = PROVIDERS.find((provider) => provider.id === "groq");
+    const model = groq?.llmModels.find((item) => item.value === "openai/gpt-oss-120b");
+    expect(model?.note).toBe("较慢 · 不是质量升级");
   });
 });

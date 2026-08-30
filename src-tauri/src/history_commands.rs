@@ -100,14 +100,15 @@ pub(crate) async fn reclean_history(
     let operation =
         cleanup_operation_from_name(&operation).ok_or_else(|| "不支持的重新整理模式".to_owned())?;
     let settings = lock_recover(&state.settings).clone();
-    let history_policy = store::history_context(&dir, id).map_err(|e| e.to_string())?;
-    let mut policy = history_policy.unwrap_or_default();
+    let scene = store::history_scene(&dir, id).map_err(|e| e.to_string())?;
+    let mut policy = scene.policy.clone().unwrap_or_default();
     if settings.output_mode != "auto" {
         policy.output_mode = Some(settings.output_mode.clone());
     }
     if settings.output_mode == "translation" {
         policy.translation_target_language = Some(settings.translation_target_language.clone());
     }
+    let family = family_from_scene(&scene, &settings.context_mappings);
     let (raw_text, pairs_hint) =
         crate::prepare_lexicon_transcript(Some(&dir), &settings.dictionary, &raw_text);
     let intent = llm::CleanupIntent::selected_text(operation, &raw_text);
@@ -116,7 +117,7 @@ pub(crate) async fn reclean_history(
     }
     let (final_text, degraded, degraded_reason, cleanup_status) = if !settings.cleanup_enabled {
         (
-            local_cleanup_or_raw(&raw_text),
+            local_cleanup_or_raw(&raw_text, family),
             false,
             None,
             CLEANUP_STATUS_LOCAL_ONLY,
@@ -149,7 +150,7 @@ pub(crate) async fn reclean_history(
             }
             Ok((_, limits)) => {
                 state.gate.update_llm(&limits);
-                let fallback = local_cleanup_or_raw(&raw_text);
+                let fallback = local_cleanup_or_raw(&raw_text, family);
                 (
                     fallback.clone(),
                     true,
@@ -159,7 +160,7 @@ pub(crate) async fn reclean_history(
             }
             Err(error) => {
                 log::warn!("history re-clean failed; using local cleanup: {error}");
-                let fallback = local_cleanup_or_raw(&raw_text);
+                let fallback = local_cleanup_or_raw(&raw_text, family);
                 (
                     fallback.clone(),
                     true,
@@ -280,17 +281,7 @@ async fn retry_dictation_inner(
         .map_err(|e| e.to_string())?
     };
     state.gate.update_asr(&transcript.limits);
-    let family = scene
-        .family
-        .as_deref()
-        .and_then(context::builtin_family_for_id)
-        .unwrap_or_else(|| {
-            scene
-                .profile_id
-                .as_deref()
-                .map(|id| lexicon::family_from_profile_id(id, &settings.context_mappings))
-                .unwrap_or(context::ContextFamily::General)
-        });
+    let family = family_from_scene(&scene, &settings.context_mappings);
     let mapping = scene
         .profile_id
         .as_deref()
@@ -299,7 +290,7 @@ async fn retry_dictation_inner(
     let (raw_text, pairs_hint) = crate::prepare_lexicon_transcript(
         Some(&dir),
         &settings.dictionary,
-        &crate::spoken_layout::apply_after_punctuation(&transcript.text, family, confidence),
+        &crate::prepare_spoken_transcript(&transcript.text, family, confidence),
     );
     let clipboard = snippets::read_clipboard_if_needed(&settings.snippets, &raw_text, || {
         clipboard_text_for_snippets(&app)
@@ -357,17 +348,17 @@ async fn retry_dictation_inner(
     };
     let cleanup_status = match &cleanup_decision {
         CleanupDecision::Provider(text) if text.trim().is_empty() => {
-            cleanup_failure_status(&cleanup_input, &local_cleanup_or_raw(&cleanup_input))
+            cleanup_failure_status(&cleanup_input, &local_cleanup_or_raw(&cleanup_input, family))
         }
         CleanupDecision::Provider(_) => CLEANUP_STATUS_AI_SUCCESS,
         CleanupDecision::Failed => {
-            cleanup_failure_status(&cleanup_input, &local_cleanup_or_raw(&cleanup_input))
+            cleanup_failure_status(&cleanup_input, &local_cleanup_or_raw(&cleanup_input, family))
         }
         CleanupDecision::Disabled if snippet_expansion.is_some() => CLEANUP_STATUS_SNIPPET_BYPASS,
         CleanupDecision::Disabled => CLEANUP_STATUS_LOCAL_ONLY,
     };
     let resolved =
-        finalize_text(&cleanup_input, cleanup_decision).map_err(|_| "No speech detected".to_owned())?;
+        finalize_text(&cleanup_input, cleanup_decision, family).map_err(|_| "No speech detected".to_owned())?;
     let final_text = resolved.text;
     let degraded = resolved.degraded;
     let degraded_reason = resolved.degraded_reason;
@@ -390,4 +381,48 @@ async fn retry_dictation_inner(
     .map_err(|e| e.to_string())?;
     store::remove_spool_artifact(&dir, std::path::Path::new(&path));
     Ok(())
+}
+
+fn family_from_scene(
+    scene: &store::HistoryScene,
+    mappings: &[context::AppMapping],
+) -> context::ContextFamily {
+    scene
+        .family
+        .as_deref()
+        .and_then(context::builtin_family_for_id)
+        .unwrap_or_else(|| {
+            scene
+                .profile_id
+                .as_deref()
+                .map(|id| lexicon::family_from_profile_id(id, mappings))
+                .unwrap_or(context::ContextFamily::General)
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reclean_uses_stored_history_family_not_general() {
+        let wechat = store::HistoryScene {
+            family: Some("personal_chat".into()),
+            profile_id: Some("chat.personal".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            family_from_scene(&wechat, &[]),
+            context::ContextFamily::PersonalChat
+        );
+
+        let terminal = store::HistoryScene {
+            family: Some("terminal".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            family_from_scene(&terminal, &[]),
+            context::ContextFamily::Terminal
+        );
+    }
 }

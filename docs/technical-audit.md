@@ -1,8 +1,10 @@
 # VoiceFlow Technical Quality Audit
 
+> **2026-08-04 快照。** 分数和测试数量不要当现状。没有仓库根目录的 `findings.md`。
+
 更新时间：2026-08-04
 
-范围：当前 React/Tauri settings UI、always-on-top HUD、交互状态和静态资源。该审计不替代真实 macOS 权限、麦克风、WindowServer 或外部 App 验收。
+范围：当时的 React/Tauri settings UI、always-on-top HUD、交互状态和静态资源。该审计不替代真实 macOS 权限、麦克风、WindowServer 或外部 App 验收。
 
 ## Audit health score
 
@@ -62,4 +64,4 @@
 
 ## Scope boundary
 
-This UI audit does not prove microphone capture, external-App insertion, Apple Events behavior, WindowServer smoothness, local-data encryption, or signed distribution. Those are tracked in `docs/acceptance-evidence.md` and the repository-wide `findings.md`.
+This UI audit does not prove microphone capture, external-App insertion, Apple Events behavior, WindowServer smoothness, local-data encryption, or signed distribution. Historical notes are in `docs/acceptance-evidence.md`.

@@ -37,6 +37,7 @@ Default GitHub Releases use a stable self-signed `VoiceFlow` identity. That keep
 - [ ] Cursor/native editor uses the developer policy and preserves technical tokens.
 - [ ] Gmail/mail host uses the professional email policy.
 - [ ] Browser access off never queries or stores a host.
+- [ ] ASR and cleanup may use different providers; keys stay in Keychain and are not written to settings JSON.
 - [ ] Browser access on stores only a normalized host; no URL path, query, title, PID, or document body is sent to the LLM.
 - [ ] Switching apps or browser tabs during processing results in clipboard fallback, never an uncertain paste.
 - [ ] A retry from history is clipboard-only because the original target guard is no longer trustworthy.

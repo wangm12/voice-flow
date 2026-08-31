@@ -1,6 +1,6 @@
 # VoiceFlow Context & Delivery E2E Verification Checklist
 
-更新时间：2026-08-11
+更新时间：2026-08-30（清单仍适用；自动化数字以当前测试为准）
 
 这份 checklist 用于验证 VoiceFlow 的全部上下文来源、Prompt policy、目标保护、交付方式和 History 结果。它覆盖自动化测试和真实 macOS 外部 App 测试。
 
@@ -592,10 +592,10 @@ Clipboard 不是 LLM context，而是 delivery safety context。
 
 ## 20. 自动化验证记录
 
-当前自动化门禁：
+当前自动化门禁（不要抄旧数字，跑完再勾）：
 
-- [ ] Rust：151 passed / 1 ignored
-- [ ] Frontend：55 passed
+- [ ] Rust：`cargo test --manifest-path src-tauri/Cargo.toml`
+- [ ] Frontend：`npm test -- --run`
 - [ ] Strict Clippy 通过
 - [ ] TypeScript lint 通过
 - [ ] Production build 通过
@@ -629,5 +629,5 @@ Clipboard 不是 LLM context，而是 delivery safety context。
 - [ ] App / Window / Tab 切换不会误写
 - [ ] Undo 不会撤销用户后续编辑
 
-真实 macOS 外部 App、Browser Tab、Accessibility、输入框写入、Clipboard 和 20B/120B 模型质量评测完成前，不能把产品标记为 prod-ready.
+真实 macOS 外部 App、Browser Tab、Accessibility、输入框写入、Clipboard 和当前默认整理模型质量评测完成前，不能把产品标记为 prod-ready.
 

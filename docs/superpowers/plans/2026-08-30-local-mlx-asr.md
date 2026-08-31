@@ -1,5 +1,7 @@
 # Local MLX ASR + Cloud Cleanup Implementation Plan
 
+> **Status:** Not shipped as a first-class preset. Engine Settings has 本机 FunASR and 阿里云百炼 Qwen3-ASR, not「本机 MLX-Audio」. Users can already point `custom` at a local `mlx_audio.server`. Do not treat this file as current product docs.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Let VoiceFlow transcribe on a local `mlx-audio` OpenAI-compatible endpoint (SenseVoice / Whisper on Apple Silicon) while keeping AI cleanup on a cloud provider.

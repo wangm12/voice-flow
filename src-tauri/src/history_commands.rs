@@ -1,7 +1,7 @@
 //! History read, export, retry, delete, and re-clean IPC commands.
 
 use crate::{
-    asr, build_asr_prompt, chrono_like_id, cleanup_failure_status, clipboard_text_for_snippets,
+    asr, chrono_like_id, cleanup_failure_status, clipboard_text_for_snippets,
     context, current_asr_provider, finalize_text, lexicon, llm, local_cleanup_or_raw, lock_recover,
     metrics, paste, queue, snippets, spoken_translation_target, store, try_claim_operation,
     release_operation, AppState,
@@ -247,11 +247,12 @@ async fn retry_dictation_inner(
         scene.family.as_deref(),
         scene.browser_host.as_deref(),
     );
-    let asr_prompt = build_asr_prompt(
+    let asr_prompt = lexicon::build_asr_prompt_shaped(
         &settings.dictionary,
         scene.policy.as_ref(),
         &pairs,
         Some(&scope),
+        lexicon::asr_prompt_shape_for(settings.asr_provider, &settings.asr_model),
     );
     let mut retry_policy = scene.policy.clone().unwrap_or_default();
     if settings.output_mode != "auto" {
@@ -358,7 +359,14 @@ async fn retry_dictation_inner(
         CleanupDecision::Disabled => CLEANUP_STATUS_LOCAL_ONLY,
     };
     let resolved =
-        finalize_text(&cleanup_input, cleanup_decision, family).map_err(|_| "No speech detected".to_owned())?;
+        finalize_text(
+            &cleanup_input,
+            cleanup_decision,
+            family,
+            &crate::load_learn_pairs(Some(&dir)),
+            &settings.dictionary,
+        )
+        .map_err(|_| "No speech detected".to_owned())?;
     let final_text = resolved.text;
     let degraded = resolved.degraded;
     let degraded_reason = resolved.degraded_reason;

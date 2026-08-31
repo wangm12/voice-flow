@@ -16,7 +16,7 @@ afterEach(() => {
 });
 
 describe("VoicePill", () => {
-  it("shows in-progress words while recording", () => {
+  it("keeps in-progress words off the HUD while recording", () => {
     render(
       <VoicePill
         state="recording"
@@ -29,10 +29,11 @@ describe("VoicePill", () => {
       />,
     );
 
-    expect(document.querySelector(".voice-pill-caption")).toHaveTextContent("WeChat · 口语 · 你好世界");
-    expect(screen.getByRole("status").getAttribute("aria-label") ?? "").toContain("你好世界");
-    expect(document.querySelector(".voice-pill-caption")).toHaveClass("voice-pill-caption--partial");
-    expect(document.querySelector(".voice-pill-caption")).toHaveStyle({ maxWidth: "360px" });
+    expect(document.querySelector(".voice-pill-caption")).toHaveTextContent("WeChat · 口语");
+    expect(document.querySelector(".voice-pill-caption")?.textContent ?? "").not.toContain("你好世界");
+    expect(screen.getByRole("status").getAttribute("aria-label") ?? "").not.toContain("你好世界");
+    expect(document.querySelector(".voice-pill-caption")).not.toHaveClass("voice-pill-caption--partial");
+    expect(document.querySelector(".voice-pill-caption")).not.toHaveStyle({ maxWidth: "360px" });
     expect(invokeMock).not.toHaveBeenCalled();
   });
 
@@ -201,7 +202,7 @@ describe("VoicePill", () => {
     expect(document.querySelector(".voice-pill-caption")).not.toBeInTheDocument();
   });
 
-  it("keeps in-progress words after the template caption dismisses", () => {
+  it("does not leave prefetch words after the template caption dismisses", () => {
     vi.useFakeTimers();
     render(
       <VoicePill
@@ -215,12 +216,12 @@ describe("VoicePill", () => {
       />,
     );
 
-    expect(document.querySelector(".voice-pill-caption")).toHaveTextContent("WeChat · 口语 · 你好世界");
+    expect(document.querySelector(".voice-pill-caption")).toHaveTextContent("WeChat · 口语");
     act(() => {
       vi.advanceTimersByTime(CONTEXT_LABEL_VISIBLE_MS);
     });
-    expect(document.querySelector(".voice-pill-caption")).toHaveTextContent("你好世界");
-    expect(document.querySelector(".voice-pill-caption")?.textContent ?? "").not.toContain("WeChat · 口语");
+    expect(document.querySelector(".voice-pill-caption")).not.toBeInTheDocument();
+    expect(screen.queryByText("你好世界")).not.toBeInTheDocument();
   });
 
   it("shows the context label while starting", () => {

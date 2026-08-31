@@ -169,6 +169,8 @@ fn finalize_text(
     raw: &str,
     decision: CleanupDecision,
     family: context::ContextFamily,
+    pairs: &[store::LearnPairRecord],
+    dictionary: &[String],
 ) -> Result<FinalText, &'static str> {
     let (candidate, mut degraded, mut degraded_reason) = match decision {
         CleanupDecision::Provider(text) => (text, false, None),
@@ -186,6 +188,10 @@ fn finalize_text(
     } else {
         candidate
     };
+    if text.trim().is_empty() {
+        return Err("no_speech");
+    }
+    let text = lexicon::apply_promoted_replacements(&text, pairs, dictionary);
     if text.trim().is_empty() {
         return Err("no_speech");
     }
@@ -343,17 +349,12 @@ fn emit_hud_partial(app: &tauri::AppHandle, session_generation: u64, text: &str)
 }
 
 fn hud_partial_expands_window(
-    text: &str,
-    phase: Phase,
-    event_generation: u64,
-    current_generation: u64,
+    _text: &str,
+    _phase: Phase,
+    _event_generation: u64,
+    _current_generation: u64,
 ) -> bool {
-    !text.trim().is_empty()
-        && event_generation == current_generation
-        && matches!(
-            phase,
-            Phase::Starting | Phase::Recording | Phase::Stopping | Phase::Processing
-        )
+    false
 }
 
 fn hud_caption_expands_window(state: &str, fallback_reason: Option<&str>) -> bool {
@@ -1145,9 +1146,10 @@ pub(crate) async fn start_claimed(
             app.path().app_data_dir().ok().as_deref(),
             &settings_snapshot.dictionary,
             &recording_context,
+            settings_snapshot.asr_provider,
+            &settings_snapshot.asr_model,
         );
         // This is silent batch prefetch of completed files, not streaming ASR.
-        let hud_app = app.clone();
         let prefetch_session = prefetch_asr::PrefetchAsrSession::spawn(
             prefetch_rx,
             prefetch_inbox,
@@ -1165,9 +1167,7 @@ pub(crate) async fn start_claimed(
             },
             state.metrics.clone(),
             prefetch_cancellation,
-            Some(std::sync::Arc::new(move |generation, text| {
-                emit_hud_partial(&hud_app, generation, &text);
-            })),
+            None,
             session_generation,
         );
         *state
@@ -1785,6 +1785,8 @@ async fn process_selected_action(
             app.path().app_data_dir().ok().as_deref(),
             &settings.dictionary,
             recording_context,
+            settings.asr_provider,
+            &settings.asr_model,
         ),
         model: asr::resolve_recognition_model(
             &settings.asr_model,
@@ -1967,6 +1969,8 @@ async fn process_short(
         app.path().app_data_dir().ok().as_deref(),
         &settings.dictionary,
         recording_context,
+        settings.asr_provider,
+        &settings.asr_model,
     );
     let asr_provider = current_asr_provider(state);
     let asr_options = asr::AsrOptions {
@@ -2178,6 +2182,8 @@ async fn process_short(
         &cleanup_input,
         cleanup_decision,
         recording_context.profile.family,
+        &load_learn_pairs(app_dir.as_deref()),
+        &settings.dictionary,
     ) {
         Ok(value) => value,
         Err("no_speech") => {
@@ -2495,6 +2501,8 @@ async fn process_long(
             app.path().app_data_dir().ok().as_deref(),
             &settings.dictionary,
             recording_context,
+            settings.asr_provider,
+            &settings.asr_model,
         ),
         model: asr::resolve_recognition_model(
             &settings.asr_model,
@@ -2789,6 +2797,11 @@ async fn process_long(
         cleanup_status = CLEANUP_STATUS_LOCAL_ONLY;
         local_cleanup_or_raw(&cleanup_input, recording_context.profile.family)
     };
+    let final_text = lexicon::apply_promoted_replacements(
+        &final_text,
+        &load_learn_pairs(app_dir.as_deref()),
+        &settings.dictionary,
+    );
     if final_text.trim().is_empty() {
         let message = "No speech detected".to_string();
         mark_spool_degraded(dir.as_deref());
@@ -3233,16 +3246,7 @@ fn record_delivery_failure(
     }
 }
 
-pub(crate) fn build_asr_prompt(
-    dictionary: &[String],
-    policy: Option<&context::ContextPolicy>,
-    pairs: &[store::LearnPairRecord],
-    scope: Option<&lexicon::PromptScope>,
-) -> Option<String> {
-    lexicon::build_asr_prompt(dictionary, policy, pairs, scope)
-}
-
-fn load_learn_pairs(dir: Option<&Path>) -> Vec<store::LearnPairRecord> {
+pub(crate) fn load_learn_pairs(dir: Option<&Path>) -> Vec<store::LearnPairRecord> {
     dir.and_then(|path| store::list_learn_pairs(path).ok())
         .unwrap_or_default()
 }
@@ -3277,14 +3281,17 @@ fn asr_prompt_for_snapshot(
     dir: Option<&Path>,
     dictionary: &[String],
     snapshot: &context::ContextSnapshot,
+    asr_provider: crate::providers::EngineProvider,
+    asr_model: &str,
 ) -> Option<String> {
     let pairs = load_learn_pairs(dir);
     let scope = lexicon::PromptScope::from_snapshot(snapshot);
-    build_asr_prompt(
+    lexicon::build_asr_prompt_shaped(
         dictionary,
         Some(&snapshot.policy),
         &pairs,
         Some(&scope),
+        lexicon::asr_prompt_shape_for(asr_provider, asr_model),
     )
 }
 
@@ -4709,14 +4716,14 @@ mod tests {
     }
 
     #[test]
-    fn hud_partial_expands_window_only_during_live_dictation() {
-        assert!(super::hud_partial_expands_window(
+    fn hud_partial_never_expands_the_window() {
+        assert!(!super::hud_partial_expands_window(
             "你好世界",
             Phase::Recording,
             4,
             4
         ));
-        assert!(super::hud_partial_expands_window(
+        assert!(!super::hud_partial_expands_window(
             "hello",
             Phase::Processing,
             4,
@@ -4729,12 +4736,6 @@ mod tests {
             4
         ));
         assert!(!super::hud_partial_expands_window("", Phase::Recording, 4, 4));
-        assert!(!super::hud_partial_expands_window(
-            "你好世界",
-            Phase::Recording,
-            3,
-            4
-        ));
     }
 
     #[test]
@@ -5239,6 +5240,8 @@ mod tests {
                 "uh deploy v2 /Users/mingjie/app",
                 CleanupDecision::Failed,
                 context::ContextFamily::PromptOrCode,
+                &[],
+                &[],
             )
             .unwrap();
         assert_eq!(result.text, "deploy v2 /Users/mingjie/app");
@@ -5252,6 +5255,8 @@ mod tests {
             "嗯 uh",
             CleanupDecision::Disabled,
             context::ContextFamily::PersonalChat,
+            &[],
+            &[],
         )
         .unwrap();
         assert_eq!(result.text, "嗯 uh");
@@ -5264,9 +5269,42 @@ mod tests {
             "uh hello",
             CleanupDecision::Provider("hello".into()),
             context::ContextFamily::General,
+            &[],
+            &[],
         )
         .unwrap();
         assert_eq!(result.text, "hello");
+        assert!(!result.degraded);
+    }
+
+    #[test]
+    fn provider_cleanup_cannot_reintroduce_a_promoted_before() {
+        let pair = store::LearnPairRecord {
+            pair_key: crate::dictionary_learn::pair_key("知呼", "知乎"),
+            before_surface: "知呼".into(),
+            after_surface: "知乎".into(),
+            hits: 3,
+            promoted: true,
+            last_at: "2026-01-01".into(),
+            family: Some("personal_chat".into()),
+            mapping_id: None,
+            browser_host: None,
+            native_bundle: None,
+            last_used_at: None,
+            pinned: false,
+            tombstoned_at: None,
+            ignored: false,
+            promote_hits: 0,
+        };
+        let result = finalize_text(
+            "今天去知乎看看",
+            CleanupDecision::Provider("今天去知呼看看".into()),
+            context::ContextFamily::PersonalChat,
+            &[pair],
+            &["知乎".into()],
+        )
+        .unwrap();
+        assert_eq!(result.text, "今天去知乎看看");
         assert!(!result.degraded);
     }
 
@@ -5276,6 +5314,8 @@ mod tests {
             "uh hello",
             CleanupDecision::Provider("  ".into()),
             context::ContextFamily::General,
+            &[],
+            &[],
         )
         .unwrap();
         assert_eq!(result.text, "hello");

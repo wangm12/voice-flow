@@ -2,10 +2,10 @@
 //!
 //! Groq's transcription API accepts completed audio files, so this is not
 //! streaming ASR. This module submits the same bounded chunks used by the
-//! long-recording path while capture is still active. Completed non-warmup
-//! transcripts may be shown on the HUD only; they are never written to the
-//! clipboard, History, or paste. Callers retain completed results and use the
-//! normal final-ASR path for missing chunks.
+//! long-recording path while capture is still active. Completed transcripts
+//! stay in the background for the final-ASR path; they are never shown on the
+//! HUD, clipboard, History, or paste. Callers retain completed results and use
+//! the normal final-ASR path for missing chunks.
 
 use crate::{asr, chunker::AudioChunk, metrics, queue};
 use std::collections::HashMap;
@@ -404,6 +404,38 @@ mod tests {
             generation,
         );
         (inbox, session)
+    }
+
+    fn spawn_silent(
+        provider: Arc<dyn asr::AsrProvider>,
+    ) -> (PrefetchInbox, PrefetchAsrSession) {
+        let (inbox, receiver) = PrefetchAsrSession::channel();
+        let session = PrefetchAsrSession::spawn(
+            receiver,
+            inbox.clone(),
+            Arc::new(queue::RequestGate::new(None)),
+            provider,
+            asr::AsrOptions::default(),
+            metrics::Metrics::default(),
+            CancellationToken::new(),
+            None,
+            1,
+        );
+        (inbox, session)
+    }
+
+    #[tokio::test]
+    async fn successful_chunks_stay_in_the_background_without_a_hud_callback() {
+        let (inbox, session) = spawn_silent(ScriptedAsr::ok(&[" later", "hello "]));
+
+        assert!(inbox.try_send(PrefetchMessage::Chunk(sample_chunk(1))));
+        assert!(inbox.try_send(PrefetchMessage::Chunk(sample_chunk(0))));
+        let result = session.finish(Duration::from_secs(2)).await;
+
+        assert_eq!(
+            result.transcripts,
+            HashMap::from([(0, "hello ".to_owned()), (1, " later".to_owned())])
+        );
     }
 
     #[tokio::test]

@@ -27,7 +27,7 @@ flowchart LR
 
 关键语义：`Cmd+V` 发出成功不等于目标控件接收成功。macOS 能读取焦点 Accessibility value 且包含本次文本时才标记 `paste`；其余情况标记 `paste_unverified`，并保留剪贴板内容。
 
-录音手势：组合键 tap 切换（再按一次结束，Esc 取消）；功能键只能双击。
+录音手势：默认组合键 tap 切换（再按一次结束，Esc 取消）；也可选 hybrid（短按切换、按住说话）；功能键只能双击。
 
 ## 2. 长录音
 
@@ -42,7 +42,7 @@ flowchart LR
 
 4. 任何部分 ASR、AI cleanup 或 delivery 降级都会保留 raw/final、原因和可恢复音频到 History。
 
-当前 ASR 是 batch 上传；prefetch 只做静默的整段 chunk 预热，部分转录不会进入 HUD、剪贴板、外部 App 或 History。
+当前 ASR 是 batch 上传，不是 WebSocket 流式。prefetch 会把已完成的非 warmup 分块预览写到 HUD（最多约 280 字），不进剪贴板、外部 App 或 History。最终仍走完整 ASR + cleanup 路径。
 
 ## 3. 选中文本助手：preview-first
 

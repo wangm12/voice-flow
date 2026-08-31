@@ -2348,6 +2348,8 @@ pub struct LearnPairRecord {
     pub tombstoned_at: Option<String>,
     #[serde(default)]
     pub ignored: bool,
+    #[serde(default)]
+    pub promote_hits: u32,
 }
 
 impl LearnPairRecord {
@@ -2387,6 +2389,7 @@ fn learn_pair_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LearnPairRec
         pinned: row.get::<_, Option<i64>>(11)?.unwrap_or(0) != 0,
         tombstoned_at: row.get(12)?,
         ignored: row.get::<_, Option<i64>>(13)?.unwrap_or(0) != 0,
+        promote_hits: 0,
     })
 }
 

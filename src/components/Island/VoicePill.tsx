@@ -106,8 +106,8 @@ export const VoicePill = memo(function VoicePill({
   selectedActionState = null,
   waveformLevels,
   progress,
-  chunkProgress,
-  partialText = null,
+  chunkProgress: _chunkProgress,
+  partialText: _partialText = null,
   reduced,
 }: {
   state: DictationState;
@@ -169,11 +169,10 @@ export const VoicePill = memo(function VoicePill({
     state,
     t,
     state === "rate_limited" ? retryRemaining : retryAfterSecs,
-    { fallbackReason, selectedActionState, chunkProgress, contextLabel: visibleContext, partialText },
+    { fallbackReason, selectedActionState, contextLabel: visibleContext },
   );
-  const showingPartial = Boolean(partialText?.trim())
-    && ["recording", "recording_limited", "starting", "processing"].includes(state);
-  const wideCaption = voicePillCaptionNeedsWide(state, { fallbackReason, partialText });
+  const showingPartial = false;
+  const wideCaption = voicePillCaptionNeedsWide(state, { fallbackReason });
   const stackHidden = state === "idle" && !caption;
   const showStackExit = isTerminal && !caption;
   const stackClassName = [

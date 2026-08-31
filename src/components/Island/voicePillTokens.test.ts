@@ -88,16 +88,16 @@ describe("voice pill state tokens", () => {
     ).toBe("部分结果已保存，请检查后再使用");
   });
 
-  it("shares prefetch partial text with the context label while recording", () => {
+  it("keeps prefetch transcripts off the HUD caption", () => {
     expect(
       pillCaption("recording", undefined, undefined, {
         contextLabel: "WeChat · 口语",
         partialText: "你好世界",
       }),
-    ).toBe("WeChat · 口语 · 你好世界");
+    ).toBe("WeChat · 口语");
     expect(
       pillCaption("recording", undefined, undefined, { partialText: "hello there" }),
-    ).toBe("hello there");
+    ).toBeNull();
   });
 
   it("allows a wider caption than 164px when in-progress words are present", () => {
@@ -112,7 +112,7 @@ describe("voice pill state tokens", () => {
     expect(voicePillCaptionNeedsWide("error")).toBe(true);
     expect(voicePillCaptionNeedsWide("copied")).toBe(true);
     expect(voicePillCaptionNeedsWide("recording")).toBe(false);
-    expect(voicePillCaptionNeedsWide("recording", { partialText: "你好" })).toBe(true);
+    expect(voicePillCaptionNeedsWide("recording", { partialText: "你好" })).toBe(false);
   });
 
   it("uses a wider island window while in-progress words are present", () => {
@@ -128,14 +128,14 @@ describe("voice pill state tokens", () => {
     ).toBe(voicePillWindowHeight);
   });
 
-  it("shows prefetch partial text during processing instead of chunk progress", () => {
+  it("keeps processing on the context label instead of prefetch or chunk counts", () => {
     expect(
       pillCaption("processing", undefined, undefined, {
         contextLabel: "Slack · 工作短讯",
         partialText: "in progress words",
         chunkProgress: { completed: 3, total: 8 },
       }),
-    ).toBe("Slack · 工作短讯 · in progress words");
+    ).toBe("Slack · 工作短讯");
   });
 
   it("prefers error and degraded captions over in-progress words", () => {
@@ -156,16 +156,19 @@ describe("voice pill state tokens", () => {
     ).toBe("正在准备改写");
   });
 
-  it("surfaces long-recording chunk progress in the caption chip", () => {
+  it("does not surface chunk counts or truncation on the HUD", () => {
     expect(
       pillCaption("processing", undefined, undefined, {
         chunkProgress: { completed: 3, total: 8 },
       }),
-    ).toBe("正在识别 3/8");
+    ).toBeNull();
     expect(
       pillCaption("processing", undefined, undefined, {
         chunkProgress: { completed: 9, total: 8 },
       }),
+    ).toBeNull();
+    expect(
+      pillCaption("recording", undefined, undefined, { partialText: "hello…".repeat(40) }),
     ).toBeNull();
   });
 

@@ -1,5 +1,7 @@
 # Engine Provider Wizard Implementation Plan
 
+> **Status:** Implemented and evolved. Provider catalog is larger than this plan (OpenAI, Deepgram, SiliconFlow, etc.). Defaults moved from gpt-oss to `llama-3.1-8b-instant`.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Settings → 语音服务 becomes a three-step wizard that picks ASR and cleanup providers, then probes the real HTTP path before those values go live.

@@ -78,7 +78,6 @@ export function voicePillCaptionNeedsWide(
   options?: Pick<PillCaptionOptions, "fallbackReason" | "partialText">,
 ): boolean {
   if (options?.fallbackReason) return true;
-  if (options?.partialText?.trim() && CONTEXT_LABEL_STATES.has(state)) return true;
   return ["error", "degraded", "copied", "unverified", "rate_limited"].includes(state);
 }
 
@@ -138,24 +137,6 @@ export function pillCaption(
     return statusCaption;
   }
 
-  const partialText = CONTEXT_LABEL_STATES.has(state) ? options?.partialText?.trim() || null : null;
-  if (partialText) {
-    if (contextLabel) return `${contextLabel} · ${partialText}`;
-    return partialText;
-  }
-
-  const chunkProgress = options?.chunkProgress;
-  if (
-    state === "processing"
-    && chunkProgress
-    && chunkProgress.total > 0
-    && chunkProgress.completed >= 0
-    && chunkProgress.completed <= chunkProgress.total
-  ) {
-    statusCaption = `${translate("正在识别")} ${chunkProgress.completed}/${chunkProgress.total}`;
-  }
-
-  if (contextLabel && statusCaption) return `${contextLabel} · ${statusCaption}`;
   if (contextLabel) return contextLabel;
   return statusCaption;
 }

@@ -179,7 +179,27 @@ pub(crate) async fn remove_dictionary_word(
 pub(crate) fn list_learn_pairs(app: tauri::AppHandle) -> Result<Vec<store::LearnPairRecord>, String> {
     let dir = app.path().app_data_dir().map_err(|error| error.to_string())?;
     let rows = store::list_learn_pairs(&dir).map_err(|error| error.to_string())?;
-    Ok(rows.into_iter().filter(|row| row.is_pending()).collect())
+    Ok(pairs_for_dictionary_settings(rows))
+}
+
+pub(crate) fn pairs_for_dictionary_settings(
+    rows: Vec<store::LearnPairRecord>,
+) -> Vec<store::LearnPairRecord> {
+    rows.into_iter()
+        .filter(|row| {
+            if row.is_pending() {
+                return true;
+            }
+            row.is_live_promoted() && !row.before_surface.is_empty()
+        })
+        .map(|mut row| {
+            row.promote_hits = promote_hits_for(classify_learn_pair(
+                &row.before_surface,
+                &row.after_surface,
+            ));
+            row
+        })
+        .collect()
 }
 
 #[tauri::command]
@@ -591,6 +611,114 @@ fn punctuation_profile(value: &str) -> PunctuationProfile {
 }
 
 pub const PROMOTE_HITS: u32 = 3;
+pub const NAME_PROMOTE_HITS: u32 = 2;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LearnClass {
+    Rejected,
+    Name,
+    Term,
+}
+
+pub fn classify_learn_pair(before: &str, after: &str) -> LearnClass {
+    let after = after.trim();
+    let before = before.trim();
+    if after.is_empty() || after == before {
+        return LearnClass::Rejected;
+    }
+    if is_case_only_change(before, after) {
+        return LearnClass::Rejected;
+    }
+    if is_rejected_learn_surface(after) {
+        return LearnClass::Rejected;
+    }
+    if looks_like_cjk_personal_name(after) {
+        return LearnClass::Name;
+    }
+    LearnClass::Term
+}
+
+pub fn promote_hits_for(class: LearnClass) -> u32 {
+    match class {
+        LearnClass::Name => NAME_PROMOTE_HITS,
+        LearnClass::Term => PROMOTE_HITS,
+        LearnClass::Rejected => u32::MAX,
+    }
+}
+
+fn is_case_only_change(before: &str, after: &str) -> bool {
+    !before.is_empty()
+        && before.chars().any(|ch| ch.is_ascii_alphabetic())
+        && before.eq_ignore_ascii_case(after)
+}
+
+fn is_rejected_learn_surface(after: &str) -> bool {
+    let folded = fold_learn_surface(after);
+    REJECTED_LEARN_SURFACES
+        .iter()
+        .any(|item| fold_learn_surface(item) == folded)
+}
+
+fn fold_learn_surface(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| !ch.is_whitespace() && *ch != '-' && *ch != '_')
+        .flat_map(|ch| ch.to_lowercase())
+        .collect()
+}
+
+fn looks_like_cjk_personal_name(after: &str) -> bool {
+    let chars: Vec<char> = after.chars().collect();
+    if chars.is_empty() || !chars.iter().copied().all(is_cjk) {
+        return false;
+    }
+    match chars.len() {
+        2 => is_single_cjk_surname(chars[0]),
+        3 => {
+            is_single_cjk_surname(chars[0])
+                || is_compound_cjk_surname(&[chars[0], chars[1]])
+        }
+        _ => false,
+    }
+}
+
+fn is_single_cjk_surname(ch: char) -> bool {
+    SINGLE_CJK_SURNAMES.contains(&ch)
+}
+
+fn is_compound_cjk_surname(chars: &[char; 2]) -> bool {
+    COMPOUND_CJK_SURNAMES
+        .iter()
+        .any(|name| name.chars().eq(chars.iter().copied()))
+}
+
+const REJECTED_LEARN_SURFACES: &[&str] = &[
+    "um", "uh", "er", "ah", "hmm", "mm", "mhm", "yeah", "yup", "like",
+    "basically", "actually", "kinda", "sorta",
+    "嗯", "啊", "呃", "额", "哦", "哈", "哈哈", "嗯嗯", "那个", "就是", "就是说",
+    "然后", "这个", "什么", "怎么", "一下", "对对",
+    "the", "a", "an", "and", "or", "but", "if", "of", "to", "in", "on", "at",
+    "for", "is", "are", "was", "were", "be", "been", "this", "that", "it",
+    "we", "they", "you",
+    "因为", "所以", "如果", "虽然", "但是", "而且", "不是", "没有", "可以",
+    "应该", "需要",
+];
+
+const SINGLE_CJK_SURNAMES: &[char] = &[
+    '李', '王', '张', '刘', '陈', '杨', '黄', '赵', '吴', '周', '徐', '孙', '马',
+    '朱', '胡', '郭', '何', '高', '林', '罗', '郑', '梁', '谢', '宋', '唐', '许',
+    '韩', '冯', '邓', '曹', '彭', '曾', '肖', '田', '董', '袁', '潘', '于', '蒋',
+    '蔡', '余', '杜', '叶', '程', '魏', '苏', '吕', '丁', '任', '沈', '姚', '卢',
+    '姜', '崔', '钟', '谭', '陆', '汪', '范', '金', '石', '廖', '贾', '夏', '韦',
+    '付', '方', '白', '邹', '孟', '熊', '秦', '邱', '江', '尹', '薛', '闫', '段',
+    '雷', '侯', '龙', '史', '陶', '黎', '贺', '顾', '毛', '郝', '龚', '邵', '万',
+    '钱', '严', '覃', '武', '戴', '莫', '孔', '向', '汤',
+];
+
+const COMPOUND_CJK_SURNAMES: &[&str] = &[
+    "欧阳", "司马", "上官", "诸葛", "司徒", "夏侯", "尉迟", "公孙", "慕容",
+    "长孙", "宇文", "司空", "端木", "东方", "独孤", "南宫", "皇甫", "闻人",
+];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RecordPairResult {
@@ -633,6 +761,11 @@ pub fn record_pair(table: &mut LearnPairTable, before: &str, after: &str) -> Rec
     if after == before {
         return RecordPairResult::Ignored;
     }
+    let class = classify_learn_pair(before, after);
+    if class == LearnClass::Rejected {
+        return RecordPairResult::Ignored;
+    }
+    let threshold = promote_hits_for(class);
     let key = pair_key(before, after);
     let row = table.by_key.entry(key).or_insert(LearnPairRow {
         hits: 0,
@@ -642,8 +775,8 @@ pub fn record_pair(table: &mut LearnPairTable, before: &str, after: &str) -> Rec
         return RecordPairResult::AlreadyPromoted;
     }
     row.hits = row.hits.saturating_add(1);
-    if row.hits >= PROMOTE_HITS {
-        row.hits = PROMOTE_HITS;
+    if row.hits >= threshold {
+        row.hits = threshold;
         row.promoted = true;
         return RecordPairResult::Promoted {
             after: after.to_string(),
@@ -671,6 +804,11 @@ pub fn record_learn_pair_with_scope(
     if after == before {
         return Ok(RecordPairResult::Ignored);
     }
+    let class = classify_learn_pair(before, after);
+    if class == LearnClass::Rejected {
+        return Ok(RecordPairResult::Ignored);
+    }
+    let threshold = promote_hits_for(class);
     let key = pair_key(before, after);
     if let Some(existing) = store::get_learn_pair(dir, &key)? {
         if existing.ignored || existing.tombstoned_at.is_some() {
@@ -679,17 +817,17 @@ pub fn record_learn_pair_with_scope(
         if existing.promoted {
             return Ok(RecordPairResult::AlreadyPromoted);
         }
-        if existing.hits >= PROMOTE_HITS {
-            return try_promote_learn_pair(dir, dictionary, after, &key);
+        if existing.hits >= threshold {
+            return try_promote_learn_pair(dir, dictionary, after, &key, threshold);
         }
     }
     let Some(row) = store::upsert_learn_pair_with_scope(dir, &key, before, after, scope)? else {
         return Ok(RecordPairResult::Ignored);
     };
-    if row.hits < PROMOTE_HITS {
+    if row.hits < threshold {
         return Ok(RecordPairResult::Pending { hits: row.hits });
     }
-    try_promote_learn_pair(dir, dictionary, after, &key)
+    try_promote_learn_pair(dir, dictionary, after, &key, threshold)
 }
 
 fn try_promote_learn_pair(
@@ -697,13 +835,14 @@ fn try_promote_learn_pair(
     dictionary: &mut Vec<String>,
     after: &str,
     key: &str,
+    threshold: u32,
 ) -> anyhow::Result<RecordPairResult> {
     if dictionary.iter().any(|word| word == after) {
         store::mark_learn_pair_promoted(dir, key)?;
         return Ok(RecordPairResult::AlreadyPromoted);
     }
     if !append_dictionary_entry(dictionary, after) {
-        return Ok(RecordPairResult::Pending { hits: PROMOTE_HITS });
+        return Ok(RecordPairResult::Pending { hits: threshold });
     }
     store::mark_learn_pair_promoted(dir, key)?;
     Ok(RecordPairResult::Promoted {
@@ -757,10 +896,15 @@ pub(crate) fn maybe_observe_after_paste(
     if !settings.dictionary_learn_enabled {
         return;
     }
-    if let Some(snapshot) = recording_context {
-        if !crate::lexicon::mapping_allows_learn(&settings.context_mappings, &snapshot.profile.id) {
-            return;
-        }
+    if !crate::lexicon::scene_allows_learn(
+        &settings.context_mappings,
+        recording_context
+            .map(|snapshot| snapshot.profile.id.as_str())
+            .unwrap_or(""),
+        target_guard.bundle_id.as_deref(),
+        target_guard.browser_host.as_deref(),
+    ) {
+        return;
     }
     let scope = recording_context.map(scope_from_snapshot);
     let mapping_id = recording_context
@@ -1456,6 +1600,80 @@ mod tests {
     }
 
     #[test]
+    fn classifier_keeps_products_abbreviations_and_cjk_names() {
+        assert_eq!(
+            super::classify_learn_pair("知呼", "知乎"),
+            super::LearnClass::Term
+        );
+        assert_eq!(
+            super::classify_learn_pair("类型脚本", "TypeScript"),
+            super::LearnClass::Term
+        );
+        assert_eq!(
+            super::classify_learn_pair("诶皮艾", "API"),
+            super::LearnClass::Term
+        );
+        assert_eq!(
+            super::classify_learn_pair("李铭", "李明"),
+            super::LearnClass::Name
+        );
+        assert_eq!(
+            super::classify_learn_pair("欧阳那", "欧阳娜"),
+            super::LearnClass::Name
+        );
+    }
+
+    #[test]
+    fn classifier_rejects_filler_grammar_and_case_only() {
+        assert_eq!(
+            super::classify_learn_pair("那个那个", "那个"),
+            super::LearnClass::Rejected
+        );
+        assert_eq!(
+            super::classify_learn_pair("因为因为", "因为"),
+            super::LearnClass::Rejected
+        );
+        assert_eq!(
+            super::classify_learn_pair("python", "Python"),
+            super::LearnClass::Rejected
+        );
+        assert_eq!(
+            super::classify_learn_pair("um um", "um"),
+            super::LearnClass::Rejected
+        );
+    }
+
+    #[test]
+    fn record_pair_ignores_filler_and_case_only() {
+        let mut table = super::LearnPairTable::default();
+        assert_eq!(
+            super::record_pair(&mut table, "那个那个", "那个"),
+            super::RecordPairResult::Ignored
+        );
+        assert_eq!(
+            super::record_pair(&mut table, "python", "Python"),
+            super::RecordPairResult::Ignored
+        );
+        assert!(table.is_empty());
+    }
+
+    #[test]
+    fn record_pair_promotes_cjk_name_on_second_hit() {
+        let mut table = super::LearnPairTable::default();
+        assert_eq!(
+            super::record_pair(&mut table, "李铭", "李明"),
+            super::RecordPairResult::Pending { hits: 1 }
+        );
+        assert_eq!(
+            super::record_pair(&mut table, "李铭", "李明"),
+            super::RecordPairResult::Promoted {
+                after: "李明".into()
+            }
+        );
+        assert_eq!(table.hits(&super::pair_key("李铭", "李明")), Some(2));
+    }
+
+    #[test]
     fn record_pair_promotes_on_third_hit_and_freezes() {
         let mut table = super::LearnPairTable::default();
         assert_eq!(
@@ -1477,6 +1695,78 @@ mod tests {
             super::RecordPairResult::AlreadyPromoted
         );
         assert_eq!(table.hits(&super::pair_key("知呼", "知乎")), Some(3));
+    }
+
+    #[test]
+    fn dictionary_settings_lists_pending_and_promoted_pairs() {
+        let pending = crate::store::LearnPairRecord {
+            pair_key: super::pair_key("知呼", "知乎"),
+            before_surface: "知呼".into(),
+            after_surface: "知乎".into(),
+            hits: 2,
+            promoted: false,
+            last_at: "2026-01-01".into(),
+            family: None,
+            mapping_id: None,
+            browser_host: None,
+            native_bundle: None,
+            last_used_at: None,
+            pinned: false,
+            tombstoned_at: None,
+            ignored: false,
+            promote_hits: 0,
+        };
+        let promoted = crate::store::LearnPairRecord {
+            promoted: true,
+            hits: 3,
+            ..pending.clone()
+        };
+        let name = crate::store::LearnPairRecord {
+            pair_key: super::pair_key("李铭", "李明"),
+            before_surface: "李铭".into(),
+            after_surface: "李明".into(),
+            hits: 2,
+            promoted: true,
+            last_at: "2026-01-01".into(),
+            family: None,
+            mapping_id: None,
+            browser_host: None,
+            native_bundle: None,
+            last_used_at: None,
+            pinned: false,
+            tombstoned_at: None,
+            ignored: false,
+            promote_hits: 0,
+        };
+        let manual = crate::store::LearnPairRecord {
+            pair_key: super::pair_key("", "手动导入"),
+            before_surface: String::new(),
+            after_surface: "手动导入".into(),
+            hits: 0,
+            promoted: true,
+            last_at: "2026-01-01".into(),
+            family: None,
+            mapping_id: None,
+            browser_host: None,
+            native_bundle: None,
+            last_used_at: None,
+            pinned: false,
+            tombstoned_at: None,
+            ignored: false,
+            promote_hits: 0,
+        };
+        let visible = super::pairs_for_dictionary_settings(vec![
+            pending,
+            promoted,
+            name,
+            manual,
+        ]);
+        assert_eq!(visible.len(), 3);
+        assert_eq!(visible[0].promote_hits, 3);
+        assert_eq!(visible[1].promote_hits, 3);
+        assert_eq!(visible[2].after_surface, "李明");
+        assert_eq!(visible[2].promote_hits, 2);
+        assert!(visible.iter().all(|row| !row.before_surface.is_empty()));
     }
 
     #[test]
@@ -1533,6 +1823,39 @@ mod tests {
                 after: "知乎".into(),
             }]
         );
+    }
+
+    #[test]
+    fn record_learn_pair_promotes_cjk_name_on_second_observe() {
+        let dir = temp_dir("rlp-name-two");
+        let mut dictionary = Vec::new();
+        assert_eq!(
+            super::record_learn_pair(&dir, &mut dictionary, "李铭", "李明").unwrap(),
+            super::RecordPairResult::Pending { hits: 1 }
+        );
+        assert_eq!(
+            super::record_learn_pair(&dir, &mut dictionary, "李铭", "李明").unwrap(),
+            super::RecordPairResult::Promoted {
+                after: "李明".into()
+            }
+        );
+        assert_eq!(dictionary, vec!["李明".to_string()]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn record_learn_pair_ignores_filler() {
+        let dir = temp_dir("rlp-filler");
+        let mut dictionary = Vec::new();
+        assert_eq!(
+            super::record_learn_pair(&dir, &mut dictionary, "那个那个", "那个").unwrap(),
+            super::RecordPairResult::Ignored
+        );
+        assert!(dictionary.is_empty());
+        assert!(crate::store::get_learn_pair(&dir, &super::pair_key("那个那个", "那个"))
+            .unwrap()
+            .is_none());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

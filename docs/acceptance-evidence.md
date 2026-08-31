@@ -1,6 +1,8 @@
 # VoiceFlow Acceptance Evidence
 
-更新时间：2026-08-11（最新确定性审计）
+> **2026-08-11 快照。** 下面的测试数量和 gate 结果不要当现状。当前门禁以 `cargo test --manifest-path src-tauri/Cargo.toml` 和 `npm test -- --run` 为准。产品行为见 [end-to-end-workflows.md](end-to-end-workflows.md)。
+
+更新时间：2026-08-11（当时的确定性审计）
 
 ## P0/P1 implementation delta
 

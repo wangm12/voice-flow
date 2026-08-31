@@ -1,5 +1,7 @@
 # ASR → Cleanup Pipeline Implementation Plan
 
+> **Status:** Implemented in tree. Do not re-execute as if these tasks are still open. Current defaults and remaining later/wont items: [asr-cleanup-later-and-wont.md](../../asr-cleanup-later-and-wont.md).
+
 > **For agentic workers:** Execute in this session. Do not wait for a second approval — the user asked to start all improvements.
 
 **Goal:** Ship the research P0 quality path (silence, restatement, scene skip, fast instruct, local punctuation) plus in-app P1 (Chinese ASR recommendations). Do not embed Python, stream ASR, or fine-tune.

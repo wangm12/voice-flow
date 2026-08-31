@@ -4,7 +4,7 @@
 
 脱敏案例位于 `src-tauri/src/cleanup_corpus.rs`。`expected` 是评审目标，不是「llama 实际返回了什么」。不得把真实录音、窗口标题、URL 或用户 History 放入评测数据。
 
-默认整理模型是 `llama-3.1-8b-instant`。不要用过时的 gpt-oss A/B 当默认对照。
+默认整理模型是 Groq `llama-3.1-8b-instant`。不要用过时的 gpt-oss A/B 当默认对照。终端和表单默认 `LocalOnly`；微信 / 邮件 / Slack 短句也走 Provider。
 
 ## 两道门
 

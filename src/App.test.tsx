@@ -208,7 +208,7 @@ describe("settings navigation", () => {
 
     render(<App />);
     fireEvent.click(await screen.findByRole("button", { name: "个人词典" }));
-    expect(await screen.findByText("还没有词条。添加后，VoiceFlow 会更准确地识别人名和专业术语。")).toBeInTheDocument();
+    expect(await screen.findByText(/还没有学到替换/)).toBeInTheDocument();
     await waitFor(() => expect(settingsHandler).toBeDefined());
 
     settingsHandler?.({ payload: { ...settings, dictionary: ["知乎"] } as typeof settings & { dictionary: string[] } });

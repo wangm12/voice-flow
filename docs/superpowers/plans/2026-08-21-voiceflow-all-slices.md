@@ -1,5 +1,7 @@
 # VoiceFlow All-Slices Implementation Plan
 
+> **Status:** Historical slice plan from 2026-08-21. Do not execute as a current backlog. Later research and shipped harness/provider work supersede several slices.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development. Fresh implementer per slice. Parent reviews. Serial only. Do not commit unless the controller's dispatch explicitly allows it.
 
 **Goal:** Land P0–P1 dictation upgrades as eight independently testable slices, without turning VoiceFlow into a meeting app or keylogger.

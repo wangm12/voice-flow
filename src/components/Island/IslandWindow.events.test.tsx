@@ -41,7 +41,7 @@ describe("IslandWindow HUD partials", () => {
     await waitFor(() => expect(handlers.has("dictation://partial")).toBe(true));
   }
 
-  it("shows prefetch words on the HUD without paste or history commands", async () => {
+  it("keeps prefetch words off the HUD without paste or history commands", async () => {
     await renderHud();
     act(() => {
       handlers.get("dictation://state")!({
@@ -52,8 +52,9 @@ describe("IslandWindow HUD partials", () => {
       });
     });
 
-    expect(document.querySelector(".voice-pill-caption")).toHaveTextContent("WeChat · 口语 · 你好世界");
-    expect(document.querySelector(".voice-pill-caption")).toHaveClass("voice-pill-caption--partial");
+    expect(document.querySelector(".voice-pill-caption")).toHaveTextContent("WeChat · 口语");
+    expect(document.querySelector(".voice-pill-caption")?.textContent ?? "").not.toContain("你好世界");
+    expect(document.querySelector(".voice-pill-caption")).not.toHaveClass("voice-pill-caption--partial");
     expect(invokeMock).not.toHaveBeenCalled();
   });
 

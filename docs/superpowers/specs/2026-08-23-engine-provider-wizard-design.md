@@ -1,7 +1,7 @@
 # Engine Provider Wizard
 
 **Date:** 2026-08-23  
-**Status:** Draft for user review  
+**Status:** Implemented and evolved. Defaults are now Groq `llama-3.1-8b-instant` plus first-class OpenAI / Deepgram / SiliconFlow / DeepSeek / Anthropic / Ollama / local Whisper. Onboarding is still Groq-only.  
 **Product:** VoiceFlow (macOS dictation, React 19 + Tauri 2 + Rust)
 
 ## Problem

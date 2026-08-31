@@ -21,6 +21,8 @@ type LearnPair = {
   hits: number;
   promoted: boolean;
   ignored?: boolean;
+  promote_hits?: number;
+  pinned?: boolean;
 };
 
 type StyleDraft = {
@@ -40,6 +42,7 @@ export function DictionarySettings({ settings, save }: { settings: Settings; sav
   const [dictionaryImporting, setDictionaryImporting] = useState(false);
   const [pendingDeleteWord, setPendingDeleteWord] = useState<string | null>(null);
   const [pendingPairs, setPendingPairs] = useState<LearnPair[]>([]);
+  const [promotedPairs, setPromotedPairs] = useState<LearnPair[]>([]);
   const [styleDrafts, setStyleDrafts] = useState<StyleDraft[]>([]);
   const [pinnedTerms, setPinnedTerms] = useState<string[]>([]);
   const [pendingStyleDraft, setPendingStyleDraft] = useState<StyleDraft | null>(null);
@@ -56,7 +59,9 @@ export function DictionarySettings({ settings, save }: { settings: Settings; sav
         invoke<StyleDraft[]>("list_style_drafts"),
         invoke<string[]>("list_pinned_terms"),
       ]);
-      setPendingPairs(Array.isArray(rows) ? rows.filter((row) => !row.promoted && !row.ignored) : []);
+      const live = Array.isArray(rows) ? rows.filter((row) => !row.ignored) : [];
+      setPendingPairs(live.filter((row) => !row.promoted));
+      setPromotedPairs(live.filter((row) => row.promoted && row.before_surface));
       setStyleDrafts(Array.isArray(drafts) ? drafts : []);
       setPinnedTerms(Array.isArray(pinned) ? pinned : []);
     } catch {
@@ -202,6 +207,9 @@ export function DictionarySettings({ settings, save }: { settings: Settings; sav
       });
   };
 
+  const learnedAfters = new Set(promotedPairs.map((pair) => pair.after_surface));
+  const manualWords = settings.dictionary.filter((word) => !learnedAfters.has(word));
+
   const openDictionaryFilePicker = () => dictionaryFileInput.current?.click();
   const handleDictionaryDrop = (event: React.DragEvent<HTMLDivElement>) => {
     event.preventDefault();
@@ -214,7 +222,7 @@ export function DictionarySettings({ settings, save }: { settings: Settings; sav
     <SettingsShell>
       <SettingsPageHeader title={t("个人词典")} description={t("把人名、产品名和专业术语添加到这里，识别时会优先保留正确拼写。")} />
       <SettingsGroup title={t("词典学习")}>
-        <SettingsRow title={t("学习词条")} description={t("第 3 次静默纠正，或历史/设置确认。继续打字不会学习。")}>
+        <SettingsRow title={t("学习词条")} description={t("默认第 3 次静默纠正，人名第 2 次；也可在历史或本页确认。继续打字不会学习。")}>
           <Toggle checked={settings.dictionary_learn_enabled !== false} onChange={(checked) => save({ dictionary_learn_enabled: checked })} label={t("学习词条")} />
         </SettingsRow>
       </SettingsGroup>
@@ -222,7 +230,7 @@ export function DictionarySettings({ settings, save }: { settings: Settings; sav
         <SettingsGroup title={t("待晋升")}>
           {pendingPairs.map((pair) => (
             <div key={pair.pair_key} className="flex items-center gap-3 px-4 py-3.5 text-sm sm:px-5">
-              <span className="min-w-0 flex-1 text-primary">{pair.before_surface} → {pair.after_surface} · {pair.hits}/3</span>
+              <span className="min-w-0 flex-1 text-primary">{pair.before_surface} → {pair.after_surface} · {pair.hits}/{pair.promote_hits || 3}</span>
               <button type="button" onClick={() => void invoke("promote_learn_pair", { pairKey: pair.pair_key, beforeSurface: pair.before_surface, afterSurface: pair.after_surface }).then(() => loadPendingPairs())} className="rounded-lg px-2 py-1 text-xs text-secondary transition-colors hover:bg-elevated hover:text-primary">{t("确认")}</button>
               <button type="button" onClick={() => void invoke("ignore_learn_pair", { pairKey: pair.pair_key }).then(() => loadPendingPairs())} className="rounded-lg px-2 py-1 text-xs text-tertiary transition-colors hover:bg-error/10 hover:text-error">{t("忽略")}</button>
             </div>
@@ -270,14 +278,32 @@ export function DictionarySettings({ settings, save }: { settings: Settings; sav
         </div>
         {dictionaryMessage && <p role="status" className="px-4 pb-4 text-xs text-secondary sm:px-5">{dictionaryMessage}</p>}
       </SettingsGroup>
-      <SettingsGroup title={t("词条列表")} description={`${settings.dictionary.length} ${t("条")}`}>
-        {settings.dictionary.length > 0 ? settings.dictionary.map((word) => (
+      <SettingsGroup title={t("已生效替换")} description={`${promotedPairs.length} ${t("条")}`}>
+        {promotedPairs.length > 0 ? promotedPairs.map((pair) => {
+          const pinned = pinnedTerms.includes(pair.after_surface);
+          return (
+            <div key={pair.pair_key} className="flex items-center gap-3 px-4 py-3.5 text-sm sm:px-5">
+              <span className="min-w-0 flex-1 text-primary">
+                {pair.before_surface} → {pair.after_surface}
+                <span className="ml-2 text-xs text-tertiary">{pair.hits} {t("次")}</span>
+                {pair.promote_hits === 2 ? <span className="ml-2 text-xs text-tertiary">{t("人名")}</span> : null}
+              </span>
+              <button type="button" aria-label={`${pinned ? t("取消置顶") : t("置顶")} ${pair.after_surface}`} onClick={() => void invoke("pin_dictionary_term", { word: pair.after_surface, pinned: !pinned }).then(() => loadPendingPairs())} className="rounded-lg px-2 py-1 text-xs text-secondary transition-colors hover:bg-elevated hover:text-primary">{pinned ? t("已置顶") : t("置顶")}</button>
+              <button type="button" onClick={() => void invoke("undo_learn_pair", { pairKey: pair.pair_key }).then(() => loadPendingPairs())} className="rounded-lg px-2 py-1 text-xs text-tertiary transition-colors hover:bg-error/10 hover:text-error">{t("忘记")}</button>
+            </div>
+          );
+        }) : (
+          <p className="px-4 py-5 text-sm text-tertiary sm:px-5">{t("还没有学到替换。听写后把错字改对，第 2 或 3 次会进入待晋升；确认后出现在已生效替换。")}</p>
+        )}
+      </SettingsGroup>
+      <SettingsGroup title={t("词条列表")} description={`${manualWords.length} ${t("条")}`}>
+        {manualWords.length > 0 ? manualWords.map((word) => (
           <div key={word} className="flex items-center gap-3 px-4 py-3.5 text-sm sm:px-5">
             <span className="flex-1 text-primary">{word}</span>
             <button type="button" aria-label={`${pinnedTerms.includes(word) ? t("取消置顶") : t("置顶")} ${word}`} onClick={() => void invoke("pin_dictionary_term", { word, pinned: !pinnedTerms.includes(word) }).then(() => loadPendingPairs())} className="rounded-lg px-2 py-1 text-xs text-secondary transition-colors hover:bg-elevated hover:text-primary">{pinnedTerms.includes(word) ? t("已置顶") : t("置顶")}</button>
             <button type="button" aria-label={`${t("删除")} ${word}`} onClick={() => setPendingDeleteWord(word)} className="rounded-lg px-2 py-1 text-xs text-tertiary transition-colors hover:bg-error/10 hover:text-error">{t("删除")}</button>
           </div>
-        )) : <p className="px-4 py-5 text-sm text-tertiary sm:px-5">{t("还没有词条。添加后，VoiceFlow 会更准确地识别人名和专业术语。")}</p>}
+        )) : <p className="px-4 py-5 text-sm text-tertiary sm:px-5">{t("没有手加或导入的词条。")}</p>}
       </SettingsGroup>
       <ConfirmDialog
         open={pendingStyleDraft != null}

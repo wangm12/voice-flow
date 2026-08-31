@@ -399,7 +399,7 @@ async fn transcribe_at(
     model: &str,
 ) -> Result<Transcript, AsrError> {
     if endpoint.contains("api.deepgram.com") || endpoint.contains("/listen") {
-        return transcribe_deepgram(endpoint, wav, key, language, model).await;
+        return transcribe_deepgram(endpoint, wav, key, language, model, prompt).await;
     }
     let client = http_client()?;
     let mut form = Form::new()
@@ -452,12 +452,40 @@ async fn transcribe_at(
     sanitize_transcript(result)
 }
 
+fn append_deepgram_keyterms(url: &mut String, prompt: Option<&str>) {
+    let Some(prompt) = prompt.filter(|value| !value.trim().is_empty()) else {
+        return;
+    };
+    for term in prompt
+        .split(|ch: char| ch.is_whitespace() || matches!(ch, '、' | '。' | ',' | ';' | ':' | '/'))
+        .filter(|term| !term.is_empty() && *term != "不要翻译")
+        .take(64)
+    {
+        url.push_str("&keyterm=");
+        url.push_str(&encode_query_component(term));
+    }
+}
+
+fn encode_query_component(value: &str) -> String {
+    let mut out = String::new();
+    for byte in value.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(*byte as char);
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
 async fn transcribe_deepgram(
     endpoint: &str,
     wav: Vec<u8>,
     key: &str,
     language: Option<&str>,
     model: &str,
+    prompt: Option<&str>,
 ) -> Result<Transcript, AsrError> {
     let mut url = endpoint.to_owned();
     if !url.contains('?') {
@@ -474,6 +502,7 @@ async fn transcribe_deepgram(
         url.push_str("&language=");
         url.push_str(language);
     }
+    append_deepgram_keyterms(&mut url, prompt);
     let client = http_client()?;
     let response = client
         .post(&url)
@@ -614,6 +643,16 @@ pub fn parse_retry_after(value: &str) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn deepgram_prompt_terms_become_keyterms() {
+        let mut url = "https://api.deepgram.com/v1/listen?model=nova-3".to_owned();
+        append_deepgram_keyterms(&mut url, Some("晓雯 知乎 TypeScript 不要翻译"));
+        assert!(url.contains("keyterm="));
+        assert!(url.contains(&encode_query_component("晓雯")));
+        assert!(url.contains("TypeScript"));
+        assert!(!url.contains("不要翻译"));
+    }
+
     #[test]
     fn parses_headers() {
         let mut h = reqwest::header::HeaderMap::new();

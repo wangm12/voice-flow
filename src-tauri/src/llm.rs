@@ -670,7 +670,7 @@ async fn cleanup_at_with_intent(
 
 fn light_cleanup_user_message(
     intent: &CleanupIntent,
-    dictionary: &[String],
+    _dictionary: &[String],
     context: Option<&str>,
     pairs_hint: Option<&str>,
     profile: Option<&ContextProfile>,
@@ -700,10 +700,6 @@ fn light_cleanup_user_message(
     if let Some(pairs) = pairs_hint.filter(|value| !value.trim().is_empty()) {
         user.push_str(&format!("<CUSTOM_VOCABULARY>\n{pairs}\n</CUSTOM_VOCABULARY>\n"));
         user.push_str(&format!("Personal dictionary pairs: {pairs}\n"));
-    } else if let Some(dictionary) = bounded_dictionary(dictionary) {
-        user.push_str(&format!(
-            "<CUSTOM_VOCABULARY>\n{dictionary}\n</CUSTOM_VOCABULARY>\n"
-        ));
     }
     user.push_str(&format!("<TRANSCRIPT>\n{}\n</TRANSCRIPT>\n", intent.content));
     user
@@ -711,7 +707,7 @@ fn light_cleanup_user_message(
 
 fn standard_cleanup_user_message(
     intent: &CleanupIntent,
-    dictionary: &[String],
+    _dictionary: &[String],
     context: Option<&str>,
     policy: Option<&ContextPolicy>,
     profile: Option<&ContextProfile>,
@@ -811,8 +807,6 @@ fn standard_cleanup_user_message(
     }
     if let Some(pairs) = pairs_hint.filter(|value| !value.trim().is_empty()) {
         user.push_str(&format!("\nPersonal dictionary pairs: {pairs}"));
-    } else if let Some(dictionary) = bounded_dictionary(dictionary) {
-        user.push_str(&format!("\nPersonal dictionary: {dictionary}"));
     }
     user.push_str(&format!("\nEffort: {}\n", effort.as_label()));
     user
@@ -2514,6 +2508,42 @@ data: [DONE]
         assert!(!user.contains("artifact_kind:"));
         assert!(!user.contains("formality:"));
         assert!(!user.contains("Effort: light"));
+    }
+
+    #[tokio::test]
+    async fn cleanup_without_hit_pairs_does_not_dump_the_dictionary() {
+        let (endpoint, request) = crate::test_http::spawn_response_with_request_capture(
+            200,
+            "text/event-stream",
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\ndata: [DONE]\n\n"
+                .to_vec(),
+            &[],
+        )
+        .await;
+        let dictionary = (0..32).map(|index| format!("term-{index}")).collect::<Vec<_>>();
+        cleanup_at_with_intent(
+            &endpoint,
+            MODEL,
+            "hello there",
+            "test-key",
+            &dictionary,
+            None,
+            None,
+            Some("auto"),
+            None,
+            None,
+            None,
+            CleanupEffort::Light,
+        )
+        .await
+        .expect("streaming cleanup");
+        let request: serde_json::Value =
+            serde_json::from_slice(&request.await.expect("provider request captured"))
+                .expect("valid JSON request");
+        let user = request["messages"][1]["content"].as_str().unwrap();
+        assert!(!user.contains("term-0"));
+        assert!(!user.contains("Personal dictionary:"));
+        assert!(!user.contains("<CUSTOM_VOCABULARY>"));
     }
 
     #[tokio::test]

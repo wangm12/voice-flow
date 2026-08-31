@@ -54,6 +54,29 @@ const pendingPair = {
   hits: 2,
   promoted: false,
   last_at: "2026-08-22 00:00:00",
+  promote_hits: 3,
+};
+
+const promotedPair = {
+  pair_key: "知呼\u001e知乎",
+  before_surface: "知呼",
+  after_surface: "知乎",
+  hits: 3,
+  promoted: true,
+  last_at: "2026-08-22 00:00:00",
+  promote_hits: 3,
+  pinned: false,
+};
+
+const promotedName = {
+  pair_key: "李铭\u001e李明",
+  before_surface: "李铭",
+  after_surface: "李明",
+  hits: 2,
+  promoted: true,
+  last_at: "2026-08-22 00:00:00",
+  promote_hits: 2,
+  pinned: false,
 };
 
 describe("DictionarySettings", () => {
@@ -79,8 +102,9 @@ describe("DictionarySettings", () => {
 
     const toggle = screen.getByRole("switch", { name: "学习词条" });
     expect(toggle).toHaveAttribute("aria-checked", "true");
-    expect(screen.getByText(/第 3 次静默纠正，或历史\/设置确认/)).toBeInTheDocument();
+    expect(screen.getByText(/默认第 3 次静默纠正，人名第 2 次/)).toBeInTheDocument();
     expect(screen.getByText(/继续打字不会学习/)).toBeInTheDocument();
+    expect(screen.getByText(/还没有学到替换/)).toBeInTheDocument();
 
     fireEvent.click(toggle);
     expect(save).toHaveBeenCalledWith({ dictionary_learn_enabled: false });
@@ -142,6 +166,39 @@ describe("DictionarySettings", () => {
     await waitFor(() =>
       expect(invokeMock).toHaveBeenCalledWith("ignore_learn_pair", {
         pairKey: pendingPair.pair_key,
+      }),
+    );
+  });
+
+  it("shows promoted replacements and can forget them", async () => {
+    invokeMock.mockImplementation(async (command) => {
+      if (command === "list_learn_pairs") return [promotedPair, promotedName];
+      if (command === "list_style_drafts") return [];
+      if (command === "list_pinned_terms") return ["知乎"];
+      return undefined;
+    });
+    render(
+      <DictionarySettings
+        settings={{ ...settings, dictionary: ["知乎", "李明", "手动导入"] }}
+        save={vi.fn()}
+      />,
+    );
+
+    expect(await screen.findByText("知呼 → 知乎")).toBeInTheDocument();
+    const nameRow = screen.getByText("李铭 → 李明").closest("div");
+    expect(nameRow).toHaveTextContent("2 次");
+    expect(nameRow).toHaveTextContent("人名");
+    expect(screen.getByText("手动导入")).toBeInTheDocument();
+    expect(screen.queryByText(/还没有学到替换/)).not.toBeInTheDocument();
+    const wordList = screen.getByText("词条列表").closest("section");
+    expect(wordList).toHaveTextContent("手动导入");
+    expect(wordList).not.toHaveTextContent("知乎");
+    expect(wordList).not.toHaveTextContent("李明");
+
+    fireEvent.click(screen.getAllByRole("button", { name: "忘记" })[0]);
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("undo_learn_pair", {
+        pairKey: promotedPair.pair_key,
       }),
     );
   });

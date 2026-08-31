@@ -1,5 +1,9 @@
 # ASR → AI Cleanup 管线研究（2026-08-25）
 
+> **快照，不是现状。** 写于 2026-08-25。文中「今天 / 默认 gpt-oss / 聊天跳过 LLM / 没有幻觉袋」已过期。
+>
+> 当前代码：默认 cleanup 是 `llama-3.1-8b-instant`；LocalOnly 只剩 Terminal / 表单；prefetch 完成块可进 HUD；多服务商 ASR/LLM；`spoken_revision` 与 post-LLM lexicon 已在。活文档见 [README.md](README.md)、[asr-cleanup-later-and-wont.md](asr-cleanup-later-and-wont.md)。
+
 范围：从麦克风到可粘贴文字的整条链路。对照闭源 Typeless / Wispr Flow / Willow Voice，以及 2026 年一批开源听写项目。目标不是再抄一份功能清单，而是解释**为什么 VoiceFlow 用起来仍对不上**，以及每一层具体该怎么改。
 
 本文基于当前仓库代码（`src-tauri/src/{audio,chunker,asr,prefetch_asr,spoken_punctuation,spoken_layout,lexicon,llm,context,lib}.rs`），以及 2026-08-25 的公开资料。不宣称对 Groq 做过新的 live 评测。

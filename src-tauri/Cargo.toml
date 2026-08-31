@@ -48,6 +48,7 @@ rusqlite = { version = "0.37", features = ["bundled"] }
 enigo = "0.6.1"
 rubato = "0.16"
 chacha20poly1305 = { version = "0.10", features = ["getrandom"] }
+pinyin = "0.10"
 
 [target.'cfg(not(target_os = "macos"))'.dependencies]
 keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }

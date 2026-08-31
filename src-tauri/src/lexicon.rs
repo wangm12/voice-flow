@@ -7,10 +7,39 @@ use crate::store::LearnPairRecord;
 use std::collections::HashSet;
 
 pub const MAX_ASR_PROMPT_TOKENS: usize = 200;
-const ASR_PREFIX: &str = "不要翻译: ";
-const ASR_MIXED_LANGUAGE_SEED: &str = "不要翻译。这个 API 的 latency 太高了。";
+const ASR_NO_TRANSLATE: &str = "不要翻译。";
+const ASR_EMPTY_SEED: &str = "不要翻译。这个 API 的 latency 太高了。";
 const MAX_CLEANUP_PAIRS: usize = 8;
 const MAX_CLEANUP_PAIR_CHARS: usize = 400;
+const MAX_CONTEXT_TERMS: usize = 64;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AsrPromptShape {
+    WhisperTranscript,
+    ContextTerms,
+}
+
+pub fn asr_prompt_shape_for(
+    provider: crate::providers::EngineProvider,
+    model: &str,
+) -> AsrPromptShape {
+    let model = model.to_ascii_lowercase();
+    if model.contains("qwen")
+        || model.contains("sensevoice")
+        || model.contains("fun-asr")
+        || model.contains("funasr")
+        || model.contains("paraformer")
+    {
+        return AsrPromptShape::ContextTerms;
+    }
+    match provider {
+        crate::providers::EngineProvider::Deepgram => AsrPromptShape::ContextTerms,
+        crate::providers::EngineProvider::SiliconFlow if !model.contains("whisper") => {
+            AsrPromptShape::ContextTerms
+        }
+        _ => AsrPromptShape::WhisperTranscript,
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LexiconPair {
@@ -155,9 +184,108 @@ pub fn mapping_for_profile<'a>(
 }
 
 pub fn mapping_allows_learn(mappings: &[AppMapping], profile_id: &str) -> bool {
-    mapping_for_profile(mappings, profile_id)
-        .map(|mapping| mapping.dictionary_learn_enabled)
-        .unwrap_or(true)
+    scene_allows_learn(mappings, profile_id, None, None)
+}
+
+pub fn scene_allows_learn(
+    mappings: &[AppMapping],
+    profile_id: &str,
+    bundle_id: Option<&str>,
+    browser_host: Option<&str>,
+) -> bool {
+    if let Some(mapping) = mapping_for_profile(mappings, profile_id)
+        .or_else(|| mapping_matching_target(mappings, bundle_id, browser_host))
+    {
+        return mapping.dictionary_learn_enabled;
+    }
+    !is_default_learn_off_target(bundle_id, browser_host)
+}
+
+fn mapping_matching_target<'a>(
+    mappings: &'a [AppMapping],
+    bundle_id: Option<&str>,
+    browser_host: Option<&str>,
+) -> Option<&'a AppMapping> {
+    mappings.iter().find(|mapping| {
+        mapping.enabled
+            && (bundle_id.is_some() && mapping.bundle_id.as_deref() == bundle_id
+                || host_is_or_under(
+                    browser_host.and_then(crate::context::normalize_host).as_deref(),
+                    mapping
+                        .browser_host
+                        .as_deref()
+                        .and_then(crate::context::normalize_host)
+                        .as_deref(),
+                ))
+    })
+}
+
+fn is_default_learn_off_target(bundle_id: Option<&str>, browser_host: Option<&str>) -> bool {
+    if bundle_id.is_some_and(is_learn_off_bundle) {
+        return true;
+    }
+    browser_host
+        .and_then(crate::context::normalize_host)
+        .is_some_and(|host| is_learn_off_host(&host))
+}
+
+fn is_learn_off_bundle(bundle_id: &str) -> bool {
+    matches!(
+        bundle_id,
+        "com.1password.1password"
+            | "com.1password.1password-launcher"
+            | "com.agilebits.onepassword7"
+            | "com.agilebits.onepassword-osx"
+            | "com.lastpass.LastPass"
+            | "com.bitwarden.desktop"
+            | "com.apple.Passwords"
+            | "com.dashlane.dashlanephonefinal"
+            | "com.callpod.android_apps.keeper"
+    )
+}
+
+fn is_learn_off_host(host: &str) -> bool {
+    const EXACT: &[&str] = &[
+        "accounts.google.com",
+        "login.microsoftonline.com",
+        "login.live.com",
+    ];
+    const SUFFIX: &[&str] = &[
+        "1password.com",
+        "lastpass.com",
+        "bitwarden.com",
+        "dashlane.com",
+        "keepersecurity.com",
+        "workday.com",
+        "myworkday.com",
+        "okta.com",
+        "auth0.com",
+        "onelogin.com",
+        "rippling.com",
+        "gusto.com",
+        "bamboohr.com",
+        "greenhouse.io",
+        "lever.co",
+        "adp.com",
+        "paylocity.com",
+        "ukg.com",
+        "ultipro.com",
+        "successfactors.com",
+        "paycom.com",
+        "namely.com",
+        "justworks.com",
+    ];
+    EXACT.iter().any(|item| host == *item)
+        || SUFFIX
+            .iter()
+            .any(|parent| host == *parent || host.ends_with(&format!(".{parent}")))
+}
+
+fn host_is_or_under(actual: Option<&str>, expected: Option<&str>) -> bool {
+    match (actual, expected) {
+        (Some(host), Some(parent)) => host == parent || host.ends_with(&format!(".{parent}")),
+        _ => false,
+    }
 }
 
 pub fn apply_lexicon_replacements(
@@ -239,7 +367,9 @@ pub fn apply_promoted_replacements(
     dictionary: &[String],
 ) -> String {
     let replaceable = replaceable_pairs(pairs, dictionary);
-    apply_lexicon_replacements(text, &replaceable, dictionary)
+    let mut rules = replaceable.clone();
+    rules.extend(phonetic_replace_rules(text, &replaceable));
+    apply_lexicon_replacements(text, &rules, dictionary)
 }
 
 pub fn hit_pairs(text: &str, pairs: &[LexiconPair], blocking: &[String]) -> Vec<LexiconPair> {
@@ -251,6 +381,8 @@ pub fn hit_pairs(text: &str, pairs: &[LexiconPair], blocking: &[String]) -> Vec<
         }
         if !independent_surface(text, &pair.before, pairs, blocking)
             && !independent_surface(text, &pair.after, pairs, blocking)
+            && !phonetic_surface_hit(text, pair, pairs)
+            && !latin_fuzzy_hit(text, pair)
         {
             continue;
         }
@@ -376,18 +508,37 @@ pub fn collect_ranked_terms(
 
 pub fn build_asr_prompt(
     dictionary: &[String],
-    _policy: Option<&ContextPolicy>,
+    policy: Option<&ContextPolicy>,
     pairs: &[LearnPairRecord],
     scope: Option<&PromptScope>,
 ) -> Option<String> {
+    build_asr_prompt_shaped(
+        dictionary,
+        policy,
+        pairs,
+        scope,
+        AsrPromptShape::WhisperTranscript,
+    )
+}
+
+pub fn build_asr_prompt_shaped(
+    dictionary: &[String],
+    _policy: Option<&ContextPolicy>,
+    pairs: &[LearnPairRecord],
+    scope: Option<&PromptScope>,
+    shape: AsrPromptShape,
+) -> Option<String> {
     let ranked = collect_ranked_terms(dictionary, pairs, scope);
-    let prefix_tokens = estimate_prompt_tokens(ASR_PREFIX);
-    let seed_tokens = estimate_prompt_tokens(ASR_MIXED_LANGUAGE_SEED);
-    let budget = MAX_ASR_PROMPT_TOKENS
-        .saturating_sub(prefix_tokens)
-        .saturating_sub(seed_tokens.saturating_add(1));
+    let glue_tokens = match shape {
+        AsrPromptShape::WhisperTranscript => estimate_prompt_tokens("今天下午在看文档。不要翻译。"),
+        AsrPromptShape::ContextTerms => 0,
+    };
+    let budget = MAX_ASR_PROMPT_TOKENS.saturating_sub(glue_tokens);
     if budget == 0 {
-        return Some(ASR_MIXED_LANGUAGE_SEED.to_owned());
+        return match shape {
+            AsrPromptShape::WhisperTranscript => Some(ASR_EMPTY_SEED.to_owned()),
+            AsrPromptShape::ContextTerms => None,
+        };
     }
 
     let scene_budget = (budget * 7) / 10;
@@ -431,13 +582,59 @@ pub fn build_asr_prompt(
     });
 
     let hints: Vec<String> = kept.into_iter().map(|term| term.term).collect();
-    if hints.is_empty() {
-        return Some(ASR_MIXED_LANGUAGE_SEED.to_owned());
+    fit_woven_prompt(hints, shape)
+}
+
+fn fit_woven_prompt(mut terms: Vec<String>, shape: AsrPromptShape) -> Option<String> {
+    match shape {
+        AsrPromptShape::WhisperTranscript => {
+            while !terms.is_empty() {
+                let woven = weave_whisper_transcript(&terms);
+                if estimate_prompt_tokens(&woven) <= MAX_ASR_PROMPT_TOKENS {
+                    return Some(woven);
+                }
+                terms.remove(0);
+            }
+            Some(ASR_EMPTY_SEED.to_owned())
+        }
+        AsrPromptShape::ContextTerms => {
+            if terms.len() > MAX_CONTEXT_TERMS {
+                let start = terms.len() - MAX_CONTEXT_TERMS;
+                terms = terms.split_off(start);
+            }
+            while !terms.is_empty() {
+                let woven = terms.join(" ");
+                if estimate_prompt_tokens(&woven) <= MAX_ASR_PROMPT_TOKENS {
+                    return Some(woven);
+                }
+                terms.remove(0);
+            }
+            None
+        }
     }
-    Some(format!(
-        "{ASR_PREFIX}{} {ASR_MIXED_LANGUAGE_SEED}",
-        hints.join(", ")
-    ))
+}
+
+fn weave_whisper_transcript(terms: &[String]) -> String {
+    if terms.is_empty() {
+        return ASR_EMPTY_SEED.to_owned();
+    }
+    let body = match terms {
+        [one] => format!("{one}今天下午在开会。"),
+        [one, two] => format!("{one}今天下午在{two}看文档。"),
+        _ => {
+            let extras = &terms[..terms.len() - 3];
+            let subject = &terms[terms.len() - 3];
+            let place = &terms[terms.len() - 2];
+            let object = &terms[terms.len() - 1];
+            let prefix = if extras.is_empty() {
+                String::new()
+            } else {
+                format!("{}。", extras.join("、"))
+            };
+            format!("{prefix}{subject}今天下午在{place}看{object}。")
+        }
+    };
+    format!("{body}{ASR_NO_TRANSLATE}")
 }
 
 pub fn used_pair_keys(text: &str, pairs: &[LearnPairRecord]) -> Vec<String> {
@@ -550,6 +747,151 @@ fn is_cjk_surface(value: &str) -> bool {
     value.chars().any(is_cjk)
 }
 
+fn phonetic_replace_rules(text: &str, pairs: &[LexiconPair]) -> Vec<LexiconPair> {
+    let mut extra = Vec::new();
+    let mut seen = HashSet::new();
+    for pair in pairs {
+        let window_len = pair.after.chars().count();
+        if !(2..=8).contains(&window_len) || !is_cjk_surface(&pair.after) {
+            continue;
+        }
+        let Some(after_py) = plain_pinyin(&pair.after) else {
+            continue;
+        };
+        let before_py = plain_pinyin(&pair.before);
+        for window in cjk_windows(text, window_len) {
+            if window == pair.after || window == pair.before {
+                continue;
+            }
+            let Some(window_py) = plain_pinyin(&window) else {
+                continue;
+            };
+            if window_py != after_py && before_py.as_deref() != Some(window_py.as_str()) {
+                continue;
+            }
+            if afters_for_pinyin(pairs, &window_py).len() != 1 {
+                continue;
+            }
+            if !seen.insert(window.clone()) {
+                continue;
+            }
+            extra.push(LexiconPair::new(window, pair.after.clone()));
+        }
+    }
+    extra
+}
+
+fn phonetic_surface_hit(text: &str, pair: &LexiconPair, pairs: &[LexiconPair]) -> bool {
+    let window_len = pair.after.chars().count();
+    if !(2..=8).contains(&window_len) || !is_cjk_surface(&pair.after) {
+        return false;
+    }
+    let Some(after_py) = plain_pinyin(&pair.after) else {
+        return false;
+    };
+    let before_py = plain_pinyin(&pair.before);
+    cjk_windows(text, window_len).any(|window| {
+        if window == pair.after || window == pair.before {
+            return false;
+        }
+        let Some(window_py) = plain_pinyin(&window) else {
+            return false;
+        };
+        (window_py == after_py || before_py.as_deref() == Some(window_py.as_str()))
+            && afters_for_pinyin(pairs, &window_py).contains(pair.after.as_str())
+    })
+}
+
+fn latin_fuzzy_hit(text: &str, pair: &LexiconPair) -> bool {
+    let target = if is_latin_surface(&pair.after) {
+        pair.after.as_str()
+    } else if is_latin_surface(&pair.before) {
+        pair.before.as_str()
+    } else {
+        return false;
+    };
+    let target_key = target.to_ascii_lowercase();
+    latin_words(text).any(|word| {
+        let chars = word.chars().count();
+        if chars < 3 {
+            return false;
+        }
+        let key = word.to_ascii_lowercase();
+        key != target_key && levenshtein(&key, &target_key) <= 2
+    })
+}
+
+fn afters_for_pinyin<'a>(pairs: &'a [LexiconPair], pinyin: &str) -> HashSet<&'a str> {
+    pairs
+        .iter()
+        .filter(|pair| {
+            plain_pinyin(&pair.after).as_deref() == Some(pinyin)
+                || plain_pinyin(&pair.before).as_deref() == Some(pinyin)
+        })
+        .map(|pair| pair.after.as_str())
+        .collect()
+}
+
+fn cjk_windows(text: &str, len: usize) -> impl Iterator<Item = String> + '_ {
+    let chars: Vec<char> = text.chars().collect();
+    let mut index = 0;
+    std::iter::from_fn(move || {
+        while index + len <= chars.len() {
+            let start = index;
+            index += 1;
+            if chars[start..start + len].iter().all(|ch| is_cjk(*ch)) {
+                return Some(chars[start..start + len].iter().collect());
+            }
+        }
+        None
+    })
+}
+
+fn latin_words(text: &str) -> impl Iterator<Item = String> + '_ {
+    text.split(|ch: char| !(is_latin_start(ch) || is_latin_cont(ch)))
+        .filter(|word| !word.is_empty())
+        .map(str::to_owned)
+}
+
+fn plain_pinyin(text: &str) -> Option<String> {
+    use pinyin::ToPinyin;
+    let mut out = String::new();
+    for ch in text.chars() {
+        if let Some(py) = ch.to_pinyin() {
+            out.push_str(py.plain());
+        } else if is_cjk(ch) {
+            return None;
+        }
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+fn levenshtein(left: &str, right: &str) -> usize {
+    let left: Vec<char> = left.chars().collect();
+    let right: Vec<char> = right.chars().collect();
+    if left.is_empty() {
+        return right.len();
+    }
+    if right.is_empty() {
+        return left.len();
+    }
+    let mut prev: Vec<usize> = (0..=right.len()).collect();
+    let mut curr = vec![0; right.len() + 1];
+    for (i, left_ch) in left.iter().enumerate() {
+        curr[0] = i + 1;
+        for (j, right_ch) in right.iter().enumerate() {
+            let cost = usize::from(left_ch != right_ch);
+            curr[j + 1] = (prev[j + 1] + 1).min(curr[j] + 1).min(prev[j] + cost);
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    prev[right.len()]
+}
+
 fn cjk_embedded_in_blocker(
     chars: &[char],
     start: usize,
@@ -604,6 +946,7 @@ mod tests {
             pinned: false,
             tombstoned_at: None,
             ignored: false,
+            promote_hits: 0,
         }
     }
 
@@ -681,6 +1024,67 @@ mod tests {
     }
 
     #[test]
+    fn hit_pairs_retrieves_same_pinyin_cjk_that_is_not_the_stored_before() {
+        let pairs = vec![LexiconPair::new("知呼", "知乎")];
+        assert_eq!(
+            hit_pairs("今天去之乎看看吧", &pairs, &[]),
+            vec![LexiconPair::new("知呼", "知乎")]
+        );
+    }
+
+    #[test]
+    fn apply_replaces_unique_same_pinyin_cjk_surface() {
+        let pair = live_pair("知呼", "知乎", "personal_chat", 3);
+        let dictionary = vec!["知乎".into()];
+        assert_eq!(
+            apply_promoted_replacements("今天去之乎看看", &[pair], &dictionary),
+            "今天去知乎看看"
+        );
+    }
+
+    #[test]
+    fn apply_does_not_replace_cjk_with_a_different_pinyin() {
+        let pair = live_pair("知呼", "知乎", "personal_chat", 3);
+        let dictionary = vec!["知乎".into()];
+        assert_eq!(
+            apply_promoted_replacements("之后再去", &[pair], &dictionary),
+            "之后再去"
+        );
+    }
+
+    #[test]
+    fn apply_does_not_replace_when_two_afters_share_the_same_pinyin() {
+        let pairs = [
+            live_pair("医士", "医师", "personal_chat", 3),
+            live_pair("意示", "意识", "personal_chat", 3),
+        ];
+        let dictionary = vec!["医师".into(), "意识".into()];
+        assert_eq!(
+            apply_promoted_replacements("一时再说", &pairs, &dictionary),
+            "一时再说"
+        );
+    }
+
+    #[test]
+    fn hit_pairs_retrieves_latin_within_edit_distance_two() {
+        let pairs = vec![LexiconPair::new("配森", "Python")];
+        assert_eq!(
+            hit_pairs("install pyton now", &pairs, &[]),
+            vec![LexiconPair::new("配森", "Python")]
+        );
+    }
+
+    #[test]
+    fn apply_does_not_fuzzy_replace_latin() {
+        let pair = live_pair("配森", "Python", "personal_chat", 3);
+        let dictionary = vec!["Python".into()];
+        assert_eq!(
+            apply_promoted_replacements("install pyton now", &[pair], &dictionary),
+            "install pyton now"
+        );
+    }
+
+    #[test]
     fn hit_pairs_keep_only_terms_in_this_transcript() {
         let pairs = vec![
             LexiconPair::new("知呼", "知乎"),
@@ -738,6 +1142,99 @@ mod tests {
     }
 
     #[test]
+    fn asr_prompt_shape_follows_the_selected_plug() {
+        assert_eq!(
+            asr_prompt_shape_for(crate::providers::EngineProvider::Groq, "whisper-large-v3-turbo"),
+            AsrPromptShape::WhisperTranscript
+        );
+        assert_eq!(
+            asr_prompt_shape_for(
+                crate::providers::EngineProvider::SiliconFlow,
+                "FunAudioLLM/SenseVoiceSmall"
+            ),
+            AsrPromptShape::ContextTerms
+        );
+        assert_eq!(
+            asr_prompt_shape_for(crate::providers::EngineProvider::Custom, "Qwen3-ASR"),
+            AsrPromptShape::ContextTerms
+        );
+        assert_eq!(
+            asr_prompt_shape_for(crate::providers::EngineProvider::Deepgram, "nova-3"),
+            AsrPromptShape::ContextTerms
+        );
+    }
+
+    #[test]
+    fn asr_prompt_weaves_a_fictional_transcript_not_a_comma_list() {
+        let dictionary = vec!["晓雯".into(), "知乎".into(), "TypeScript".into()];
+        let pairs = vec![
+            live_pair("小文", "晓雯", "work_chat", 1),
+            live_pair("知呼", "知乎", "personal_chat", 5),
+            live_pair("类型脚本", "TypeScript", "personal_chat", 9),
+        ];
+        let scope = PromptScope {
+            family: Some("personal_chat".into()),
+            mapping_id: None,
+            browser_host: None,
+        };
+        let prompt = build_asr_prompt(&dictionary, None, &pairs, Some(&scope)).unwrap();
+        assert!(prompt.contains("晓雯"));
+        assert!(prompt.contains("知乎"));
+        assert!(prompt.contains("TypeScript"));
+        assert!(prompt.contains("不要翻译"));
+        assert!(
+            prompt.contains("今天下午"),
+            "Whisper should continue from a spoken seed, got {prompt}"
+        );
+        assert!(
+            !prompt.contains("不要翻译: "),
+            "comma inventory is not a Whisper prefix: {prompt}"
+        );
+        assert!(
+            !prompt.contains("晓雯, 知乎"),
+            "terms must be woven, not listed: {prompt}"
+        );
+        let xiaowen = prompt.find("晓雯").unwrap();
+        let zhihu = prompt.find("知乎").unwrap();
+        let typescript = prompt.find("TypeScript").unwrap();
+        assert!(xiaowen < zhihu && zhihu < typescript);
+        assert!(prompt.ends_with("不要翻译。"), "{prompt}");
+    }
+
+    #[test]
+    fn asr_prompt_for_context_engines_is_a_term_list() {
+        let dictionary = vec!["晓雯".into(), "知乎".into(), "TypeScript".into()];
+        let pairs = vec![
+            live_pair("小文", "晓雯", "work_chat", 1),
+            live_pair("知呼", "知乎", "personal_chat", 5),
+            live_pair("类型脚本", "TypeScript", "personal_chat", 9),
+        ];
+        let scope = PromptScope {
+            family: Some("personal_chat".into()),
+            mapping_id: None,
+            browser_host: None,
+        };
+        let prompt = build_asr_prompt_shaped(
+            &dictionary,
+            None,
+            &pairs,
+            Some(&scope),
+            AsrPromptShape::ContextTerms,
+        )
+        .unwrap();
+        assert!(prompt.contains("晓雯"));
+        assert!(prompt.contains("知乎"));
+        assert!(prompt.contains("TypeScript"));
+        assert!(
+            !prompt.contains("今天下午"),
+            "Qwen/SenseVoice get terms, not a Whisper story: {prompt}"
+        );
+        let xiaowen = prompt.find("晓雯").unwrap();
+        let typescript = prompt.rfind("TypeScript").unwrap();
+        assert!(xiaowen < typescript);
+    }
+
+    #[test]
     fn asr_prompt_ends_with_mixed_language_seed_and_never_english_only() {
         let policy = ContextPolicy {
             preserve_technical_tokens: true,
@@ -746,14 +1243,14 @@ mod tests {
         let prompt = build_asr_prompt(&["VoiceFlow".into()], Some(&policy), &[], None).unwrap();
         assert!(prompt.contains("不要翻译"));
         assert!(
-            prompt.ends_with("这个 API 的 latency 太高了。"),
+            prompt.contains("VoiceFlow"),
             "Whisper continues from the prompt tail: {prompt}"
         );
         assert!(
             !prompt.ends_with("versions"),
             "English technical clause must not be the decoder prefix: {prompt}"
         );
-        assert!(prompt.contains("VoiceFlow"));
+        assert!(prompt.contains("今天下午") || prompt.ends_with("不要翻译。"));
 
         let empty = build_asr_prompt(&[], None, &[], None).unwrap();
         assert!(empty.ends_with("这个 API 的 latency 太高了。"));
@@ -895,6 +1392,72 @@ mod tests {
             ),
             CleanupRoute::Provider(CleanupEffort::Light)
         );
+    }
+
+    #[test]
+    fn default_learn_off_covers_password_managers_and_hr() {
+        assert!(!scene_allows_learn(
+            &[],
+            "browser.unknown",
+            Some("com.1password.1password"),
+            None
+        ));
+        assert!(!scene_allows_learn(
+            &[],
+            "browser.unknown",
+            Some("com.agilebits.onepassword7"),
+            None
+        ));
+        assert!(!scene_allows_learn(
+            &[],
+            "browser.unknown",
+            None,
+            Some("company.myworkday.com")
+        ));
+        assert!(!scene_allows_learn(
+            &[],
+            "browser.unknown",
+            None,
+            Some("acme.okta.com")
+        ));
+        assert!(!scene_allows_learn(
+            &[],
+            "browser.unknown",
+            None,
+            Some("accounts.google.com")
+        ));
+        assert!(scene_allows_learn(
+            &[],
+            "chat.personal",
+            Some("com.tencent.xinWeChat"),
+            None
+        ));
+        assert!(scene_allows_learn(&[], "chat.personal", None, Some("mail.google.com")));
+    }
+
+    #[test]
+    fn user_mapping_can_reenable_learn_on_a_denied_host() {
+        let mapping = AppMapping {
+            id: "workday".into(),
+            label: "Workday".into(),
+            family: ContextFamily::FormFilling,
+            mode_id: None,
+            bundle_id: None,
+            executable: None,
+            browser_host: Some("company.myworkday.com".into()),
+            style_example_input: None,
+            style_example_output: None,
+            enabled: true,
+            cleanup_effort: None,
+            cleanup_enabled: true,
+            dictionary_learn_enabled: true,
+        };
+        assert!(scene_allows_learn(
+            &[mapping],
+            "user.workday",
+            None,
+            Some("company.myworkday.com")
+        ));
     }
 
     #[test]

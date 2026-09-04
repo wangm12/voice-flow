@@ -135,6 +135,23 @@ export function RecordingSettings({ settings, save }: { settings: Settings; save
           {settings.keep_audio_days === 365 && <p className="px-4 pb-4 text-xs text-warning sm:px-5">{t("较长时间保留可能占用更多磁盘空间。")} </p>}
         </div>
         <div>
+          <SettingsRow
+            title={t("成功听写也保留音频")}
+            description={t("打开后，成功听写也会在本机保存 wav，供以后本地训练。占用磁盘，含你说的话，不会上传。密码框和默认关学习的目标不会保留。")}
+          >
+            <Toggle
+              checked={Boolean(settings.keep_success_audio)}
+              onChange={(checked) => save({ keep_success_audio: checked })}
+              label={t("成功听写也保留音频")}
+            />
+          </SettingsRow>
+          {settings.keep_success_audio && settings.keep_audio_days === 7 && (
+            <p role="note" className="px-4 pb-4 text-xs text-warning sm:px-5">
+              {t("训练建议把音频保留至少 90 天或 1 年。")}
+            </p>
+          )}
+        </div>
+        <div>
           <SettingsRow title={t("保留历史文字")} description={t("自动清理本机历史记录中的原始文字、整理结果和上下文策略。")}>
             <select
               aria-label={t("历史文字保留时间")}

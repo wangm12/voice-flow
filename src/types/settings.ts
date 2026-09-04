@@ -38,6 +38,7 @@ export type Settings = {
   delivery_policy: string;
   keep_audio_days: number;
   keep_history_days: number;
+  keep_success_audio?: boolean;
   onboarded: boolean;
   cleanup_enabled: boolean;
   show_tray_icon: boolean;

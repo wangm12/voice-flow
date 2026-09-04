@@ -74,6 +74,17 @@ export function History({ items, reload, hasMore, loading, onLoadMore, error, on
     }
   };
 
+  const exportGold = async () => {
+    setDataError(null);
+    setDataMessage(null);
+    try {
+      const path = await invoke<string>("export_gold_corpus");
+      setDataMessage(t("已导出音频到：") + path);
+    } catch (reason) {
+      setDataError(t("导出音频失败：") + String(reason));
+    }
+  };
+
   const clearAll = () => {
     setConfirmClear(true);
   };
@@ -92,7 +103,7 @@ export function History({ items, reload, hasMore, loading, onLoadMore, error, on
 
   return (
     <SettingsShell>
-      <SettingsPageHeader title={t("历史")} description={t("每一次表达，都留在这里。")} actions={<div className="flex shrink-0 items-center gap-1"><IconButton label={t("下载")} aria-label={t("下载历史记录")} icon={<Download size={16} aria-hidden="true" />} onClick={() => void exportData()} /><IconButton label={t("清空")} aria-label={t("清空全部数据")} tone="danger" icon={<Eraser size={16} aria-hidden="true" />} disabled={loading} onClick={() => void clearAll()} /></div>} />
+      <SettingsPageHeader title={t("历史")} description={t("每一次表达，都留在这里。")} actions={<div className="flex shrink-0 items-center gap-1"><IconButton label={t("下载")} aria-label={t("下载历史记录")} icon={<Download size={16} aria-hidden="true" />} onClick={() => void exportData()} /><IconButton label={t("导出音频")} aria-label={t("导出保留的音频")} icon={<Download size={16} aria-hidden="true" />} onClick={() => void exportGold()} /><IconButton label={t("清空")} aria-label={t("清空全部数据")} tone="danger" icon={<Eraser size={16} aria-hidden="true" />} disabled={loading} onClick={() => void clearAll()} /></div>} />
       <div className="mt-7 flex flex-wrap items-center justify-between gap-3 border-y border-border py-3">
         <input aria-label={t("搜索历史记录")} value={query} onChange={(event) => setQuery(event.target.value)} placeholder={t("搜索历史…")} className={`h-9 w-64 max-w-full ${radius.control} border ${colors.border} ${colors.bg.elevated} px-3 text-sm text-primary outline-none transition-colors placeholder:text-tertiary focus:border-accent ${focusRingClass}`} />
         <p className="text-xs text-tertiary">{items.length ? `${items.length}${hasMore ? "+" : ""} ${t("条")} · ${hasMore ? t("还有更早记录") : t("已显示全部")}` : ""}</p>
@@ -129,7 +140,7 @@ export function History({ items, reload, hasMore, loading, onLoadMore, error, on
       <ConfirmDialog
         open={confirmClear}
         title={t("清空全部数据")}
-        description={t("这会删除全部历史文字、恢复音频和本地用量，但不会删除 Keychain 中的 API Key，且无法撤销。确定继续吗？")}
+        description={t("这会删除全部历史文字、恢复音频、金标 wav 和本地用量，但不会删除 Keychain 中的 API Key，且无法撤销。确定继续吗？")}
         confirmLabel={t("确定继续")}
         cancelLabel={t("取消")}
         onCancel={() => setConfirmClear(false)}

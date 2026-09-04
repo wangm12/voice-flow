@@ -2335,6 +2335,10 @@ async fn process_short(
         discard_short_recovery_audio(app, recovery_spool.as_deref());
         return Ok(());
     }
+    if recovery_spool.is_none() {
+        recovery_spool =
+            persist_success_gold_audio(app, settings, recording_context, &wav, degraded);
+    }
     if let Ok(dir) = app.path().app_data_dir() {
         if let Err(history_error) = store::insert_history_with_delivery_and_spool_and_cleanup(
             &dir,
@@ -2411,6 +2415,90 @@ async fn process_short(
         .await;
     }
     Ok(())
+}
+
+fn should_keep_success_audio(
+    settings: &store::Settings,
+    recording_context: &context::ContextSnapshot,
+) -> bool {
+    if !settings.keep_success_audio || settings.keep_audio_days == 0 {
+        return false;
+    }
+    if recording_context.target_guard.secure_input {
+        return false;
+    }
+    lexicon::scene_allows_learn(
+        &settings.context_mappings,
+        &recording_context.profile.id,
+        recording_context.target_guard.bundle_id.as_deref(),
+        recording_context.target_guard.browser_host.as_deref(),
+    )
+}
+
+fn persist_gold_wav(dir: &Path, wav: &[u8]) -> Option<std::path::PathBuf> {
+    let sequence = SHORT_RECOVERY_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let file_name = format!("gold-{}-{sequence}.wav", chrono_like_id());
+    match store::write_gold_file(dir, &file_name, wav) {
+        Ok(path) => Some(path),
+        Err(error) => {
+            log::warn!("failed to keep success audio for later review: {error}");
+            None
+        }
+    }
+}
+
+fn persist_success_gold_audio(
+    app: &tauri::AppHandle,
+    settings: &store::Settings,
+    recording_context: &context::ContextSnapshot,
+    wav: &[u8],
+    degraded: bool,
+) -> Option<std::path::PathBuf> {
+    if degraded || !should_keep_success_audio(settings, recording_context) {
+        return None;
+    }
+    let dir = match app.path().app_data_dir() {
+        Ok(dir) => dir,
+        Err(error) => {
+            log::warn!("failed to resolve app data directory for gold audio: {error}");
+            return None;
+        }
+    };
+    persist_gold_wav(&dir, wav)
+}
+
+fn persist_long_success_gold(
+    app: &tauri::AppHandle,
+    settings: &store::Settings,
+    recording_context: &context::ContextSnapshot,
+    session_dir: Option<&Path>,
+) -> Option<std::path::PathBuf> {
+    if !should_keep_success_audio(settings, recording_context) {
+        return None;
+    }
+    let session_dir = session_dir?;
+    let recovery = match store::rebuild_spool_recovery(session_dir) {
+        Ok(recovery) => recovery,
+        Err(error) => {
+            log::warn!("failed to rebuild success audio for gold keep: {error}");
+            return None;
+        }
+    };
+    let wav = match store::read_spool_file(&recovery.audio_path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            log::warn!("failed to read rebuilt success audio for gold keep: {error}");
+            return None;
+        }
+    };
+    let dir = match app.path().app_data_dir() {
+        Ok(dir) => dir,
+        Err(error) => {
+            log::warn!("failed to resolve app data directory for gold audio: {error}");
+            return None;
+        }
+    };
+    persist_gold_wav(&dir, &wav)
 }
 
 fn persist_short_recovery_audio(app: &tauri::AppHandle, wav: &[u8]) -> Option<std::path::PathBuf> {
@@ -2990,7 +3078,14 @@ async fn process_long(
     } else {
         None
     };
-    let degraded_spool = degraded_spool_path.as_deref();
+    let success_gold_path = if degraded {
+        None
+    } else {
+        persist_long_success_gold(app, settings, recording_context, dir.as_deref())
+    };
+    let insert_spool = degraded_spool_path
+        .as_deref()
+        .or(success_gold_path.as_deref());
     if let Ok(app_data_dir) = app.path().app_data_dir() {
         if let Err(history_error) = store::insert_history_with_delivery_and_spool_and_cleanup(
             &app_data_dir,
@@ -3011,7 +3106,7 @@ async fn process_long(
             delivery_method,
             fallback_reason,
             recording_context,
-            degraded_spool,
+            insert_spool,
             cleanup_status,
         ) {
             log::warn!("failed to record long dictation history: {history_error}");
@@ -3872,6 +3967,11 @@ async fn apply_settings(
             log::warn!("history retention cleanup after settings change failed: {error}");
         }
     }
+    if prev.keep_audio_days != settings.keep_audio_days {
+        if let Err(error) = store::purge_gold_audio(&dir, settings.keep_audio_days) {
+            log::warn!("gold audio retention cleanup after settings change failed: {error}");
+        }
+    }
     let asr_provider_changed = prev.asr_provider != settings.asr_provider
         || prev.asr_base_url != settings.asr_base_url
         || prev.custom_base_url != settings.custom_base_url
@@ -3943,6 +4043,7 @@ async fn update_settings_patch(
         "delivery_policy",
         "keep_audio_days",
         "keep_history_days",
+        "keep_success_audio",
         "onboarded",
         "cleanup_enabled",
         "cleanup_model",
@@ -4263,6 +4364,9 @@ fn recover_spool_into_history(
     if let Err(error) = store::purge_history(&dir, keep_history_days) {
         log::warn!("history retention cleanup failed: {error}");
     }
+    if let Err(error) = store::purge_gold_audio(&dir, keep_audio_days) {
+        log::warn!("gold audio retention cleanup failed: {error}");
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -4551,6 +4655,9 @@ pub fn run() {
             get_latency_metrics,
             history_commands::get_history,
             history_commands::export_history,
+            history_commands::export_gold_corpus,
+            history_commands::get_history_audio,
+            history_commands::save_verbatim,
             clear_all_data,
             history_commands::retry_dictation,
             probe_engine_draft,
@@ -5605,5 +5712,28 @@ mod tests {
             super::spoken_translation_target(&translating),
             Some("en")
         );
+    }
+
+    #[test]
+    fn success_audio_keep_is_opt_in_and_skips_secure_or_learn_off_targets() {
+        let mut settings = store::Settings::default();
+        let mut context = context::ContextSnapshot::general();
+        assert!(!settings.keep_success_audio);
+        assert!(!super::should_keep_success_audio(&settings, &context));
+
+        settings.keep_success_audio = true;
+        settings.keep_audio_days = 7;
+        assert!(super::should_keep_success_audio(&settings, &context));
+
+        context.target_guard.secure_input = true;
+        assert!(!super::should_keep_success_audio(&settings, &context));
+
+        context.target_guard.secure_input = false;
+        context.target_guard.bundle_id = Some("com.1password.1password".into());
+        assert!(!super::should_keep_success_audio(&settings, &context));
+
+        context.target_guard.bundle_id = None;
+        settings.keep_audio_days = 0;
+        assert!(!super::should_keep_success_audio(&settings, &context));
     }
 }

@@ -13,8 +13,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
-pub const SETTINGS_SCHEMA_VERSION: u32 = 17;
-const HISTORY_SCHEMA_VERSION: i32 = 8;
+pub const SETTINGS_SCHEMA_VERSION: u32 = 18;
+const HISTORY_SCHEMA_VERSION: i32 = 9;
 const LEARN_PAIRS_PENDING_CAP: i64 = 256;
 
 fn ensure_private_dir(path: &Path) -> anyhow::Result<()> {
@@ -87,6 +87,8 @@ pub struct Settings {
     pub delivery_policy: String,
     pub keep_audio_days: u64,
     pub keep_history_days: u64,
+    #[serde(default)]
+    pub keep_success_audio: bool,
     pub onboarded: bool,
     pub cleanup_enabled: bool,
     #[serde(default = "default_cleanup_model")]
@@ -209,6 +211,7 @@ impl Default for Settings {
             delivery_policy: default_delivery_policy(),
             keep_audio_days: 7,
             keep_history_days: 365,
+            keep_success_audio: false,
             onboarded: false,
             cleanup_enabled: true,
             cleanup_model: default_cleanup_model(),
@@ -913,6 +916,7 @@ pub struct SettingsView {
     pub delivery_policy: String,
     pub keep_audio_days: u64,
     pub keep_history_days: u64,
+    pub keep_success_audio: bool,
     pub onboarded: bool,
     pub cleanup_enabled: bool,
     pub show_tray_icon: bool,
@@ -981,6 +985,7 @@ impl From<&Settings> for SettingsView {
             delivery_policy: settings.delivery_policy.clone(),
             keep_audio_days: settings.keep_audio_days,
             keep_history_days: settings.keep_history_days,
+            keep_success_audio: settings.keep_success_audio,
             onboarded: settings.onboarded,
             cleanup_enabled: settings.cleanup_enabled,
             show_tray_icon: settings.show_tray_icon,
@@ -1015,6 +1020,9 @@ pub struct HistoryItem {
     pub context_profile_id: Option<String>,
     pub retryable: bool,
     pub revision_count: usize,
+    pub has_audio: bool,
+    pub verbatim_text: Option<String>,
+    pub verbatim_reviewed: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1047,6 +1055,7 @@ pub const ASR_DAILY_LIMIT: i64 = 2000;
 #[allow(dead_code)]
 pub const LLM_DAILY_LIMIT: i64 = 1000;
 pub const MAX_SPOOL_BYTES: u64 = 256 * 1024 * 1024;
+pub const MAX_GOLD_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const SPOOL_MANIFEST_VERSION: u32 = 1;
 const AUDIO_SAMPLE_RATE: usize = 16_000;
 const SPOOL_ENVELOPE_MAGIC: &[u8; 8] = b"VFSPOOL1";
@@ -1088,6 +1097,18 @@ fn is_safe_spool_path(root: &Path, path: &Path) -> bool {
         && !path
             .components()
             .any(|component| matches!(component, Component::ParentDir))
+}
+
+fn gold_root(dir: &Path) -> PathBuf {
+    dir.join("gold")
+}
+
+fn is_safe_managed_audio_path(dir: &Path, path: &Path) -> bool {
+    is_safe_spool_path(&dir.join("spool"), path) || is_safe_spool_path(&gold_root(dir), path)
+}
+
+fn managed_audio_exists(dir: &Path, path: &Path) -> bool {
+    is_safe_managed_audio_path(dir, path) && path.is_file()
 }
 
 fn spool_size(path: &Path) -> anyhow::Result<u64> {
@@ -1253,6 +1274,50 @@ fn write_spool_file_internal(
         .parent()
         .ok_or_else(|| anyhow::anyhow!("invalid spool path"))?;
     ensure_private_dir(parent)?;
+    write_atomic_bytes(&path, &stored_bytes)?;
+    Ok(path)
+}
+
+/// Persist a successful-dictation WAV under `gold/`. Quota is independent of
+/// the recovery spool. Full quota returns an error; callers must not fail the
+/// dictation itself.
+pub fn write_gold_file(dir: &Path, file_name: &str, bytes: &[u8]) -> anyhow::Result<PathBuf> {
+    let relative = Path::new(file_name);
+    if file_name.is_empty()
+        || relative
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        anyhow::bail!("invalid gold audio path");
+    }
+    let encryption_enabled = spool_encryption_enabled();
+    let encryption_key = if encryption_enabled {
+        Some(history_encryption_key_for_write()?)
+    } else {
+        None
+    };
+    let root = gold_root(dir);
+    let path = root.join(relative);
+    let stored_bytes = if encryption_enabled {
+        let key = encryption_key
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("history encryption key is unavailable"))?;
+        encrypt_spool_bytes(bytes, key)?
+    } else {
+        bytes.to_vec()
+    };
+    let current = spool_size(&root)?;
+    let existing = fs::symlink_metadata(&path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    if current
+        .saturating_sub(existing)
+        .saturating_add(stored_bytes.len() as u64)
+        > MAX_GOLD_BYTES
+    {
+        anyhow::bail!("gold audio quota exceeded");
+    }
+    ensure_private_dir(&root)?;
     write_atomic_bytes(&path, &stored_bytes)?;
     Ok(path)
 }
@@ -1856,6 +1921,8 @@ fn schema(c: &Connection) -> anyhow::Result<()> {
     ensure_column(c, "context_browser_host", "TEXT")?;
     ensure_column(c, "context_native_bundle", "TEXT")?;
     ensure_column(c, "cleanup_status", "TEXT")?;
+    ensure_column(c, "verbatim_text", "TEXT")?;
+    ensure_column(c, "verbatim_reviewed", "INTEGER NOT NULL DEFAULT 0")?;
     c.execute_batch(
         "CREATE TABLE IF NOT EXISTS learn_pairs (
             pair_key TEXT PRIMARY KEY,
@@ -2215,34 +2282,33 @@ pub fn get_history_page(
     query: Option<&str>,
 ) -> anyhow::Result<HistoryPage> {
     let c = open_history(dir)?;
-    let spool_root = dir.join("spool");
     let limit = limit.clamp(1, 100);
     let fetch_limit = limit + 1;
     let search_pattern = query
         .filter(|value| !value.is_empty())
         .map(|value| format!("%{}%", escape_history_search(value)));
     let sql = match (before_id.is_some(), search_pattern.is_some()) {
-        (true, true) => "SELECT id,created_at,COALESCE(raw_text,''),COALESCE((SELECT final_text FROM dictation_revisions WHERE dictation_id=dictations.id ORDER BY revision_id DESC LIMIT 1),final_text,''),COALESCE(duration_secs,0),COALESCE(degraded,0),degraded_reason,COALESCE(status,'ok'),delivery_method,fallback_reason,context_profile_id,raw_audio_path,COALESCE(cleanup_status,'unknown'),(SELECT COUNT(*) FROM dictation_revisions WHERE dictation_id=dictations.id) FROM dictations WHERE id < ? AND (COALESCE(raw_text,'') LIKE ? ESCAPE '\\' OR COALESCE((SELECT final_text FROM dictation_revisions WHERE dictation_id=dictations.id ORDER BY revision_id DESC LIMIT 1),final_text,'') LIKE ? ESCAPE '\\') ORDER BY id DESC LIMIT ?",
-        (true, false) => "SELECT id,created_at,COALESCE(raw_text,''),COALESCE((SELECT final_text FROM dictation_revisions WHERE dictation_id=dictations.id ORDER BY revision_id DESC LIMIT 1),final_text,''),COALESCE(duration_secs,0),COALESCE(degraded,0),degraded_reason,COALESCE(status,'ok'),delivery_method,fallback_reason,context_profile_id,raw_audio_path,COALESCE(cleanup_status,'unknown'),(SELECT COUNT(*) FROM dictation_revisions WHERE dictation_id=dictations.id) FROM dictations WHERE id < ? ORDER BY id DESC LIMIT ?",
-        (false, true) => "SELECT id,created_at,COALESCE(raw_text,''),COALESCE((SELECT final_text FROM dictation_revisions WHERE dictation_id=dictations.id ORDER BY revision_id DESC LIMIT 1),final_text,''),COALESCE(duration_secs,0),COALESCE(degraded,0),degraded_reason,COALESCE(status,'ok'),delivery_method,fallback_reason,context_profile_id,raw_audio_path,COALESCE(cleanup_status,'unknown'),(SELECT COUNT(*) FROM dictation_revisions WHERE dictation_id=dictations.id) FROM dictations WHERE (COALESCE(raw_text,'') LIKE ? ESCAPE '\\' OR COALESCE((SELECT final_text FROM dictation_revisions WHERE dictation_id=dictations.id ORDER BY revision_id DESC LIMIT 1),final_text,'') LIKE ? ESCAPE '\\') ORDER BY id DESC LIMIT ?",
-        (false, false) => "SELECT id,created_at,COALESCE(raw_text,''),COALESCE((SELECT final_text FROM dictation_revisions WHERE dictation_id=dictations.id ORDER BY revision_id DESC LIMIT 1),final_text,''),COALESCE(duration_secs,0),COALESCE(degraded,0),degraded_reason,COALESCE(status,'ok'),delivery_method,fallback_reason,context_profile_id,raw_audio_path,COALESCE(cleanup_status,'unknown'),(SELECT COUNT(*) FROM dictation_revisions WHERE dictation_id=dictations.id) FROM dictations ORDER BY id DESC LIMIT ?",
+        (true, true) => "SELECT id,created_at,COALESCE(raw_text,''),COALESCE((SELECT final_text FROM dictation_revisions WHERE dictation_id=dictations.id ORDER BY revision_id DESC LIMIT 1),final_text,''),COALESCE(duration_secs,0),COALESCE(degraded,0),degraded_reason,COALESCE(status,'ok'),delivery_method,fallback_reason,context_profile_id,raw_audio_path,COALESCE(cleanup_status,'unknown'),(SELECT COUNT(*) FROM dictation_revisions WHERE dictation_id=dictations.id),verbatim_text,COALESCE(verbatim_reviewed,0) FROM dictations WHERE id < ? AND (COALESCE(raw_text,'') LIKE ? ESCAPE '\\' OR COALESCE((SELECT final_text FROM dictation_revisions WHERE dictation_id=dictations.id ORDER BY revision_id DESC LIMIT 1),final_text,'') LIKE ? ESCAPE '\\') ORDER BY id DESC LIMIT ?",
+        (true, false) => "SELECT id,created_at,COALESCE(raw_text,''),COALESCE((SELECT final_text FROM dictation_revisions WHERE dictation_id=dictations.id ORDER BY revision_id DESC LIMIT 1),final_text,''),COALESCE(duration_secs,0),COALESCE(degraded,0),degraded_reason,COALESCE(status,'ok'),delivery_method,fallback_reason,context_profile_id,raw_audio_path,COALESCE(cleanup_status,'unknown'),(SELECT COUNT(*) FROM dictation_revisions WHERE dictation_id=dictations.id),verbatim_text,COALESCE(verbatim_reviewed,0) FROM dictations WHERE id < ? ORDER BY id DESC LIMIT ?",
+        (false, true) => "SELECT id,created_at,COALESCE(raw_text,''),COALESCE((SELECT final_text FROM dictation_revisions WHERE dictation_id=dictations.id ORDER BY revision_id DESC LIMIT 1),final_text,''),COALESCE(duration_secs,0),COALESCE(degraded,0),degraded_reason,COALESCE(status,'ok'),delivery_method,fallback_reason,context_profile_id,raw_audio_path,COALESCE(cleanup_status,'unknown'),(SELECT COUNT(*) FROM dictation_revisions WHERE dictation_id=dictations.id),verbatim_text,COALESCE(verbatim_reviewed,0) FROM dictations WHERE (COALESCE(raw_text,'') LIKE ? ESCAPE '\\' OR COALESCE((SELECT final_text FROM dictation_revisions WHERE dictation_id=dictations.id ORDER BY revision_id DESC LIMIT 1),final_text,'') LIKE ? ESCAPE '\\') ORDER BY id DESC LIMIT ?",
+        (false, false) => "SELECT id,created_at,COALESCE(raw_text,''),COALESCE((SELECT final_text FROM dictation_revisions WHERE dictation_id=dictations.id ORDER BY revision_id DESC LIMIT 1),final_text,''),COALESCE(duration_secs,0),COALESCE(degraded,0),degraded_reason,COALESCE(status,'ok'),delivery_method,fallback_reason,context_profile_id,raw_audio_path,COALESCE(cleanup_status,'unknown'),(SELECT COUNT(*) FROM dictation_revisions WHERE dictation_id=dictations.id),verbatim_text,COALESCE(verbatim_reviewed,0) FROM dictations ORDER BY id DESC LIMIT ?",
     };
     let mut s = c.prepare(sql)?;
     let mut items = match (before_id, search_pattern.as_deref()) {
         (Some(before_id), Some(pattern)) => s
             .query_map(
                 params![before_id, pattern, pattern, fetch_limit],
-                history_row(&spool_root),
+                history_row(dir),
             )?
             .collect::<Result<Vec<_>, _>>()?,
         (Some(before_id), None) => s
-            .query_map(params![before_id, fetch_limit], history_row(&spool_root))?
+            .query_map(params![before_id, fetch_limit], history_row(dir))?
             .collect::<Result<Vec<_>, _>>()?,
         (None, Some(pattern)) => s
-            .query_map(params![pattern, pattern, fetch_limit], history_row(&spool_root))?
+            .query_map(params![pattern, pattern, fetch_limit], history_row(dir))?
             .collect::<Result<Vec<_>, _>>()?,
         (None, None) => s
-            .query_map([fetch_limit], history_row(&spool_root))?
+            .query_map([fetch_limit], history_row(dir))?
             .collect::<Result<Vec<_>, _>>()?,
     };
     let has_more = items.len() > limit as usize;
@@ -2258,14 +2324,25 @@ fn escape_history_search(value: &str) -> String {
 }
 
 fn history_row<'a>(
-    spool_root: &'a Path,
+    dir: &'a Path,
 ) -> impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<HistoryItem> + 'a {
     move |r| {
         let raw_audio_path: Option<String> = r.get(11)?;
-        let retryable = raw_audio_path.as_deref().is_some_and(|path| {
-            let path = Path::new(path);
-            is_safe_spool_path(spool_root, path) && path.is_file()
+        let status: String = r.get(7)?;
+        let has_audio = raw_audio_path.as_deref().is_some_and(|path| {
+            managed_audio_exists(dir, Path::new(path))
         });
+        let retryable = has_audio && matches!(status.as_str(), "failed" | "degraded");
+        let verbatim_text: Option<String> = r
+            .get::<_, Option<String>>(14)?
+            .and_then(|value| {
+                let trimmed = value.trim();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(value)
+                }
+            });
         Ok(HistoryItem {
             id: r.get(0)?,
             created_at: r.get(1)?,
@@ -2275,12 +2352,15 @@ fn history_row<'a>(
             duration: r.get(4)?,
             degraded: r.get::<_, i32>(5)? != 0,
             degraded_reason: r.get(6)?,
-            status: r.get(7)?,
+            status,
             delivery_method: r.get(8)?,
             fallback_reason: r.get(9)?,
             context_profile_id: r.get(10)?,
             retryable,
             revision_count: r.get::<_, i64>(13)? as usize,
+            has_audio,
+            verbatim_text,
+            verbatim_reviewed: r.get::<_, i32>(15)? != 0,
         })
     }
 }
@@ -2655,6 +2735,10 @@ pub fn clear_all_data(dir: &Path) -> anyhow::Result<()> {
         fs::remove_dir_all(&spool)?;
     }
     ensure_private_dir(&spool)?;
+    let gold = gold_root(dir);
+    if gold.exists() {
+        fs::remove_dir_all(&gold)?;
+    }
     Ok(())
 }
 
@@ -2891,20 +2975,200 @@ pub fn record_recovered_history(dir: &Path, recovery: &RecoveredSpool) -> anyhow
 }
 
 pub fn remove_spool_artifact(dir: &Path, path: &Path) {
-    let root = dir.join("spool");
-    if !is_safe_spool_path(&root, path) {
+    let spool_root = dir.join("spool");
+    if is_safe_spool_path(&spool_root, path) {
+        if path.is_dir() {
+            let _ = fs::remove_dir_all(path);
+            return;
+        }
+        let _ = fs::remove_file(path);
+        if let Some(parent) = path.parent() {
+            if parent != spool_root && parent.join("manifest.json").is_file() {
+                let _ = fs::remove_dir_all(parent);
+            }
+        }
         return;
     }
-    if path.is_dir() {
-        let _ = fs::remove_dir_all(path);
-        return;
+    if is_safe_spool_path(&gold_root(dir), path) && path.is_file() {
+        let _ = fs::remove_file(path);
     }
-    let _ = fs::remove_file(path);
-    if let Some(parent) = path.parent() {
-        if parent != root && parent.join("manifest.json").is_file() {
-            let _ = fs::remove_dir_all(parent);
+}
+
+pub fn history_audio_bytes(dir: &Path, id: i64) -> anyhow::Result<Vec<u8>> {
+    let c = open_history(dir)?;
+    let path: Option<String> = c
+        .query_row(
+            "SELECT raw_audio_path FROM dictations WHERE id=?",
+            [id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten();
+    let path = path.ok_or_else(|| anyhow::anyhow!("history audio is no longer available"))?;
+    let path = Path::new(&path);
+    if !managed_audio_exists(dir, path) {
+        anyhow::bail!("history audio is no longer available");
+    }
+    read_spool_file(path)
+}
+
+pub fn save_verbatim(dir: &Path, id: i64, text: &str, reviewed: bool) -> anyhow::Result<()> {
+    let trimmed = text.trim();
+    if reviewed && trimmed.is_empty() {
+        anyhow::bail!("reviewed verbatim text cannot be empty");
+    }
+    let stored = if reviewed || !trimmed.is_empty() {
+        Some(trimmed)
+    } else {
+        None
+    };
+    let c = open_history(dir)?;
+    c.execute(
+        "UPDATE dictations SET verbatim_text=?, verbatim_reviewed=? WHERE id=?",
+        params![stored, reviewed as i32, id],
+    )?;
+    if c.changes() == 0 {
+        anyhow::bail!("history record was not found");
+    }
+    Ok(())
+}
+
+pub fn qwen_gold_language_tag(language: &str) -> &'static str {
+    match language {
+        "zh" => "Chinese",
+        "en" => "English",
+        _ => "None",
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GoldExport {
+    pub directory: String,
+    pub jsonl_path: String,
+    pub count: usize,
+}
+
+pub fn export_gold_corpus(
+    dir: &Path,
+    downloads: &Path,
+    language: &str,
+) -> anyhow::Result<GoldExport> {
+    if downloads.as_os_str().is_empty() || !downloads.is_absolute() {
+        anyhow::bail!("invalid export path");
+    }
+    let c = open_history(dir)?;
+    let mut statement = c.prepare(
+        "SELECT id, COALESCE(raw_text,''), raw_audio_path FROM dictations WHERE raw_audio_path IS NOT NULL ORDER BY id ASC",
+    )?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(statement);
+    drop(c);
+
+    let language_tag = qwen_gold_language_tag(language);
+    let export_dir = downloads.join(format!("voiceflow-gold-{}", now_ms()));
+    ensure_private_dir(&export_dir)?;
+    let jsonl_path = export_dir.join("corpus.jsonl");
+    let mut jsonl = String::new();
+    let mut count = 0usize;
+    let gold = gold_root(dir);
+    for (id, raw_text, audio_path) in rows {
+        let text = raw_text.trim();
+        if text.is_empty() {
+            continue;
+        }
+        let Some(audio_path) = audio_path else {
+            continue;
+        };
+        let source = Path::new(&audio_path);
+        if !is_safe_spool_path(&gold, source) || !source.is_file() {
+            continue;
+        }
+        let wav = match read_spool_file(source) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                log::warn!("skipping gold export for history {id}: {error}");
+                continue;
+            }
+        };
+        count += 1;
+        let file_name = format!("utt{count:04}.wav");
+        let dest = export_dir.join(&file_name);
+        write_atomic_bytes(&dest, &wav)?;
+        let line = serde_json::json!({
+            "audio": dest.to_string_lossy(),
+            "text": format!("language {language_tag}<asr_text>{text}"),
+        });
+        jsonl.push_str(&line.to_string());
+        jsonl.push('\n');
+    }
+    if count == 0 {
+        let _ = fs::remove_dir_all(&export_dir);
+        anyhow::bail!("没有可导出的训练音频。");
+    }
+    write_atomic_bytes(&jsonl_path, jsonl.as_bytes())?;
+    Ok(GoldExport {
+        directory: export_dir.to_string_lossy().into_owned(),
+        jsonl_path: jsonl_path.to_string_lossy().into_owned(),
+        count,
+    })
+}
+
+pub fn purge_gold_audio(dir: &Path, keep_audio_days: u64) -> anyhow::Result<usize> {
+    let root = gold_root(dir);
+    if !root.exists() {
+        return Ok(0);
+    }
+    let max_age = keep_audio_days.saturating_mul(86_400);
+    let mut deleted = 0usize;
+    for entry in fs::read_dir(&root)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let age = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .map(|elapsed| elapsed.as_secs())
+            .unwrap_or(max_age.saturating_add(1));
+        if keep_audio_days == 0 || age > max_age {
+            if fs::remove_file(&path).is_ok() {
+                deleted += 1;
+            }
         }
     }
+    let c = open_history(dir)?;
+    let mut statement =
+        c.prepare("SELECT id, raw_audio_path FROM dictations WHERE raw_audio_path IS NOT NULL")?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(statement);
+    for (id, path) in rows.into_iter() {
+        let Some(path) = path else {
+            continue;
+        };
+        let path = Path::new(&path);
+        if is_safe_spool_path(&root, path) && !path.is_file() {
+            c.execute(
+                "UPDATE dictations SET raw_audio_path=NULL WHERE id=?",
+                [id],
+            )?;
+        }
+    }
+    Ok(deleted)
 }
 pub fn history_text(dir: &Path, id: i64) -> anyhow::Result<String> {
     let c = open_history(dir)?;
@@ -2954,11 +3218,7 @@ pub fn delete_history(dir: &Path, id: i64) -> anyhow::Result<()> {
         .flatten();
     c.execute("DELETE FROM dictations WHERE id=?", [id])?;
     if let Some(spool) = spool {
-        let spool_root = dir.join("spool");
-        let path = Path::new(&spool);
-        if is_safe_spool_path(&spool_root, path) {
-            remove_spool_artifact(dir, path);
-        }
+        remove_spool_artifact(dir, Path::new(&spool));
     }
     Ok(())
 }
@@ -3017,6 +3277,7 @@ mod tests {
         assert!(settings.dictionary_learn_enabled);
         assert!(settings.input_device.is_empty());
         assert_eq!(settings.input_gain, 1.0);
+        assert!(!settings.keep_success_audio);
         assert!(settings.asr_base_url.is_empty());
         assert!(settings.asr_api_key.is_empty());
         assert!(settings
@@ -4306,6 +4567,7 @@ mod tests {
         let dir = temp_dir("clear-all-data");
         insert_history(&dir, "raw", "final", 2.0, false).unwrap();
         write_spool_file(&dir, Path::new("recovery.wav"), b"audio").unwrap();
+        write_gold_file(&dir, "kept.wav", b"gold").unwrap();
 
         clear_all_data(&dir).unwrap();
 
@@ -4334,6 +4596,7 @@ mod tests {
                 & 0o777;
             assert_eq!(mode, 0o700);
         }
+        assert!(!dir.join("gold").exists());
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -4540,6 +4803,143 @@ mod tests {
 
         assert!(recover_spool(&dir, 7).unwrap().is_empty());
         assert!(!session.exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn success_gold_audio_is_playable_but_not_retryable() {
+        let dir = temp_dir("gold-success");
+        let path = write_gold_file(&dir, "12.wav", b"RIFF").unwrap();
+        let context = crate::context::ContextSnapshot::general();
+        insert_history_with_delivery_and_spool(
+            &dir,
+            "raw spoken",
+            "Cleaned text.",
+            1.0,
+            false,
+            None,
+            "ok",
+            "paste",
+            None,
+            &context,
+            Some(&path),
+        )
+        .unwrap();
+        let item = get_history(&dir, 1).unwrap().remove(0);
+        assert!(item.has_audio);
+        assert!(!item.retryable);
+        assert!(!item.verbatim_reviewed);
+        assert_eq!(item.verbatim_text, None);
+        assert!(failed_spool(&dir, item.id).unwrap().is_none());
+        assert_eq!(history_audio_bytes(&dir, item.id).unwrap(), b"RIFF");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn write_gold_file_rejects_parent_dir_escape() {
+        let dir = temp_dir("gold-escape");
+        assert!(write_gold_file(&dir, "../escape.wav", b"nope").is_err());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn save_verbatim_marks_reviewed_and_can_unreview() {
+        let dir = temp_dir("verbatim-review");
+        insert_history(&dir, "draft words", "Cleaned.", 1.0, false).unwrap();
+        let id = get_history(&dir, 1).unwrap()[0].id;
+        save_verbatim(&dir, id, "  mouth words  ", true).unwrap();
+        let item = get_history(&dir, 1).unwrap().remove(0);
+        assert_eq!(item.verbatim_text.as_deref(), Some("mouth words"));
+        assert!(item.verbatim_reviewed);
+        save_verbatim(&dir, id, "", false).unwrap();
+        let item = get_history(&dir, 1).unwrap().remove(0);
+        assert_eq!(item.verbatim_text, None);
+        assert!(!item.verbatim_reviewed);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn purge_and_delete_remove_gold_files() {
+        let dir = temp_dir("gold-purge");
+        let path = write_gold_file(&dir, "kept.wav", b"gold").unwrap();
+        let context = crate::context::ContextSnapshot::general();
+        insert_history_with_delivery_and_spool(
+            &dir,
+            "raw",
+            "final",
+            1.0,
+            false,
+            None,
+            "ok",
+            "paste",
+            None,
+            &context,
+            Some(&path),
+        )
+        .unwrap();
+        let id = get_history(&dir, 1).unwrap()[0].id;
+        assert_eq!(purge_gold_audio(&dir, 0).unwrap(), 1);
+        assert!(!path.exists());
+        assert!(!get_history(&dir, 1).unwrap()[0].has_audio);
+
+        let path = write_gold_file(&dir, "again.wav", b"gold").unwrap();
+        let c = open_history(&dir).unwrap();
+        c.execute(
+            "UPDATE dictations SET raw_audio_path=? WHERE id=?",
+            params![path.to_string_lossy(), id],
+        )
+        .unwrap();
+        drop(c);
+        delete_history(&dir, id).unwrap();
+        assert!(!path.exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn export_gold_corpus_exports_gold_audio_with_raw_text() {
+        let dir = temp_dir("gold-export");
+        let downloads = dir.join("downloads");
+        std::fs::create_dir_all(&downloads).unwrap();
+        let gold = write_gold_file(&dir, "kept.wav", b"RIFFGOLD").unwrap();
+        let spool = write_spool_file(&dir, Path::new("failed-short.wav"), b"SPOOL").unwrap();
+        let context = crate::context::ContextSnapshot::general();
+        insert_history_with_delivery_and_spool(
+            &dir,
+            "spoken words",
+            "Cleaned words.",
+            1.0,
+            false,
+            None,
+            "ok",
+            "paste",
+            None,
+            &context,
+            Some(&gold),
+        )
+        .unwrap();
+        insert_history_with_delivery_and_spool(
+            &dir,
+            "failed raw",
+            "",
+            1.0,
+            false,
+            Some("asr_failed"),
+            "failed",
+            "none",
+            None,
+            &context,
+            Some(&spool),
+        )
+        .unwrap();
+
+        let exported = export_gold_corpus(&dir, &downloads, "zh").unwrap();
+        assert_eq!(exported.count, 1);
+        let wav = std::fs::read(Path::new(&exported.directory).join("utt0001.wav")).unwrap();
+        assert_eq!(wav, b"RIFFGOLD");
+        let jsonl = std::fs::read_to_string(&exported.jsonl_path).unwrap();
+        assert!(jsonl.contains("language Chinese<asr_text>spoken words"));
+        assert!(!jsonl.contains("Cleaned words"));
+        assert!(!jsonl.contains("failed raw"));
         let _ = std::fs::remove_dir_all(dir);
     }
 }

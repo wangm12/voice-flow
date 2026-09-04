@@ -16,12 +16,16 @@ VoiceFlow 的录音只在用户主动触发 dictation 后开始。音频会发�
 
 - history SQLite：原始转录、整理结果、状态、delivery/fallback 信息和 context policy；
 - recovery spool：失败或中断录音的 WAV/F32 分块；
+- gold wav：仅在设置中主动打开「成功听写也保留音频」后，成功听写才会写入本机 `gold/`（默认关；配额 4 GB；满则停止新写，不挡听写）；
 - usage：当天的请求数量和录音时长；
 - settings：不包含明文 API Key；每个服务商的密钥单独存在 macOS Keychain。
+
+成功听写的 gold 音频默认不保存。打开后仍跳过密码框 / Secure Input，以及 1Password、HR、SSO 等预设关学习的目标。音频只留在本机，不会上传，也不会写进普通 History JSON 导出。删除单条 History 或清空全部数据时，对应 gold wav 一并删除。导出训练音频时附带识别草稿，不使用 AI 整理后的 `final_text`，也不会自动写入词典学习。
 
 当前默认保留策略：
 
 - recovery audio：7 天；
+- gold audio（仅 opt-in）：沿用同一保留天数；训练建议至少 90 天或 1 年；
 - history text：365 天；
 - usage：按天存储，清空全部数据会一并删除。
 
@@ -31,9 +35,10 @@ VoiceFlow 的录音只在用户主动触发 dictation 后开始。音频会发�
 
 History 页面提供：
 
-- 导出全部 history JSON；
-- 删除单条记录；
-- 清空全部 history、recovery audio 和本地 usage。
+- 导出全部 history JSON（不含音频）；
+- 导出保留的训练音频：wav + Qwen JSONL（识别草稿，不含整理结果）；
+- 删除单条记录（含对应 gold wav）；
+- 清空全部 history、recovery audio、gold wav 和本地 usage。
 
 清空操作不可撤销。删除 API Key 是独立操作，会从 Keychain 删除凭据并将 onboarding 标记为未完成。
 
@@ -45,4 +50,4 @@ VoiceFlow 当前不收集 telemetry、广告标识或用户行为分析。网络
 
 VoiceFlow 的本地 SQLite 和 recovery audio 默认依赖 macOS 用户账户和应用数据目录的文件权限；应用数据目录、SQLite 文件和 recovery spool 文件会尽量使用 `0700`/`0600` 权限。默认不启用应用层加密，因而共享 macOS 用户账户或未加密备份仍可能暴露本地转录。
 
-应用层 recovery spool 加密是显式 opt-in 的发布能力：构建时启用 `encrypted-spool` feature，并设置 `VOICEFLOW_ENCRYPT_SPOOL=1` 后，新写入的 recovery 音频会使用 XChaCha20-Poly1305 加密，32-byte 密钥单独保存在 Keychain 的 `history-key` 项中。若 Keychain 不可用，VoiceFlow 会 fail-closed，不会把密文当作 WAV 发送，也不会退回写明文；旧的明文 recovery 文件仍可读取。History SQLite 当前仍未做应用层加密。
+应用层 recovery spool 加密是显式 opt-in 的发布能力：构建时启用 `encrypted-spool` feature，并设置 `VOICEFLOW_ENCRYPT_SPOOL=1` 后，新写入的 recovery 音频和 gold wav 会使用 XChaCha20-Poly1305 加密，32-byte 密钥单独保存在 Keychain 的 `history-key` 项中。若 Keychain 不可用，VoiceFlow 会 fail-closed，不会把密文当作 WAV 发送，也不会退回写明文；旧的明文 recovery 文件仍可读取。History SQLite 当前仍未做应用层加密。

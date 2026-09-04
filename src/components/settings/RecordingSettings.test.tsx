@@ -119,4 +119,26 @@ describe("RecordingSettings", () => {
       screen.getByText("增益大于 1 时，过大的声音会被压限，避免削波。说话很轻再提高。"),
     ).toBeTruthy();
   });
+
+  it("keeps success-audio off by default and warns when retention is still 7 days", () => {
+    const save = vi.fn();
+    const { rerender } = render(<RecordingSettings settings={settings} save={save} />);
+    const toggle = screen.getByRole("switch", { name: "成功听写也保留音频" });
+    expect(toggle.getAttribute("aria-checked")).toBe("false");
+    expect(screen.queryByText("训练建议把音频保留至少 90 天或 1 年。")).toBeNull();
+
+    fireEvent.click(toggle);
+    expect(save).toHaveBeenCalledWith({ keep_success_audio: true });
+
+    rerender(<RecordingSettings settings={{ ...settings, keep_success_audio: true }} save={save} />);
+    expect(screen.getByText("训练建议把音频保留至少 90 天或 1 年。")).toBeTruthy();
+
+    rerender(
+      <RecordingSettings
+        settings={{ ...settings, keep_success_audio: true, keep_audio_days: 90 }}
+        save={save}
+      />,
+    );
+    expect(screen.queryByText("训练建议把音频保留至少 90 天或 1 年。")).toBeNull();
+  });
 });

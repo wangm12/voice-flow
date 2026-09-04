@@ -377,6 +377,16 @@ describe("History", () => {
     expect(screen.queryByText("可能的词典建议")).not.toBeInTheDocument();
   });
 
+  it("exports saved audio through the native command", async () => {
+    invokeMock.mockResolvedValue("/Users/test/Downloads/voiceflow-gold");
+    render(<History items={[item]} reload={vi.fn()} hasMore={false} loading={false} onLoadMore={vi.fn()} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "导出保留的音频" }));
+
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("export_gold_corpus"));
+    expect(await screen.findByRole("status")).toHaveTextContent("已导出音频到：/Users/test/Downloads/voiceflow-gold");
+  });
+
   it("writes a confirmed candidate into the dictionary", async () => {
     invokeMock.mockImplementation(async (command) => {
       if (command === "suggest_dictionary_entries") return [pythonSuggestion];

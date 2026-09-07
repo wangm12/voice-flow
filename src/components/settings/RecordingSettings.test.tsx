@@ -13,7 +13,7 @@ vi.mock("../HotkeyRecorder", () => ({
       activationMode?: "tap" | "double_tap" | "hybrid",
       options?: { persist?: boolean },
     ) => void;
-    captureTarget?: "dictation" | "selected_action";
+    captureTarget?: "dictation" | "selected_action" | "screen_action";
   }) => (
     <>
     <button
@@ -101,6 +101,14 @@ describe("RecordingSettings", () => {
 
     rerender(<RecordingSettings settings={settings} save={save} />);
     expect(screen.queryByText("微信 / 微信输入法可能会占用 Fn 键，VoiceFlow 可能收不到这个快捷键。")).toBeNull();
+  });
+
+  it("records an off-by-default look-at-screen hotkey", () => {
+    const save = vi.fn();
+    render(<RecordingSettings settings={settings} save={save} />);
+    expect(screen.getByText("未设置快捷键，看屏幕不会触发")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "recapture-screen_action" }));
+    expect(save).toHaveBeenCalledWith({ screen_action_hotkey: "Command+Shift+Space" }, { persist: true });
   });
 
   it("saves input gain from the recognition control", () => {

@@ -169,7 +169,7 @@ export const VoicePill = memo(function VoicePill({
     state,
     t,
     state === "rate_limited" ? retryRemaining : retryAfterSecs,
-    { fallbackReason, selectedActionState, contextLabel: visibleContext },
+    { fallbackReason, selectedActionState, contextLabel: visibleContext, phase },
   );
   const showingPartial = false;
   const wideCaption = voicePillCaptionNeedsWide(state, { fallbackReason });

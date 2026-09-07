@@ -157,6 +157,21 @@ describe("VoicePill", () => {
     expect(document.querySelector(".voice-pill-caption")).toHaveTextContent("Cursor · 代码");
   });
 
+  it("renders 精确重打中 when the cascade accurate phase is in flight", () => {
+    render(
+      <VoicePill
+        state="processing"
+        phase="cascade_accurate"
+        contextLabel={null}
+        selectedActionState={null}
+        waveformLevels={[]}
+        progress={0.5}
+        reduced
+      />,
+    );
+    expect(document.querySelector(".voice-pill-caption")).toHaveTextContent("精确重打中");
+  });
+
   it("shows the context label during processing", () => {
     render(
       <VoicePill

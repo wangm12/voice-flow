@@ -1,6 +1,6 @@
 # ASR / Cleanup：以后再做，以及明确不做
 
-更新：2026-08-30
+更新：2026-09-03
 
 来源：竞品与开源研究（Typeless / Wispr / Willow / MacWhisper / Daisy / yw-transcribe / VoiceInk / Handy / TypeWhisper）。质量标杆是 **Typeless 的中英混合听写 + 整理**。2026-08-30 周期的引擎插头和 cleanup prompt 已经落地；下面两张表仍是边界，避免下次会话又把 Agent / 真流式 / 会议笔记塞进听写 PR。
 
@@ -81,7 +81,7 @@ Daisy 本地 Whisper：VAD 前保留 500ms，避免吃掉句首。以后若做�
 | 不做 | 为什么 | 常见伪装 |
 |---|---|---|
 | Typeless / Wispr **Ask Anything** 联网动作 | 听写会变成 Agent，延迟和安全模型都变 | 「让 LLM 搜一下再贴」 |
-| **截图进 LLM**（Wispr `screenshot` / screen assistant） | 隐私；窗口里有邮件和密钥 | 「看看屏幕上的字好整理」 |
+| **默认听写截图进 LLM**（Wispr `screenshot` / 松手整理） | 默认听写零截屏；窗口里有邮件和密钥 | 「看看屏幕上的字好整理」若绑到 dictate stop |
 | **会议录音** / 日历自动开录（MacWhisper / Wispr Notetaker） | 另一条产品，不是松手粘贴 | 「顺手录 Zoom」 |
 | Daisy **`run_shell_command`** | 任意命令 = 不可接受的桌面权限 | 「工具失败就用 shell 兜底」 |
 | 在 Tauri 里 **嵌 Python FunASR** | 体积、崩溃、模型下载都变成我们的运行时 | 「本机中文准就要带 Python」 |
@@ -92,6 +92,8 @@ Daisy 本地 Whisper：VAD 前保留 500ms，避免吃掉句首。以后若做�
 | 抄 **GPLv3** 源码（VoiceInk / TypeWhisper / FluidVoice） | 许可证 | 「把他们的 prompt 文件贴进来」 |
 
 Daisy 的 Notes / Calendar AppleScript 可以以后做；**不要**带着 `run_shell_command`、Firecrawl、Control Center 刮「勿扰」一起做。
+
+**看屏幕例外（已收窄，不是默认听写）：** 用户自己录了 `screen_action_hotkey`、配了 `vision_model`、预览确认之后，才允许把**一张当前窗口图**发给用户配置的 vision provider。默认听写、Phase 2 本机 OCR、会议录音、Spark、生图仍然 **never**。目标变了只复制；取消立刻丢掉内存 PNG。
 
 ---
 

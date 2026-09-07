@@ -27,6 +27,25 @@ function isUnknownAppName(app: string): boolean {
   );
 }
 
+const HUD_INTENSITY_LABELS: Record<string, string> = {
+  off: "关",
+  light: "轻",
+  standard: "中",
+  heavy: "重",
+};
+
+export function formatHudIntensityLabel(
+  app: string | null | undefined,
+  intensity: "off" | "light" | "standard" | "heavy" | null | undefined,
+  translate: (source: string) => string = (source) => source,
+): string | null {
+  if (intensity == null || !(intensity in HUD_INTENSITY_LABELS)) {
+    return null;
+  }
+  const appLabel = app && !isUnknownAppName(app) ? app.trim() : translate("未知应用");
+  return `${appLabel} · ${translate(HUD_INTENSITY_LABELS[intensity])}`;
+}
+
 export function formatHudContextLabel(
   app: string | null | undefined,
   style: string | null | undefined,

@@ -1,11 +1,11 @@
 import { invoke } from "@tauri-apps/api/core";
-import { Check, Mic, RefreshCw, TextCursorInput } from "lucide-react";
+import { Check, Mic, Monitor, RefreshCw, TextCursorInput } from "lucide-react";
 import type React from "react";
 import { useI18n } from "../lib/i18n";
 import { secondaryButtonClass } from "../lib/theme";
 import { SettingsGroup, SettingsPageHeader, SettingsRow, SettingsShell, SettingsStatus } from "./SettingsLayout";
 
-export type Permissions = { microphone: boolean; microphone_status?: string; accessibility: boolean };
+export type Permissions = { microphone: boolean; microphone_status?: string; accessibility: boolean; screen_recording?: boolean };
 
 export function PermissionsSettings({ permissions, onRefresh }: { permissions: Permissions | null; onRefresh: () => Promise<void> }) {
   const { t } = useI18n();
@@ -22,6 +22,10 @@ export function PermissionsSettings({ permissions, onRefresh }: { permissions: P
     if (!granted) {
       await invoke("open_privacy_settings", { pane: "accessibility" });
     }
+    await onRefresh();
+  };
+  const requestScreenRecording = async () => {
+    await invoke("open_privacy_settings", { pane: "screen" });
     await onRefresh();
   };
 
@@ -46,6 +50,15 @@ export function PermissionsSettings({ permissions, onRefresh }: { permissions: P
           ok={permissions?.accessibility ?? false}
           actionLabel={t("开启权限")}
           onAction={() => void requestAccessibility()}
+        />
+        <PermissionSettingRow
+          icon={<Monitor size={18} strokeWidth={1.5} aria-hidden="true" />}
+          title={t("屏幕录制")}
+          description={t("仅在你打开窗口文字识别时，用于读取当前听写窗口上的字。默认听写不会截屏。")}
+          status={permissions ? (permissions.screen_recording ? t("已允许") : t("未开启，可稍后设置")) : t("检测中…")}
+          ok={permissions?.screen_recording ?? false}
+          actionLabel={t("打开设置")}
+          onAction={() => void requestScreenRecording()}
         />
       </SettingsGroup>
       <p className="mt-4 max-w-2xl text-xs leading-5 text-tertiary">{t("自动粘贴权限只用于将结果写入当前光标；未开启时，VoiceFlow 会保留文字并复制到剪贴板。")} </p>

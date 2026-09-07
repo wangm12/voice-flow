@@ -2,7 +2,7 @@
 
 ## 数据流
 
-VoiceFlow 的录音只在用户主动触发 dictation 后开始。音频会发送到用户配置的 ASR 服务（默认为 Groq Whisper；也可改为 OpenAI、Deepgram、SiliconFlow SenseVoice、本机 Whisper，或兼容 OpenAI `/audio/transcriptions` 的端点，例如本机 FunASR / 阿里云百炼 Qwen3-ASR）。启用 AI 文字整理时，转录文本会发送到用户配置的整理服务（默认为 Groq；也可改为 OpenAI、SiliconFlow、DeepSeek、Anthropic、Ollama 或自定义端点）。转写和润色可以不是同一家。VoiceFlow 不发送 raw URL、窗口标题、PID 或目标 identity 给 LLM。用户主动启用 selected-text action 时，当前选中文本和语音操作会作为该次整理请求的输入；它不会写入普通 History，也不会被 VoiceFlow 自动保存为个性化数据。
+VoiceFlow 的录音只在用户主动触发 dictation 后开始。音频会发送到用户配置的 ASR 服务（默认为 Groq Whisper；也可改为 OpenAI、Deepgram、SiliconFlow SenseVoice、本机 Whisper，或兼容 OpenAI `/audio/transcriptions` 的端点，例如本机 FunASR / 阿里云百炼 Qwen3-ASR）。启用 AI 文字整理时，转录文本会发送到用户配置的整理服务（默认为 Groq；也可改为 OpenAI、SiliconFlow、DeepSeek、Anthropic、Ollama 或自定义端点）。转写和润色可以不是同一家。VoiceFlow 不发送 raw URL、窗口标题、PID 或目标 identity 给 LLM。用户主动启用 selected-text action 时，当前选中文本和语音操作会作为该次整理请求的输入；它不会写入普通 History，也不会被 VoiceFlow 自动保存为个性化数据。用户主动录了「看屏幕」快捷键并配置视觉模型后，VoiceFlow 只会在该热键触发时截取当前窗口一张内存 PNG，连同语音指令发给用户配置的 vision provider，并先弹出预览（替换 / 只复制 / 取消）。默认听写不会截屏，也不会把窗口图发给 LLM。取消或关闭预览会丢掉图片；History 不保存截图。会议录音、Spark 和生图仍不提供。
 
 上下文检测在本机完成。浏览器 host 检测只有在用户开启浏览器访问后才会执行；本地只保留必要的 host/profile 信息和不可逆的目标 fingerprint，用于防止录音期间误粘贴到变化后的窗口或 Tab。
 

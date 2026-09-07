@@ -41,6 +41,16 @@ export type Settings = {
   keep_success_audio?: boolean;
   onboarded: boolean;
   cleanup_enabled: boolean;
+  cleanup_intensity?: "off" | "light" | "standard" | "heavy";
+  accurate_asr_provider?: ProviderId;
+  accurate_asr_model?: string;
+  accurate_asr_base_url?: string;
+  cascade_timeout_ms?: number;
+  cascade_proper_noun_threshold?: number;
+  window_ocr_enabled?: boolean;
+  screen_action_hotkey?: string;
+  vision_provider?: string;
+  vision_model?: string;
   show_tray_icon: boolean;
   hotkey: string;
   activation_mode: string;

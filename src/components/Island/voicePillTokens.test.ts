@@ -156,6 +156,21 @@ describe("voice pill state tokens", () => {
     ).toBe("正在准备改写");
   });
 
+  it("surfaces cascade accurate status from the processing phase", () => {
+    expect(
+      pillCaption("processing", undefined, undefined, { phase: "cascade_accurate" }),
+    ).toBe("精确重打中");
+    expect(
+      pillCaption("processing", undefined, undefined, {
+        phase: "cascade_accurate",
+        contextLabel: "微信 · 重",
+      }),
+    ).toBe("微信 · 重 · 精确重打中");
+    expect(
+      pillCaption("processing", undefined, undefined, { phase: "asr" }),
+    ).toBeNull();
+  });
+
   it("does not surface chunk counts or truncation on the HUD", () => {
     expect(
       pillCaption("processing", undefined, undefined, {

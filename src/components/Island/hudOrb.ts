@@ -17,6 +17,7 @@ export type DictationState =
 export type ProcessingPhase =
   | "finalizing_audio"
   | "asr"
+  | "cascade_accurate"
   | "cleanup"
   | "delivery"
   | "waiting_retry"

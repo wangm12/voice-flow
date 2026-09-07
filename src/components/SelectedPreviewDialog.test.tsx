@@ -2,7 +2,7 @@ import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { useState } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { flushAnimationFrames } from "../test/flushRaf";
-import { SelectedPreviewDialog } from "./SelectedPreviewDialog";
+import { SelectedPreviewDialog, type SelectedActionPreview } from "./SelectedPreviewDialog";
 
 afterEach(() => {
   cleanup();
@@ -149,6 +149,38 @@ describe("SelectedPreviewDialog", () => {
 
     fireEvent.click(screen.getByRole("dialog"));
     expect(onCancel).not.toHaveBeenCalled();
+  });
+
+  it("shows look-at-screen actions and drops the thumbnail on cancel", async () => {
+    function Harness() {
+      const [preview, setPreview] = useState<SelectedActionPreview | null>({
+        kind: "screen",
+        selected_text: "",
+        transcript: "把标题改短",
+        final_text: "周五开会",
+        thumbnail: "data:image/png;base64,aaa",
+        replace_allowed: true,
+      });
+      if (!preview) return null;
+      return (
+        <SelectedPreviewDialog
+          preview={preview}
+          draft={preview.final_text}
+          onDraftChange={() => undefined}
+          onCancel={() => setPreview(null)}
+          onCopy={() => undefined}
+          onConfirm={() => undefined}
+        />
+      );
+    }
+
+    render(<Harness />);
+    expect(screen.getByRole("img", { name: "窗口截图" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "替换原文" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "只复制" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "取消" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "取消" }));
+    expect(screen.queryByRole("img", { name: "窗口截图" })).not.toBeInTheDocument();
   });
 
   it("marks the settings chrome inert while the preview is open", async () => {

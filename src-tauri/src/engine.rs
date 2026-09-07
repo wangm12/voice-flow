@@ -439,6 +439,7 @@ pub async fn probe_engine_draft(draft: &EngineDraft, stored: &Settings) -> Probe
                 None,
                 None,
                 CleanupEffort::Light,
+                None,
             )
             .await
             {

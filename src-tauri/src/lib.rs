@@ -1,5 +1,6 @@
 mod asr;
 mod audio;
+mod cascade;
 mod chunker;
 #[cfg(test)]
 mod cleanup_corpus;
@@ -25,7 +26,10 @@ mod permissions;
 mod providers;
 mod queue;
 mod prefetch_asr;
+mod screen_text;
+mod screen_action;
 mod selected_action;
+mod window_capture;
 mod silence;
 mod snippets;
 mod spoken_layout;
@@ -88,6 +92,8 @@ pub(crate) struct AppState {
     prefetch_asr: Mutex<Option<prefetch_asr::PrefetchAsrSession>>,
     selected_action: Mutex<Option<SelectedActionSession>>,
     selected_preview: Mutex<Option<SelectedActionPreview>>,
+    screen_action: Mutex<Option<screen_action::ScreenActionSession>>,
+    screen_preview: Mutex<Option<screen_action::ScreenActionPreview>>,
     undo: Mutex<Option<UndoTransaction>>,
     operation_lease: Mutex<OperationLease>,
     asr_provider: Mutex<Arc<dyn asr::AsrProvider>>,
@@ -100,6 +106,7 @@ pub(crate) struct AppState {
     pending_recorder_cancel: Mutex<Option<u64>>,
     onboarding_test_mode: Mutex<bool>,
     onboarding_selected_text: Mutex<Option<String>>,
+    screen_text: Mutex<Option<screen_text::ScreenTextContext>>,
     _instance_lock: instance::InstanceLock,
 }
 
@@ -375,6 +382,29 @@ fn attach_context_fields(payload: &mut serde_json::Value, context: &context::Con
     payload["context_style"] = serde_json::json!(context::hud_style_id(context));
 }
 
+fn attach_cleanup_intensity(
+    app: &tauri::AppHandle,
+    payload: &mut serde_json::Value,
+    context: &context::ContextSnapshot,
+) {
+    let Some(state) = app.try_state::<AppState>() else {
+        return;
+    };
+    let settings = lock_recover(&state.settings);
+    let mapping = lexicon::mapping_for_profile(&settings.context_mappings, &context.profile.id);
+    let global = llm::CleanupIntensity::parse(&settings.cleanup_intensity)
+        .unwrap_or(llm::CleanupIntensity::Heavy);
+    let resolved = mapping
+        .and_then(|item| item.cleanup_intensity)
+        .or_else(|| {
+            mapping
+                .and_then(|item| item.cleanup_effort)
+                .and_then(llm::CleanupEffort::as_intensity)
+        })
+        .unwrap_or(global);
+    payload["cleanup_intensity"] = serde_json::json!(resolved.as_str());
+}
+
 fn emit_selected_action_state(app: &tauri::AppHandle, state: &str) {
     let _ = app.emit(
         "selected-action://state",
@@ -485,6 +515,12 @@ fn emit_state_with_delivery_and_input_device(
     });
     if let Some(context) = context {
         attach_context_fields(&mut payload, context);
+        attach_cleanup_intensity(app, &mut payload, context);
+    }
+    if let Some(app_state) = app.try_state::<AppState>() {
+        if let Some(count) = session_screen_text(&app_state).map(|ctx| ctx.proper_noun_count()) {
+            payload["screen_token_count"] = serde_json::json!(count);
+        }
     }
     payload["delivery_method"] = serde_json::json!(delivery_method);
     payload["phase"] = serde_json::json!(match state {
@@ -554,6 +590,7 @@ fn emit_processing_phase(
     });
     if let Some(context) = context {
         attach_context_fields(&mut payload, context);
+        attach_cleanup_intensity(app, &mut payload, context);
     }
     sync_island_mouse(app);
     island_window::set_has_wide_caption(app, false);
@@ -990,6 +1027,127 @@ async fn start_selected_action_with_feedback(
     .await
 }
 
+pub(crate) async fn start_screen_action_with_feedback(
+    app: &tauri::AppHandle,
+    state: &AppState,
+) -> Result<(), String> {
+    screen_action::clear_screen_preview(state);
+    clear_selected_preview(state);
+    let Some(session_generation) = claim_selected_action_entry(state).await else {
+        return Ok(());
+    };
+    hotkey::register_cancel(app);
+
+    let perms = permissions::check();
+    if !perms.accessibility || !perms.screen_recording {
+        if !perms.accessibility {
+            let _ = permissions::open_privacy_settings("accessibility");
+        }
+        if !perms.screen_recording {
+            let _ = permissions::open_privacy_settings("screen");
+        }
+        let message = screen_action::ScreenActionError::PermissionsMissing.message().to_owned();
+        if !reset_selected_action_start(app, state, session_generation).await {
+            return Ok(());
+        }
+        show_selected_action_error(app, state, &message, "permissions_required").await;
+        return Err(message);
+    }
+
+    let settings = lock_recover(&state.settings).clone();
+    if !settings.vision_configured() {
+        let message = screen_action::VISION_UNSET_MESSAGE.to_owned();
+        if !reset_selected_action_start(app, state, session_generation).await {
+            return Ok(());
+        }
+        show_selected_action_error(app, state, &message, "vision_unset").await;
+        return Err(message);
+    }
+
+    refresh_context_snapshot(app, state).await;
+    if lock_recover(&state.manager).session_generation != session_generation {
+        let _ = reset_starting(state, session_generation);
+        return Ok(());
+    }
+    let snapshot = lock_recover(&state.context).snapshot.clone();
+    let window_id = snapshot.target_guard.window_id;
+    let captured = match tokio::task::spawn_blocking(move || {
+        screen_action::begin_screen_capture(
+            &settings.vision_provider,
+            &settings.vision_model,
+            true,
+            true,
+            || window_capture::capture_for_vision(window_id),
+        )
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(error) => {
+            let message = format!("window capture worker failed: {error}");
+            if !reset_selected_action_start(app, state, session_generation).await {
+                return Ok(());
+            }
+            show_selected_action_error(app, state, &message, "capture_failed").await;
+            return Err(message);
+        }
+    };
+    let image = match captured {
+        Ok(image) => image,
+        Err(error) => {
+            let message = error.message().to_owned();
+            if !reset_selected_action_start(app, state, session_generation).await {
+                return Ok(());
+            }
+            show_selected_action_error(app, state, &message, "capture_failed").await;
+            return Err(message);
+        }
+    };
+
+    let claimed = {
+        let _gate = state.hotkey_gate.lock().await;
+        let manager = lock_recover(&state.manager);
+        if manager.phase != Phase::Starting
+            || manager.session_generation != session_generation
+            || manager.cancellation.is_cancelled()
+        {
+            false
+        } else {
+            screen_action::store_screen_action(
+                state,
+                screen_action::ScreenActionSession {
+                    image,
+                    target_guard: snapshot.target_guard,
+                },
+            );
+            true
+        }
+    };
+    if !claimed {
+        let _ = reset_selected_action_start(app, state, session_generation).await;
+        screen_action::clear_screen_action(state);
+        return Ok(());
+    }
+
+    match start_claimed(app, state, session_generation).await {
+        Ok(()) => {
+            if lock_recover(&state.manager).phase == Phase::Recording {
+                emit_selected_action_state(app, "listening");
+                Ok(())
+            } else {
+                screen_action::clear_screen_action(state);
+                emit_selected_action_state(app, "idle");
+                Ok(())
+            }
+        }
+        Err(error) => {
+            screen_action::clear_screen_action(state);
+            fail_for_generation(app, state, error.message.clone(), error.generation).await;
+            Err(error.message)
+        }
+    }
+}
+
 pub(crate) async fn start_claimed(
     app: &tauri::AppHandle,
     state: &AppState,
@@ -1006,6 +1164,7 @@ pub(crate) async fn start_claimed(
         return Ok(());
     }
     state.gate.set_session_generation(session_generation);
+    store_session_screen_text(state, None);
     clear_selected_preview(state);
     // Escape must be available during recorder setup as well as recording.
     hotkey::register_cancel(app);
@@ -1110,6 +1269,15 @@ pub(crate) async fn start_claimed(
     // narrows the race where the user changes apps while cpal is initializing.
     refresh_context_snapshot(app, state).await;
     let recording_context = lock_recover(&state.context).snapshot.clone();
+    let screen_family = recording_context.profile.family;
+    let screen_guard = recording_context.target_guard.clone();
+    let screen = tokio::task::spawn_blocking(move || capture_screen_text(screen_family, &screen_guard))
+        .await
+        .unwrap_or_else(|_| screen_text::ScreenTextContext {
+            family: recording_context.profile.family,
+            ..screen_text::ScreenTextContext::default()
+        });
+    store_session_screen_text(state, Some(screen));
 
     // Phase 3 (sync, short lock): commit the recording state.
     let (start_was_cancelled, pending_stop) = {
@@ -1142,12 +1310,14 @@ pub(crate) async fn start_claimed(
         };
         let asr_language =
             asr::normalize_language(Some(settings_snapshot.language.as_str())).map(str::to_owned);
+        let screen = session_screen_text(state);
         let asr_prompt = asr_prompt_for_snapshot(
             app.path().app_data_dir().ok().as_deref(),
             &settings_snapshot.dictionary,
             &recording_context,
             settings_snapshot.asr_provider,
             &settings_snapshot.asr_model,
+            screen.as_ref(),
         );
         // This is silent batch prefetch of completed files, not streaming ASR.
         let prefetch_session = prefetch_asr::PrefetchAsrSession::spawn(
@@ -1199,7 +1369,9 @@ fn reset_starting(state: &AppState, expected_generation: u64) -> Option<u64> {
     }
     let generation = dictation::reset_starting_manager(&mut manager);
     drop(manager);
+    store_session_screen_text(state, None);
     clear_selected_action(state);
+    screen_action::clear_screen_action(state);
     release_operation(state, OperationLease::LiveDictation);
     was_starting.then_some(generation)
 }
@@ -1248,6 +1420,7 @@ async fn handle_audio_error(app: &tauri::AppHandle, state: &AppState, message: S
         return;
     };
     clear_selected_action(state);
+    screen_action::clear_screen_action(state);
     // The audio engine marks the active session as device_failed, so canceling
     // it here preserves durable chunks for recovery instead of deleting them.
     cancel_prefetch_asr(state);
@@ -1331,6 +1504,9 @@ async fn paste_text(
         expected_target,
         recording_context,
     );
+    if outcome.verified {
+        dictionary_learn::maybe_seed_screen_lexicon(app, state, recording_context);
+    }
     Ok(outcome)
 }
 
@@ -1516,6 +1692,16 @@ pub(crate) async fn stop_claimed(
         recording_context,
     } = claim;
     state.gate.set_session_generation(session_generation);
+    let window_ocr_enabled = lock_recover(&state.settings).window_ocr_enabled;
+    let recording_ok = permissions::screen_recording_is_allowed();
+    let screen_ctx = recording_context.clone();
+    let resolved = tokio::task::spawn_blocking(move || {
+        refresh_screen_text_for_stop(window_ocr_enabled, recording_ok, &screen_ctx)
+    })
+    .await
+    .ok()
+    .flatten();
+    store_session_screen_text(state, resolved);
 
     // Finalizing a long recording can take noticeable time. Show processing
     // immediately so the HUD never appears to ignore the user's stop press.
@@ -1627,6 +1813,20 @@ pub(crate) async fn stop_claimed(
             &settings,
             &recording_context,
             selected_action,
+            session_generation,
+            cancellation,
+            stop_to_insert,
+        )
+        .await;
+    }
+    if let Some(screen_session) = screen_action::take_screen_action(state) {
+        return process_screen_action(
+            app,
+            state,
+            wav,
+            &settings,
+            &recording_context,
+            screen_session,
             session_generation,
             cancellation,
             stop_to_insert,
@@ -1787,6 +1987,7 @@ async fn process_selected_action(
             recording_context,
             settings.asr_provider,
             &settings.asr_model,
+            session_screen_text(state).as_ref(),
         ),
         model: asr::resolve_recognition_model(
             &settings.asr_model,
@@ -1935,6 +2136,165 @@ async fn process_selected_action(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn process_screen_action(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    wav: Vec<u8>,
+    settings: &store::Settings,
+    recording_context: &context::ContextSnapshot,
+    screen_session: screen_action::ScreenActionSession,
+    session_generation: u64,
+    cancellation: CancellationToken,
+    stop_to_insert: metrics::LatencyTimer,
+) -> Result<(), String> {
+    emit_selected_action_state(app, "looking_at_screen");
+    let provider = current_asr_provider(state);
+    let options = asr::AsrOptions {
+        api_key: settings.asr_credential().to_owned(),
+        language: asr::normalize_language(Some(settings.language.as_str())).map(str::to_owned),
+        prompt: asr_prompt_for_snapshot(
+            app.path().app_data_dir().ok().as_deref(),
+            &settings.dictionary,
+            recording_context,
+            settings.asr_provider,
+            &settings.asr_model,
+            None,
+        ),
+        model: asr::resolve_recognition_model(
+            &settings.asr_model,
+            Some(settings.language.as_str()),
+        )
+        .to_owned(),
+    };
+    let transcript = {
+        let _latency = state.metrics.timer(metrics::MetricKind::FinalAsr);
+        queue::execute_with_retry_cancelled(
+            &state.gate,
+            queue::RequestKind::Asr,
+            || provider.transcribe_batch(wav.clone(), options.clone()),
+            cancellation.clone(),
+        )
+        .await
+    };
+    let transcript = match transcript {
+        Ok(transcript) => {
+            state.gate.update_asr(&transcript.limits);
+            transcript.text
+        }
+        Err(queue::ExecuteError::Cancelled) => {
+            drop(screen_session.image);
+            return Ok(());
+        }
+        Err(queue::ExecuteError::Operation(error)) => {
+            drop(screen_session.image);
+            emit_selected_action_state(app, "idle");
+            let message = error.to_string();
+            fail_for_generation(app, state, message.clone(), session_generation).await;
+            return Err(message);
+        }
+    };
+    if processing_aborted(state, session_generation) {
+        drop(screen_session.image);
+        return Ok(());
+    }
+    if transcript.trim().is_empty() {
+        drop(screen_session.image);
+        emit_selected_action_state(app, "idle");
+        let message = "No speech detected".to_owned();
+        fail_for_generation(app, state, message.clone(), session_generation).await;
+        return Err(message);
+    }
+
+    let Some(endpoint) = settings.vision_endpoint() else {
+        drop(screen_session.image);
+        let message = screen_action::VISION_UNSET_MESSAGE.to_owned();
+        fail_for_generation(app, state, message.clone(), session_generation).await;
+        return Err(message);
+    };
+    if cancellation.is_cancelled() {
+        drop(screen_session.image);
+        return Ok(());
+    }
+    let vision_model = settings.vision_model.clone();
+    let vision_key = settings.vision_credential().to_owned();
+    let png = screen_session.image.png.clone();
+    let vision = {
+        let _latency = state.metrics.timer(metrics::MetricKind::Cleanup);
+        screen_action::run_vision(&endpoint, &vision_model, &vision_key, &png, &transcript).await
+    };
+    let final_text = match vision {
+        Ok(text) => text,
+        Err(error) => {
+            drop(screen_session.image);
+            emit_selected_action_state(app, "idle");
+            fail_for_generation(app, state, error.clone(), session_generation).await;
+            return Err(error);
+        }
+    };
+    if processing_aborted(state, session_generation) {
+        drop(screen_session.image);
+        return Ok(());
+    }
+    if final_text.trim().is_empty() {
+        drop(screen_session.image);
+        emit_selected_action_state(app, "idle");
+        let message = "Look-at-screen returned no result".to_owned();
+        fail_for_generation(app, state, message.clone(), session_generation).await;
+        return Err(message);
+    }
+
+    let thumbnail = if screen_session.image.png.is_empty() {
+        None
+    } else {
+        Some(screen_action::vision_data_url(&screen_session.image.png))
+    };
+    let mappings = lock_recover(&state.context).mappings.clone();
+    let browser_access_enabled = lock_recover(&state.context).browser_access_enabled;
+    let guard_matches = verify_delivery_target(
+        &screen_session.target_guard,
+        &mappings,
+        browser_access_enabled,
+    )
+    .is_ok();
+    let preview = screen_action::ScreenActionPreview {
+        session: screen_session,
+        session_generation,
+        context: recording_context.clone(),
+    };
+    *state
+        .screen_preview
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(preview);
+    stop_to_insert.finish();
+    if move_processing_to_selected_preview(state, session_generation) {
+        hotkey::unregister_cancel(app);
+        sync_modifier_hotkey_phase(Phase::Idle);
+        emit_progress(app, 0.0);
+        emit_selected_action_state(app, "preview_ready");
+        let _ = app.emit(
+            "selected-action://preview",
+            screen_action::ScreenPreviewPayload {
+                kind: "screen",
+                selected_text: String::new(),
+                transcript,
+                final_text,
+                thumbnail,
+                replace_allowed: screen_action::replace_allowed(guard_matches),
+            },
+        );
+        island_window::hide_overlay(app);
+        if let Some(window) = app.get_webview_window("main") {
+            let _ = window.show();
+            let _ = window.unminimize();
+            let _ = window.set_focus();
+        }
+    } else {
+        screen_action::clear_screen_preview(state);
+    }
+    Ok(())
+}
+
 fn move_processing_to_selected_preview(state: &AppState, expected_generation: u64) -> bool {
     let mut manager = lock_recover(&state.manager);
     if manager.phase != Phase::Processing
@@ -1947,6 +2307,33 @@ fn move_processing_to_selected_preview(state: &AppState, expected_generation: u6
     manager.phase = Phase::Idle;
     manager.recording_context = None;
     true
+}
+
+fn record_failed_short_asr(
+    app: &tauri::AppHandle,
+    wav: &[u8],
+    started: std::time::Instant,
+    recording_context: &context::ContextSnapshot,
+) {
+    if let Ok(dir) = app.path().app_data_dir() {
+        let relative = std::path::PathBuf::from(format!("failed-{}.wav", chrono_like_id()));
+        match store::write_spool_file(&dir, &relative, wav) {
+            Ok(path) => {
+                if let Err(history_error) = store::insert_failed_history_with_context(
+                    &dir,
+                    "",
+                    started.elapsed().as_secs_f64(),
+                    Some(&path),
+                    recording_context,
+                ) {
+                    log::warn!("failed to record ASR retry history: {history_error}");
+                }
+            }
+            Err(spool_error) => {
+                log::warn!("failed to preserve retry audio: {spool_error}");
+            }
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1971,11 +2358,12 @@ async fn process_short(
         recording_context,
         settings.asr_provider,
         &settings.asr_model,
+        session_screen_text(state).as_ref(),
     );
     let asr_provider = current_asr_provider(state);
     let asr_options = asr::AsrOptions {
         api_key: settings.asr_credential().to_owned(),
-        language,
+        language: language.clone(),
         prompt: asr_prompt,
         model: asr::resolve_recognition_model(
             &settings.asr_model,
@@ -1984,14 +2372,17 @@ async fn process_short(
         .to_owned(),
     };
     let cleanup_policy = cleanup_policy_for(settings, recording_context);
-    let mut raw = None;
+    let mut primary_text = None;
+    let mut primary_failed = false;
+    let mut primary_error = None;
+    let mut low_confidence = false;
     if let Some(warmup) = prefetch_result
         .as_ref()
         .and_then(|result| result.warmup.as_deref())
     {
         let total_samples = chunks.first().map(|chunk| chunk.samples.len()).unwrap_or(0);
         if total_samples <= prefetch_asr::WARMUP_CHUNK_SECS * 16_000 {
-            raw = Some(warmup.to_owned());
+            primary_text = Some(warmup.to_owned());
         } else if let Some(tail_wav) = prefetch_short_tail_wav(&chunks) {
             let tail_result = {
                 let _latency = state.metrics.timer(metrics::MetricKind::FinalAsr);
@@ -2006,7 +2397,8 @@ async fn process_short(
             match tail_result {
                 Ok(tail) => {
                     state.gate.update_asr(&tail.limits);
-                    raw = Some(chunker::merge_transcripts(vec![
+                    low_confidence = asr::segments_look_low_confidence(&tail.segments);
+                    primary_text = Some(chunker::merge_transcripts(vec![
                         (0, warmup.to_owned()),
                         (1, tail.text),
                     ]));
@@ -2020,60 +2412,102 @@ async fn process_short(
             }
         }
     }
-    let raw = if let Some(raw) = raw {
-        raw
-    } else {
+    if primary_text.is_none() {
         let audio_for_retry = wav.clone();
-        let transcript = {
-            let _latency = state.metrics.timer(metrics::MetricKind::FinalAsr);
-            match queue::execute_with_retry_cancelled(
-                &state.gate,
-                queue::RequestKind::Asr,
-                || asr_provider.transcribe_batch(audio_for_retry.clone(), asr_options.clone()),
-                cancellation.clone(),
-            )
-            .await
-            {
-                Err(queue::ExecuteError::Cancelled) => return Ok(()),
-                Err(queue::ExecuteError::Operation(e)) => {
-                    if processing_aborted(state, session_generation) {
-                        return Ok(());
-                    }
-                    let message = e.to_string();
-                    if let Ok(dir) = app.path().app_data_dir() {
-                        let relative =
-                            std::path::PathBuf::from(format!("failed-{}.wav", chrono_like_id()));
-                        match store::write_spool_file(&dir, &relative, &wav) {
-                            Ok(path) => {
-                                if let Err(history_error) =
-                                    store::insert_failed_history_with_context(
-                                        &dir,
-                                        "",
-                                        started.elapsed().as_secs_f64(),
-                                        Some(&path),
-                                        recording_context,
-                                    )
-                                {
-                                    log::warn!(
-                                        "failed to record ASR retry history: {history_error}"
-                                    );
-                                }
-                            }
-                            Err(spool_error) => {
-                                log::warn!("failed to preserve retry audio: {spool_error}");
-                            }
-                        }
-                    }
-                    fail_for_generation(app, state, message.clone(), session_generation).await;
-                    return Err(message);
+        let _latency = state.metrics.timer(metrics::MetricKind::FinalAsr);
+        match queue::execute_with_retry_cancelled(
+            &state.gate,
+            queue::RequestKind::Asr,
+            || asr_provider.transcribe_batch(audio_for_retry.clone(), asr_options.clone()),
+            cancellation.clone(),
+        )
+        .await
+        {
+            Err(queue::ExecuteError::Cancelled) => return Ok(()),
+            Err(queue::ExecuteError::Operation(error)) => {
+                if processing_aborted(state, session_generation) {
+                    return Ok(());
                 }
-                Ok(v) => {
-                    state.gate.update_asr(&v.limits);
-                    v
-                }
+                primary_failed = true;
+                primary_error = Some(error.to_string());
             }
+            Ok(transcript) => {
+                state.gate.update_asr(&transcript.limits);
+                low_confidence = asr::segments_look_low_confidence(&transcript.segments);
+                primary_text = Some(transcript.text);
+            }
+        }
+    }
+    if processing_aborted(state, session_generation) {
+        return Ok(());
+    }
+    let screen = session_screen_text(state);
+    let cascade_gate = cascade::cascade_input_for(
+        settings.accurate_asr_configured(),
+        primary_failed,
+        primary_text.as_deref(),
+        low_confidence,
+        screen.as_ref().map(|ctx| ctx.proper_noun_count()).unwrap_or(0),
+        settings.cascade_proper_noun_threshold,
+    );
+    let accurate_outcome = cascade::maybe_run_accurate(&cascade_gate, || {
+        emit_processing_phase(
+            app,
+            "cascade_accurate",
+            Some(recording_context),
+            None,
+            None,
+        );
+        if let Some(draft) = primary_text
+            .as_deref()
+            .filter(|text| !text.trim().is_empty())
+        {
+            emit_hud_partial(app, current_session_generation(app), draft);
+        }
+        let provider =
+            asr::GroqAsrProvider::from_resolved_endpoint(settings.accurate_asr_endpoint());
+        let options = asr::AsrOptions {
+            api_key: settings.accurate_asr_credential().to_owned(),
+            language: language.clone(),
+            prompt: asr_prompt_for_snapshot(
+                app.path().app_data_dir().ok().as_deref(),
+                &settings.dictionary,
+                recording_context,
+                settings.accurate_asr_provider,
+                &settings.accurate_asr_model,
+                screen.as_ref(),
+            ),
+            model: asr::resolve_recognition_model(
+                &settings.accurate_asr_model,
+                Some(settings.language.as_str()),
+            )
+            .to_owned(),
         };
-        transcript.text
+        let audio = wav.clone();
+        let timeout = std::time::Duration::from_millis(settings.cascade_timeout_ms);
+        async move { cascade::accurate_shot(&provider, audio, options, timeout).await }
+    })
+    .await;
+    if processing_aborted(state, session_generation) {
+        return Ok(());
+    }
+    let accurate_text = accurate_outcome
+        .as_ref()
+        .ok()
+        .and_then(|text| text.clone());
+    let winner = cascade::pick_winner(primary_text.as_deref(), accurate_outcome);
+    let Some(raw) = cascade::winning_text(
+        winner,
+        primary_text.as_deref(),
+        accurate_text.as_deref(),
+    )
+    .map(str::to_owned) else {
+        let message = primary_error.unwrap_or_else(|| "No speech detected".to_string());
+        if primary_failed {
+            record_failed_short_asr(app, &wav, started, recording_context);
+        }
+        fail_for_generation(app, state, message.clone(), session_generation).await;
+        return Err(message);
     };
     let raw = prepare_spoken_transcript(
         &raw,
@@ -2116,6 +2550,7 @@ async fn process_short(
         let cleanup_endpoint = settings.cleanup_endpoint();
         let cleanup_model = settings.cleanup_request_model();
         let cleanup_key = settings.cleanup_credential().to_owned();
+        let visible_context = visible_context_for_cleanup(session_screen_text(state).as_ref());
         let cleanup_result = {
             let _latency = state.metrics.timer(metrics::MetricKind::Cleanup);
             queue::execute_with_retry_cancelled(
@@ -2135,6 +2570,7 @@ async fn process_short(
                         Some(&intent),
                         pairs_hint.as_deref(),
                         effort,
+                        visible_context.as_deref(),
                     )
                 },
                 cancellation.clone(),
@@ -2591,6 +3027,7 @@ async fn process_long(
             recording_context,
             settings.asr_provider,
             &settings.asr_model,
+            session_screen_text(state).as_ref(),
         ),
         model: asr::resolve_recognition_model(
             &settings.asr_model,
@@ -2817,6 +3254,8 @@ async fn process_long(
         // Long recordings are cleaned only after every ASR chunk has been
         // merged. This gives the model the complete spoken structure instead
         // of asking it to make independent decisions at chunk boundaries.
+        // Accurate ASR cascade stays on the short path: a second provider
+        // shot over concatenated long audio is a different latency/cost product.
         emit_progress(app, 0.86);
         emit_processing_phase(
             app,
@@ -2829,6 +3268,7 @@ async fn process_long(
         let cleanup_endpoint = settings.cleanup_endpoint();
         let cleanup_model = settings.cleanup_request_model();
         let cleanup_key = settings.cleanup_credential().to_owned();
+        let visible_context = visible_context_for_cleanup(session_screen_text(state).as_ref());
         let cleanup_result = {
             let _latency = state.metrics.timer(metrics::MetricKind::Cleanup);
             queue::execute_with_retry_cancelled(
@@ -2848,6 +3288,7 @@ async fn process_long(
                         Some(&intent),
                         pairs_hint.as_deref(),
                         effort,
+                        visible_context.as_deref(),
                     )
                 },
                 cancellation.clone(),
@@ -3378,6 +3819,7 @@ fn asr_prompt_for_snapshot(
     snapshot: &context::ContextSnapshot,
     asr_provider: crate::providers::EngineProvider,
     asr_model: &str,
+    screen: Option<&screen_text::ScreenTextContext>,
 ) -> Option<String> {
     let pairs = load_learn_pairs(dir);
     let scope = lexicon::PromptScope::from_snapshot(snapshot);
@@ -3387,7 +3829,59 @@ fn asr_prompt_for_snapshot(
         &pairs,
         Some(&scope),
         lexicon::asr_prompt_shape_for(asr_provider, asr_model),
+        screen,
     )
+}
+
+pub(crate) fn session_screen_text(state: &AppState) -> Option<screen_text::ScreenTextContext> {
+    lock_recover(&state.screen_text).clone()
+}
+
+fn store_session_screen_text(state: &AppState, ctx: Option<screen_text::ScreenTextContext>) {
+    *lock_recover(&state.screen_text) = ctx;
+}
+
+fn visible_context_for_cleanup(screen: Option<&screen_text::ScreenTextContext>) -> Option<String> {
+    screen
+        .map(|ctx| ctx.visible_context_text())
+        .filter(|text| !text.trim().is_empty())
+}
+
+fn capture_screen_text(
+    family: context::ContextFamily,
+    guard: &context::TargetAppGuard,
+) -> screen_text::ScreenTextContext {
+    screen_text::extract_live(family, guard)
+}
+
+fn refresh_screen_text_for_stop(
+    window_ocr_enabled: bool,
+    recording_ok: bool,
+    recording_context: &context::ContextSnapshot,
+) -> Option<screen_text::ScreenTextContext> {
+    screen_action::on_dictation_stop();
+    let live = context::probe_focus_guard();
+    let family = recording_context.profile.family;
+    let guard = recording_context.target_guard.clone();
+    let resolved = screen_text::resolve_screen_at_stop(
+        &recording_context.target_guard,
+        &live,
+        family,
+        || capture_screen_text(family, &guard),
+    );
+    let sensitive = guard.secure_input
+        || lexicon::is_default_learn_off_target(guard.bundle_id.as_deref(), guard.browser_host.as_deref());
+    resolved.map(|ctx| {
+        window_capture::maybe_ocr(
+            window_ocr_enabled,
+            recording_ok,
+            family,
+            sensitive,
+            &ctx,
+            guard.window_id,
+        )
+        .unwrap_or(ctx)
+    })
 }
 
 fn cleanup_route_for(
@@ -3401,15 +3895,13 @@ fn cleanup_route_for(
     let family = recording_context
         .map(|snapshot| snapshot.profile.family)
         .unwrap_or(context::ContextFamily::General);
-    let confidence = recording_context
-        .map(|snapshot| snapshot.profile.confidence)
-        .unwrap_or(0.0);
     lexicon::decide_cleanup(
         settings.cleanup_enabled,
+        llm::CleanupIntensity::parse(&settings.cleanup_intensity)
+            .unwrap_or(llm::CleanupIntensity::Heavy),
         mapping,
         family,
         intent,
-        confidence,
     )
 }
 #[cfg(test)]
@@ -3598,6 +4090,8 @@ async fn set_hotkeys_suspended(
         if capture_target.as_deref() == Some("selected_action") {
             settings.selected_action_hotkey = hotkey;
             settings.selected_actions_enabled = true;
+        } else if capture_target.as_deref() == Some("screen_action") {
+            settings.screen_action_hotkey = hotkey;
         } else {
             settings.hotkey = hotkey;
         }
@@ -3615,6 +4109,7 @@ async fn set_hotkeys_suspended(
             previous.selected_actions_enabled,
         )
         .await;
+        let _ = hotkey::apply_screen_action_hotkey(&app, &previous.screen_action_hotkey).await;
         hotkey::set_suspended(false);
         return Err(error.to_string());
     }
@@ -3648,6 +4143,21 @@ async fn set_hotkeys_suspended(
             previous.selected_actions_enabled,
         )
         .await;
+        let _ = hotkey::apply_screen_action_hotkey(&app, &previous.screen_action_hotkey).await;
+        hotkey::set_suspended(false);
+        return Err(error);
+    }
+    if let Err(error) = hotkey::apply_screen_action_hotkey(&app, &settings.screen_action_hotkey).await
+    {
+        let _ =
+            hotkey::apply_settings_hotkey(&app, &previous.hotkey, &previous.activation_mode).await;
+        let _ = hotkey::apply_selected_action_hotkey(
+            &app,
+            &previous.selected_action_hotkey,
+            previous.selected_actions_enabled,
+        )
+        .await;
+        let _ = hotkey::apply_screen_action_hotkey(&app, &previous.screen_action_hotkey).await;
         hotkey::set_suspended(false);
         return Err(error);
     }
@@ -3771,8 +4281,8 @@ async fn save_context_mapping(
             current.mappings.clone(),
         )
     };
-    if let Some(existing) = mappings.iter_mut().find(|item| item.id == mapping.id) {
-        *existing = mapping;
+    if let Some(index) = mappings.iter().position(|item| item.id == mapping.id) {
+        mappings[index] = context::merge_saved_mapping(&mappings[index], mapping);
     } else {
         mappings.push(mapping);
     }
@@ -3898,9 +4408,11 @@ async fn apply_settings(
     let mode = settings.activation_mode.clone();
     let selected_hotkey = settings.selected_action_hotkey.clone();
     let selected_enabled = settings.selected_actions_enabled;
+    let screen_hotkey = settings.screen_action_hotkey.clone();
     let hotkey_changed = prev.hotkey != hotkey || prev.activation_mode != mode;
     let selected_hotkey_changed = prev.selected_action_hotkey != selected_hotkey
         || prev.selected_actions_enabled != selected_enabled;
+    let screen_hotkey_changed = prev.screen_action_hotkey != screen_hotkey;
     let context_changed = prev.context_enabled != settings.context_enabled
         || prev.browser_access_enabled != settings.browser_access_enabled
         || prev.context_mappings != settings.context_mappings
@@ -3937,6 +4449,23 @@ async fn apply_settings(
                 prev.selected_actions_enabled,
             )
             .await;
+            let _ = hotkey::apply_screen_action_hotkey(&app, &prev.screen_action_hotkey).await;
+            return Err(error);
+        }
+    }
+    if !hotkey::is_suspended() && (hotkey_changed || screen_hotkey_changed) {
+        if let Err(error) = hotkey::apply_screen_action_hotkey(&app, &screen_hotkey).await {
+            if hotkey_changed {
+                let _ =
+                    hotkey::apply_settings_hotkey(&app, &prev.hotkey, &prev.activation_mode).await;
+            }
+            let _ = hotkey::apply_selected_action_hotkey(
+                &app,
+                &prev.selected_action_hotkey,
+                prev.selected_actions_enabled,
+            )
+            .await;
+            let _ = hotkey::apply_screen_action_hotkey(&app, &prev.screen_action_hotkey).await;
             return Err(error);
         }
     }
@@ -4046,6 +4575,16 @@ async fn update_settings_patch(
         "keep_success_audio",
         "onboarded",
         "cleanup_enabled",
+        "cleanup_intensity",
+        "accurate_asr_provider",
+        "accurate_asr_model",
+        "accurate_asr_base_url",
+        "cascade_timeout_ms",
+        "cascade_proper_noun_threshold",
+        "window_ocr_enabled",
+        "screen_action_hotkey",
+        "vision_provider",
+        "vision_model",
         "cleanup_model",
         "show_tray_icon",
         "context_enabled",
@@ -4416,6 +4955,8 @@ pub fn run() {
                 prefetch_asr: Mutex::new(None),
                 selected_action: Mutex::new(None),
                 selected_preview: Mutex::new(None),
+                screen_action: Mutex::new(None),
+                screen_preview: Mutex::new(None),
                 undo: Mutex::new(None),
                 operation_lease: Mutex::new(OperationLease::Idle),
                 asr_provider: Mutex::new(Arc::new(asr::GroqAsrProvider::from_resolved_endpoint(
@@ -4435,6 +4976,7 @@ pub fn run() {
                 pending_recorder_cancel: Mutex::new(None),
                 onboarding_test_mode: Mutex::new(false),
                 onboarding_selected_text: Mutex::new(None),
+                screen_text: Mutex::new(None),
                 _instance_lock: instance_lock,
             });
             let context_handle = app.handle().clone();
@@ -4575,6 +5117,14 @@ pub fn run() {
                 });
             });
             let h = app.handle().clone();
+            app.listen("hotkey://screen-action", move |_| {
+                let h = h.clone();
+                tauri::async_runtime::spawn(async move {
+                    let state = h.state::<AppState>();
+                    screen_action::handle_screen_action_hotkey(&h, &state).await;
+                });
+            });
+            let h = app.handle().clone();
             app.listen("audio://error", move |event| {
                 let h = h.clone();
                 let message = event.payload().to_owned();
@@ -4602,6 +5152,7 @@ pub fn run() {
             }
             let selected_hotkey = settings.selected_action_hotkey.clone();
             let selected_enabled = settings.selected_actions_enabled;
+            let screen_hotkey = settings.screen_action_hotkey.clone();
             let selected_handle = h.clone();
             tauri::async_runtime::spawn(async move {
                 if let Err(error) = hotkey::apply_selected_action_hotkey(
@@ -4612,6 +5163,12 @@ pub fn run() {
                 .await
                 {
                     log::warn!("selected action hotkey registration failed: {error}");
+                    let _ = selected_handle.emit("dictation://error", error);
+                }
+                if let Err(error) =
+                    hotkey::apply_screen_action_hotkey(&selected_handle, &screen_hotkey).await
+                {
+                    log::warn!("look-at-screen hotkey registration failed: {error}");
                     let _ = selected_handle.emit("dictation://error", error);
                 }
             });
@@ -4671,6 +5228,9 @@ pub fn run() {
             selected_action::confirm_selected_action_preview,
             selected_action::copy_selected_action_preview,
             selected_action::cancel_selected_action_preview,
+            screen_action::confirm_screen_action_preview,
+            screen_action::copy_screen_action_preview,
+            screen_action::cancel_screen_action_preview,
             history_commands::delete_history,
             check_permissions,
             get_audio_input_devices,
@@ -4710,7 +5270,8 @@ mod tests {
         delivery_fallback_reason, error_completion_is_current, error_fallback_reason,
         finalize_text, long_completion_state, process_bounded_chunk_jobs,
         processing_completion_is_current,
-        processing_watchdog_delay, read_dictionary_file_contents, should_chunk_recording,
+        processing_watchdog_delay, read_dictionary_file_contents, refresh_screen_text_for_stop,
+        should_chunk_recording,
         stop_transition_is_current, target_guard_mismatch_with_retry, undo_available_for_hud,
         undo_preflight,
         CleanupDecision, DictationManager, OperationLease, Phase, UndoTransaction,
@@ -4727,6 +5288,14 @@ mod tests {
     use std::time::Instant;
     use std::time::{SystemTime, UNIX_EPOCH};
     use tokio_util::sync::CancellationToken;
+
+    #[test]
+    fn stop_refresh_never_increments_vision_capture() {
+        crate::window_capture::reset_vision_capture_count();
+        let snapshot = context::ContextSnapshot::general();
+        let _ = refresh_screen_text_for_stop(true, true, &snapshot);
+        assert_eq!(crate::window_capture::vision_capture_count(), 0);
+    }
 
     #[test]
     fn short_hotkey_recordings_use_the_short_path() {

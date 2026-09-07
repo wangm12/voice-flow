@@ -437,6 +437,15 @@ const CASES: &[CleanupCase] = &[
         preserve_structure: true,
     },
     CleanupCase {
+        name: "zh_wechat_heavy_stays_chat",
+        raw: "嗯那个好的哈哈我晚点回你",
+        expected: "好的哈哈我晚点回你。",
+        protected_tokens: &["哈哈", "晚点"],
+        context_family: "personal_chat",
+        allow_rewrite: false,
+        preserve_structure: true,
+    },
+    CleanupCase {
         name: "zh_wechat_swear_kept",
         raw: "这破需求我晚点再改",
         expected: "这破需求我晚点再改。",
@@ -634,6 +643,9 @@ mod tests {
         assert!(CASES
             .iter()
             .any(|case| case.name == "zh_untrusted_rewrite_instruction"));
+        assert!(CASES
+            .iter()
+            .any(|case| case.name == "zh_wechat_heavy_stays_chat"));
     }
 
     #[test]
@@ -710,6 +722,17 @@ mod tests {
         assert!(!casual.expected.contains("稍后回复"));
         assert!(casual.expected.contains('。'));
         assert_ne!(casual.expected, casual.raw);
+
+        let heavy = CASES
+            .iter()
+            .find(|case| case.name == "zh_wechat_heavy_stays_chat")
+            .expect("zh_wechat_heavy_stays_chat");
+        assert_eq!(heavy.context_family, "personal_chat");
+        assert!(heavy.expected.contains("哈哈"));
+        assert!(heavy.expected.contains("晚点"));
+        assert!(!heavy.expected.contains("您好"));
+        assert!(!heavy.expected.contains("稍后回复"));
+        assert!(!heavy.raw.contains("您好"));
 
         let untrusted = CASES
             .iter()
@@ -913,10 +936,10 @@ mod tests {
             let local = local_cleanup(&prepared);
             let route = decide_cleanup(
                 true,
+                crate::llm::CleanupIntensity::Heavy,
                 None,
                 family,
                 &CleanupIntent::implicit(&prepared),
-                0.9,
             );
             (prepared, local, route)
         };
@@ -926,7 +949,7 @@ mod tests {
         assert!(wechat_prepared.contains("哈哈"), "{wechat_prepared}");
         assert_eq!(
             wechat_route,
-            CleanupRoute::Provider(CleanupEffort::Light)
+            CleanupRoute::Provider(CleanupEffort::Heavy)
         );
 
         let fillers = local_cleanup("嗯那个就是说我们进展不错");
@@ -934,12 +957,12 @@ mod tests {
         assert_eq!(
             decide_cleanup(
                 true,
+                crate::llm::CleanupIntensity::Heavy,
                 None,
                 ContextFamily::PersonalChat,
                 &CleanupIntent::implicit("嗯那个就是说我们进展不错"),
-                0.9,
             ),
-            CleanupRoute::Provider(CleanupEffort::Light)
+            CleanupRoute::Provider(CleanupEffort::Heavy)
         );
 
         let (correction, _, _) = run("zh_self_correction", ContextFamily::PersonalChat);
@@ -951,10 +974,10 @@ mod tests {
             local_cleanup("ls -la"),
             decide_cleanup(
                 true,
+                crate::llm::CleanupIntensity::Heavy,
                 None,
                 ContextFamily::Terminal,
                 &CleanupIntent::implicit("ls -la"),
-                0.9,
             ),
         );
         assert_eq!(terminal_prepared, "ls -la");
@@ -969,12 +992,12 @@ mod tests {
         assert_eq!(
             decide_cleanup(
                 true,
+                crate::llm::CleanupIntensity::Heavy,
                 None,
                 ContextFamily::PromptOrCode,
                 &CleanupIntent::implicit(&mixed),
-                0.9,
             ),
-            CleanupRoute::Provider(CleanupEffort::Light)
+            CleanupRoute::Provider(CleanupEffort::Heavy)
         );
 
         let _ = builtin_family_for_id("personal_chat");

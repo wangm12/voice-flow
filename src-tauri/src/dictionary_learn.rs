@@ -261,6 +261,9 @@ pub(crate) async fn undo_learn_pair(
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "learn pair was not found".to_string())?;
     store::tombstone_learn_pair(&dir, &pair_key).map_err(|error| error.to_string())?;
+    if pair_key.starts_with("learn:style:") || pair_key.starts_with("learn:intensity:") {
+        restore_mapping_learn(&app, &dir, &row).await?;
+    }
     let still_used = store::list_learn_pairs(&dir)
         .map_err(|error| error.to_string())?
         .into_iter()
@@ -281,6 +284,60 @@ pub(crate) async fn undo_learn_pair(
     };
     let _ = app.emit("learn_pairs://changed", ());
     Ok(view)
+}
+
+async fn restore_mapping_learn(
+    app: &tauri::AppHandle,
+    dir: &std::path::Path,
+    row: &store::LearnPairRecord,
+) -> Result<(), String> {
+    let mapping_id = row
+        .mapping_id
+        .clone()
+        .or_else(|| {
+            row.pair_key
+                .rsplit(':')
+                .next()
+                .filter(|part| !part.is_empty())
+                .map(str::to_owned)
+        })
+        .ok_or_else(|| "mapping was not found".to_string())?;
+    let state = app.state::<AppState>();
+    let _gate = state.settings_gate.lock().await;
+    let mut snapshot = lock_recover(&state.settings).clone();
+    let Some(mapping) = snapshot
+        .context_mappings
+        .iter_mut()
+        .find(|mapping| mapping.id == mapping_id)
+    else {
+        return Ok(());
+    };
+    if row.pair_key.starts_with("learn:style:") {
+        if let Some(index) = mapping
+            .style_example_pairs
+            .iter()
+            .rposition(|pair| pair.output == row.after_surface)
+        {
+            mapping.style_example_pairs.remove(index);
+        } else if !mapping.style_example_pairs.is_empty() {
+            mapping.style_example_pairs.pop();
+        }
+    } else if row.pair_key.starts_with("learn:intensity:") {
+        mapping.cleanup_intensity = if row.before_surface.trim().is_empty() {
+            None
+        } else {
+            crate::llm::CleanupIntensity::parse(&row.before_surface)
+        };
+    }
+    snapshot.normalize();
+    store::save_settings(dir, &snapshot).map_err(|error| error.to_string())?;
+    *lock_recover(&state.settings) = snapshot.clone();
+    {
+        let mut context = lock_recover(&state.context);
+        context.mappings = snapshot.context_mappings.clone();
+    }
+    let _ = app.emit("settings://changed", store::SettingsView::from(&snapshot));
+    Ok(())
 }
 
 #[tauri::command]
@@ -338,6 +395,11 @@ pub(crate) async fn confirm_style_draft(
         .iter_mut()
         .find(|mapping| mapping.id == draft.mapping_id)
         .ok_or_else(|| "mapping was not found".to_string())?;
+    push_style_pair(
+        &mut mapping.style_example_pairs,
+        draft.before_excerpt.clone(),
+        draft.after_excerpt.clone(),
+    );
     mapping.style_example_input = Some(draft.before_excerpt.clone());
     mapping.style_example_output = Some(draft.after_excerpt.clone());
     snapshot.normalize();
@@ -411,6 +473,7 @@ pub enum ObserveOutcome {
     Unchanged,
     LeftTarget,
     SingleToken { before_span: String, after: String },
+    ShortStyleRewrite { before: String, after: String },
     StyleSignal {
         excerpt: String,
         style_key: String,
@@ -475,6 +538,12 @@ fn finalize_observe(baseline: &str, settled: &str, left_target: bool) -> Observe
     if let Some((before_span, after)) = lexeme_candidate(baseline, settled) {
         return ObserveOutcome::SingleToken { before_span, after };
     }
+    if is_short_style_rewrite(baseline, settled) {
+        return ObserveOutcome::ShortStyleRewrite {
+            before: baseline.to_owned(),
+            after: settled.to_owned(),
+        };
+    }
     if let Some(signal) = style_signal(baseline, settled) {
         return signal;
     }
@@ -524,6 +593,257 @@ fn is_short_phrase(value: &str) -> bool {
                 .all(|ch| is_cjk(ch) || ch.is_whitespace())
     } else {
         false
+    }
+}
+
+pub fn is_short_style_rewrite(baseline: &str, settled: &str) -> bool {
+    let baseline = baseline.trim();
+    let settled = settled.trim();
+    if baseline.is_empty() || settled.is_empty() || baseline == settled {
+        return false;
+    }
+    if looks_like_foreign_bubble(baseline) || looks_like_foreign_bubble(settled) {
+        return false;
+    }
+    if baseline.contains('\n') || settled.contains('\n') {
+        return false;
+    }
+    if is_pure_prefix_edit(baseline, settled) {
+        return false;
+    }
+    if style_content_key(baseline) == style_content_key(settled) {
+        return false;
+    }
+    if baseline.chars().count() > 40 || settled.chars().count() > 40 {
+        return false;
+    }
+    if is_topic_change(baseline, settled) {
+        return false;
+    }
+    let latin_words = |value: &str| {
+        extract_tokens(value)
+            .into_iter()
+            .filter(|token| token.surface.chars().any(|ch| is_latin_start(ch)))
+            .count()
+    };
+    let cjk_count = |value: &str| value.chars().filter(|ch| is_cjk(*ch)).count();
+    let short_latin = {
+        let before_words = latin_words(baseline);
+        let after_words = latin_words(settled);
+        before_words > 0
+            && cjk_count(baseline) == 0
+            && after_words > 0
+            && cjk_count(settled) == 0
+            && (2..=4).contains(&before_words)
+            && (2..=4).contains(&after_words)
+    };
+    let short_cjk = {
+        let before_cjk = cjk_count(baseline);
+        let after_cjk = cjk_count(settled);
+        latin_words(baseline) == 0
+            && latin_words(settled) == 0
+            && (2..=8).contains(&before_cjk)
+            && (2..=8).contains(&after_cjk)
+    };
+    short_latin || short_cjk || (settled.chars().count() <= 40 && baseline.chars().count() <= 40)
+}
+
+fn is_pure_prefix_edit(baseline: &str, settled: &str) -> bool {
+    if !(settled.starts_with(baseline) || baseline.starts_with(settled)) {
+        return false;
+    }
+    let style_signal = casual_score(settled) != casual_score(baseline)
+        || (baseline.contains('您') && settled.contains('你') && !settled.contains('您'))
+        || (baseline.contains("稍后") && settled.contains("晚点"));
+    !style_signal
+}
+
+fn looks_like_foreign_bubble(value: &str) -> bool {
+    let trimmed = value.trim();
+    trimmed.starts_with("对方:")
+        || trimmed.starts_with("对方：")
+        || trimmed.starts_with("Other:")
+}
+
+fn is_topic_change(baseline: &str, settled: &str) -> bool {
+    let shared = shared_content_chars(baseline, settled);
+    let baseline_len = baseline.chars().filter(|ch| !ch.is_whitespace()).count().max(1);
+    let settled_len = settled.chars().filter(|ch| !ch.is_whitespace()).count().max(1);
+    let ratio = shared as f32 / baseline_len.min(settled_len) as f32;
+    ratio < 0.3
+}
+
+fn shared_content_chars(left: &str, right: &str) -> usize {
+    let mut right_chars: Vec<char> = right.chars().filter(|ch| !ch.is_whitespace()).collect();
+    let mut shared = 0usize;
+    for ch in left.chars().filter(|ch| !ch.is_whitespace()) {
+        if let Some(index) = right_chars.iter().position(|item| *item == ch) {
+            right_chars.remove(index);
+            shared += 1;
+        }
+    }
+    shared
+}
+
+pub fn push_style_pair(
+    pairs: &mut Vec<context::StyleExamplePair>,
+    input: String,
+    output: String,
+) {
+    let input = input.trim().to_string();
+    let output = output.trim().to_string();
+    if input.is_empty() || output.is_empty() || input == output {
+        return;
+    }
+    if pairs.iter().any(|pair| pair.output == output) {
+        return;
+    }
+    pairs.push(context::StyleExamplePair { input, output });
+    if pairs.len() > 3 {
+        pairs.remove(0);
+    }
+}
+
+pub fn intensity_shift_from_edit(
+    baseline: &str,
+    settled: &str,
+    current: crate::llm::CleanupIntensity,
+) -> Option<i8> {
+    if !is_short_style_rewrite(baseline, settled) {
+        return None;
+    }
+    let casual_delta = casual_score(settled) - casual_score(baseline);
+    let baseline_len = baseline.chars().count();
+    let settled_len = settled.chars().count();
+    if casual_delta > 0 || settled_len + 2 < baseline_len {
+        return (current != crate::llm::CleanupIntensity::Off).then_some(-1);
+    }
+    if settled_len > baseline_len + 4 && casual_delta <= 0 {
+        return (current != crate::llm::CleanupIntensity::Heavy).then_some(1);
+    }
+    None
+}
+
+fn casual_score(value: &str) -> i32 {
+    let mut score = 0i32;
+    for marker in ["哈哈", "晚点", "嗯", "啊", "lol", "haha"] {
+        if value.contains(marker) {
+            score += 1;
+        }
+    }
+    if value.contains('你') && !value.contains('您') {
+        score += 1;
+    }
+    if value.contains('您') {
+        score -= 1;
+    }
+    if value.contains("稍后") {
+        score -= 1;
+    }
+    score
+}
+
+const STYLE_LEARN_HITS: u32 = 3;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StyleLearnApply {
+    pub pairs_changed: bool,
+    pub intensity_changed: bool,
+    pub style_pair_key: Option<String>,
+    pub intensity_pair_key: Option<String>,
+}
+
+pub fn apply_post_paste_style_learn(
+    mappings: &mut Vec<context::AppMapping>,
+    dir: &std::path::Path,
+    mapping_id: &str,
+    baseline: &str,
+    settled: &str,
+    global_intensity: crate::llm::CleanupIntensity,
+) -> anyhow::Result<StyleLearnApply> {
+    if !is_short_style_rewrite(baseline, settled) {
+        return Ok(StyleLearnApply::default());
+    }
+    ensure_mapping_for_learn(mappings, mapping_id);
+    let Some(mapping_index) = mappings.iter().position(|mapping| mapping.id == mapping_id) else {
+        return Ok(StyleLearnApply::default());
+    };
+    let scope = store::LearnPairScope {
+        family: Some(context::family_id(mappings[mapping_index].family).to_owned()),
+        mapping_id: Some(mapping_id.to_owned()),
+        browser_host: mappings[mapping_index].browser_host.clone(),
+        native_bundle: mappings[mapping_index].bundle_id.clone(),
+    };
+    let mut applied = StyleLearnApply::default();
+
+    let style_key = format!("learn:style:{mapping_id}");
+    if let Some(row) = store::upsert_learn_pair_with_scope(
+        dir,
+        &style_key,
+        baseline,
+        settled,
+        Some(&scope),
+    )? {
+        if row.hits >= STYLE_LEARN_HITS {
+            push_style_pair(
+                &mut mappings[mapping_index].style_example_pairs,
+                baseline.to_owned(),
+                settled.to_owned(),
+            );
+            let first = mappings[mapping_index]
+                .style_example_pairs
+                .first()
+                .map(|pair| (pair.input.clone(), pair.output.clone()));
+            if let Some((input, output)) = first {
+                mappings[mapping_index].style_example_input = Some(input);
+                mappings[mapping_index].style_example_output = Some(output);
+            }
+            let _ = store::set_learn_pair_hits(dir, &style_key, 0);
+            applied.pairs_changed = true;
+            applied.style_pair_key = Some(style_key);
+        }
+    }
+
+    let current = mappings[mapping_index]
+        .cleanup_intensity
+        .unwrap_or(global_intensity);
+    if let Some(shift) = intensity_shift_from_edit(baseline, settled, current) {
+        let direction = if shift < 0 { "down" } else { "up" };
+        let intensity_key = format!("learn:intensity:{direction}:{mapping_id}");
+        let previous = mappings[mapping_index]
+            .cleanup_intensity
+            .map(|item| item.as_str().to_owned())
+            .unwrap_or_default();
+        let next = if shift < 0 {
+            current.demote()
+        } else {
+            current.promote()
+        };
+        if let Some(row) = store::upsert_learn_pair_with_scope(
+            dir,
+            &intensity_key,
+            &previous,
+            next.as_str(),
+            Some(&scope),
+        )? {
+            if row.hits >= STYLE_LEARN_HITS && next != current {
+                mappings[mapping_index].cleanup_intensity = Some(next);
+                let _ = store::set_learn_pair_hits(dir, &intensity_key, 0);
+                applied.intensity_changed = true;
+                applied.intensity_pair_key = Some(intensity_key);
+            }
+        }
+    }
+
+    Ok(applied)
+}
+
+fn ensure_mapping_for_learn(mappings: &mut Vec<context::AppMapping>, mapping_id: &str) {
+    if mappings.iter().any(|mapping| mapping.id == mapping_id) {
+        return;
+    }
+    if let Some(created) = mapping_from_style_draft_id(mapping_id) {
+        mappings.push(created);
     }
 }
 
@@ -636,6 +956,91 @@ pub fn classify_learn_pair(before: &str, after: &str) -> LearnClass {
         return LearnClass::Name;
     }
     LearnClass::Term
+}
+
+pub fn seed_lexicon_from_screen(
+    dir: &std::path::Path,
+    dictionary: &mut Vec<String>,
+    screen: &crate::screen_text::ScreenTextContext,
+    style_pairs: &mut Vec<context::StyleExamplePair>,
+    scope: Option<&store::LearnPairScope>,
+) -> anyhow::Result<()> {
+    let _ = style_pairs;
+    for token in &screen.tokens {
+        let token = token.trim();
+        if token.is_empty() || is_blocked(token) {
+            continue;
+        }
+        let _ = record_learn_pair_with_scope(dir, dictionary, "", token, scope)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn maybe_seed_screen_lexicon(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    recording_context: Option<&context::ContextSnapshot>,
+) {
+    let settings = lock_recover(&state.settings);
+    if !settings.dictionary_learn_enabled {
+        return;
+    }
+    let Some(screen) = crate::session_screen_text(state) else {
+        return;
+    };
+    if screen.tokens.is_empty() {
+        return;
+    }
+    if !crate::lexicon::scene_allows_learn(
+        &settings.context_mappings,
+        recording_context
+            .map(|snapshot| snapshot.profile.id.as_str())
+            .unwrap_or(""),
+        recording_context.and_then(|snapshot| snapshot.target_guard.bundle_id.as_deref()),
+        recording_context.and_then(|snapshot| snapshot.target_guard.browser_host.as_deref()),
+    ) {
+        return;
+    }
+    let scope = recording_context.map(scope_from_snapshot);
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        persist_screen_lexicon_locked(&app, screen, scope).await;
+    });
+}
+
+async fn persist_screen_lexicon_locked(
+    app: &tauri::AppHandle,
+    screen: crate::screen_text::ScreenTextContext,
+    scope: Option<store::LearnPairScope>,
+) {
+    let state = app.state::<AppState>();
+    let _gate = state.settings_gate.lock().await;
+    let Ok(dir) = app.path().app_data_dir() else {
+        return;
+    };
+    let mut snapshot = lock_recover(&state.settings).clone();
+    if !snapshot.dictionary_learn_enabled {
+        return;
+    }
+    let mut unused_pairs = Vec::new();
+    if let Err(error) = seed_lexicon_from_screen(
+        &dir,
+        &mut snapshot.dictionary,
+        &screen,
+        &mut unused_pairs,
+        scope.as_ref(),
+    ) {
+        log::warn!("screen lexicon seed failed: {error}");
+        return;
+    }
+    snapshot.normalize();
+    if let Err(error) = store::save_settings(&dir, &snapshot) {
+        log::warn!("screen lexicon persist failed: {error}");
+        return;
+    }
+    *lock_recover(&state.settings) = snapshot.clone();
+    let _ = app.emit("settings://changed", store::SettingsView::from(&snapshot));
+    let _ = app.emit("learn_pairs://changed", ());
 }
 
 pub fn promote_hits_for(class: LearnClass) -> u32 {
@@ -925,6 +1330,9 @@ pub(crate) fn maybe_observe_after_paste(
             ObserveOutcome::SingleToken { before_span, after } => {
                 persist_learn_pair(&app, &before_span, &after, scope);
             }
+            ObserveOutcome::ShortStyleRewrite { before, after } => {
+                persist_style_intensity_learn(&app, &before, &after, mapping_id);
+            }
             ObserveOutcome::StyleSignal {
                 excerpt,
                 style_key,
@@ -1004,8 +1412,10 @@ fn mapping_from_style_draft_id(mapping_id: &str) -> Option<context::AppMapping> 
             browser_host: None,
             style_example_input: None,
             style_example_output: None,
+            style_example_pairs: Vec::new(),
             enabled: true,
             cleanup_effort: None,
+            cleanup_intensity: None,
             cleanup_enabled: true,
             dictionary_learn_enabled: true,
         });
@@ -1021,8 +1431,10 @@ fn mapping_from_style_draft_id(mapping_id: &str) -> Option<context::AppMapping> 
             browser_host: Some(host.to_owned()),
             style_example_input: None,
             style_example_output: None,
+            style_example_pairs: Vec::new(),
             enabled: true,
             cleanup_effort: None,
+            cleanup_intensity: None,
             cleanup_enabled: true,
             dictionary_learn_enabled: true,
         });
@@ -1060,6 +1472,91 @@ fn persist_learn_pair(
     tauri::async_runtime::spawn(async move {
         persist_learn_pair_locked(&app, &before, &after, scope.as_ref()).await;
     });
+}
+
+fn persist_style_intensity_learn(
+    app: &tauri::AppHandle,
+    baseline: &str,
+    settled: &str,
+    mapping_id: Option<String>,
+) {
+    let Some(mapping_id) = mapping_id else {
+        return;
+    };
+    let app = app.clone();
+    let baseline = baseline.to_owned();
+    let settled = settled.to_owned();
+    tauri::async_runtime::spawn(async move {
+        persist_style_intensity_learn_locked(&app, &baseline, &settled, &mapping_id).await;
+    });
+}
+
+async fn persist_style_intensity_learn_locked(
+    app: &tauri::AppHandle,
+    baseline: &str,
+    settled: &str,
+    mapping_id: &str,
+) {
+    let state = app.state::<AppState>();
+    let _gate = state.settings_gate.lock().await;
+    let Ok(dir) = app.path().app_data_dir() else {
+        return;
+    };
+    let mut snapshot = lock_recover(&state.settings).clone();
+    if !snapshot.dictionary_learn_enabled {
+        return;
+    }
+    let global = crate::llm::CleanupIntensity::parse(&snapshot.cleanup_intensity)
+        .unwrap_or(crate::llm::CleanupIntensity::Heavy);
+    let applied = match apply_post_paste_style_learn(
+        &mut snapshot.context_mappings,
+        &dir,
+        mapping_id,
+        baseline,
+        settled,
+        global,
+    ) {
+        Ok(applied) => applied,
+        Err(error) => {
+            log::warn!("style learn persist failed: {error}");
+            return;
+        }
+    };
+    if !applied.pairs_changed && !applied.intensity_changed {
+        return;
+    }
+    snapshot.normalize();
+    if let Err(error) = store::save_settings(&dir, &snapshot) {
+        log::warn!("style learn settings persist failed: {error}");
+        return;
+    }
+    *lock_recover(&state.settings) = snapshot.clone();
+    {
+        let mut context = lock_recover(&state.context);
+        context.mappings = snapshot.context_mappings.clone();
+    }
+    let _ = app.emit("settings://changed", store::SettingsView::from(&snapshot));
+    let _ = app.emit("learn_pairs://changed", ());
+    let pair_keys = [
+        applied.style_pair_key.clone(),
+        applied.intensity_pair_key.clone(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    if let Some(pair_key) = pair_keys.first() {
+        let _ = app.emit(
+            "learn_pairs://promoted",
+            serde_json::json!({
+                "pair_key": pair_key,
+                "pair_keys": pair_keys,
+                "before": baseline,
+                "after": settled,
+            }),
+        );
+        crate::island_window::show_overlay(app);
+        crate::island_window::set_learn_toast_interactive(app, true);
+    }
 }
 
 fn persist_style_draft(
@@ -1224,8 +1721,10 @@ pub(crate) fn is_cjk(value: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        add_dictionary_words, append_dictionary_entry, observe_after_paste, ObserveLimits,
-        ObserveOutcome, remove_dictionary_entry, single_token_candidates,
+        add_dictionary_words, append_dictionary_entry, apply_post_paste_style_learn,
+        intensity_shift_from_edit, is_short_style_rewrite, observe_after_paste, push_style_pair,
+        seed_lexicon_from_screen,
+        ObserveLimits, ObserveOutcome, remove_dictionary_entry, single_token_candidates,
     };
     use crate::context::TargetAppGuard;
     use std::cell::RefCell;
@@ -2028,5 +2527,160 @@ mod tests {
             super::style_draft_mapping_id(&snapshot, &[]).as_deref(),
             Some("bundle:com.tencent.xinWeChat")
         );
+    }
+
+    #[test]
+    fn short_rewrite_is_style_candidate() {
+        assert!(is_short_style_rewrite(
+            "好的我会稍后回复您",
+            "好的哈哈我晚点回你"
+        ));
+        assert!(is_short_style_rewrite("好的", "好的哈哈我晚点回你"));
+        assert!(!is_short_style_rewrite("好的", &"x".repeat(80)));
+    }
+
+    #[test]
+    fn style_pairs_cap_at_three() {
+        let mut pairs = vec![];
+        for i in 0..4 {
+            push_style_pair(&mut pairs, format!("in{i}"), format!("out{i}"));
+        }
+        assert_eq!(pairs.len(), 3);
+        assert_eq!(pairs[0].input, "in1");
+    }
+
+    #[test]
+    fn foreign_bubble_is_not_a_style_pair() {
+        assert!(!is_short_style_rewrite(
+            "好的我晚点回你",
+            "对方: 那你把合同发我一下谢谢"
+        ));
+    }
+
+    fn test_mapping(id: &str) -> crate::context::AppMapping {
+        crate::context::AppMapping {
+            id: id.to_owned(),
+            label: "WeChat".into(),
+            family: crate::context::ContextFamily::PersonalChat,
+            mode_id: None,
+            bundle_id: Some("com.tencent.xinWeChat".into()),
+            executable: None,
+            browser_host: None,
+            style_example_input: None,
+            style_example_output: None,
+            style_example_pairs: Vec::new(),
+            enabled: true,
+            cleanup_effort: None,
+            cleanup_intensity: None,
+            cleanup_enabled: true,
+            dictionary_learn_enabled: true,
+        }
+    }
+
+    #[test]
+    fn three_short_rewrites_write_a_style_pair() {
+        let dir = temp_dir("style-learn-3x");
+        let mut mappings = vec![test_mapping("wechat")];
+        for _ in 0..2 {
+            let applied = apply_post_paste_style_learn(
+                &mut mappings,
+                &dir,
+                "wechat",
+                "好的我会稍后回复您",
+                "好的哈哈我晚点回你",
+                crate::llm::CleanupIntensity::Heavy,
+            )
+            .unwrap();
+            assert!(!applied.pairs_changed);
+        }
+        let applied = apply_post_paste_style_learn(
+            &mut mappings,
+            &dir,
+            "wechat",
+            "好的我会稍后回复您",
+            "好的哈哈我晚点回你",
+            crate::llm::CleanupIntensity::Heavy,
+        )
+        .unwrap();
+        assert!(applied.pairs_changed);
+        assert_eq!(mappings[0].style_example_pairs.len(), 1);
+        assert_eq!(mappings[0].style_example_pairs[0].output, "好的哈哈我晚点回你");
+    }
+
+    #[test]
+    fn three_casual_edits_demote_intensity() {
+        let dir = temp_dir("intensity-learn-3x");
+        let mut mappings = vec![test_mapping("wechat")];
+        for _ in 0..2 {
+            let applied = apply_post_paste_style_learn(
+                &mut mappings,
+                &dir,
+                "wechat",
+                "好的我会稍后回复您",
+                "好的哈哈我晚点回你",
+                crate::llm::CleanupIntensity::Heavy,
+            )
+            .unwrap();
+            assert!(!applied.intensity_changed);
+        }
+        let applied = apply_post_paste_style_learn(
+            &mut mappings,
+            &dir,
+            "wechat",
+            "好的我会稍后回复您",
+            "好的哈哈我晚点回你",
+            crate::llm::CleanupIntensity::Heavy,
+        )
+        .unwrap();
+        assert!(applied.intensity_changed);
+        assert!(applied.style_pair_key.is_some() && applied.intensity_pair_key.is_some());
+        assert_eq!(
+            mappings[0].cleanup_intensity,
+            Some(crate::llm::CleanupIntensity::Standard)
+        );
+        assert_eq!(
+            intensity_shift_from_edit(
+                "好的我会稍后回复您",
+                "好的哈哈我晚点回你",
+                crate::llm::CleanupIntensity::Heavy
+            ),
+            Some(-1)
+        );
+    }
+
+    #[test]
+    fn screen_token_does_not_become_style_pair() {
+        let ctx = crate::screen_text::ScreenTextContext {
+            tokens: vec!["晓雯".into()],
+            snippets: vec!["在吗".into(), "晚点回你".into()],
+            family: crate::context::ContextFamily::PersonalChat,
+            ..crate::screen_text::ScreenTextContext::default()
+        };
+        let dir = temp_dir("screen-no-style");
+        let mut dictionary = Vec::new();
+        let mut pairs: Vec<crate::context::StyleExamplePair> = Vec::new();
+        seed_lexicon_from_screen(&dir, &mut dictionary, &ctx, &mut pairs, None).unwrap();
+        assert!(pairs.is_empty());
+        assert!(!dictionary.iter().any(|item| item == "在吗" || item == "晚点回你"));
+        let rows = crate::store::list_learn_pairs(&dir).unwrap();
+        assert!(!rows.iter().any(|row| row.pair_key.starts_with("learn:style")));
+        assert!(!rows.iter().any(|row| row.after_surface == "在吗" || row.after_surface == "晚点回你"));
+    }
+
+    #[test]
+    fn person_name_promotes_at_two() {
+        let ctx = crate::screen_text::ScreenTextContext {
+            tokens: vec!["李明".into()],
+            family: crate::context::ContextFamily::PersonalChat,
+            ..crate::screen_text::ScreenTextContext::default()
+        };
+        let dir = temp_dir("screen-name-2x");
+        let mut dictionary = Vec::new();
+        let mut pairs = Vec::new();
+        seed_lexicon_from_screen(&dir, &mut dictionary, &ctx, &mut pairs, None).unwrap();
+        assert!(dictionary.is_empty());
+        seed_lexicon_from_screen(&dir, &mut dictionary, &ctx, &mut pairs, None).unwrap();
+        assert!(dictionary.contains(&"李明".to_string()));
+        assert!(pairs.is_empty());
     }
 }

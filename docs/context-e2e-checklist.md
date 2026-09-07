@@ -532,19 +532,19 @@ Clipboard 不是 LLM context，而是 delivery safety context。
 
 ## 18. Image / Screen Context
 
-当前状态：BLOCKED / NOT IMPLEMENTED。
+当前状态：Phase 1 AX + Phase 2 opt-in 本机 OCR + Phase 3 看屏幕热键。
 
-本轮只验证安全边界：
+本轮安全边界：
 
-- [ ] 当前没有图片/屏幕采集入口
-- [ ] 未经用户触发不会截屏
-- [ ] 不会持续录屏
-- [ ] 不会把截图上传给 LLM
-- [ ] 不会把图片内容伪装成普通 text context
-- [ ] 不会把截图保存到 History
-- [ ] 图片存在时不会改变 cleanup policy
+- [x] 默认听写没有截图进 LLM 的入口
+- [x] 未经用户触发（看屏幕热键）不会把窗口图发给 LLM
+- [x] 不会持续录屏
+- [x] 默认听写不会把截图上传给 LLM；Phase 3 只发一张用户触发的窗口图
+- [x] Phase 1/2 屏幕字是 token，不是整段邮件进 History
+- [x] 不会把截图保存到 History
+- [x] 图片存在时不会改变默认听写 cleanup policy
 
-未来实现 Image / Screen Context 后，必须新增：
+已实现后继续核对：
 
 ### 18.1 Image capture
 

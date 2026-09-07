@@ -26,7 +26,7 @@ function errorMessage(reason: unknown): string {
 async function setHotkeysSuspended(
   suspended: boolean,
   captured?: CapturedHotkey | null,
-  captureTarget: "dictation" | "selected_action" = "dictation",
+  captureTarget: "dictation" | "selected_action" | "screen_action" = "dictation",
 ) {
   await invoke("set_hotkeys_suspended", {
     suspended,
@@ -61,7 +61,7 @@ export function useHotkeyCapture({
   onRecord: (result: CapturedHotkey) => void;
   onCancel?: () => void;
   translate?: (source: string) => string;
-  captureTarget?: "dictation" | "selected_action";
+  captureTarget?: "dictation" | "selected_action" | "screen_action";
 }) {
   const [isRecording, setIsRecording] = useState(false);
   const [recordedHotkey, setRecordedHotkey] = useState<string | null>(null);

@@ -9,6 +9,7 @@ static LAST_REGISTERED: Mutex<Option<(String, String)>> = Mutex::new(None);
 static CANCEL_REGISTERED: AtomicBool = AtomicBool::new(false);
 static REGISTRATION_ERROR: Mutex<Option<String>> = Mutex::new(None);
 static SELECTED_ACTION_REGISTERED: Mutex<Option<String>> = Mutex::new(None);
+static SCREEN_ACTION_REGISTERED: Mutex<Option<String>> = Mutex::new(None);
 
 pub const HYBRID_HOLD_MS: u64 = 280;
 
@@ -332,6 +333,56 @@ pub fn register_selected_action(app: &AppHandle, hotkey: &str) -> Result<(), Str
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(hotkey.to_owned());
     Ok(())
+}
+
+fn unregister_screen_action_on_main(app: &AppHandle) {
+    let previous = SCREEN_ACTION_REGISTERED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take();
+    if let Some(previous) = previous {
+        if let Ok(shortcut) = previous.parse::<Shortcut>() {
+            let _ = app.global_shortcut().unregister(shortcut);
+        }
+    }
+}
+
+/// Register the optional look-at-screen shortcut. Empty means off.
+pub fn register_screen_action(app: &AppHandle, hotkey: &str) -> Result<(), String> {
+    unregister_screen_action_on_main(app);
+    let hotkey = canonicalize_hotkey(hotkey);
+    if hotkey.trim().is_empty() {
+        return Ok(());
+    }
+    let shortcut: Shortcut = hotkey
+        .parse()
+        .map_err(|error| format!("invalid look-at-screen hotkey `{hotkey}`: {error}"))?;
+    app.global_shortcut()
+        .on_shortcut(shortcut, move |app, _, event| {
+            if !is_suspended() && event.state == ShortcutState::Pressed {
+                let _ = app.emit("hotkey://screen-action", ());
+            }
+        })
+        .map_err(|error| format!("failed to register look-at-screen hotkey: {error}"))?;
+    *SCREEN_ACTION_REGISTERED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(hotkey.to_owned());
+    Ok(())
+}
+
+pub async fn apply_screen_action_hotkey(app: &AppHandle, hotkey: &str) -> Result<(), String> {
+    let hotkey = hotkey.to_owned();
+    let dispatcher = app.clone();
+    let app_for_thread = app.clone();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    dispatcher
+        .run_on_main_thread(move || {
+            let result = register_screen_action(&app_for_thread, &hotkey);
+            let _ = tx.send(result);
+        })
+        .map_err(|error| format!("look-at-screen hotkey dispatch failed: {error}"))?;
+    rx.await
+        .map_err(|_| "look-at-screen hotkey dispatch was cancelled".to_owned())?
 }
 
 pub async fn apply_selected_action_hotkey(

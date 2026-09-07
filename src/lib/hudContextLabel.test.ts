@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { formatHudContextLabel } from "./hudContextLabel";
+import { formatHudContextLabel, formatHudIntensityLabel } from "./hudContextLabel";
 
 describe("formatHudContextLabel", () => {
   it("composes a known app with a Chinese style label", () => {
@@ -28,5 +28,34 @@ describe("formatHudContextLabel", () => {
     };
     expect(formatHudContextLabel("Cursor", "prompt_or_code", null, t)).toBe("Cursor · Code");
     expect(formatHudContextLabel(null, "general", null, t)).toBe("Unknown app · General");
+  });
+});
+
+describe("formatHudIntensityLabel", () => {
+  it("shows app and resolved intensity only", () => {
+    expect(formatHudIntensityLabel("WeChat", "heavy")).toBe("WeChat · 重");
+    expect(formatHudIntensityLabel("WeChat", "light")).toBe("WeChat · 轻");
+    expect(formatHudIntensityLabel("WeChat", "standard")).toBe("WeChat · 中");
+    expect(formatHudIntensityLabel("WeChat", "off")).toBe("WeChat · 关");
+  });
+
+  it("uses 未知应用 when the app name is missing", () => {
+    expect(formatHudIntensityLabel(null, "heavy")).toBe("未知应用 · 重");
+    expect(formatHudIntensityLabel("General", "heavy")).toBe("未知应用 · 重");
+  });
+
+  it("returns null without a resolved intensity", () => {
+    expect(formatHudIntensityLabel("WeChat", null)).toBeNull();
+    expect(formatHudIntensityLabel("WeChat", undefined)).toBeNull();
+  });
+
+  it("translates intensity labels through the i18n function", () => {
+    const t = (source: string) => {
+      if (source === "重") return "Heavy";
+      if (source === "未知应用") return "Unknown app";
+      return source;
+    };
+    expect(formatHudIntensityLabel("WeChat", "heavy", t)).toBe("WeChat · Heavy");
+    expect(formatHudIntensityLabel(null, "heavy", t)).toBe("Unknown app · Heavy");
   });
 });

@@ -83,6 +83,22 @@ export function RecordingSettings({ settings, save }: { settings: Settings; save
           </div>
         </div>
       </SettingsGroup>
+      <SettingsGroup title={t("看屏幕")} description={t("独立快捷键，先截当前窗口再说话；结果只进预览，默认听写不会截屏。")}>
+        <div className="px-4 py-4 sm:px-5">
+          <p className="text-sm font-medium text-primary">{t("看屏幕快捷键")}</p>
+          <p className="mt-1 text-xs leading-5 text-tertiary">{t("空着就不注册。需要屏幕录制、辅助功能和已配置的视觉模型。")}</p>
+          {!settings.screen_action_hotkey?.trim() && (
+            <p className="mt-2 text-xs text-tertiary">{t("未设置快捷键，看屏幕不会触发")}</p>
+          )}
+          <div className="mt-4">
+            <HotkeyRecorder
+              value={settings.screen_action_hotkey ?? ""}
+              captureTarget="screen_action"
+              onChange={(hotkey, _mode, options) => save({ screen_action_hotkey: hotkey }, options)}
+            />
+          </div>
+        </div>
+      </SettingsGroup>
       <SettingsGroup title={t("识别")}>
         <SettingsRow title={t("识别语言")} description={t("自动检测适合中文、English 和混合语音。只有在识别结果不稳定时，才建议手动指定。")}>
           <select aria-label={t("识别语言")} value={settings.language} onChange={(event) => save({ language: event.target.value })} className={selectClass}><option value="auto">{t("自动检测")}</option><option value="zh">{t("中文")}</option><option value="en">{t("English")}</option></select>

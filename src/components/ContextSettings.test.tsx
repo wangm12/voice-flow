@@ -66,11 +66,54 @@ describe("ContextSettings", () => {
     expect(await screen.findByPlaceholderText("Paste a typical WeChat message")).toBeInTheDocument();
   });
 
+  it("leaves the look-at-screen vision model unset", async () => {
+    render(
+      <ContextSettings
+        automationOnly
+        visionProvider=""
+        visionModel=""
+        onVisionProviderChange={vi.fn()}
+        onVisionModelChange={vi.fn()}
+      />,
+    );
+
+    expect(await screen.findByLabelText("视觉模型")).toHaveValue("");
+    expect(screen.getByLabelText("视觉服务商")).toHaveValue("");
+    expect(screen.queryByRole("option", { name: "Anthropic" })).not.toBeInTheDocument();
+  });
+
+  it("exposes accurate ASR fields that default empty", async () => {
+    render(
+      <ContextSettings
+        automationOnly
+        accurateAsrProvider="groq"
+        accurateAsrModel=""
+        onAccurateAsrProviderChange={vi.fn()}
+        onAccurateAsrModelChange={vi.fn()}
+      />,
+    );
+
+    expect(await screen.findByLabelText("精确转写模型")).toHaveValue("");
+    expect(screen.getByLabelText("精确转写服务商")).toHaveValue("groq");
+  });
+
+  it("exposes a window OCR opt-in that defaults off", async () => {
+    render(
+      <ContextSettings
+        automationOnly
+        windowOcrEnabled={false}
+        onWindowOcrEnabledChange={vi.fn()}
+      />,
+    );
+
+    expect(await screen.findByRole("switch", { name: "窗口文字识别" })).toHaveAttribute("aria-checked", "false");
+  });
+
   it("exposes per-app cleanup effort and learning controls", async () => {
     render(<ContextSettings />);
 
     fireEvent.change(await screen.findByRole("combobox", { name: "选择 App" }), { target: { value: "com.todesktop.230313mzl4w4u92" } });
-    expect(screen.getByRole("combobox", { name: "整理力度" })).toHaveValue("auto");
+    expect(screen.getByRole("combobox", { name: "整理强度" })).toHaveValue("auto");
     expect(screen.getByRole("switch", { name: "这个 App 使用 AI 整理" })).toHaveAttribute("aria-checked", "true");
     expect(screen.getByRole("switch", { name: "在这个 App 学习词条" })).toHaveAttribute("aria-checked", "true");
   });
@@ -109,10 +152,27 @@ describe("ContextSettings", () => {
         browser_host: null,
         enabled: true,
         cleanup_effort: null,
+        cleanup_intensity: null,
         cleanup_enabled: true,
         dictionary_learn_enabled: true,
       },
     }));
+  });
+
+  it("defaults global cleanup intensity to heavy and can save light", async () => {
+    const onCleanupIntensityChange = vi.fn();
+    render(
+      <ContextSettings
+        automationOnly
+        cleanupIntensity="heavy"
+        onCleanupIntensityChange={onCleanupIntensityChange}
+      />,
+    );
+
+    const control = await screen.findByRole("combobox", { name: "整理强度" });
+    expect(control).toHaveValue("heavy");
+    fireEvent.change(control, { target: { value: "light" } });
+    expect(onCleanupIntensityChange).toHaveBeenCalledWith("light");
   });
 
   it("uses a custom writing mode in an app mapping", async () => {
@@ -185,6 +245,7 @@ describe("ContextSettings", () => {
         browser_host: "mail.google.com",
         enabled: true,
         cleanup_effort: null,
+        cleanup_intensity: null,
         cleanup_enabled: true,
         dictionary_learn_enabled: true,
       },

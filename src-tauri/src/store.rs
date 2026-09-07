@@ -13,7 +13,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
-pub const SETTINGS_SCHEMA_VERSION: u32 = 18;
+pub const SETTINGS_SCHEMA_VERSION: u32 = 19;
 const HISTORY_SCHEMA_VERSION: i32 = 9;
 const LEARN_PAIRS_PENDING_CAP: i64 = 256;
 
@@ -91,6 +91,26 @@ pub struct Settings {
     pub keep_success_audio: bool,
     pub onboarded: bool,
     pub cleanup_enabled: bool,
+    #[serde(default = "default_cleanup_intensity")]
+    pub cleanup_intensity: String,
+    #[serde(default)]
+    pub accurate_asr_provider: crate::engine::EngineProvider,
+    #[serde(default)]
+    pub accurate_asr_model: String,
+    #[serde(default)]
+    pub accurate_asr_base_url: String,
+    #[serde(default = "default_cascade_timeout_ms")]
+    pub cascade_timeout_ms: u64,
+    #[serde(default = "default_cascade_proper_noun_threshold")]
+    pub cascade_proper_noun_threshold: usize,
+    #[serde(default)]
+    pub window_ocr_enabled: bool,
+    #[serde(default)]
+    pub screen_action_hotkey: String,
+    #[serde(default)]
+    pub vision_provider: String,
+    #[serde(default)]
+    pub vision_model: String,
     #[serde(default = "default_cleanup_model")]
     pub cleanup_model: String,
     #[serde(default)]
@@ -134,6 +154,18 @@ pub struct Settings {
     pub input_device: String,
     #[serde(default = "default_input_gain")]
     pub input_gain: f32,
+}
+
+fn default_cleanup_intensity() -> String {
+    "heavy".into()
+}
+
+fn default_cascade_timeout_ms() -> u64 {
+    5000
+}
+
+fn default_cascade_proper_noun_threshold() -> usize {
+    3
 }
 
 fn default_cleanup_model() -> String {
@@ -214,6 +246,16 @@ impl Default for Settings {
             keep_success_audio: false,
             onboarded: false,
             cleanup_enabled: true,
+            cleanup_intensity: default_cleanup_intensity(),
+            accurate_asr_provider: crate::engine::EngineProvider::Groq,
+            accurate_asr_model: String::new(),
+            accurate_asr_base_url: String::new(),
+            cascade_timeout_ms: default_cascade_timeout_ms(),
+            cascade_proper_noun_threshold: default_cascade_proper_noun_threshold(),
+            window_ocr_enabled: false,
+            screen_action_hotkey: String::new(),
+            vision_provider: String::new(),
+            vision_model: String::new(),
             cleanup_model: default_cleanup_model(),
             cleanup_provider: crate::engine::EngineProvider::Groq,
             cleanup_base_url: String::new(),
@@ -339,6 +381,7 @@ impl Settings {
         self.hotkey = crate::hotkey::canonicalize_hotkey(&self.hotkey);
         self.selected_action_hotkey =
             crate::hotkey::canonicalize_hotkey(&self.selected_action_hotkey);
+        self.screen_action_hotkey = crate::hotkey::canonicalize_hotkey(&self.screen_action_hotkey);
         if self.activation_mode == "hold" {
             self.activation_mode = if crate::modifier_hotkey::is_modifier_only(&self.hotkey) {
                 "double_tap"
@@ -378,6 +421,27 @@ impl Settings {
                 let trimmed: String = value.trim().chars().take(2_000).collect();
                 (!trimmed.is_empty()).then_some(trimmed)
             });
+            if mapping.style_example_pairs.is_empty() {
+                if let (Some(input), Some(output)) = (
+                    mapping.style_example_input.clone(),
+                    mapping.style_example_output.clone(),
+                ) {
+                    mapping.style_example_pairs.push(crate::context::StyleExamplePair { input, output });
+                }
+            } else {
+                mapping.style_example_pairs.truncate(3);
+                for pair in &mut mapping.style_example_pairs {
+                    pair.input = pair.input.trim().chars().take(2_000).collect();
+                    pair.output = pair.output.trim().chars().take(2_000).collect();
+                }
+                mapping
+                    .style_example_pairs
+                    .retain(|pair| !pair.input.is_empty() && !pair.output.is_empty());
+                if let Some(first) = mapping.style_example_pairs.first() {
+                    mapping.style_example_input = Some(first.input.clone());
+                    mapping.style_example_output = Some(first.output.clone());
+                }
+            }
         }
         crate::context::normalize_writing_modes(&mut self.writing_modes);
         crate::snippets::normalize_snippets(&mut self.snippets);
@@ -399,12 +463,36 @@ impl Settings {
         if crate::modifier_hotkey::is_modifier_only(&self.selected_action_hotkey) {
             self.selected_action_hotkey.clear();
         }
+        if self.screen_action_hotkey.len() > 128 {
+            self.screen_action_hotkey.clear();
+        }
+        if crate::modifier_hotkey::is_modifier_only(&self.screen_action_hotkey) {
+            self.screen_action_hotkey.clear();
+        }
+        self.vision_provider = self.vision_provider.trim().chars().take(64).collect();
+        if !self.vision_provider.is_empty()
+            && crate::engine::EngineProvider::parse(&self.vision_provider).is_none()
+        {
+            self.vision_provider.clear();
+        }
+        self.vision_model = self.vision_model.trim().chars().take(256).collect();
         self.input_device = self.input_device.trim().chars().take(512).collect();
         self.input_gain = if self.input_gain.is_finite() {
             self.input_gain.clamp(0.5, 4.0)
         } else {
             default_input_gain()
         };
+        if crate::llm::CleanupIntensity::parse(&self.cleanup_intensity).is_none() {
+            self.cleanup_intensity = default_cleanup_intensity();
+        }
+        if self.cascade_timeout_ms == 0 {
+            self.cascade_timeout_ms = default_cascade_timeout_ms();
+        }
+        if self.cascade_proper_noun_threshold == 0 {
+            self.cascade_proper_noun_threshold = default_cascade_proper_noun_threshold();
+        }
+        self.accurate_asr_model = self.accurate_asr_model.trim().chars().take(256).collect();
+        self.accurate_asr_base_url = self.accurate_asr_base_url.trim().chars().take(2_048).collect();
         self.asr_base_url = self.asr_base_url.trim().chars().take(2_048).collect();
         self.cleanup_base_url = self.cleanup_base_url.trim().chars().take(2_048).collect();
         self.asr_model = crate::asr::resolve_asr_model(&self.asr_model).to_owned();
@@ -610,6 +698,9 @@ impl Settings {
         ) {
             anyhow::bail!("unsupported delivery policy");
         }
+        if crate::llm::CleanupIntensity::parse(&self.cleanup_intensity).is_none() {
+            anyhow::bail!("unsupported cleanup intensity");
+        }
         if self.cleanup_provider.is_groq() {
             if !crate::llm::is_supported_model(&self.cleanup_model) {
                 anyhow::bail!("unsupported cleanup model");
@@ -695,6 +786,20 @@ impl Settings {
         }
         if crate::modifier_hotkey::is_modifier_only(&self.selected_action_hotkey) {
             anyhow::bail!("selected action hotkeys require a key combination");
+        }
+        if self.screen_action_hotkey.len() > 128 {
+            anyhow::bail!("look-at-screen hotkey is too long");
+        }
+        if crate::modifier_hotkey::is_modifier_only(&self.screen_action_hotkey) {
+            anyhow::bail!("look-at-screen hotkeys require a key combination");
+        }
+        if !self.vision_provider.is_empty()
+            && crate::engine::EngineProvider::parse(&self.vision_provider).is_none()
+        {
+            anyhow::bail!("unsupported vision provider");
+        }
+        if self.vision_model.len() > 256 {
+            anyhow::bail!("vision model name is too long");
         }
         if self.input_device.len() > 512 {
             anyhow::bail!("input device name is too long");
@@ -801,6 +906,48 @@ impl Settings {
     /// Groq default or `api.groq.com`; custom hosts must supply `asr_api_key`.
     pub fn asr_credential(&self) -> &str {
         self.provider_secret(self.asr_provider)
+    }
+
+    pub fn accurate_asr_configured(&self) -> bool {
+        !self.accurate_asr_model.trim().is_empty()
+    }
+
+    pub fn accurate_asr_credential(&self) -> &str {
+        self.provider_secret(self.accurate_asr_provider)
+    }
+
+    pub fn accurate_asr_endpoint(&self) -> String {
+        let base = if !self.accurate_asr_base_url.trim().is_empty() {
+            self.accurate_asr_base_url.trim().to_owned()
+        } else {
+            self.resolved_provider_base(self.accurate_asr_provider)
+        };
+        crate::providers::resolve_asr_endpoint(self.accurate_asr_provider, &base)
+    }
+
+    pub fn vision_configured(&self) -> bool {
+        if !crate::screen_action::vision_settings_ready(&self.vision_provider, &self.vision_model) {
+            return false;
+        }
+        let Some(provider) = crate::engine::EngineProvider::parse(&self.vision_provider) else {
+            return false;
+        };
+        let key = self.provider_secret(provider);
+        !key.is_empty() || provider.allows_empty_key()
+    }
+
+    pub fn vision_credential(&self) -> &str {
+        match crate::engine::EngineProvider::parse(&self.vision_provider) {
+            Some(provider) => self.provider_secret(provider),
+            None => "",
+        }
+    }
+
+    pub fn vision_endpoint(&self) -> Option<String> {
+        let provider = crate::engine::EngineProvider::parse(&self.vision_provider)?;
+        Some(crate::llm::resolve_chat_url(
+            &self.resolved_provider_base(provider),
+        ))
     }
 
     pub fn cleanup_credential(&self) -> &str {
@@ -919,6 +1066,16 @@ pub struct SettingsView {
     pub keep_success_audio: bool,
     pub onboarded: bool,
     pub cleanup_enabled: bool,
+    pub cleanup_intensity: String,
+    pub accurate_asr_provider: crate::engine::EngineProvider,
+    pub accurate_asr_model: String,
+    pub accurate_asr_base_url: String,
+    pub cascade_timeout_ms: u64,
+    pub cascade_proper_noun_threshold: usize,
+    pub window_ocr_enabled: bool,
+    pub screen_action_hotkey: String,
+    pub vision_provider: String,
+    pub vision_model: String,
     pub show_tray_icon: bool,
     pub context_enabled: bool,
     pub browser_access_enabled: bool,
@@ -988,6 +1145,16 @@ impl From<&Settings> for SettingsView {
             keep_success_audio: settings.keep_success_audio,
             onboarded: settings.onboarded,
             cleanup_enabled: settings.cleanup_enabled,
+            cleanup_intensity: settings.cleanup_intensity.clone(),
+            accurate_asr_provider: settings.accurate_asr_provider,
+            accurate_asr_model: settings.accurate_asr_model.clone(),
+            accurate_asr_base_url: settings.accurate_asr_base_url.clone(),
+            cascade_timeout_ms: settings.cascade_timeout_ms,
+            cascade_proper_noun_threshold: settings.cascade_proper_noun_threshold,
+            window_ocr_enabled: settings.window_ocr_enabled,
+            screen_action_hotkey: settings.screen_action_hotkey.clone(),
+            vision_provider: settings.vision_provider.clone(),
+            vision_model: settings.vision_model.clone(),
             show_tray_icon: settings.show_tray_icon,
             context_enabled: settings.context_enabled,
             browser_access_enabled: settings.browser_access_enabled,
@@ -2592,6 +2759,15 @@ pub fn ensure_learn_pair_promoted(
     Ok(())
 }
 
+pub fn set_learn_pair_hits(dir: &Path, pair_key: &str, hits: u32) -> anyhow::Result<bool> {
+    let c = open_history(dir)?;
+    c.execute(
+        "UPDATE learn_pairs SET hits = ?2, promoted = 0, last_at = datetime('now') WHERE pair_key = ?1 AND ignored = 0 AND tombstoned_at IS NULL",
+        params![pair_key, hits as i64],
+    )?;
+    Ok(c.changes() > 0)
+}
+
 pub fn tombstone_learn_pair(dir: &Path, pair_key: &str) -> anyhow::Result<bool> {
     let c = open_history(dir)?;
     c.execute(
@@ -3251,6 +3427,105 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
     #[test]
+    fn schema_19_defaults_cleanup_intensity_heavy() {
+        let settings = Settings::default();
+        assert_eq!(settings.cleanup_intensity, "heavy");
+        assert_eq!(settings.cascade_timeout_ms, 5000);
+        assert_eq!(settings.cascade_proper_noun_threshold, 3);
+        assert!(settings.accurate_asr_model.is_empty());
+        assert_eq!(
+            settings.accurate_asr_provider,
+            crate::engine::EngineProvider::Groq
+        );
+        assert_eq!(settings.schema_version, 19);
+        let view = SettingsView::from(&settings);
+        assert_eq!(view.cleanup_intensity, "heavy");
+        assert_eq!(view.cascade_timeout_ms, 5000);
+        assert_eq!(view.cascade_proper_noun_threshold, 3);
+        assert!(view.accurate_asr_model.is_empty());
+        assert!(!settings.accurate_asr_configured());
+        assert!(!settings.window_ocr_enabled);
+        assert!(!view.window_ocr_enabled);
+        assert!(settings.screen_action_hotkey.is_empty());
+        assert!(settings.vision_provider.is_empty());
+        assert!(settings.vision_model.is_empty());
+        assert!(!settings.vision_configured());
+        assert!(view.screen_action_hotkey.is_empty());
+        assert!(view.vision_model.is_empty());
+    }
+
+    #[test]
+    fn accurate_asr_helpers_use_model_and_provider_keychain() {
+        let mut settings = Settings::default();
+        assert!(!settings.accurate_asr_configured());
+        assert_eq!(settings.accurate_asr_credential(), "");
+        settings.accurate_asr_model = "whisper-large-v3".into();
+        settings.accurate_asr_provider = crate::engine::EngineProvider::OpenAi;
+        settings
+            .provider_api_keys
+            .insert("openai".into(), "sk-accurate".into());
+        assert!(settings.accurate_asr_configured());
+        assert_eq!(settings.accurate_asr_credential(), "sk-accurate");
+        assert!(settings.accurate_asr_endpoint().contains("transcriptions"));
+    }
+
+    #[test]
+    fn vision_configured_needs_provider_model_and_key() {
+        let mut settings = Settings::default();
+        settings.vision_model = "gpt-4o".into();
+        assert!(!settings.vision_configured());
+        settings.vision_provider = "openai".into();
+        assert!(!settings.vision_configured());
+        settings
+            .provider_api_keys
+            .insert("openai".into(), "sk-vision".into());
+        assert!(settings.vision_configured());
+        settings.vision_provider = "ollama".into();
+        settings.vision_model = "llava".into();
+        assert!(settings.vision_configured());
+    }
+
+    #[test]
+    fn schema_19_copies_legacy_style_example_into_pairs() {
+        let mut settings = Settings {
+            cleanup_intensity: String::new(),
+            cascade_timeout_ms: 0,
+            cascade_proper_noun_threshold: 0,
+            context_mappings: vec![crate::context::AppMapping {
+                id: "wechat".into(),
+                label: "微信".into(),
+                family: crate::context::ContextFamily::PersonalChat,
+                mode_id: None,
+                bundle_id: Some("com.tencent.xinWeChat".into()),
+                executable: None,
+                browser_host: None,
+                style_example_input: Some("好的哈哈".into()),
+                style_example_output: Some("好的哈哈。".into()),
+                style_example_pairs: Vec::new(),
+                enabled: true,
+                cleanup_effort: None,
+                cleanup_intensity: None,
+                cleanup_enabled: true,
+                dictionary_learn_enabled: true,
+            }],
+            ..Settings::default()
+        };
+        settings.normalize();
+        assert_eq!(settings.cleanup_intensity, "heavy");
+        assert_eq!(settings.cascade_timeout_ms, 5000);
+        assert_eq!(settings.cascade_proper_noun_threshold, 3);
+        assert_eq!(settings.context_mappings[0].style_example_pairs.len(), 1);
+        assert_eq!(
+            settings.context_mappings[0].style_example_pairs[0].input,
+            "好的哈哈"
+        );
+        assert_eq!(
+            settings.context_mappings[0].style_example_pairs[0].output,
+            "好的哈哈。"
+        );
+    }
+
+    #[test]
     fn old_settings_get_new_defaults() {
         let dir = temp_dir("settings");
         std::fs::create_dir_all(&dir).unwrap();
@@ -3262,6 +3537,10 @@ mod tests {
         let (settings, _) = load_settings(&dir);
         assert!(!settings.onboarded);
         assert!(settings.cleanup_enabled);
+        assert_eq!(settings.cleanup_intensity, "heavy");
+        assert_eq!(settings.cascade_timeout_ms, 5000);
+        assert_eq!(settings.cascade_proper_noun_threshold, 3);
+        assert!(settings.accurate_asr_model.is_empty());
         assert!(settings.show_tray_icon);
         assert_eq!(settings.cleanup_model, crate::llm::MODEL);
         assert_eq!(settings.activation_mode, "tap");

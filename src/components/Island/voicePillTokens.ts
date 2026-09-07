@@ -50,6 +50,7 @@ type PillCaptionOptions = {
   selectedActionState?: string | null;
   contextLabel?: string | null;
   partialText?: string | null;
+  phase?: string | null;
   chunkProgress?: {
     completed: number;
     total: number;
@@ -115,6 +116,9 @@ export function pillCaption(
   }
 
   const selectedState = options?.selectedActionState;
+  if (!statusCaption && state === "processing" && options?.phase === "cascade_accurate") {
+    statusCaption = translate("精确重打中");
+  }
   if (!statusCaption && state === "processing" && selectedState === "preparing_rewrite") {
     statusCaption = selectedActionCaption("preparing_rewrite", translate);
   }

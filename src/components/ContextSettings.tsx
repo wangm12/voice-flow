@@ -9,6 +9,7 @@ import { IconButton } from "./IconButton";
 import { Toggle } from "./Toggle";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { SettingsAlert, SettingsGroup, SettingsPageHeader, SettingsRow, SettingsShell } from "./SettingsLayout";
+import type { ProviderId } from "../lib/providers";
 
 export type ContextFamily =
   | "email"
@@ -42,8 +43,10 @@ type ContextMapping = {
   browser_host?: string | null;
   style_example_input?: string | null;
   style_example_output?: string | null;
+  style_example_pairs?: { input: string; output: string }[];
   enabled: boolean;
   cleanup_effort?: "light" | "standard" | null;
+  cleanup_intensity?: "off" | "light" | "standard" | "heavy" | null;
   cleanup_enabled?: boolean;
   dictionary_learn_enabled?: boolean;
 };
@@ -73,6 +76,16 @@ function mergeApplicationOptions(...groups: ApplicationOption[][]): ApplicationO
 
 function applicationsFromMappings(mappings: ContextMapping[]): ApplicationOption[] {
   return mappings.flatMap((mapping) => mapping.bundle_id ? [{ bundle_id: mapping.bundle_id, label: mapping.label }] : []);
+}
+
+function mappingIntensityFrom(
+  mapping?: ContextMapping,
+): "auto" | "off" | "light" | "standard" | "heavy" {
+  if (mapping?.cleanup_intensity) return mapping.cleanup_intensity;
+  if (mapping?.cleanup_effort === "light" || mapping?.cleanup_effort === "standard") {
+    return mapping.cleanup_effort;
+  }
+  return "auto";
 }
 
 const familyLabels: Record<ContextFamily, string> = {
@@ -161,6 +174,20 @@ export function ContextSettings({
   translationTargetLanguage,
   onOutputModeChange,
   onTranslationTargetLanguageChange,
+  cleanupIntensity = "heavy",
+  onCleanupIntensityChange,
+  windowOcrEnabled = false,
+  onWindowOcrEnabledChange,
+  visionProvider = "",
+  visionModel = "",
+  onVisionProviderChange,
+  onVisionModelChange,
+  accurateAsrProvider = "groq",
+  accurateAsrModel = "",
+  accurateAsrBaseUrl = "",
+  onAccurateAsrProviderChange,
+  onAccurateAsrModelChange,
+  onAccurateAsrBaseUrlChange,
 }: {
   writingModes?: WritingMode[];
   onWritingModesChange?: (writingModes: WritingMode[]) => void;
@@ -170,6 +197,20 @@ export function ContextSettings({
   translationTargetLanguage?: string;
   onOutputModeChange?: (outputMode: string) => void;
   onTranslationTargetLanguageChange?: (language: string) => void;
+  cleanupIntensity?: "off" | "light" | "standard" | "heavy";
+  onCleanupIntensityChange?: (intensity: "off" | "light" | "standard" | "heavy") => void;
+  windowOcrEnabled?: boolean;
+  onWindowOcrEnabledChange?: (enabled: boolean) => void;
+  visionProvider?: string;
+  visionModel?: string;
+  onVisionProviderChange?: (provider: string) => void;
+  onVisionModelChange?: (model: string) => void;
+  accurateAsrProvider?: ProviderId;
+  accurateAsrModel?: string;
+  accurateAsrBaseUrl?: string;
+  onAccurateAsrProviderChange?: (provider: ProviderId) => void;
+  onAccurateAsrModelChange?: (model: string) => void;
+  onAccurateAsrBaseUrlChange?: (url: string) => void;
 }) {
   const { t } = useI18n();
   const [snapshot, setSnapshot] = useState<ContextSnapshot | null>(null);
@@ -180,7 +221,7 @@ export function ContextSettings({
   const [selectedModeId, setSelectedModeId] = useState("general");
   const [styleExampleInput, setStyleExampleInput] = useState("");
   const [styleExampleOutput, setStyleExampleOutput] = useState("");
-  const [cleanupEffort, setCleanupEffort] = useState<"auto" | "light" | "standard">("auto");
+  const [mappingIntensity, setMappingIntensity] = useState<"auto" | "off" | "light" | "standard" | "heavy">("auto");
   const [mappingCleanupEnabled, setMappingCleanupEnabled] = useState(true);
   const [mappingLearnEnabled, setMappingLearnEnabled] = useState(true);
   const [writingModes, setWritingModes] = useState<WritingMode[]>(managedWritingModes);
@@ -427,7 +468,7 @@ export function ContextSettings({
     setSelectedModeId(existing?.mode_id ?? familyModeId(existing?.family ?? "general"));
     setStyleExampleInput(existing?.style_example_input ?? "");
     setStyleExampleOutput(existing?.style_example_output ?? "");
-    setCleanupEffort(existing?.cleanup_effort ?? "auto");
+    setMappingIntensity(mappingIntensityFrom(existing));
     setMappingCleanupEnabled(existing?.cleanup_enabled !== false);
     setMappingLearnEnabled(existing?.dictionary_learn_enabled !== false);
     setError(null);
@@ -439,7 +480,7 @@ export function ContextSettings({
     if (existing) setSelectedModeId(existing.mode_id ?? familyModeId(existing.family));
     setStyleExampleInput(existing?.style_example_input ?? "");
     setStyleExampleOutput(existing?.style_example_output ?? "");
-    setCleanupEffort(existing?.cleanup_effort ?? "auto");
+    setMappingIntensity(mappingIntensityFrom(existing));
     setMappingCleanupEnabled(existing?.cleanup_enabled !== false);
     setMappingLearnEnabled(existing?.dictionary_learn_enabled !== false);
     setError(null);
@@ -516,7 +557,8 @@ export function ContextSettings({
           executable: null,
           browser_host: browserHost,
           enabled: true,
-          cleanup_effort: cleanupEffort === "auto" ? null : cleanupEffort,
+          cleanup_effort: null,
+          cleanup_intensity: mappingIntensity === "auto" ? null : mappingIntensity,
           cleanup_enabled: mappingCleanupEnabled,
           dictionary_learn_enabled: mappingLearnEnabled,
         };
@@ -524,6 +566,9 @@ export function ContextSettings({
       const styleOutput = styleExampleOutput.trim();
       if (styleInput) mapping.style_example_input = styleInput;
       if (styleOutput) mapping.style_example_output = styleOutput;
+      if (existing?.style_example_pairs?.length) {
+        mapping.style_example_pairs = existing.style_example_pairs;
+      }
       const next = await invoke<ContextMapping[]>("save_context_mapping", { mapping });
       setMappings(next);
       setSelectedApplicationId("");
@@ -531,7 +576,7 @@ export function ContextSettings({
       setSelectedModeId("general");
       setStyleExampleInput("");
       setStyleExampleOutput("");
-      setCleanupEffort("auto");
+      setMappingIntensity("auto");
       setMappingCleanupEnabled(true);
       setMappingLearnEnabled(true);
     } catch (reason) {
@@ -581,6 +626,84 @@ export function ContextSettings({
                 <option value="auto">{t("自动适配")}</option>
                 {Object.entries(familyLabels).map(([value, label]) => <option key={value} value={value}>{t(label)}</option>)}
               </select>
+            </SettingsRow>
+            <SettingsRow title={t("整理强度")} description={t("默认对所有 App 用重度整理；也可以按 App 单独覆盖。")}>
+              <select
+                aria-label={t("整理强度")}
+                value={cleanupIntensity}
+                onChange={(event) => onCleanupIntensityChange?.(event.target.value as "off" | "light" | "standard" | "heavy")}
+                disabled={busy}
+                className={`w-52 max-w-full ${fieldClass}`}
+              >
+                <option value="off">{t("关")}</option>
+                <option value="light">{t("轻")}</option>
+                <option value="standard">{t("中")}</option>
+                <option value="heavy">{t("重")}</option>
+              </select>
+            </SettingsRow>
+            <SettingsRow title={t("窗口文字识别")} description={t("当辅助功能读到的字太少时，只截当前听写窗口并在本机识别。默认关闭，需要屏幕录制权限。")}>
+              <Toggle checked={windowOcrEnabled} onChange={(next) => onWindowOcrEnabledChange?.(next)} disabled={busy || !onWindowOcrEnabledChange} label={t("窗口文字识别")} />
+            </SettingsRow>
+            <SettingsRow title={t("精确转写")} description={t("留空则关闭二次转写。只在人名多、主转写失败或置信度低时用。")}>
+              <div className="flex w-full max-w-md flex-col gap-2">
+                <div className="flex w-full flex-col gap-2 sm:flex-row">
+                  <select
+                    aria-label={t("精确转写服务商")}
+                    value={accurateAsrProvider}
+                    onChange={(event) => onAccurateAsrProviderChange?.(event.target.value as ProviderId)}
+                    disabled={busy || !onAccurateAsrProviderChange}
+                    className={`w-full sm:w-40 ${fieldClass}`}
+                  >
+                    <option value="groq">Groq</option>
+                    <option value="openai">OpenAI</option>
+                    <option value="siliconflow">SiliconFlow</option>
+                    <option value="custom">{t("自定义")}</option>
+                  </select>
+                  <input
+                    aria-label={t("精确转写模型")}
+                    value={accurateAsrModel}
+                    onChange={(event) => onAccurateAsrModelChange?.(event.target.value)}
+                    disabled={busy || !onAccurateAsrModelChange}
+                    placeholder={t("例如 whisper-large-v3")}
+                    className={`w-full ${fieldClass}`}
+                  />
+                </div>
+                {accurateAsrProvider === "custom" && (
+                  <input
+                    aria-label={t("精确转写地址")}
+                    value={accurateAsrBaseUrl}
+                    onChange={(event) => onAccurateAsrBaseUrlChange?.(event.target.value)}
+                    disabled={busy || !onAccurateAsrBaseUrlChange}
+                    placeholder="https://api.example.com/v1"
+                    className={`w-full ${fieldClass}`}
+                  />
+                )}
+              </div>
+            </SettingsRow>
+            <SettingsRow title={t("视觉模型")} description={t("看屏幕热键才会把一张窗口图发给这个模型。留空则拒绝截屏。会议录音、Spark 和生图仍然不做。")}>
+              <div className="flex w-full max-w-md flex-col gap-2 sm:flex-row">
+                <select
+                  aria-label={t("视觉服务商")}
+                  value={visionProvider}
+                  onChange={(event) => onVisionProviderChange?.(event.target.value)}
+                  disabled={busy || !onVisionProviderChange}
+                  className={`w-full sm:w-40 ${fieldClass}`}
+                >
+                  <option value="">{t("未配置")}</option>
+                  <option value="openai">OpenAI</option>
+                  <option value="groq">Groq</option>
+                  <option value="ollama">Ollama</option>
+                  <option value="custom">{t("自定义")}</option>
+                </select>
+                <input
+                  aria-label={t("视觉模型")}
+                  value={visionModel}
+                  onChange={(event) => onVisionModelChange?.(event.target.value)}
+                  disabled={busy || !onVisionModelChange}
+                  placeholder={t("例如 gpt-4o")}
+                  className={`w-full ${fieldClass}`}
+                />
+              </div>
             </SettingsRow>
             {snapshot?.browser_access_status !== "not_applicable" && snapshot?.browser_access_status !== "granted" && (
               <SettingsRow title={t("浏览器站点检测")} description={t("Chrome / Safari 需要额外授权，VoiceFlow 只保存站点标识。")} icon={<Globe size={17} className="text-warning" aria-hidden="true" />}>
@@ -656,11 +779,13 @@ export function ContextSettings({
               <textarea aria-label={t("App 风格期望输出")} value={styleExampleOutput} onChange={(event) => setStyleExampleOutput(event.target.value)} maxLength={2_000} rows={3} disabled={busy || !selectedApplicationId} placeholder={t("希望 VoiceFlow 输出的样子…")} className={`mt-1 w-full resize-y rounded-lg border ${colors.border} ${colors.bg.elevated} ${colors.text.primary} px-3 py-2 text-sm outline-none focus:border-accent ${focusRingClass}`} />
             </label>
           </div>
-          <label className="block text-xs text-secondary">{t("整理力度")}
-            <select aria-label={t("整理力度")} value={cleanupEffort} onChange={(event) => setCleanupEffort(event.target.value as "auto" | "light" | "standard")} disabled={busy || !selectedApplicationId} className={`mt-1 w-full ${fieldClass}`}>
-              <option value="auto">{t("跟随场景")}</option>
-              <option value="light">{t("轻度：去口头禅，保持口语")}</option>
-              <option value="standard">{t("标准整理")}</option>
+          <label className="block text-xs text-secondary">{t("整理强度")}
+            <select aria-label={t("整理强度")} value={mappingIntensity} onChange={(event) => setMappingIntensity(event.target.value as "auto" | "off" | "light" | "standard" | "heavy")} disabled={busy || !selectedApplicationId} className={`mt-1 w-full ${fieldClass}`}>
+              <option value="auto">{t("跟随全局")}</option>
+              <option value="off">{t("关")}</option>
+              <option value="light">{t("轻")}</option>
+              <option value="standard">{t("中")}</option>
+              <option value="heavy">{t("重")}</option>
             </select>
           </label>
           <SettingsRow title={t("这个 App 使用 AI 整理")} description={t("关闭后仍会去掉 um / 嗯，但不请求整理服务。")}>

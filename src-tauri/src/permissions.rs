@@ -12,6 +12,7 @@ pub struct PermissionStatus {
     pub microphone: bool,
     pub microphone_status: String,
     pub accessibility: bool,
+    pub screen_recording: bool,
 }
 #[cfg(target_os = "macos")]
 #[link(name = "AVFoundation", kind = "framework")]
@@ -48,6 +49,7 @@ pub fn check() -> PermissionStatus {
             }
             .into(),
             accessibility: accessibility_is_trusted(),
+            screen_recording: screen_recording_is_allowed(),
         }
     }
 }
@@ -57,6 +59,7 @@ pub fn check() -> PermissionStatus {
         microphone: true,
         microphone_status: "authorized".into(),
         accessibility: true,
+        screen_recording: true,
     }
 }
 #[cfg(target_os = "macos")]
@@ -102,6 +105,7 @@ pub fn open_privacy_settings(pane: &str) -> Result<(), String> {
         let url = match pane {
             "accessibility" => "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_Accessibility",
             "microphone" => "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_Microphone",
+            "screen" => "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_ScreenCapture",
             _ => return Err(format!("unknown pane: {pane}")),
         };
         std::process::Command::new("open")
@@ -136,5 +140,19 @@ pub fn request_accessibility() -> bool {
 
 #[cfg(not(target_os = "macos"))]
 pub fn request_accessibility() -> bool {
+    true
+}
+
+#[cfg(target_os = "macos")]
+pub fn screen_recording_is_allowed() -> bool {
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGPreflightScreenCaptureAccess() -> bool;
+    }
+    unsafe { CGPreflightScreenCaptureAccess() }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn screen_recording_is_allowed() -> bool {
     true
 }

@@ -34,7 +34,7 @@ export function HotkeyRecorder({
   value: string;
   onChange: (hotkey: string, activationMode?: ActivationMode, options?: HotkeyChangeOptions) => void;
   disabled?: boolean;
-  captureTarget?: "dictation" | "selected_action";
+  captureTarget?: "dictation" | "selected_action" | "screen_action";
 }) {
   const { t } = useI18n();
   const surfaceRef = useRef<HTMLButtonElement>(null);

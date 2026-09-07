@@ -2,7 +2,8 @@
 
 use crate::context::{AppMapping, ContextFamily, ContextPolicy, ContextSnapshot};
 use crate::dictionary_learn::{is_cjk, is_latin_cont, is_latin_start, pair_key};
-use crate::llm::{CleanupEffort, CleanupIntent, IntentSource};
+use crate::llm::{CleanupEffort, CleanupIntensity, CleanupIntent, IntentSource};
+use crate::screen_text::ScreenTextContext;
 use crate::store::LearnPairRecord;
 use std::collections::HashSet;
 
@@ -138,10 +139,10 @@ pub enum CleanupRoute {
 
 pub fn decide_cleanup(
     settings_cleanup_enabled: bool,
+    global_intensity: CleanupIntensity,
     mapping: Option<&AppMapping>,
     family: ContextFamily,
     intent: &CleanupIntent,
-    profile_confidence: f32,
 ) -> CleanupRoute {
     if !settings_cleanup_enabled {
         return CleanupRoute::LocalOnly;
@@ -149,22 +150,30 @@ pub fn decide_cleanup(
     if mapping.is_some_and(|item| !item.cleanup_enabled) {
         return CleanupRoute::LocalOnly;
     }
-    if intent.source == IntentSource::SpokenCommand {
+    if matches!(
+        intent.source,
+        IntentSource::SpokenCommand | IntentSource::SelectedText
+    ) {
         return CleanupRoute::Provider(CleanupEffort::Command);
     }
     if intent.content.trim().is_empty() {
         return CleanupRoute::LocalOnly;
     }
-    if let Some(effort) = mapping.and_then(|item| item.cleanup_effort) {
-        return CleanupRoute::Provider(effort);
-    }
     if skips_llm_scene(family) {
         return CleanupRoute::LocalOnly;
     }
-    if profile_confidence < 0.75 {
-        return CleanupRoute::Provider(CleanupEffort::Light);
+    let resolved = mapping
+        .and_then(|item| item.cleanup_intensity)
+        .or_else(|| {
+            mapping
+                .and_then(|item| item.cleanup_effort)
+                .and_then(CleanupEffort::as_intensity)
+        })
+        .unwrap_or(global_intensity);
+    match resolved.as_effort() {
+        None => CleanupRoute::LocalOnly,
+        Some(effort) => CleanupRoute::Provider(effort),
     }
-    CleanupRoute::Provider(CleanupEffort::default_for_family(family))
 }
 
 fn skips_llm_scene(family: ContextFamily) -> bool {
@@ -220,7 +229,7 @@ fn mapping_matching_target<'a>(
     })
 }
 
-fn is_default_learn_off_target(bundle_id: Option<&str>, browser_host: Option<&str>) -> bool {
+pub(crate) fn is_default_learn_off_target(bundle_id: Option<&str>, browser_host: Option<&str>) -> bool {
     if bundle_id.is_some_and(is_learn_off_bundle) {
         return true;
     }
@@ -518,6 +527,7 @@ pub fn build_asr_prompt(
         pairs,
         scope,
         AsrPromptShape::WhisperTranscript,
+        None,
     )
 }
 
@@ -527,6 +537,7 @@ pub fn build_asr_prompt_shaped(
     pairs: &[LearnPairRecord],
     scope: Option<&PromptScope>,
     shape: AsrPromptShape,
+    screen: Option<&ScreenTextContext>,
 ) -> Option<String> {
     let ranked = collect_ranked_terms(dictionary, pairs, scope);
     let glue_tokens = match shape {
@@ -540,6 +551,20 @@ pub fn build_asr_prompt_shaped(
             AsrPromptShape::ContextTerms => None,
         };
     }
+
+    let mut screen_kept = Vec::new();
+    let mut screen_used = 0usize;
+    if let Some(screen) = screen {
+        for token in &screen.tokens {
+            let cost = estimate_prompt_tokens(token) + usize::from(!screen_kept.is_empty()) * 2;
+            if screen_used.saturating_add(cost) > budget {
+                break;
+            }
+            screen_used = screen_used.saturating_add(cost);
+            screen_kept.push(token.clone());
+        }
+    }
+    let budget = budget.saturating_sub(screen_used);
 
     let scene_budget = (budget * 7) / 10;
     let global_budget = budget.saturating_sub(scene_budget);
@@ -581,7 +606,12 @@ pub fn build_asr_prompt_shaped(
             .then(left.term.cmp(&right.term))
     });
 
-    let hints: Vec<String> = kept.into_iter().map(|term| term.term).collect();
+    let mut hints: Vec<String> = screen_kept;
+    for term in kept {
+        if !hints.iter().any(|existing| existing == &term.term) {
+            hints.push(term.term);
+        }
+    }
     fit_woven_prompt(hints, shape)
 }
 
@@ -928,7 +958,36 @@ mod tests {
     use super::*;
     use crate::context::ContextFamily;
     use crate::dictionary_learn::pair_key;
-    use crate::llm::CleanupIntent;
+    use crate::llm::{CleanupIntensity, CleanupIntent};
+
+    fn decide(
+        enabled: bool,
+        mapping: Option<&AppMapping>,
+        family: ContextFamily,
+        intent: &CleanupIntent,
+    ) -> CleanupRoute {
+        decide_cleanup(enabled, CleanupIntensity::Heavy, mapping, family, intent)
+    }
+
+    fn sample_mapping() -> AppMapping {
+        AppMapping {
+            id: "wechat".into(),
+            label: "微信".into(),
+            family: ContextFamily::PersonalChat,
+            mode_id: None,
+            bundle_id: None,
+            executable: None,
+            browser_host: None,
+            style_example_input: None,
+            style_example_output: None,
+            style_example_pairs: Vec::new(),
+            enabled: true,
+            cleanup_effort: None,
+            cleanup_intensity: None,
+            cleanup_enabled: true,
+            dictionary_learn_enabled: true,
+        }
+    }
 
     fn live_pair(before: &str, after: &str, family: &str, hits: u32) -> LearnPairRecord {
         LearnPairRecord {
@@ -1220,6 +1279,7 @@ mod tests {
             &pairs,
             Some(&scope),
             AsrPromptShape::ContextTerms,
+            None,
         )
         .unwrap();
         assert!(prompt.contains("晓雯"));
@@ -1232,6 +1292,40 @@ mod tests {
         let xiaowen = prompt.find("晓雯").unwrap();
         let typescript = prompt.rfind("TypeScript").unwrap();
         assert!(xiaowen < typescript);
+    }
+
+    #[test]
+    fn asr_prompt_puts_screen_tokens_first_without_secrets() {
+        let ctx = crate::screen_text::extract_from_fixture(&crate::screen_text::AxWindowFixture {
+            family: ContextFamily::PersonalChat,
+            counterpart: Some("晓雯".into()),
+            bubbles: vec!["在吗".into()],
+            email_recipients: Vec::new(),
+            email_subject: None,
+            ide_filenames: Vec::new(),
+            ide_symbols: Vec::new(),
+            selected_text: None,
+            document_name: None,
+            focused_role: "AXTextField".into(),
+            secure: false,
+            banking_preset: false,
+            window_title: "晓雯 - 微信".into(),
+            raw_url: Some("https://wx.qq.com/chat/secret".into()),
+            pid: 4242,
+        });
+        let prompt = build_asr_prompt_shaped(
+            &["TypeScript".into()],
+            None,
+            &[],
+            None,
+            AsrPromptShape::WhisperTranscript,
+            Some(&ctx),
+        )
+        .unwrap();
+        assert!(prompt.find("晓雯").unwrap() < prompt.find("TypeScript").unwrap_or(usize::MAX));
+        assert!(!prompt.contains("https://"));
+        assert!(!prompt.contains("4242"));
+        assert!(!prompt.contains("微信"));
     }
 
     #[test]
@@ -1264,62 +1358,60 @@ mod tests {
             "请帮我看一下这份季度报告里的几个数字然后在周五之前把意见发我",
         );
         assert_eq!(
-            decide_cleanup(true, None, ContextFamily::PersonalChat, &short, 0.9),
-            CleanupRoute::Provider(CleanupEffort::Light)
+            decide(true, None, ContextFamily::PersonalChat, &short),
+            CleanupRoute::Provider(CleanupEffort::Heavy)
         );
         assert_eq!(
-            decide_cleanup(true, None, ContextFamily::PersonalChat, &long, 0.9),
-            CleanupRoute::Provider(CleanupEffort::Light)
+            decide(true, None, ContextFamily::PersonalChat, &long),
+            CleanupRoute::Provider(CleanupEffort::Heavy)
         );
         assert_eq!(
-            decide_cleanup(true, None, ContextFamily::Email, &short, 0.9),
-            CleanupRoute::Provider(CleanupEffort::Standard)
+            decide(true, None, ContextFamily::Email, &short),
+            CleanupRoute::Provider(CleanupEffort::Heavy)
         );
         assert_eq!(
-            decide_cleanup(true, None, ContextFamily::Email, &long, 0.9),
-            CleanupRoute::Provider(CleanupEffort::Standard)
+            decide(true, None, ContextFamily::Email, &long),
+            CleanupRoute::Provider(CleanupEffort::Heavy)
         );
         assert_eq!(
-            decide_cleanup(true, None, ContextFamily::WorkChat, &long, 0.9),
-            CleanupRoute::Provider(CleanupEffort::Light)
+            decide(true, None, ContextFamily::WorkChat, &long),
+            CleanupRoute::Provider(CleanupEffort::Heavy)
         );
         assert_eq!(
-            decide_cleanup(true, None, ContextFamily::SocialMedia, &short, 0.9),
-            CleanupRoute::Provider(CleanupEffort::Light)
+            decide(true, None, ContextFamily::SocialMedia, &short),
+            CleanupRoute::Provider(CleanupEffort::Heavy)
         );
         assert_eq!(
-            decide_cleanup(true, None, ContextFamily::BrowserSearch, &short, 0.9),
-            CleanupRoute::Provider(CleanupEffort::Standard)
+            decide(true, None, ContextFamily::BrowserSearch, &short),
+            CleanupRoute::Provider(CleanupEffort::Heavy)
         );
         assert_eq!(
-            decide_cleanup(true, None, ContextFamily::Terminal, &long, 0.9),
+            decide(true, None, ContextFamily::Terminal, &long),
             CleanupRoute::LocalOnly
         );
         assert_eq!(
-            decide_cleanup(true, None, ContextFamily::FormFilling, &short, 0.9),
+            decide(true, None, ContextFamily::FormFilling, &short),
             CleanupRoute::LocalOnly
         );
         assert_eq!(
-            decide_cleanup(true, None, ContextFamily::PromptOrCode, &long, 0.9),
-            CleanupRoute::Provider(CleanupEffort::Light)
+            decide(true, None, ContextFamily::PromptOrCode, &long),
+            CleanupRoute::Provider(CleanupEffort::Heavy)
         );
         assert_eq!(
-            decide_cleanup(
+            decide(
                 true,
                 None,
                 ContextFamily::DeveloperCollaboration,
                 &long,
-                0.9
             ),
-            CleanupRoute::Provider(CleanupEffort::Light)
+            CleanupRoute::Provider(CleanupEffort::Heavy)
         );
         assert_eq!(
-            decide_cleanup(
+            decide(
                 true,
                 None,
                 ContextFamily::PersonalChat,
                 &CleanupIntent::implicit("   "),
-                0.9
             ),
             CleanupRoute::LocalOnly
         );
@@ -1328,30 +1420,19 @@ mod tests {
             ..CleanupIntent::implicit("改正式")
         };
         assert_eq!(
-            decide_cleanup(true, None, ContextFamily::PersonalChat, &spoken, 0.9),
+            decide(true, None, ContextFamily::PersonalChat, &spoken),
             CleanupRoute::Provider(CleanupEffort::Command)
         );
         assert_eq!(
-            decide_cleanup(false, None, ContextFamily::PersonalChat, &long, 0.9),
+            decide(false, None, ContextFamily::PersonalChat, &long),
             CleanupRoute::LocalOnly
         );
         let mapping = AppMapping {
-            id: "wechat".into(),
-            label: "微信".into(),
-            family: ContextFamily::PersonalChat,
-            mode_id: None,
-            bundle_id: None,
-            executable: None,
-            browser_host: None,
-            style_example_input: None,
-            style_example_output: None,
-            enabled: true,
             cleanup_effort: Some(CleanupEffort::Standard),
-            cleanup_enabled: true,
-            dictionary_learn_enabled: true,
+            ..sample_mapping()
         };
         assert_eq!(
-            decide_cleanup(true, Some(&mapping), ContextFamily::PersonalChat, &long, 0.9),
+            decide(true, Some(&mapping), ContextFamily::PersonalChat, &long),
             CleanupRoute::Provider(CleanupEffort::Standard)
         );
         let mapping_off = AppMapping {
@@ -1360,19 +1441,18 @@ mod tests {
             ..mapping
         };
         assert_eq!(
-            decide_cleanup(
+            decide(
                 true,
                 Some(&mapping_off),
                 ContextFamily::PersonalChat,
                 &long,
-                0.9
             ),
             CleanupRoute::LocalOnly
         );
     }
 
     #[test]
-    fn history_personal_chat_still_routes_to_light() {
+    fn history_personal_chat_uses_global_heavy() {
         let intent = CleanupIntent::implicit(
             "请帮我看一下这份季度报告里的几个数字然后在周五之前把意见发我",
         );
@@ -1383,14 +1463,78 @@ mod tests {
         );
         assert_eq!(scope.family.as_deref(), Some("personal_chat"));
         assert_eq!(
-            decide_cleanup(
+            decide(
                 true,
                 None,
                 family_from_profile_id("chat.personal", &[]),
                 &intent,
-                0.9,
             ),
-            CleanupRoute::Provider(CleanupEffort::Light)
+            CleanupRoute::Provider(CleanupEffort::Heavy)
+        );
+    }
+
+    #[test]
+    fn unmapped_wechat_uses_global_heavy() {
+        let route = decide_cleanup(
+            true,
+            CleanupIntensity::Heavy,
+            None,
+            ContextFamily::PersonalChat,
+            &CleanupIntent::implicit("好的哈哈我晚点回你"),
+        );
+        assert_eq!(route, CleanupRoute::Provider(CleanupEffort::Heavy));
+    }
+
+    #[test]
+    fn mapping_light_overrides_global_heavy() {
+        let mut mapping = sample_mapping();
+        mapping.cleanup_intensity = Some(CleanupIntensity::Light);
+        let route = decide_cleanup(
+            true,
+            CleanupIntensity::Heavy,
+            Some(&mapping),
+            ContextFamily::PersonalChat,
+            &CleanupIntent::implicit("好的"),
+        );
+        assert_eq!(route, CleanupRoute::Provider(CleanupEffort::Light));
+    }
+
+    #[test]
+    fn intensity_off_or_cleanup_disabled_is_local_only() {
+        let intent = CleanupIntent::implicit("hello");
+        assert_eq!(
+            decide_cleanup(
+                true,
+                CleanupIntensity::Off,
+                None,
+                ContextFamily::Email,
+                &intent
+            ),
+            CleanupRoute::LocalOnly
+        );
+        assert_eq!(
+            decide_cleanup(
+                false,
+                CleanupIntensity::Heavy,
+                None,
+                ContextFamily::Email,
+                &intent
+            ),
+            CleanupRoute::LocalOnly
+        );
+    }
+
+    #[test]
+    fn terminal_stays_local_even_when_heavy() {
+        assert_eq!(
+            decide_cleanup(
+                true,
+                CleanupIntensity::Heavy,
+                None,
+                ContextFamily::Terminal,
+                &CleanupIntent::implicit("ls -la"),
+            ),
+            CleanupRoute::LocalOnly
         );
     }
 
@@ -1447,8 +1591,10 @@ mod tests {
             browser_host: Some("company.myworkday.com".into()),
             style_example_input: None,
             style_example_output: None,
+            style_example_pairs: Vec::new(),
             enabled: true,
             cleanup_effort: None,
+            cleanup_intensity: None,
             cleanup_enabled: true,
             dictionary_learn_enabled: true,
         };
@@ -1472,8 +1618,10 @@ mod tests {
             browser_host: None,
             style_example_input: None,
             style_example_output: None,
+            style_example_pairs: Vec::new(),
             enabled: true,
             cleanup_effort: None,
+            cleanup_intensity: None,
             cleanup_enabled: true,
             dictionary_learn_enabled: false,
         };

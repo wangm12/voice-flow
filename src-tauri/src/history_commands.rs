@@ -170,6 +170,7 @@ pub(crate) async fn reclean_history(
                 Some(&intent),
                 pairs_hint.as_deref(),
                 llm::CleanupEffort::Command,
+                None,
             )
         })
         .await;
@@ -283,6 +284,7 @@ async fn retry_dictation_inner(
         &pairs,
         Some(&scope),
         lexicon::asr_prompt_shape_for(settings.asr_provider, &settings.asr_model),
+        None,
     );
     let mut retry_policy = scene.policy.clone().unwrap_or_default();
     if settings.output_mode != "auto" {
@@ -334,10 +336,11 @@ async fn retry_dictation_inner(
         .unwrap_or_else(|| intent.content.clone());
     let cleanup_route = lexicon::decide_cleanup(
         settings.cleanup_enabled,
+        llm::CleanupIntensity::parse(&settings.cleanup_intensity)
+            .unwrap_or(llm::CleanupIntensity::Heavy),
         mapping,
         family,
         &intent,
-        confidence,
     );
     let cleanup_decision = match cleanup_route {
         lexicon::CleanupRoute::Provider(effort) if snippet_expansion.is_none() => {
@@ -360,6 +363,7 @@ async fn retry_dictation_inner(
                         Some(&intent),
                         pairs_hint.as_deref(),
                         effort,
+                        None,
                     )
                 })
                 .await

@@ -8,5 +8,7 @@
   <string>VoiceFlow 只使用辅助功能权限，将文字插入当前获得焦点的输入框。</string>
   <key>NSAppleEventsUsageDescription</key>
   <string>启用浏览器上下文检测后，VoiceFlow 才会读取当前站点信息，并仅将结果保存在本机。</string>
+  <key>NSScreenCaptureUsageDescription</key>
+  <string>VoiceFlow may capture the front dictation window to read on-screen words locally when the user enables window text recognition. Not used for default dictation.</string>
 </dict>
 </plist>

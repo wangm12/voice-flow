@@ -609,6 +609,12 @@ fn keep_segment(segment: &Segment) -> bool {
     !crate::spoken_revision::is_hallucination_text(segment.text.trim())
 }
 
+pub fn segments_look_low_confidence(segments: &[Segment]) -> bool {
+    segments.iter().any(|segment| {
+        segment.no_speech_prob.unwrap_or(0.0) > 0.6 || segment.avg_logprob.unwrap_or(0.0) < -1.0
+    })
+}
+
 fn strip_hallucination_sentences(text: &str) -> String {
     text.split_inclusive(['.', '!', '?', '。', '！', '？', '\n'])
         .filter(|sentence| !crate::spoken_revision::is_hallucination_text(sentence.trim()))
@@ -720,6 +726,25 @@ mod tests {
         assert_eq!(normalize_language(Some(" AUTO ")), None);
         assert_eq!(normalize_language(Some("zh")), Some("zh"));
         assert_eq!(normalize_language(None), None);
+    }
+
+    #[test]
+    fn segments_look_low_confidence_uses_existing_thresholds() {
+        assert!(!segments_look_low_confidence(&[Segment {
+            text: "hello".into(),
+            avg_logprob: Some(-0.2),
+            no_speech_prob: Some(0.1),
+        }]));
+        assert!(segments_look_low_confidence(&[Segment {
+            text: "hello".into(),
+            avg_logprob: Some(-1.2),
+            no_speech_prob: Some(0.1),
+        }]));
+        assert!(segments_look_low_confidence(&[Segment {
+            text: "hello".into(),
+            avg_logprob: Some(-0.2),
+            no_speech_prob: Some(0.65),
+        }]));
     }
 
     #[test]

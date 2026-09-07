@@ -8,7 +8,7 @@ import { Onboarding } from "./components/Onboarding/Onboarding";
 import { ContextSettings } from "./components/ContextSettings";
 import { AnimatedContent } from "./components/ReactBits/AnimatedContent";
 import { SettingsAlert } from "./components/SettingsLayout";
-import { SelectedPreviewDialog } from "./components/SelectedPreviewDialog";
+import { SelectedPreviewDialog, type SelectedActionPreview } from "./components/SelectedPreviewDialog";
 import { PermissionsSettings, type Permissions } from "./components/PermissionsSettings";
 import { SnippetsSettings } from "./components/SnippetsSettings";
 import { DictionarySettings } from "./components/DictionarySettings";
@@ -22,7 +22,6 @@ import { colors, radius, buttonClass } from "./lib/theme";
 import type { AudioInputDevice, Settings } from "./types/settings";
 
 type HistoryPage = { items: HistoryItem[]; has_more: boolean };
-type SelectedActionPreview = { selected_text: string; transcript: string; final_text: string };
 type View = "general" | "engine" | "dictionary" | "history" | "smart" | "writing" | "permissions" | "system" | "snippets";
 const brandIconSrc = "/voiceflow-icon-ui.svg";
 const navigationGroups: { label: string; items: { id: View; label: string; icon: typeof AudioLines }[] }[] = [
@@ -68,7 +67,7 @@ export default function App() {
   const [audioInputDevices, setAudioInputDevices] = useState<AudioInputDevice[]>([]);
   const [loadingError, setLoadingError] = useState<string | null>(null);
   const [runtimeError, setRuntimeError] = useState<string | null>(null);
-  const [learnToast, setLearnToast] = useState<{ pair_key: string; before: string; after: string } | null>(null);
+  const [learnToast, setLearnToast] = useState<{ pair_key: string; pair_keys?: string[]; before: string; after: string } | null>(null);
   const [selectedPreview, setSelectedPreview] = useState<SelectedActionPreview | null>(null);
   const [selectedPreviewDraft, setSelectedPreviewDraft] = useState("");
   const selectedPreviewRestoreRef = useRef<HTMLElement | null>(null);
@@ -133,7 +132,7 @@ export default function App() {
 
   useEffect(() => {
     let active = true;
-    const subscription = listen<{ pair_key: string; before: string; after: string }>("learn_pairs://promoted", (event) => {
+    const subscription = listen<{ pair_key: string; pair_keys?: string[]; before: string; after: string }>("learn_pairs://promoted", (event) => {
       if (!active) return;
       setLearnToast(event.payload);
     });
@@ -327,11 +326,11 @@ export default function App() {
   }, []);
   const cancelSelectedPreview = useCallback(async () => {
     try {
-      await invoke("cancel_selected_action_preview");
+      await invoke(selectedPreview?.kind === "screen" ? "cancel_screen_action_preview" : "cancel_selected_action_preview");
     } finally {
       closeSelectedPreview();
     }
-  }, [closeSelectedPreview]);
+  }, [closeSelectedPreview, selectedPreview]);
 
   if (loadingError) {
     return (
@@ -424,7 +423,10 @@ export default function App() {
   };
   const confirmSelectedPreview = async () => {
     try {
-      await invoke("confirm_selected_action_preview", { final_text: selectedPreviewDraft });
+      await invoke(
+        selectedPreview?.kind === "screen" ? "confirm_screen_action_preview" : "confirm_selected_action_preview",
+        { final_text: selectedPreviewDraft },
+      );
       closeSelectedPreview();
     } catch (reason) {
       setRuntimeError(String(reason));
@@ -432,7 +434,10 @@ export default function App() {
   };
   const copySelectedPreview = async () => {
     try {
-      await invoke("copy_selected_action_preview", { final_text: selectedPreviewDraft });
+      await invoke(
+        selectedPreview?.kind === "screen" ? "copy_screen_action_preview" : "copy_selected_action_preview",
+        { final_text: selectedPreviewDraft },
+      );
       closeSelectedPreview();
     } catch (reason) {
       setRuntimeError(String(reason));
@@ -492,7 +497,7 @@ export default function App() {
               <div role="status" className="mb-4 flex items-center gap-3 rounded-lg border border-border bg-elevated px-4 py-3 text-sm text-primary">
                 <span className="min-w-0 flex-1">{t("已学")} {learnToast.before}→{learnToast.after}</span>
                 <button type="button" className={buttonClass} onClick={() => {
-                  void invoke("undo_learn_pair", { pairKey: learnToast.pair_key }).then(async () => {
+                  void Promise.all((learnToast.pair_keys?.length ? learnToast.pair_keys : [learnToast.pair_key]).map((pairKey) => invoke("undo_learn_pair", { pairKey }))).then(async () => {
                     const next = await invoke<Settings>("get_settings");
                     setSettings(next);
                     setLearnToast(null);
@@ -503,7 +508,7 @@ export default function App() {
             )}
             <AnimatedContent key={view} className="w-full">
               {view === "history" ? <History items={history} reload={() => reloadHistory()} hasMore={historyHasMore} loading={historyLoading} onLoadMore={loadMoreHistory} error={historyError} onRetry={() => reloadHistory()} onQueryChange={searchHistory} />
-                : view === "smart" ? <ContextSettings automationOnly writingModes={settings.writing_modes} onWritingModesChange={(writingModes) => save({ writing_modes: writingModes })} outputMode={settings.output_mode} translationTargetLanguage={settings.translation_target_language} onOutputModeChange={(outputMode) => save({ output_mode: outputMode })} onTranslationTargetLanguageChange={(language) => save({ translation_target_language: language })} />
+                : view === "smart" ? <ContextSettings automationOnly writingModes={settings.writing_modes} onWritingModesChange={(writingModes) => save({ writing_modes: writingModes })} outputMode={settings.output_mode} translationTargetLanguage={settings.translation_target_language} onOutputModeChange={(outputMode) => save({ output_mode: outputMode })} onTranslationTargetLanguageChange={(language) => save({ translation_target_language: language })} cleanupIntensity={settings.cleanup_intensity ?? "heavy"} onCleanupIntensityChange={(cleanup_intensity) => save({ cleanup_intensity })} windowOcrEnabled={settings.window_ocr_enabled ?? false} onWindowOcrEnabledChange={(window_ocr_enabled) => save({ window_ocr_enabled })} visionProvider={settings.vision_provider ?? ""} visionModel={settings.vision_model ?? ""} onVisionProviderChange={(vision_provider) => save({ vision_provider })} onVisionModelChange={(vision_model) => save({ vision_model })} accurateAsrProvider={settings.accurate_asr_provider ?? "groq"} accurateAsrModel={settings.accurate_asr_model ?? ""} accurateAsrBaseUrl={settings.accurate_asr_base_url ?? ""} onAccurateAsrProviderChange={(accurate_asr_provider) => save({ accurate_asr_provider })} onAccurateAsrModelChange={(accurate_asr_model) => save({ accurate_asr_model })} onAccurateAsrBaseUrlChange={(accurate_asr_base_url) => save({ accurate_asr_base_url })} />
                   : view === "writing" ? <ContextSettings writingModes={settings.writing_modes} onWritingModesChange={(writingModes) => save({ writing_modes: writingModes })} />
                     : view === "snippets" ? <SnippetsSettings snippets={settings.snippets} onChange={(snippets) => save({ snippets })} />
                       : view === "dictionary" ? <DictionarySettings settings={settings} save={save} />

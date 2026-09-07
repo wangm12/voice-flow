@@ -80,6 +80,8 @@ pub struct ContextPolicy {
     pub style_example_input: Option<String>,
     #[serde(default)]
     pub style_example_output: Option<String>,
+    #[serde(default)]
+    pub style_example_pairs: Vec<StyleExamplePair>,
 }
 
 impl ContextPolicy {
@@ -103,6 +105,7 @@ impl ContextPolicy {
             translation_target_language: None,
             style_example_input: None,
             style_example_output: None,
+            style_example_pairs: Vec::new(),
         };
         match family {
             ContextFamily::Email => {
@@ -645,14 +648,24 @@ pub struct AppMapping {
     pub style_example_input: Option<String>,
     #[serde(default)]
     pub style_example_output: Option<String>,
+    #[serde(default)]
+    pub style_example_pairs: Vec<StyleExamplePair>,
     #[serde(default = "default_true")]
     pub enabled: bool,
     #[serde(default)]
     pub cleanup_effort: Option<crate::llm::CleanupEffort>,
+    #[serde(default)]
+    pub cleanup_intensity: Option<crate::llm::CleanupIntensity>,
     #[serde(default = "default_true")]
     pub cleanup_enabled: bool,
     #[serde(default = "default_true")]
     pub dictionary_learn_enabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StyleExamplePair {
+    pub input: String,
+    pub output: String,
 }
 
 /// A user-facing application choice. Native code generates the selector so the
@@ -703,11 +716,45 @@ impl AppMapping {
                 .style_example_output
                 .as_deref()
                 .is_some_and(|value| value.chars().count() > 2_000)
+            || self.style_example_pairs.iter().any(|pair| {
+                pair.input.chars().count() > 2_000 || pair.output.chars().count() > 2_000
+            })
         {
             return Err("style examples cannot exceed 2000 characters".into());
         }
+        if self.style_example_pairs.len() > 3 {
+            return Err("style example pairs cannot exceed 3".into());
+        }
         Ok(())
     }
+}
+
+pub fn merge_saved_mapping(existing: &AppMapping, mut incoming: AppMapping) -> AppMapping {
+    if incoming.style_example_pairs.is_empty() {
+        incoming.style_example_pairs = existing.style_example_pairs.clone();
+    }
+    if incoming.style_example_input.is_none() {
+        incoming.style_example_input = existing.style_example_input.clone();
+    }
+    if incoming.style_example_output.is_none() {
+        incoming.style_example_output = existing.style_example_output.clone();
+    }
+    if let (Some(input), Some(output)) = (
+        incoming.style_example_input.clone(),
+        incoming.style_example_output.clone(),
+    ) {
+        match incoming.style_example_pairs.first() {
+            None => incoming
+                .style_example_pairs
+                .push(StyleExamplePair { input, output }),
+            Some(first) if first.input != input || first.output != output => {
+                incoming.style_example_pairs[0] = StyleExamplePair { input, output };
+            }
+            _ => {}
+        }
+    }
+    incoming.style_example_pairs.truncate(3);
+    incoming
 }
 
 #[derive(Debug, Clone, Default)]
@@ -789,6 +836,27 @@ fn snapshot_for_signal_with_modes(
     {
         policy.style_example_input = mapping.style_example_input.clone();
         policy.style_example_output = mapping.style_example_output.clone();
+        policy.style_example_pairs = mapping
+            .style_example_pairs
+            .iter()
+            .take(3)
+            .cloned()
+            .collect();
+        if policy.style_example_pairs.is_empty() {
+            if let (Some(input), Some(output)) = (
+                policy.style_example_input.clone(),
+                policy.style_example_output.clone(),
+            ) {
+                policy
+                    .style_example_pairs
+                    .push(StyleExamplePair { input, output });
+            }
+        } else if let Some(first) = policy.style_example_pairs.first() {
+            if policy.style_example_input.is_none() {
+                policy.style_example_input = Some(first.input.clone());
+                policy.style_example_output = Some(first.output.clone());
+            }
+        }
     }
     let browser_status = if signal.is_browser() {
         if !browser_access_enabled {
@@ -2744,8 +2812,10 @@ mod tests {
             browser_host: None,
             style_example_input: None,
             style_example_output: None,
+            style_example_pairs: Vec::new(),
             enabled: true,
             cleanup_effort: None,
+            cleanup_intensity: None,
             cleanup_enabled: true,
             dictionary_learn_enabled: true,
         };
@@ -2756,6 +2826,86 @@ mod tests {
         );
         assert_eq!(snapshot.profile.id, "user.cursor-formal");
         assert_eq!(snapshot.profile.family, ContextFamily::Document);
+    }
+
+    #[test]
+    fn save_mapping_keeps_learned_style_pairs() {
+        let existing = AppMapping {
+            id: "wechat".into(),
+            label: "微信".into(),
+            family: ContextFamily::PersonalChat,
+            mode_id: None,
+            bundle_id: Some("com.tencent.xinWeChat".into()),
+            executable: None,
+            browser_host: None,
+            style_example_input: Some("好的".into()),
+            style_example_output: Some("好的哈哈".into()),
+            style_example_pairs: vec![
+                StyleExamplePair {
+                    input: "好的".into(),
+                    output: "好的哈哈".into(),
+                },
+                StyleExamplePair {
+                    input: "稍等".into(),
+                    output: "稍等下".into(),
+                },
+            ],
+            enabled: true,
+            cleanup_effort: None,
+            cleanup_intensity: None,
+            cleanup_enabled: true,
+            dictionary_learn_enabled: true,
+        };
+        let incoming = AppMapping {
+            style_example_input: None,
+            style_example_output: None,
+            style_example_pairs: Vec::new(),
+            ..existing.clone()
+        };
+        let merged = merge_saved_mapping(&existing, incoming);
+        assert_eq!(merged.style_example_pairs.len(), 2);
+        assert_eq!(merged.style_example_pairs[1].output, "稍等下");
+    }
+
+    #[test]
+    fn snapshot_copies_three_style_pairs() {
+        let mapping = AppMapping {
+            id: "wechat".into(),
+            label: "微信".into(),
+            family: ContextFamily::PersonalChat,
+            mode_id: None,
+            bundle_id: Some("com.tencent.xinWeChat".into()),
+            executable: None,
+            browser_host: None,
+            style_example_input: Some("a".into()),
+            style_example_output: Some("b".into()),
+            style_example_pairs: vec![
+                StyleExamplePair {
+                    input: "a".into(),
+                    output: "b".into(),
+                },
+                StyleExamplePair {
+                    input: "c".into(),
+                    output: "d".into(),
+                },
+                StyleExamplePair {
+                    input: "e".into(),
+                    output: "f".into(),
+                },
+            ],
+            enabled: true,
+            cleanup_effort: None,
+            cleanup_intensity: None,
+            cleanup_enabled: true,
+            dictionary_learn_enabled: true,
+        };
+        let snapshot = snapshot_for_signal(
+            &signal("com.tencent.xinWeChat", "WeChat", None),
+            &[mapping],
+            false,
+        );
+        assert_eq!(snapshot.policy.style_example_pairs.len(), 3);
+        assert_eq!(snapshot.policy.style_example_pairs[2].output, "f");
     }
 
     #[test]
@@ -2777,8 +2927,10 @@ mod tests {
             browser_host: None,
             style_example_input: None,
             style_example_output: None,
+            style_example_pairs: Vec::new(),
             enabled: true,
             cleanup_effort: None,
+            cleanup_intensity: None,
             cleanup_enabled: true,
             dictionary_learn_enabled: true,
         };
@@ -2843,8 +2995,10 @@ mod tests {
             browser_host: None,
             style_example_input: None,
             style_example_output: None,
+            style_example_pairs: Vec::new(),
             enabled: true,
             cleanup_effort: None,
+            cleanup_intensity: None,
             cleanup_enabled: true,
             dictionary_learn_enabled: true,
         };

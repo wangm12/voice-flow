@@ -7,9 +7,12 @@ import { useI18n } from "../lib/i18n";
 import { buttonClass, colors, focusRingClass, secondaryButtonClass } from "../lib/theme";
 
 export type SelectedActionPreview = {
+  kind?: "selected" | "screen";
   selected_text: string;
   transcript: string;
   final_text: string;
+  thumbnail?: string | null;
+  replace_allowed?: boolean;
 };
 
 export function SelectedPreviewDialog({
@@ -58,8 +61,14 @@ export function SelectedPreviewDialog({
       >
         <div className="flex items-start justify-between gap-4">
           <div>
-            <h2 id="selected-preview-title" className="text-base font-semibold text-primary">{t("预览选中文本操作")}</h2>
-            <p className="mt-1 text-xs leading-5 text-tertiary">{t("确认后才会替换原文；取消或复制不会修改原输入框。")}</p>
+            <h2 id="selected-preview-title" className="text-base font-semibold text-primary">
+              {preview.thumbnail ? t("看屏幕") : t("预览选中文本操作")}
+            </h2>
+            <p className="mt-1 text-xs leading-5 text-tertiary">
+              {preview.thumbnail
+                ? t("确认后才会写入当前窗口；取消会丢掉截图，不会自动保存到历史。")
+                : t("确认后才会替换原文；取消或复制不会修改原输入框。")}
+            </p>
           </div>
           <button
             type="button"
@@ -71,8 +80,18 @@ export function SelectedPreviewDialog({
           </button>
         </div>
         <div className="mt-5 grid gap-4">
+          {preview.thumbnail && (
+            <div>
+              <p className="mb-1.5 text-xs font-medium text-secondary">{t("窗口截图")}</p>
+              <img
+                src={preview.thumbnail}
+                alt={t("窗口截图")}
+                className="max-h-40 w-full rounded-xl border object-contain"
+              />
+            </div>
+          )}
           <div>
-            <p className="mb-1.5 text-xs font-medium text-secondary">{t("原选中文本")}</p>
+            <p className="mb-1.5 text-xs font-medium text-secondary">{preview.thumbnail ? t("当前窗口") : t("原选中文本")}</p>
             <p className={`max-h-28 overflow-y-auto rounded-xl border ${colors.border} ${colors.bg.elevated} px-3 py-2 text-sm leading-6 text-secondary whitespace-pre-wrap`}>
               {preview.selected_text}
             </p>
@@ -95,7 +114,12 @@ export function SelectedPreviewDialog({
             <Copy size={14} aria-hidden="true" />
             {t("只复制")}
           </button>
-          <button type="button" onClick={onConfirm} disabled={!draft.trim()} className={buttonClass}>
+          <button
+            type="button"
+            onClick={onConfirm}
+            disabled={!draft.trim() || preview.replace_allowed === false}
+            className={buttonClass}
+          >
             <Check size={14} aria-hidden="true" />
             {t("替换原文")}
           </button>

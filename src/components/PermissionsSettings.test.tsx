@@ -92,6 +92,25 @@ describe("PermissionsSettings", () => {
     });
   });
 
+  it("opens Screen Recording settings without treating it as required for dictation", async () => {
+    invokeMock.mockResolvedValue(undefined);
+    const onRefresh = vi.fn().mockResolvedValue(undefined);
+    render(
+      <PermissionsSettings
+        permissions={{ microphone: true, microphone_status: "authorized", accessibility: true, screen_recording: false }}
+        onRefresh={onRefresh}
+      />,
+    );
+
+    expect(screen.getByText("屏幕录制")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "打开设置" }));
+
+    await waitFor(() => {
+      expect(invokeMock).toHaveBeenCalledWith("open_privacy_settings", { pane: "screen" });
+      expect(onRefresh).toHaveBeenCalledOnce();
+    });
+  });
+
   it("exposes a manual recheck action", async () => {
     const onRefresh = vi.fn().mockResolvedValue(undefined);
     render(<PermissionsSettings permissions={null} onRefresh={onRefresh} />);

@@ -80,6 +80,16 @@ sequenceDiagram
 
 Undo 只针对最近一次已完成的 paste transaction，生命周期 3 秒。点击后会再次比较 session generation、App/PID、window、browser target 和 focused input；任一目标变化就返回 `stale_target`，绝不发送盲目的 Cmd+Z。连续第二次插入会使前一次 transaction 失效。
 
-## 5. Screen assistant 当前边界
+## 5. Screen assistant / 看屏幕
 
-Screen assistant 仍未接入生产流程。安全实现还需要：屏幕录制权限、ScreenCaptureKit 的纯内存 PNG 编码、图像尺寸/压缩上限、vision model 配置、截图脱敏策略和 preview-first 触发 UI。当前 LLM adapter 只接受文本，未满足这些前置条件前不采集或上传截图。
+默认听写只走辅助功能读到的字（Phase 1），可选本机窗口 OCR（Phase 2，不上传）。**截图进 LLM 只发生在「看屏幕」热键：**
+
+1. 用户自己录了 `screen_action_hotkey`（空着不注册）。
+2. 已配置 `vision_provider` / `vision_model`；否则提示 configure a vision model，**不截屏**。
+3. 需要屏幕录制 + 辅助功能，否则只打开系统设置。
+4. 只截当前锁定窗口一张内存 PNG（长边 ≤1280），不落盘。
+5. 用户说话 → ASR → 把图和指令发给用户配置的 vision provider。
+6. 预览：缩略图、建议文本、替换 / 只复制 / 取消。目标变了只复制。取消丢掉 PNG。
+7. 不自动写入 History。会议录音、Spark、生图仍然不做。
+
+听写松手路径不得调用 Phase 3 的 `capture_for_vision`。

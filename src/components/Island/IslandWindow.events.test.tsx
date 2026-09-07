@@ -156,4 +156,26 @@ describe("IslandWindow HUD partials", () => {
       expect(invokeMock).toHaveBeenCalledWith("set_island_learn_interactive", { interactive: false }),
     );
   });
+
+  it("undoes both style and intensity pair keys", async () => {
+    invokeMock.mockResolvedValue(undefined);
+    await renderHud();
+    await waitFor(() => expect(handlers.has("learn_pairs://promoted")).toBe(true));
+    act(() => {
+      handlers.get("learn_pairs://promoted")!({
+        payload: {
+          pair_key: "learn:style:wechat",
+          pair_keys: ["learn:style:wechat", "learn:intensity:down:wechat"],
+          before: "好的",
+          after: "好的哈哈",
+        },
+      });
+    });
+
+    fireEvent.click(await screen.findByRole("button", { name: "撤销" }));
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("undo_learn_pair", { pairKey: "learn:style:wechat" }),
+    );
+    expect(invokeMock).toHaveBeenCalledWith("undo_learn_pair", { pairKey: "learn:intensity:down:wechat" });
+  });
 });

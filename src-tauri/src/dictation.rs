@@ -10,6 +10,7 @@ use crate::{
     start_with_error_feedback, stop_claimed, sync_modifier_hotkey_phase, AppState, StartError,
 };
 use crate::prefetch_asr;
+use crate::screen_action::{clear_screen_action, clear_screen_preview};
 use crate::selected_action::{clear_selected_action, clear_selected_preview};
 use tauri::{Emitter, State};
 use tokio_util::sync::CancellationToken;
@@ -310,12 +311,14 @@ pub(crate) fn claim_cancel_manager(
 
 fn claim_cancel(state: &AppState) -> CancelClaim {
     clear_selected_action(state);
+    clear_screen_action(state);
     let had_preview = state
         .selected_preview
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .is_some();
     clear_selected_preview(state);
+    clear_screen_preview(state);
     let mut manager = lock_recover(&state.manager);
     let phase = claim_cancel_manager(&mut manager, had_preview);
     CancelClaim {

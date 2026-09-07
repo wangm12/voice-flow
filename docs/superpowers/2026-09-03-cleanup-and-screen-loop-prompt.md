@@ -220,29 +220,29 @@ product rule.
 ================================================================
 
 Spec 1:
-- [ ] cleanup_intensity exists, default heavy, UI 关/轻/中/重
-- [ ] unmapped WeChat resolves Heavy; mapping Light wins; HUD shows one label
-- [ ] Heavy few-shots stay chat-shaped; protected-facts / no 您好 tests pass
-- [ ] intensity off skips cleanup HTTP
-- [ ] cascade gate unit tests for 4 triggers; unset Accurate → no second call
-- [ ] 5s timeout keeps primary; cleanup invoked once
-- [ ] style learn 3× / max 3 pairs / paragraph ignored / foreign bubble ignored
-- [ ] intensity 3× revert + Undo
-- [ ] single-paste invariant still holds (no insert-then-replace helper)
+- [x] cleanup_intensity exists, default heavy, UI 关/轻/中/重
+- [x] unmapped WeChat resolves Heavy; mapping Light wins; HUD shows one label
+- [x] Heavy few-shots stay chat-shaped; protected-facts / no 您好 tests pass
+- [x] intensity off skips cleanup HTTP
+- [x] cascade gate unit tests for 4 triggers; unset Accurate → no second call
+- [x] 5s timeout keeps primary; cleanup invoked once
+- [x] style learn 3× / max 3 pairs / paragraph ignored / foreign bubble ignored
+- [x] intensity 3× revert + Undo
+- [x] single-paste invariant still holds (no insert-then-replace helper)
 
 Spec 2:
-- [ ] Phase 1 fixtures per family + empty secure/terminal/banking
-- [ ] prompt assembly privacy tests (no title/URL/PID)
-- [ ] extractor error does not fail dictation
-- [ ] Phase 2 thin-gate + no disk write + no full-display
-- [ ] Phase 3 preview-only; dictate stop capture-count is 0
-- [ ] later-and-wont.md red-line updated only with Phase 3
-- [ ] privacy.md + end-to-end-workflows.md + context-e2e-checklist.md §18
+- [x] Phase 1 fixtures per family + empty secure/terminal/banking
+- [x] prompt assembly privacy tests (no title/URL/PID)
+- [x] extractor error does not fail dictation
+- [x] Phase 2 thin-gate + no disk write + no full-display
+- [x] Phase 3 preview-only; dictate stop capture-count is 0
+- [x] later-and-wont.md red-line updated only with Phase 3
+- [x] privacy.md + end-to-end-workflows.md + context-e2e-checklist.md §18
       updated to match shipped phases
 
 Process:
-- [ ] cargo test --lib and npm test -- --run and npm run lint are green
-- [ ] both implementation plans have all tasks checked or explicitly deferred
+- [x] cargo test --lib and npm test -- --run and npm run lint are green
+- [x] both implementation plans have all tasks checked or explicitly deferred
 
 When COMPLETE, do not start extra features. Say the loop should be stopped.
 

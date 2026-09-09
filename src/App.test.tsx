@@ -52,7 +52,6 @@ describe("settings navigation", () => {
       if (command === "get_settings") return settings;
       if (command === "check_permissions") return { microphone: false, microphone_status: "denied", accessibility: false };
       if (command === "get_audio_input_devices") return [{ name: "MacBook Pro Microphone", is_default: true }];
-      if (command === "get_audio_input_device") return "MacBook Pro Microphone";
       if (command === "get_context_snapshot") return { profile: { id: "native.general", family: "general", app_label: "VoiceFlow", icon_key: "app", source: "fallback", confidence: 0.4 }, browser_access_status: "not_applicable" };
       if (command === "get_context_mappings") return [];
       if (command === "get_context_override") return null;

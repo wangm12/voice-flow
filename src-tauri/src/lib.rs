@@ -4803,15 +4803,6 @@ fn clamp_double_tap_activation(settings: &mut store::Settings) {
     }
 }
 #[tauri::command]
-fn get_usage(app: tauri::AppHandle, state: State<'_, AppState>) -> Result<store::Usage, String> {
-    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
-    store::get_usage(&dir, state.gate.snapshots()).map_err(|e| e.to_string())
-}
-#[tauri::command]
-fn get_latency_metrics(state: State<'_, AppState>) -> metrics::LatencyMetrics {
-    state.metrics.snapshot()
-}
-#[tauri::command]
 fn clear_all_data(app: tauri::AppHandle) -> Result<(), String> {
     let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
     store::clear_all_data(&dir).map_err(|e| e.to_string())
@@ -4841,10 +4832,6 @@ fn check_permissions() -> permissions::PermissionStatus {
 #[tauri::command]
 fn get_audio_input_devices() -> Result<Vec<audio::InputDeviceInfo>, String> {
     audio::list_input_devices()
-}
-#[tauri::command]
-fn get_audio_input_device() -> Result<String, String> {
-    audio::default_input_device_name()
 }
 #[tauri::command]
 #[cfg(target_os = "macos")]
@@ -5208,13 +5195,9 @@ pub fn run() {
             remove_asr_api_key,
             remove_cleanup_api_key,
             remove_provider_key,
-            get_usage,
-            get_latency_metrics,
             history_commands::get_history,
             history_commands::export_history,
             history_commands::export_gold_corpus,
-            history_commands::get_history_audio,
-            history_commands::save_verbatim,
             clear_all_data,
             history_commands::retry_dictation,
             probe_engine_draft,
@@ -5234,7 +5217,6 @@ pub fn run() {
             history_commands::delete_history,
             check_permissions,
             get_audio_input_devices,
-            get_audio_input_device,
             request_microphone_permission,
             open_privacy_settings,
             request_accessibility_permission,

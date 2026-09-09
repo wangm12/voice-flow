@@ -4,7 +4,7 @@
 
 来源：竞品与开源研究（Typeless / Wispr / Willow / MacWhisper / Daisy / yw-transcribe / VoiceInk / Handy / TypeWhisper）。质量标杆是 **Typeless 的中英混合听写 + 整理**。2026-08-30 周期的引擎插头和 cleanup prompt 已经落地；下面两张表仍是边界，避免下次会话又把 Agent / 真流式 / 会议笔记塞进听写 PR。
 
-对照实现计划：[2026-08-25-asr-cleanup-pipeline.md](superpowers/plans/2026-08-25-asr-cleanup-pipeline.md)。旧分层见 [competitive-research.md](competitive-research.md)。隐私红线见 [privacy.md](privacy.md)。
+旧分层见 [competitive-research.md](competitive-research.md)。管线研究快照见 [asr-cleanup-pipeline-research-2026-08-25.md](asr-cleanup-pipeline-research-2026-08-25.md)。隐私红线见 [privacy.md](privacy.md)。
 
 ---
 

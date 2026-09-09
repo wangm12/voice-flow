@@ -386,6 +386,9 @@ export function EngineSettings({
                       </label>
                       <div className="flex flex-wrap gap-2">
                         <p className="w-full text-xs text-tertiary">{t("中文转写预设")}</p>
+                        <p className="w-full text-xs leading-5 text-tertiary">
+                          {t("这条 Qwen 路径走 chat completions，需要带 ASR 权限的百炼密钥，不是 Groq Whisper。")}
+                        </p>
                         <button
                           type="button"
                           className="rounded-lg px-2 py-1 text-xs text-secondary hover:bg-elevated"
@@ -398,6 +401,19 @@ export function EngineSettings({
                           }))}
                         >
                           {t("阿里云百炼 Qwen3-ASR")}
+                        </button>
+                        <button
+                          type="button"
+                          className="rounded-lg px-2 py-1 text-xs text-secondary hover:bg-elevated"
+                          onClick={() => setDraft((current) => ({
+                            ...current,
+                            asrProvider: "custom",
+                            customAsr: true,
+                            customBaseUrl: "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+                            asrModel: "qwen3-asr-flash",
+                          }))}
+                        >
+                          {t("国际站 Qwen3-ASR")}
                         </button>
                         <button
                           type="button"

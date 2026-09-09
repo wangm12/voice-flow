@@ -1,9 +1,11 @@
+import { useState } from "react";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import { I18nProvider } from "../lib/i18n";
+import type { ProviderId } from "../lib/providers";
 import { ContextSettings } from "./ContextSettings";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
@@ -95,6 +97,45 @@ describe("ContextSettings", () => {
 
     expect(await screen.findByLabelText("精确转写模型")).toHaveValue("");
     expect(screen.getByLabelText("精确转写服务商")).toHaveValue("groq");
+    expect(screen.getByText("中英混合、人名多、主转写失败或置信度低时才打第二枪；留空仍关闭。")).toBeInTheDocument();
+    expect(screen.getByText("第二枪需要自定义 / 兼容接口上已填的百炼密钥。")).toBeInTheDocument();
+    expect(screen.queryByDisplayValue("whisper-large-v3-turbo")).not.toBeInTheDocument();
+  });
+
+  it("fills Accurate ASR with DashScope Qwen3-ASR on one click", async () => {
+    function Harness() {
+      const [provider, setProvider] = useState<ProviderId>("groq");
+      const [model, setModel] = useState("");
+      const [url, setUrl] = useState("");
+      return (
+        <ContextSettings
+          automationOnly
+          accurateAsrProvider={provider}
+          accurateAsrModel={model}
+          accurateAsrBaseUrl={url}
+          onAccurateAsrProviderChange={setProvider}
+          onAccurateAsrModelChange={setModel}
+          onAccurateAsrBaseUrlChange={setUrl}
+        />
+      );
+    }
+
+    render(<Harness />);
+    fireEvent.click(await screen.findByRole("button", { name: "用百炼 Qwen3-ASR 补一枪" }));
+
+    expect(screen.getByLabelText("精确转写服务商")).toHaveValue("custom");
+    expect(screen.getByLabelText("精确转写模型")).toHaveValue("qwen3-asr-flash");
+    expect(screen.getByLabelText("精确转写模型")).not.toHaveValue("");
+    expect(screen.getByLabelText("精确转写模型")).not.toHaveValue("whisper-large-v3-turbo");
+    expect(screen.getByLabelText("精确转写地址")).toHaveValue("https://dashscope.aliyuncs.com/compatible-mode/v1");
+  });
+
+  it("no-ops the Accurate Qwen fill when change handlers are missing", async () => {
+    render(<ContextSettings automationOnly />);
+    fireEvent.click(await screen.findByRole("button", { name: "用百炼 Qwen3-ASR 补一枪" }));
+    expect(screen.getByLabelText("精确转写服务商")).toHaveValue("groq");
+    expect(screen.getByLabelText("精确转写模型")).toHaveValue("");
+    expect(screen.queryByLabelText("精确转写地址")).not.toBeInTheDocument();
   });
 
   it("exposes a window OCR opt-in that defaults off", async () => {

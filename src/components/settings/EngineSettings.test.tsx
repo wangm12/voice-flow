@@ -106,6 +106,23 @@ describe("EngineSettings form", () => {
     ).toBeInTheDocument();
   });
 
+  it("fills Beijing DashScope Qwen3-ASR from the Chinese preset", () => {
+    renderEngine();
+    fireEvent.click(screen.getByText("兼容接口", { selector: "p.text-sm" }));
+    fireEvent.click(screen.getByRole("button", { name: "阿里云百炼 Qwen3-ASR" }));
+    expect(screen.getByRole("combobox", { name: "转写服务" })).toHaveValue("custom");
+    expect(screen.getByLabelText("兼容地址")).toHaveValue("https://dashscope.aliyuncs.com/compatible-mode/v1");
+    expect(screen.getByRole("textbox", { name: "ASR 模型" })).toHaveValue("qwen3-asr-flash");
+  });
+
+  it("explains that the Qwen path uses chat completions", () => {
+    renderEngine();
+    fireEvent.click(screen.getByText("兼容接口", { selector: "p.text-sm" }));
+    expect(
+      screen.getByText("这条 Qwen 路径走 chat completions，需要带 ASR 权限的百炼密钥，不是 Groq Whisper。"),
+    ).toBeInTheDocument();
+  });
+
   it("keeps model notes in the interface language", () => {
     renderEngine();
     expect(screen.getByRole("option", { name: "Whisper Large v3 Turbo · 默认 · 英文更快，中文较弱" })).toBeInTheDocument();

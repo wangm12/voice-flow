@@ -121,7 +121,7 @@ Typeflux（人设）、OpenTypeless、各类 Voice Paste。中文用户要 BYOK 
 
 ## 阿里 FunASR：中文引擎怎么接
 
-[FunASR](https://github.com/modelscope/FunASR) 是阿里达摩院 / ModelScope 的工具包，不是「又一个 Whisper」。工具包 MIT，**模型许可证各异**。公开数字（中文 CER）：Whisper-large-v3 大约 20%；SenseVoice-Small / Fun-ASR-Nano / Paraformer 大约 8–10%，CPU 也能跑到十倍实时。SayIt 作者的中文体感排序：豆包 > Typeless ≈ Qwen3-ASR > FunASR-Nano >= FireRedASR2 > Whisper。
+[FunASR](https://github.com/modelscope/FunASR) 是阿里达摩院 / ModelScope 的工具包，不是「又一个 Whisper」。工具包 MIT，**模型许可证各异**。公开数字（中文 CER）：Whisper-large-v3 大约 20%；SenseVoice-Small / Fun-ASR-Nano / Paraformer 大约 8–10%，CPU 也能跑到十倍实时。SayIt 作者的中文体感排序：豆包 > Typeless ≈ Qwen3-ASR > FunASR-Nano >= FireRedASR2 > Whisper。2026-09 榜单与插头取舍见 [asr-leaderboard-2026-09.md](asr-leaderboard-2026-09.md)。
 
 ### 对 VoiceFlow 有用的能力
 

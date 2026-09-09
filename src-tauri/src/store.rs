@@ -910,6 +910,7 @@ impl Settings {
 
     pub fn accurate_asr_configured(&self) -> bool {
         !self.accurate_asr_model.trim().is_empty()
+            && !self.accurate_asr_credential().trim().is_empty()
     }
 
     pub fn accurate_asr_credential(&self) -> &str {
@@ -3467,6 +3468,34 @@ mod tests {
         assert!(settings.accurate_asr_configured());
         assert_eq!(settings.accurate_asr_credential(), "sk-accurate");
         assert!(settings.accurate_asr_endpoint().contains("transcriptions"));
+    }
+
+    #[test]
+    fn accurate_asr_configured_requires_nonempty_credential() {
+        let mut settings = Settings::default();
+        settings.api_key = "gsk-groq".into();
+        settings.accurate_asr_provider = crate::engine::EngineProvider::Custom;
+        settings.accurate_asr_model = "qwen3-asr-flash".into();
+        assert_eq!(settings.accurate_asr_credential().trim(), "");
+        assert!(!settings.accurate_asr_configured());
+
+        settings
+            .provider_api_keys
+            .insert("custom".into(), "   ".into());
+        assert_eq!(settings.accurate_asr_credential().trim(), "");
+        assert!(!settings.accurate_asr_configured());
+
+        settings
+            .provider_api_keys
+            .insert("custom".into(), "sk-bailian".into());
+        assert_eq!(settings.accurate_asr_credential(), "sk-bailian");
+        assert!(settings.accurate_asr_configured());
+
+        settings.accurate_asr_provider = crate::engine::EngineProvider::Groq;
+        settings.accurate_asr_model = "whisper-large-v3".into();
+        settings.provider_api_keys.remove("custom");
+        assert!(settings.accurate_asr_configured());
+        assert_eq!(settings.accurate_asr_credential(), "gsk-groq");
     }
 
     #[test]

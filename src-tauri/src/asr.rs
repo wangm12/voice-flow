@@ -51,6 +51,42 @@ pub fn resolve_transcription_url(base: &str) -> String {
     )
 }
 
+const QWEN_CHAT_MAX_ENCODED_BYTES: usize = 10 * 1024 * 1024;
+const QWEN_AUDIO_DATA_PREFIX: &str = "data:audio/wav;base64,";
+
+/// DashScope OpenAI-compat Qwen ASR uses `/chat/completions`, not Whisper
+/// `/audio/transcriptions`. Official DashScope / MaaS hosts + Qwen ASR models.
+fn is_dashscope_family_host(host: &str) -> bool {
+    host == "dashscope.aliyuncs.com"
+        || host == "dashscope-intl.aliyuncs.com"
+        || host.ends_with(".maas.aliyuncs.com")
+}
+
+fn is_dashscope_qwen_chat_asr(base_or_endpoint: &str, model: &str) -> bool {
+    let host = host_from_url(base_or_endpoint)
+        .or_else(|| transcription_host(base_or_endpoint))
+        .unwrap_or_default();
+    if !is_dashscope_family_host(&host) {
+        return false;
+    }
+    let model = model.to_ascii_lowercase();
+    model.contains("qwen3-asr") || model.contains("qwen-asr")
+}
+
+/// Rewrite a user `/v1` or resolved transcriptions URL to chat completions.
+fn resolve_qwen_chat_completions_url(base: &str) -> String {
+    let trimmed = base.trim().trim_end_matches('/');
+    let without_transcriptions = trimmed
+        .strip_suffix("/audio/transcriptions")
+        .unwrap_or(trimmed);
+    resolve_compat_url(
+        without_transcriptions,
+        without_transcriptions,
+        "chat/completions",
+        "chat/completions",
+    )
+}
+
 /// Reuse the Groq chat key only for the Groq default or `api.groq.com`.
 pub fn groq_key_fallback_allowed(base_url: &str) -> bool {
     if base_url.trim().is_empty() {
@@ -136,7 +172,7 @@ pub enum AsrError {
     Server(String),
     #[error("empty speech result")]
     EmptyResult,
-    #[error("Groq error: {0}")]
+    #[error("ASR error: {0}")]
     Other(String),
 }
 
@@ -390,6 +426,218 @@ pub(crate) async fn probe_transcription(
     }
 }
 
+fn qwen_asr_language(language: Option<&str>) -> Option<&'static str> {
+    match normalize_language(language)? {
+        value if value.eq_ignore_ascii_case("zh") => Some("zh"),
+        value if value.eq_ignore_ascii_case("en") => Some("en"),
+        _ => None,
+    }
+}
+
+fn encoded_base64_len(byte_len: usize) -> usize {
+    byte_len.div_ceil(3) * 4
+}
+
+fn encode_base64(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(encoded_base64_len(bytes.len()));
+    let mut index = 0;
+    while index < bytes.len() {
+        let b0 = bytes[index];
+        let b1 = bytes.get(index + 1).copied().unwrap_or(0);
+        let b2 = bytes.get(index + 2).copied().unwrap_or(0);
+        let n = (u32::from(b0) << 16) | (u32::from(b1) << 8) | u32::from(b2);
+        out.push(TABLE[((n >> 18) & 63) as usize] as char);
+        out.push(TABLE[((n >> 12) & 63) as usize] as char);
+        if index + 1 < bytes.len() {
+            out.push(TABLE[((n >> 6) & 63) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if index + 2 < bytes.len() {
+            out.push(TABLE[(n & 63) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        index += 3;
+    }
+    out
+}
+
+fn build_qwen_chat_body(
+    wav: &[u8],
+    language: Option<&str>,
+    prompt: Option<&str>,
+    model: &str,
+) -> Result<serde_json::Value, AsrError> {
+    let encoded_len = QWEN_AUDIO_DATA_PREFIX.len() + encoded_base64_len(wav.len());
+    if encoded_len > QWEN_CHAT_MAX_ENCODED_BYTES {
+        return Err(AsrError::Other(
+            "encoded audio payload exceeds 10 MB".into(),
+        ));
+    }
+    let data = format!("{QWEN_AUDIO_DATA_PREFIX}{}", encode_base64(wav));
+    let mut messages = Vec::new();
+    if let Some(prompt) = prompt.filter(|value| !value.is_empty()) {
+        messages.push(serde_json::json!({
+            "role": "system",
+            "content": [{ "type": "text", "text": prompt }]
+        }));
+    }
+    messages.push(serde_json::json!({
+        "role": "user",
+        "content": [{
+            "type": "input_audio",
+            "input_audio": { "data": data }
+        }]
+    }));
+    let mut asr_options = serde_json::json!({ "enable_itn": true });
+    if let Some(language) = qwen_asr_language(language) {
+        asr_options["language"] = serde_json::Value::String(language.to_owned());
+    }
+    Ok(serde_json::json!({
+        "model": resolve_asr_model(model),
+        "messages": messages,
+        "asr_options": asr_options,
+    }))
+}
+
+fn qwen_chat_content(value: &serde_json::Value) -> Result<String, AsrError> {
+    let choices = value
+        .get("choices")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| AsrError::Other("missing choices".into()))?;
+    let first = choices
+        .first()
+        .ok_or_else(|| AsrError::Other("missing choices".into()))?;
+    let content = first
+        .pointer("/message/content")
+        .ok_or(AsrError::EmptyResult)?;
+    let text = match content {
+        serde_json::Value::String(text) => text.clone(),
+        serde_json::Value::Null => String::new(),
+        serde_json::Value::Array(parts) => parts
+            .iter()
+            .filter_map(|part| {
+                part.get("text")
+                    .and_then(serde_json::Value::as_str)
+                    .or_else(|| part.as_str())
+            })
+            .collect(),
+        _ => return Err(AsrError::Other("invalid message content".into())),
+    };
+    if text.trim().is_empty() {
+        return Err(AsrError::EmptyResult);
+    }
+    Ok(text)
+}
+
+fn qwen_json_string<'a>(value: &'a serde_json::Value, key: &str) -> Option<&'a str> {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            value
+                .get("error")
+                .and_then(|error| error.get(key))
+                .and_then(serde_json::Value::as_str)
+        })
+}
+
+fn qwen_error_body_detail(body: &str) -> Option<String> {
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(body) {
+        let code = qwen_json_string(&value, "code");
+        let message = qwen_json_string(&value, "message").or_else(|| {
+            value.get("error").and_then(serde_json::Value::as_str)
+        });
+        match (code, message) {
+            (Some(code), Some(message)) if !code.is_empty() && !message.is_empty() => {
+                return Some(format!("{code}: {message}"));
+            }
+            (_, Some(message)) if !message.is_empty() => return Some(message.to_owned()),
+            (Some(code), _) if !code.is_empty() => return Some(code.to_owned()),
+            _ => {}
+        }
+    }
+    let trimmed = body.trim();
+    (!trimmed.is_empty()).then(|| trimmed.chars().take(240).collect())
+}
+
+fn qwen_http_error_message(status: reqwest::StatusCode, body: &str) -> String {
+    match qwen_error_body_detail(body) {
+        Some(detail) => format!("HTTP status {status}: {detail}"),
+        None => format!("HTTP status {status}"),
+    }
+}
+
+fn asr_status_error(
+    status: reqwest::StatusCode,
+    endpoint: &str,
+    limits: &RateLimits,
+) -> Option<AsrError> {
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        return Some(AsrError::Unauthorized(
+            host_from_url(endpoint).unwrap_or_else(|| "unknown".into()),
+        ));
+    }
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        return Some(AsrError::RateLimited(
+            limits.retry_after.clone().unwrap_or_default(),
+        ));
+    }
+    if status.is_server_error() {
+        return Some(AsrError::Server(format!("HTTP status {status}")));
+    }
+    if !status.is_success() {
+        return Some(AsrError::Other(format!("HTTP status {status}")));
+    }
+    None
+}
+
+async fn transcribe_qwen_chat(
+    endpoint: &str,
+    wav: Vec<u8>,
+    key: &str,
+    language: Option<&str>,
+    prompt: Option<&str>,
+    model: &str,
+) -> Result<Transcript, AsrError> {
+    let url = resolve_qwen_chat_completions_url(endpoint);
+    let body = build_qwen_chat_body(&wav, language, prompt, model)?;
+    let client = http_client()?;
+    let response = client
+        .post(&url)
+        .bearer_auth(key)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|error| {
+            if error.is_timeout() {
+                AsrError::Timeout
+            } else {
+                AsrError::Network(error.to_string())
+            }
+        })?;
+    let limits = parse_rate_limits(response.headers());
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .map_err(|error| AsrError::Other(error.to_string()))?;
+    if !status.is_success() {
+        return Err(AsrError::Other(qwen_http_error_message(status, &body)));
+    }
+    let parsed: serde_json::Value =
+        serde_json::from_str(&body).map_err(|error| AsrError::Other(error.to_string()))?;
+    let text = qwen_chat_content(&parsed)?;
+    sanitize_transcript(Transcript {
+        text,
+        segments: Vec::new(),
+        words: Vec::new(),
+        limits,
+    })
+}
+
 async fn transcribe_at(
     endpoint: &str,
     wav: Vec<u8>,
@@ -400,6 +648,9 @@ async fn transcribe_at(
 ) -> Result<Transcript, AsrError> {
     if endpoint.contains("api.deepgram.com") || endpoint.contains("/listen") {
         return transcribe_deepgram(endpoint, wav, key, language, model, prompt).await;
+    }
+    if is_dashscope_qwen_chat_asr(endpoint, model) {
+        return transcribe_qwen_chat(endpoint, wav, key, language, prompt, model).await;
     }
     let client = http_client()?;
     let mut form = Form::new()
@@ -429,20 +680,8 @@ async fn transcribe_at(
         })?;
     let limits = parse_rate_limits(response.headers());
     let status = response.status();
-    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-        let host = host_from_url(endpoint).unwrap_or_else(|| "unknown".into());
-        return Err(AsrError::Unauthorized(host));
-    }
-    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-        return Err(AsrError::RateLimited(
-            limits.retry_after.unwrap_or_default(),
-        ));
-    }
-    if status.is_server_error() {
-        return Err(AsrError::Server(format!("HTTP status {status}")));
-    }
-    if !status.is_success() {
-        return Err(AsrError::Other(format!("HTTP status {status}")));
+    if let Some(error) = asr_status_error(status, endpoint, &limits) {
+        return Err(error);
     }
     let mut result: Transcript = response
         .json()
@@ -1075,5 +1314,289 @@ mod tests {
                 .await,
             Err(AsrError::RateLimited(value)) if value == "2"
         ));
+    }
+
+    #[test]
+    fn dashscope_beijing_qwen3_asr_flash_uses_chat() {
+        assert!(is_dashscope_qwen_chat_asr(
+            "https://dashscope.aliyuncs.com/compatible-mode/v1",
+            "qwen3-asr-flash",
+        ));
+        assert!(is_dashscope_qwen_chat_asr(
+            "https://dashscope.aliyuncs.com/compatible-mode/v1/audio/transcriptions",
+            "Qwen3-ASR-Flash",
+        ));
+    }
+
+    #[test]
+    fn dashscope_intl_qwen_asr_uses_chat() {
+        assert!(is_dashscope_qwen_chat_asr(
+            "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+            "qwen-asr-foo",
+        ));
+    }
+
+    #[test]
+    fn dashscope_whisper_model_does_not_use_chat() {
+        assert!(!is_dashscope_qwen_chat_asr(
+            "https://dashscope.aliyuncs.com/compatible-mode/v1",
+            "whisper-1",
+        ));
+    }
+
+    #[test]
+    fn groq_host_with_qwen_model_does_not_use_chat() {
+        assert!(!is_dashscope_qwen_chat_asr(
+            "https://api.groq.com/openai/v1",
+            "qwen3-asr-flash",
+        ));
+        assert!(!is_dashscope_qwen_chat_asr("", "qwen3-asr-flash"));
+    }
+
+    #[test]
+    fn maas_workspace_qwen3_asr_flash_uses_chat() {
+        assert!(is_dashscope_qwen_chat_asr(
+            "https://abc.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
+            "qwen3-asr-flash",
+        ));
+    }
+
+    #[test]
+    fn maas_workspace_whisper_does_not_use_chat() {
+        assert!(!is_dashscope_qwen_chat_asr(
+            "https://abc.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
+            "whisper-1",
+        ));
+    }
+
+    #[test]
+    fn notdashscope_host_does_not_use_chat() {
+        assert!(!is_dashscope_qwen_chat_asr(
+            "https://notdashscope.aliyuncs.com/v1",
+            "qwen3-asr-flash",
+        ));
+    }
+
+    #[test]
+    fn asr_error_other_uses_generic_prefix() {
+        assert_eq!(
+            AsrError::Other("HTTP status 403 Forbidden".into()).to_string(),
+            "ASR error: HTTP status 403 Forbidden"
+        );
+    }
+
+    #[test]
+    fn qwen_chat_url_uses_completions_not_transcriptions() {
+        assert_eq!(
+            resolve_qwen_chat_completions_url(
+                "https://dashscope.aliyuncs.com/compatible-mode/v1"
+            ),
+            "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
+        );
+        assert_eq!(
+            resolve_qwen_chat_completions_url(
+                "https://dashscope.aliyuncs.com/compatible-mode/v1/audio/transcriptions"
+            ),
+            "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
+        );
+        assert_eq!(
+            resolve_qwen_chat_completions_url(
+                "https://dashscope-intl.aliyuncs.com/compatible-mode/v1/"
+            ),
+            "https://dashscope-intl.aliyuncs.com/compatible-mode/v1/chat/completions"
+        );
+        let url = resolve_qwen_chat_completions_url(
+            "https://dashscope.aliyuncs.com/compatible-mode/v1/audio/transcriptions",
+        );
+        assert!(url.contains("chat/completions"));
+        assert!(!url.contains("audio/transcriptions"));
+    }
+
+    #[test]
+    fn qwen_chat_body_omits_language_for_auto_and_missing() {
+        for language in [None, Some("auto"), Some(" AUTO "), Some("")] {
+            let body = build_qwen_chat_body(b"wav", language, None, "qwen3-asr-flash")
+                .expect("small payload");
+            assert_eq!(body["asr_options"]["enable_itn"], true);
+            assert!(body["asr_options"].get("language").is_none());
+        }
+    }
+
+    #[test]
+    fn qwen_chat_body_sends_explicit_zh_language() {
+        let body = build_qwen_chat_body(b"wav", Some("zh"), None, "qwen3-asr-flash")
+            .expect("small payload");
+        assert_eq!(body["asr_options"]["language"], "zh");
+        assert_eq!(body["asr_options"]["enable_itn"], true);
+    }
+
+    #[test]
+    fn qwen_chat_body_includes_system_text_from_prompt() {
+        let body = build_qwen_chat_body(
+            b"wav",
+            None,
+            Some("晓雯 知乎 TypeScript"),
+            "qwen3-asr-flash",
+        )
+        .expect("small payload");
+        let messages = body["messages"].as_array().expect("messages");
+        assert_eq!(messages[0]["role"], "system");
+        assert_eq!(messages[0]["content"][0]["type"], "text");
+        assert_eq!(messages[0]["content"][0]["text"], "晓雯 知乎 TypeScript");
+        assert_eq!(messages[1]["role"], "user");
+        assert_eq!(messages[1]["content"][0]["type"], "input_audio");
+        assert!(messages[1]["content"][0]["input_audio"]["data"]
+            .as_str()
+            .unwrap()
+            .starts_with("data:audio/wav;base64,"));
+    }
+
+    #[test]
+    fn qwen_chat_body_omits_system_when_prompt_empty() {
+        for prompt in [None, Some("")] {
+            let body = build_qwen_chat_body(b"wav", None, prompt, "qwen3-asr-flash")
+                .expect("small payload");
+            let messages = body["messages"].as_array().expect("messages");
+            assert_eq!(messages.len(), 1);
+            assert_eq!(messages[0]["role"], "user");
+        }
+    }
+
+    #[test]
+    fn qwen_chat_oversize_payload_errors_before_encoding_request() {
+        let wav = vec![0_u8; 8 * 1024 * 1024];
+        let error = build_qwen_chat_body(&wav, None, None, "qwen3-asr-flash")
+            .expect_err("oversize encoded payload");
+        assert!(
+            matches!(&error, AsrError::Other(message) if message.contains("10 MB")),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn qwen_chat_content_reads_choices_message() {
+        let value = serde_json::json!({
+            "choices": [{ "message": { "content": "你好世界" } }]
+        });
+        assert_eq!(qwen_chat_content(&value).expect("content"), "你好世界");
+    }
+
+    #[test]
+    fn qwen_chat_content_errors_on_missing_choices_or_empty() {
+        assert!(matches!(
+            qwen_chat_content(&serde_json::json!({})),
+            Err(AsrError::Other(_))
+        ));
+        assert!(matches!(
+            qwen_chat_content(&serde_json::json!({ "choices": [] })),
+            Err(AsrError::Other(_))
+        ));
+        assert!(matches!(
+            qwen_chat_content(&serde_json::json!({
+                "choices": [{ "message": { "content": "" } }]
+            })),
+            Err(AsrError::EmptyResult)
+        ));
+        assert!(matches!(
+            qwen_chat_content(&serde_json::json!({
+                "choices": [{ "message": { "content": null } }]
+            })),
+            Err(AsrError::EmptyResult)
+        ));
+    }
+
+    #[tokio::test]
+    async fn qwen_chat_oversize_does_not_send_request() {
+        let started = std::time::Instant::now();
+        let error = transcribe_at(
+            "https://dashscope.aliyuncs.com:1/compatible-mode/v1/audio/transcriptions",
+            vec![0_u8; 8 * 1024 * 1024],
+            "test-key",
+            None,
+            None,
+            "qwen3-asr-flash",
+        )
+        .await
+        .expect_err("oversize must fail");
+        assert!(
+            matches!(&error, AsrError::Other(message) if message.contains("10 MB")),
+            "{error}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "oversize must fail before opening a socket"
+        );
+    }
+
+    #[tokio::test]
+    async fn qwen_chat_transcribe_posts_json_and_parses_content() {
+        let (host, request) = crate::test_http::spawn_response_with_request_capture(
+            200,
+            "application/json",
+            r#"{"choices":[{"message":{"content":"识别结果"}}]}"#.as_bytes().to_vec(),
+            &[],
+        )
+        .await;
+        let result = transcribe_qwen_chat(
+            &host,
+            b"wav".to_vec(),
+            "qwen-key",
+            Some("zh"),
+            Some("晓雯"),
+            "qwen3-asr-flash",
+        )
+        .await
+        .expect("qwen chat success");
+        assert_eq!(result.text, "识别结果");
+        let body: serde_json::Value =
+            serde_json::from_slice(&request.await.expect("captured")).expect("json body");
+        assert_eq!(body["model"], "qwen3-asr-flash");
+        assert_eq!(body["asr_options"]["enable_itn"], true);
+        assert_eq!(body["asr_options"]["language"], "zh");
+        assert_eq!(body["messages"][0]["content"][0]["text"], "晓雯");
+
+        let invalid = crate::test_http::spawn_response(
+            200,
+            "application/json",
+            b"not-json".to_vec(),
+            &[],
+        )
+        .await;
+        assert!(matches!(
+            transcribe_qwen_chat(&invalid, b"wav".to_vec(), "k", None, None, "qwen3-asr-flash")
+                .await,
+            Err(AsrError::Other(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn qwen_chat_403_surfaces_json_body() {
+        let endpoint = crate::test_http::spawn_response(
+            403,
+            "application/json",
+            r#"{"code":"AccessDenied","message":"需要 ASR 权限","error":"Forbidden"}"#
+                .as_bytes()
+                .to_vec(),
+            &[],
+        )
+        .await;
+        let error = transcribe_qwen_chat(
+            &endpoint,
+            b"wav".to_vec(),
+            "k",
+            None,
+            None,
+            "qwen3-asr-flash",
+        )
+        .await
+        .expect_err("403 must fail");
+        let displayed = error.to_string();
+        assert!(
+            matches!(&error, AsrError::Other(_)),
+            "{error}"
+        );
+        assert!(displayed.contains("ASR error"), "{displayed}");
+        assert!(displayed.contains("需要 ASR 权限"), "{displayed}");
+        assert!(displayed.contains("AccessDenied"), "{displayed}");
     }
 }

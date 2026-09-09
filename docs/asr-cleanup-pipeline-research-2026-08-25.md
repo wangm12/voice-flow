@@ -8,7 +8,7 @@
 
 本文基于当前仓库代码（`src-tauri/src/{audio,chunker,asr,prefetch_asr,spoken_punctuation,spoken_layout,lexicon,llm,context,lib}.rs`），以及 2026-08-25 的公开资料。不宣称对 Groq 做过新的 live 评测。
 
-相关旧文：[competitive-research.md](competitive-research.md)（产品分层，2026-08-20）、[cleanup-evaluation.md](cleanup-evaluation.md)、[.superpowers/sdd/harness-competitive-compare.md](../.superpowers/sdd/harness-competitive-compare.md)、[.superpowers/sdd/cleanup-three-layer-audit.md](../.superpowers/sdd/cleanup-three-layer-audit.md)。旧文已经把「手感 / 语气 / 词典学习」说清楚了。本文补的是**识别引擎与整理模型本身**——这才是质量对不上的主因。
+相关旧文：[competitive-research.md](competitive-research.md)（产品分层，2026-08-20）、[cleanup-evaluation.md](cleanup-evaluation.md)。旧文已经把「手感 / 语气 / 词典学习」说清楚了。本文补的是**识别引擎与整理模型本身**——这才是质量对不上的主因。
 
 ---
 

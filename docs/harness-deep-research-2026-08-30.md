@@ -4,7 +4,7 @@
 
 范围：系统级听写的自学循环。不是会议笔记，不是 Agent，也不是再训一个 ASR。
 
-对照：[competitive-research.md](competitive-research.md)（产品分层）、[.superpowers/sdd/harness-competitive-compare.md](../.superpowers/sdd/harness-competitive-compare.md)（8 月 23 日对照）、[asr-cleanup-later-and-wont.md](asr-cleanup-later-and-wont.md)、[privacy.md](privacy.md)。
+对照：[competitive-research.md](competitive-research.md)（产品分层）、[asr-cleanup-later-and-wont.md](asr-cleanup-later-and-wont.md)、[privacy.md](privacy.md)。
 
 ---
 

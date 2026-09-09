@@ -1,6 +1,6 @@
 # VoiceFlow Context & Delivery E2E Verification Checklist
 
-更新时间：2026-08-30（清单仍适用；自动化数字以当前测试为准）
+更新时间：2026-09-08（清单仍适用；自动化数字以当前测试为准）
 
 这份 checklist 用于验证 VoiceFlow 的全部上下文来源、Prompt policy、目标保护、交付方式和 History 结果。它覆盖自动化测试和真实 macOS 外部 App 测试。
 
@@ -18,9 +18,9 @@
 | Manual context override | 已实现 | policy override + target guard |
 | Selected text context | 已实现 | preview-first + 真实选区 |
 | Clipboard safety context | 已实现 | clipboard sentinel + cancellation/fallback |
-| Image / screen context | 未实现 | 只验证“不采集、不上传、不伪装成成功” |
+| Image / screen context | 已实现（Phase 1 AX + 可选本机 OCR + 看屏幕热键） | 默认听写零截屏；看屏幕才截一张内存图并走 preview；§18 |
 
-图片/屏幕上下文目前没有 capture、vision provider、ScreenCaptureKit、image preview 或 image delivery 链路，因此不能把它标记为通过。本轮只验证它不会被未经用户触发地采集或发送。
+截图进 LLM 只发生在用户自己录了看屏幕热键且配置了视觉模型之后。区域框选仍未做（§18.3 保持未实现）。会议录音、Spark、生图仍然不做。
 
 ## 2. 状态和证据约定
 
@@ -567,6 +567,8 @@ Clipboard 不是 LLM context，而是 delivery safety context。
 - [ ] preview 确认前不能写入目标 App
 
 ### 18.3 Image + selected region
+
+当前未实现（整窗一张图，没有框选）。下面留给以后验收，不要标成已通过。
 
 - [ ] 可以选择图片区域
 - [ ] OCR / vision 只处理所选区域

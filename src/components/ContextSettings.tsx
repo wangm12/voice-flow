@@ -644,7 +644,7 @@ export function ContextSettings({
             <SettingsRow title={t("窗口文字识别")} description={t("当辅助功能读到的字太少时，只截当前听写窗口并在本机识别。默认关闭，需要屏幕录制权限。")}>
               <Toggle checked={windowOcrEnabled} onChange={(next) => onWindowOcrEnabledChange?.(next)} disabled={busy || !onWindowOcrEnabledChange} label={t("窗口文字识别")} />
             </SettingsRow>
-            <SettingsRow title={t("精确转写")} description={t("留空则关闭二次转写。只在人名多、主转写失败或置信度低时用。")}>
+            <SettingsRow title={t("精确转写")} description={t("中英混合、人名多、主转写失败或置信度低时才打第二枪；留空仍关闭。")}>
               <div className="flex w-full max-w-md flex-col gap-2">
                 <div className="flex w-full flex-col gap-2 sm:flex-row">
                   <select
@@ -664,7 +664,7 @@ export function ContextSettings({
                     value={accurateAsrModel}
                     onChange={(event) => onAccurateAsrModelChange?.(event.target.value)}
                     disabled={busy || !onAccurateAsrModelChange}
-                    placeholder={t("例如 whisper-large-v3")}
+                    placeholder={t("例如 whisper-large-v3 或 qwen3-asr-flash")}
                     className={`w-full ${fieldClass}`}
                   />
                 </div>
@@ -678,6 +678,20 @@ export function ContextSettings({
                     className={`w-full ${fieldClass}`}
                   />
                 )}
+                <p className="text-xs leading-5 text-tertiary">
+                  {t("第二枪需要自定义 / 兼容接口上已填的百炼密钥。")}
+                </p>
+                <button
+                  type="button"
+                  onClick={() => {
+                    onAccurateAsrProviderChange?.("custom");
+                    onAccurateAsrModelChange?.("qwen3-asr-flash");
+                    onAccurateAsrBaseUrlChange?.("https://dashscope.aliyuncs.com/compatible-mode/v1");
+                  }}
+                  className="self-start rounded-lg px-2 py-1 text-xs text-secondary hover:bg-elevated"
+                >
+                  {t("用百炼 Qwen3-ASR 补一枪")}
+                </button>
               </div>
             </SettingsRow>
             <SettingsRow title={t("视觉模型")} description={t("看屏幕热键才会把一张窗口图发给这个模型。留空则拒绝截屏。会议录音、Spark 和生图仍然不做。")}>

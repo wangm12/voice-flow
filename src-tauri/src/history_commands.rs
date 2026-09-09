@@ -47,23 +47,6 @@ pub(crate) fn export_gold_corpus(
 }
 
 #[tauri::command]
-pub(crate) fn get_history_audio(id: i64, app: tauri::AppHandle) -> Result<Vec<u8>, String> {
-    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
-    store::history_audio_bytes(&dir, id).map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-pub(crate) fn save_verbatim(
-    id: i64,
-    text: String,
-    reviewed: bool,
-    app: tauri::AppHandle,
-) -> Result<(), String> {
-    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
-    store::save_verbatim(&dir, id, &text, reviewed).map_err(|e| e.to_string())
-}
-
-#[tauri::command]
 pub(crate) fn repaste_history(id: i64, app: tauri::AppHandle) -> Result<(), String> {
     let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
     let text = store::history_text(&dir, id).map_err(|e| e.to_string())?;

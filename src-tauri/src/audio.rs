@@ -38,16 +38,6 @@ pub enum AudioError {
     EmptyRecording,
 }
 
-pub fn default_input_device_name() -> Result<String, String> {
-    let host = cpal::default_host();
-    let device = host
-        .default_input_device()
-        .ok_or_else(|| "no input device is available".to_owned())?;
-    device
-        .name()
-        .map_err(|error| format!("could not read input device name: {error}"))
-}
-
 #[derive(Debug, Clone, Serialize)]
 pub struct InputDeviceInfo {
     pub name: String,

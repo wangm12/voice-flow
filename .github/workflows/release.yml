@@ -22,7 +22,7 @@ concurrency:
   cancel-in-progress: true
 
 permissions:
-  contents: read
+  contents: write
 
 env:
   NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
@@ -105,14 +105,16 @@ jobs:
           fi
 
       - name: Publish GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ steps.tag.outputs.name }}
-          name: VoiceFlow ${{ steps.tag.outputs.name }}
-          target_commitish: ${{ github.sha }}
-          draft: false
-          make_latest: true
-          generate_release_notes: true
-          overwrite_files: true
-          fail_on_unmatched_files: true
-          files: artifacts/VoiceFlow.dmg
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="${{ steps.tag.outputs.name }}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" artifacts/VoiceFlow.dmg --clobber
+          else
+            gh release create "$tag" artifacts/VoiceFlow.dmg \
+              --title "VoiceFlow $tag" \
+              --generate-notes \
+              --latest \
+              --target "${{ github.sha }}"
+          fi

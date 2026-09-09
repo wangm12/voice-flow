@@ -7,6 +7,9 @@ on:
 permissions:
   contents: read
 
+env:
+  NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
+
 jobs:
   frontend:
     runs-on: ubuntu-24.04
@@ -16,7 +19,7 @@ jobs:
         with:
           node-version: 22
           cache: npm
-      - run: npm ci
+      - run: npm ci --registry=https://registry.npmjs.org
       - run: npm test
       - run: npm run lint
       - run: npm run build
@@ -48,7 +51,7 @@ jobs:
         with:
           node-version: 22
           cache: npm
-      - run: npm ci
+      - run: npm ci --registry=https://registry.npmjs.org
       - run: npm run build
       - run: npm run tauri -- info
 

@@ -1,6 +1,6 @@
 # VoiceFlow release checklist
 
-This is a preflight checklist, not an automated publishing workflow. A build is not shippable until every unchecked item has an owner and evidence.
+This is a preflight checklist. GitHub Actions (`.github/workflows/release.yml`) builds `VoiceFlow.dmg` and attaches it to the GitHub Release. A build is not shippable until every unchecked item has an owner and evidence.
 
 ## Automated gates
 

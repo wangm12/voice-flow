@@ -283,7 +283,10 @@ tccutil reset Accessibility com.voiceflow.desktop
 
 ### GitHub Release
 
-推送 `v*` tag（或在 **Actions → macOS Release** 手动跑）会构建并上传 `.build/release/VoiceFlow.dmg`。
+`.github/workflows/release.yml` 会打 `VoiceFlow.dmg`，并用 `softprops/action-gh-release` 挂到 **GitHub Release** 上（不是 Vite 的 `dist/`）。两种触发方式：
+
+1. **Actions → Release → Run workflow** — 用 `package.json` 的版本当 tag（现在是 `v0.1.0`）。
+2. **推送匹配的 tag**：`git tag v0.1.0 && git push origin v0.1.0`。
 
 要让别人更新时权限还在，Actions 必须用**同一张**证：
 

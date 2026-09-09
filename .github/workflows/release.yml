@@ -1,4 +1,15 @@
-name: macOS Release
+# Build VoiceFlow.dmg and attach it to a GitHub Release.
+# Source code zip/tar.gz is added by GitHub automatically.
+#
+# Optional secrets (unsigned builds lose Accessibility on each update):
+#   MACOS_CERT_P12         base64-encoded VoiceFlow self-signed .p12
+#   MACOS_CERT_PASSWORD    password for that .p12
+#
+# Cut a release:
+#   - Push tag vX.Y.Z matching package.json, or
+#   - Actions → Release → Run workflow (uses package.json version)
+
+name: Release
 
 on:
   push:
@@ -6,52 +17,100 @@ on:
       - "v*"
   workflow_dispatch:
 
-permissions:
-  contents: write
-
 concurrency:
   group: voiceflow-release-${{ github.ref }}
   cancel-in-progress: false
 
+permissions:
+  contents: read
+
+env:
+  NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
+
 jobs:
-  release:
+  build-mac:
+    name: macOS DMG
     runs-on: macos-14
-    timeout-minutes: 60
-    env:
-      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: npm
+
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: stable
-      - run: npm ci
+
+      - name: Install dependencies
+        run: npm ci --registry=https://registry.npmjs.org
+
+      - name: Require tag to match package.json
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          pkg="$(node -p "require('./package.json').version")"
+          if [ "$tag" != "$pkg" ]; then
+            echo "Tag $GITHUB_REF_NAME does not match package.json version $pkg"
+            exit 1
+          fi
+
       - name: Import stable signing certificate
         env:
           MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
           MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
         run: ./scripts/import-signing-cert.sh
+
       - name: Package Release DMG
         run: make dmg
+
       - name: Upload DMG artifact
         uses: actions/upload-artifact@v4
         with:
-          name: VoiceFlow.dmg
+          name: macos-dmg
           path: .build/release/VoiceFlow.dmg
           if-no-files-found: error
-      - name: Publish GitHub Release
-        if: startsWith(github.ref, 'refs/tags/')
+
+  release:
+    name: GitHub Release
+    needs: build-mac
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: macos-dmg
+          path: artifacts
+
+      - name: Require installer artifact
         run: |
-          set -euo pipefail
-          tag="${GITHUB_REF_NAME}"
-          if gh release view "$tag" >/dev/null 2>&1; then
-            gh release upload "$tag" .build/release/VoiceFlow.dmg --clobber
+          test -f artifacts/VoiceFlow.dmg
+          ls -lh artifacts/VoiceFlow.dmg
+
+      - name: Resolve release tag
+        id: tag
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            echo "name=$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
           else
-            gh release create "$tag" .build/release/VoiceFlow.dmg \
-              --title "VoiceFlow ${tag#v}" \
-              --generate-notes \
-              --verify-tag
+            echo "name=v$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
           fi
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.name }}
+          name: VoiceFlow ${{ steps.tag.outputs.name }}
+          target_commitish: ${{ github.sha }}
+          draft: false
+          make_latest: true
+          generate_release_notes: true
+          overwrite_files: true
+          fail_on_unmatched_files: true
+          files: artifacts/VoiceFlow.dmg

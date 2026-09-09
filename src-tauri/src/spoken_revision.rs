@@ -110,7 +110,9 @@ pub fn is_hallucination_text(text: &str) -> bool {
 
 fn fold_compare(text: &str) -> String {
     text.chars()
-        .filter(|ch| !ch.is_whitespace() && !matches!(*ch, '.' | '!' | '?' | '。' | '！' | '？' | ',' | '，'))
+        .filter(|ch| {
+            !ch.is_whitespace() && !matches!(*ch, '.' | '!' | '?' | '。' | '！' | '？' | ',' | '，')
+        })
         .flat_map(char::to_lowercase)
         .collect()
 }
@@ -152,7 +154,7 @@ fn starts_with_correction(sentence: &str) -> bool {
 
 fn resolve_one_sentence(sentence: &str) -> String {
     let (body, closer) = peel_closer(sentence);
-    if let Some((_prefix, suffix)) = split_on_last_marker_run(&body) {
+    if let Some((_prefix, suffix)) = split_on_last_marker_run(body) {
         if suffix.trim().is_empty() {
             if starts_with_correction(sentence) || !is_glued_content_marker(&_prefix) {
                 return String::new();
@@ -161,7 +163,7 @@ fn resolve_one_sentence(sentence: &str) -> String {
         }
         return attach_closer(&strip_replacement_introducer(suffix.trim()), closer);
     }
-    if let Some(replaced) = apply_contrast_not_a_but_b(&body) {
+    if let Some(replaced) = apply_contrast_not_a_but_b(body) {
         return attach_closer(&replaced, closer);
     }
     sentence.to_owned()
@@ -318,8 +320,7 @@ fn match_one_marker(text: &str, lower: &str, start: usize) -> Option<(usize, usi
 
 fn match_plain_marker(text: &str, lower: &str, start: usize, marker: &str) -> Option<usize> {
     if marker.is_ascii() {
-        if lower[start..].starts_with(marker)
-            && ascii_boundaries(text, start, start + marker.len())
+        if lower[start..].starts_with(marker) && ascii_boundaries(text, start, start + marker.len())
         {
             return Some(start + marker.len());
         }
@@ -373,7 +374,12 @@ fn cjk_bu_dui_right_ok(text: &str, end: usize) -> bool {
     match text[end..].chars().next() {
         None => true,
         Some(ch) if ch.is_whitespace() => true,
-        Some(ch) if matches!(ch, ',' | '，' | '。' | '.' | '、' | '!' | '?' | '！' | '？' | '\n') => {
+        Some(ch)
+            if matches!(
+                ch,
+                ',' | '，' | '。' | '.' | '、' | '!' | '?' | '！' | '？' | '\n'
+            ) =>
+        {
             true
         }
         Some('是') => true,
@@ -416,7 +422,8 @@ fn is_blank_or_markers(text: &str) -> bool {
     let stripped = text
         .trim()
         .trim_matches(|ch: char| {
-            ch.is_whitespace() || matches!(ch, ',' | '，' | '。' | '.' | '、' | '!' | '?' | '！' | '？')
+            ch.is_whitespace()
+                || matches!(ch, ',' | '，' | '。' | '.' | '、' | '!' | '?' | '！' | '？')
         })
         .to_ascii_lowercase();
     stripped.is_empty() || MARKERS.iter().any(|marker| stripped == *marker)
@@ -452,7 +459,10 @@ fn normalize_repeat(text: &str) -> String {
     out.chars()
         .filter(|ch| {
             !ch.is_whitespace()
-                && !matches!(*ch, '，' | ',' | '。' | '.' | '！' | '!' | '？' | '?' | '、')
+                && !matches!(
+                    *ch,
+                    '，' | ',' | '。' | '.' | '！' | '!' | '？' | '?' | '、'
+                )
         })
         .collect()
 }
@@ -466,7 +476,11 @@ fn split_sentences(text: &str) -> Vec<String> {
         let ch = chars[index];
         current.push(ch);
         let next = chars.get(index + 1).copied();
-        let prev = if index > 0 { Some(chars[index - 1]) } else { None };
+        let prev = if index > 0 {
+            Some(chars[index - 1])
+        } else {
+            None
+        };
         let is_version_dot = ch == '.'
             && prev.is_some_and(|item| item.is_ascii_digit())
             && next.is_some_and(|item| item.is_ascii_digit());
@@ -509,7 +523,10 @@ mod tests {
         assert!(!out.contains("cloud"), "{out}");
         assert!(!out.contains("不对"), "{out}");
         assert!(out.contains("cursor"), "{out}");
-        assert!(out.contains("看一下它具体的 cleanup") || out.contains("看一下它这个具体的 cleanup"), "{out}");
+        assert!(
+            out.contains("看一下它具体的 cleanup") || out.contains("看一下它这个具体的 cleanup"),
+            "{out}"
+        );
         assert_eq!(out.matches("cleanup").count(), 1, "{out}");
     }
 
@@ -528,11 +545,11 @@ mod tests {
     #[test]
     fn english_markers() {
         assert_eq!(apply("Tuesday, no Wednesday"), "Wednesday");
+        assert_eq!(apply("let's meet Tuesday, actually Wednesday"), "Wednesday");
         assert_eq!(
-            apply("let's meet Tuesday, actually Wednesday"),
-            "Wednesday"
+            apply("I actually enjoyed the movie"),
+            "I actually enjoyed the movie"
         );
-        assert_eq!(apply("I actually enjoyed the movie"), "I actually enjoyed the movie");
         assert_eq!(
             apply("write a cloud test, scratch that, write a cursor test"),
             "write a cursor test"
@@ -545,8 +562,14 @@ mod tests {
 
     #[test]
     fn revision_markers_need_a_replacement() {
-        assert_eq!(apply("写 cloud 测试，删掉，写 cursor 测试"), "写 cursor 测试");
-        assert_eq!(apply("写 cloud 测试，算了，写 cursor 测试"), "写 cursor 测试");
+        assert_eq!(
+            apply("写 cloud 测试，删掉，写 cursor 测试"),
+            "写 cursor 测试"
+        );
+        assert_eq!(
+            apply("写 cloud 测试，算了，写 cursor 测试"),
+            "写 cursor 测试"
+        );
         assert_eq!(apply("这件事删掉"), "这件事删掉");
         assert_eq!(apply("算了"), "算了");
         assert!(apply("I actually enjoyed the movie").contains("actually"));
@@ -599,14 +622,8 @@ mod tests {
             "cursor 测试。"
         );
         assert_eq!(apply("周四，我是说周五"), "周五");
-        assert_eq!(
-            apply("做一个 cloud 测试，不是 cloud，是 cursor"),
-            "cursor"
-        );
-        assert_eq!(
-            apply("Tuesday, I mean Wednesday"),
-            "Wednesday"
-        );
+        assert_eq!(apply("做一个 cloud 测试，不是 cloud，是 cursor"), "cursor");
+        assert_eq!(apply("Tuesday, I mean Wednesday"), "Wednesday");
     }
 
     #[test]

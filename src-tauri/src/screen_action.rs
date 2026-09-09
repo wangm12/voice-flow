@@ -1,12 +1,12 @@
 //! Phase 3 look-at-screen hotkey. Never called from `dictation::stop`.
 
+use crate::dictation::{self, OperationLease, Phase};
+use crate::window_capture::{self, CaptureError, MemoryImage};
 use crate::{
     arm_undo_transaction, context, copy_text, delivery, emit_selected_action_state,
     finish_with_delivery, hotkey, lock_recover, permissions, release_operation,
     verify_delivery_target, AppState, CLEANUP_STATUS_AI_SUCCESS,
 };
-use crate::dictation::{self, OperationLease, Phase};
-use crate::window_capture::{self, CaptureError, MemoryImage};
 use serde::Serialize;
 use tauri::State;
 use tokio_util::sync::CancellationToken;
@@ -451,7 +451,10 @@ mod tests {
                 height: 480,
             })
         });
-        assert_eq!(err, Err(ScreenActionError::Capture(CaptureError::Unavailable)));
+        assert_eq!(
+            err,
+            Err(ScreenActionError::Capture(CaptureError::Unavailable))
+        );
     }
 
     #[test]

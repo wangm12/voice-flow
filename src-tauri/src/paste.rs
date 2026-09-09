@@ -75,7 +75,10 @@ fn send_command_shortcut(keycode: u16) -> Result<(), PasteError> {
 }
 
 #[cfg(target_os = "macos")]
-fn send_command_shortcut_targeting(keycode: u16, target_pid: Option<i32>) -> Result<(), PasteError> {
+fn send_command_shortcut_targeting(
+    keycode: u16,
+    target_pid: Option<i32>,
+) -> Result<(), PasteError> {
     if !crate::permissions::accessibility_is_trusted() {
         return Err(PasteError::Accessibility);
     }
@@ -744,7 +747,8 @@ mod macos_ax {
             location: location as isize,
             length: length as isize,
         };
-        let value = unsafe { AXValueCreate(AX_VALUE_CF_RANGE, &range as *const _ as *const c_void) };
+        let value =
+            unsafe { AXValueCreate(AX_VALUE_CF_RANGE, &range as *const _ as *const c_void) };
         if value.is_null() {
             return false;
         }
@@ -880,13 +884,13 @@ mod macos_raise {
     fn copy_windows(app: &AxElement) -> Vec<AxElement> {
         let attr = CFString::new("AXWindows");
         let mut value: CFTypeRef = std::ptr::null();
-        let err = unsafe {
-            AXUIElementCopyAttributeValue(app.0, attr.as_concrete_TypeRef(), &mut value)
-        };
+        let err =
+            unsafe { AXUIElementCopyAttributeValue(app.0, attr.as_concrete_TypeRef(), &mut value) };
         if err != AX_SUCCESS || value.is_null() {
             return Vec::new();
         }
-        let array = unsafe { CFArray::<*const c_void>::wrap_under_create_rule(value as CFArrayRef) };
+        let array =
+            unsafe { CFArray::<*const c_void>::wrap_under_create_rule(value as CFArrayRef) };
         let mut windows = Vec::new();
         for index in 0..array.len() {
             let Some(item) = array.get(index) else {
@@ -1329,16 +1333,8 @@ mod tests {
             "inserted"
         ));
         assert!(!input_value_verifies_delivery(None, None, "inserted"));
-        assert!(!input_value_verifies_delivery(
-            Some("aa"),
-            Some("aa"),
-            "a"
-        ));
-        assert!(!input_value_verifies_delivery(
-            Some("aa"),
-            Some("aaa"),
-            "a"
-        ));
+        assert!(!input_value_verifies_delivery(Some("aa"), Some("aa"), "a"));
+        assert!(!input_value_verifies_delivery(Some("aa"), Some("aaa"), "a"));
         assert!(input_value_verifies_delivery(
             Some("hi"),
             Some("hi hello"),
@@ -1358,11 +1354,7 @@ mod tests {
             Some("开头字"),
             "字"
         ));
-        assert!(!input_value_verifies_delivery(
-            None,
-            Some("inserted"),
-            "i"
-        ));
+        assert!(!input_value_verifies_delivery(None, Some("inserted"), "i"));
         assert!(!input_value_verifies_delivery(None, Some("x"), "x"));
         assert!(!input_value_verifies_delivery(None, Some("字"), "字"));
         assert!(input_value_verifies_delivery(
@@ -1392,7 +1384,8 @@ mod tests {
 
     #[test]
     fn unverified_ax_insert_copies_clipboard_fallback_without_arming_undo() {
-        let verified_ax = build_insert_outcome(false, Some(""), Some("hello".into()), "hello", false);
+        let verified_ax =
+            build_insert_outcome(false, Some(""), Some("hello".into()), "hello", false);
         assert!(!verified_ax.used_keyboard_paste);
         assert!(verified_ax.verified);
         assert!(!should_copy_clipboard_fallback(&verified_ax));
@@ -1514,7 +1507,14 @@ mod tests {
     #[test]
     fn ax_insert_skips_secure_and_non_text_roles() {
         assert_eq!(
-            ax_insert_decision("AXTextField", "AXSecureTextField", true, true, Some((0, 0)), true),
+            ax_insert_decision(
+                "AXTextField",
+                "AXSecureTextField",
+                true,
+                true,
+                Some((0, 0)),
+                true
+            ),
             AxInsertDecision::SkipSecure
         );
         assert_eq!(
@@ -1577,7 +1577,10 @@ mod tests {
             utf16_splice("hello", 5, 0, "世界").as_deref(),
             Some("hello世界")
         );
-        assert_eq!(utf16_splice("你好", 2, 0, "世界").as_deref(), Some("你好世界"));
+        assert_eq!(
+            utf16_splice("你好", 2, 0, "世界").as_deref(),
+            Some("你好世界")
+        );
         assert_eq!(utf16_splice("hello", 0, 5, "hi").as_deref(), Some("hi"));
         assert_eq!(utf16_splice("hello", 1, 3, "i").as_deref(), Some("hio"));
         assert_eq!(utf16_splice("hello", 6, 0, "x"), None);
@@ -1592,12 +1595,10 @@ mod tests {
         assert!(try_ax_insert_if_safe(&cancellation, || Ok(()), "hello").is_none());
 
         let cancellation = CancellationToken::new();
-        assert!(try_ax_insert_if_safe(
-            &cancellation,
-            || Err(PasteError::TargetChanged),
-            "hello"
-        )
-        .is_none());
+        assert!(
+            try_ax_insert_if_safe(&cancellation, || Err(PasteError::TargetChanged), "hello")
+                .is_none()
+        );
     }
 
     #[test]

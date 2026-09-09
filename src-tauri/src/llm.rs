@@ -21,7 +21,12 @@ pub const SUPPORTED_MODELS: &[&str] = &[
 ];
 
 pub fn resolve_chat_url(base: &str) -> String {
-    crate::asr::resolve_compat_url(base, DEFAULT_CHAT_BASE_URL, "chat/completions", "chat/completions")
+    crate::asr::resolve_compat_url(
+        base,
+        DEFAULT_CHAT_BASE_URL,
+        "chat/completions",
+        "chat/completions",
+    )
 }
 
 pub fn chat_host(base_url: &str) -> Option<String> {
@@ -561,7 +566,17 @@ pub async fn cleanup_with_limits_and_language_and_profile(
 ) -> Result<(String, RateLimits), LlmError> {
     cleanup_with_model_and_limits_and_language_and_profile_and_intent(
         &resolve_chat_url(""),
-        MODEL, text, key, dictionary, context, policy, language, profile, None, None, CleanupEffort::Standard,
+        MODEL,
+        text,
+        key,
+        dictionary,
+        context,
+        policy,
+        language,
+        profile,
+        None,
+        None,
+        CleanupEffort::Standard,
         None,
     )
     .await
@@ -580,7 +595,16 @@ pub async fn cleanup_with_model_and_limits_and_language(
     cleanup_with_model_and_limits_and_language_and_profile_and_intent(
         &resolve_chat_url(""),
         normalized_model(model),
-        text, key, dictionary, context, policy, language, None, None, None, CleanupEffort::Standard,
+        text,
+        key,
+        dictionary,
+        context,
+        policy,
+        language,
+        None,
+        None,
+        None,
+        CleanupEffort::Standard,
         None,
     )
     .await
@@ -601,7 +625,16 @@ pub async fn cleanup_with_model_and_limits_and_language_and_profile(
     cleanup_with_model_and_limits_and_language_and_profile_and_intent(
         &resolve_chat_url(""),
         normalized_model(model),
-        text, key, dictionary, context, policy, language, profile, None, None, CleanupEffort::Standard,
+        text,
+        key,
+        dictionary,
+        context,
+        policy,
+        language,
+        profile,
+        None,
+        None,
+        CleanupEffort::Standard,
         None,
     )
     .await
@@ -786,7 +819,10 @@ fn assemble_cleanup_user_prompt(
 }
 
 fn append_visible_context(user: &mut String, visible_context: Option<&str>) {
-    let Some(visible) = visible_context.map(str::trim).filter(|value| !value.is_empty()) else {
+    let Some(visible) = visible_context
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
         return;
     };
     user.push('\n');
@@ -827,10 +863,15 @@ fn light_cleanup_user_message(
     }
     user.push_str("</TASK_INSTRUCTIONS>\n");
     if let Some(pairs) = pairs_hint.filter(|value| !value.trim().is_empty()) {
-        user.push_str(&format!("<CUSTOM_VOCABULARY>\n{pairs}\n</CUSTOM_VOCABULARY>\n"));
+        user.push_str(&format!(
+            "<CUSTOM_VOCABULARY>\n{pairs}\n</CUSTOM_VOCABULARY>\n"
+        ));
         user.push_str(&format!("Personal dictionary pairs: {pairs}\n"));
     }
-    user.push_str(&format!("<TRANSCRIPT>\n{}\n</TRANSCRIPT>\n", intent.content));
+    user.push_str(&format!(
+        "<TRANSCRIPT>\n{}\n</TRANSCRIPT>\n",
+        intent.content
+    ));
     append_visible_context(&mut user, visible_context);
     user
 }
@@ -1974,8 +2015,8 @@ fn remove_standalone_cjk_filler(text: &str, filler: &str) -> String {
         if index + needle.len() <= chars.len() && chars[index..index + needle.len()] == needle[..] {
             let before_ok = index == 0 || !crate::dictionary_learn::is_cjk(chars[index - 1]);
             let after_index = index + needle.len();
-            let after_ok = after_index >= chars.len()
-                || !crate::dictionary_learn::is_cjk(chars[after_index]);
+            let after_ok =
+                after_index >= chars.len() || !crate::dictionary_learn::is_cjk(chars[after_index]);
             if before_ok || after_ok {
                 if after_index < chars.len()
                     && matches!(chars[after_index], ',' | '，' | '、' | '.' | '。')
@@ -2025,7 +2066,10 @@ mod tests {
 
     #[test]
     fn cleanup_intensity_parses_and_steps() {
-        assert_eq!(CleanupIntensity::parse("heavy"), Some(CleanupIntensity::Heavy));
+        assert_eq!(
+            CleanupIntensity::parse("heavy"),
+            Some(CleanupIntensity::Heavy)
+        );
         assert_eq!(CleanupIntensity::parse("off"), Some(CleanupIntensity::Off));
         assert_eq!(CleanupIntensity::parse("nope"), None);
         assert_eq!(CleanupIntensity::Heavy.as_str(), "heavy");
@@ -2695,7 +2739,9 @@ data: [DONE]
             &[],
         )
         .await;
-        let dictionary = (0..100).map(|index| format!("term-{index}")).collect::<Vec<_>>();
+        let dictionary = (0..100)
+            .map(|index| format!("term-{index}"))
+            .collect::<Vec<_>>();
         cleanup_at_with_intent(
             &endpoint,
             MODEL,
@@ -2741,7 +2787,9 @@ data: [DONE]
             &[],
         )
         .await;
-        let dictionary = (0..32).map(|index| format!("term-{index}")).collect::<Vec<_>>();
+        let dictionary = (0..32)
+            .map(|index| format!("term-{index}"))
+            .collect::<Vec<_>>();
         cleanup_at_with_intent(
             &endpoint,
             MODEL,
@@ -2911,21 +2959,21 @@ data: [DONE]
             confidence: 0.98,
         };
         let policy = ContextPolicy::for_family(crate::context::ContextFamily::CalendarTask);
-        assert!(scene_guidance(crate::context::ContextFamily::CalendarTask, &policy).contains("dates"));
+        assert!(
+            scene_guidance(crate::context::ContextFamily::CalendarTask, &policy).contains("dates")
+        );
         assert!(profile_guidance(&profile).contains("reminders"));
     }
 
     #[test]
     fn empty_writing_prompt_casual_chat_uses_personal_chat_guidance() {
         let policy = ContextPolicy::for_family(crate::context::ContextFamily::PersonalChat);
-        assert!(
-            policy
-                .writing_prompt
-                .as_deref()
-                .unwrap_or("")
-                .trim()
-                .is_empty()
-        );
+        assert!(policy
+            .writing_prompt
+            .as_deref()
+            .unwrap_or("")
+            .trim()
+            .is_empty());
         let guidance = scene_guidance(crate::context::ContextFamily::PersonalChat, &policy);
         assert!(
             guidance.contains("哈哈") || guidance.contains("您好"),
@@ -2999,18 +3047,27 @@ data: [DONE]
 
     #[test]
     fn family_few_shots_cover_email_calendar_and_notes() {
-        let email = family_few_shot(ContextFamily::Email, CleanupEffort::Standard).expect("email few-shot");
-        assert!(email.contains("Mingjie") || email.contains("email"), "{email}");
+        let email =
+            family_few_shot(ContextFamily::Email, CleanupEffort::Standard).expect("email few-shot");
+        assert!(
+            email.contains("Mingjie") || email.contains("email"),
+            "{email}"
+        );
         assert!(!email.contains("您好"));
 
-        let calendar = family_few_shot(ContextFamily::CalendarTask, CleanupEffort::Standard).expect("calendar few-shot");
+        let calendar = family_few_shot(ContextFamily::CalendarTask, CleanupEffort::Standard)
+            .expect("calendar few-shot");
         assert!(
             calendar.contains("10") || calendar.contains("十点") || calendar.contains("时间"),
             "{calendar}"
         );
 
-        let notes = family_few_shot(ContextFamily::NotesJournaling, CleanupEffort::Standard).expect("notes few-shot");
-        assert!(notes.contains("Keep") || notes.contains("voice") || notes.contains("语气"), "{notes}");
+        let notes = family_few_shot(ContextFamily::NotesJournaling, CleanupEffort::Standard)
+            .expect("notes few-shot");
+        assert!(
+            notes.contains("Keep") || notes.contains("voice") || notes.contains("语气"),
+            "{notes}"
+        );
     }
 
     fn assemble_user_prompt_for_test(
@@ -3070,7 +3127,8 @@ data: [DONE]
 
     #[test]
     fn personal_chat_heavy_few_shot_stays_chat_shaped() {
-        let shot = family_few_shot(ContextFamily::PersonalChat, CleanupEffort::Heavy).expect("shot");
+        let shot =
+            family_few_shot(ContextFamily::PersonalChat, CleanupEffort::Heavy).expect("shot");
         assert!(shot.contains("好的哈哈我晚点回你"));
         assert!(!shot.contains("您好"));
         let work = family_few_shot(ContextFamily::WorkChat, CleanupEffort::Heavy).expect("work");
@@ -3110,7 +3168,8 @@ data: [DONE]
 
     #[test]
     fn visible_context_is_spell_only() {
-        let user = assemble_user_prompt_for_test("hi alex", CleanupEffort::Heavy, Some("Alex Chen"));
+        let user =
+            assemble_user_prompt_for_test("hi alex", CleanupEffort::Heavy, Some("Alex Chen"));
         assert!(user.contains("spell names"));
         assert!(user.contains("do not quote, summarize, or answer the screen"));
         assert!(user.contains("Alex Chen"));
@@ -3121,11 +3180,7 @@ data: [DONE]
 
     #[test]
     fn heavy_prompt_asks_for_sendable_polish_without_greetings() {
-        let user = assemble_user_prompt_for_test(
-            "好的哈哈我晚点回你",
-            CleanupEffort::Heavy,
-            None,
-        );
+        let user = assemble_user_prompt_for_test("好的哈哈我晚点回你", CleanupEffort::Heavy, None);
         assert!(user.contains("Polish for sending"));
         assert!(user.contains("Do not invent facts, greetings, or subjects"));
         assert!(user.contains("Effort: heavy"));

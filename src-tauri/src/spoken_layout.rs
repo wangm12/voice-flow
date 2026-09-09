@@ -98,10 +98,10 @@ fn render_list(block: &str, markers: &[Marker], kind: MarkerKind) -> String {
             items.push(item);
         }
     }
-        if items.len() < 2 {
-            return block.to_string();
-        }
-        let mut out = String::new();
+    if items.len() < 2 {
+        return block.to_string();
+    }
+    let mut out = String::new();
     if !preamble.is_empty() {
         out.push_str(preamble);
         out.push('\n');
@@ -206,7 +206,10 @@ fn rewrite_list_backtrack_block(block: &str) -> String {
 
 fn strip_trailing_punct(text: &str) -> String {
     text.trim_end_matches(|ch: char| {
-        matches!(ch, ',' | '，' | '.' | '。' | '!' | '！' | ';' | '；' | ' ' | '\t')
+        matches!(
+            ch,
+            ',' | '，' | '.' | '。' | '!' | '！' | ';' | '；' | ' ' | '\t'
+        )
     })
     .to_string()
 }
@@ -252,13 +255,7 @@ fn strip_one_trailing_backtrack(text: &str) -> Option<String> {
 
 fn strip_trailing_english_backtrack(text: &str) -> Option<String> {
     let lower = text.to_ascii_lowercase();
-    for marker in [
-        "scratch that",
-        "oh, wait",
-        "oh wait",
-        "oh, no",
-        "oh no",
-    ] {
+    for marker in ["scratch that", "oh, wait", "oh wait", "oh, no", "oh no"] {
         if let Some(index) = lower.rfind(marker) {
             let after = lower[index + marker.len()..].trim_end_matches(is_trailing_marker_punct);
             if after.is_empty() {
@@ -348,9 +345,11 @@ fn match_chinese_ordinal(text: &str, start: usize) -> Option<usize> {
         return None;
     }
     let after = &text[end..];
-    if let Some(suffix) = after.chars().next().filter(|ch| {
-        matches!(*ch, '点' | '条' | '项' | '个' | '步')
-    }) {
+    if let Some(suffix) = after
+        .chars()
+        .next()
+        .filter(|ch| matches!(*ch, '点' | '条' | '项' | '个' | '步'))
+    {
         return Some(end + suffix.len_utf8());
     }
     const DENY: &[&str] = &[
@@ -580,10 +579,7 @@ fn strip_list_prefix(line: &str) -> String {
     if let Some(rest) = trimmed.strip_prefix("- ") {
         return rest.trim().to_string();
     }
-    let digits = trimmed
-        .chars()
-        .take_while(|ch| ch.is_ascii_digit())
-        .count();
+    let digits = trimmed.chars().take_while(|ch| ch.is_ascii_digit()).count();
     if digits > 0 {
         if let Some(rest) = trimmed.get(digits..) {
             if let Some(rest) = rest.strip_prefix(". ") {
@@ -684,10 +680,7 @@ fn is_list_line(line: &str) -> bool {
     if trimmed.starts_with("- ") {
         return true;
     }
-    let digits = trimmed
-        .chars()
-        .take_while(|ch| ch.is_ascii_digit())
-        .count();
+    let digits = trimmed.chars().take_while(|ch| ch.is_ascii_digit()).count();
     digits > 0
         && trimmed
             .get(digits..)
@@ -796,9 +789,9 @@ fn is_body_starter(word: &str) -> bool {
 
 fn is_signature_function_word(word: &str) -> bool {
     const DENY: &[&str] = &[
-        "option", "way", "for", "to", "of", "if", "when", "that", "this", "please", "us",
-        "me", "you", "it", "one", "the", "an", "and", "or", "but", "with", "about", "at",
-        "on", "in", "by", "from", "as", "so", "not",
+        "option", "way", "for", "to", "of", "if", "when", "that", "this", "please", "us", "me",
+        "you", "it", "one", "the", "an", "and", "or", "but", "with", "about", "at", "on", "in",
+        "by", "from", "as", "so", "not",
     ];
     DENY.iter().any(|item| word.eq_ignore_ascii_case(item))
 }
@@ -969,8 +962,7 @@ fn negated_english_break(text: &str, start: usize) -> bool {
 
 fn followed_by_character_word(text: &str, end: usize) -> bool {
     let rest = text[end..].trim_start();
-    starts_with_ignore_ascii_case(rest, "character")
-        && is_ascii_word_right(rest, "character".len())
+    starts_with_ignore_ascii_case(rest, "character") && is_ascii_word_right(rest, "character".len())
 }
 
 fn skip_leading_whitespace(text: &str, start: usize) -> usize {
@@ -1093,8 +1085,14 @@ mod tests {
         assert_eq!(layout("这里不要换行谢谢"), "这里不要换行谢谢");
         assert_eq!(layout("这里不换行"), "这里不换行");
         assert_eq!(layout("使用换行符即可"), "使用换行符即可");
-        assert_eq!(layout("please do not new line here"), "please do not new line here");
-        assert_eq!(layout("please don't new line here"), "please don't new line here");
+        assert_eq!(
+            layout("please do not new line here"),
+            "please do not new line here"
+        );
+        assert_eq!(
+            layout("please don't new line here"),
+            "please don't new line here"
+        );
     }
 
     #[test]
@@ -1127,16 +1125,19 @@ mod tests {
             layout("the first time I tried and the second time I failed"),
             "the first time I tried and the second time I failed"
         );
-        assert_eq!(layout("first of all we should wait"), "first of all we should wait");
+        assert_eq!(
+            layout("first of all we should wait"),
+            "first of all we should wait"
+        );
     }
 
     #[test]
     fn a_single_bullet_or_yaodian_stays_prose() {
+        assert_eq!(layout("今天会议的要点是进度"), "今天会议的要点是进度");
         assert_eq!(
-            layout("今天会议的要点是进度"),
-            "今天会议的要点是进度"
+            layout("the bullet train is late"),
+            "the bullet train is late"
         );
-        assert_eq!(layout("the bullet train is late"), "the bullet train is late");
     }
 
     #[test]
@@ -1173,10 +1174,7 @@ mod tests {
             layout("1. 是 prompt 2. 是标点符号 3. 是逻辑"),
             "1. 是 prompt\n2. 是标点符号\n3. 是逻辑"
         );
-        assert_eq!(
-            layout("1、完成设计 2、写测试"),
-            "1. 完成设计\n2. 写测试"
-        );
+        assert_eq!(layout("1、完成设计 2、写测试"), "1. 完成设计\n2. 写测试");
         assert_eq!(
             layout("一是 prompt 二是标点符号 三是逻辑"),
             "1. prompt\n2. 标点符号\n3. 逻辑"

@@ -113,8 +113,16 @@ fn changed_spans(before: &str, after: &str) -> (String, String) {
             before_end += 1;
         }
     }
-    let before_span = before_chars.get(start..before_end).unwrap_or(&[]).iter().collect();
-    let after_span = after_chars.get(start..after_end).unwrap_or(&[]).iter().collect();
+    let before_span = before_chars
+        .get(start..before_end)
+        .unwrap_or(&[])
+        .iter()
+        .collect();
+    let after_span = after_chars
+        .get(start..after_end)
+        .unwrap_or(&[])
+        .iter()
+        .collect();
     (before_span, after_span)
 }
 
@@ -176,8 +184,13 @@ pub(crate) async fn remove_dictionary_word(
 }
 
 #[tauri::command]
-pub(crate) fn list_learn_pairs(app: tauri::AppHandle) -> Result<Vec<store::LearnPairRecord>, String> {
-    let dir = app.path().app_data_dir().map_err(|error| error.to_string())?;
+pub(crate) fn list_learn_pairs(
+    app: tauri::AppHandle,
+) -> Result<Vec<store::LearnPairRecord>, String> {
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| error.to_string())?;
     let rows = store::list_learn_pairs(&dir).map_err(|error| error.to_string())?;
     Ok(pairs_for_dictionary_settings(rows))
 }
@@ -193,10 +206,8 @@ pub(crate) fn pairs_for_dictionary_settings(
             row.is_live_promoted() && !row.before_surface.is_empty()
         })
         .map(|mut row| {
-            row.promote_hits = promote_hits_for(classify_learn_pair(
-                &row.before_surface,
-                &row.after_surface,
-            ));
+            row.promote_hits =
+                promote_hits_for(classify_learn_pair(&row.before_surface, &row.after_surface));
             row
         })
         .collect()
@@ -210,7 +221,10 @@ pub(crate) async fn promote_learn_pair(
     after_surface: Option<String>,
     history_id: Option<i64>,
 ) -> Result<store::SettingsView, String> {
-    let dir = app.path().app_data_dir().map_err(|error| error.to_string())?;
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| error.to_string())?;
     let row = store::get_learn_pair(&dir, &pair_key).map_err(|error| error.to_string())?;
     let before = row
         .as_ref()
@@ -226,7 +240,8 @@ pub(crate) async fn promote_learn_pair(
         append_dictionary_entry(dictionary, &after);
     })
     .await?;
-    let scope = history_id.and_then(|id| store::history_scene(&dir, id).ok())
+    let scope = history_id
+        .and_then(|id| store::history_scene(&dir, id).ok())
         .map(|scene| scene.learn_scope());
     store::ensure_learn_pair_promoted(&dir, &pair_key, &before, &after, scope.as_ref())
         .map_err(|error| error.to_string())?;
@@ -244,8 +259,14 @@ pub(crate) async fn promote_learn_pair(
 }
 
 #[tauri::command]
-pub(crate) async fn ignore_learn_pair(app: tauri::AppHandle, pair_key: String) -> Result<(), String> {
-    let dir = app.path().app_data_dir().map_err(|error| error.to_string())?;
+pub(crate) async fn ignore_learn_pair(
+    app: tauri::AppHandle,
+    pair_key: String,
+) -> Result<(), String> {
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| error.to_string())?;
     store::tombstone_learn_pair(&dir, &pair_key).map_err(|error| error.to_string())?;
     let _ = app.emit("learn_pairs://changed", ());
     Ok(())
@@ -256,7 +277,10 @@ pub(crate) async fn undo_learn_pair(
     app: tauri::AppHandle,
     pair_key: String,
 ) -> Result<store::SettingsView, String> {
-    let dir = app.path().app_data_dir().map_err(|error| error.to_string())?;
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| error.to_string())?;
     let row = store::get_learn_pair(&dir, &pair_key)
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "learn pair was not found".to_string())?;
@@ -342,7 +366,10 @@ async fn restore_mapping_learn(
 
 #[tauri::command]
 pub(crate) fn list_pinned_terms(app: tauri::AppHandle) -> Result<Vec<String>, String> {
-    let dir = app.path().app_data_dir().map_err(|error| error.to_string())?;
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| error.to_string())?;
     let rows = store::list_learn_pairs(&dir).map_err(|error| error.to_string())?;
     Ok(rows
         .into_iter()
@@ -357,15 +384,23 @@ pub(crate) async fn pin_dictionary_term(
     word: String,
     pinned: bool,
 ) -> Result<(), String> {
-    let dir = app.path().app_data_dir().map_err(|error| error.to_string())?;
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| error.to_string())?;
     store::ensure_pinned_dictionary_term(&dir, &word, pinned).map_err(|error| error.to_string())?;
     let _ = app.emit("learn_pairs://changed", ());
     Ok(())
 }
 
 #[tauri::command]
-pub(crate) fn list_style_drafts(app: tauri::AppHandle) -> Result<Vec<store::StyleDraftRecord>, String> {
-    let dir = app.path().app_data_dir().map_err(|error| error.to_string())?;
+pub(crate) fn list_style_drafts(
+    app: tauri::AppHandle,
+) -> Result<Vec<store::StyleDraftRecord>, String> {
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| error.to_string())?;
     store::list_style_drafts(&dir).map_err(|error| error.to_string())
 }
 
@@ -374,7 +409,10 @@ pub(crate) async fn confirm_style_draft(
     app: tauri::AppHandle,
     draft_key: String,
 ) -> Result<store::SettingsView, String> {
-    let dir = app.path().app_data_dir().map_err(|error| error.to_string())?;
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| error.to_string())?;
     let draft = store::get_style_draft(&dir, &draft_key)
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "style draft was not found".to_string())?;
@@ -417,8 +455,14 @@ pub(crate) async fn confirm_style_draft(
 }
 
 #[tauri::command]
-pub(crate) async fn dismiss_style_draft(app: tauri::AppHandle, draft_key: String) -> Result<(), String> {
-    let dir = app.path().app_data_dir().map_err(|error| error.to_string())?;
+pub(crate) async fn dismiss_style_draft(
+    app: tauri::AppHandle,
+    draft_key: String,
+) -> Result<(), String> {
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| error.to_string())?;
     store::delete_style_draft(&dir, &draft_key).map_err(|error| error.to_string())?;
     let _ = app.emit("style_drafts://changed", ());
     Ok(())
@@ -436,7 +480,10 @@ async fn mutate_dictionary(
         settings.normalize();
         settings.clone()
     };
-    let dir = app.path().app_data_dir().map_err(|error| error.to_string())?;
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| error.to_string())?;
     store::save_settings(&dir, &snapshot).map_err(|error| error.to_string())?;
     *lock_recover(&state.settings) = snapshot.clone();
     let view = store::SettingsView::from(&snapshot);
@@ -472,8 +519,14 @@ impl Default for ObserveLimits {
 pub enum ObserveOutcome {
     Unchanged,
     LeftTarget,
-    SingleToken { before_span: String, after: String },
-    ShortStyleRewrite { before: String, after: String },
+    SingleToken {
+        before_span: String,
+        after: String,
+    },
+    ShortStyleRewrite {
+        before: String,
+        after: String,
+    },
     StyleSignal {
         excerpt: String,
         style_key: String,
@@ -520,7 +573,9 @@ pub fn observe_after_paste(
         };
         if current != last_settled {
             last_settled = current;
-            deadline = limits.max_total.min(elapsed.saturating_add(limits.idle_grace));
+            deadline = limits
+                .max_total
+                .min(elapsed.saturating_add(limits.idle_grace));
         }
     }
 
@@ -574,23 +629,18 @@ fn lexeme_candidate(before: &str, after: &str) -> Option<(String, String)> {
 
 fn is_short_phrase(value: &str) -> bool {
     let trimmed = value.trim();
-    if trimmed.is_empty()
-        || trimmed.contains(['。', '！', '？', '.', '!', '?'])
-    {
+    if trimmed.is_empty() || trimmed.contains(['。', '！', '？', '.', '!', '?']) {
         return false;
     }
     let latin_words = extract_tokens(trimmed)
         .into_iter()
-        .filter(|token| token.surface.chars().any(|ch| is_latin_start(ch)))
+        .filter(|token| token.surface.chars().any(is_latin_start))
         .count();
     let cjk_count = trimmed.chars().filter(|ch| is_cjk(*ch)).count();
     if latin_words > 0 && cjk_count == 0 {
         (2..=4).contains(&latin_words)
     } else if latin_words == 0 && cjk_count > 0 {
-        (2..=8).contains(&cjk_count)
-            && trimmed
-                .chars()
-                .all(|ch| is_cjk(ch) || ch.is_whitespace())
+        (2..=8).contains(&cjk_count) && trimmed.chars().all(|ch| is_cjk(ch) || ch.is_whitespace())
     } else {
         false
     }
@@ -623,7 +673,7 @@ pub fn is_short_style_rewrite(baseline: &str, settled: &str) -> bool {
     let latin_words = |value: &str| {
         extract_tokens(value)
             .into_iter()
-            .filter(|token| token.surface.chars().any(|ch| is_latin_start(ch)))
+            .filter(|token| token.surface.chars().any(is_latin_start))
             .count()
     };
     let cjk_count = |value: &str| value.chars().filter(|ch| is_cjk(*ch)).count();
@@ -660,15 +710,21 @@ fn is_pure_prefix_edit(baseline: &str, settled: &str) -> bool {
 
 fn looks_like_foreign_bubble(value: &str) -> bool {
     let trimmed = value.trim();
-    trimmed.starts_with("对方:")
-        || trimmed.starts_with("对方：")
-        || trimmed.starts_with("Other:")
+    trimmed.starts_with("对方:") || trimmed.starts_with("对方：") || trimmed.starts_with("Other:")
 }
 
 fn is_topic_change(baseline: &str, settled: &str) -> bool {
     let shared = shared_content_chars(baseline, settled);
-    let baseline_len = baseline.chars().filter(|ch| !ch.is_whitespace()).count().max(1);
-    let settled_len = settled.chars().filter(|ch| !ch.is_whitespace()).count().max(1);
+    let baseline_len = baseline
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .count()
+        .max(1);
+    let settled_len = settled
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .count()
+        .max(1);
     let ratio = shared as f32 / baseline_len.min(settled_len) as f32;
     ratio < 0.3
 }
@@ -685,11 +741,7 @@ fn shared_content_chars(left: &str, right: &str) -> usize {
     shared
 }
 
-pub fn push_style_pair(
-    pairs: &mut Vec<context::StyleExamplePair>,
-    input: String,
-    output: String,
-) {
+pub fn push_style_pair(pairs: &mut Vec<context::StyleExamplePair>, input: String, output: String) {
     let input = input.trim().to_string();
     let output = output.trim().to_string();
     if input.is_empty() || output.is_empty() || input == output {
@@ -777,13 +829,9 @@ pub fn apply_post_paste_style_learn(
     let mut applied = StyleLearnApply::default();
 
     let style_key = format!("learn:style:{mapping_id}");
-    if let Some(row) = store::upsert_learn_pair_with_scope(
-        dir,
-        &style_key,
-        baseline,
-        settled,
-        Some(&scope),
-    )? {
+    if let Some(row) =
+        store::upsert_learn_pair_with_scope(dir, &style_key, baseline, settled, Some(&scope))?
+    {
         if row.hits >= STYLE_LEARN_HITS {
             push_style_pair(
                 &mut mappings[mapping_index].style_example_pairs,
@@ -898,16 +946,25 @@ fn is_style_noise(value: char) -> bool {
         || matches!(
             value,
             '.' | '。'
-                | '?' | '？'
-                | '!' | '！'
-                | ',' | '，'
-                | ';' | '；'
-                | ':' | '：'
-                | '"' | '\''
-                | '“' | '”'
+                | '?'
+                | '？'
+                | '!'
+                | '！'
+                | ','
+                | '，'
+                | ';'
+                | '；'
+                | ':'
+                | '：'
+                | '"'
+                | '\''
+                | '“'
+                | '”'
                 | '、'
-                | '(' | ')'
-                | '（' | '）'
+                | '('
+                | ')'
+                | '（'
+                | '）'
         )
 }
 
@@ -1079,10 +1136,7 @@ fn looks_like_cjk_personal_name(after: &str) -> bool {
     }
     match chars.len() {
         2 => is_single_cjk_surname(chars[0]),
-        3 => {
-            is_single_cjk_surname(chars[0])
-                || is_compound_cjk_surname(&[chars[0], chars[1]])
-        }
+        3 => is_single_cjk_surname(chars[0]) || is_compound_cjk_surname(&[chars[0], chars[1]]),
         _ => false,
     }
 }
@@ -1098,31 +1152,88 @@ fn is_compound_cjk_surname(chars: &[char; 2]) -> bool {
 }
 
 const REJECTED_LEARN_SURFACES: &[&str] = &[
-    "um", "uh", "er", "ah", "hmm", "mm", "mhm", "yeah", "yup", "like",
-    "basically", "actually", "kinda", "sorta",
-    "嗯", "啊", "呃", "额", "哦", "哈", "哈哈", "嗯嗯", "那个", "就是", "就是说",
-    "然后", "这个", "什么", "怎么", "一下", "对对",
-    "the", "a", "an", "and", "or", "but", "if", "of", "to", "in", "on", "at",
-    "for", "is", "are", "was", "were", "be", "been", "this", "that", "it",
-    "we", "they", "you",
-    "因为", "所以", "如果", "虽然", "但是", "而且", "不是", "没有", "可以",
-    "应该", "需要",
+    "um",
+    "uh",
+    "er",
+    "ah",
+    "hmm",
+    "mm",
+    "mhm",
+    "yeah",
+    "yup",
+    "like",
+    "basically",
+    "actually",
+    "kinda",
+    "sorta",
+    "嗯",
+    "啊",
+    "呃",
+    "额",
+    "哦",
+    "哈",
+    "哈哈",
+    "嗯嗯",
+    "那个",
+    "就是",
+    "就是说",
+    "然后",
+    "这个",
+    "什么",
+    "怎么",
+    "一下",
+    "对对",
+    "the",
+    "a",
+    "an",
+    "and",
+    "or",
+    "but",
+    "if",
+    "of",
+    "to",
+    "in",
+    "on",
+    "at",
+    "for",
+    "is",
+    "are",
+    "was",
+    "were",
+    "be",
+    "been",
+    "this",
+    "that",
+    "it",
+    "we",
+    "they",
+    "you",
+    "因为",
+    "所以",
+    "如果",
+    "虽然",
+    "但是",
+    "而且",
+    "不是",
+    "没有",
+    "可以",
+    "应该",
+    "需要",
 ];
 
 const SINGLE_CJK_SURNAMES: &[char] = &[
-    '李', '王', '张', '刘', '陈', '杨', '黄', '赵', '吴', '周', '徐', '孙', '马',
-    '朱', '胡', '郭', '何', '高', '林', '罗', '郑', '梁', '谢', '宋', '唐', '许',
-    '韩', '冯', '邓', '曹', '彭', '曾', '肖', '田', '董', '袁', '潘', '于', '蒋',
-    '蔡', '余', '杜', '叶', '程', '魏', '苏', '吕', '丁', '任', '沈', '姚', '卢',
-    '姜', '崔', '钟', '谭', '陆', '汪', '范', '金', '石', '廖', '贾', '夏', '韦',
-    '付', '方', '白', '邹', '孟', '熊', '秦', '邱', '江', '尹', '薛', '闫', '段',
-    '雷', '侯', '龙', '史', '陶', '黎', '贺', '顾', '毛', '郝', '龚', '邵', '万',
-    '钱', '严', '覃', '武', '戴', '莫', '孔', '向', '汤',
+    '李', '王', '张', '刘', '陈', '杨', '黄', '赵', '吴', '周', '徐', '孙', '马', '朱', '胡', '郭',
+    '何', '高', '林', '罗', '郑', '梁', '谢', '宋', '唐', '许', '韩', '冯', '邓', '曹', '彭', '曾',
+    '肖', '田', '董', '袁', '潘', '于', '蒋', '蔡', '余', '杜', '叶', '程', '魏', '苏', '吕', '丁',
+    '任', '沈', '姚', '卢', '姜', '崔', '钟', '谭', '陆', '汪', '范', '金', '石', '廖', '贾', '夏',
+    '韦', '付', '方', '白', '邹', '孟', '熊', '秦', '邱', '江', '尹', '薛', '闫', '段', '雷', '侯',
+    '龙', '史', '陶', '黎', '贺', '顾', '毛', '郝', '龚', '邵', '万', '钱', '严', '覃', '武', '戴',
+    '莫', '孔', '向', '汤',
 ];
 
 const COMPOUND_CJK_SURNAMES: &[&str] = &[
-    "欧阳", "司马", "上官", "诸葛", "司徒", "夏侯", "尉迟", "公孙", "慕容",
-    "长孙", "宇文", "司空", "端木", "东方", "独孤", "南宫", "皇甫", "闻人",
+    "欧阳", "司马", "上官", "诸葛", "司徒", "夏侯", "尉迟", "公孙", "慕容", "长孙", "宇文", "司空",
+    "端木", "东方", "独孤", "南宫", "皇甫", "闻人",
 ];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1358,11 +1469,7 @@ pub(crate) fn maybe_observe_after_paste(
 fn scope_from_snapshot(snapshot: &context::ContextSnapshot) -> store::LearnPairScope {
     store::LearnPairScope {
         family: Some(context::family_id(snapshot.profile.family).to_owned()),
-        mapping_id: snapshot
-            .profile
-            .id
-            .strip_prefix("user.")
-            .map(str::to_owned),
+        mapping_id: snapshot.profile.id.strip_prefix("user.").map(str::to_owned),
         browser_host: snapshot.target_guard.browser_host.clone(),
         native_bundle: if snapshot.target_guard.browser_host.is_some() {
             None
@@ -1607,19 +1714,14 @@ async fn persist_learn_pair_locked(
     if !snapshot.dictionary_learn_enabled {
         return;
     }
-    let result = match record_learn_pair_with_scope(
-        &dir,
-        &mut snapshot.dictionary,
-        before,
-        after,
-        scope,
-    ) {
-        Ok(result) => result,
-        Err(error) => {
-            log::warn!("dictionary learn pair failed: {error}");
-            return;
-        }
-    };
+    let result =
+        match record_learn_pair_with_scope(&dir, &mut snapshot.dictionary, before, after, scope) {
+            Ok(result) => result,
+            Err(error) => {
+                log::warn!("dictionary learn pair failed: {error}");
+                return;
+            }
+        };
     match result {
         RecordPairResult::Promoted { .. } => {
             snapshot.normalize();
@@ -1723,8 +1825,8 @@ mod tests {
     use super::{
         add_dictionary_words, append_dictionary_entry, apply_post_paste_style_learn,
         intensity_shift_from_edit, is_short_style_rewrite, observe_after_paste, push_style_pair,
-        seed_lexicon_from_screen,
-        ObserveLimits, ObserveOutcome, remove_dictionary_entry, single_token_candidates,
+        remove_dictionary_entry, seed_lexicon_from_screen, single_token_candidates, ObserveLimits,
+        ObserveOutcome,
     };
     use crate::context::TargetAppGuard;
     use std::cell::RefCell;
@@ -1805,10 +1907,7 @@ mod tests {
     fn remove_word_does_not_rebuild_from_a_stale_list() {
         let mut dictionary = vec!["保留".to_string(), "删除".to_string(), "也保留".to_string()];
         assert!(remove_dictionary_entry(&mut dictionary, "删除"));
-        assert_eq!(
-            dictionary,
-            vec!["保留".to_string(), "也保留".to_string()]
-        );
+        assert_eq!(dictionary, vec!["保留".to_string(), "也保留".to_string()]);
     }
 
     #[test]
@@ -2254,12 +2353,7 @@ mod tests {
             ignored: false,
             promote_hits: 0,
         };
-        let visible = super::pairs_for_dictionary_settings(vec![
-            pending,
-            promoted,
-            name,
-            manual,
-        ]);
+        let visible = super::pairs_for_dictionary_settings(vec![pending, promoted, name, manual]);
         assert_eq!(visible.len(), 3);
         assert_eq!(visible[0].promote_hits, 3);
         assert_eq!(visible[1].promote_hits, 3);
@@ -2289,14 +2383,8 @@ mod tests {
             super::record_pair(&mut table, "配森", "pytorch"),
             super::RecordPairResult::Pending { hits: 1 }
         );
-        assert_eq!(
-            table.hits(&super::pair_key("配森", "Python")),
-            Some(1)
-        );
-        assert_eq!(
-            table.hits(&super::pair_key("配森", "pytorch")),
-            Some(1)
-        );
+        assert_eq!(table.hits(&super::pair_key("配森", "Python")), Some(1));
+        assert_eq!(table.hits(&super::pair_key("配森", "pytorch")), Some(1));
     }
 
     fn temp_dir(name: &str) -> std::path::PathBuf {
@@ -2351,9 +2439,11 @@ mod tests {
             super::RecordPairResult::Ignored
         );
         assert!(dictionary.is_empty());
-        assert!(crate::store::get_learn_pair(&dir, &super::pair_key("那个那个", "那个"))
-            .unwrap()
-            .is_none());
+        assert!(
+            crate::store::get_learn_pair(&dir, &super::pair_key("那个那个", "那个"))
+                .unwrap()
+                .is_none()
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -2476,7 +2566,9 @@ mod tests {
             vec![expected.clone()],
         );
         match learned {
-            ObserveOutcome::StyleSignal { style_key, excerpt, .. } => {
+            ObserveOutcome::StyleSignal {
+                style_key, excerpt, ..
+            } => {
                 assert_eq!(style_key, "more_questions");
                 assert!(excerpt.chars().count() <= 120);
             }
@@ -2604,7 +2696,10 @@ mod tests {
         .unwrap();
         assert!(applied.pairs_changed);
         assert_eq!(mappings[0].style_example_pairs.len(), 1);
-        assert_eq!(mappings[0].style_example_pairs[0].output, "好的哈哈我晚点回你");
+        assert_eq!(
+            mappings[0].style_example_pairs[0].output,
+            "好的哈哈我晚点回你"
+        );
     }
 
     #[test]
@@ -2661,10 +2756,16 @@ mod tests {
         let mut pairs: Vec<crate::context::StyleExamplePair> = Vec::new();
         seed_lexicon_from_screen(&dir, &mut dictionary, &ctx, &mut pairs, None).unwrap();
         assert!(pairs.is_empty());
-        assert!(!dictionary.iter().any(|item| item == "在吗" || item == "晚点回你"));
+        assert!(!dictionary
+            .iter()
+            .any(|item| item == "在吗" || item == "晚点回你"));
         let rows = crate::store::list_learn_pairs(&dir).unwrap();
-        assert!(!rows.iter().any(|row| row.pair_key.starts_with("learn:style")));
-        assert!(!rows.iter().any(|row| row.after_surface == "在吗" || row.after_surface == "晚点回你"));
+        assert!(!rows
+            .iter()
+            .any(|row| row.pair_key.starts_with("learn:style")));
+        assert!(!rows
+            .iter()
+            .any(|row| row.after_surface == "在吗" || row.after_surface == "晚点回你"));
     }
 
     #[test]

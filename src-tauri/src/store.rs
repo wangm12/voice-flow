@@ -7,11 +7,11 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
 use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
 
 pub const SETTINGS_SCHEMA_VERSION: u32 = 19;
 const HISTORY_SCHEMA_VERSION: i32 = 9;
@@ -426,7 +426,9 @@ impl Settings {
                     mapping.style_example_input.clone(),
                     mapping.style_example_output.clone(),
                 ) {
-                    mapping.style_example_pairs.push(crate::context::StyleExamplePair { input, output });
+                    mapping
+                        .style_example_pairs
+                        .push(crate::context::StyleExamplePair { input, output });
                 }
             } else {
                 mapping.style_example_pairs.truncate(3);
@@ -492,7 +494,12 @@ impl Settings {
             self.cascade_proper_noun_threshold = default_cascade_proper_noun_threshold();
         }
         self.accurate_asr_model = self.accurate_asr_model.trim().chars().take(256).collect();
-        self.accurate_asr_base_url = self.accurate_asr_base_url.trim().chars().take(2_048).collect();
+        self.accurate_asr_base_url = self
+            .accurate_asr_base_url
+            .trim()
+            .chars()
+            .take(2_048)
+            .collect();
         self.asr_base_url = self.asr_base_url.trim().chars().take(2_048).collect();
         self.cleanup_base_url = self.cleanup_base_url.trim().chars().take(2_048).collect();
         self.asr_model = crate::asr::resolve_asr_model(&self.asr_model).to_owned();
@@ -580,7 +587,8 @@ impl Settings {
             }
         }
         if self.cleanup_provider.is_custom() {
-            if let Some(named) = crate::providers::infer_provider_from_host(&self.cleanup_base_url) {
+            if let Some(named) = crate::providers::infer_provider_from_host(&self.cleanup_base_url)
+            {
                 self.cleanup_provider = named;
                 if !self.cleanup_api_key.trim().is_empty() {
                     self.provider_api_keys
@@ -899,7 +907,10 @@ impl Settings {
     }
 
     pub fn asr_endpoint(&self) -> String {
-        crate::providers::resolve_asr_endpoint(self.asr_provider, &self.resolved_provider_base(self.asr_provider))
+        crate::providers::resolve_asr_endpoint(
+            self.asr_provider,
+            &self.resolved_provider_base(self.asr_provider),
+        )
     }
 
     /// Prefer a dedicated ASR key when set. Reuse the Groq key only for the
@@ -1356,9 +1367,8 @@ fn decrypt_spool_bytes(bytes: &[u8], key: &[u8]) -> anyhow::Result<Vec<u8>> {
         anyhow::bail!("unsupported audio spool envelope");
     }
     let header = &bytes[..SPOOL_ENVELOPE_HEADER_LEN];
-    let nonce = XNonce::from_slice(
-        &header[SPOOL_ENVELOPE_MAGIC.len() + 1..SPOOL_ENVELOPE_HEADER_LEN],
-    );
+    let nonce =
+        XNonce::from_slice(&header[SPOOL_ENVELOPE_MAGIC.len() + 1..SPOOL_ENVELOPE_HEADER_LEN]);
     cipher_for_key(key)?
         .decrypt(
             nonce,
@@ -1618,7 +1628,9 @@ fn read_recovery_samples(session_dir: &Path) -> anyhow::Result<Vec<f32>> {
         }
         samples.extend(
             bytes
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .map(|bytes| f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])),
         );
     }
@@ -1929,14 +1941,13 @@ pub fn load_settings(dir: &Path) -> (Settings, bool) {
     fill_empty_secret_from_sidecar(dir, "asr_api_key", &mut settings.asr_api_key);
     fill_empty_secret_from_sidecar(dir, "cleanup_api_key", &mut settings.cleanup_api_key);
     for provider in crate::providers::EngineProvider::ALL {
-        match crate::keychain::get_provider_api_key_state(provider) {
-            crate::keychain::ApiKeyState::Configured(key) => {
-                settings
-                    .provider_api_keys
-                    .entry(provider.as_str().to_owned())
-                    .or_insert(key);
-            }
-            _ => {}
+        if let crate::keychain::ApiKeyState::Configured(key) =
+            crate::keychain::get_provider_api_key_state(provider)
+        {
+            settings
+                .provider_api_keys
+                .entry(provider.as_str().to_owned())
+                .or_insert(key);
         }
         let mut key = settings
             .provider_api_keys
@@ -1959,9 +1970,7 @@ pub fn load_settings(dir: &Path) -> (Settings, bool) {
     }
     // Only repair when the store confirmed the key is absent. A timeout must
     // not wipe a custom URL that still has a credential in the keychain.
-    if asr_key_missing
-        && settings.asr_api_key.trim().is_empty()
-        && settings.repair_incomplete_asr()
+    if asr_key_missing && settings.asr_api_key.trim().is_empty() && settings.repair_incomplete_asr()
     {
         needs_persist = true;
     }
@@ -2034,7 +2043,12 @@ pub fn save_settings(dir: &Path, settings: &Settings) -> anyhow::Result<()> {
     // so ordinary settings writes must never interpret it as a destructive
     // credential deletion. Credential removal needs an explicit operation.
     if !settings.api_key.trim().is_empty() {
-        persist_secret_to_keychain_or_sidecar(dir, "api_key", &settings.api_key, crate::keychain::set_api_key)?;
+        persist_secret_to_keychain_or_sidecar(
+            dir,
+            "api_key",
+            &settings.api_key,
+            crate::keychain::set_api_key,
+        )?;
     }
     if !settings.asr_api_key.trim().is_empty() {
         persist_secret_to_keychain_or_sidecar(
@@ -2059,12 +2073,9 @@ pub fn save_settings(dir: &Path, settings: &Settings) -> anyhow::Result<()> {
         if key.trim().is_empty() {
             continue;
         }
-        persist_secret_to_keychain_or_sidecar(
-            dir,
-            provider.keychain_account(),
-            key,
-            |value| crate::keychain::set_provider_api_key(provider, value),
-        )?;
+        persist_secret_to_keychain_or_sidecar(dir, provider.keychain_account(), key, |value| {
+            crate::keychain::set_provider_api_key(provider, value)
+        })?;
     }
     let mut on_disk = settings.clone();
     on_disk.api_key = String::new();
@@ -2497,20 +2508,18 @@ fn history_row<'a>(
     move |r| {
         let raw_audio_path: Option<String> = r.get(11)?;
         let status: String = r.get(7)?;
-        let has_audio = raw_audio_path.as_deref().is_some_and(|path| {
-            managed_audio_exists(dir, Path::new(path))
-        });
+        let has_audio = raw_audio_path
+            .as_deref()
+            .is_some_and(|path| managed_audio_exists(dir, Path::new(path)));
         let retryable = has_audio && matches!(status.as_str(), "failed" | "degraded");
-        let verbatim_text: Option<String> = r
-            .get::<_, Option<String>>(14)?
-            .and_then(|value| {
-                let trimmed = value.trim();
-                if trimmed.is_empty() {
-                    None
-                } else {
-                    Some(value)
-                }
-            });
+        let verbatim_text: Option<String> = r.get::<_, Option<String>>(14)?.and_then(|value| {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(value)
+            }
+        });
         Ok(HistoryItem {
             id: r.get(0)?,
             created_at: r.get(1)?,
@@ -2788,7 +2797,11 @@ pub fn set_learn_pair_pinned(dir: &Path, pair_key: &str, pinned: bool) -> anyhow
     Ok(c.changes() > 0)
 }
 
-pub fn ensure_pinned_dictionary_term(dir: &Path, after_surface: &str, pinned: bool) -> anyhow::Result<()> {
+pub fn ensure_pinned_dictionary_term(
+    dir: &Path,
+    after_surface: &str,
+    pinned: bool,
+) -> anyhow::Result<()> {
     let pair_key = crate::dictionary_learn::pair_key("", after_surface);
     let c = open_history(dir)?;
     c.execute(
@@ -2807,9 +2820,8 @@ pub fn bump_learn_pairs_used(dir: &Path, pair_keys: &[String]) -> anyhow::Result
         return Ok(());
     }
     let c = open_history(dir)?;
-    let mut statement = c.prepare(
-        "UPDATE learn_pairs SET last_used_at = datetime('now') WHERE pair_key = ?1",
-    )?;
+    let mut statement =
+        c.prepare("UPDATE learn_pairs SET last_used_at = datetime('now') WHERE pair_key = ?1")?;
     for key in pair_keys {
         statement.execute([key])?;
     }
@@ -3318,10 +3330,8 @@ pub fn purge_gold_audio(dir: &Path, keep_audio_days: u64) -> anyhow::Result<usiz
             .and_then(|modified| modified.elapsed().ok())
             .map(|elapsed| elapsed.as_secs())
             .unwrap_or(max_age.saturating_add(1));
-        if keep_audio_days == 0 || age > max_age {
-            if fs::remove_file(&path).is_ok() {
-                deleted += 1;
-            }
+        if (keep_audio_days == 0 || age > max_age) && fs::remove_file(&path).is_ok() {
+            deleted += 1;
         }
     }
     let c = open_history(dir)?;
@@ -3339,10 +3349,7 @@ pub fn purge_gold_audio(dir: &Path, keep_audio_days: u64) -> anyhow::Result<usiz
         };
         let path = Path::new(&path);
         if is_safe_spool_path(&root, path) && !path.is_file() {
-            c.execute(
-                "UPDATE dictations SET raw_audio_path=NULL WHERE id=?",
-                [id],
-            )?;
+            c.execute("UPDATE dictations SET raw_audio_path=NULL WHERE id=?", [id])?;
         }
     }
     Ok(deleted)
@@ -3899,7 +3906,10 @@ mod tests {
         assert_eq!(settings.schema_version, SETTINGS_SCHEMA_VERSION);
         assert_eq!(settings.asr_provider, crate::engine::EngineProvider::Custom);
         assert_eq!(settings.asr_model, "my-local-whisper");
-        assert_eq!(settings.cleanup_provider, crate::engine::EngineProvider::Groq);
+        assert_eq!(
+            settings.cleanup_provider,
+            crate::engine::EngineProvider::Groq
+        );
         assert!(settings.cleanup_base_url.is_empty());
     }
 
@@ -4225,7 +4235,9 @@ mod tests {
         let recovered = recover_spool(&dir, 7).unwrap();
         assert_eq!(recovered.len(), 1);
         assert!(recovered[0].audio_path.is_file());
-        assert!(!read_spool_file(&recovered[0].audio_path).unwrap().is_empty());
+        assert!(!read_spool_file(&recovered[0].audio_path)
+            .unwrap()
+            .is_empty());
         let manifest: SpoolManifest =
             serde_json::from_slice(&std::fs::read(session.join("manifest.json")).unwrap()).unwrap();
         assert_eq!(manifest.status, "recoverable");
@@ -4654,7 +4666,10 @@ mod tests {
             ..Settings::default()
         };
         assert!(settings.asr_credential().is_empty());
-        assert_eq!(settings.provider_secret(crate::engine::EngineProvider::Groq), "gsk_keep");
+        assert_eq!(
+            settings.provider_secret(crate::engine::EngineProvider::Groq),
+            "gsk_keep"
+        );
     }
 
     #[test]
@@ -4700,12 +4715,7 @@ mod tests {
             "new-key"
         );
         assert_eq!(
-            bind_asr_key_to_host(
-                "",
-                "https://api.groq.com/openai/v1",
-                "",
-                "old-key"
-            ),
+            bind_asr_key_to_host("", "https://api.groq.com/openai/v1", "", "old-key"),
             "old-key"
         );
         assert_eq!(
@@ -4794,13 +4804,7 @@ mod tests {
         assert_eq!(first.items[0].raw_text, "VoiceFlow second");
         assert!(first.has_more);
 
-        let second = get_history_page(
-            &dir,
-            1,
-            Some(first.items[0].id),
-            Some("VoiceFlow"),
-        )
-        .unwrap();
+        let second = get_history_page(&dir, 1, Some(first.items[0].id), Some("VoiceFlow")).unwrap();
         assert_eq!(second.items.len(), 1);
         assert_eq!(second.items[0].final_text, "VoiceFlow first");
         assert!(!second.has_more);
@@ -4937,9 +4941,17 @@ mod tests {
         )
         .unwrap();
         let key = crate::dictionary_learn::pair_key("知呼", "知乎");
-        assert_eq!(upsert_learn_pair(&dir, &key, "知呼", "知乎").unwrap().unwrap().hits, 1);
+        assert_eq!(
+            upsert_learn_pair(&dir, &key, "知呼", "知乎")
+                .unwrap()
+                .unwrap()
+                .hits,
+            1
+        );
         upsert_learn_pair(&dir, &key, "知呼", "知乎").unwrap();
-        let third = upsert_learn_pair(&dir, &key, "知呼", "知乎").unwrap().unwrap();
+        let third = upsert_learn_pair(&dir, &key, "知呼", "知乎")
+            .unwrap()
+            .unwrap();
         assert_eq!(third.hits, 3);
         assert!(!third.promoted);
         assert!(load_settings(&dir).0.dictionary.is_empty());
@@ -4969,10 +4981,7 @@ mod tests {
                 });
             }
         });
-        assert_eq!(
-            get_learn_pair(&dir, &key).unwrap().unwrap().hits,
-            8
-        );
+        assert_eq!(get_learn_pair(&dir, &key).unwrap().unwrap().hits, 8);
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -5012,7 +5021,9 @@ mod tests {
         assert!(row.ignored);
         assert!(row.tombstoned_at.is_some());
         assert!(!row.is_pending());
-        assert!(upsert_learn_pair(&dir, &key, "知呼", "知乎").unwrap().is_none());
+        assert!(upsert_learn_pair(&dir, &key, "知呼", "知乎")
+            .unwrap()
+            .is_none());
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -5080,17 +5091,14 @@ mod tests {
         let scene = history_scene(&dir, id).unwrap();
         assert_eq!(scene.profile_id.as_deref(), Some("chat.personal"));
         assert_eq!(scene.family.as_deref(), Some("personal_chat"));
-        assert_eq!(scene.native_bundle.as_deref(), Some("com.tencent.xinWeChat"));
+        assert_eq!(
+            scene.native_bundle.as_deref(),
+            Some("com.tencent.xinWeChat")
+        );
         assert!(history_context(&dir, id).unwrap().is_some());
         let key = crate::dictionary_learn::pair_key("派森", "Python");
-        ensure_learn_pair_promoted(
-            &dir,
-            &key,
-            "派森",
-            "Python",
-            Some(&scene.learn_scope()),
-        )
-        .unwrap();
+        ensure_learn_pair_promoted(&dir, &key, "派森", "Python", Some(&scene.learn_scope()))
+            .unwrap();
         let row = get_learn_pair(&dir, &key).unwrap().unwrap();
         assert!(row.is_live_promoted());
         assert_eq!(row.family.as_deref(), Some("personal_chat"));

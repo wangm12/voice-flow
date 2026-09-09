@@ -364,8 +364,7 @@ impl CaptureWorker {
                                     start_secs: 0.0,
                                     end_secs: crate::prefetch_asr::WARMUP_CHUNK_SECS as f32,
                                 };
-                                warmup_sent =
-                                    prefetch_tx.try_send(PrefetchMessage::Warmup(warmup));
+                                warmup_sent = prefetch_tx.try_send(PrefetchMessage::Warmup(warmup));
                             }
                         }
                         for chunk in prefetch_chunker.push(&produced[..accepted]) {
@@ -408,8 +407,7 @@ impl CaptureWorker {
                                         start_secs: 0.0,
                                         end_secs: crate::prefetch_asr::WARMUP_CHUNK_SECS as f32,
                                     };
-                                    let _ =
-                                        prefetch_tx.try_send(PrefetchMessage::Warmup(warmup));
+                                    let _ = prefetch_tx.try_send(PrefetchMessage::Warmup(warmup));
                                 }
                             }
                             for chunk in prefetch_chunker.push(&trailing[..accepted]) {

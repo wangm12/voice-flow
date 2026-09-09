@@ -35,10 +35,7 @@ pub fn scaled_size(width: u32, height: u32) -> (u32, u32) {
 }
 
 fn family_blocks_ocr(family: ContextFamily) -> bool {
-    matches!(
-        family,
-        ContextFamily::Terminal | ContextFamily::FormFilling
-    )
+    matches!(family, ContextFamily::Terminal | ContextFamily::FormFilling)
 }
 
 pub fn is_png(bytes: &[u8]) -> bool {
@@ -77,7 +74,9 @@ pub fn memory_image(png: Vec<u8>, width: u32, height: u32) -> Result<MemoryImage
 }
 
 pub fn capture_locked_window(window_id: Option<u64>) -> Result<MemoryImage, CaptureError> {
-    let window_id = window_id.filter(|id| *id != 0).ok_or(CaptureError::NoWindow)?;
+    let window_id = window_id
+        .filter(|id| *id != 0)
+        .ok_or(CaptureError::NoWindow)?;
     capture_locked_window_id(window_id)
 }
 
@@ -438,8 +437,24 @@ mod tests {
     #[test]
     fn ocr_skipped_when_disabled_or_no_permission_or_sensitive() {
         let ctx = thin_ctx();
-        assert!(maybe_ocr(false, true, ContextFamily::PersonalChat, false, &ctx, Some(1)).is_none());
-        assert!(maybe_ocr(true, false, ContextFamily::PersonalChat, false, &ctx, Some(1)).is_none());
+        assert!(maybe_ocr(
+            false,
+            true,
+            ContextFamily::PersonalChat,
+            false,
+            &ctx,
+            Some(1)
+        )
+        .is_none());
+        assert!(maybe_ocr(
+            true,
+            false,
+            ContextFamily::PersonalChat,
+            false,
+            &ctx,
+            Some(1)
+        )
+        .is_none());
         assert!(maybe_ocr(true, true, ContextFamily::Terminal, false, &ctx, Some(1)).is_none());
         assert!(maybe_ocr(true, true, ContextFamily::FormFilling, false, &ctx, Some(1)).is_none());
         assert!(maybe_ocr(true, true, ContextFamily::PersonalChat, true, &ctx, Some(1)).is_none());

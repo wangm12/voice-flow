@@ -25,7 +25,11 @@ pub fn trim_and_compress(samples: &[f32]) -> Vec<f32> {
         let gap_to = start;
         if gap_to > gap_from {
             let gap = gap_to - gap_from;
-            let keep = if gap > LONG_GAP { KEPT_GAP.min(gap) } else { gap };
+            let keep = if gap > LONG_GAP {
+                KEPT_GAP.min(gap)
+            } else {
+                gap
+            };
             out.extend_from_slice(&samples[gap_to - keep..gap_to]);
         }
         out.extend_from_slice(&samples[start..end]);
@@ -90,7 +94,9 @@ mod tests {
     use super::*;
 
     fn tone(samples: usize) -> Vec<f32> {
-        (0..samples).map(|i| if i % 2 == 0 { 0.2 } else { -0.2 }).collect()
+        (0..samples)
+            .map(|i| if i % 2 == 0 { 0.2 } else { -0.2 })
+            .collect()
     }
 
     #[test]

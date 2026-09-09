@@ -1,12 +1,11 @@
 //! History read, export, retry, delete, and re-clean IPC commands.
 
 use crate::{
-    asr, chrono_like_id, cleanup_failure_status, clipboard_text_for_snippets,
-    context, current_asr_provider, finalize_text, lexicon, llm, local_cleanup_or_raw, lock_recover,
-    metrics, paste, queue, snippets, spoken_translation_target, store, try_claim_operation,
-    release_operation, AppState,
-    CleanupDecision, OperationLease, CLEANUP_STATUS_AI_SUCCESS, CLEANUP_STATUS_LOCAL_ONLY,
-    CLEANUP_STATUS_SNIPPET_BYPASS,
+    asr, chrono_like_id, cleanup_failure_status, clipboard_text_for_snippets, context,
+    current_asr_provider, finalize_text, lexicon, llm, local_cleanup_or_raw, lock_recover, metrics,
+    paste, queue, release_operation, snippets, spoken_translation_target, store,
+    try_claim_operation, AppState, CleanupDecision, OperationLease, CLEANUP_STATUS_AI_SUCCESS,
+    CLEANUP_STATUS_LOCAL_ONLY, CLEANUP_STATUS_SNIPPET_BYPASS,
 };
 use tauri::{Emitter, Manager, State};
 
@@ -42,7 +41,8 @@ pub(crate) fn export_gold_corpus(
     let downloads = app.path().download_dir().map_err(|e| e.to_string())?;
     std::fs::create_dir_all(&downloads).map_err(|e| e.to_string())?;
     let language = lock_recover(&state.settings).language.clone();
-    let exported = store::export_gold_corpus(&dir, &downloads, &language).map_err(|e| e.to_string())?;
+    let exported =
+        store::export_gold_corpus(&dir, &downloads, &language).map_err(|e| e.to_string())?;
     Ok(exported.directory)
 }
 
@@ -302,7 +302,11 @@ async fn retry_dictation_inner(
         .profile_id
         .as_deref()
         .and_then(|id| lexicon::mapping_for_profile(&settings.context_mappings, id));
-    let confidence = if scene.profile_id.is_some() { 0.88 } else { 0.0 };
+    let confidence = if scene.profile_id.is_some() {
+        0.88
+    } else {
+        0.0
+    };
     let (raw_text, pairs_hint) = crate::prepare_lexicon_transcript(
         Some(&dir),
         &settings.dictionary,
@@ -365,25 +369,26 @@ async fn retry_dictation_inner(
         _ => CleanupDecision::Disabled,
     };
     let cleanup_status = match &cleanup_decision {
-        CleanupDecision::Provider(text) if text.trim().is_empty() => {
-            cleanup_failure_status(&cleanup_input, &local_cleanup_or_raw(&cleanup_input, family))
-        }
+        CleanupDecision::Provider(text) if text.trim().is_empty() => cleanup_failure_status(
+            &cleanup_input,
+            &local_cleanup_or_raw(&cleanup_input, family),
+        ),
         CleanupDecision::Provider(_) => CLEANUP_STATUS_AI_SUCCESS,
-        CleanupDecision::Failed => {
-            cleanup_failure_status(&cleanup_input, &local_cleanup_or_raw(&cleanup_input, family))
-        }
+        CleanupDecision::Failed => cleanup_failure_status(
+            &cleanup_input,
+            &local_cleanup_or_raw(&cleanup_input, family),
+        ),
         CleanupDecision::Disabled if snippet_expansion.is_some() => CLEANUP_STATUS_SNIPPET_BYPASS,
         CleanupDecision::Disabled => CLEANUP_STATUS_LOCAL_ONLY,
     };
-    let resolved =
-        finalize_text(
-            &cleanup_input,
-            cleanup_decision,
-            family,
-            &crate::load_learn_pairs(Some(&dir)),
-            &settings.dictionary,
-        )
-        .map_err(|_| "No speech detected".to_owned())?;
+    let resolved = finalize_text(
+        &cleanup_input,
+        cleanup_decision,
+        family,
+        &crate::load_learn_pairs(Some(&dir)),
+        &settings.dictionary,
+    )
+    .map_err(|_| "No speech detected".to_owned())?;
     let final_text = resolved.text;
     let degraded = resolved.degraded;
     let degraded_reason = resolved.degraded_reason;

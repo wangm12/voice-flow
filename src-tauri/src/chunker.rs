@@ -313,10 +313,7 @@ mod tests {
     #[test]
     fn merge_skips_failed_chunks_without_placeholder_text() {
         assert_eq!(
-            merge_transcripts(vec![
-                (0, "hello world".into()),
-                (2, "and done".into())
-            ]),
+            merge_transcripts(vec![(0, "hello world".into()), (2, "and done".into())]),
             "hello world and done"
         );
         let merged = merge_transcripts(vec![(0, "你好".into()), (1, "世界".into())]);

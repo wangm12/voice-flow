@@ -2523,11 +2523,7 @@ mod tests {
 
     #[test]
     fn display_label_keeps_a_known_app_when_confidence_is_low() {
-        let snapshot = snapshot_for_signal(
-            &signal("com.apple.Safari", "Safari", None),
-            &[],
-            false,
-        );
+        let snapshot = snapshot_for_signal(&signal("com.apple.Safari", "Safari", None), &[], false);
         assert!(snapshot.profile.confidence < 0.75);
         assert_eq!(display_label(&snapshot), "Safari · 通用");
         assert_eq!(hud_style_id(&snapshot), "general");
@@ -2579,7 +2575,10 @@ mod tests {
 
     #[test]
     fn display_label_hides_placeholder_general_app_names() {
-        assert_eq!(display_label(&ContextSnapshot::general()), "未知应用 · 通用");
+        assert_eq!(
+            display_label(&ContextSnapshot::general()),
+            "未知应用 · 通用"
+        );
         assert_eq!(display_app_name(&ContextSnapshot::general()), None);
     }
 
@@ -2615,11 +2614,8 @@ mod tests {
         );
         assert_eq!(display_label(&slack), "Slack · 工作短讯");
 
-        let wechat = snapshot_for_signal(
-            &signal("com.tencent.xinWeChat", "WeChat", None),
-            &[],
-            false,
-        );
+        let wechat =
+            snapshot_for_signal(&signal("com.tencent.xinWeChat", "WeChat", None), &[], false);
         assert_eq!(wechat.profile.app_label, "WeChat");
         assert_eq!(display_label(&wechat), "WeChat · 口语");
     }

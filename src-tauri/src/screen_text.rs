@@ -34,7 +34,10 @@ impl ScreenTextContext {
     }
 
     pub fn usable_chars(&self) -> usize {
-        self.tokens.iter().map(|token| token.chars().count()).sum::<usize>()
+        self.tokens
+            .iter()
+            .map(|token| token.chars().count())
+            .sum::<usize>()
             + self
                 .snippets
                 .iter()
@@ -195,9 +198,8 @@ pub fn extract_live(
     guard: &crate::context::TargetAppGuard,
 ) -> ScreenTextContext {
     let guard = guard.clone();
-    let mut ctx = extract_with_reader(move || {
-        extract_from_fixture(&live_fixture_from_guard(family, &guard))
-    });
+    let mut ctx =
+        extract_with_reader(move || extract_from_fixture(&live_fixture_from_guard(family, &guard)));
     ctx.family = family;
     ctx
 }
@@ -342,7 +344,10 @@ fn is_numeric_only(value: &str) -> bool {
 
 fn usable_text(value: &str) -> Option<String> {
     let trimmed = value.trim();
-    if trimmed.is_empty() || is_placeholder_hint(trimmed) || looks_like_url(trimmed) || is_numeric_only(trimmed)
+    if trimmed.is_empty()
+        || is_placeholder_hint(trimmed)
+        || looks_like_url(trimmed)
+        || is_numeric_only(trimmed)
     {
         return None;
     }
@@ -419,10 +424,7 @@ fn looks_like_email(value: &str) -> bool {
     let Some((user, host)) = trimmed.split_once('@') else {
         return false;
     };
-    !user.is_empty()
-        && host.contains('.')
-        && !host.contains(' ')
-        && !trimmed.contains("://")
+    !user.is_empty() && host.contains('.') && !host.contains(' ') && !trimmed.contains("://")
 }
 
 fn looks_like_identifier(value: &str) -> bool {
@@ -436,11 +438,7 @@ fn looks_like_identifier(value: &str) -> bool {
 }
 
 fn document_basename(value: &str) -> Option<String> {
-    let name = value
-        .rsplit(['/', '\\'])
-        .next()
-        .unwrap_or(value)
-        .trim();
+    let name = value.rsplit(['/', '\\']).next().unwrap_or(value).trim();
     if is_allowed_filename(name) {
         Some(name.to_owned())
     } else {
@@ -570,7 +568,8 @@ mod macos_live_ax {
             collect_value_tokens(snap, ContextFamily::General, value);
             if role == "AXStaticText" || role == "AXTextField" {
                 if let Some(text) = usable_text(value) {
-                    if text.chars().count() <= 80 && snap.counterpart.as_deref() != Some(text.as_str())
+                    if text.chars().count() <= 80
+                        && snap.counterpart.as_deref() != Some(text.as_str())
                     {
                         push_unique(&mut snap.bubbles, &text);
                     }
@@ -633,7 +632,8 @@ mod macos_live_ax {
         let Some(value) = copy_raw_attr(element, "AXChildren") else {
             return Vec::new();
         };
-        let array = unsafe { CFArray::<*const c_void>::wrap_under_create_rule(value as CFArrayRef) };
+        let array =
+            unsafe { CFArray::<*const c_void>::wrap_under_create_rule(value as CFArrayRef) };
         let mut children = Vec::new();
         for index in 0..array.len() {
             let Some(item) = array.get(index) else {
@@ -804,16 +804,13 @@ mod tests {
         let mut live = expected.clone();
         live.pid = 2;
         live.bundle_id = Some("com.example.b".into());
-        let dropped = resolve_screen_at_stop(
-            &expected,
-            &live,
-            ContextFamily::PersonalChat,
-            || ScreenTextContext {
+        let dropped = resolve_screen_at_stop(&expected, &live, ContextFamily::PersonalChat, || {
+            ScreenTextContext {
                 tokens: vec!["晓雯".into()],
                 family: ContextFamily::PersonalChat,
                 ..ScreenTextContext::default()
-            },
-        );
+            }
+        });
         assert!(dropped.is_none());
     }
 
@@ -829,10 +826,7 @@ mod tests {
 
     #[test]
     fn extractor_error_does_not_fail_session() {
-        let ctx = screen_context_for_session(
-            ContextFamily::PersonalChat,
-            Err("ax denied"),
-        );
+        let ctx = screen_context_for_session(ContextFamily::PersonalChat, Err("ax denied"));
         assert!(ctx.tokens.is_empty());
         assert_eq!(ctx.family, ContextFamily::PersonalChat);
     }

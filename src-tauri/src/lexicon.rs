@@ -78,11 +78,10 @@ impl PromptScope {
         family: Option<&str>,
         browser_host: Option<&str>,
     ) -> Self {
-        let inferred_family = family
-            .map(str::to_owned)
-            .or_else(|| {
-                profile_id.map(|id| crate::context::family_id(family_from_profile_id(id, &[])).to_owned())
-            });
+        let inferred_family = family.map(str::to_owned).or_else(|| {
+            profile_id
+                .map(|id| crate::context::family_id(family_from_profile_id(id, &[])).to_owned())
+        });
         Self {
             family: inferred_family,
             mapping_id: profile_id
@@ -177,10 +176,7 @@ pub fn decide_cleanup(
 }
 
 fn skips_llm_scene(family: ContextFamily) -> bool {
-    matches!(
-        family,
-        ContextFamily::FormFilling | ContextFamily::Terminal
-    )
+    matches!(family, ContextFamily::FormFilling | ContextFamily::Terminal)
 }
 
 pub fn mapping_for_profile<'a>(
@@ -219,7 +215,9 @@ fn mapping_matching_target<'a>(
         mapping.enabled
             && (bundle_id.is_some() && mapping.bundle_id.as_deref() == bundle_id
                 || host_is_or_under(
-                    browser_host.and_then(crate::context::normalize_host).as_deref(),
+                    browser_host
+                        .and_then(crate::context::normalize_host)
+                        .as_deref(),
                     mapping
                         .browser_host
                         .as_deref()
@@ -229,7 +227,10 @@ fn mapping_matching_target<'a>(
     })
 }
 
-pub(crate) fn is_default_learn_off_target(bundle_id: Option<&str>, browser_host: Option<&str>) -> bool {
+pub(crate) fn is_default_learn_off_target(
+    bundle_id: Option<&str>,
+    browser_host: Option<&str>,
+) -> bool {
     if bundle_id.is_some_and(is_learn_off_bundle) {
         return true;
     }
@@ -284,7 +285,7 @@ fn is_learn_off_host(host: &str) -> bool {
         "namely.com",
         "justworks.com",
     ];
-    EXACT.iter().any(|item| host == *item)
+    EXACT.contains(&host)
         || SUFFIX
             .iter()
             .any(|parent| host == *parent || host.ends_with(&format!(".{parent}")))
@@ -357,10 +358,7 @@ pub fn apply_lexicon_replacements(
     output
 }
 
-pub fn replaceable_pairs<'a>(
-    pairs: &'a [LearnPairRecord],
-    dictionary: &[String],
-) -> Vec<LexiconPair> {
+pub fn replaceable_pairs(pairs: &[LearnPairRecord], dictionary: &[String]) -> Vec<LexiconPair> {
     let dict: HashSet<&str> = dictionary.iter().map(String::as_str).collect();
     pairs
         .iter()
@@ -486,7 +484,10 @@ pub fn collect_ranked_terms(
         });
     }
 
-    for word in dictionary.iter().map(|item| item.trim()).filter(|item| !item.is_empty())
+    for word in dictionary
+        .iter()
+        .map(|item| item.trim())
+        .filter(|item| !item.is_empty())
     {
         if !seen.insert(word.to_owned()) {
             continue;
@@ -748,7 +749,10 @@ fn region_matches(haystack: &[char], start: usize, needle: &[char]) -> bool {
         .iter()
         .zip(needle)
         .all(|(left, right)| {
-            if is_latin_start(*left) || is_latin_cont(*left) || is_latin_start(*right) || is_latin_cont(*right)
+            if is_latin_start(*left)
+                || is_latin_cont(*left)
+                || is_latin_start(*right)
+                || is_latin_cont(*right)
             {
                 left.eq_ignore_ascii_case(right)
             } else {
@@ -769,7 +773,9 @@ fn is_latin_token_char(value: char) -> bool {
 }
 
 fn is_latin_surface(value: &str) -> bool {
-    value.chars().any(|ch| is_latin_start(ch) || is_latin_cont(ch))
+    value
+        .chars()
+        .any(|ch| is_latin_start(ch) || is_latin_cont(ch))
         && !value.chars().any(is_cjk)
 }
 
@@ -1177,12 +1183,7 @@ mod tests {
         for index in 0..3 {
             let after = format!("微信词{index}");
             dictionary.push(after.clone());
-            pairs.push(live_pair(
-                &format!("微{index}"),
-                &after,
-                "personal_chat",
-                9,
-            ));
+            pairs.push(live_pair(&format!("微{index}"), &after, "personal_chat", 9));
         }
         dictionary.push("手动导入".into());
         let scope = PromptScope {
@@ -1203,7 +1204,10 @@ mod tests {
     #[test]
     fn asr_prompt_shape_follows_the_selected_plug() {
         assert_eq!(
-            asr_prompt_shape_for(crate::providers::EngineProvider::Groq, "whisper-large-v3-turbo"),
+            asr_prompt_shape_for(
+                crate::providers::EngineProvider::Groq,
+                "whisper-large-v3-turbo"
+            ),
             AsrPromptShape::WhisperTranscript
         );
         assert_eq!(
@@ -1354,9 +1358,8 @@ mod tests {
     #[test]
     fn decide_cleanup_sends_prose_including_short_chat_to_provider() {
         let short = CleanupIntent::implicit("好的哈哈我晚点回你");
-        let long = CleanupIntent::implicit(
-            "请帮我看一下这份季度报告里的几个数字然后在周五之前把意见发我",
-        );
+        let long =
+            CleanupIntent::implicit("请帮我看一下这份季度报告里的几个数字然后在周五之前把意见发我");
         assert_eq!(
             decide(true, None, ContextFamily::PersonalChat, &short),
             CleanupRoute::Provider(CleanupEffort::Heavy)
@@ -1398,12 +1401,7 @@ mod tests {
             CleanupRoute::Provider(CleanupEffort::Heavy)
         );
         assert_eq!(
-            decide(
-                true,
-                None,
-                ContextFamily::DeveloperCollaboration,
-                &long,
-            ),
+            decide(true, None, ContextFamily::DeveloperCollaboration, &long,),
             CleanupRoute::Provider(CleanupEffort::Heavy)
         );
         assert_eq!(
@@ -1441,26 +1439,16 @@ mod tests {
             ..mapping
         };
         assert_eq!(
-            decide(
-                true,
-                Some(&mapping_off),
-                ContextFamily::PersonalChat,
-                &long,
-            ),
+            decide(true, Some(&mapping_off), ContextFamily::PersonalChat, &long,),
             CleanupRoute::LocalOnly
         );
     }
 
     #[test]
     fn history_personal_chat_uses_global_heavy() {
-        let intent = CleanupIntent::implicit(
-            "请帮我看一下这份季度报告里的几个数字然后在周五之前把意见发我",
-        );
-        let scope = PromptScope::from_history(
-            Some("chat.personal"),
-            Some("personal_chat"),
-            None,
-        );
+        let intent =
+            CleanupIntent::implicit("请帮我看一下这份季度报告里的几个数字然后在周五之前把意见发我");
+        let scope = PromptScope::from_history(Some("chat.personal"), Some("personal_chat"), None);
         assert_eq!(scope.family.as_deref(), Some("personal_chat"));
         assert_eq!(
             decide(
@@ -1576,7 +1564,12 @@ mod tests {
             Some("com.tencent.xinWeChat"),
             None
         ));
-        assert!(scene_allows_learn(&[], "chat.personal", None, Some("mail.google.com")));
+        assert!(scene_allows_learn(
+            &[],
+            "chat.personal",
+            None,
+            Some("mail.google.com")
+        ));
     }
 
     #[test]

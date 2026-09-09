@@ -134,7 +134,10 @@ fn is_loopback_host(host: &str) -> bool {
 pub(crate) fn host_from_url(url: &str) -> Option<String> {
     let rest = url.split_once("://")?.1;
     let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
-    let hostport = authority.rsplit_once('@').map(|(_, host)| host).unwrap_or(authority);
+    let hostport = authority
+        .rsplit_once('@')
+        .map(|(_, host)| host)
+        .unwrap_or(authority);
     let host = if let Some(end) = hostport.strip_prefix('[') {
         end.split_once(']')?.0
     } else {
@@ -547,9 +550,8 @@ fn qwen_json_string<'a>(value: &'a serde_json::Value, key: &str) -> Option<&'a s
 fn qwen_error_body_detail(body: &str) -> Option<String> {
     if let Ok(value) = serde_json::from_str::<serde_json::Value>(body) {
         let code = qwen_json_string(&value, "code");
-        let message = qwen_json_string(&value, "message").or_else(|| {
-            value.get("error").and_then(serde_json::Value::as_str)
-        });
+        let message = qwen_json_string(&value, "message")
+            .or_else(|| value.get("error").and_then(serde_json::Value::as_str));
         match (code, message) {
             (Some(code), Some(message)) if !code.is_empty() && !message.is_empty() => {
                 return Some(format!("{code}: {message}"));
@@ -945,7 +947,9 @@ mod tests {
     #[test]
     fn transcription_url_never_uses_the_english_translation_endpoint() {
         assert!(!resolve_transcription_url("").contains("translations"));
-        assert!(!resolve_transcription_url("https://api.groq.com/openai/v1").contains("translations"));
+        assert!(
+            !resolve_transcription_url("https://api.groq.com/openai/v1").contains("translations")
+        );
         assert!(resolve_transcription_url("").contains("transcriptions"));
     }
 
@@ -1058,9 +1062,16 @@ mod tests {
             &[],
         )
         .await;
-        let result = transcribe_at(&endpoint, b"wav".to_vec(), "test-key", Some("auto"), None, MODEL)
-            .await
-            .expect("ASR success");
+        let result = transcribe_at(
+            &endpoint,
+            b"wav".to_vec(),
+            "test-key",
+            Some("auto"),
+            None,
+            MODEL,
+        )
+        .await
+        .expect("ASR success");
         assert_eq!(result.text, "hello world");
 
         let empty = crate::test_http::spawn_response(
@@ -1181,9 +1192,7 @@ mod tests {
             "http://127.0.0.1:8000/audio/transcriptions"
         );
         assert_eq!(
-            resolve_transcription_url(
-                "http://127.0.0.1:8000/v1/audio/transcriptions/"
-            ),
+            resolve_transcription_url("http://127.0.0.1:8000/v1/audio/transcriptions/"),
             "http://127.0.0.1:8000/v1/audio/transcriptions"
         );
     }
@@ -1204,10 +1213,7 @@ mod tests {
             transcription_host("http://127.0.0.1:8000/v1").as_deref(),
             Some("127.0.0.1")
         );
-        assert!(!asr_host_changed(
-            "",
-            "https://api.groq.com/openai/v1"
-        ));
+        assert!(!asr_host_changed("", "https://api.groq.com/openai/v1"));
         assert!(asr_host_changed(
             "https://api.groq.com/openai/v1",
             "https://asr.example.com/v1"
@@ -1388,9 +1394,7 @@ mod tests {
     #[test]
     fn qwen_chat_url_uses_completions_not_transcriptions() {
         assert_eq!(
-            resolve_qwen_chat_completions_url(
-                "https://dashscope.aliyuncs.com/compatible-mode/v1"
-            ),
+            resolve_qwen_chat_completions_url("https://dashscope.aliyuncs.com/compatible-mode/v1"),
             "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
         );
         assert_eq!(
@@ -1533,7 +1537,9 @@ mod tests {
         let (host, request) = crate::test_http::spawn_response_with_request_capture(
             200,
             "application/json",
-            r#"{"choices":[{"message":{"content":"识别结果"}}]}"#.as_bytes().to_vec(),
+            r#"{"choices":[{"message":{"content":"识别结果"}}]}"#
+                .as_bytes()
+                .to_vec(),
             &[],
         )
         .await;
@@ -1555,16 +1561,19 @@ mod tests {
         assert_eq!(body["asr_options"]["language"], "zh");
         assert_eq!(body["messages"][0]["content"][0]["text"], "晓雯");
 
-        let invalid = crate::test_http::spawn_response(
-            200,
-            "application/json",
-            b"not-json".to_vec(),
-            &[],
-        )
-        .await;
+        let invalid =
+            crate::test_http::spawn_response(200, "application/json", b"not-json".to_vec(), &[])
+                .await;
         assert!(matches!(
-            transcribe_qwen_chat(&invalid, b"wav".to_vec(), "k", None, None, "qwen3-asr-flash")
-                .await,
+            transcribe_qwen_chat(
+                &invalid,
+                b"wav".to_vec(),
+                "k",
+                None,
+                None,
+                "qwen3-asr-flash"
+            )
+            .await,
             Err(AsrError::Other(_))
         ));
     }
@@ -1591,10 +1600,7 @@ mod tests {
         .await
         .expect_err("403 must fail");
         let displayed = error.to_string();
-        assert!(
-            matches!(&error, AsrError::Other(_)),
-            "{error}"
-        );
+        assert!(matches!(&error, AsrError::Other(_)), "{error}");
         assert!(displayed.contains("ASR error"), "{displayed}");
         assert!(displayed.contains("需要 ASR 权限"), "{displayed}");
         assert!(displayed.contains("AccessDenied"), "{displayed}");

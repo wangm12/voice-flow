@@ -8,16 +8,7 @@
 /// Task 7 markers plus real TIS families observed on macOS (`TYIM`,
 /// `Japanese`).
 const CJK_SOURCE_MARKERS: &[&str] = &[
-    "Hans",
-    "Hant",
-    "Kotoeri",
-    "Pinyin",
-    "IMK",
-    "SCIM",
-    "TCIM",
-    "TYIM",
-    "Hiragana",
-    "Korean",
+    "Hans", "Hant", "Kotoeri", "Pinyin", "IMK", "SCIM", "TCIM", "TYIM", "Hiragana", "Korean",
     "Japanese",
 ];
 
@@ -79,7 +70,7 @@ impl AbcLayoutGuard {
     pub fn acquire() -> Self {
         #[cfg(target_os = "macos")]
         {
-            return macos::acquire_guard();
+            macos::acquire_guard()
         }
         #[cfg(not(target_os = "macos"))]
         {
@@ -114,7 +105,7 @@ impl Drop for AbcLayoutGuard {
 
 #[cfg(target_os = "macos")]
 mod macos {
-    use super::{AbcLayoutGuard, RetainedInputSource, should_switch_input_source};
+    use super::{should_switch_input_source, AbcLayoutGuard, RetainedInputSource};
     use core::ffi::c_void;
     use core_foundation::array::{CFArray, CFArrayRef};
     use core_foundation::base::{CFRelease, CFType, CFTypeRef, TCFType};
@@ -206,7 +197,8 @@ mod macos {
 
     fn switch_to_latin_if_cjk() -> Option<RetainedInputSource> {
         let current = copy_current_source()?;
-        let id = source_property(current.0, unsafe { kTISPropertyInputSourceID }).unwrap_or_default();
+        let id =
+            source_property(current.0, unsafe { kTISPropertyInputSourceID }).unwrap_or_default();
         let name =
             source_property(current.0, unsafe { kTISPropertyLocalizedName }).unwrap_or_default();
         if !should_switch_input_source(&id, &name) {
@@ -257,8 +249,7 @@ mod macos {
             return false;
         }
         let id = source_property(ascii, unsafe { kTISPropertyInputSourceID }).unwrap_or_default();
-        let name =
-            source_property(ascii, unsafe { kTISPropertyLocalizedName }).unwrap_or_default();
+        let name = source_property(ascii, unsafe { kTISPropertyLocalizedName }).unwrap_or_default();
         if should_switch_input_source(&id, &name) {
             unsafe { CFRelease(ascii as CFTypeRef) };
             return false;
@@ -322,7 +313,10 @@ mod tests {
             "com.apple.keylayout.ABC",
             "ABC"
         ));
-        assert!(!should_switch_input_source("com.apple.keylayout.US", "U.S."));
+        assert!(!should_switch_input_source(
+            "com.apple.keylayout.US",
+            "U.S."
+        ));
         assert!(!should_switch_input_source(
             "com.apple.keylayout.USExtended",
             "ABC – Extended"

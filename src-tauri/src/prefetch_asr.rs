@@ -350,11 +350,7 @@ mod tests {
     }
 
     impl asr::AsrProvider for ScriptedAsr {
-        fn transcribe_batch(
-            &self,
-            _audio: Vec<u8>,
-            _options: asr::AsrOptions,
-        ) -> asr::AsrFuture {
+        fn transcribe_batch(&self, _audio: Vec<u8>, _options: asr::AsrOptions) -> asr::AsrFuture {
             let reply = self
                 .replies
                 .lock()
@@ -406,9 +402,7 @@ mod tests {
         (inbox, session)
     }
 
-    fn spawn_silent(
-        provider: Arc<dyn asr::AsrProvider>,
-    ) -> (PrefetchInbox, PrefetchAsrSession) {
+    fn spawn_silent(provider: Arc<dyn asr::AsrProvider>) -> (PrefetchInbox, PrefetchAsrSession) {
         let (inbox, receiver) = PrefetchAsrSession::channel();
         let session = PrefetchAsrSession::spawn(
             receiver,
@@ -441,7 +435,8 @@ mod tests {
     #[tokio::test]
     async fn successful_non_warmup_chunks_emit_concatenated_hud_partials() {
         let hud: HudEvents = Arc::new(Mutex::new(Vec::new()));
-        let (inbox, session) = spawn_with_hud(ScriptedAsr::ok(&[" later", "hello "]), Arc::clone(&hud), 7);
+        let (inbox, session) =
+            spawn_with_hud(ScriptedAsr::ok(&[" later", "hello "]), Arc::clone(&hud), 7);
 
         assert!(inbox.try_send(PrefetchMessage::Chunk(sample_chunk(1))));
         assert!(inbox.try_send(PrefetchMessage::Chunk(sample_chunk(0))));
@@ -452,7 +447,9 @@ mod tests {
             HashMap::from([(0, "hello ".to_owned()), (1, " later".to_owned())])
         );
         assert_eq!(
-            hud.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).as_slice(),
+            hud.lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .as_slice(),
             &[(7, "later".to_owned()), (7, "hello later".to_owned())]
         );
     }
@@ -460,8 +457,11 @@ mod tests {
     #[tokio::test]
     async fn warmup_and_prefetch_failure_stay_silent_on_the_hud() {
         let warmup_hud: HudEvents = Arc::new(Mutex::new(Vec::new()));
-        let (warmup_inbox, warmup_session) =
-            spawn_with_hud(ScriptedAsr::ok(&["warmup only"]), Arc::clone(&warmup_hud), 3);
+        let (warmup_inbox, warmup_session) = spawn_with_hud(
+            ScriptedAsr::ok(&["warmup only"]),
+            Arc::clone(&warmup_hud),
+            3,
+        );
         assert!(warmup_inbox.try_send(PrefetchMessage::Warmup(sample_chunk(0))));
         let warmup_result = warmup_session.finish(Duration::from_secs(2)).await;
         assert_eq!(warmup_result.warmup.as_deref(), Some("warmup only"));
@@ -471,7 +471,8 @@ mod tests {
             .is_empty());
 
         let fail_hud: HudEvents = Arc::new(Mutex::new(Vec::new()));
-        let (fail_inbox, fail_session) = spawn_with_hud(ScriptedAsr::err(), Arc::clone(&fail_hud), 4);
+        let (fail_inbox, fail_session) =
+            spawn_with_hud(ScriptedAsr::err(), Arc::clone(&fail_hud), 4);
         assert!(fail_inbox.try_send(PrefetchMessage::Chunk(sample_chunk(0))));
         let fail_result = fail_session.finish(Duration::from_secs(2)).await;
         assert!(fail_result.transcripts.is_empty());

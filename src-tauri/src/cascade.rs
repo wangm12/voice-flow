@@ -185,12 +185,24 @@ mod tests {
 
     #[test]
     fn each_trigger_fires_when_configured() {
-        assert!(should_run_accurate(&configured(|input| input.primary_failed = true)));
-        assert!(should_run_accurate(&configured(|input| input.low_confidence = true)));
-        assert!(should_run_accurate(&configured(|input| input.hallucination_hit = true)));
-        assert!(should_run_accurate(&configured(|input| input.mixed_cjk_english = true)));
-        assert!(should_run_accurate(&configured(|input| input.proper_noun_count = 3)));
-        assert!(!should_run_accurate(&configured(|input| input.proper_noun_count = 2)));
+        assert!(should_run_accurate(&configured(|input| input
+            .primary_failed =
+            true)));
+        assert!(should_run_accurate(&configured(|input| input
+            .low_confidence =
+            true)));
+        assert!(should_run_accurate(&configured(|input| input
+            .hallucination_hit =
+            true)));
+        assert!(should_run_accurate(&configured(|input| input
+            .mixed_cjk_english =
+            true)));
+        assert!(should_run_accurate(&configured(|input| input
+            .proper_noun_count =
+            3)));
+        assert!(!should_run_accurate(&configured(|input| input
+            .proper_noun_count =
+            2)));
         assert!(!should_run_accurate(&configured(|_| {})));
     }
 
@@ -351,18 +363,21 @@ mod tests {
     #[tokio::test]
     async fn maybe_run_accurate_skips_http_when_gate_is_closed() {
         let mut runs = 0usize;
-        let skipped = maybe_run_accurate(&CascadeInput {
-            accurate_asr_configured: false,
-            primary_failed: true,
-            low_confidence: true,
-            hallucination_hit: true,
-            mixed_cjk_english: true,
-            proper_noun_count: 9,
-            noun_threshold: 3,
-        }, || {
-            runs += 1;
-            async { Ok(Some("should not run".into())) }
-        })
+        let skipped = maybe_run_accurate(
+            &CascadeInput {
+                accurate_asr_configured: false,
+                primary_failed: true,
+                low_confidence: true,
+                hallucination_hit: true,
+                mixed_cjk_english: true,
+                proper_noun_count: 9,
+                noun_threshold: 3,
+            },
+            || {
+                runs += 1;
+                async { Ok(Some("should not run".into())) }
+            },
+        )
         .await;
         assert_eq!(skipped, Ok(None));
         assert_eq!(runs, 0);

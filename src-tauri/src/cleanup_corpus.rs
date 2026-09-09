@@ -639,7 +639,9 @@ mod tests {
         assert!(CASES
             .iter()
             .any(|case| case.name == "zh_bu_dui_as_question"));
-        assert!(CASES.iter().any(|case| case.name == "en_scratch_that_restate"));
+        assert!(CASES
+            .iter()
+            .any(|case| case.name == "en_scratch_that_restate"));
         assert!(CASES
             .iter()
             .any(|case| case.name == "zh_untrusted_rewrite_instruction"));
@@ -771,7 +773,10 @@ mod tests {
         assert_eq!(thanks.context_family, "work_chat");
         assert!(thanks.raw.to_ascii_lowercase().contains("thanks"));
         assert!(!thanks.expected.contains('\n'));
-        assert!(!thanks.expected.to_ascii_lowercase().contains("best regards"));
+        assert!(!thanks
+            .expected
+            .to_ascii_lowercase()
+            .contains("best regards"));
 
         let ordinals = CASES
             .iter()
@@ -947,10 +952,7 @@ mod tests {
         let (wechat_prepared, _, wechat_route) =
             run("zh_wechat_casual", ContextFamily::PersonalChat);
         assert!(wechat_prepared.contains("哈哈"), "{wechat_prepared}");
-        assert_eq!(
-            wechat_route,
-            CleanupRoute::Provider(CleanupEffort::Heavy)
-        );
+        assert_eq!(wechat_route, CleanupRoute::Provider(CleanupEffort::Heavy));
 
         let fillers = local_cleanup("嗯那个就是说我们进展不错");
         assert_eq!(fillers, "我们进展不错");

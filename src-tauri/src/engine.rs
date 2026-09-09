@@ -134,10 +134,14 @@ pub fn classify_status_body(status: u16, body: &str) -> ProbeErrorKind {
     if status == 401 || status == 403 {
         return ProbeErrorKind::Key;
     }
-    if status == 404 || lower.contains("model") && (lower.contains("not") || lower.contains("invalid") || lower.contains("unknown")) {
+    if status == 404
+        || lower.contains("model")
+            && (lower.contains("not") || lower.contains("invalid") || lower.contains("unknown"))
+    {
         return ProbeErrorKind::Model;
     }
-    if status == 400 && (lower.contains("url") || lower.contains("path") || lower.contains("route")) {
+    if status == 400 && (lower.contains("url") || lower.contains("path") || lower.contains("route"))
+    {
         return ProbeErrorKind::Path;
     }
     ProbeErrorKind::Provider
@@ -166,7 +170,12 @@ pub fn classify_llm_error(error: &LlmError) -> ProbeErrorKind {
 fn status_from_message(message: &str) -> u16 {
     message
         .split_whitespace()
-        .find_map(|token| token.parse::<u16>().ok().filter(|code| (100..600).contains(code)))
+        .find_map(|token| {
+            token
+                .parse::<u16>()
+                .ok()
+                .filter(|code| (100..600).contains(code))
+        })
         .unwrap_or(0)
 }
 
@@ -207,7 +216,8 @@ fn resolve_side_key(
     if !stored_legacy.trim().is_empty() {
         return Ok(stored_legacy.trim().to_owned());
     }
-    if provider.allows_empty_key() && providers::is_loopback_url(&draft_provider_base(draft, provider))
+    if provider.allows_empty_key()
+        && providers::is_loopback_url(&draft_provider_base(draft, provider))
     {
         return Ok(String::new());
     }
@@ -236,14 +246,10 @@ fn resolve_cleanup_key(draft: &EngineDraft, stored: &Settings) -> Result<String,
 
 fn draft_provider_base(draft: &EngineDraft, provider: EngineProvider) -> String {
     match provider {
-        EngineProvider::Ollama => nonempty(
-            &draft.ollama_base_url,
-            provider.default_base_url(),
-        ),
-        EngineProvider::LocalWhisper => nonempty(
-            &draft.local_whisper_base_url,
-            provider.default_base_url(),
-        ),
+        EngineProvider::Ollama => nonempty(&draft.ollama_base_url, provider.default_base_url()),
+        EngineProvider::LocalWhisper => {
+            nonempty(&draft.local_whisper_base_url, provider.default_base_url())
+        }
         EngineProvider::Custom => nonempty(
             &draft.custom_base_url,
             nonempty(&draft.asr_base_url, &draft.cleanup_base_url),

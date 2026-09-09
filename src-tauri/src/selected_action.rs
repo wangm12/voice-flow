@@ -1,12 +1,12 @@
 //! Selected-text hotkey and preview delivery commands.
 
+use crate::dictation::{self, OperationLease, Phase};
 use crate::{
     arm_undo_transaction, context, copy_text, delivery, dictionary_learn,
     emit_selected_action_state, finish_with_delivery, hotkey, lock_recover, paste, permissions,
     release_operation, start_selected_action_with_feedback, verify_delivery_target, AppState,
     CLEANUP_STATUS_AI_SUCCESS,
 };
-use crate::dictation::{self, OperationLease, Phase};
 use tauri::State;
 use tokio_util::sync::CancellationToken;
 
@@ -101,10 +101,7 @@ fn take_current_selected_preview(state: &AppState) -> Result<SelectedActionPrevi
     take_preview_if_current(&mut preview, current_generation, lease)
 }
 
-pub(crate) async fn handle_selected_action_hotkey(
-    app: &tauri::AppHandle,
-    state: &AppState,
-) {
+pub(crate) async fn handle_selected_action_hotkey(app: &tauri::AppHandle, state: &AppState) {
     if hotkey::is_suspended() {
         return;
     }
@@ -211,9 +208,9 @@ pub(crate) async fn confirm_selected_action_preview(
     let activation = tokio::task::spawn_blocking(move || {
         paste::restore_delivery_target_if_needed(pid, window_id)
     })
-        .await
-        .map_err(|error| format!("target activation worker failed: {error}"))
-        .and_then(|result| result.map_err(|error| error.to_string()));
+    .await
+    .map_err(|error| format!("target activation worker failed: {error}"))
+    .and_then(|result| result.map_err(|error| error.to_string()));
     if let Err(error) = activation {
         if selected_preview_lease_is_current(&state, preview.session_generation) {
             release_operation(&state, OperationLease::LiveDictation);

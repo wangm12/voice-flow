@@ -319,9 +319,8 @@ fn read_stored_secret(
         match read(service, account) {
             Ok(Some(key)) => Ok(Some(key)),
             Ok(None) => read(fallback_service, account).map_err(|error| error.to_string()),
-            Err(primary_error) => read(fallback_service, account).map_err(|fallback_error| {
-                format!("{primary_error}; fallback: {fallback_error}")
-            }),
+            Err(primary_error) => read(fallback_service, account)
+                .map_err(|fallback_error| format!("{primary_error}; fallback: {fallback_error}")),
         }
     }
 }
@@ -340,9 +339,7 @@ fn read_stored_cleanup_api_key() -> Result<Option<String>, String> {
 
 fn is_keychain_auth_failure(error: &str) -> bool {
     let lower = error.to_ascii_lowercase();
-    lower.contains("passphrase")
-        || lower.contains("errsecauthfailed")
-        || lower.contains("(-25293)")
+    lower.contains("passphrase") || lower.contains("errsecauthfailed") || lower.contains("(-25293)")
 }
 
 fn keychain_read_error_state(error: String) -> ApiKeyState {
@@ -410,8 +407,7 @@ fn set_secret(
             if key.is_empty() {
                 #[cfg(debug_assertions)]
                 {
-                    delete_fallback(&fallback_service, &account)
-                        .map_err(|error| error.to_string())
+                    delete_fallback(&fallback_service, &account).map_err(|error| error.to_string())
                 }
 
                 #[cfg(not(debug_assertions))]
@@ -533,14 +529,17 @@ pub fn get_provider_api_key_state(provider: crate::providers::EngineProvider) ->
     }
     if provider.is_custom() {
         let custom = secret_state(move || {
-            read_stored_secret(API_SERVICE, API_FALLBACK_SERVICE, provider.keychain_account())
+            read_stored_secret(
+                API_SERVICE,
+                API_FALLBACK_SERVICE,
+                provider.keychain_account(),
+            )
         });
         if matches!(custom, ApiKeyState::Configured(_)) {
             return custom;
         }
-        match get_asr_api_key_state() {
-            ApiKeyState::Configured(key) => return ApiKeyState::Configured(key),
-            _ => {}
+        if let ApiKeyState::Configured(key) = get_asr_api_key_state() {
+            return ApiKeyState::Configured(key);
         }
         return get_cleanup_api_key_state();
     }
@@ -548,11 +547,19 @@ pub fn get_provider_api_key_state(provider: crate::providers::EngineProvider) ->
     secret_state(move || read_stored_secret(API_SERVICE, API_FALLBACK_SERVICE, account))
 }
 
-pub fn set_provider_api_key(provider: crate::providers::EngineProvider, key: &str) -> Result<(), String> {
+pub fn set_provider_api_key(
+    provider: crate::providers::EngineProvider,
+    key: &str,
+) -> Result<(), String> {
     if provider.is_groq() {
         return set_api_key(key);
     }
-    set_secret(API_SERVICE, API_FALLBACK_SERVICE, provider.keychain_account(), key)
+    set_secret(
+        API_SERVICE,
+        API_FALLBACK_SERVICE,
+        provider.keychain_account(),
+        key,
+    )
 }
 
 pub fn resolve_cleanup_api_key(plaintext: &str) -> ApiKeyState {
@@ -594,9 +601,7 @@ pub fn get_history_key() -> Result<Option<Vec<u8>>, String> {
         )
     });
     match result {
-        Some(Ok(Some(value))) => {
-            decode_history_key(&value).map(Some)
-        }
+        Some(Ok(Some(value))) => decode_history_key(&value).map(Some),
         Some(Ok(None)) => Ok(None),
         Some(Err(error)) => Err(error),
         None => Err("keychain read timed out".into()),

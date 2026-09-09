@@ -74,14 +74,25 @@ impl EngineProvider {
     pub fn has_asr(self) -> bool {
         matches!(
             self,
-            Self::Groq | Self::OpenAi | Self::Deepgram | Self::SiliconFlow | Self::LocalWhisper | Self::Custom
+            Self::Groq
+                | Self::OpenAi
+                | Self::Deepgram
+                | Self::SiliconFlow
+                | Self::LocalWhisper
+                | Self::Custom
         )
     }
 
     pub fn has_llm(self) -> bool {
         matches!(
             self,
-            Self::Groq | Self::OpenAi | Self::SiliconFlow | Self::DeepSeek | Self::Anthropic | Self::Ollama | Self::Custom
+            Self::Groq
+                | Self::OpenAi
+                | Self::SiliconFlow
+                | Self::DeepSeek
+                | Self::Anthropic
+                | Self::Ollama
+                | Self::Custom
         )
     }
 
@@ -160,7 +171,10 @@ pub fn host_of(url: &str) -> String {
         .map(|(_, rest)| rest)
         .unwrap_or(trimmed);
     let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
-    let hostport = authority.rsplit_once('@').map(|(_, host)| host).unwrap_or(authority);
+    let hostport = authority
+        .rsplit_once('@')
+        .map(|(_, host)| host)
+        .unwrap_or(authority);
     let host = if let Some(end) = hostport.strip_prefix('[') {
         end.split_once(']').map(|(host, _)| host).unwrap_or(end)
     } else {
@@ -178,7 +192,11 @@ pub fn is_loopback_url(url: &str) -> bool {
 
 pub fn resolve_asr_endpoint(provider: EngineProvider, base: &str) -> String {
     let fallback = provider.default_base_url();
-    let base = if base.trim().is_empty() { fallback } else { base.trim() };
+    let base = if base.trim().is_empty() {
+        fallback
+    } else {
+        base.trim()
+    };
     match provider.protocol() {
         ProviderProtocol::Deepgram => {
             if base.contains("/listen") {
@@ -194,7 +212,11 @@ pub fn resolve_asr_endpoint(provider: EngineProvider, base: &str) -> String {
 
 pub fn resolve_llm_endpoint(provider: EngineProvider, base: &str) -> String {
     let fallback = provider.default_base_url();
-    let base = if base.trim().is_empty() { fallback } else { base.trim() };
+    let base = if base.trim().is_empty() {
+        fallback
+    } else {
+        base.trim()
+    };
     match provider.protocol() {
         ProviderProtocol::Anthropic => {
             if base.contains("/messages") {
@@ -281,6 +303,9 @@ mod tests {
             infer_provider_from_host("http://127.0.0.1:11434/v1"),
             Some(EngineProvider::Ollama)
         );
-        assert_eq!(infer_provider_from_host("https://relay.example.com/v1"), None);
+        assert_eq!(
+            infer_provider_from_host("https://relay.example.com/v1"),
+            None
+        );
     }
 }

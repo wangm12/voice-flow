@@ -211,14 +211,18 @@ mod tests {
     fn expands_date_placeholder() {
         let snippets = vec![snippet("today", "on {{date}}")];
         let got = resolve_exact(&snippets, "today").expect("snippet should match");
-        let date = got.strip_prefix("on ").expect("keeps surrounding expansion");
+        let date = got
+            .strip_prefix("on ")
+            .expect("keeps surrounding expansion");
         assert_eq!(date.len(), 10, "{got}");
         let parts: Vec<_> = date.split('-').collect();
         assert_eq!(parts.len(), 3, "{got}");
         assert_eq!(parts[0].len(), 4);
         assert_eq!(parts[1].len(), 2);
         assert_eq!(parts[2].len(), 2);
-        assert!(parts.iter().all(|part| part.chars().all(|ch| ch.is_ascii_digit())));
+        assert!(parts
+            .iter()
+            .all(|part| part.chars().all(|ch| ch.is_ascii_digit())));
         assert!(!got.contains("{{date}}"));
     }
 
@@ -253,7 +257,8 @@ mod tests {
         });
         assert!(!read);
         assert!(ignored.is_none());
-        let clipboard = read_clipboard_if_needed(&with_placeholder, "clip", || Some("hello".into()));
+        let clipboard =
+            read_clipboard_if_needed(&with_placeholder, "clip", || Some("hello".into()));
         assert_eq!(clipboard.as_deref(), Some("hello"));
     }
 }

@@ -414,10 +414,7 @@ mod tests {
 
     #[test]
     fn hybrid_hold_release_stops() {
-        assert_eq!(
-            hybrid_release_action(400, true),
-            HybridReleaseAction::Stop
-        );
+        assert_eq!(hybrid_release_action(400, true), HybridReleaseAction::Stop);
     }
 
     #[test]
@@ -431,10 +428,7 @@ mod tests {
     #[test]
     fn hybrid_hold_threshold_is_280ms() {
         assert_eq!(HYBRID_HOLD_MS, 280);
-        assert_eq!(
-            hybrid_release_action(280, true),
-            HybridReleaseAction::Stop
-        );
+        assert_eq!(hybrid_release_action(280, true), HybridReleaseAction::Stop);
         assert_eq!(
             hybrid_release_action(279, true),
             HybridReleaseAction::KeepRecording

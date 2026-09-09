@@ -98,9 +98,8 @@ fn has_terminal_mark(text: &str) -> bool {
 }
 
 fn is_question(text: &str) -> bool {
-    let not_a_me_question = text.ends_with("没什么")
-        || text.ends_with("那么")
-        || text.ends_with("要么");
+    let not_a_me_question =
+        text.ends_with("没什么") || text.ends_with("那么") || text.ends_with("要么");
     if !not_a_me_question
         && (text.ends_with('吗')
             || text.ends_with(['呢', '嘛'])
@@ -279,9 +278,11 @@ fn period_is_false_positive(text: &str, start: usize, end: usize) -> bool {
     {
         return true;
     }
-    if previous_ascii_word(text, start)
-        .is_some_and(|word| DETERMINERS.iter().any(|item| word.eq_ignore_ascii_case(item)))
-    {
+    if previous_ascii_word(text, start).is_some_and(|word| {
+        DETERMINERS
+            .iter()
+            .any(|item| word.eq_ignore_ascii_case(item))
+    }) {
         return match next_ascii_word(text, end) {
             None => false,
             Some(word) => word.chars().next().is_some_and(|ch| !ch.is_uppercase()),
@@ -307,7 +308,7 @@ fn is_right_boundary(text: &str, end: usize) -> bool {
 }
 
 fn precedes_classifier_ge(text: &str, start: usize) -> bool {
-    text[..start].chars().next_back() == Some('个')
+    text[..start].ends_with('个')
 }
 
 fn is_cjk_letter(value: char) -> bool {
@@ -427,10 +428,7 @@ mod tests {
             "我晚点回你。"
         );
         assert_eq!(ensure_terminal("hello", ContextFamily::General), "hello");
-        assert_eq!(
-            ensure_terminal("ls -la", ContextFamily::Terminal),
-            "ls -la"
-        );
+        assert_eq!(ensure_terminal("ls -la", ContextFamily::Terminal), "ls -la");
         assert_eq!(
             ensure_terminal("今晚吃饭吗。", ContextFamily::PersonalChat),
             "今晚吃饭吗。"
@@ -439,14 +437,8 @@ mod tests {
             ensure_terminal("没什么", ContextFamily::PersonalChat),
             "没什么"
         );
-        assert_eq!(
-            ensure_terminal("那么", ContextFamily::WorkChat),
-            "那么"
-        );
-        assert_eq!(
-            ensure_terminal("要么", ContextFamily::General),
-            "要么"
-        );
+        assert_eq!(ensure_terminal("那么", ContextFamily::WorkChat), "那么");
+        assert_eq!(ensure_terminal("要么", ContextFamily::General), "要么");
         assert_eq!(
             ensure_terminal("为什么", ContextFamily::PersonalChat),
             "为什么？"

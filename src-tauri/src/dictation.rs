@@ -4,14 +4,14 @@
 //! owns only the state machine and the short-lived claims that protect the
 //! blocking recorder and provider work performed by the surrounding pipeline.
 
+use crate::prefetch_asr;
+use crate::screen_action::{clear_screen_action, clear_screen_preview};
+use crate::selected_action::{clear_selected_action, clear_selected_preview};
 use crate::{
     audio, cancel_audio, cancel_prefetch_asr, chunker, context, emit_state, fail_for_generation,
     hotkey, island_window, lock_recover, release_operation, start_claimed,
     start_with_error_feedback, stop_claimed, sync_modifier_hotkey_phase, AppState, StartError,
 };
-use crate::prefetch_asr;
-use crate::screen_action::{clear_screen_action, clear_screen_preview};
-use crate::selected_action::{clear_selected_action, clear_selected_preview};
 use tauri::{Emitter, State};
 use tokio_util::sync::CancellationToken;
 
@@ -107,9 +107,8 @@ impl RecorderBackend for audio::Recorder {
         input_gain: f32,
         prefetch_tx: prefetch_asr::PrefetchInbox,
     ) -> Result<(), audio::AudioError> {
-        let app = app.ok_or_else(|| {
-            audio::AudioError::Device("recorder app handle is required".into())
-        })?;
+        let app =
+            app.ok_or_else(|| audio::AudioError::Device("recorder app handle is required".into()))?;
         audio::Recorder::start(
             self,
             app.clone(),
@@ -158,9 +157,7 @@ pub(crate) fn claim_start_manager(
     manager: &mut DictationManager,
     lease: &mut OperationLease,
 ) -> Option<u64> {
-    if manager.phase != Phase::Idle
-        || !claim_operation(lease, OperationLease::LiveDictation)
-    {
+    if manager.phase != Phase::Idle || !claim_operation(lease, OperationLease::LiveDictation) {
         return None;
     }
     manager.phase = Phase::Starting;
@@ -294,10 +291,7 @@ pub(crate) struct CancelClaim {
     pub(crate) had_preview: bool,
 }
 
-pub(crate) fn claim_cancel_manager(
-    manager: &mut DictationManager,
-    had_preview: bool,
-) -> Phase {
+pub(crate) fn claim_cancel_manager(manager: &mut DictationManager, had_preview: bool) -> Phase {
     let phase = manager.phase;
     if phase != Phase::Idle || had_preview {
         manager.cancellation.cancel();
@@ -333,11 +327,7 @@ async fn claim_cancel_entry(state: &AppState) -> CancelClaim {
     claim_cancel(state)
 }
 
-async fn finish_cancel_claim(
-    app: &tauri::AppHandle,
-    state: &AppState,
-    release_live_lease: bool,
-) {
+async fn finish_cancel_claim(app: &tauri::AppHandle, state: &AppState, release_live_lease: bool) {
     let _gate = state.hotkey_gate.lock().await;
     if release_live_lease {
         release_operation(state, OperationLease::LiveDictation);
@@ -386,10 +376,7 @@ pub(crate) async fn start_internal(
     start_claimed(app, state, session_generation).await
 }
 
-pub(crate) async fn stop_internal(
-    app: &tauri::AppHandle,
-    state: &AppState,
-) -> Result<(), String> {
+pub(crate) async fn stop_internal(app: &tauri::AppHandle, state: &AppState) -> Result<(), String> {
     let Some(claim) = claim_stop_entry(state).await else {
         return Ok(());
     };
@@ -823,8 +810,14 @@ mod tests {
     fn starting_cancel_is_idempotent_and_does_not_touch_recorder() {
         let mut harness = Harness::new();
         harness.begin_start();
-        assert_eq!(claim_cancel_manager(&mut harness.manager, false), Phase::Starting);
-        assert_eq!(claim_cancel_manager(&mut harness.manager, false), Phase::Idle);
+        assert_eq!(
+            claim_cancel_manager(&mut harness.manager, false),
+            Phase::Starting
+        );
+        assert_eq!(
+            claim_cancel_manager(&mut harness.manager, false),
+            Phase::Idle
+        );
         assert_eq!(harness.manager.phase, Phase::Idle);
         assert_eq!(harness.recorder.cancels, 0);
     }

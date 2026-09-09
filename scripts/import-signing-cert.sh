@@ -45,15 +45,26 @@ security set-keychain-settings -lut 21600 "${keychain}"
 security unlock-keychain -p "${keychain_password}" "${keychain}"
 security import "${p12_path}" -k "${keychain}" -P "${P12_PASSWORD}" \
   -T /usr/bin/codesign -A
-security set-key-partition-list -S apple-tool:,apple:,codesign: -s \
+# Can block on a password dialog if the runner keychain is locked.
+if ! perl -e 'alarm shift; exec @ARGV' 30 \
+  security set-key-partition-list -S apple-tool:,apple:,codesign: -s \
   -k "${keychain_password}" "${keychain}" >/dev/null
+then
+  echo "error: set-key-partition-list failed or timed out" >&2
+  exit 1
+fi
 
-openssl pkcs12 -in "${p12_path}" -nokeys -clcerts -passin "pass:${P12_PASSWORD}" \
-  -out "${tmp}/cert.pem" 2>/dev/null \
-  || openssl pkcs12 -in "${p12_path}" -nokeys -clcerts -legacy \
-    -passin "pass:${P12_PASSWORD}" -out "${tmp}/cert.pem"
-
-security add-trusted-cert -r trustRoot -p codeSign -k "${keychain}" "${tmp}/cert.pem"
+# add-trusted-cert can block on a GUI prompt on GitHub-hosted macOS runners.
+# Signing still works from the imported keychain identity without it.
+if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
+  echo "==> Skipping add-trusted-cert on GitHub Actions"
+else
+  openssl pkcs12 -in "${p12_path}" -nokeys -clcerts -passin "pass:${P12_PASSWORD}" \
+    -out "${tmp}/cert.pem" 2>/dev/null \
+    || openssl pkcs12 -in "${p12_path}" -nokeys -clcerts -legacy \
+      -passin "pass:${P12_PASSWORD}" -out "${tmp}/cert.pem"
+  security add-trusted-cert -r trustRoot -p codeSign -k "${keychain}" "${tmp}/cert.pem"
+fi
 
 existing_keychains=()
 while IFS= read -r keychain_path; do

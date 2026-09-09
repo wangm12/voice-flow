@@ -59,6 +59,7 @@ jobs:
           fi
 
       - name: Import stable signing certificate
+        timeout-minutes: 3
         env:
           MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
           MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}

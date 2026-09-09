@@ -19,7 +19,7 @@ on:
 
 concurrency:
   group: voiceflow-release-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 permissions:
   contents: read

@@ -1,8 +1,9 @@
 import { Check, Mic, RefreshCw, TextCursorInput } from "lucide-react";
 import type React from "react";
-import { compactButtonClass } from "../../lib/theme";
+import { compactButtonClass, secondaryButtonClass } from "../../lib/theme";
 import { iconProps, iconPropsSm } from "../../lib/icons";
 import { useI18n } from "../../lib/i18n";
+import { MicrophoneCheck } from "../MicrophoneCheck";
 
 function statusLabel(kind: "microphone" | "accessibility", ok: boolean, status: string, t: (source: string) => string): string {
   if (ok) return t("已授权");
@@ -35,17 +36,17 @@ function PermissionRow({
   const label = statusLabel(kind, ok, status, t);
 
   return (
-    <div className="flex items-center gap-3 border-t border-border py-4 first:border-t-0">
-      <div className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-lg ${ok ? "bg-success/10 text-success" : "bg-elevated text-secondary"}`}>
+    <div className="flex flex-wrap items-center gap-3 border-t border-border py-4 first:border-t-0">
+      <div className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-lg ${ok ? "bg-success/10 text-success-ink" : "bg-elevated text-secondary"}`}>
         {icon}
       </div>
       <div className="min-w-0 flex-1">
         <p className="text-sm font-medium text-primary">{t(title)}</p>
-        <p className={`text-xs ${ok ? "text-success" : "text-tertiary"}`}>{label}</p>
+        <p className={`text-xs ${ok ? "text-success-ink" : "text-tertiary"}`}>{label}</p>
       </div>
       {action}
       {ok && (
-        <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-success/15 text-success">
+        <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-success/15 text-success-ink">
           <Check {...iconPropsSm} aria-hidden="true" />
         </span>
       )}
@@ -69,10 +70,10 @@ export function PermissionsStep({
   const { t } = useI18n();
   return (
     <div>
-      <h1 className="text-2xl font-semibold tracking-tight text-primary">
+      <h1 className="text-[28px] font-semibold leading-tight tracking-tight text-primary">
         {t("先确认必要权限")}
       </h1>
-      <p className="mt-1.5 text-sm text-secondary">
+      <p className="mt-2 text-[13px] leading-6 text-secondary">
         {t("麦克风用于录音；开启自动粘贴权限后，文字会直接写入当前光标。未开启时，结果会复制到剪贴板。")}
       </p>
 
@@ -85,8 +86,8 @@ export function PermissionsStep({
           status={permissions?.microphone_status ?? "checking"}
           action={
             !permissions?.microphone ? (
-              <button type="button" onClick={onRequestMicrophone} className={compactButtonClass}>
-                {t(permissions?.microphone_status === "denied" || permissions?.microphone_status === "restricted" ? "打开设置" : "开启权限")}
+              <button type="button" onClick={onRequestMicrophone} className={secondaryButtonClass}>
+                {t(permissions?.microphone_status === "denied" || permissions?.microphone_status === "restricted" ? "打开麦克风设置" : "允许麦克风")}
               </button>
             ) : undefined
           }
@@ -99,8 +100,8 @@ export function PermissionsStep({
           status={permissions?.accessibility ? "authorized" : "pending"}
           action={
             !permissions?.accessibility ? (
-              <button type="button" onClick={onEnableAccessibility} className={compactButtonClass}>
-                {t("开启权限")}
+              <button type="button" onClick={onEnableAccessibility} className={secondaryButtonClass}>
+                {t("开启自动粘贴")}
               </button>
             ) : undefined
           }
@@ -118,10 +119,11 @@ export function PermissionsStep({
       </div>
 
       {settingsError && (
-        <p role="alert" className="mt-2 text-xs text-error">
+        <p role="alert" className="mt-2 text-xs text-error-ink">
           {settingsError}
         </p>
       )}
+      {permissions?.microphone && <MicrophoneCheck />}
     </div>
   );
 }

@@ -1,56 +1,78 @@
-use std::sync::atomic::{AtomicU32, Ordering};
+//! Fn/Globe and held-combination release observation. The listener reads only
+//! flags and physical key state, never characters or typed text.
+use crate::dictation::{HotkeySource, ModeTrigger};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
-use std::thread;
-use std::time::{Duration, Instant};
+use tauri::AppHandle;
 
-use tauri::{AppHandle, Emitter};
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ModifierBinding {
-    Alt,
-    Control,
-    Shift,
-    Command,
-    Fn,
+#[derive(Clone)]
+struct FnConfig {
+    source: HotkeySource,
+    mode: String,
 }
-
-#[derive(Clone, Default)]
-struct ModifierHotkeyConfig {
-    binding: Option<ModifierBinding>,
-    activation_mode: String,
-}
-
-pub const DOUBLE_TAP_MS: u64 = 400;
 
 #[derive(Default)]
-struct GestureState {
+struct FnGesture {
     key_down: bool,
-    awaiting_second_tap: bool,
-    last_release_at: Option<Instant>,
-    timer_generation: u64,
+    chorded: bool,
+    blocked_until_release: bool,
+    gesture_id: u64,
 }
 
-static CONFIG: OnceLock<Arc<Mutex<ModifierHotkeyConfig>>> = OnceLock::new();
-static GESTURE: OnceLock<Arc<Mutex<GestureState>>> = OnceLock::new();
+impl FnGesture {
+    fn press(&mut self, mode: &str, chorded: bool) -> Option<(ModeTrigger, u64)> {
+        if self.key_down || self.blocked_until_release {
+            return None;
+        }
+        self.key_down = true;
+        self.chorded = chorded;
+        self.gesture_id = crate::hotkey::next_gesture_id();
+        (mode == "hold_to_talk" && !chorded).then_some((ModeTrigger::Press, self.gesture_id))
+    }
+    fn chord(&mut self, mode: &str) -> Option<(ModeTrigger, u64)> {
+        if !self.key_down || self.chorded {
+            return None;
+        }
+        self.chorded = true;
+        (mode == "hold_to_talk").then_some((ModeTrigger::Cancel, self.gesture_id))
+    }
+    fn release(&mut self, mode: &str) -> Option<(ModeTrigger, u64)> {
+        self.blocked_until_release = false;
+        if !std::mem::take(&mut self.key_down) || std::mem::take(&mut self.chorded) {
+            return None;
+        }
+        Some((
+            if mode == "hold_to_talk" {
+                ModeTrigger::Release
+            } else {
+                ModeTrigger::Toggle
+            },
+            self.gesture_id,
+        ))
+    }
+    fn reset(&mut self) {
+        self.blocked_until_release |= self.key_down;
+        self.key_down = false;
+        self.chorded = false;
+    }
+}
+
+static CONFIG: OnceLock<Arc<Mutex<Option<FnConfig>>>> = OnceLock::new();
+static GESTURE: OnceLock<Arc<Mutex<FnGesture>>> = OnceLock::new();
 static LISTENER: OnceLock<()> = OnceLock::new();
-static APP_HANDLE: OnceLock<AppHandle> = OnceLock::new();
-/// While a paste is being simulated (enigo injects a synthetic Cmd/Ctrl keystroke),
-/// the event tap must ignore modifier events — our own synthetic keys would otherwise
-/// be misread as a physical double-tap and re-enter the event system (which crashes
-/// the main runloop with an uncaught NSException).
+static TAP_PORT: AtomicUsize = AtomicUsize::new(0);
+static SLEEP_OBSERVER: OnceLock<()> = OnceLock::new();
 static PASTE_SUPPRESS: AtomicU32 = AtomicU32::new(0);
 
 pub struct PasteSuppressGuard {
     _private: (),
 }
-
 impl PasteSuppressGuard {
     pub fn new() -> Self {
         set_paste_suppressed(true);
         Self { _private: () }
     }
 }
-
 impl Drop for PasteSuppressGuard {
     fn drop(&mut self) {
         set_paste_suppressed(false);
@@ -62,355 +84,302 @@ fn lock_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
+fn config_store() -> Arc<Mutex<Option<FnConfig>>> {
+    CONFIG.get_or_init(|| Arc::new(Mutex::new(None))).clone()
+}
+fn gesture_store() -> Arc<Mutex<FnGesture>> {
+    GESTURE
+        .get_or_init(|| Arc::new(Mutex::new(FnGesture::default())))
+        .clone()
+}
 
 pub fn set_paste_suppressed(suppressed: bool) {
     if suppressed {
-        let previous = PASTE_SUPPRESS.fetch_add(1, Ordering::SeqCst);
-        if previous == 0 {
+        if PASTE_SUPPRESS.fetch_add(1, Ordering::SeqCst) == 0 {
             reset_state();
+            crate::hotkey::reset_pressed_state();
         }
-        return;
-    }
-    loop {
-        let current = PASTE_SUPPRESS.load(Ordering::SeqCst);
-        if current == 0 {
-            return;
-        }
-        if PASTE_SUPPRESS
-            .compare_exchange(current, current - 1, Ordering::SeqCst, Ordering::SeqCst)
-            .is_ok()
-        {
-            return;
-        }
+    } else {
+        let _ = PASTE_SUPPRESS.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |depth| {
+            depth.checked_sub(1)
+        });
     }
 }
-
 pub fn is_paste_suppressed() -> bool {
     PASTE_SUPPRESS.load(Ordering::SeqCst) > 0
 }
-
-#[cfg(test)]
-fn paste_suppress_depth() -> u32 {
-    PASTE_SUPPRESS.load(Ordering::SeqCst)
-}
-
 pub fn set_dictation_active(active: bool) {
     if !active {
         reset_state();
+        crate::hotkey::reset_pressed_state();
     }
 }
 
-fn config_store() -> Arc<Mutex<ModifierHotkeyConfig>> {
-    CONFIG
-        .get_or_init(|| Arc::new(Mutex::new(ModifierHotkeyConfig::default())))
-        .clone()
-}
-
-fn gesture_store() -> Arc<Mutex<GestureState>> {
-    GESTURE
-        .get_or_init(|| Arc::new(Mutex::new(GestureState::default())))
-        .clone()
-}
-
+/// Used to identify deprecated saved bindings as well as the supported Fn key.
 pub fn is_modifier_only(hotkey: &str) -> bool {
-    parse_modifier_hotkey(hotkey).is_some()
+    matches!(
+        hotkey.trim(),
+        "Alt"
+            | "Option"
+            | "Control"
+            | "Ctrl"
+            | "Shift"
+            | "CmdOrControl"
+            | "CommandOrControl"
+            | "CmdOrCtrl"
+            | "Super"
+            | "Meta"
+            | "Command"
+            | "Fn"
+            | "Function"
+            | "Globe"
+    )
+}
+pub fn is_fn_only(hotkey: &str) -> bool {
+    matches!(hotkey.trim(), "Fn" | "Function" | "Globe")
 }
 
-fn parse_modifier_hotkey(hotkey: &str) -> Option<ModifierBinding> {
-    match hotkey.trim() {
-        "Alt" | "Option" => Some(ModifierBinding::Alt),
-        "Control" | "Ctrl" => Some(ModifierBinding::Control),
-        "Shift" => Some(ModifierBinding::Shift),
-        "CmdOrControl" | "CommandOrControl" | "CmdOrCtrl" | "Super" | "Meta" | "Command" => {
-            Some(ModifierBinding::Command)
-        }
-        "Fn" | "Function" | "Globe" => Some(ModifierBinding::Fn),
-        _ => None,
-    }
-}
-
-fn keycode_matches_binding(code: u16, binding: ModifierBinding) -> bool {
-    use core_graphics::event::KeyCode;
-
-    match binding {
-        ModifierBinding::Alt => code == KeyCode::OPTION || code == KeyCode::RIGHT_OPTION,
-        ModifierBinding::Command => code == KeyCode::COMMAND || code == KeyCode::RIGHT_COMMAND,
-        ModifierBinding::Control => code == KeyCode::CONTROL || code == KeyCode::RIGHT_CONTROL,
-        ModifierBinding::Shift => code == KeyCode::SHIFT || code == KeyCode::RIGHT_SHIFT,
-        ModifierBinding::Fn => code == KeyCode::FUNCTION,
-    }
-}
-
-fn modifier_flag(binding: ModifierBinding) -> core_graphics::event::CGEventFlags {
-    use core_graphics::event::CGEventFlags;
-
-    match binding {
-        ModifierBinding::Alt => CGEventFlags::CGEventFlagAlternate,
-        ModifierBinding::Control => CGEventFlags::CGEventFlagControl,
-        ModifierBinding::Shift => CGEventFlags::CGEventFlagShift,
-        ModifierBinding::Command => CGEventFlags::CGEventFlagCommand,
-        ModifierBinding::Fn => CGEventFlags::CGEventFlagSecondaryFn,
-    }
-}
-
-/// Emit a hotkey event to the frontend listeners. `app.emit` is thread-safe (it posts
-/// to webviews via Tauri IPC, not AppKit), so we can call it directly from the event
-/// handler — no `run_on_main_thread`, no re-entrancy into the main runloop.
-fn emit_hotkey(app: &AppHandle, event_name: &'static str) {
-    let app = app.clone();
-    tauri::async_runtime::spawn(async move {
-        let _ = app.emit(event_name, ());
-    });
-}
-
-fn app_handle() -> Option<AppHandle> {
-    APP_HANDLE.get().cloned()
-}
-
-fn reset_gesture_state(state: &mut GestureState) {
-    state.key_down = false;
-    state.awaiting_second_tap = false;
-    state.last_release_at = None;
-    state.timer_generation = state.timer_generation.wrapping_add(1);
-}
-
-fn schedule_tap_timeout(generation: u64) {
-    thread::spawn(move || {
-        thread::sleep(Duration::from_millis(DOUBLE_TAP_MS));
-        let store = gesture_store();
-        let mut state = lock_recover(&store);
-        if state.timer_generation == generation && state.awaiting_second_tap {
-            state.awaiting_second_tap = false;
-            state.last_release_at = None;
-        }
-    });
-}
-
-fn on_modifier_press(app: &AppHandle) {
-    let store = gesture_store();
-    let mut state = lock_recover(&store);
-    let now = Instant::now();
-    if lock_recover(&config_store()).activation_mode != "double_tap" || state.key_down {
-        return;
-    }
-
-    if state.awaiting_second_tap
-        && state
-            .last_release_at
-            .map(|t| now.duration_since(t).as_millis() < DOUBLE_TAP_MS as u128)
-            .unwrap_or(false)
-    {
-        state.awaiting_second_tap = false;
-        state.last_release_at = None;
-        state.timer_generation = state.timer_generation.wrapping_add(1);
-        drop(state);
-        emit_hotkey(app, "hotkey://double_tap");
-        return;
-    }
-    state.key_down = true;
-}
-
-fn on_modifier_release(_app: &AppHandle) {
-    let store = gesture_store();
-    let mut state = lock_recover(&store);
-    if !state.key_down {
-        return;
-    }
-    let now = Instant::now();
-    state.key_down = false;
-    state.awaiting_second_tap = true;
-    state.last_release_at = Some(now);
-    state.timer_generation = state.timer_generation.wrapping_add(1);
-    let generation = state.timer_generation;
-    drop(state);
-    schedule_tap_timeout(generation);
-}
-
-/// Install the modifier event tap on the MAIN CFRunLoop (the same architecture as
-/// the production Voxt / openwhispr hotkey managers). Handling events on the main
-/// runloop — instead of a background CFRunLoop thread that re-dispatches to main via
-/// `run_on_main_thread` — eliminates the cross-thread re-entrancy that was crashing
-/// the process with an uncaught NSException on every double-tap.
-///
-/// Must be called on AppKit's main thread.
 #[cfg(target_os = "macos")]
-fn ensure_listener_on_main() -> Result<(), String> {
+#[link(name = "CoreGraphics", kind = "framework")]
+unsafe extern "C" {
+    fn CGEventSourceKeyState(state_id: i32, key: u16) -> bool;
+    fn CGEventSourceFlagsState(state_id: i32) -> u64;
+    fn CGEventTapEnable(tap: *const std::ffi::c_void, enable: bool);
+}
+
+#[cfg(target_os = "macos")]
+fn other_keys_down() -> bool {
+    (0..128)
+        .filter(|code| *code != 63)
+        .any(|code| unsafe { CGEventSourceKeyState(0, code) })
+}
+
+pub async fn wait_for_key_release() {
+    #[cfg(target_os = "macos")]
+    while unsafe { CGEventSourceFlagsState(0) }
+        & ((1 << 17) | (1 << 18) | (1 << 19) | (1 << 20) | (1 << 23))
+        != 0
+        || (0..128).any(|key| unsafe { CGEventSourceKeyState(0, key) })
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub fn ensure_listener(_app: AppHandle) -> Result<(), String> {
     if LISTENER.get().is_some() {
         return Ok(());
     }
-    use core_foundation::runloop::{kCFRunLoopCommonModes, CFRunLoop};
+    use core_foundation::{
+        base::TCFType,
+        runloop::{kCFRunLoopCommonModes, CFRunLoop},
+    };
     use core_graphics::event::{
         CGEventTap, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement, CGEventType,
         EventField,
     };
-
-    let tap = match CGEventTap::new(
+    let tap = CGEventTap::new(
         CGEventTapLocation::HID,
         CGEventTapPlacement::HeadInsertEventTap,
         CGEventTapOptions::ListenOnly,
-        vec![CGEventType::FlagsChanged],
-        move |_proxy, event_type, event| {
-            if !matches!(event_type, CGEventType::FlagsChanged) || crate::hotkey::is_suspended() {
+        vec![CGEventType::FlagsChanged, CGEventType::KeyDown],
+        move |_, event_type, event| {
+            if matches!(
+                event_type,
+                CGEventType::TapDisabledByTimeout | CGEventType::TapDisabledByUserInput
+            ) {
+                reset_state();
+                crate::hotkey::reset_pressed_state();
+                crate::dictation::interrupt_hotkeys();
+                let port = TAP_PORT.load(Ordering::Acquire);
+                if port != 0 {
+                    unsafe {
+                        CGEventTapEnable(port as *const std::ffi::c_void, true);
+                    }
+                }
                 return None;
             }
-
-            // Ignore our own synthetic paste keystrokes (and any modifier event
-            // delivered while pasting) to avoid phantom double-taps.
-            if is_paste_suppressed() {
+            if crate::hotkey::is_suspended() || is_paste_suppressed() {
                 return None;
             }
-
-            let config = lock_recover(&config_store()).clone();
-            let binding = config.binding?;
-
+            let flags = event.get_flags().bits();
+            if matches!(event_type, CGEventType::FlagsChanged) {
+                crate::hotkey::modifiers_changed(flags);
+            }
+            let config = lock_recover(&config_store()).clone()?;
             let code = event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE) as u16;
-            if !keycode_matches_binding(code, binding) {
-                return None;
-            }
-
-            if config.activation_mode != "double_tap" {
-                return None;
-            }
-            let is_press = event.get_flags().contains(modifier_flag(binding));
-
-            // We are already on the main thread (the tap lives on the main runloop),
-            // so gesture detection + `app.emit` run synchronously here. `app.emit` is
-            // thread-safe and posts to webviews via Tauri IPC — no AppKit call, no
-            // nested run_on_main_thread, no re-entrancy.
-            let app = app_handle()?;
-            if is_press {
-                on_modifier_press(&app);
+            let fn_down = flags & (1 << 23) != 0;
+            let store = gesture_store();
+            let mut state = lock_recover(&store);
+            let action = if matches!(event_type, CGEventType::FlagsChanged) && code == 63 {
+                if fn_down {
+                    let has_modifiers =
+                        flags & ((1 << 17) | (1 << 18) | (1 << 19) | (1 << 20)) != 0;
+                    state.press(&config.mode, has_modifiers || other_keys_down())
+                } else {
+                    state.release(&config.mode)
+                }
+            } else if fn_down
+                && (matches!(event_type, CGEventType::KeyDown)
+                    || matches!(event_type, CGEventType::FlagsChanged))
+            {
+                state.chord(&config.mode)
             } else {
-                on_modifier_release(&app);
+                None
+            };
+            if let Some((trigger, id)) = action {
+                crate::dictation::enqueue_hotkey(config.source, trigger, id);
             }
-
             None
         },
-    ) {
-        Ok(tap) => tap,
-        Err(()) => {
-            log::error!("modifier hotkey event tap failed to create");
-            return Err("无法安装功能键监听，请在系统设置中开启 VoiceFlow 的辅助功能权限".into());
-        }
-    };
-
+    )
+    .map_err(|_| "无法安装按键监听，请在系统设置中开启 VoiceFlow 的辅助功能权限".to_owned())?;
     unsafe {
-        let loop_source = tap
+        let source = tap
             .mach_port
             .create_runloop_source(0)
-            .map_err(|_| "无法创建功能键监听 run loop source".to_owned())?;
-        let run_loop = CFRunLoop::get_main();
-        run_loop.add_source(&loop_source, kCFRunLoopCommonModes);
+            .map_err(|_| "无法创建按键监听 run loop source".to_owned())?;
+        CFRunLoop::get_main().add_source(&source, kCFRunLoopCommonModes);
+        TAP_PORT.store(
+            tap.mach_port.as_concrete_TypeRef() as usize,
+            Ordering::Release,
+        );
         tap.enable();
-        // The tap is installed for the process lifetime and never removed, so we must
-        // keep the `CGEventTap` (and its boxed callback, which the OS dereferences via
-        // `user_info` on every event) alive forever. Dropping it here would free the
-        // callback while the tap is still installed on the runloop -> the next modifier
-        // event dereferences freed memory (SIGSEGV at 0x28).
+        // The main runloop owns the tap for the process lifetime; keep its
+        // callback alive until process exit to avoid dereferencing freed state.
         std::mem::forget(tap);
     }
     let _ = LISTENER.set(());
     Ok(())
 }
-
-#[cfg(target_os = "macos")]
-fn ensure_listener(app: AppHandle) -> Result<(), String> {
-    let _ = APP_HANDLE.set(app.clone());
-    if LISTENER.get().is_some() {
-        return Ok(());
-    }
-    // `modifier_hotkey::register` is only called by the Tauri setup callback or
-    // `hotkey::register_on_main`, so it is already running on AppKit's main thread.
-    // Installing synchronously lets permission failures reach the settings UI.
-    ensure_listener_on_main()
-}
-
 #[cfg(not(target_os = "macos"))]
-fn ensure_listener(_app: AppHandle) -> Result<(), String> {
-    Err("modifier-only hotkeys are only supported on macOS".into())
+pub fn ensure_listener(_app: AppHandle) -> Result<(), String> {
+    Err("Fn and held-combination observation require macOS".into())
 }
 
-pub fn register(app: &AppHandle, hotkey: &str, activation_mode: &str) -> Result<(), String> {
-    let binding = parse_modifier_hotkey(hotkey)
-        .ok_or_else(|| format!("unknown modifier-only hotkey `{hotkey}`"))?;
-    reset_gesture_state(&mut lock_recover(&gesture_store()));
+pub fn register(app: &AppHandle, source: HotkeySource, mode: &str) -> Result<(), String> {
     ensure_listener(app.clone())?;
-    let store = config_store();
-    let mut state = lock_recover(&store);
-    state.binding = Some(binding);
-    state.activation_mode = activation_mode.to_owned();
+    reset_state();
+    *lock_recover(&config_store()) = Some(FnConfig {
+        source,
+        mode: mode.into(),
+    });
     Ok(())
 }
-
+pub fn arm_after_release() {
+    *lock_recover(&gesture_store()) = FnGesture::default();
+}
 pub fn reset_state() {
-    reset_gesture_state(&mut lock_recover(&gesture_store()));
+    lock_recover(&gesture_store()).reset();
+}
+pub fn unregister_source(source: HotkeySource) {
+    let store = config_store();
+    let mut config = lock_recover(&store);
+    if config
+        .as_ref()
+        .is_some_and(|config| config.source == source)
+    {
+        *config = None;
+        reset_state();
+    }
+}
+pub fn unregister() {
+    reset_state();
+    *lock_recover(&config_store()) = None;
 }
 
-pub fn unregister() {
-    reset_gesture_state(&mut lock_recover(&gesture_store()));
-    lock_recover(&config_store()).binding = None;
+#[cfg(target_os = "macos")]
+pub fn install_sleep_observer() {
+    if SLEEP_OBSERVER.set(()).is_err() {
+        return;
+    }
+    use core_foundation::{base::TCFType, string::CFString};
+    use objc::{class, msg_send, sel, sel_impl};
+    let callback = block2::RcBlock::new(move |_notification: *mut objc2::runtime::AnyObject| {
+        reset_state();
+        crate::hotkey::reset_pressed_state();
+        crate::dictation::interrupt_hotkeys();
+    });
+    unsafe {
+        let workspace: *mut objc::runtime::Object = msg_send![class!(NSWorkspace), sharedWorkspace];
+        let center: *mut objc::runtime::Object = msg_send![workspace, notificationCenter];
+        for name in [
+            "NSWorkspaceWillSleepNotification",
+            "NSWorkspaceSessionDidResignActiveNotification",
+        ] {
+            let name = CFString::new(name);
+            let _: *mut objc::runtime::Object = msg_send![center, addObserverForName:name.as_concrete_TypeRef() object:std::ptr::null::<objc::runtime::Object>() queue:std::ptr::null::<objc::runtime::Object>() usingBlock:&*callback];
+        }
+    }
+    std::mem::forget(callback);
 }
+#[cfg(not(target_os = "macos"))]
+pub fn install_sleep_observer() {}
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
-    fn recognizes_supported_modifier_only_bindings() {
-        for hotkey in ["Alt", "Control", "Shift", "CmdOrControl", "Fn", "Globe"] {
-            assert!(
-                is_modifier_only(hotkey),
-                "expected modifier-only hotkey: {hotkey}"
-            );
+    fn distinguishes_fn_from_deprecated_modifiers() {
+        for key in ["Alt", "Control", "Shift", "CmdOrControl", "Fn", "Globe"] {
+            assert!(is_modifier_only(key));
+        }
+        assert!(is_fn_only("Globe"));
+        assert!(!is_fn_only("Alt"));
+        assert!(!is_modifier_only("CmdOrControl+Alt+Space"));
+    }
+    #[test]
+    fn fn_tap_only_fires_on_clean_release_and_deduplicates_repeat() {
+        let mut state = FnGesture::default();
+        assert!(state.press("tap", false).is_none());
+        assert!(state.press("tap", false).is_none());
+        let first = state.release("tap").unwrap();
+        assert_eq!(first.0, ModeTrigger::Toggle);
+        assert!(state.release("tap").is_none());
+        state.press("tap", false);
+        assert_ne!(first.1, state.release("tap").unwrap().1);
+    }
+    #[test]
+    fn fn_tap_chords_never_toggle() {
+        for preexisting_chord in [false, true] {
+            let mut state = FnGesture::default();
+            state.press("tap", preexisting_chord);
+            state.chord("tap");
+            assert!(state.release("tap").is_none());
         }
     }
-
     #[test]
-    fn rejects_combinations_and_unknown_bindings() {
-        assert!(!is_modifier_only("CmdOrControl+Shift+Space"));
-        assert!(!is_modifier_only("NotAKey"));
+    fn fn_hold_short_release_stops_and_chord_cancels_once() {
+        let mut state = FnGesture::default();
+        let (_, id) = state.press("hold_to_talk", false).unwrap();
+        assert_eq!(
+            state.release("hold_to_talk"),
+            Some((ModeTrigger::Release, id))
+        );
+        let (_, id) = state.press("hold_to_talk", false).unwrap();
+        assert_eq!(state.chord("hold_to_talk"), Some((ModeTrigger::Cancel, id)));
+        assert!(state.chord("hold_to_talk").is_none());
+        assert!(state.release("hold_to_talk").is_none());
+        assert!(state.press("hold_to_talk", true).is_none());
     }
-
     #[test]
-    fn reset_clears_pending_gesture_and_invalidates_timer() {
-        let mut state = GestureState {
-            key_down: true,
-            awaiting_second_tap: true,
-            last_release_at: Some(Instant::now()),
-            timer_generation: 3,
-        };
-        reset_gesture_state(&mut state);
-        assert!(!state.key_down);
-        assert!(!state.awaiting_second_tap);
-        assert!(state.last_release_at.is_none());
-        assert_eq!(state.timer_generation, 4);
+    fn reset_waits_for_release_and_discards_old_gesture() {
+        let mut state = FnGesture::default();
+        state.press("hold_to_talk", false);
+        state.reset();
+        assert!(state.press("hold_to_talk", false).is_none());
+        assert!(state.release("hold_to_talk").is_none());
+        assert!(state.press("hold_to_talk", false).is_some());
     }
-
     #[test]
-    fn production_lock_helper_recovers_poisoned_state() {
-        let state = Arc::new(Mutex::new(7));
-        let poisoned = state.clone();
-        let _ = thread::spawn(move || {
-            let _guard = poisoned.lock().expect("initial lock");
-            panic!("poison modifier state");
-        })
-        .join();
-
-        assert_eq!(*lock_recover(&state), 7);
-    }
-
-    #[test]
-    fn nested_paste_suppress_keeps_the_outer_window() {
-        let baseline = paste_suppress_depth();
+    fn nested_paste_suppression_keeps_the_outer_window() {
+        let baseline = PASTE_SUPPRESS.load(Ordering::SeqCst);
         let outer = PasteSuppressGuard::new();
-        assert_eq!(paste_suppress_depth(), baseline + 1);
-        {
-            let inner = PasteSuppressGuard::new();
-            assert_eq!(paste_suppress_depth(), baseline + 2);
-            drop(inner);
-            assert_eq!(paste_suppress_depth(), baseline + 1);
-        }
+        let inner = PasteSuppressGuard::new();
+        assert_eq!(PASTE_SUPPRESS.load(Ordering::SeqCst), baseline + 2);
+        drop(inner);
+        assert_eq!(PASTE_SUPPRESS.load(Ordering::SeqCst), baseline + 1);
         drop(outer);
-        assert_eq!(paste_suppress_depth(), baseline);
+        assert_eq!(PASTE_SUPPRESS.load(Ordering::SeqCst), baseline);
     }
 }

@@ -1,3 +1,4 @@
+#[cfg(test)]
 use crate::queue::QuotaView;
 use chacha20poly1305::{
     aead::{Aead, AeadCore, KeyInit, OsRng, Payload},
@@ -13,8 +14,11 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-pub const SETTINGS_SCHEMA_VERSION: u32 = 19;
-const HISTORY_SCHEMA_VERSION: i32 = 9;
+pub const SETTINGS_SCHEMA_VERSION: u32 = 25;
+const HISTORY_SCHEMA_VERSION: i32 = 13;
+// Migration rollback copies contain historical text, so they have a finite
+// lifetime even when the user elects to keep the live history forever.
+const HISTORY_MIGRATION_BACKUP_MAX_DAYS: u64 = 7;
 const LEARN_PAIRS_PENDING_CAP: i64 = 256;
 
 fn ensure_private_dir(path: &Path) -> anyhow::Result<()> {
@@ -78,6 +82,7 @@ pub struct Settings {
     pub dictionary: Vec<String>,
     #[serde(default = "default_hotkey")]
     pub hotkey: String,
+    #[serde(default = "default_legacy_activation_mode")]
     pub activation_mode: String,
     pub chunk_threshold_secs: u64,
     pub chunk_length_secs: usize,
@@ -128,6 +133,8 @@ pub struct Settings {
     #[serde(default)]
     pub ollama_base_url: String,
     #[serde(default)]
+    pub strict_offline_enabled: bool,
+    #[serde(default)]
     pub local_whisper_base_url: String,
     #[serde(default)]
     pub provider_api_keys: std::collections::BTreeMap<String, String>,
@@ -154,10 +161,43 @@ pub struct Settings {
     pub input_device: String,
     #[serde(default = "default_input_gain")]
     pub input_gain: f32,
+    #[serde(default)]
+    pub verbatim_hotkey: String,
+    #[serde(default)]
+    pub translation_hotkey: String,
+    #[serde(default = "default_extra_recording_buffer_ms")]
+    pub extra_recording_buffer_ms: u64,
+    #[serde(default)]
+    pub audio_feedback_enabled: bool,
+    #[serde(default = "default_audio_feedback_volume")]
+    pub audio_feedback_volume: f32,
+    #[serde(default)]
+    pub vad_enabled: bool,
+    #[serde(default)]
+    pub always_on_microphone: bool,
+    #[serde(default)]
+    pub clamshell_microphone: String,
+    #[serde(default)]
+    pub autostart_enabled: bool,
+    #[serde(default = "default_whats_new_last_seen_version")]
+    pub whats_new_last_seen_version: String,
+    #[serde(default)]
+    pub debug_mode: bool,
+    #[serde(default)]
+    pub fuzzy_dictionary_enabled: bool,
+    /// Legacy credential values that could not yet be verified in the OS
+    /// credential store. These stay in memory only to preserve compatibility;
+    /// save_settings keeps their source data intact until migration succeeds.
+    #[serde(skip)]
+    pub(crate) unverified_credential_sources: std::collections::BTreeMap<String, String>,
+    /// Secure values observed while loading, used to distinguish ordinary
+    /// settings saves from an explicit key replacement.
+    #[serde(skip)]
+    pub(crate) credential_baselines: std::collections::BTreeMap<String, String>,
 }
 
 fn default_cleanup_intensity() -> String {
-    "heavy".into()
+    "auto".into()
 }
 
 fn default_cascade_timeout_ms() -> u64 {
@@ -208,6 +248,22 @@ fn default_selected_actions_enabled() -> bool {
 
 fn default_dictionary_learn_enabled() -> bool {
     true
+}
+
+fn default_legacy_activation_mode() -> String {
+    "tap".into()
+}
+
+fn default_extra_recording_buffer_ms() -> u64 {
+    250
+}
+
+fn default_audio_feedback_volume() -> f32 {
+    0.6
+}
+
+fn default_whats_new_last_seen_version() -> String {
+    env!("CARGO_PKG_VERSION").into()
 }
 
 fn default_input_gain() -> f32 {
@@ -266,6 +322,7 @@ impl Default for Settings {
             ollama_base_url: crate::providers::EngineProvider::Ollama
                 .default_base_url()
                 .to_owned(),
+            strict_offline_enabled: false,
             local_whisper_base_url: crate::providers::EngineProvider::LocalWhisper
                 .default_base_url()
                 .to_owned(),
@@ -283,6 +340,20 @@ impl Default for Settings {
             dictionary_learn_enabled: default_dictionary_learn_enabled(),
             input_device: String::new(),
             input_gain: default_input_gain(),
+            verbatim_hotkey: String::new(),
+            translation_hotkey: String::new(),
+            extra_recording_buffer_ms: 250,
+            audio_feedback_enabled: false,
+            audio_feedback_volume: 0.6,
+            vad_enabled: false,
+            always_on_microphone: false,
+            clamshell_microphone: String::new(),
+            autostart_enabled: false,
+            whats_new_last_seen_version: default_whats_new_last_seen_version(),
+            debug_mode: false,
+            fuzzy_dictionary_enabled: false,
+            unverified_credential_sources: std::collections::BTreeMap::new(),
+            credential_baselines: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -348,6 +419,15 @@ impl Settings {
             if self.schema_version < 17 {
                 self.migrate_provider_pool();
             }
+            if self.schema_version < 21 && self.window_ocr_enabled {
+                // Before per-App OCR grants existed, enabling the global OCR
+                // switch together with an App mapping was the user's explicit
+                // local OCR opt-in. Preserve that choice for those mappings;
+                // no AX text, provider text, or cloud vision grant is inferred.
+                for mapping in &mut self.context_mappings {
+                    mapping.source_permissions.local_ocr = true;
+                }
+            }
             self.schema_version = SETTINGS_SCHEMA_VERSION;
         }
         self.chunk_threshold_secs = self.chunk_threshold_secs.clamp(5, 3_600);
@@ -382,27 +462,12 @@ impl Settings {
         self.selected_action_hotkey =
             crate::hotkey::canonicalize_hotkey(&self.selected_action_hotkey);
         self.screen_action_hotkey = crate::hotkey::canonicalize_hotkey(&self.screen_action_hotkey);
-        if self.activation_mode == "hold" {
-            self.activation_mode = if crate::modifier_hotkey::is_modifier_only(&self.hotkey) {
-                "double_tap"
-            } else {
-                "hybrid"
-            }
-            .into();
-        }
-        if !matches!(
-            self.activation_mode.as_str(),
-            "tap" | "double_tap" | "hybrid"
-        ) {
+        // Legacy hold meant the hybrid gesture, not pure hold-to-talk. All
+        // retired gestures migrate to tap; an explicit v25 hold choice survives.
+        if !matches!(self.activation_mode.as_str(), "tap" | "hold_to_talk") {
             self.activation_mode = "tap".into();
         }
-        // Modifier-only shortcuts are implemented by the macOS event tap,
-        // whose only supported gesture is a double tap. A legacy or manually
-        // edited settings file must not leave the app with a shortcut that is
-        // registered successfully but can never emit a toggle event.
-        if crate::modifier_hotkey::is_modifier_only(&self.hotkey) {
-            self.activation_mode = "double_tap".into();
-        }
+
         self.dictionary.truncate(256);
         self.dictionary
             .iter_mut()
@@ -412,6 +477,9 @@ impl Settings {
         for mapping in &mut self.context_mappings {
             if let Some(host) = &mapping.browser_host {
                 mapping.browser_host = crate::context::normalize_host(host);
+            }
+            if let Some(path) = &mapping.browser_path_prefix {
+                mapping.browser_path_prefix = crate::context::normalize_path_prefix(path);
             }
             mapping.style_example_input = mapping.style_example_input.take().and_then(|value| {
                 let trimmed: String = value.trim().chars().take(2_000).collect();
@@ -462,13 +530,7 @@ impl Settings {
         if self.selected_action_hotkey.len() > 128 {
             self.selected_action_hotkey.clear();
         }
-        if crate::modifier_hotkey::is_modifier_only(&self.selected_action_hotkey) {
-            self.selected_action_hotkey.clear();
-        }
         if self.screen_action_hotkey.len() > 128 {
-            self.screen_action_hotkey.clear();
-        }
-        if crate::modifier_hotkey::is_modifier_only(&self.screen_action_hotkey) {
             self.screen_action_hotkey.clear();
         }
         self.vision_provider = self.vision_provider.trim().chars().take(64).collect();
@@ -484,6 +546,30 @@ impl Settings {
         } else {
             default_input_gain()
         };
+        if self.verbatim_hotkey.len() > 128 {
+            self.verbatim_hotkey.clear();
+        }
+        self.verbatim_hotkey = crate::hotkey::canonicalize_hotkey(&self.verbatim_hotkey);
+        if self.translation_hotkey.len() > 128 {
+            self.translation_hotkey.clear();
+        }
+        self.translation_hotkey = crate::hotkey::canonicalize_hotkey(&self.translation_hotkey);
+        self.extra_recording_buffer_ms = self.extra_recording_buffer_ms.clamp(0, 2000);
+        self.audio_feedback_volume = if self.audio_feedback_volume.is_finite() {
+            self.audio_feedback_volume.clamp(0.0, 1.0)
+        } else {
+            default_audio_feedback_volume()
+        };
+        self.clamshell_microphone = self.clamshell_microphone.trim().chars().take(512).collect();
+        self.whats_new_last_seen_version = self
+            .whats_new_last_seen_version
+            .trim()
+            .chars()
+            .take(64)
+            .collect();
+        if self.whats_new_last_seen_version.is_empty() {
+            self.whats_new_last_seen_version = env!("CARGO_PKG_VERSION").into();
+        }
         if crate::llm::CleanupIntensity::parse(&self.cleanup_intensity).is_none() {
             self.cleanup_intensity = default_cleanup_intensity();
         }
@@ -537,7 +623,13 @@ impl Settings {
             if !crate::asr::is_groq_asr_model(&self.asr_model) {
                 self.asr_model = default_asr_model();
             }
-        } else if self.asr_model.trim().is_empty() {
+        } else if self.asr_provider == crate::engine::EngineProvider::Soniox {
+            self.asr_model = crate::asr::SONIOX_MODEL.to_owned();
+        } else if matches!(
+            self.asr_provider,
+            crate::engine::EngineProvider::AssemblyAi | crate::engine::EngineProvider::DashScope
+        ) || self.asr_model.trim().is_empty()
+        {
             self.asr_model = self.asr_provider.default_asr_model().to_owned();
         }
         if self.cleanup_provider.is_groq() {
@@ -669,10 +761,26 @@ impl Settings {
         true
     }
 
+    #[cfg(test)]
     pub fn validate(&self) -> anyhow::Result<()> {
-        if self.onboarded && self.api_key.trim().is_empty() {
-            anyhow::bail!("a valid API key is required before onboarding can be completed");
-        }
+        self.validate_with_models_root(None)
+    }
+
+    pub fn validate_with_models_root(&self, models_root: Option<&Path>) -> anyhow::Result<()> {
+        self.validate_internal(models_root, true)
+    }
+
+    /// Structural validation for a binding transaction or schema migration.
+    /// Service edits, onboarding completion and recording still check readiness.
+    pub fn validate_configuration(&self) -> anyhow::Result<()> {
+        self.validate_internal(None, false)
+    }
+
+    fn validate_internal(
+        &self,
+        models_root: Option<&Path>,
+        check_readiness: bool,
+    ) -> anyhow::Result<()> {
         if !matches!(self.language.as_str(), "auto" | "zh" | "en") {
             anyhow::bail!("unsupported recognition language");
         }
@@ -716,25 +824,7 @@ impl Settings {
         } else if self.cleanup_model.trim().is_empty() {
             anyhow::bail!("自定义整理需要填写模型名。");
         }
-        if self.hotkey.is_empty() || self.hotkey.len() > 128 {
-            anyhow::bail!("hotkey must contain between 1 and 128 characters");
-        }
-        if !matches!(
-            self.activation_mode.as_str(),
-            "tap" | "double_tap" | "hybrid"
-        ) {
-            anyhow::bail!("unsupported activation mode");
-        }
-        if crate::modifier_hotkey::is_modifier_only(&self.hotkey)
-            && self.activation_mode != "double_tap"
-        {
-            anyhow::bail!("modifier-only hotkeys require double_tap activation");
-        }
-        if !crate::modifier_hotkey::is_modifier_only(&self.hotkey)
-            && self.activation_mode == "double_tap"
-        {
-            anyhow::bail!("double_tap activation requires a modifier-only hotkey");
-        }
+        self.validate_bindings()?;
         if self.dictionary.len() > 256 || self.dictionary.iter().any(|word| word.len() > 256) {
             anyhow::bail!("dictionary is too large");
         }
@@ -766,9 +856,14 @@ impl Settings {
             .map_err(|error| anyhow::anyhow!(error))?;
         crate::asr::validate_asr_base_url(&self.local_whisper_base_url)
             .map_err(|error| anyhow::anyhow!(error))?;
-        self.validate_provider_side(self.asr_provider, true)?;
-        if self.cleanup_enabled {
-            self.validate_provider_side(self.cleanup_provider, false)?;
+        self.validate_provider_side(self.asr_provider, true, models_root, check_readiness)?;
+        if self.cleanup_enabled && self.asr_provider != crate::engine::EngineProvider::AssemblyAi {
+            self.validate_provider_side(
+                self.cleanup_provider,
+                false,
+                models_root,
+                check_readiness,
+            )?;
         }
         for mapping in &self.context_mappings {
             mapping.validate().map_err(|error| anyhow::anyhow!(error))?;
@@ -792,14 +887,13 @@ impl Settings {
         if self.selected_action_hotkey.len() > 128 {
             anyhow::bail!("selected action hotkey is too long");
         }
-        if crate::modifier_hotkey::is_modifier_only(&self.selected_action_hotkey) {
-            anyhow::bail!("selected action hotkeys require a key combination");
-        }
+
         if self.screen_action_hotkey.len() > 128 {
             anyhow::bail!("look-at-screen hotkey is too long");
         }
-        if crate::modifier_hotkey::is_modifier_only(&self.screen_action_hotkey) {
-            anyhow::bail!("look-at-screen hotkeys require a key combination");
+
+        if self.verbatim_hotkey.len() > 128 {
+            anyhow::bail!("verbatim hotkey is too long");
         }
         if !self.vision_provider.is_empty()
             && crate::engine::EngineProvider::parse(&self.vision_provider).is_none()
@@ -818,12 +912,144 @@ impl Settings {
         Ok(())
     }
 
+    pub fn validate_bindings(&self) -> anyhow::Result<()> {
+        if !matches!(self.activation_mode.as_str(), "tap" | "hold_to_talk") {
+            anyhow::bail!("unsupported recording mode");
+        }
+        let bindings = [
+            &self.hotkey,
+            &self.selected_action_hotkey,
+            &self.screen_action_hotkey,
+            &self.verbatim_hotkey,
+            &self.translation_hotkey,
+        ];
+        if self.hotkey.trim().is_empty() {
+            anyhow::bail!("hotkey is required");
+        }
+        for (index, binding) in bindings.iter().enumerate() {
+            if binding.len() > 128 {
+                anyhow::bail!("hotkey must contain at most 128 characters");
+            }
+            if binding.trim().is_empty() {
+                continue;
+            }
+            // Preserve deprecated single modifiers so users can see and replace
+            // their old bindings. New bindings are checked at the transaction boundary.
+            if !crate::modifier_hotkey::is_modifier_only(binding) {
+                binding
+                    .parse::<tauri_plugin_global_shortcut::Shortcut>()
+                    .map_err(|_| anyhow::anyhow!("invalid hotkey: {binding}"))?;
+            }
+            for other in bindings
+                .iter()
+                .skip(index + 1)
+                .filter(|key| !key.trim().is_empty())
+            {
+                if crate::hotkey::bindings_equal(binding, other) {
+                    anyhow::bail!("hotkey conflicts with another shortcut");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn validate_binding_changes(&self, previous: &Self) -> anyhow::Result<()> {
+        self.validate_bindings()?;
+        for (new, old, recording) in [
+            (&self.hotkey, &previous.hotkey, true),
+            (&self.verbatim_hotkey, &previous.verbatim_hotkey, true),
+            (&self.translation_hotkey, &previous.translation_hotkey, true),
+            (
+                &self.selected_action_hotkey,
+                &previous.selected_action_hotkey,
+                false,
+            ),
+            (
+                &self.screen_action_hotkey,
+                &previous.screen_action_hotkey,
+                false,
+            ),
+        ] {
+            if new != old
+                && crate::modifier_hotkey::is_modifier_only(new)
+                && !(recording && crate::modifier_hotkey::is_fn_only(new))
+            {
+                anyhow::bail!(if recording {
+                    "请再按一个键组成快捷键；单键录音可选择 Fn。"
+                } else {
+                    "请再按一个键组成快捷键。"
+                });
+            }
+            if new != old
+                && !new.trim().is_empty()
+                && !crate::modifier_hotkey::is_modifier_only(new)
+            {
+                use tauri_plugin_global_shortcut::{Modifiers, Shortcut};
+                let shortcut: Shortcut = new
+                    .parse()
+                    .map_err(|_| anyhow::anyhow!("invalid hotkey: {new}"))?;
+                let key = shortcut.key.to_string();
+                let function_key = key
+                    .strip_prefix('F')
+                    .and_then(|number| number.parse::<u8>().ok())
+                    .is_some_and(|number| (1..=24).contains(&number));
+                if !shortcut
+                    .mods
+                    .intersects(Modifiers::SUPER | Modifiers::CONTROL | Modifiers::ALT)
+                    && !function_key
+                {
+                    anyhow::bail!(if recording {
+                        "请使用 ⌘、⌥ 或 ⌃ 组成快捷键，或选择 Fn。"
+                    } else {
+                        "请使用 ⌘、⌥ 或 ⌃ 加上另一个键。"
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn on_device_asr_ready(&self, models_root: Option<&Path>) -> bool {
+        self.asr_provider == crate::engine::EngineProvider::OnDevice
+            && models_root.is_some_and(|root| {
+                crate::ondevice_asr::model_setup_is_ready(root, &self.asr_model)
+            })
+    }
+
     fn validate_provider_side(
         &self,
         provider: crate::engine::EngineProvider,
         asr: bool,
+        models_root: Option<&Path>,
+        check_readiness: bool,
     ) -> anyhow::Result<()> {
+        if asr && !provider.has_asr() {
+            anyhow::bail!("所选服务商不支持转写。");
+        }
+        if !asr && !provider.has_llm() {
+            anyhow::bail!("OnDevice 不能用于文字整理。");
+        }
+        if provider == crate::engine::EngineProvider::OnDevice && asr {
+            if check_readiness && self.onboarded && !self.on_device_asr_ready(models_root) {
+                anyhow::bail!("本机语音识别尚未就绪，不能完成设置。");
+            }
+            return Ok(());
+        }
+        if !provider.has_http_asr()
+            && asr
+            && !matches!(
+                provider,
+                crate::engine::EngineProvider::Soniox | crate::engine::EngineProvider::DashScope
+            )
+        {
+            return Ok(());
+        }
         let url = self.resolved_provider_base(provider);
+        if provider == crate::engine::EngineProvider::DashScope
+            && crate::providers::resolve_asr_endpoint(provider, &url).is_none()
+        {
+            anyhow::bail!("请选择有效的 DashScope 区域端点。");
+        }
         if provider.is_custom() && url.trim().is_empty() {
             anyhow::bail!(if asr {
                 "自定义 ASR 需要填写兼容地址。"
@@ -834,7 +1060,7 @@ impl Settings {
         let key = self.provider_secret(provider);
         let empty_ok = provider.allows_empty_key() && crate::providers::is_loopback_url(&url);
         if key.is_empty() && !empty_ok {
-            if provider.is_groq() && !self.onboarded {
+            if !check_readiness || !self.onboarded {
                 return Ok(());
             }
             if provider.is_custom() {
@@ -902,11 +1128,23 @@ impl Settings {
                     self.cleanup_base_url.trim().to_owned()
                 }
             }
+            crate::engine::EngineProvider::AssemblyAi => crate::engine::EngineProvider::AssemblyAi
+                .default_base_url()
+                .to_owned(),
+            crate::engine::EngineProvider::DashScope => {
+                let url = self.asr_base_url.trim();
+                if url.is_empty() {
+                    provider.default_base_url().to_owned()
+                } else {
+                    url.to_owned()
+                }
+            }
+            crate::engine::EngineProvider::OnDevice => String::new(),
             other => other.default_base_url().to_owned(),
         }
     }
 
-    pub fn asr_endpoint(&self) -> String {
+    pub fn asr_endpoint(&self) -> Option<String> {
         crate::providers::resolve_asr_endpoint(
             self.asr_provider,
             &self.resolved_provider_base(self.asr_provider),
@@ -920,7 +1158,8 @@ impl Settings {
     }
 
     pub fn accurate_asr_configured(&self) -> bool {
-        !self.accurate_asr_model.trim().is_empty()
+        self.accurate_asr_provider.has_http_asr()
+            && !self.accurate_asr_model.trim().is_empty()
             && !self.accurate_asr_credential().trim().is_empty()
     }
 
@@ -928,7 +1167,10 @@ impl Settings {
         self.provider_secret(self.accurate_asr_provider)
     }
 
-    pub fn accurate_asr_endpoint(&self) -> String {
+    pub fn accurate_asr_endpoint(&self) -> Option<String> {
+        if !self.accurate_asr_provider.has_http_asr() {
+            return None;
+        }
         let base = if !self.accurate_asr_base_url.trim().is_empty() {
             self.accurate_asr_base_url.trim().to_owned()
         } else {
@@ -944,6 +1186,9 @@ impl Settings {
         let Some(provider) = crate::engine::EngineProvider::parse(&self.vision_provider) else {
             return false;
         };
+        if !provider.has_llm() {
+            return false;
+        }
         let key = self.provider_secret(provider);
         !key.is_empty() || provider.allows_empty_key()
     }
@@ -957,6 +1202,9 @@ impl Settings {
 
     pub fn vision_endpoint(&self) -> Option<String> {
         let provider = crate::engine::EngineProvider::parse(&self.vision_provider)?;
+        if !provider.has_llm() {
+            return None;
+        }
         Some(crate::llm::resolve_chat_url(
             &self.resolved_provider_base(provider),
         ))
@@ -967,6 +1215,9 @@ impl Settings {
     }
 
     pub fn cleanup_endpoint(&self) -> String {
+        if self.cleanup_provider == crate::engine::EngineProvider::Ollama {
+            return crate::ollama_local::chat_endpoint(&self.ollama_base_url);
+        }
         crate::providers::resolve_llm_endpoint(
             self.cleanup_provider,
             &self.resolved_provider_base(self.cleanup_provider),
@@ -1060,6 +1311,7 @@ pub struct SettingsView {
     pub custom_asr: bool,
     pub custom_llm: bool,
     pub ollama_base_url: String,
+    pub strict_offline_enabled: bool,
     pub local_whisper_base_url: String,
     pub provider_keys: std::collections::BTreeMap<String, ProviderKeyView>,
     pub language: String,
@@ -1101,6 +1353,18 @@ pub struct SettingsView {
     pub dictionary_learn_enabled: bool,
     pub input_device: String,
     pub input_gain: f32,
+    pub verbatim_hotkey: String,
+    pub translation_hotkey: String,
+    pub extra_recording_buffer_ms: u64,
+    pub audio_feedback_enabled: bool,
+    pub audio_feedback_volume: f32,
+    pub vad_enabled: bool,
+    pub always_on_microphone: bool,
+    pub clamshell_microphone: String,
+    pub autostart_enabled: bool,
+    pub whats_new_last_seen_version: String,
+    pub debug_mode: bool,
+    pub fuzzy_dictionary_enabled: bool,
 }
 
 fn provider_key_views(settings: &Settings) -> std::collections::BTreeMap<String, ProviderKeyView> {
@@ -1139,6 +1403,7 @@ impl From<&Settings> for SettingsView {
             custom_asr: settings.custom_asr,
             custom_llm: settings.custom_llm,
             ollama_base_url: settings.ollama_base_url.clone(),
+            strict_offline_enabled: settings.strict_offline_enabled,
             local_whisper_base_url: settings.local_whisper_base_url.clone(),
             provider_keys: provider_key_views(settings),
             language: settings.language.clone(),
@@ -1180,6 +1445,18 @@ impl From<&Settings> for SettingsView {
             dictionary_learn_enabled: settings.dictionary_learn_enabled,
             input_device: settings.input_device.clone(),
             input_gain: settings.input_gain,
+            verbatim_hotkey: settings.verbatim_hotkey.clone(),
+            translation_hotkey: settings.translation_hotkey.clone(),
+            extra_recording_buffer_ms: settings.extra_recording_buffer_ms,
+            audio_feedback_enabled: settings.audio_feedback_enabled,
+            audio_feedback_volume: settings.audio_feedback_volume,
+            vad_enabled: settings.vad_enabled,
+            always_on_microphone: settings.always_on_microphone,
+            clamshell_microphone: settings.clamshell_microphone.clone(),
+            autostart_enabled: settings.autostart_enabled,
+            whats_new_last_seen_version: settings.whats_new_last_seen_version.clone(),
+            debug_mode: settings.debug_mode,
+            fuzzy_dictionary_enabled: settings.fuzzy_dictionary_enabled,
         }
     }
 }
@@ -1188,6 +1465,14 @@ pub struct HistoryItem {
     pub id: i64,
     pub created_at: String,
     pub raw_text: String,
+    /// Provider-returned transcript before local filtering, revisions, or
+    /// dictionary replacement. Null on rows written before this field existed.
+    pub asr_text: Option<String>,
+    /// Provider-supplied cleanup candidate kept distinct from the ASR text and
+    /// VoiceFlow's final guarded output. Null when the provider supplied none.
+    pub provider_cleaned_candidate: Option<String>,
+    /// ASR provider/model that produced the selected transcript, when known.
+    pub engine: Option<String>,
     pub final_text: String,
     pub cleanup_status: String,
     pub duration: f64,
@@ -1196,6 +1481,10 @@ pub struct HistoryItem {
     pub status: String,
     pub delivery_method: Option<String>,
     pub fallback_reason: Option<String>,
+    /// Stable reason code for a paste delivery failure or unverified result.
+    pub delivery_error_code: Option<String>,
+    /// Safe, transcript-free next step shown in History.
+    pub delivery_user_reason: Option<String>,
     pub context_profile_id: Option<String>,
     pub retryable: bool,
     pub revision_count: usize,
@@ -1223,6 +1512,7 @@ pub struct HistoryPage {
     pub has_more: bool,
 }
 #[derive(Debug, Clone, Serialize)]
+#[cfg(test)]
 pub struct Usage {
     pub asr_requests: i64,
     pub llm_requests: i64,
@@ -1247,6 +1537,10 @@ struct SpoolChunkManifest {
     start_secs: f32,
     end_secs: f32,
     status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_start_sample: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sample_count: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1269,6 +1563,13 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+fn spool_manifest_age_secs(manifest: &SpoolManifest, now_ms: u64) -> Option<u64> {
+    if manifest.created_at_ms == 0 || manifest.created_at_ms > now_ms {
+        return None;
+    }
+    Some((now_ms - manifest.created_at_ms) / 1_000)
 }
 
 fn is_safe_spool_path(root: &Path, path: &Path) -> bool {
@@ -1563,12 +1864,73 @@ pub fn begin_spool_session(root: &Path, session_id: &str) -> anyhow::Result<Path
     Ok(session_dir)
 }
 
+/// Persist one complete WAV as a recoverable spool session. This is used when
+/// History is the only delivery recovery path and a failed History write must
+/// leave audio that startup recovery can promote into a retryable History item.
+pub fn persist_recovery_wav_session(
+    root: &Path,
+    session_id: &str,
+    wav: &[u8],
+) -> anyhow::Result<RecoveredSpool> {
+    let duration_secs = crate::asr::wav_duration_seconds(wav)
+        .filter(|duration| duration.is_finite() && *duration > 0.0)
+        .ok_or_else(|| anyhow::anyhow!("recovery WAV duration could not be read"))?;
+    let session_dir = begin_spool_session(root, session_id)?;
+    let result = (|| {
+        let audio_path = write_spool_session_file(&session_dir, "recovery.wav", wav)?;
+        mark_spool_status(&session_dir, "recoverable")?;
+        Ok(RecoveredSpool {
+            audio_path,
+            duration_secs,
+        })
+    })();
+    if result.is_err() {
+        let _ = fs::remove_dir_all(&session_dir);
+    }
+    result
+}
+
 pub fn record_spool_chunk(
     session_dir: &Path,
     index: usize,
     start_secs: f32,
     end_secs: f32,
     status: &str,
+) -> anyhow::Result<()> {
+    record_spool_chunk_inner(session_dir, index, start_secs, end_secs, status, None)
+}
+
+/// Record a written chunk with exact source-timeline sample coverage.
+/// Later status-only updates through `record_spool_chunk` preserve these fields.
+pub fn record_spool_chunk_with_samples(
+    session_dir: &Path,
+    index: usize,
+    start_secs: f32,
+    end_secs: f32,
+    status: &str,
+    source_start_sample: u64,
+    sample_count: u64,
+) -> anyhow::Result<()> {
+    if sample_count == 0 || source_start_sample.checked_add(sample_count).is_none() {
+        anyhow::bail!("invalid recovery chunk sample interval");
+    }
+    record_spool_chunk_inner(
+        session_dir,
+        index,
+        start_secs,
+        end_secs,
+        status,
+        Some((source_start_sample, sample_count)),
+    )
+}
+
+fn record_spool_chunk_inner(
+    session_dir: &Path,
+    index: usize,
+    start_secs: f32,
+    end_secs: f32,
+    status: &str,
+    source_interval: Option<(u64, u64)>,
 ) -> anyhow::Result<()> {
     let mut manifest = load_manifest(session_dir)?;
     if let Some(chunk) = manifest
@@ -1579,12 +1941,18 @@ pub fn record_spool_chunk(
         chunk.start_secs = start_secs;
         chunk.end_secs = end_secs;
         chunk.status = status.to_owned();
+        if let Some((source_start_sample, sample_count)) = source_interval {
+            chunk.source_start_sample = Some(source_start_sample);
+            chunk.sample_count = Some(sample_count);
+        }
     } else {
         manifest.chunks.push(SpoolChunkManifest {
             index,
             start_secs,
             end_secs,
             status: status.to_owned(),
+            source_start_sample: source_interval.map(|(start, _)| start),
+            sample_count: source_interval.map(|(_, count)| count),
         });
     }
     save_manifest(session_dir, &manifest)
@@ -1620,20 +1988,121 @@ fn read_recovery_samples(session_dir: &Path) -> anyhow::Result<Vec<f32>> {
         anyhow::bail!("recovery contains no complete audio chunks");
     }
 
-    let mut samples = Vec::new();
-    for (_, path) in chunks {
+    let manifest = if manifest_path(session_dir).is_file() {
+        Some(load_manifest(session_dir)?)
+    } else {
+        None
+    };
+    let mut manifest_chunks = std::collections::BTreeMap::new();
+    if let Some(manifest) = &manifest {
+        for chunk in &manifest.chunks {
+            if manifest_chunks.insert(chunk.index, chunk).is_some() {
+                anyhow::bail!("recovery manifest contains duplicate chunk indexes");
+            }
+            if chunk.source_start_sample.is_some() != chunk.sample_count.is_some() {
+                anyhow::bail!("recovery manifest contains an incomplete sample interval");
+            }
+        }
+    }
+
+    let manifest_has_exact_intervals = manifest_chunks
+        .values()
+        .any(|chunk| chunk.source_start_sample.is_some());
+    let mut decoded_chunks = Vec::with_capacity(chunks.len());
+    for (index, path) in chunks {
         let bytes = read_spool_file(&path)?;
         if bytes.len() % std::mem::size_of::<f32>() != 0 {
             anyhow::bail!("recovery audio chunk is truncated");
         }
-        samples.extend(
-            bytes
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .map(|bytes| f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])),
-        );
+        let samples = bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|bytes| f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+            .collect::<Vec<_>>();
+        let interval = manifest_chunks
+            .get(&index)
+            .and_then(|chunk| chunk.source_start_sample.zip(chunk.sample_count));
+        decoded_chunks.push((index, samples, interval));
     }
+
+    let exact_interval_count = decoded_chunks
+        .iter()
+        .filter(|(_, _, interval)| interval.is_some())
+        .count();
+    if exact_interval_count == 0 {
+        if manifest_has_exact_intervals {
+            anyhow::bail!("recovery sample intervals are missing for one or more chunks");
+        }
+        let mut legacy_timing = decoded_chunks
+            .iter()
+            .filter_map(|(index, _, _)| manifest_chunks.get(index).copied())
+            .collect::<Vec<_>>();
+        legacy_timing.sort_by_key(|chunk| chunk.index);
+        if legacy_timing
+            .windows(2)
+            .any(|pair| pair[1].start_secs < pair[0].end_secs)
+        {
+            anyhow::bail!("legacy recovery chunks overlap but lack exact source sample intervals");
+        }
+        let mut samples: Vec<f32> = Vec::new();
+        for (_, chunk_samples, _) in decoded_chunks {
+            samples.extend(chunk_samples);
+        }
+        if samples.is_empty() {
+            anyhow::bail!("recovery contains no audio samples");
+        }
+        return Ok(samples);
+    }
+
+    if exact_interval_count != decoded_chunks.len()
+        || manifest_chunks.values().any(|chunk| {
+            chunk.source_start_sample.is_some()
+                && !decoded_chunks.iter().any(|(i, _, _)| i == &chunk.index)
+        })
+    {
+        anyhow::bail!("recovery sample intervals are missing for one or more chunks");
+    }
+
+    let mut positioned = Vec::with_capacity(decoded_chunks.len());
+    for (index, samples, interval) in decoded_chunks {
+        let (source_start, sample_count) =
+            interval.ok_or_else(|| anyhow::anyhow!("recovery sample intervals are incomplete"))?;
+        if sample_count == 0 || u64::try_from(samples.len()).ok() != Some(sample_count) {
+            anyhow::bail!("recovery chunk sample count does not match its manifest");
+        }
+        let source_end = source_start
+            .checked_add(sample_count)
+            .ok_or_else(|| anyhow::anyhow!("recovery chunk sample interval overflows"))?;
+        positioned.push((source_start, source_end, index, samples));
+    }
+
+    positioned.sort_by_key(|(start, _, index, _)| (*start, *index));
+    let mut samples: Vec<f32> = Vec::new();
+    let mut covered_until = 0_u64;
+    for (source_start, source_end, _, chunk_samples) in positioned {
+        if source_start > covered_until {
+            anyhow::bail!("recovery audio contains a gap in source samples");
+        }
+        let overlap_count = usize::try_from(covered_until.saturating_sub(source_start))
+            .unwrap_or(usize::MAX)
+            .min(chunk_samples.len());
+        let overlap_start = usize::try_from(source_start)
+            .map_err(|_| anyhow::anyhow!("recovery sample interval is too large"))?;
+        for (offset, chunk_sample) in chunk_samples.iter().take(overlap_count).enumerate() {
+            let existing = samples
+                .get(overlap_start + offset)
+                .ok_or_else(|| anyhow::anyhow!("recovery sample coverage is inconsistent"))?;
+            if existing.to_bits() != chunk_sample.to_bits() {
+                anyhow::bail!("overlapping recovery chunks contain conflicting samples");
+            }
+        }
+        if source_end > covered_until {
+            samples.extend_from_slice(&chunk_samples[overlap_count..]);
+            covered_until = source_end;
+        }
+    }
+
     if samples.is_empty() {
         anyhow::bail!("recovery contains no audio samples");
     }
@@ -1665,6 +2134,18 @@ fn rebuild_recovery_wav(session_dir: &Path) -> anyhow::Result<RecoveredSpool> {
     })
 }
 
+fn read_existing_recovery_wav(session_dir: &Path) -> anyhow::Result<RecoveredSpool> {
+    let audio_path = session_dir.join("recovery.wav");
+    let wav = read_spool_file(&audio_path)?;
+    let duration_secs = crate::asr::wav_duration_seconds(&wav)
+        .filter(|duration| duration.is_finite() && *duration > 0.0)
+        .ok_or_else(|| anyhow::anyhow!("stored recovery WAV duration could not be read"))?;
+    Ok(RecoveredSpool {
+        audio_path,
+        duration_secs,
+    })
+}
+
 /// Rebuild a retryable WAV from the complete audio chunks kept for a long
 /// recording. This is also used when processing finishes in a degraded state
 /// so the user can retry the whole recording instead of losing failed chunks.
@@ -1673,8 +2154,9 @@ pub fn rebuild_spool_recovery(session_dir: &Path) -> anyhow::Result<RecoveredSpo
 }
 
 /// Recover interrupted sessions into retryable audio artifacts. Active
-/// manifests are never treated as successful dictations: only complete,
-/// atomically-written chunks are rebuilt into a WAV for manual retry.
+/// manifests are never treated as successful dictations: complete,
+/// atomically-written chunks are rebuilt, while explicitly persisted single
+/// WAV recovery sessions are retained for manual retry.
 pub fn recover_spool(dir: &Path, keep_audio_days: u64) -> anyhow::Result<Vec<RecoveredSpool>> {
     let root = dir.join("spool");
     if !root.exists() {
@@ -1685,13 +2167,6 @@ pub fn recover_spool(dir: &Path, keep_audio_days: u64) -> anyhow::Result<Vec<Rec
     for entry in fs::read_dir(&root)? {
         let entry = entry?;
         let path = entry.path();
-        let age = entry
-            .metadata()
-            .and_then(|metadata| metadata.modified())
-            .ok()
-            .and_then(|modified| modified.elapsed().ok())
-            .map(|elapsed| elapsed.as_secs())
-            .unwrap_or(max_age.saturating_add(1));
         if path.is_dir() {
             let manifest = match load_manifest(&path) {
                 Ok(manifest) if manifest.schema_version == SPOOL_MANIFEST_VERSION => Some(manifest),
@@ -1711,33 +2186,57 @@ pub fn recover_spool(dir: &Path, keep_audio_days: u64) -> anyhow::Result<Vec<Rec
                     None
                 }
             };
+            // Session-directory mtime changes whenever recovery output or the
+            // manifest is rewritten. Retention must remain anchored to the
+            // manifest's immutable creation time, otherwise every successful
+            // startup could extend the lifetime indefinitely. Invalid or
+            // future timestamps cannot establish a trustworthy age, so expire
+            // those sessions fail-closed.
+            let age = manifest
+                .as_ref()
+                .and_then(|manifest| spool_manifest_age_secs(manifest, now_ms()));
+            let expired = age.is_none_or(|age| age > max_age);
             let recoverable = manifest.as_ref().is_some_and(|manifest| {
                 matches!(
                     manifest.status.as_str(),
                     "active" | "recoverable" | "degraded"
                 )
             });
-            if recoverable && age <= max_age {
-                match rebuild_recovery_wav(&path) {
+            if recoverable && !expired {
+                let recovery = rebuild_recovery_wav(&path)
+                    .or_else(|chunk_error| {
+                        read_existing_recovery_wav(&path).map_err(|wav_error| {
+                            anyhow::anyhow!(
+                                "chunks could not be rebuilt ({chunk_error}); stored WAV could not be read ({wav_error})"
+                            )
+                        })
+                    });
+                match recovery {
                     Ok(recovery) => {
                         let _ = mark_spool_status(&path, "recoverable");
                         recovered.push(recovery);
                     }
-                    Err(_) => {
+                    Err(error) => {
+                        log::warn!(
+                            "preserving spool session at {} without a rebuilt recovery WAV; the source chunks could not be reconstructed: {error}",
+                            path.display()
+                        );
                         let _ = mark_spool_status(&path, "abandoned");
-                        fs::remove_dir_all(path)?;
                     }
                 }
-            } else if age > max_age {
-                fs::remove_dir_all(path)?;
-            } else if manifest.is_none() {
-                // There is no safe way to reconstruct ownership/status from a
-                // malformed manifest. Remove it now instead of letting an
-                // orphan consume the spool quota indefinitely.
+            } else if expired {
                 fs::remove_dir_all(path)?;
             }
-        } else if age > max_age {
-            fs::remove_file(path)?;
+        } else {
+            let age = entry
+                .metadata()
+                .and_then(|metadata| metadata.modified())
+                .ok()
+                .and_then(|modified| modified.elapsed().ok())
+                .map(|elapsed| elapsed.as_secs());
+            if age.is_none_or(|age| age > max_age) {
+                fs::remove_file(path)?;
+            }
         }
     }
     Ok(recovered)
@@ -1766,6 +2265,7 @@ fn secret_sidecar_path(dir: &Path, slot: &str) -> PathBuf {
     dir.join("secrets").join(slot)
 }
 
+#[cfg(test)]
 fn write_secret_sidecar(dir: &Path, slot: &str, key: &str) -> anyhow::Result<()> {
     let slot = secret_sidecar_slot(slot)
         .ok_or_else(|| anyhow::anyhow!("unsupported secret sidecar slot"))?;
@@ -1775,51 +2275,281 @@ fn write_secret_sidecar(dir: &Path, slot: &str, key: &str) -> anyhow::Result<()>
 fn read_secret_sidecar(dir: &Path, slot: &str) -> Option<String> {
     let bytes = fs::read(secret_sidecar_path(dir, slot)).ok()?;
     let key = String::from_utf8(bytes).ok()?;
-    let key = key.trim();
-    (!key.is_empty()).then(|| key.to_string())
+    (!key.trim().is_empty()).then_some(key)
 }
 
 fn clear_secret_sidecar(dir: &Path, slot: &str) {
     let _ = fs::remove_file(secret_sidecar_path(dir, slot));
 }
 
-fn fill_empty_secret_from_sidecar(dir: &Path, slot: &str, current: &mut String) {
-    if !current.trim().is_empty() {
-        return;
+pub fn clear_provider_key_sidecars(dir: &Path, provider: crate::engine::EngineProvider) {
+    clear_secret_sidecar(dir, provider.keychain_account());
+    if provider == crate::engine::EngineProvider::Groq {
+        clear_secret_sidecar(dir, "api_key");
     }
-    if let Some(key) = read_secret_sidecar(dir, slot) {
-        *current = key;
+    if provider == crate::engine::EngineProvider::Custom {
+        clear_secret_sidecar(dir, "asr_api_key");
+        clear_secret_sidecar(dir, "cleanup_api_key");
     }
 }
 
-fn persist_secret_to_keychain_or_sidecar(
+pub fn clear_asr_key_sidecar(dir: &Path) {
+    clear_secret_sidecar(dir, "asr_api_key");
+}
+
+pub fn clear_cleanup_key_sidecar(dir: &Path) {
+    clear_secret_sidecar(dir, "cleanup_api_key");
+}
+
+trait CredentialBackend {
+    fn read(&self, slot: &str) -> crate::keychain::ApiKeyState;
+    fn write(&self, slot: &str, key: &str) -> Result<(), String>;
+}
+
+struct OsCredentialBackend;
+
+impl CredentialBackend for OsCredentialBackend {
+    fn read(&self, slot: &str) -> crate::keychain::ApiKeyState {
+        use crate::engine::EngineProvider;
+        match slot {
+            "api_key" | "groq_api_key" => crate::keychain::get_api_key_state(),
+            "asr_api_key" => crate::keychain::get_asr_api_key_state(),
+            "cleanup_api_key" => crate::keychain::get_cleanup_api_key_state(),
+            account => EngineProvider::ALL
+                .into_iter()
+                .find(|provider| provider.keychain_account() == account)
+                .map(crate::keychain::get_provider_api_key_state)
+                .unwrap_or_else(|| {
+                    crate::keychain::ApiKeyState::Unavailable(format!(
+                        "unsupported credential account {account}"
+                    ))
+                }),
+        }
+    }
+
+    fn write(&self, slot: &str, key: &str) -> Result<(), String> {
+        use crate::engine::EngineProvider;
+        match slot {
+            "api_key" | "groq_api_key" => crate::keychain::set_api_key(key),
+            "asr_api_key" => crate::keychain::set_asr_api_key(key),
+            "cleanup_api_key" => crate::keychain::set_cleanup_api_key(key),
+            account => EngineProvider::ALL
+                .into_iter()
+                .find(|provider| provider.keychain_account() == account)
+                .ok_or_else(|| format!("unsupported credential account {account}"))
+                .and_then(|provider| crate::keychain::set_provider_api_key(provider, key)),
+        }
+    }
+}
+
+fn clear_secret_sidecar_if_matches(dir: &Path, slot: &str, key: &str) {
+    if read_secret_sidecar(dir, slot).as_deref() == Some(key) {
+        clear_secret_sidecar(dir, slot);
+    }
+}
+
+/// Persist to the OS credential store and confirm the exact value can be read
+/// back before treating the operation as durable. `preserve_existing` is used
+/// for legacy migration: it prevents a stale source from replacing a secure
+/// credential that already exists or could not be read.
+fn persist_secret_to_secure_store(
     dir: &Path,
     slot: &str,
     key: &str,
-    store: impl FnOnce(&str) -> Result<(), String>,
+    backend: &dyn CredentialBackend,
+    preserve_existing: bool,
+    clear_replaced_sidecar: bool,
 ) -> anyhow::Result<()> {
-    match store(key) {
-        Ok(()) => {
-            if cfg!(debug_assertions) {
-                // `make run` / `tauri dev` is ad-hoc signed. A write can succeed
-                // in this process and become unreadable after the next Cargo
-                // rebuild. Keep the sidecar so the next debug launch still has
-                // the key.
-                if !key.trim().is_empty() {
-                    write_secret_sidecar(dir, slot, key)?;
-                }
-            } else {
+    let before = backend.read(slot);
+    match &before {
+        crate::keychain::ApiKeyState::Configured(stored) if stored == key => {
+            if clear_replaced_sidecar {
                 clear_secret_sidecar(dir, slot);
+            } else {
+                clear_secret_sidecar_if_matches(dir, slot, key);
+            }
+            return Ok(());
+        }
+        crate::keychain::ApiKeyState::Configured(_) if preserve_existing => {
+            anyhow::bail!("credential_storage: secure {slot} credential changed during migration")
+        }
+        crate::keychain::ApiKeyState::Unavailable(error) if preserve_existing => {
+            anyhow::bail!("credential_storage: cannot verify existing {slot} credential: {error}")
+        }
+        crate::keychain::ApiKeyState::Missing
+        | crate::keychain::ApiKeyState::Configured(_)
+        | crate::keychain::ApiKeyState::Unavailable(_) => {}
+    }
+
+    backend.write(slot, key).map_err(|error| {
+        anyhow::anyhow!("credential_storage: failed to store {slot} securely: {error}")
+    })?;
+    match backend.read(slot) {
+        crate::keychain::ApiKeyState::Configured(stored) if stored == key => {
+            if clear_replaced_sidecar {
+                clear_secret_sidecar(dir, slot);
+            } else {
+                clear_secret_sidecar_if_matches(dir, slot, key);
             }
             Ok(())
         }
-        Err(error) => {
-            log::warn!("keychain write for {slot} failed ({error}); storing in app data");
-            write_secret_sidecar(dir, slot, key).map_err(|sidecar_error| {
-                anyhow::anyhow!(
-                    "credential_storage: failed to store {slot} securely: {error}; sidecar: {sidecar_error}"
-                )
-            })
+        crate::keychain::ApiKeyState::Configured(_) => {
+            anyhow::bail!("credential_storage: secure {slot} write verification failed")
+        }
+        crate::keychain::ApiKeyState::Missing => {
+            anyhow::bail!("credential_storage: secure {slot} write was not readable")
+        }
+        crate::keychain::ApiKeyState::Unavailable(error) => {
+            anyhow::bail!("credential_storage: cannot verify secure {slot} write: {error}")
+        }
+    }
+}
+
+fn credential_source_slot(source: &str) -> Option<String> {
+    if let Some(field) = source.strip_prefix("settings:") {
+        return match field {
+            "api_key" => Some("groq_api_key".into()),
+            "asr_api_key" => Some("asr_api_key".into()),
+            "cleanup_api_key" => Some("cleanup_api_key".into()),
+            provider_field if provider_field.starts_with("provider:") => {
+                let id = provider_field.strip_prefix("provider:")?;
+                let provider = crate::providers::EngineProvider::parse(id)?;
+                Some(provider.keychain_account().into())
+            }
+            _ => None,
+        };
+    }
+    let sidecar = source.strip_prefix("sidecar:")?;
+    let normalized = secret_sidecar_slot(sidecar)?;
+    if normalized == "api_key" {
+        Some("groq_api_key".into())
+    } else {
+        Some(normalized.to_owned())
+    }
+}
+
+fn has_unverified_source(settings: &Settings, slot: &str, key: &str) -> bool {
+    settings
+        .unverified_credential_sources
+        .iter()
+        .any(|(source, value)| {
+            if value != key {
+                return false;
+            }
+            let Some(source_slot) = credential_source_slot(source) else {
+                return false;
+            };
+            source_slot == slot
+                || (slot == crate::engine::EngineProvider::Custom.keychain_account()
+                    && matches!(source_slot.as_str(), "asr_api_key" | "cleanup_api_key"))
+        })
+}
+
+fn is_explicit_credential_replacement(settings: &Settings, slot: &str, key: &str) -> bool {
+    if has_unverified_source(settings, slot, key) {
+        return false;
+    }
+    settings
+        .credential_baselines
+        .get(slot)
+        .is_none_or(|previous| previous != key)
+}
+
+struct CredentialResolution {
+    value: String,
+    state: crate::keychain::ApiKeyState,
+    settings_source_verified: bool,
+}
+
+fn resolve_legacy_credential(
+    dir: &Path,
+    slot: &str,
+    legacy_value: &str,
+    settings_source: Option<&str>,
+    settings: &mut Settings,
+    backend: &dyn CredentialBackend,
+) -> CredentialResolution {
+    let has_legacy_value = !legacy_value.trim().is_empty();
+    let sidecar_value = read_secret_sidecar(dir, slot);
+    let (candidate, source) = if has_legacy_value {
+        (
+            Some(legacy_value.to_owned()),
+            settings_source.map(str::to_owned),
+        )
+    } else if let Some(value) = sidecar_value {
+        (Some(value), Some(format!("sidecar:{slot}")))
+    } else {
+        (None, None)
+    };
+
+    match backend.read(slot) {
+        crate::keychain::ApiKeyState::Configured(stored) => {
+            settings
+                .credential_baselines
+                .insert(slot.to_owned(), stored.clone());
+            if let Some(value) = candidate.as_deref() {
+                if value == stored {
+                    clear_secret_sidecar_if_matches(dir, slot, value);
+                }
+            }
+            CredentialResolution {
+                value: stored.clone(),
+                state: crate::keychain::ApiKeyState::Configured(stored),
+                settings_source_verified: settings_source.is_some() && has_legacy_value,
+            }
+        }
+        crate::keychain::ApiKeyState::Unavailable(error) => {
+            if let (Some(value), Some(source)) = (candidate, source) {
+                settings
+                    .unverified_credential_sources
+                    .insert(source, value.clone());
+                CredentialResolution {
+                    value,
+                    state: crate::keychain::ApiKeyState::Unavailable(error),
+                    settings_source_verified: false,
+                }
+            } else {
+                CredentialResolution {
+                    value: String::new(),
+                    state: crate::keychain::ApiKeyState::Unavailable(error),
+                    settings_source_verified: false,
+                }
+            }
+        }
+        crate::keychain::ApiKeyState::Missing => {
+            let Some(value) = candidate else {
+                return CredentialResolution {
+                    value: String::new(),
+                    state: crate::keychain::ApiKeyState::Missing,
+                    settings_source_verified: false,
+                };
+            };
+            match persist_secret_to_secure_store(dir, slot, &value, backend, true, false) {
+                Ok(()) => {
+                    settings
+                        .credential_baselines
+                        .insert(slot.to_owned(), value.clone());
+                    CredentialResolution {
+                        value: value.clone(),
+                        state: crate::keychain::ApiKeyState::Configured(value),
+                        settings_source_verified: settings_source.is_some() && has_legacy_value,
+                    }
+                }
+                Err(error) => {
+                    let error = error.to_string();
+                    if let Some(source) = source {
+                        settings
+                            .unverified_credential_sources
+                            .insert(source, value.clone());
+                    }
+                    log::warn!("legacy credential migration for {slot} was not verified: {error}");
+                    CredentialResolution {
+                        value,
+                        state: crate::keychain::ApiKeyState::Unavailable(error),
+                        settings_source_verified: false,
+                    }
+                }
+            }
         }
     }
 }
@@ -1828,6 +2558,10 @@ fn persist_secret_to_keychain_or_sidecar(
 /// OS credential store. Returns the settings plus a flag indicating whether
 /// the caller should persist the normalized result.
 pub fn load_settings(dir: &Path) -> (Settings, bool) {
+    load_settings_with_backend(dir, &OsCredentialBackend)
+}
+
+fn load_settings_with_backend(dir: &Path, backend: &dyn CredentialBackend) -> (Settings, bool) {
     let path = dir.join("settings.json");
     let raw = std::fs::read(&path).ok();
     let malformed = raw
@@ -1844,7 +2578,8 @@ pub fn load_settings(dir: &Path) -> (Settings, bool) {
     let needs_backup = schema_needs_persist
         || !settings.api_key.is_empty()
         || !settings.asr_api_key.is_empty()
-        || !settings.cleanup_api_key.is_empty();
+        || !settings.cleanup_api_key.is_empty()
+        || !settings.provider_api_keys.is_empty();
     if needs_backup {
         if let Some(raw) = raw.as_deref() {
             if let Err(error) = backup_legacy_settings(&path, raw) {
@@ -1858,114 +2593,106 @@ pub fn load_settings(dir: &Path) -> (Settings, bool) {
     let hotkeys_rewritten = settings.hotkey != hotkey_before
         || settings.selected_action_hotkey != selected_action_hotkey_before;
 
-    // Reconcile the API key with the keychain. If we find a plaintext key in
-    // the file, migrate it into the keychain and flag that the file should be
-    // re-saved with the key removed.
-    let plaintext_key = settings.api_key.clone();
-    let had_plaintext = !plaintext_key.is_empty();
-    let key_state = crate::keychain::resolve_api_key(&plaintext_key);
-    let plaintext_asr_key = settings.asr_api_key.clone();
-    let had_plaintext_asr = !plaintext_asr_key.is_empty();
-    let asr_key_state = crate::keychain::resolve_asr_api_key(&plaintext_asr_key);
     let mut needs_persist = schema_needs_persist || hotkeys_rewritten;
-    let mut api_key_missing = false;
-    match key_state {
-        crate::keychain::ApiKeyState::Configured(key) => {
-            settings.api_key = key;
-            if had_plaintext {
-                needs_persist = true;
-            }
-        }
-        crate::keychain::ApiKeyState::Missing => {
-            api_key_missing = true;
-            settings.api_key.clear();
-        }
-        crate::keychain::ApiKeyState::Unavailable(error) => {
-            // Do not rewrite settings or revoke onboarding when the OS store
-            // is temporarily unavailable. The next launch can retry, and the
-            // settings UI can still offer an explicit replacement/removal.
-            log::warn!("API key state unavailable during startup: {error}");
-            if had_plaintext {
-                settings.api_key = plaintext_key;
-            }
-        }
+    let legacy_api_key = settings.api_key.clone();
+    let api_resolution = resolve_legacy_credential(
+        dir,
+        "groq_api_key",
+        &legacy_api_key,
+        (!legacy_api_key.trim().is_empty()).then_some("settings:api_key"),
+        &mut settings,
+        backend,
+    );
+    settings.api_key = api_resolution.value;
+    if api_resolution.settings_source_verified {
+        needs_persist = true;
     }
-    let mut asr_key_missing = false;
-    match asr_key_state {
-        crate::keychain::ApiKeyState::Configured(key) => {
-            settings.asr_api_key = key;
-            if had_plaintext_asr {
-                needs_persist = true;
-            }
-        }
-        crate::keychain::ApiKeyState::Missing => {
-            asr_key_missing = true;
-            settings.asr_api_key.clear();
-            if had_plaintext_asr {
-                needs_persist = true;
-            }
-        }
-        crate::keychain::ApiKeyState::Unavailable(error) => {
-            log::warn!("ASR API key state unavailable during startup: {error}");
-            if had_plaintext_asr {
-                settings.asr_api_key = plaintext_asr_key;
-            }
-        }
+    let api_key_missing = matches!(api_resolution.state, crate::keychain::ApiKeyState::Missing);
+
+    let legacy_asr_key = settings.asr_api_key.clone();
+    let asr_resolution = resolve_legacy_credential(
+        dir,
+        "asr_api_key",
+        &legacy_asr_key,
+        (!legacy_asr_key.trim().is_empty()).then_some("settings:asr_api_key"),
+        &mut settings,
+        backend,
+    );
+    settings.asr_api_key = asr_resolution.value;
+    if asr_resolution.settings_source_verified {
+        needs_persist = true;
     }
-    let plaintext_cleanup_key = settings.cleanup_api_key.clone();
-    let had_plaintext_cleanup = !plaintext_cleanup_key.is_empty();
-    let cleanup_key_state = crate::keychain::resolve_cleanup_api_key(&plaintext_cleanup_key);
-    let mut cleanup_key_missing = false;
-    match cleanup_key_state {
-        crate::keychain::ApiKeyState::Configured(key) => {
-            settings.cleanup_api_key = key;
-            if had_plaintext_cleanup {
-                needs_persist = true;
-            }
-        }
-        crate::keychain::ApiKeyState::Missing => {
-            cleanup_key_missing = true;
-            settings.cleanup_api_key.clear();
-            if had_plaintext_cleanup {
-                needs_persist = true;
-            }
-        }
-        crate::keychain::ApiKeyState::Unavailable(error) => {
-            log::warn!("cleanup API key state unavailable during startup: {error}");
-            if had_plaintext_cleanup {
-                settings.cleanup_api_key = plaintext_cleanup_key;
-            }
-        }
+    let asr_key_missing = matches!(asr_resolution.state, crate::keychain::ApiKeyState::Missing);
+
+    let legacy_cleanup_key = settings.cleanup_api_key.clone();
+    let cleanup_resolution = resolve_legacy_credential(
+        dir,
+        "cleanup_api_key",
+        &legacy_cleanup_key,
+        (!legacy_cleanup_key.trim().is_empty()).then_some("settings:cleanup_api_key"),
+        &mut settings,
+        backend,
+    );
+    settings.cleanup_api_key = cleanup_resolution.value;
+    if cleanup_resolution.settings_source_verified {
+        needs_persist = true;
     }
-    fill_empty_secret_from_sidecar(dir, "api_key", &mut settings.api_key);
-    fill_empty_secret_from_sidecar(dir, "asr_api_key", &mut settings.asr_api_key);
-    fill_empty_secret_from_sidecar(dir, "cleanup_api_key", &mut settings.cleanup_api_key);
+    let cleanup_key_missing = matches!(
+        cleanup_resolution.state,
+        crate::keychain::ApiKeyState::Missing
+    );
+
+    let mut provider_states = std::collections::HashMap::new();
     for provider in crate::providers::EngineProvider::ALL {
-        if let crate::keychain::ApiKeyState::Configured(key) =
-            crate::keychain::get_provider_api_key_state(provider)
-        {
-            settings
-                .provider_api_keys
-                .entry(provider.as_str().to_owned())
-                .or_insert(key);
-        }
-        let mut key = settings
+        let legacy_key = settings
             .provider_api_keys
             .get(provider.as_str())
             .cloned()
             .unwrap_or_default();
-        fill_empty_secret_from_sidecar(dir, provider.keychain_account(), &mut key);
-        if !key.trim().is_empty() {
-            settings
-                .provider_api_keys
-                .insert(provider.as_str().to_owned(), key);
-        }
-    }
-    bind_legacy_keys_into_pool(&mut settings);
-    if api_key_missing && settings.api_key.trim().is_empty() {
-        if settings.onboarded {
+        let source = (!legacy_key.trim().is_empty())
+            .then(|| format!("settings:provider:{}", provider.as_str()));
+        let resolution = resolve_legacy_credential(
+            dir,
+            provider.keychain_account(),
+            &legacy_key,
+            source.as_deref(),
+            &mut settings,
+            backend,
+        );
+        if resolution.settings_source_verified {
             needs_persist = true;
         }
+        if !resolution.value.trim().is_empty() {
+            settings
+                .provider_api_keys
+                .insert(provider.as_str().to_owned(), resolution.value);
+        } else {
+            settings.provider_api_keys.remove(provider.as_str());
+        }
+        provider_states.insert(provider, resolution.state);
+    }
+    bind_legacy_keys_into_pool(&mut settings);
+    let selected_asr = settings.asr_provider;
+    let selected_asr_key_missing = if selected_asr.is_groq() {
+        api_key_missing
+    } else {
+        matches!(
+            provider_states.get(&selected_asr),
+            Some(crate::keychain::ApiKeyState::Missing)
+        )
+    };
+    let selected_asr_url = settings.resolved_provider_base(selected_asr);
+    let selected_asr_empty_ok = selected_asr == crate::engine::EngineProvider::OnDevice
+        && settings.on_device_asr_ready(Some(&dir.join("models")))
+        || selected_asr.allows_empty_key() && crate::providers::is_loopback_url(&selected_asr_url);
+    if settings.onboarded
+        && (selected_asr == crate::engine::EngineProvider::OnDevice
+            && !settings.on_device_asr_ready(Some(&dir.join("models")))
+            || selected_asr_key_missing
+                && settings.asr_credential().trim().is_empty()
+                && !selected_asr_empty_ok)
+    {
+        needs_persist = true;
         settings.onboarded = false;
     }
     // Only repair when the store confirmed the key is absent. A timeout must
@@ -2025,45 +2752,78 @@ fn backup_legacy_settings(path: &Path, raw: &[u8]) -> anyhow::Result<()> {
         "cleanup_api_key".into(),
         serde_json::Value::String(String::new()),
     );
+    object.insert(
+        "provider_api_keys".into(),
+        serde_json::Value::Object(serde_json::Map::new()),
+    );
     let bytes = serde_json::to_vec_pretty(&value)?;
     write_atomic_bytes(&backup, &bytes)?;
     Ok(())
 }
-/// Persist settings to `settings.json`. The API key is stored in the OS
-/// credential store, never in the file, so the on-disk JSON always has the
-/// key field blanked out.
+/// Persist settings to `settings.json`. API keys are written only to the OS
+/// credential store and verified there before the settings file is updated.
 pub fn save_settings(dir: &Path, settings: &Settings) -> anyhow::Result<()> {
-    settings.validate()?;
+    save_settings_with_backend(dir, settings, &OsCredentialBackend)
+}
+
+fn save_settings_with_backend(
+    dir: &Path,
+    settings: &Settings,
+    backend: &dyn CredentialBackend,
+) -> anyhow::Result<()> {
+    save_settings_with_validation(dir, settings, backend, true)
+}
+
+pub fn save_configuration(dir: &Path, settings: &Settings) -> anyhow::Result<()> {
+    save_settings_with_validation(dir, settings, &OsCredentialBackend, false)
+}
+
+fn save_settings_with_validation(
+    dir: &Path,
+    settings: &Settings,
+    backend: &dyn CredentialBackend,
+    check_readiness: bool,
+) -> anyhow::Result<()> {
+    settings.validate_internal(Some(&dir.join("models")), check_readiness)?;
     let lock = SETTINGS_WRITE_LOCK.get_or_init(|| Mutex::new(()));
     let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     ensure_private_dir(dir)?;
-    // Write a new key into the keychain first; only persist the file (without
-    // the key) once the secret is safely stored. An empty in-memory key can
-    // also mean that a non-interactive keychain read timed out during startup,
-    // so ordinary settings writes must never interpret it as a destructive
-    // credential deletion. Credential removal needs an explicit operation.
+    // Persist every non-empty credential before writing settings.json. A
+    // legacy value may remain in memory while its migration is pending; its
+    // marker prevents a transient read failure from replacing a newer secure
+    // value. On failure this function returns before modifying settings.json.
     if !settings.api_key.trim().is_empty() {
-        persist_secret_to_keychain_or_sidecar(
+        persist_secret_to_secure_store(
             dir,
-            "api_key",
+            "groq_api_key",
             &settings.api_key,
-            crate::keychain::set_api_key,
+            backend,
+            has_unverified_source(settings, "groq_api_key", &settings.api_key),
+            is_explicit_credential_replacement(settings, "groq_api_key", &settings.api_key),
         )?;
     }
     if !settings.asr_api_key.trim().is_empty() {
-        persist_secret_to_keychain_or_sidecar(
+        persist_secret_to_secure_store(
             dir,
             "asr_api_key",
             &settings.asr_api_key,
-            crate::keychain::set_asr_api_key,
+            backend,
+            has_unverified_source(settings, "asr_api_key", &settings.asr_api_key),
+            is_explicit_credential_replacement(settings, "asr_api_key", &settings.asr_api_key),
         )?;
     }
     if !settings.cleanup_api_key.trim().is_empty() {
-        persist_secret_to_keychain_or_sidecar(
+        persist_secret_to_secure_store(
             dir,
             "cleanup_api_key",
             &settings.cleanup_api_key,
-            crate::keychain::set_cleanup_api_key,
+            backend,
+            has_unverified_source(settings, "cleanup_api_key", &settings.cleanup_api_key),
+            is_explicit_credential_replacement(
+                settings,
+                "cleanup_api_key",
+                &settings.cleanup_api_key,
+            ),
         )?;
     }
     for (id, key) in &settings.provider_api_keys {
@@ -2073,9 +2833,15 @@ pub fn save_settings(dir: &Path, settings: &Settings) -> anyhow::Result<()> {
         if key.trim().is_empty() {
             continue;
         }
-        persist_secret_to_keychain_or_sidecar(dir, provider.keychain_account(), key, |value| {
-            crate::keychain::set_provider_api_key(provider, value)
-        })?;
+        let slot = provider.keychain_account();
+        persist_secret_to_secure_store(
+            dir,
+            slot,
+            key,
+            backend,
+            has_unverified_source(settings, slot, key),
+            is_explicit_credential_replacement(settings, slot, key),
+        )?;
     }
     let mut on_disk = settings.clone();
     on_disk.api_key = String::new();
@@ -2094,6 +2860,8 @@ fn schema(c: &Connection) -> anyhow::Result<()> {
     ensure_column(c, "degraded_reason", "TEXT")?;
     ensure_column(c, "delivery_method", "TEXT")?;
     ensure_column(c, "fallback_reason", "TEXT")?;
+    ensure_column(c, "delivery_error_code", "TEXT")?;
+    ensure_column(c, "delivery_user_reason", "TEXT")?;
     ensure_column(c, "context_profile_id", "TEXT")?;
     ensure_column(c, "context_policy_json", "TEXT")?;
     ensure_column(c, "context_family", "TEXT")?;
@@ -2102,6 +2870,8 @@ fn schema(c: &Connection) -> anyhow::Result<()> {
     ensure_column(c, "cleanup_status", "TEXT")?;
     ensure_column(c, "verbatim_text", "TEXT")?;
     ensure_column(c, "verbatim_reviewed", "INTEGER NOT NULL DEFAULT 0")?;
+    ensure_column(c, "asr_text", "TEXT")?;
+    ensure_column(c, "provider_cleaned_candidate", "TEXT")?;
     c.execute_batch(
         "CREATE TABLE IF NOT EXISTS learn_pairs (
             pair_key TEXT PRIMARY KEY,
@@ -2110,6 +2880,11 @@ fn schema(c: &Connection) -> anyhow::Result<()> {
             hits INTEGER NOT NULL,
             promoted INTEGER NOT NULL DEFAULT 0,
             last_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS learned_term_usage (
+            word TEXT PRIMARY KEY,
+            replacement_runs INTEGER NOT NULL,
+            last_replaced_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS style_drafts (
             draft_key TEXT PRIMARY KEY,
@@ -2153,14 +2928,94 @@ fn open_history(dir: &Path) -> anyhow::Result<Connection> {
         connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if existed && previous_version < HISTORY_SCHEMA_VERSION {
         let backup = dir.join(format!("history.sqlite.v{previous_version}.bak"));
-        if !backup.exists() {
-            fs::copy(&path, &backup)?;
-            restrict_file_mode(&backup)?;
+        match fs::symlink_metadata(&backup) {
+            Ok(metadata) if metadata.file_type().is_file() => {}
+            Ok(_) => anyhow::bail!("unsafe history migration backup path"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let mut options = fs::OpenOptions::new();
+                options.write(true).create_new(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    options.mode(0o600);
+                }
+                // create_new refuses existing links, including a link placed
+                // after the metadata check. Never overwrite another file.
+                let mut destination = options.open(&backup)?;
+                let mut source = File::open(&path)?;
+                if let Err(error) = std::io::copy(&mut source, &mut destination) {
+                    drop(destination);
+                    let _ = fs::remove_file(&backup);
+                    return Err(error.into());
+                }
+                restrict_file_mode(&backup)?;
+            }
+            Err(error) => return Err(error.into()),
         }
     }
     schema(&connection)?;
     restrict_history_sidecars(dir)?;
+    prune_history_migration_backups(
+        dir,
+        Some(HISTORY_MIGRATION_BACKUP_MAX_DAYS),
+        SystemTime::now(),
+    )?;
     Ok(connection)
+}
+
+/// Only names generated by open_history are owned rollback copies. Do not
+/// recurse or follow links; user exports, settings and model files are outside
+/// this cleanup boundary. None means the user explicitly cleared all data.
+fn prune_history_migration_backups(
+    dir: &Path,
+    keep_days: Option<u64>,
+    now: SystemTime,
+) -> anyhow::Result<usize> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error.into()),
+    };
+    let mut removed = 0;
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(version) = name
+            .to_str()
+            .and_then(|name| name.strip_prefix("history.sqlite.v"))
+            .and_then(|name| name.strip_suffix(".bak"))
+        else {
+            continue;
+        };
+        if !version
+            .parse::<u32>()
+            .is_ok_and(|value| value.to_string() == version)
+        {
+            continue;
+        }
+        let metadata = match fs::symlink_metadata(entry.path()) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        if !metadata.file_type().is_file() {
+            continue;
+        }
+        let expired = match keep_days {
+            None => true,
+            Some(days) => now
+                .duration_since(metadata.modified()?)
+                .is_ok_and(|age| age >= Duration::from_secs(days.saturating_mul(86_400))),
+        };
+        if expired {
+            match fs::remove_file(entry.path()) {
+                Ok(()) => removed += 1,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+    Ok(removed)
 }
 
 static HISTORY_SCHEMA_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -2192,6 +3047,8 @@ fn ensure_table_column(
 pub struct InsertHistory<'a> {
     pub dir: &'a Path,
     pub raw: &'a str,
+    pub asr_text: Option<&'a str>,
+    pub engine: Option<&'a str>,
     pub final_text: &'a str,
     pub cleanup_status: Option<&'a str>,
     pub duration: f64,
@@ -2217,6 +3074,8 @@ pub fn insert_history(
     insert_history_with_status(InsertHistory {
         dir,
         raw,
+        asr_text: None,
+        engine: None,
         final_text,
         cleanup_status: None,
         duration,
@@ -2300,6 +3159,8 @@ pub fn insert_history_with_delivery_and_spool(
     insert_history_with_status(InsertHistory {
         dir,
         raw,
+        asr_text: None,
+        engine: None,
         final_text,
         cleanup_status: None,
         duration,
@@ -2316,6 +3177,124 @@ pub fn insert_history_with_delivery_and_spool(
 }
 
 #[allow(clippy::too_many_arguments)]
+pub fn insert_history_with_asr_and_delivery_and_spool_and_cleanup(
+    dir: &Path,
+    raw: &str,
+    asr_text: Option<&str>,
+    final_text: &str,
+    duration: f64,
+    degraded: bool,
+    degraded_reason: Option<&str>,
+    status: &str,
+    delivery_method: &str,
+    fallback_reason: Option<&str>,
+    context: &crate::context::ContextSnapshot,
+    spool: Option<&Path>,
+    engine: &str,
+    cleanup_status: &str,
+) -> anyhow::Result<()> {
+    insert_history_with_asr_candidate_and_delivery_and_spool_and_cleanup(
+        dir,
+        raw,
+        asr_text,
+        None,
+        final_text,
+        duration,
+        degraded,
+        degraded_reason,
+        status,
+        delivery_method,
+        fallback_reason,
+        context,
+        spool,
+        engine,
+        cleanup_status,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn insert_history_with_asr_candidate_and_delivery_and_spool_and_cleanup(
+    dir: &Path,
+    raw: &str,
+    asr_text: Option<&str>,
+    provider_cleaned_candidate: Option<&str>,
+    final_text: &str,
+    duration: f64,
+    degraded: bool,
+    degraded_reason: Option<&str>,
+    status: &str,
+    delivery_method: &str,
+    fallback_reason: Option<&str>,
+    context: &crate::context::ContextSnapshot,
+    spool: Option<&Path>,
+    engine: &str,
+    cleanup_status: &str,
+) -> anyhow::Result<()> {
+    insert_history_with_asr_candidate_and_delivery_and_spool_and_cleanup_diagnostic(
+        dir,
+        raw,
+        asr_text,
+        provider_cleaned_candidate,
+        final_text,
+        duration,
+        degraded,
+        degraded_reason,
+        status,
+        delivery_method,
+        fallback_reason,
+        context,
+        spool,
+        engine,
+        cleanup_status,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn insert_history_with_asr_candidate_and_delivery_and_spool_and_cleanup_diagnostic(
+    dir: &Path,
+    raw: &str,
+    asr_text: Option<&str>,
+    provider_cleaned_candidate: Option<&str>,
+    final_text: &str,
+    duration: f64,
+    degraded: bool,
+    degraded_reason: Option<&str>,
+    status: &str,
+    delivery_method: &str,
+    fallback_reason: Option<&str>,
+    context: &crate::context::ContextSnapshot,
+    spool: Option<&Path>,
+    engine: &str,
+    cleanup_status: &str,
+    diagnostic: Option<&crate::delivery_diagnostics::DeliveryDiagnostic>,
+) -> anyhow::Result<()> {
+    insert_history_with_status_and_candidate(
+        InsertHistory {
+            dir,
+            raw,
+            asr_text,
+            engine: Some(engine),
+            final_text,
+            cleanup_status: Some(cleanup_status),
+            duration,
+            degraded,
+            degraded_reason,
+            status: status.to_owned(),
+            delivery_method: Some(delivery_method),
+            fallback_reason,
+            spool,
+            count_asr: true,
+            count_llm: true,
+            context: Some(context),
+        },
+        provider_cleaned_candidate,
+        diagnostic,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub fn insert_history_with_delivery_and_spool_and_cleanup(
     dir: &Path,
     raw: &str,
@@ -2330,22 +3309,22 @@ pub fn insert_history_with_delivery_and_spool_and_cleanup(
     spool: Option<&Path>,
     cleanup_status: &str,
 ) -> anyhow::Result<()> {
-    insert_history_with_status(InsertHistory {
+    insert_history_with_asr_and_delivery_and_spool_and_cleanup(
         dir,
         raw,
+        None,
         final_text,
-        cleanup_status: Some(cleanup_status),
         duration,
         degraded,
         degraded_reason,
-        status: status.to_owned(),
-        delivery_method: Some(delivery_method),
+        status,
+        delivery_method,
         fallback_reason,
+        context,
         spool,
-        count_asr: true,
-        count_llm: true,
-        context: Some(context),
-    })
+        "unknown",
+        cleanup_status,
+    )
 }
 #[cfg(test)]
 #[allow(dead_code)]
@@ -2358,6 +3337,8 @@ pub fn insert_failed_history(
     insert_history_with_status(InsertHistory {
         dir,
         raw,
+        asr_text: None,
+        engine: None,
         final_text: "",
         cleanup_status: None,
         duration,
@@ -2379,10 +3360,13 @@ pub fn insert_failed_history_with_context(
     duration: f64,
     spool: Option<&Path>,
     context: &crate::context::ContextSnapshot,
+    engine: &str,
 ) -> anyhow::Result<()> {
     insert_history_with_status(InsertHistory {
         dir,
         raw,
+        asr_text: None,
+        engine: Some(engine),
         final_text: "",
         cleanup_status: None,
         duration,
@@ -2398,9 +3382,19 @@ pub fn insert_failed_history_with_context(
     })
 }
 fn insert_history_with_status(input: InsertHistory) -> anyhow::Result<()> {
+    insert_history_with_status_and_candidate(input, None, None)
+}
+
+fn insert_history_with_status_and_candidate(
+    input: InsertHistory,
+    provider_cleaned_candidate: Option<&str>,
+    diagnostic: Option<&crate::delivery_diagnostics::DeliveryDiagnostic>,
+) -> anyhow::Result<()> {
     let InsertHistory {
         dir,
         raw,
+        asr_text,
+        engine,
         final_text,
         cleanup_status,
         duration,
@@ -2417,7 +3411,7 @@ fn insert_history_with_status(input: InsertHistory) -> anyhow::Result<()> {
     let c = open_history(dir)?;
     let context_profile_id = context.map(|snapshot| snapshot.profile.id.as_str());
     let context_policy_json = context
-        .map(|snapshot| serde_json::to_string(&snapshot.policy))
+        .map(|snapshot| serde_json::to_string(&snapshot.policy.history_metadata()))
         .transpose()?;
     let context_family =
         context.map(|snapshot| crate::context::family_id(snapshot.profile.family).to_owned());
@@ -2430,12 +3424,13 @@ fn insert_history_with_status(input: InsertHistory) -> anyhow::Result<()> {
             snapshot.target_guard.bundle_id.clone()
         }
     });
-    c.execute("INSERT INTO dictations (created_at,duration_secs,raw_text,final_text,cleanup_status,engine,degraded,degraded_reason,status,raw_audio_path,delivery_method,fallback_reason,context_profile_id,context_policy_json,context_family,context_browser_host,context_native_bundle) VALUES (datetime('now'),?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", params![duration, raw, final_text, cleanup_status, "groq", degraded as i32, degraded_reason, status, spool.map(|p| p.to_string_lossy().to_string()), delivery_method, fallback_reason, context_profile_id, context_policy_json, context_family, context_browser_host, context_native_bundle])?;
+    c.execute("INSERT INTO dictations (created_at,duration_secs,raw_text,final_text,cleanup_status,engine,degraded,degraded_reason,status,raw_audio_path,delivery_method,fallback_reason,context_profile_id,context_policy_json,context_family,context_browser_host,context_native_bundle,asr_text,provider_cleaned_candidate,delivery_error_code,delivery_user_reason) VALUES (datetime('now'),?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", params![duration, raw, final_text, cleanup_status, engine.unwrap_or("unknown"), degraded as i32, degraded_reason, status, spool.map(|p| p.to_string_lossy().to_string()), delivery_method, fallback_reason, context_profile_id, context_policy_json, context_family, context_browser_host, context_native_bundle, asr_text, provider_cleaned_candidate, diagnostic.map(|item| item.code), diagnostic.map(|item| item.user_reason)])?;
     if count_asr || count_llm {
         c.execute("INSERT INTO usage(day,asr_requests,llm_requests,audio_seconds) VALUES (date('now'),?,?,?) ON CONFLICT(day) DO UPDATE SET asr_requests=asr_requests+excluded.asr_requests,llm_requests=llm_requests+excluded.llm_requests,audio_seconds=audio_seconds+excluded.audio_seconds", params![count_asr as i64, count_llm as i64, duration])?;
     }
     Ok(())
 }
+#[cfg(test)]
 pub fn get_usage(dir: &Path, quota: QuotaView) -> anyhow::Result<Usage> {
     let c = open_history(dir)?;
     let row = match c.query_row(
@@ -2466,30 +3461,13 @@ pub fn get_history_page(
     let search_pattern = query
         .filter(|value| !value.is_empty())
         .map(|value| format!("%{}%", escape_history_search(value)));
-    let sql = match (before_id.is_some(), search_pattern.is_some()) {
-        (true, true) => "SELECT id,created_at,COALESCE(raw_text,''),COALESCE((SELECT final_text FROM dictation_revisions WHERE dictation_id=dictations.id ORDER BY revision_id DESC LIMIT 1),final_text,''),COALESCE(duration_secs,0),COALESCE(degraded,0),degraded_reason,COALESCE(status,'ok'),delivery_method,fallback_reason,context_profile_id,raw_audio_path,COALESCE(cleanup_status,'unknown'),(SELECT COUNT(*) FROM dictation_revisions WHERE dictation_id=dictations.id),verbatim_text,COALESCE(verbatim_reviewed,0) FROM dictations WHERE id < ? AND (COALESCE(raw_text,'') LIKE ? ESCAPE '\\' OR COALESCE((SELECT final_text FROM dictation_revisions WHERE dictation_id=dictations.id ORDER BY revision_id DESC LIMIT 1),final_text,'') LIKE ? ESCAPE '\\') ORDER BY id DESC LIMIT ?",
-        (true, false) => "SELECT id,created_at,COALESCE(raw_text,''),COALESCE((SELECT final_text FROM dictation_revisions WHERE dictation_id=dictations.id ORDER BY revision_id DESC LIMIT 1),final_text,''),COALESCE(duration_secs,0),COALESCE(degraded,0),degraded_reason,COALESCE(status,'ok'),delivery_method,fallback_reason,context_profile_id,raw_audio_path,COALESCE(cleanup_status,'unknown'),(SELECT COUNT(*) FROM dictation_revisions WHERE dictation_id=dictations.id),verbatim_text,COALESCE(verbatim_reviewed,0) FROM dictations WHERE id < ? ORDER BY id DESC LIMIT ?",
-        (false, true) => "SELECT id,created_at,COALESCE(raw_text,''),COALESCE((SELECT final_text FROM dictation_revisions WHERE dictation_id=dictations.id ORDER BY revision_id DESC LIMIT 1),final_text,''),COALESCE(duration_secs,0),COALESCE(degraded,0),degraded_reason,COALESCE(status,'ok'),delivery_method,fallback_reason,context_profile_id,raw_audio_path,COALESCE(cleanup_status,'unknown'),(SELECT COUNT(*) FROM dictation_revisions WHERE dictation_id=dictations.id),verbatim_text,COALESCE(verbatim_reviewed,0) FROM dictations WHERE (COALESCE(raw_text,'') LIKE ? ESCAPE '\\' OR COALESCE((SELECT final_text FROM dictation_revisions WHERE dictation_id=dictations.id ORDER BY revision_id DESC LIMIT 1),final_text,'') LIKE ? ESCAPE '\\') ORDER BY id DESC LIMIT ?",
-        (false, false) => "SELECT id,created_at,COALESCE(raw_text,''),COALESCE((SELECT final_text FROM dictation_revisions WHERE dictation_id=dictations.id ORDER BY revision_id DESC LIMIT 1),final_text,''),COALESCE(duration_secs,0),COALESCE(degraded,0),degraded_reason,COALESCE(status,'ok'),delivery_method,fallback_reason,context_profile_id,raw_audio_path,COALESCE(cleanup_status,'unknown'),(SELECT COUNT(*) FROM dictation_revisions WHERE dictation_id=dictations.id),verbatim_text,COALESCE(verbatim_reviewed,0) FROM dictations ORDER BY id DESC LIMIT ?",
-    };
-    let mut s = c.prepare(sql)?;
-    let mut items = match (before_id, search_pattern.as_deref()) {
-        (Some(before_id), Some(pattern)) => s
-            .query_map(
-                params![before_id, pattern, pattern, fetch_limit],
-                history_row(dir),
-            )?
-            .collect::<Result<Vec<_>, _>>()?,
-        (Some(before_id), None) => s
-            .query_map(params![before_id, fetch_limit], history_row(dir))?
-            .collect::<Result<Vec<_>, _>>()?,
-        (None, Some(pattern)) => s
-            .query_map(params![pattern, pattern, fetch_limit], history_row(dir))?
-            .collect::<Result<Vec<_>, _>>()?,
-        (None, None) => s
-            .query_map([fetch_limit], history_row(dir))?
-            .collect::<Result<Vec<_>, _>>()?,
-    };
+    let mut s = c.prepare("SELECT id,created_at,COALESCE(raw_text,''),COALESCE((SELECT final_text FROM dictation_revisions WHERE dictation_id=dictations.id ORDER BY revision_id DESC LIMIT 1),final_text,''),COALESCE(duration_secs,0),COALESCE(degraded,0),degraded_reason,COALESCE(status,'ok'),delivery_method,fallback_reason,context_profile_id,raw_audio_path,COALESCE(cleanup_status,'unknown'),(SELECT COUNT(*) FROM dictation_revisions WHERE dictation_id=dictations.id),verbatim_text,COALESCE(verbatim_reviewed,0),asr_text,engine,provider_cleaned_candidate,delivery_error_code,delivery_user_reason FROM dictations WHERE (?1 IS NULL OR id < ?1) AND (?2 IS NULL OR (COALESCE(raw_text,'') LIKE ?2 ESCAPE '\\' OR COALESCE(asr_text,'') LIKE ?2 ESCAPE '\\' OR COALESCE(provider_cleaned_candidate,'') LIKE ?2 ESCAPE '\\' OR COALESCE((SELECT final_text FROM dictation_revisions WHERE dictation_id=dictations.id ORDER BY revision_id DESC LIMIT 1),final_text,'') LIKE ?2 ESCAPE '\\')) ORDER BY id DESC LIMIT ?3")?;
+    let mut items = s
+        .query_map(
+            params![before_id, search_pattern.as_deref(), fetch_limit],
+            history_row(dir),
+        )?
+        .collect::<Result<Vec<_>, _>>()?;
     let has_more = items.len() > limit as usize;
     items.truncate(limit as usize);
     Ok(HistoryPage { items, has_more })
@@ -2538,6 +3516,11 @@ fn history_row<'a>(
             has_audio,
             verbatim_text,
             verbatim_reviewed: r.get::<_, i32>(15)? != 0,
+            asr_text: r.get(16)?,
+            engine: r.get(17)?,
+            provider_cleaned_candidate: r.get(18)?,
+            delivery_error_code: r.get(19)?,
+            delivery_user_reason: r.get(20)?,
         })
     }
 }
@@ -2548,7 +3531,13 @@ pub fn get_history(dir: &Path, limit: i64) -> anyhow::Result<Vec<HistoryItem>> {
 }
 
 pub fn purge_history(dir: &Path, keep_history_days: u64) -> anyhow::Result<usize> {
-    // Zero is the explicit "keep forever" setting for history text.
+    let backup_days = if keep_history_days == 0 {
+        HISTORY_MIGRATION_BACKUP_MAX_DAYS
+    } else {
+        keep_history_days.min(HISTORY_MIGRATION_BACKUP_MAX_DAYS)
+    };
+    prune_history_migration_backups(dir, Some(backup_days), SystemTime::now())?;
+    // Zero is the explicit "keep forever" setting for live history text.
     if keep_history_days == 0 {
         return Ok(0);
     }
@@ -2650,6 +3639,7 @@ fn learn_pair_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LearnPairRec
     })
 }
 
+#[cfg(test)]
 pub fn upsert_learn_pair(
     dir: &Path,
     pair_key: &str,
@@ -2837,6 +3827,40 @@ pub fn list_learn_pairs(dir: &Path) -> anyhow::Result<Vec<LearnPairRecord>> {
     rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
 }
 
+#[derive(Clone, Serialize)]
+pub struct LearnedTermUsage {
+    pub word: String,
+    pub replacement_runs: u64,
+    pub last_replaced_at: String,
+}
+
+/// One observation per distinct corrected term in one local processing pass.
+pub fn record_learned_term_usage(dir: &Path, words: &[String]) -> anyhow::Result<()> {
+    if words.is_empty() {
+        return Ok(());
+    }
+    let mut c = open_history(dir)?;
+    let transaction = c.transaction()?;
+    for word in words.iter().collect::<std::collections::BTreeSet<_>>() {
+        transaction.execute("INSERT INTO learned_term_usage (word, replacement_runs, last_replaced_at) VALUES (?1, 1, datetime('now')) ON CONFLICT(word) DO UPDATE SET replacement_runs = replacement_runs + 1, last_replaced_at = datetime('now')", [word])?;
+    }
+    transaction.commit()?;
+    Ok(())
+}
+
+pub fn list_learned_term_usage(dir: &Path) -> anyhow::Result<Vec<LearnedTermUsage>> {
+    let c = open_history(dir)?;
+    let mut statement = c.prepare("SELECT word, replacement_runs, last_replaced_at FROM learned_term_usage WHERE EXISTS (SELECT 1 FROM learn_pairs WHERE after_surface = word AND promoted = 1 AND ignored = 0 AND tombstoned_at IS NULL) ORDER BY last_replaced_at DESC, word ASC")?;
+    let rows = statement.query_map([], |row| {
+        Ok(LearnedTermUsage {
+            word: row.get(0)?,
+            replacement_runs: row.get(1)?,
+            last_replaced_at: row.get(2)?,
+        })
+    })?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
 pub fn upsert_style_draft(
     dir: &Path,
     mapping_id: &str,
@@ -2917,8 +3941,11 @@ pub fn delete_style_draft(dir: &Path, draft_key: &str) -> anyhow::Result<bool> {
 
 pub fn clear_all_data(dir: &Path) -> anyhow::Result<()> {
     let c = open_history(dir)?;
-    c.execute_batch("DELETE FROM dictations; DELETE FROM usage; DELETE FROM learn_pairs; DELETE FROM style_drafts;")?;
+    c.execute_batch("DELETE FROM dictations; DELETE FROM usage; DELETE FROM learn_pairs; DELETE FROM style_drafts; DELETE FROM learned_term_usage;")?;
     drop(c);
+    // Run after open_history: clearing a legacy database can itself create a
+    // rollback copy, which must not retain the very text the user cleared.
+    prune_history_migration_backups(dir, None, SystemTime::now())?;
     let spool = dir.join("spool");
     if spool.exists() {
         fs::remove_dir_all(&spool)?;
@@ -2994,6 +4021,7 @@ impl HistoryScene {
     }
 }
 
+#[cfg(test)]
 pub fn history_context(
     dir: &Path,
     id: i64,
@@ -3051,7 +4079,10 @@ pub fn save_history_revision(
     }
     let c = open_history(dir)?;
     let intent_json = intent.map(serde_json::to_string).transpose()?;
-    let context_policy_json = context_policy.map(serde_json::to_string).transpose()?;
+    let context_policy_json = context_policy
+        .map(crate::context::ContextPolicy::history_metadata)
+        .map(|policy| serde_json::to_string(&policy))
+        .transpose()?;
     c.execute(
         "INSERT INTO dictation_revisions (dictation_id,created_at,final_text,cleanup_status,intent_json,model,context_policy_json,revision_reason) SELECT ?,datetime('now'),?,?,?,?,?,? WHERE EXISTS (SELECT 1 FROM dictations WHERE id=?)",
         params![
@@ -3102,13 +4133,28 @@ pub fn mark_retried(
     degraded: bool,
     degraded_reason: Option<&str>,
 ) -> anyhow::Result<()> {
-    mark_retried_with_texts(dir, id, None, final_text, degraded, degraded_reason, None)
+    mark_retried_with_texts(
+        dir,
+        id,
+        None,
+        None,
+        None,
+        final_text,
+        degraded,
+        degraded_reason,
+        None,
+    )
 }
 
+// Keep the persisted transcript, provider-original transcript, and delivery
+// status explicit at this history boundary.
+#[allow(clippy::too_many_arguments)]
 pub fn mark_retried_with_texts(
     dir: &Path,
     id: i64,
     raw_text: Option<&str>,
+    asr_text: Option<&str>,
+    engine: Option<&str>,
     final_text: &str,
     degraded: bool,
     degraded_reason: Option<&str>,
@@ -3120,12 +4166,14 @@ pub fn mark_retried_with_texts(
         params![id, final_text, cleanup_status, "retry", id],
     )?;
     c.execute(
-        "UPDATE dictations SET status=?, degraded=?, degraded_reason=?, raw_text=COALESCE(?,raw_text), cleanup_status=COALESCE(?,cleanup_status), raw_audio_path=NULL, delivery_method='clipboard', fallback_reason='retry_clipboard_only' WHERE id=?",
+        "UPDATE dictations SET status=?, degraded=?, degraded_reason=?, raw_text=COALESCE(?,raw_text), asr_text=COALESCE(?,asr_text), engine=COALESCE(?,engine), cleanup_status=COALESCE(?,cleanup_status), raw_audio_path=NULL, delivery_method='clipboard', fallback_reason='retry_clipboard_only', delivery_error_code=NULL, delivery_user_reason=NULL WHERE id=?",
         params![
             if degraded { "degraded" } else { "copied" },
             degraded as i32,
             degraded_reason,
             raw_text,
+            asr_text,
+            engine,
             cleanup_status,
             id
         ],
@@ -3148,6 +4196,8 @@ pub fn record_recovered_history(dir: &Path, recovery: &RecoveredSpool) -> anyhow
     insert_history_with_status(InsertHistory {
         dir,
         raw: "",
+        asr_text: None,
+        engine: None,
         final_text: "",
         cleanup_status: None,
         duration: recovery.duration_secs,
@@ -3183,6 +4233,7 @@ pub fn remove_spool_artifact(dir: &Path, path: &Path) {
     }
 }
 
+#[cfg(test)]
 pub fn history_audio_bytes(dir: &Path, id: i64) -> anyhow::Result<Vec<u8>> {
     let c = open_history(dir)?;
     let path: Option<String> = c
@@ -3201,6 +4252,7 @@ pub fn history_audio_bytes(dir: &Path, id: i64) -> anyhow::Result<Vec<u8>> {
     read_spool_file(path)
 }
 
+#[cfg(test)]
 pub fn save_verbatim(dir: &Path, id: i64, text: &str, reviewed: bool) -> anyhow::Result<()> {
     let trimmed = text.trim();
     if reviewed && trimmed.is_empty() {
@@ -3382,7 +4434,7 @@ pub fn update_history_revision_state(
 ) -> anyhow::Result<()> {
     let c = open_history(dir)?;
     c.execute(
-        "UPDATE dictations SET status=?,degraded=?,degraded_reason=?,cleanup_status=COALESCE(?,cleanup_status),delivery_method='clipboard',fallback_reason=NULL WHERE id=?",
+        "UPDATE dictations SET status=?,degraded=?,degraded_reason=?,cleanup_status=COALESCE(?,cleanup_status),delivery_method='clipboard',fallback_reason=NULL,delivery_error_code=NULL,delivery_user_reason=NULL WHERE id=?",
         params![status, degraded as i32, degraded_reason, cleanup_status, id],
     )?;
     if c.changes() == 0 {
@@ -3410,6 +4462,77 @@ pub fn delete_history(dir: &Path, id: i64) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
+
+    #[derive(Default)]
+    struct FakeCredentialBackend {
+        values: RefCell<std::collections::BTreeMap<String, String>>,
+        read_scripts: RefCell<
+            std::collections::BTreeMap<
+                String,
+                std::collections::VecDeque<crate::keychain::ApiKeyState>,
+            >,
+        >,
+        write_errors: RefCell<std::collections::BTreeMap<String, String>>,
+        writes: RefCell<Vec<(String, String)>>,
+    }
+
+    impl FakeCredentialBackend {
+        fn seed(&self, slot: &str, key: &str) {
+            self.values
+                .borrow_mut()
+                .insert(slot.to_owned(), key.to_owned());
+        }
+
+        fn fail_write(&self, slot: &str, error: &str) {
+            self.write_errors
+                .borrow_mut()
+                .insert(slot.to_owned(), error.to_owned());
+        }
+
+        fn script_reads(
+            &self,
+            slot: &str,
+            states: impl IntoIterator<Item = crate::keychain::ApiKeyState>,
+        ) {
+            self.read_scripts
+                .borrow_mut()
+                .insert(slot.to_owned(), states.into_iter().collect());
+        }
+    }
+
+    impl CredentialBackend for FakeCredentialBackend {
+        fn read(&self, slot: &str) -> crate::keychain::ApiKeyState {
+            if let Some(state) = self
+                .read_scripts
+                .borrow_mut()
+                .get_mut(slot)
+                .and_then(std::collections::VecDeque::pop_front)
+            {
+                return state;
+            }
+            self.values
+                .borrow()
+                .get(slot)
+                .cloned()
+                .map(crate::keychain::ApiKeyState::Configured)
+                .unwrap_or(crate::keychain::ApiKeyState::Missing)
+        }
+
+        fn write(&self, slot: &str, key: &str) -> Result<(), String> {
+            self.writes
+                .borrow_mut()
+                .push((slot.to_owned(), key.to_owned()));
+            if let Some(error) = self.write_errors.borrow().get(slot) {
+                return Err(error.clone());
+            }
+            self.values
+                .borrow_mut()
+                .insert(slot.to_owned(), key.to_owned());
+            Ok(())
+        }
+    }
+
     fn temp_dir(name: &str) -> std::path::PathBuf {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -3422,6 +4545,27 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         dir
     }
+
+    fn write_spool_f32_chunk(root: &Path, session_id: &str, index: usize, samples: &[f32]) {
+        let mut bytes = Vec::with_capacity(std::mem::size_of_val(samples));
+        for sample in samples {
+            bytes.extend_from_slice(&sample.to_le_bytes());
+        }
+        let relative = PathBuf::from(session_id)
+            .join("chunks")
+            .join(format!("{index:08}.f32"));
+        write_spool_file(root, &relative, &bytes).unwrap();
+    }
+
+    fn decode_wav_samples(path: &Path) -> Vec<i16> {
+        let wav = read_spool_file(path).unwrap();
+        hound::WavReader::new(std::io::Cursor::new(wav))
+            .unwrap()
+            .into_samples::<i16>()
+            .map(Result::unwrap)
+            .collect()
+    }
+
     #[test]
     fn usage_upsert_by_day() {
         let dir = temp_dir("usage");
@@ -3435,9 +4579,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
     #[test]
-    fn schema_19_defaults_cleanup_intensity_heavy() {
+    fn schema_20_defaults_cleanup_intensity_auto() {
         let settings = Settings::default();
-        assert_eq!(settings.cleanup_intensity, "heavy");
+        assert_eq!(settings.cleanup_intensity, "auto");
         assert_eq!(settings.cascade_timeout_ms, 5000);
         assert_eq!(settings.cascade_proper_noun_threshold, 3);
         assert!(settings.accurate_asr_model.is_empty());
@@ -3445,9 +4589,9 @@ mod tests {
             settings.accurate_asr_provider,
             crate::engine::EngineProvider::Groq
         );
-        assert_eq!(settings.schema_version, 19);
+        assert_eq!(settings.schema_version, SETTINGS_SCHEMA_VERSION);
         let view = SettingsView::from(&settings);
-        assert_eq!(view.cleanup_intensity, "heavy");
+        assert_eq!(view.cleanup_intensity, "auto");
         assert_eq!(view.cascade_timeout_ms, 5000);
         assert_eq!(view.cascade_proper_noun_threshold, 3);
         assert!(view.accurate_asr_model.is_empty());
@@ -3460,6 +4604,17 @@ mod tests {
         assert!(!settings.vision_configured());
         assert!(view.screen_action_hotkey.is_empty());
         assert!(view.vision_model.is_empty());
+    }
+    #[test]
+    fn migration_keeps_an_explicit_saved_cleanup_intensity() {
+        let mut settings = Settings {
+            schema_version: 19,
+            cleanup_intensity: "heavy".into(),
+            ..Settings::default()
+        };
+        settings.normalize();
+        assert_eq!(settings.schema_version, SETTINGS_SCHEMA_VERSION);
+        assert_eq!(settings.cleanup_intensity, "heavy");
     }
 
     #[test]
@@ -3474,15 +4629,20 @@ mod tests {
             .insert("openai".into(), "sk-accurate".into());
         assert!(settings.accurate_asr_configured());
         assert_eq!(settings.accurate_asr_credential(), "sk-accurate");
-        assert!(settings.accurate_asr_endpoint().contains("transcriptions"));
+        assert!(settings
+            .accurate_asr_endpoint()
+            .expect("HTTP accurate endpoint")
+            .contains("transcriptions"));
     }
 
     #[test]
     fn accurate_asr_configured_requires_nonempty_credential() {
-        let mut settings = Settings::default();
-        settings.api_key = "gsk-groq".into();
-        settings.accurate_asr_provider = crate::engine::EngineProvider::Custom;
-        settings.accurate_asr_model = "qwen3-asr-flash".into();
+        let mut settings = Settings {
+            api_key: "gsk-groq".into(),
+            accurate_asr_provider: crate::engine::EngineProvider::Custom,
+            accurate_asr_model: "qwen3-asr-flash".into(),
+            ..Settings::default()
+        };
         assert_eq!(settings.accurate_asr_credential().trim(), "");
         assert!(!settings.accurate_asr_configured());
 
@@ -3507,8 +4667,10 @@ mod tests {
 
     #[test]
     fn vision_configured_needs_provider_model_and_key() {
-        let mut settings = Settings::default();
-        settings.vision_model = "gpt-4o".into();
+        let mut settings = Settings {
+            vision_model: "gpt-4o".into(),
+            ..Settings::default()
+        };
         assert!(!settings.vision_configured());
         settings.vision_provider = "openai".into();
         assert!(!settings.vision_configured());
@@ -3521,8 +4683,115 @@ mod tests {
         assert!(settings.vision_configured());
     }
 
+    fn write_sensevoice_fixture(models_root: &Path) {
+        let dir = models_root.join("sensevoice-small");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("model.int8.onnx"), b"fixture-onnx").unwrap();
+        std::fs::write(dir.join("tokens.txt"), b"fixture-tokens").unwrap();
+        std::fs::write(
+            crate::ondevice_asr::archive_sha_path(models_root, "sensevoice-small"),
+            crate::ondevice_models::SENSEVOICE_ARCHIVE_SHA256,
+        )
+        .unwrap();
+    }
+
+    fn on_device_settings(onboarded: bool) -> Settings {
+        Settings {
+            asr_provider: crate::engine::EngineProvider::OnDevice,
+            asr_model: "sensevoice-small".into(),
+            api_key: String::new(),
+            onboarded,
+            cleanup_enabled: false,
+            ..Settings::default()
+        }
+    }
+
     #[test]
-    fn schema_19_copies_legacy_style_example_into_pairs() {
+    fn on_device_files_ready_do_not_allow_onboarding_without_inference() {
+        let dir = temp_dir("on-device-ready-validate");
+        let models_root = dir.join("models");
+        write_sensevoice_fixture(&models_root);
+        let settings = on_device_settings(true);
+        assert!(settings
+            .validate_with_models_root(Some(&models_root))
+            .is_err());
+        assert!(!settings.on_device_asr_ready(Some(&models_root)));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn onboarded_on_device_empty_groq_key_rejected_when_model_missing() {
+        let dir = temp_dir("on-device-missing-validate");
+        let models_root = dir.join("models");
+        std::fs::create_dir_all(&models_root).unwrap();
+        let settings = on_device_settings(true);
+        assert!(settings
+            .validate_with_models_root(Some(&models_root))
+            .is_err());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn validate_without_models_root_rejects_on_device_empty_key() {
+        let dir = temp_dir("on-device-validate-no-root");
+        write_sensevoice_fixture(&dir.join("models"));
+        let settings = on_device_settings(true);
+        assert!(
+            settings.validate().is_err(),
+            "validate() must not grant the empty-key exception without a Ready check"
+        );
+        assert!(settings.validate_with_models_root(None).is_err());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn load_settings_does_not_keep_onboarding_for_files_only_on_device() {
+        let dir = temp_dir("on-device-load-ready");
+        std::fs::create_dir_all(&dir).unwrap();
+        write_sensevoice_fixture(&dir.join("models"));
+        std::fs::write(
+            dir.join("settings.json"),
+            r#"{"schema_version":19,"onboarded":true,"asr_provider":"on_device","asr_model":"sensevoice-small","cleanup_enabled":false}"#,
+        )
+        .unwrap();
+        let (settings, _) = load_settings(&dir);
+        assert_eq!(
+            settings.asr_provider,
+            crate::engine::EngineProvider::OnDevice
+        );
+        assert!(!settings.onboarded);
+        assert!(settings.api_key.trim().is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn vision_and_cleanup_reject_on_device() {
+        let mut settings = on_device_settings(false);
+        settings.cleanup_enabled = true;
+        settings.cleanup_provider = crate::engine::EngineProvider::OnDevice;
+        settings.cleanup_model = "llama3.2".into();
+        assert!(settings.validate().is_err());
+
+        settings.cleanup_enabled = false;
+        settings.vision_provider = "on_device".into();
+        settings.vision_model = "sensevoice-small".into();
+        assert!(!settings.vision_configured());
+        assert!(settings.vision_endpoint().is_none());
+    }
+
+    #[test]
+    fn accurate_asr_rejects_on_device_and_empty_key() {
+        let settings = Settings {
+            accurate_asr_provider: crate::engine::EngineProvider::OnDevice,
+            accurate_asr_model: "sensevoice-small".into(),
+            ..Settings::default()
+        };
+        assert!(!settings.accurate_asr_configured());
+        assert!(settings.accurate_asr_endpoint().is_none());
+    }
+
+    #[test]
+    fn schema_20_copies_legacy_style_example_into_pairs() {
         let mut settings = Settings {
             cleanup_intensity: String::new(),
             cascade_timeout_ms: 0,
@@ -3535,9 +4804,13 @@ mod tests {
                 bundle_id: Some("com.tencent.xinWeChat".into()),
                 executable: None,
                 browser_host: None,
+                browser_path_prefix: None,
+                focused_field: None,
+                source_permissions: Default::default(),
                 style_example_input: Some("好的哈哈".into()),
                 style_example_output: Some("好的哈哈。".into()),
                 style_example_pairs: Vec::new(),
+                style_examples_approved: false,
                 enabled: true,
                 cleanup_effort: None,
                 cleanup_intensity: None,
@@ -3547,7 +4820,7 @@ mod tests {
             ..Settings::default()
         };
         settings.normalize();
-        assert_eq!(settings.cleanup_intensity, "heavy");
+        assert_eq!(settings.cleanup_intensity, "auto");
         assert_eq!(settings.cascade_timeout_ms, 5000);
         assert_eq!(settings.cascade_proper_noun_threshold, 3);
         assert_eq!(settings.context_mappings[0].style_example_pairs.len(), 1);
@@ -3562,6 +4835,51 @@ mod tests {
     }
 
     #[test]
+    fn schema_20_preserves_only_explicit_legacy_local_ocr_choice() {
+        let mapping = crate::context::AppMapping {
+            id: "notes".into(),
+            label: "Notes".into(),
+            family: crate::context::ContextFamily::Document,
+            mode_id: None,
+            bundle_id: Some("com.example.Notes".into()),
+            executable: None,
+            browser_host: None,
+            browser_path_prefix: None,
+            focused_field: None,
+            source_permissions: Default::default(),
+            style_example_input: None,
+            style_example_output: None,
+            style_example_pairs: Vec::new(),
+            style_examples_approved: false,
+            enabled: true,
+            cleanup_effort: None,
+            cleanup_intensity: None,
+            cleanup_enabled: true,
+            dictionary_learn_enabled: true,
+        };
+        let mut settings = Settings {
+            schema_version: 20,
+            window_ocr_enabled: true,
+            context_mappings: vec![mapping],
+            ..Settings::default()
+        };
+        settings.normalize();
+        let grants = settings.context_mappings[0].source_permissions;
+        assert!(grants.local_ocr);
+        assert!(!grants.ax_text);
+        assert!(!grants.cloud_vision);
+        assert!(!grants.context_text_to_providers);
+
+        let legacy: crate::context::AppMapping = serde_json::from_str(
+            r#"{"id":"legacy","label":"Legacy","family":"document","bundle_id":"com.example.Editor","style_example_input":"private","style_example_output":"private."}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.style_example_input.as_deref(), Some("private"));
+        assert!(!legacy.style_examples_approved);
+        assert_eq!(legacy.source_permissions, Default::default());
+    }
+
+    #[test]
     fn old_settings_get_new_defaults() {
         let dir = temp_dir("settings");
         std::fs::create_dir_all(&dir).unwrap();
@@ -3573,7 +4891,7 @@ mod tests {
         let (settings, _) = load_settings(&dir);
         assert!(!settings.onboarded);
         assert!(settings.cleanup_enabled);
-        assert_eq!(settings.cleanup_intensity, "heavy");
+        assert_eq!(settings.cleanup_intensity, "auto");
         assert_eq!(settings.cascade_timeout_ms, 5000);
         assert_eq!(settings.cascade_proper_noun_threshold, 3);
         assert!(settings.accurate_asr_model.is_empty());
@@ -3654,49 +4972,118 @@ mod tests {
     }
 
     #[test]
-    fn hold_combo_hotkey_migrates_to_hybrid() {
-        let mut settings = Settings {
-            activation_mode: "hold".into(),
-            hotkey: "CmdOrControl+Shift+Space".into(),
-            ..Settings::default()
-        };
-        settings.normalize();
-        assert_eq!(settings.activation_mode, "hybrid");
-        settings.validate().unwrap();
+    fn schema_25_migrates_retired_gestures_to_tap_idempotently_without_rebinding() {
+        for mode in ["double_tap", "hybrid", "hold", "tap"] {
+            for hotkey in ["Fn", "CmdOrControl+Alt+K", "Shift"] {
+                let mut settings = Settings {
+                    schema_version: 24,
+                    activation_mode: mode.into(),
+                    hotkey: hotkey.into(),
+                    ..Settings::default()
+                };
+                settings.normalize();
+                assert_eq!(settings.schema_version, 25);
+                assert_eq!(settings.activation_mode, "tap");
+                assert_eq!(settings.hotkey, hotkey);
+                settings.normalize();
+                assert_eq!(settings.activation_mode, "tap");
+                settings.validate().unwrap();
+            }
+        }
     }
-
     #[test]
-    fn hold_modifier_hotkey_still_migrates_to_double_tap() {
-        let mut settings = Settings {
-            activation_mode: "hold".into(),
-            hotkey: "Fn".into(),
-            ..Settings::default()
-        };
-        settings.normalize();
-        assert_eq!(settings.activation_mode, "double_tap");
+    fn both_current_modes_support_fn_and_combinations() {
+        assert_eq!(Settings::default().activation_mode, "tap");
+        for mode in ["tap", "hold_to_talk"] {
+            for hotkey in ["Fn", "CmdOrControl+Alt+Space"] {
+                let mut settings = Settings {
+                    activation_mode: mode.into(),
+                    hotkey: hotkey.into(),
+                    ..Settings::default()
+                };
+                settings.normalize();
+                assert_eq!(settings.activation_mode, mode);
+                settings.validate().unwrap();
+            }
+        }
     }
-
     #[test]
-    fn hybrid_combo_survives_normalize_and_validate() {
-        let mut settings = Settings {
-            activation_mode: "hybrid".into(),
-            hotkey: "CmdOrControl+Shift+Space".into(),
+    fn changing_binding_preserves_mode_and_rejects_new_standalone_modifiers() {
+        let previous = Settings {
+            activation_mode: "hold_to_talk".into(),
             ..Settings::default()
         };
-        settings.normalize();
-        assert_eq!(settings.activation_mode, "hybrid");
-        settings.validate().unwrap();
+        let mut next = previous.clone();
+        next.hotkey = "Fn".into();
+        next.validate_binding_changes(&previous).unwrap();
+        assert_eq!(next.activation_mode, "hold_to_talk");
+        next.hotkey = "Shift".into();
+        assert!(next.validate_binding_changes(&previous).is_err());
+        let legacy = next.clone();
+        next.validate_binding_changes(&legacy).unwrap();
     }
-
     #[test]
-    fn hybrid_modifier_only_is_forced_to_double_tap() {
-        let mut settings = Settings {
-            activation_mode: "hybrid".into(),
-            hotkey: "Command".into(),
+    fn new_global_bindings_do_not_take_over_typing_or_navigation() {
+        let previous = Settings::default();
+        for binding in ["A", "Enter", "Tab", "Space", "Shift+A", "Shift+Space"] {
+            let mut next = previous.clone();
+            next.hotkey = binding.into();
+            next.validate_bindings().unwrap();
+            assert!(
+                next.validate_binding_changes(&previous).is_err(),
+                "{binding}"
+            );
+            next.hotkey = previous.hotkey.clone();
+            next.selected_action_hotkey = binding.into();
+            assert!(
+                next.validate_binding_changes(&previous).is_err(),
+                "{binding}"
+            );
+        }
+    }
+    #[test]
+    fn new_combinations_and_function_keys_remain_available() {
+        let previous = Settings::default();
+        for binding in [
+            "Fn",
+            "CmdOrControl+Shift+1",
+            "Alt+A",
+            "Control+K",
+            "F13",
+            "Shift+F13",
+        ] {
+            let mut next = previous.clone();
+            next.hotkey = binding.into();
+            next.validate_binding_changes(&previous).unwrap();
+        }
+    }
+    #[test]
+    fn mode_changes_preserve_existing_plain_key_bindings() {
+        let previous = Settings {
+            hotkey: "Shift+A".into(),
             ..Settings::default()
         };
-        settings.normalize();
-        assert_eq!(settings.activation_mode, "double_tap");
+        let mut next = previous.clone();
+        next.activation_mode = "hold_to_talk".into();
+        next.validate_binding_changes(&previous).unwrap();
+        assert_eq!(next.hotkey, "Shift+A");
+    }
+    #[test]
+    fn configuration_validation_allows_missing_unchanged_keys_but_readiness_does_not() {
+        let settings = Settings {
+            onboarded: true,
+            activation_mode: "hold_to_talk".into(),
+            ..Settings::default()
+        };
+        assert!(settings.validate_configuration().is_ok());
+        assert!(settings.validate().is_err());
+        let dir = temp_dir("binding-without-key");
+        let backend = FakeCredentialBackend::default();
+        save_settings_with_validation(&dir, &settings, &backend, false).unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join("settings.json")).unwrap()).unwrap();
+        assert_eq!(saved["activation_mode"], "hold_to_talk");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -3786,17 +5173,18 @@ mod tests {
     }
 
     #[test]
-    fn invalid_selected_action_hotkey_is_cleared_without_disabling_feature() {
+    fn deprecated_single_modifier_bindings_remain_visible_after_migration() {
         let mut settings = Settings {
             selected_action_hotkey: "Shift".into(),
-            selected_actions_enabled: true,
+            verbatim_hotkey: "Alt".into(),
+            translation_hotkey: "Control".into(),
             ..Settings::default()
         };
-        assert!(settings.validate().is_err());
         settings.normalize();
-        assert!(settings.selected_action_hotkey.is_empty());
-        assert!(settings.selected_actions_enabled);
-        assert!(settings.validate().is_ok());
+        assert_eq!(settings.selected_action_hotkey, "Shift");
+        assert_eq!(settings.verbatim_hotkey, "Alt");
+        assert_eq!(settings.translation_hotkey, "Control");
+        settings.validate().unwrap();
     }
 
     #[test]
@@ -3826,6 +5214,48 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_default_moves_off_retired_llama_without_rewriting_saved_choices() {
+        assert_eq!(Settings::default().cleanup_model, "openai/gpt-oss-20b");
+        let dir = temp_dir("cleanup-model-retirement");
+        std::fs::create_dir_all(&dir).unwrap();
+        for model in [
+            "llama-3.1-8b-instant",
+            "llama-3.3-70b-versatile",
+            "openai/gpt-oss-120b",
+        ] {
+            std::fs::write(
+                dir.join("settings.json"),
+                serde_json::to_vec(&serde_json::json!({
+                    "schema_version": SETTINGS_SCHEMA_VERSION,
+                    "onboarded": false,
+                    "cleanup_enabled": false,
+                    "cleanup_provider": "groq",
+                    "cleanup_model": model,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            let (settings, _) = load_settings(&dir);
+            assert_eq!(settings.cleanup_model, model);
+        }
+
+        std::fs::write(
+            dir.join("settings.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": SETTINGS_SCHEMA_VERSION,
+                "onboarded": false,
+                "cleanup_enabled": false,
+                "cleanup_provider": "groq",
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let (settings, _) = load_settings(&dir);
+        assert_eq!(settings.cleanup_model, "openai/gpt-oss-20b");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn normalize_keeps_custom_asr_url_when_the_key_is_empty() {
         let mut settings = Settings {
             asr_provider: crate::engine::EngineProvider::Custom,
@@ -3849,7 +5279,7 @@ mod tests {
             asr_api_key: String::new(),
             asr_model: "whisper-1".into(),
             api_key: "gsk_test".into(),
-            onboarded: false,
+            onboarded: true,
             ..Settings::default()
         };
         settings.normalize();
@@ -3934,6 +5364,7 @@ mod tests {
             cleanup_model: "gpt-4o-mini".into(),
             api_key: "gsk_fallback".into(),
             cleanup_api_key: String::new(),
+            onboarded: true,
             ..Settings::default()
         };
         assert_eq!(settings.cleanup_credential(), "");
@@ -3962,25 +5393,136 @@ mod tests {
         let path = dir.join("history.sqlite");
         let connection = Connection::open(&path).unwrap();
         connection
-            .execute_batch(
-                "CREATE TABLE dictations (id INTEGER PRIMARY KEY, created_at TEXT NOT NULL, duration_secs REAL, raw_text TEXT, final_text TEXT, engine TEXT, degraded INTEGER, status TEXT, raw_audio_path TEXT); PRAGMA user_version=2;",
+        .execute_batch(
+                "CREATE TABLE dictations (id INTEGER PRIMARY KEY, created_at TEXT NOT NULL, duration_secs REAL, raw_text TEXT, final_text TEXT, engine TEXT, degraded INTEGER, status TEXT, raw_audio_path TEXT); INSERT INTO dictations (created_at,raw_text,final_text) VALUES (datetime('now'),'legacy raw','legacy final'); PRAGMA user_version=2;",
             )
             .unwrap();
         drop(connection);
 
-        let _ = get_history(&dir, 10).unwrap();
+        let history = get_history(&dir, 10).unwrap();
 
         assert!(dir.join("history.sqlite.v2.bak").is_file());
+        assert_eq!(history[0].asr_text, None);
         let _ = std::fs::remove_dir_all(dir);
     }
     #[test]
+    fn clear_all_data_removes_backups_created_while_migrating_legacy_history() {
+        let dir = temp_dir("clear-legacy-migration-backups");
+        fs::create_dir_all(&dir).unwrap();
+        let connection = Connection::open(dir.join("history.sqlite")).unwrap();
+        connection.execute_batch("CREATE TABLE dictations (id INTEGER PRIMARY KEY, created_at TEXT NOT NULL, duration_secs REAL, raw_text TEXT, final_text TEXT, engine TEXT, degraded INTEGER, status TEXT, raw_audio_path TEXT); INSERT INTO dictations (created_at,raw_text,final_text) VALUES (datetime('now'),'private legacy','private legacy'); PRAGMA user_version=2;").unwrap();
+        drop(connection);
+        fs::write(dir.join("history.sqlite.v1.bak"), "private previous").unwrap();
+        fs::write(dir.join("history.sqlite.v2.bak.user"), "user export").unwrap();
+        fs::write(dir.join("settings.json"), "user settings").unwrap();
+        clear_all_data(&dir).unwrap();
+        assert!(!dir.join("history.sqlite.v1.bak").exists());
+        assert!(!dir.join("history.sqlite.v2.bak").exists());
+        assert!(get_history(&dir, 10).unwrap().is_empty());
+        assert_eq!(
+            fs::read_to_string(dir.join("history.sqlite.v2.bak.user")).unwrap(),
+            "user export"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.join("settings.json")).unwrap(),
+            "user settings"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn migration_backups_have_finite_retention_even_with_forever_live_history() {
+        let dir = temp_dir("migration-backup-retention");
+        fs::create_dir_all(&dir).unwrap();
+        let now = SystemTime::now();
+        for (version, days) in [(1, 8), (2, 3), (3, 0)] {
+            let file = File::create(dir.join(format!("history.sqlite.v{version}.bak"))).unwrap();
+            file.set_times(
+                fs::FileTimes::new().set_modified(now - Duration::from_secs(days * 86_400)),
+            )
+            .unwrap();
+        }
+        assert_eq!(purge_history(&dir, 0).unwrap(), 0);
+        assert!(!dir.join("history.sqlite.v1.bak").exists());
+        assert!(dir.join("history.sqlite.v2.bak").exists());
+        assert!(dir.join("history.sqlite.v3.bak").exists());
+        purge_history(&dir, 1).unwrap();
+        assert!(!dir.join("history.sqlite.v2.bak").exists());
+        assert!(dir.join("history.sqlite.v3.bak").exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn migration_backup_cleanup_ignores_future_dates_and_nonowned_names() {
+        let dir = temp_dir("migration-backup-boundary");
+        fs::create_dir_all(&dir).unwrap();
+        let now = SystemTime::now();
+        for name in [
+            "history.sqlite.v1.bak",
+            "history.sqlite.v02.bak",
+            "history.sqlite.v-1.bak",
+            "settings.json.pre-migration.bak",
+            "history.sqlite.v2.bak.user",
+        ] {
+            fs::write(dir.join(name), "private").unwrap();
+        }
+        File::open(dir.join("history.sqlite.v1.bak"))
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(now + Duration::from_secs(86_400)))
+            .unwrap();
+        fs::create_dir(dir.join("history.sqlite.v3.bak")).unwrap();
+        assert_eq!(
+            prune_history_migration_backups(&dir, Some(7), now).unwrap(),
+            0
+        );
+        assert_eq!(prune_history_migration_backups(&dir, None, now).unwrap(), 1);
+        assert!(dir.join("history.sqlite.v02.bak").exists());
+        assert!(dir.join("history.sqlite.v-1.bak").exists());
+        assert!(dir.join("settings.json.pre-migration.bak").exists());
+        assert!(dir.join("history.sqlite.v2.bak.user").exists());
+        assert!(dir.join("history.sqlite.v3.bak").is_dir());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn migration_backup_links_are_neither_followed_nor_overwritten() {
+        use std::os::unix::fs::symlink;
+        let dir = temp_dir("migration-backup-links");
+        fs::create_dir_all(&dir).unwrap();
+        let external = dir.join("user-backup.txt");
+        fs::write(&external, "user-owned private backup").unwrap();
+        symlink(&external, dir.join("history.sqlite.v1.bak")).unwrap();
+        let dangling_target = dir.join("must-not-create.txt");
+        symlink(&dangling_target, dir.join("history.sqlite.v2.bak")).unwrap();
+        assert_eq!(
+            prune_history_migration_backups(&dir, None, SystemTime::now()).unwrap(),
+            0
+        );
+        assert_eq!(
+            fs::read_to_string(&external).unwrap(),
+            "user-owned private backup"
+        );
+        let connection = Connection::open(dir.join("history.sqlite")).unwrap();
+        connection.pragma_update(None, "user_version", 2).unwrap();
+        drop(connection);
+        assert!(open_history(&dir).is_err());
+        assert!(!dangling_target.exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn save_settings_never_writes_plaintext_key() {
         let dir = temp_dir("keyblank");
+        let backend = FakeCredentialBackend::default();
         let settings = Settings {
             api_key: "test_key_should_not_be_on_disk".into(),
+            provider_api_keys: [("openai".to_owned(), "synthetic-openai-key".to_owned())]
+                .into_iter()
+                .collect(),
             ..Settings::default()
         };
-        save_settings(&dir, &settings).unwrap();
+        save_settings_with_backend(&dir, &settings, &backend).unwrap();
         let on_disk = std::fs::read_to_string(dir.join("settings.json")).unwrap();
         assert!(
             !on_disk.contains("test_key_should_not_be_on_disk"),
@@ -3988,78 +5530,308 @@ mod tests {
         );
         let parsed: serde_json::Value = serde_json::from_str(&on_disk).unwrap();
         assert_eq!(parsed["api_key"].as_str().unwrap_or(""), "");
+        assert_eq!(
+            backend
+                .values
+                .borrow()
+                .get("groq_api_key")
+                .map(String::as_str),
+            Some("test_key_should_not_be_on_disk")
+        );
+        assert_eq!(
+            backend
+                .values
+                .borrow()
+                .get("provider_openai")
+                .map(String::as_str),
+            Some("synthetic-openai-key")
+        );
+        assert!(!on_disk.contains("synthetic-openai-key"));
+        assert!(!secret_sidecar_path(&dir, "api_key").exists());
+        assert!(!secret_sidecar_path(&dir, "provider_openai").exists());
         let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
-    fn persist_secret_uses_sidecar_when_keychain_write_fails() {
-        let dir = temp_dir("sidecar-write");
-        persist_secret_to_keychain_or_sidecar(&dir, "api_key", "gsk_secret", |_| {
-            Err("keychain write timed out".into())
-        })
-        .unwrap();
-        let path = secret_sidecar_path(&dir, "api_key");
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "gsk_secret");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-            assert_eq!(mode, 0o600);
+    fn secure_store_failure_preserves_sources_and_creates_no_plaintext() {
+        let dir = temp_dir("credential-write-failure");
+        std::fs::create_dir_all(dir.join("secrets")).unwrap();
+        let previous_settings = br#"{"api_key":"legacy-original","onboarded":false}"#;
+        std::fs::write(dir.join("settings.json"), previous_settings).unwrap();
+        write_secret_sidecar(&dir, "api_key", "legacy-sidecar").unwrap();
+        let previous_sidecar = std::fs::read(secret_sidecar_path(&dir, "api_key")).unwrap();
+        let backend = FakeCredentialBackend::default();
+        backend.fail_write("groq_api_key", "synthetic secure-store failure");
+        let settings = Settings {
+            api_key: "new-synthetic-key".into(),
+            ..Settings::default()
+        };
+
+        let error = save_settings_with_backend(&dir, &settings, &backend).unwrap_err();
+
+        assert!(error.to_string().contains("credential_storage"));
+        assert_eq!(
+            std::fs::read(dir.join("settings.json")).unwrap(),
+            previous_settings
+        );
+        assert_eq!(
+            std::fs::read(secret_sidecar_path(&dir, "api_key")).unwrap(),
+            previous_sidecar
+        );
+        assert!(
+            !std::fs::read_to_string(secret_sidecar_path(&dir, "api_key"))
+                .unwrap()
+                .contains("new-synthetic-key")
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn verified_settings_migration_scrubs_settings_only_after_secure_readback() {
+        let dir = temp_dir("settings-credential-migration");
+        std::fs::create_dir_all(&dir).unwrap();
+        let legacy_settings =
+            br#"{"schema_version":20,"api_key":"synthetic-legacy-key","onboarded":false}"#;
+        std::fs::write(dir.join("settings.json"), legacy_settings).unwrap();
+        let backend = FakeCredentialBackend::default();
+
+        let (settings, needs_persist) = load_settings_with_backend(&dir, &backend);
+
+        assert_eq!(settings.api_key, "synthetic-legacy-key");
+        assert!(needs_persist);
+        assert_eq!(
+            backend
+                .values
+                .borrow()
+                .get("groq_api_key")
+                .map(String::as_str),
+            Some("synthetic-legacy-key")
+        );
+        save_settings_with_backend(&dir, &settings, &backend).unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join("settings.json")).unwrap()).unwrap();
+        assert_eq!(saved["api_key"].as_str(), Some(""));
+        assert!(!std::fs::read_to_string(dir.join("settings.json"))
+            .unwrap()
+            .contains("synthetic-legacy-key"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn verified_sidecar_migration_removes_only_matching_legacy_file() {
+        let dir = temp_dir("sidecar-migration");
+        write_secret_sidecar(&dir, "api_key", "synthetic-groq-legacy").unwrap();
+        write_secret_sidecar(&dir, "provider_openai", "unrelated-openai-sidecar").unwrap();
+        let backend = FakeCredentialBackend::default();
+        let mut settings = Settings::default();
+
+        let resolution =
+            resolve_legacy_credential(&dir, "groq_api_key", "", None, &mut settings, &backend);
+
+        assert_eq!(resolution.value, "synthetic-groq-legacy");
+        assert!(matches!(
+            resolution.state,
+            crate::keychain::ApiKeyState::Configured(ref key) if key == "synthetic-groq-legacy"
+        ));
+        assert!(!secret_sidecar_path(&dir, "api_key").exists());
+        assert_eq!(
+            read_secret_sidecar(&dir, "provider_openai").as_deref(),
+            Some("unrelated-openai-sidecar")
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn provider_and_custom_alias_sidecars_migrate_to_their_secure_accounts() {
+        let provider_dir = temp_dir("provider-sidecar-migration");
+        write_secret_sidecar(&provider_dir, "provider_openai", "synthetic-provider-key").unwrap();
+        let provider_backend = FakeCredentialBackend::default();
+        let mut provider_settings = Settings::default();
+        let provider_resolution = resolve_legacy_credential(
+            &provider_dir,
+            "provider_openai",
+            "",
+            None,
+            &mut provider_settings,
+            &provider_backend,
+        );
+        assert_eq!(provider_resolution.value, "synthetic-provider-key");
+        assert_eq!(
+            provider_backend
+                .values
+                .borrow()
+                .get("provider_openai")
+                .map(String::as_str),
+            Some("synthetic-provider-key")
+        );
+        assert!(!secret_sidecar_path(&provider_dir, "provider_openai").exists());
+
+        let custom_dir = temp_dir("custom-alias-sidecar-migration");
+        write_secret_sidecar(&custom_dir, "asr_api_key", "synthetic-custom-asr").unwrap();
+        write_secret_sidecar(&custom_dir, "cleanup_api_key", "synthetic-custom-cleanup").unwrap();
+        let custom_backend = FakeCredentialBackend::default();
+        let (custom_settings, _) = load_settings_with_backend(&custom_dir, &custom_backend);
+        assert_eq!(custom_settings.asr_api_key, "synthetic-custom-asr");
+        assert_eq!(custom_settings.cleanup_api_key, "synthetic-custom-cleanup");
+        assert_eq!(
+            custom_backend
+                .values
+                .borrow()
+                .get("asr_api_key")
+                .map(String::as_str),
+            Some("synthetic-custom-asr")
+        );
+        assert_eq!(
+            custom_backend
+                .values
+                .borrow()
+                .get("cleanup_api_key")
+                .map(String::as_str),
+            Some("synthetic-custom-cleanup")
+        );
+        assert!(!secret_sidecar_path(&custom_dir, "asr_api_key").exists());
+        assert!(!secret_sidecar_path(&custom_dir, "cleanup_api_key").exists());
+        let _ = std::fs::remove_dir_all(provider_dir);
+        let _ = std::fs::remove_dir_all(custom_dir);
+    }
+
+    #[test]
+    fn failed_or_unverified_legacy_migration_retains_settings_and_sidecar_sources() {
+        let dir = temp_dir("failed-credential-migration");
+        std::fs::create_dir_all(&dir).unwrap();
+        let raw =
+            br#"{"schema_version":22,"api_key":"synthetic-settings-source","onboarded":false}"#;
+        std::fs::write(dir.join("settings.json"), raw).unwrap();
+        write_secret_sidecar(&dir, "api_key", "synthetic-sidecar-source").unwrap();
+        let backend = FakeCredentialBackend::default();
+        backend.script_reads(
+            "groq_api_key",
+            [
+                crate::keychain::ApiKeyState::Missing,
+                crate::keychain::ApiKeyState::Missing,
+                crate::keychain::ApiKeyState::Missing,
+            ],
+        );
+        backend.fail_write("groq_api_key", "synthetic write failure");
+
+        let (settings, needs_persist) = load_settings_with_backend(&dir, &backend);
+
+        assert_eq!(settings.api_key, "synthetic-settings-source");
+        // Schema 23 requests a save, but a failed credential migration must
+        // still prevent overwriting the original source configuration.
+        assert!(needs_persist);
+        assert!(save_settings_with_backend(&dir, &settings, &backend).is_err());
+        assert_eq!(std::fs::read(dir.join("settings.json")).unwrap(), raw);
+        assert_eq!(
+            read_secret_sidecar(&dir, "api_key").as_deref(),
+            Some("synthetic-sidecar-source")
+        );
+        assert!(settings
+            .unverified_credential_sources
+            .contains_key("settings:api_key"));
+
+        let unverifiable_dir = temp_dir("unverified-credential-migration");
+        write_secret_sidecar(&unverifiable_dir, "api_key", "synthetic-unverified-sidecar").unwrap();
+        let unverifiable_backend = FakeCredentialBackend::default();
+        unverifiable_backend.script_reads(
+            "groq_api_key",
+            [
+                crate::keychain::ApiKeyState::Missing,
+                crate::keychain::ApiKeyState::Missing,
+                crate::keychain::ApiKeyState::Missing,
+            ],
+        );
+        let mut unresolved = Settings::default();
+        let result = resolve_legacy_credential(
+            &unverifiable_dir,
+            "groq_api_key",
+            "",
+            None,
+            &mut unresolved,
+            &unverifiable_backend,
+        );
+        assert_eq!(result.value, "synthetic-unverified-sidecar");
+        assert!(matches!(
+            result.state,
+            crate::keychain::ApiKeyState::Unavailable(_)
+        ));
+        assert_eq!(
+            read_secret_sidecar(&unverifiable_dir, "api_key").as_deref(),
+            Some("synthetic-unverified-sidecar")
+        );
+        assert!(unresolved
+            .unverified_credential_sources
+            .contains_key("sidecar:groq_api_key"));
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(unverifiable_dir);
+    }
+
+    #[test]
+    fn existing_secure_credential_wins_over_stale_sidecar_without_removing_it() {
+        let dir = temp_dir("secure-precedence");
+        write_secret_sidecar(&dir, "api_key", "stale-sidecar-value").unwrap();
+        let backend = FakeCredentialBackend::default();
+        backend.seed("groq_api_key", "newer-secure-value");
+        let mut settings = Settings::default();
+
+        let resolution =
+            resolve_legacy_credential(&dir, "groq_api_key", "", None, &mut settings, &backend);
+
+        assert_eq!(resolution.value, "newer-secure-value");
+        assert!(backend.writes.borrow().is_empty());
+        assert_eq!(
+            read_secret_sidecar(&dir, "api_key").as_deref(),
+            Some("stale-sidecar-value")
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn explicit_key_replacement_updates_secure_value_and_clears_legacy_alias() {
+        let dir = temp_dir("explicit-credential-replacement");
+        write_secret_sidecar(&dir, "groq_api_key", "synthetic-old-sidecar").unwrap();
+        let backend = FakeCredentialBackend::default();
+        backend.seed("groq_api_key", "synthetic-old-secure");
+        let mut settings = Settings {
+            api_key: "synthetic-new-key".into(),
+            ..Settings::default()
+        };
+        settings
+            .credential_baselines
+            .insert("groq_api_key".into(), "synthetic-old-secure".into());
+
+        save_settings_with_backend(&dir, &settings, &backend).unwrap();
+
+        assert_eq!(
+            backend
+                .values
+                .borrow()
+                .get("groq_api_key")
+                .map(String::as_str),
+            Some("synthetic-new-key")
+        );
+        assert!(!secret_sidecar_path(&dir, "api_key").exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn explicit_provider_deletion_clears_groq_and_custom_legacy_aliases() {
+        let dir = temp_dir("credential-alias-delete");
+        for slot in [
+            "api_key",
+            "provider_custom",
+            "asr_api_key",
+            "cleanup_api_key",
+        ] {
+            write_secret_sidecar(&dir, slot, &format!("synthetic-{slot}")).unwrap();
         }
-        let _ = std::fs::remove_dir_all(dir);
-    }
 
-    #[test]
-    fn persist_secret_keeps_debug_sidecar_after_keychain_succeeds() {
-        let dir = temp_dir("sidecar-debug-backup");
-        persist_secret_to_keychain_or_sidecar(&dir, "api_key", "gsk_debug", |_| Ok(())).unwrap();
-        assert_eq!(
-            std::fs::read_to_string(secret_sidecar_path(&dir, "api_key")).unwrap(),
-            "gsk_debug"
-        );
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn persist_groq_provider_account_survives_keychain_auth_failure() {
-        let dir = temp_dir("sidecar-groq-account");
-        persist_secret_to_keychain_or_sidecar(&dir, "groq_api_key", "gsk_from_dev", |_| {
-            Err("The user name or passphrase you entered is not correct.".into())
-        })
-        .unwrap();
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join("settings.json"),
-            r#"{"onboarded":true,"api_key":""}"#,
-        )
-        .unwrap();
-        let (settings, _) = load_settings(&dir);
-        assert_eq!(settings.api_key, "gsk_from_dev");
-        assert_eq!(
-            settings.provider_secret(crate::engine::EngineProvider::Groq),
-            "gsk_from_dev"
-        );
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn persist_openai_provider_account_survives_keychain_auth_failure() {
-        let dir = temp_dir("sidecar-openai-account");
-        persist_secret_to_keychain_or_sidecar(&dir, "provider_openai", "sk-from-dev", |_| {
-            Err("The user name or passphrase you entered is not correct.".into())
-        })
-        .unwrap();
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join("settings.json"),
-            r#"{"onboarded":true,"api_key":""}"#,
-        )
-        .unwrap();
-        let (settings, _) = load_settings(&dir);
-        assert_eq!(
-            settings.provider_secret(crate::engine::EngineProvider::OpenAi),
-            "sk-from-dev"
-        );
+        clear_provider_key_sidecars(&dir, crate::engine::EngineProvider::Groq);
+        assert!(!secret_sidecar_path(&dir, "groq_api_key").exists());
+        clear_provider_key_sidecars(&dir, crate::engine::EngineProvider::Custom);
+        for slot in ["provider_custom", "asr_api_key", "cleanup_api_key"] {
+            assert!(!secret_sidecar_path(&dir, slot).exists());
+        }
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -4115,13 +5887,90 @@ mod tests {
     }
 
     #[test]
-    fn onboarding_requires_an_api_key() {
+    fn onboarding_requires_the_selected_provider_credential() {
         let settings = Settings {
             onboarded: true,
             api_key: String::new(),
+            cleanup_enabled: false,
             ..Settings::default()
         };
         assert!(settings.validate().is_err());
+    }
+
+    #[test]
+    fn onboarding_accepts_selected_provider_key_without_a_groq_key() {
+        let mut settings = Settings {
+            onboarded: true,
+            api_key: String::new(),
+            asr_provider: crate::engine::EngineProvider::SiliconFlow,
+            asr_model: "FunAudioLLM/SenseVoiceSmall".into(),
+            cleanup_provider: crate::engine::EngineProvider::SiliconFlow,
+            cleanup_model: "Qwen/Qwen2.5-7B-Instruct".into(),
+            ..Settings::default()
+        };
+        settings
+            .provider_api_keys
+            .insert("siliconflow".into(), "configured-in-memory".into());
+        settings
+            .validate()
+            .expect("selected ASR/cleanup provider keys validate");
+    }
+
+    #[test]
+    fn onboarding_accepts_keyless_loopback_asr_without_a_groq_key() {
+        let settings = Settings {
+            onboarded: true,
+            api_key: String::new(),
+            asr_provider: crate::engine::EngineProvider::LocalWhisper,
+            cleanup_enabled: false,
+            ..Settings::default()
+        };
+        settings
+            .validate()
+            .expect("loopback ASR has a valid keyless route");
+    }
+
+    #[test]
+    fn onboarding_rejects_remote_keyless_cleanup_provider() {
+        let mut settings = Settings {
+            onboarded: true,
+            cleanup_provider: crate::engine::EngineProvider::Ollama,
+            ollama_base_url: "https://ollama.example/v1".into(),
+            cleanup_model: "llama3.2".into(),
+            ..Settings::default()
+        };
+        settings.api_key = "configured-groq-key".into();
+        assert!(settings.validate().is_err());
+    }
+
+    #[test]
+    fn load_settings_keeps_onboarding_for_selected_provider_sidecar() {
+        let dir = temp_dir("selected-provider-onboarding");
+        std::fs::create_dir_all(dir.join("secrets")).unwrap();
+        std::fs::write(
+            dir.join("settings.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": SETTINGS_SCHEMA_VERSION,
+                "onboarded": true,
+                "asr_provider": "openai",
+                "asr_model": "whisper-1",
+                "cleanup_enabled": false,
+                "api_key": ""
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            secret_sidecar_path(&dir, "provider_openai"),
+            "selected-provider-secret",
+        )
+        .unwrap();
+
+        let (settings, _) = load_settings(&dir);
+        assert!(settings.onboarded);
+        assert_eq!(settings.asr_provider, crate::engine::EngineProvider::OpenAi);
+        assert_eq!(settings.asr_credential(), "selected-provider-secret");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -4241,6 +6090,373 @@ mod tests {
         let manifest: SpoolManifest =
             serde_json::from_slice(&std::fs::read(session.join("manifest.json")).unwrap()).unwrap();
         assert_eq!(manifest.status, "recoverable");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn set_spool_created_at_for_test(session: &Path, created_at_ms: u64) {
+        let mut manifest = load_manifest(session).unwrap();
+        manifest.created_at_ms = created_at_ms;
+        save_manifest(session, &manifest).unwrap();
+    }
+
+    fn assert_spool_mtime_is_recent(session: &Path) {
+        let elapsed = std::fs::metadata(session)
+            .unwrap()
+            .modified()
+            .unwrap()
+            .elapsed()
+            .unwrap();
+        assert!(
+            elapsed.as_secs() < 60,
+            "test must model a recent directory mtime"
+        );
+    }
+
+    #[test]
+    fn recovery_expiry_uses_session_creation_time_after_success_or_failure() {
+        const KEEP_DAYS: u64 = 7;
+        let dir = temp_dir("spool-origin-retention");
+
+        let successful = begin_spool_session(&dir, "successful-old-session").unwrap();
+        write_spool_f32_chunk(&dir, "successful-old-session", 0, &[0.1, 0.2, 0.3]);
+        record_spool_chunk(&successful, 0, 0.0, 0.0001875, "written").unwrap();
+        assert_eq!(recover_spool(&dir, KEEP_DAYS).unwrap().len(), 1);
+        set_spool_created_at_for_test(
+            &successful,
+            now_ms().saturating_sub((KEEP_DAYS + 1) * 86_400_000),
+        );
+        assert_spool_mtime_is_recent(&successful);
+
+        // A successful startup rewrites recovery.wav and manifest.json. Those
+        // filesystem mtimes must not renew the immutable session retention age.
+        assert!(recover_spool(&dir, KEEP_DAYS).unwrap().is_empty());
+        assert!(
+            !successful.exists(),
+            "expired source and recovery files are purged"
+        );
+
+        let failed = begin_spool_session(&dir, "failed-old-session").unwrap();
+        write_spool_f32_chunk(&dir, "failed-old-session", 0, &[0.1, 0.2]);
+        write_spool_f32_chunk(&dir, "failed-old-session", 1, &[0.9, 0.3]);
+        record_spool_chunk(&failed, 0, 0.0, 1.0, "written").unwrap();
+        record_spool_chunk(&failed, 1, 0.5, 1.5, "written").unwrap();
+        assert!(recover_spool(&dir, KEEP_DAYS).unwrap().is_empty());
+        assert_eq!(load_manifest(&failed).unwrap().status, "abandoned");
+        set_spool_created_at_for_test(
+            &failed,
+            now_ms().saturating_sub((KEEP_DAYS + 1) * 86_400_000),
+        );
+        assert_spool_mtime_is_recent(&failed);
+
+        // Marking a failed rebuild abandoned changes the directory mtime too,
+        // but it does not start a new retention period.
+        assert!(recover_spool(&dir, KEEP_DAYS).unwrap().is_empty());
+        assert!(
+            !failed.exists(),
+            "expired unreconstructable chunks are purged"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn recent_recovery_keeps_immutable_creation_time_and_invalid_dates_expire() {
+        const KEEP_DAYS: u64 = 7;
+        let dir = temp_dir("spool-valid-retention-dates");
+
+        let in_window = begin_spool_session(&dir, "in-window").unwrap();
+        let created_at_ms = load_manifest(&in_window).unwrap().created_at_ms;
+        write_spool_f32_chunk(&dir, "in-window", 0, &[0.1, 0.2]);
+        record_spool_chunk(&in_window, 0, 0.0, 0.000125, "written").unwrap();
+        set_spool_created_at_for_test(
+            &in_window,
+            now_ms().saturating_sub((KEEP_DAYS - 1) * 86_400_000),
+        );
+        let retained_created_at_ms = load_manifest(&in_window).unwrap().created_at_ms;
+        assert_ne!(retained_created_at_ms, created_at_ms);
+        assert_eq!(recover_spool(&dir, KEEP_DAYS).unwrap().len(), 1);
+        assert_eq!(
+            load_manifest(&in_window).unwrap().created_at_ms,
+            retained_created_at_ms,
+            "successful recovery must preserve its original creation timestamp"
+        );
+        assert!(in_window.exists());
+
+        for (session_id, created_at_ms) in [
+            ("zero-timestamp", 0),
+            ("future-timestamp", now_ms().saturating_add(86_400_000)),
+        ] {
+            let invalid_dir = temp_dir(session_id);
+            let invalid = begin_spool_session(&invalid_dir, session_id).unwrap();
+            write_spool_f32_chunk(&invalid_dir, session_id, 0, &[0.1, 0.2]);
+            record_spool_chunk(&invalid, 0, 0.0, 0.000125, "written").unwrap();
+            set_spool_created_at_for_test(&invalid, created_at_ms);
+            assert_spool_mtime_is_recent(&invalid);
+            assert!(recover_spool(&invalid_dir, u64::MAX).unwrap().is_empty());
+            assert!(
+                !invalid.exists(),
+                "untrustworthy creation timestamps expire fail-closed: {session_id}"
+            );
+            let _ = std::fs::remove_dir_all(invalid_dir);
+        }
+
+        // A schema-one manifest from a build predating the required immutable
+        // creation timestamp cannot establish an age, so preserve the existing
+        // cleanup behavior for timestamp-less legacy manifests.
+        let legacy_dir = temp_dir("legacy-without-creation-time");
+        let legacy = legacy_dir.join("spool/legacy-without-creation-time");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(
+            legacy.join("manifest.json"),
+            r#"{"schema_version":1,"session_id":"legacy-without-creation-time","status":"active","chunks":[]}"#,
+        )
+        .unwrap();
+        assert!(recover_spool(&legacy_dir, KEEP_DAYS).unwrap().is_empty());
+        assert!(!legacy.exists());
+
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(legacy_dir);
+    }
+
+    #[test]
+    fn chunker_spool_recovery_reconstructs_exact_overlapping_sample_coverage() {
+        const SAMPLE_RATE: usize = 16_000;
+        const SOURCE_LEN: usize = 50 * SAMPLE_RATE;
+        let dir = temp_dir("exact-chunk-recovery");
+        let session_id = "exact-chunks";
+        let session = begin_spool_session(&dir, session_id).unwrap();
+
+        let mut source = (0..SOURCE_LEN)
+            .map(|index| ((index % 997) as f32 / 997.0 - 0.5) * 0.008)
+            .collect::<Vec<_>>();
+        let config = crate::chunker::ChunkerConfig {
+            chunk_length_secs: 15,
+        };
+        let mut probe = crate::chunker::Chunker::new(config);
+        let mut planned = probe.push(&source);
+        planned.extend(probe.finish());
+        assert!(planned.len() >= 2);
+        let boundary_sample = planned[1].source_start_sample + 100;
+        source[boundary_sample] = 0.008;
+
+        let mut chunker = crate::chunker::Chunker::new(config);
+        let mut chunks = chunker.push(&source);
+        chunks.extend(chunker.finish());
+        assert!(chunks.len() >= 2);
+        assert_eq!(
+            chunks[1].source_start_sample,
+            planned[1].source_start_sample
+        );
+        assert!(chunks[1].source_start_sample <= boundary_sample);
+        assert!(boundary_sample < chunks[0].source_start_sample + chunks[0].samples.len());
+
+        for chunk in &chunks {
+            write_spool_f32_chunk(&dir, session_id, chunk.index, &chunk.samples);
+            record_spool_chunk_with_samples(
+                &session,
+                chunk.index,
+                chunk.start_secs,
+                chunk.end_secs,
+                "written",
+                chunk.source_start_sample as u64,
+                chunk.samples.len() as u64,
+            )
+            .unwrap();
+        }
+        // The older status API is also used as chunks progress; it must not
+        // erase the exact interval required for recovery.
+        record_spool_chunk(
+            &session,
+            chunks[0].index,
+            chunks[0].start_secs,
+            chunks[0].end_secs,
+            "transcribed",
+        )
+        .unwrap();
+        let manifest: SpoolManifest =
+            serde_json::from_slice(&std::fs::read(session.join("manifest.json")).unwrap()).unwrap();
+        let first = manifest
+            .chunks
+            .iter()
+            .find(|chunk| chunk.index == chunks[0].index)
+            .unwrap();
+        assert_eq!(first.source_start_sample, Some(0));
+        assert_eq!(first.sample_count, Some(chunks[0].samples.len() as u64));
+
+        let recovered = rebuild_spool_recovery(&session).unwrap();
+        assert_eq!(
+            recovered.duration_secs,
+            SOURCE_LEN as f64 / SAMPLE_RATE as f64
+        );
+        let expected = source
+            .iter()
+            .map(|sample| (sample.clamp(-1.0, 1.0) * i16::MAX as f32) as i16)
+            .collect::<Vec<_>>();
+        let recovered_samples = decode_wav_samples(&recovered.audio_path);
+        assert_eq!(recovered_samples.len(), SOURCE_LEN);
+        assert_eq!(recovered_samples, expected);
+        let marker = expected[boundary_sample];
+        assert_eq!(
+            recovered_samples
+                .iter()
+                .filter(|sample| **sample == marker)
+                .count(),
+            1
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn legacy_nonoverlapping_spool_chunks_still_concatenate_in_index_order() {
+        let dir = temp_dir("legacy-nonoverlap-recovery");
+        let session = begin_spool_session(&dir, "legacy-chunks").unwrap();
+        let first = [0.1_f32, 0.2];
+        let second = [-0.3_f32, 0.4];
+        write_spool_f32_chunk(&dir, "legacy-chunks", 0, &first);
+        write_spool_f32_chunk(&dir, "legacy-chunks", 1, &second);
+        record_spool_chunk(&session, 0, 0.0, 0.000125, "written").unwrap();
+        record_spool_chunk(&session, 1, 0.000125, 0.00025, "written").unwrap();
+
+        let recovered = recover_spool(&dir, 7).unwrap();
+        assert_eq!(recovered.len(), 1);
+        let expected = first
+            .iter()
+            .chain(&second)
+            .map(|sample| (*sample * i16::MAX as f32) as i16)
+            .collect::<Vec<_>>();
+        assert_eq!(decode_wav_samples(&recovered[0].audio_path), expected);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn exact_spool_intervals_reject_missing_gaps_and_conflicting_samples() {
+        let dir = temp_dir("invalid-exact-recovery");
+
+        let missing = begin_spool_session(&dir, "missing").unwrap();
+        write_spool_f32_chunk(&dir, "missing", 0, &[0.1, 0.2]);
+        write_spool_f32_chunk(&dir, "missing", 1, &[0.3, 0.4]);
+        record_spool_chunk_with_samples(&missing, 0, 0.0, 0.000125, "written", 0, 2).unwrap();
+        record_spool_chunk(&missing, 1, 0.000125, 0.00025, "written").unwrap();
+        let error = rebuild_spool_recovery(&missing).unwrap_err().to_string();
+        assert!(error.contains("intervals are missing"), "{error}");
+
+        let unmatched = begin_spool_session(&dir, "unmatched-exact").unwrap();
+        record_spool_chunk_with_samples(&unmatched, 0, 0.0, 0.000125, "written", 0, 2).unwrap();
+        write_spool_f32_chunk(&dir, "unmatched-exact", 1, &[0.3, 0.4]);
+        let error = rebuild_spool_recovery(&unmatched).unwrap_err().to_string();
+        assert!(error.contains("intervals are missing"), "{error}");
+
+        let gap = begin_spool_session(&dir, "gap").unwrap();
+        write_spool_f32_chunk(&dir, "gap", 0, &[0.1, 0.2]);
+        write_spool_f32_chunk(&dir, "gap", 1, &[0.3, 0.4]);
+        record_spool_chunk_with_samples(&gap, 0, 0.0, 0.000125, "written", 0, 2).unwrap();
+        record_spool_chunk_with_samples(&gap, 1, 0.0001875, 0.0003125, "written", 3, 2).unwrap();
+        let error = rebuild_spool_recovery(&gap).unwrap_err().to_string();
+        assert!(error.contains("gap in source samples"), "{error}");
+
+        let conflict = begin_spool_session(&dir, "conflict").unwrap();
+        write_spool_f32_chunk(&dir, "conflict", 0, &[0.1, 0.2, 0.3]);
+        write_spool_f32_chunk(&dir, "conflict", 1, &[0.9, 0.4]);
+        record_spool_chunk_with_samples(&conflict, 0, 0.0, 0.0001875, "written", 0, 3).unwrap();
+        record_spool_chunk_with_samples(&conflict, 1, 0.000125, 0.00025, "written", 2, 2).unwrap();
+        let error = rebuild_spool_recovery(&conflict).unwrap_err().to_string();
+        assert!(error.contains("conflicting samples"), "{error}");
+
+        assert!(record_spool_chunk_with_samples(&conflict, 2, 0.0, 0.0, "written", 0, 0).is_err());
+        assert!(
+            record_spool_chunk_with_samples(&conflict, 2, 0.0, 0.0, "written", u64::MAX, 1,)
+                .is_err()
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn legacy_overlapping_chunks_without_sample_intervals_fail_truthfully() {
+        let dir = temp_dir("legacy-overlap-recovery");
+        let session = begin_spool_session(&dir, "legacy-overlap").unwrap();
+        write_spool_f32_chunk(&dir, "legacy-overlap", 0, &[0.1, 0.2]);
+        write_spool_f32_chunk(&dir, "legacy-overlap", 1, &[0.2, 0.3]);
+        record_spool_chunk(&session, 0, 0.0, 1.0, "written").unwrap();
+        record_spool_chunk(&session, 1, 0.5, 1.5, "written").unwrap();
+
+        let error = rebuild_spool_recovery(&session).unwrap_err().to_string();
+        assert!(error.contains("overlap but lack exact source sample intervals"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn unreconstructable_recovery_keeps_original_chunks_until_retention() {
+        let dir = temp_dir("unreconstructable-recovery-retained");
+
+        let legacy = begin_spool_session(&dir, "legacy-overlap-retained").unwrap();
+        let legacy_first = [0.1_f32, 0.2];
+        let legacy_second = [0.2_f32, 0.3];
+        write_spool_f32_chunk(&dir, "legacy-overlap-retained", 0, &legacy_first);
+        write_spool_f32_chunk(&dir, "legacy-overlap-retained", 1, &legacy_second);
+        record_spool_chunk(&legacy, 0, 0.0, 1.0, "written").unwrap();
+        record_spool_chunk(&legacy, 1, 0.5, 1.5, "written").unwrap();
+        let legacy_first_bytes = read_spool_file(&legacy.join("chunks/00000000.f32")).unwrap();
+        let legacy_second_bytes = read_spool_file(&legacy.join("chunks/00000001.f32")).unwrap();
+        let legacy_manifest_before: SpoolManifest =
+            serde_json::from_slice(&std::fs::read(legacy.join("manifest.json")).unwrap()).unwrap();
+
+        let conflict = begin_spool_session(&dir, "conflict-retained").unwrap();
+        let conflict_first = [0.1_f32, 0.2, 0.3];
+        let conflict_second = [0.9_f32, 0.4];
+        write_spool_f32_chunk(&dir, "conflict-retained", 0, &conflict_first);
+        write_spool_f32_chunk(&dir, "conflict-retained", 1, &conflict_second);
+        record_spool_chunk_with_samples(&conflict, 0, 0.0, 0.0001875, "written", 0, 3).unwrap();
+        record_spool_chunk_with_samples(&conflict, 1, 0.000125, 0.00025, "written", 2, 2).unwrap();
+        let conflict_first_bytes = read_spool_file(&conflict.join("chunks/00000000.f32")).unwrap();
+        let conflict_second_bytes = read_spool_file(&conflict.join("chunks/00000001.f32")).unwrap();
+        let conflict_manifest_before: SpoolManifest =
+            serde_json::from_slice(&std::fs::read(conflict.join("manifest.json")).unwrap())
+                .unwrap();
+
+        let recovered = recover_spool(&dir, 7).unwrap();
+        assert!(
+            recovered.is_empty(),
+            "unreconstructable audio must not be reported recovered"
+        );
+
+        for (session, expected, second_expected, manifest_before) in [
+            (
+                legacy,
+                legacy_first_bytes,
+                legacy_second_bytes,
+                legacy_manifest_before,
+            ),
+            (
+                conflict,
+                conflict_first_bytes,
+                conflict_second_bytes,
+                conflict_manifest_before,
+            ),
+        ] {
+            assert!(session.is_dir());
+            assert!(!session.join("recovery.wav").exists());
+            assert_eq!(
+                read_spool_file(&session.join("chunks/00000000.f32")).unwrap(),
+                expected
+            );
+            assert_eq!(
+                read_spool_file(&session.join("chunks/00000001.f32")).unwrap(),
+                second_expected
+            );
+            let manifest_after: SpoolManifest =
+                serde_json::from_slice(&std::fs::read(session.join("manifest.json")).unwrap())
+                    .unwrap();
+            assert_eq!(manifest_after.status, "abandoned");
+            assert_eq!(manifest_after.chunks.len(), manifest_before.chunks.len());
+            for (before, after) in manifest_before.chunks.iter().zip(&manifest_after.chunks) {
+                assert_eq!(before.index, after.index);
+                assert_eq!(before.start_secs, after.start_secs);
+                assert_eq!(before.end_secs, after.end_secs);
+                assert_eq!(before.source_start_sample, after.source_start_sample);
+                assert_eq!(before.sample_count, after.sample_count);
+                assert_eq!(before.status, after.status);
+            }
+        }
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -4366,6 +6582,47 @@ mod tests {
     }
 
     #[test]
+    fn history_exports_original_asr_separately_and_preserves_null_for_legacy_rows() {
+        let dir = temp_dir("history-asr-text");
+        let context = crate::context::ContextSnapshot::general();
+        insert_history_with_asr_and_delivery_and_spool_and_cleanup(
+            &dir,
+            "prepared and dictionary-replaced",
+            Some("uh, raw provider output"),
+            "cleaned final",
+            1.0,
+            false,
+            None,
+            "ok",
+            "history",
+            None,
+            &context,
+            None,
+            "openai:whisper-1",
+            "ai_success",
+        )
+        .unwrap();
+
+        let item = get_history(&dir, 10).unwrap().remove(0);
+        assert_eq!(item.raw_text, "prepared and dictionary-replaced");
+        assert_eq!(item.asr_text.as_deref(), Some("uh, raw provider output"));
+        assert_eq!(item.engine.as_deref(), Some("openai:whisper-1"));
+        assert_eq!(
+            get_history_page(&dir, 10, None, Some("raw provider"))
+                .unwrap()
+                .items
+                .len(),
+            1
+        );
+        let export: serde_json::Value =
+            serde_json::from_str(&export_history_json(&dir).unwrap()).unwrap();
+        assert_eq!(export[0]["asr_text"], "uh, raw provider output");
+        assert_eq!(export[0]["engine"], "openai:whisper-1");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn history_retryable_only_when_recovery_audio_exists() {
         let dir = temp_dir("history-retryable");
         let context = crate::context::ContextSnapshot::general();
@@ -4413,6 +6670,8 @@ mod tests {
             &dir,
             id,
             Some("retried raw"),
+            Some("retry ASR before local filters"),
+            Some("deepgram:nova-3"),
             "final",
             false,
             None,
@@ -4422,8 +6681,13 @@ mod tests {
         let item = get_history(&dir, 10).unwrap().remove(0);
         assert_eq!(item.status, "copied");
         assert_eq!(item.raw_text, "retried raw");
+        assert_eq!(
+            item.asr_text.as_deref(),
+            Some("retry ASR before local filters")
+        );
         assert_eq!(item.final_text, "final");
         assert_eq!(item.cleanup_status, "ai_success");
+        assert_eq!(item.engine.as_deref(), Some("deepgram:nova-3"));
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -4611,6 +6875,7 @@ mod tests {
             asr_provider: crate::engine::EngineProvider::Custom,
             asr_base_url: "https://asr.example.com/v1".into(),
             custom_base_url: "https://asr.example.com/v1".into(),
+            onboarded: true,
             ..Settings::default()
         };
         assert_eq!(
@@ -4732,12 +6997,13 @@ mod tests {
     #[test]
     fn save_settings_never_writes_plaintext_asr_key() {
         let dir = temp_dir("asr-keyblank");
+        let backend = FakeCredentialBackend::default();
         let settings = Settings {
             asr_api_key: "asr_secret_should_not_be_on_disk".into(),
             asr_base_url: "http://127.0.0.1:8000/v1".into(),
             ..Settings::default()
         };
-        save_settings(&dir, &settings).unwrap();
+        save_settings_with_backend(&dir, &settings, &backend).unwrap();
         let on_disk = std::fs::read_to_string(dir.join("settings.json")).unwrap();
         assert!(
             !on_disk.contains("asr_secret_should_not_be_on_disk"),
@@ -4755,6 +7021,7 @@ mod tests {
     #[test]
     fn save_settings_never_writes_plaintext_cleanup_key() {
         let dir = temp_dir("cleanup-keyblank");
+        let backend = FakeCredentialBackend::default();
         let settings = Settings {
             cleanup_provider: crate::engine::EngineProvider::Custom,
             cleanup_base_url: "https://api.openai.com/v1".into(),
@@ -4762,7 +7029,7 @@ mod tests {
             cleanup_api_key: "cleanup_secret_should_not_be_on_disk".into(),
             ..Settings::default()
         };
-        save_settings(&dir, &settings).unwrap();
+        save_settings_with_backend(&dir, &settings, &backend).unwrap();
         let on_disk = std::fs::read_to_string(dir.join("settings.json")).unwrap();
         assert!(
             !on_disk.contains("cleanup_secret_should_not_be_on_disk"),
@@ -4913,6 +7180,31 @@ mod tests {
     }
 
     #[test]
+    fn clear_all_data_does_not_delete_on_device_models() {
+        let dir = temp_dir("clear-keeps-models");
+        insert_history(&dir, "raw", "final", 1.0, false).unwrap();
+        let models = dir.join("models").join("sensevoice-small");
+        std::fs::create_dir_all(&models).unwrap();
+        std::fs::write(models.join("model.int8.onnx"), b"onnx").unwrap();
+        std::fs::write(models.join("tokens.txt"), b"tokens").unwrap();
+        let sidecar = dir.join("models").join("sensevoice-small.archive.sha256");
+        std::fs::write(&sidecar, crate::ondevice_models::SENSEVOICE_ARCHIVE_SHA256).unwrap();
+
+        clear_all_data(&dir).unwrap();
+
+        assert_eq!(
+            std::fs::read(models.join("model.int8.onnx")).unwrap(),
+            b"onnx"
+        );
+        assert_eq!(std::fs::read(models.join("tokens.txt")).unwrap(), b"tokens");
+        assert_eq!(
+            std::fs::read_to_string(&sidecar).unwrap(),
+            crate::ondevice_models::SENSEVOICE_ARCHIVE_SHA256
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn malformed_settings_are_kept_untouched() {
         let dir = temp_dir("malformed-settings");
         std::fs::create_dir_all(&dir).unwrap();
@@ -4965,6 +7257,50 @@ mod tests {
         upsert_learn_pair(&dir, &key, "知呼", "知乎").unwrap();
         clear_all_data(&dir).unwrap();
         assert!(list_learn_pairs(&dir).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn learned_usage_deduplicates_processing_passes_hides_forgotten_terms_and_clears() {
+        let dir = temp_dir("learned-usage");
+        let key = crate::dictionary_learn::pair_key("知呼", "知乎");
+        ensure_learn_pair_promoted(&dir, &key, "知呼", "知乎", None).unwrap();
+        assert!(list_learned_term_usage(&dir).unwrap().is_empty());
+        record_learned_term_usage(&dir, &["知乎".into(), "知乎".into()]).unwrap();
+        record_learned_term_usage(&dir, &["知乎".into()]).unwrap();
+        let usage = list_learned_term_usage(&dir).unwrap();
+        assert_eq!(usage.len(), 1);
+        assert_eq!(usage[0].word, "知乎");
+        assert_eq!(usage[0].replacement_runs, 2);
+        assert!(!usage[0].last_replaced_at.is_empty());
+        tombstone_learn_pair(&dir, &key).unwrap();
+        assert!(list_learned_term_usage(&dir).unwrap().is_empty());
+        clear_all_data(&dir).unwrap();
+        let count: u64 = open_history(&dir)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM learned_term_usage", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn history_v12_migration_preserves_learning_without_inventing_usage() {
+        let dir = temp_dir("learned-usage-migration");
+        let key = crate::dictionary_learn::pair_key("知呼", "知乎");
+        ensure_learn_pair_promoted(&dir, &key, "知呼", "知乎", None).unwrap();
+        let connection = open_history(&dir).unwrap();
+        connection
+            .execute_batch("DROP TABLE learned_term_usage; PRAGMA user_version = 12;")
+            .unwrap();
+        drop(connection);
+        assert!(list_learned_term_usage(&dir).unwrap().is_empty());
+        assert!(list_learn_pairs(&dir).unwrap()[0].is_live_promoted());
+        assert!(dir.join("history.sqlite.v12.bak").is_file());
+        clear_all_data(&dir).unwrap();
+        assert!(!dir.join("history.sqlite.v12.bak").exists());
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -5103,6 +7439,54 @@ mod tests {
         assert!(row.is_live_promoted());
         assert_eq!(row.family.as_deref(), Some("personal_chat"));
         assert_eq!(row.native_bundle.as_deref(), Some("com.tencent.xinWeChat"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn history_and_revision_policies_keep_only_safe_metadata() {
+        let dir = temp_dir("history-context-source-safety");
+        let mut snapshot = crate::context::ContextSnapshot::general();
+        snapshot.policy.style_examples_approved = true;
+        snapshot.policy.style_example_input = Some("private style input".into());
+        snapshot.policy.style_example_output = Some("private style output".into());
+        snapshot.policy.style_example_pairs = vec![crate::context::StyleExamplePair {
+            input: "private pair input".into(),
+            output: "private pair output".into(),
+        }];
+        snapshot
+            .evidence
+            .items
+            .push(crate::screen_text::ContextEvidenceItem {
+                source: crate::screen_text::ContextEvidenceSource::Ax,
+                kind: crate::screen_text::ContextEvidenceKind::NearbyText,
+                value: "private live window excerpt".into(),
+                confidence_milli: Some(900),
+                truncated: false,
+            });
+
+        insert_history_with_context(&dir, "spoken", "final", 1.0, false, &snapshot).unwrap();
+        let stored = history_scene(&dir, 1).unwrap().policy.unwrap();
+        assert!(!stored.style_examples_approved);
+        assert!(stored.style_example_input.is_none());
+        assert!(stored.style_example_output.is_none());
+        assert!(stored.style_example_pairs.is_empty());
+
+        save_history_revision(
+            &dir,
+            1,
+            "revised",
+            None,
+            None,
+            None,
+            Some(&snapshot.policy),
+            "manual_edit",
+        )
+        .unwrap();
+        let revision = get_history_revisions(&dir, 1).unwrap().remove(0);
+        let serialized = revision.context_policy.unwrap().to_string();
+        assert!(!serialized.contains("private style"));
+        assert!(!serialized.contains("private pair"));
+        assert!(!serialized.contains("private live window"));
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -5257,5 +7641,97 @@ mod tests {
         assert!(!jsonl.contains("Cleaned words"));
         assert!(!jsonl.contains("failed raw"));
         let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[cfg(test)]
+mod handy_settings_tests {
+    use super::*;
+    #[test]
+    fn translation_shortcut_defaults_off_and_round_trips_in_public_view() {
+        let mut settings: Settings = serde_json::from_str("{}").unwrap();
+        assert!(settings.translation_hotkey.is_empty());
+        settings.translation_hotkey = "Command+Shift+T".into();
+        settings.translation_target_language = "ja".into();
+        settings.normalize();
+        let restored: Settings =
+            serde_json::from_value(serde_json::to_value(&settings).unwrap()).unwrap();
+        assert_eq!(restored.translation_hotkey, "Command+Shift+T");
+        let view = serde_json::to_value(SettingsView::from(&restored)).unwrap();
+        assert_eq!(view["translation_hotkey"], "Command+Shift+T");
+        assert_eq!(view["translation_target_language"], "ja");
+    }
+
+    #[test]
+    fn translation_shortcut_rejects_alias_conflicts_and_accepts_fn() {
+        for field in ["hotkey", "selected", "screen", "verbatim"] {
+            let mut settings = Settings {
+                translation_hotkey: "Cmd+Shift+T".into(),
+                ..Settings::default()
+            };
+            match field {
+                "hotkey" => settings.hotkey = "Command+Shift+T".into(),
+                "selected" => settings.selected_action_hotkey = "Command+Shift+T".into(),
+                "screen" => settings.screen_action_hotkey = "Command+Shift+T".into(),
+                _ => settings.verbatim_hotkey = "Command+Shift+T".into(),
+            }
+            assert!(settings
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("hotkey conflicts"));
+        }
+        let settings = Settings {
+            translation_hotkey: "Fn".into(),
+            ..Settings::default()
+        };
+        settings.validate().unwrap();
+        let mut fn_conflict = settings.clone();
+        fn_conflict.hotkey = "Globe".into();
+        assert!(fn_conflict.validate().is_err());
+    }
+    #[test]
+    fn missing_legacy_mode_deserializes_as_tap() {
+        let legacy: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(legacy.activation_mode, "tap");
+    }
+    #[test]
+    fn conservative_settings_round_trip_and_clamp() {
+        let mut settings = Settings {
+            extra_recording_buffer_ms: 9000,
+            audio_feedback_volume: f32::NAN,
+            verbatim_hotkey: "Cmd+Shift+V".into(),
+            ..Settings::default()
+        };
+        settings.normalize();
+        assert_eq!(settings.extra_recording_buffer_ms, 2000);
+        assert_eq!(settings.audio_feedback_volume, 0.6);
+        assert!(
+            !settings.vad_enabled
+                && !settings.audio_feedback_enabled
+                && !settings.fuzzy_dictionary_enabled
+                && !settings.always_on_microphone
+                && !settings.autostart_enabled
+                && !settings.debug_mode
+        );
+        let encoded = serde_json::to_value(&settings).unwrap();
+        let restored: Settings = serde_json::from_value(encoded).unwrap();
+        assert_eq!(restored.verbatim_hotkey, settings.verbatim_hotkey);
+        let view = serde_json::to_value(SettingsView::from(&restored)).unwrap();
+        for key in [
+            "verbatim_hotkey",
+            "extra_recording_buffer_ms",
+            "audio_feedback_enabled",
+            "audio_feedback_volume",
+            "vad_enabled",
+            "fuzzy_dictionary_enabled",
+            "always_on_microphone",
+            "clamshell_microphone",
+            "autostart_enabled",
+            "whats_new_last_seen_version",
+            "debug_mode",
+        ] {
+            assert!(view.get(key).is_some(), "{key}");
+        }
     }
 }

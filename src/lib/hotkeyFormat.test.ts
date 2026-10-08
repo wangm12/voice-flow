@@ -7,6 +7,7 @@ import {
   hotkeyFromKeyboardEvent,
   isFnOnlyHotkey,
   isModifierOnlyHotkey,
+  isSafeCapturedHotkey,
   sanitizeTauriHotkey,
   toTauriHotkey,
   toTanStackHotkey,
@@ -66,5 +67,28 @@ describe("hotkey formatting", () => {
     });
     expect(hotkeyFromKeyboardEvent(event)).toBe("CmdOrControl+Alt+Slash");
     expect(sanitizeTauriHotkey("CmdOrControl+Alt+÷")).toBe("CmdOrControl+Alt+Slash");
+  });
+
+  it.each([
+    [{ key: "å", code: "KeyA", altKey: true }, "Alt+A"],
+    [{ key: "!", code: "Digit1", metaKey: true, shiftKey: true }, "CmdOrControl+Shift+1"],
+    [{ key: "+", code: "Equal", metaKey: true, shiftKey: true }, "CmdOrControl+Shift+Equal"],
+    [{ key: "Dead", code: "KeyE", altKey: true }, "Alt+E"],
+    [{ key: "{", code: "BracketLeft", ctrlKey: true, shiftKey: true }, "Control+Shift+BracketLeft"],
+  ])("captures physical keys instead of generated text: %s", (options, binding) => {
+    expect(hotkeyFromKeyboardEvent(new KeyboardEvent("keydown", options))).toBe(binding);
+  });
+
+  it("preserves legacy Command aliases in shortcut labels and normalization", () => {
+    for (const alias of ["Command", "Super", "Meta", "CmdOrControl"]) {
+      expect(toTanStackHotkey(`${alias}+Shift+V`)).toBe("Mod+Shift+V");
+      expect(formatHotkeyDisplay(`${alias}+Shift+V`)).toMatch(/⌘|Ctrl/);
+      expect(toTauriHotkey(`${alias}+Shift+V`)).toBe("CmdOrControl+Shift+V");
+    }
+  });
+
+  it("accepts new global combinations and function keys without taking over typing", () => {
+    for (const binding of ["Alt+A", "CmdOrControl+Enter", "Control+Tab", "F13", "Shift+F13"]) expect(isSafeCapturedHotkey(binding)).toBe(true);
+    for (const binding of ["A", "Space", "Tab", "Enter", "Shift+A", "Shift+Tab", "F25"]) expect(isSafeCapturedHotkey(binding)).toBe(false);
   });
 });

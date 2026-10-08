@@ -345,9 +345,9 @@ fn is_keychain_auth_failure(error: &str) -> bool {
 fn keychain_read_error_state(error: String) -> ApiKeyState {
     if is_keychain_auth_failure(&error) {
         log::warn!(
-            "keychain credential unreadable ({error}); treating as missing so an app-data sidecar can load"
+            "keychain credential unreadable ({error}); preserving legacy sources without migration"
         );
-        ApiKeyState::Missing
+        ApiKeyState::Unavailable(error)
     } else {
         ApiKeyState::Unavailable(error)
     }
@@ -523,6 +523,22 @@ pub fn set_cleanup_api_key(key: &str) -> Result<(), String> {
     set_secret(API_SERVICE, API_FALLBACK_SERVICE, CLEANUP_ACCOUNT, key)
 }
 
+fn custom_provider_state(
+    custom: ApiKeyState,
+    asr: ApiKeyState,
+    cleanup: ApiKeyState,
+) -> ApiKeyState {
+    match custom {
+        configured @ ApiKeyState::Configured(_) => configured,
+        unavailable @ ApiKeyState::Unavailable(_) => unavailable,
+        ApiKeyState::Missing => match asr {
+            configured @ ApiKeyState::Configured(_) => configured,
+            unavailable @ ApiKeyState::Unavailable(_) => unavailable,
+            ApiKeyState::Missing => cleanup,
+        },
+    }
+}
+
 pub fn get_provider_api_key_state(provider: crate::providers::EngineProvider) -> ApiKeyState {
     if provider.is_groq() {
         return get_api_key_state();
@@ -535,13 +551,10 @@ pub fn get_provider_api_key_state(provider: crate::providers::EngineProvider) ->
                 provider.keychain_account(),
             )
         });
-        if matches!(custom, ApiKeyState::Configured(_)) {
+        if !matches!(custom, ApiKeyState::Missing) {
             return custom;
         }
-        if let ApiKeyState::Configured(key) = get_asr_api_key_state() {
-            return ApiKeyState::Configured(key);
-        }
-        return get_cleanup_api_key_state();
+        return custom_provider_state(custom, get_asr_api_key_state(), get_cleanup_api_key_state());
     }
     let account = provider.keychain_account();
     secret_state(move || read_stored_secret(API_SERVICE, API_FALLBACK_SERVICE, account))
@@ -562,30 +575,28 @@ pub fn set_provider_api_key(
     )
 }
 
-pub fn resolve_cleanup_api_key(plaintext: &str) -> ApiKeyState {
-    if !plaintext.is_empty() {
-        if keychain_disabled() {
-            return ApiKeyState::Configured(plaintext.to_owned());
-        }
-        return match set_cleanup_api_key(plaintext) {
-            Ok(()) => ApiKeyState::Configured(plaintext.to_owned()),
+fn resolve_legacy_secret(
+    plaintext: &str,
+    read: fn() -> ApiKeyState,
+    write: fn(&str) -> Result<(), String>,
+) -> ApiKeyState {
+    match read() {
+        configured @ ApiKeyState::Configured(_) => configured,
+        unavailable @ ApiKeyState::Unavailable(_) => unavailable,
+        ApiKeyState::Missing if plaintext.is_empty() => ApiKeyState::Missing,
+        ApiKeyState::Missing => match write(plaintext) {
             Err(error) => ApiKeyState::Unavailable(error),
-        };
+            Ok(()) => match read() {
+                ApiKeyState::Configured(stored) if stored == plaintext => {
+                    ApiKeyState::Configured(stored)
+                }
+                ApiKeyState::Configured(_) | ApiKeyState::Missing => ApiKeyState::Unavailable(
+                    "credential_storage: legacy credential write was not verified".into(),
+                ),
+                ApiKeyState::Unavailable(error) => ApiKeyState::Unavailable(error),
+            },
+        },
     }
-    get_cleanup_api_key_state()
-}
-
-pub fn resolve_asr_api_key(plaintext: &str) -> ApiKeyState {
-    if !plaintext.is_empty() {
-        if keychain_disabled() {
-            return ApiKeyState::Configured(plaintext.to_owned());
-        }
-        return match set_asr_api_key(plaintext) {
-            Ok(()) => ApiKeyState::Configured(plaintext.to_owned()),
-            Err(error) => ApiKeyState::Unavailable(error),
-        };
-    }
-    get_asr_api_key_state()
 }
 
 /// Read the optional application-layer history encryption key.
@@ -658,41 +669,16 @@ fn decode_history_key(value: &str) -> Result<Vec<u8>, String> {
 /// responsible for clearing the plaintext field and re-saving settings.
 #[allow(dead_code)]
 pub fn migrate_plaintext(plaintext: &str) -> Option<String> {
-    if keychain_disabled() {
-        // In tests we can't persist to a keychain, so just hand back the
-        // plaintext key for in-memory use.
-        return if plaintext.is_empty() {
-            None
-        } else {
-            Some(plaintext.to_string())
-        };
-    }
-    if plaintext.is_empty() {
-        return get_api_key();
-    }
-    match set_api_key(plaintext) {
-        Ok(()) => Some(plaintext.to_string()),
-        Err(error) => {
-            log::error!("failed to migrate API key into keychain: {error}");
-            // Fall back to whatever (if anything) is already in the keychain.
-            get_api_key()
-        }
+    match resolve_api_key(plaintext) {
+        ApiKeyState::Configured(key) => Some(key),
+        ApiKeyState::Missing | ApiKeyState::Unavailable(_) => None,
     }
 }
 
 /// Resolve a legacy plaintext key or an existing OS credential without
 /// converting an unavailable keychain into a destructive settings update.
 pub fn resolve_api_key(plaintext: &str) -> ApiKeyState {
-    if !plaintext.is_empty() {
-        if keychain_disabled() {
-            return ApiKeyState::Configured(plaintext.to_owned());
-        }
-        return match set_api_key(plaintext) {
-            Ok(()) => ApiKeyState::Configured(plaintext.to_owned()),
-            Err(error) => ApiKeyState::Unavailable(error),
-        };
-    }
-    get_api_key_state()
+    resolve_legacy_secret(plaintext, get_api_key_state, set_api_key)
 }
 
 #[cfg(test)]
@@ -716,17 +702,37 @@ mod tests {
     }
 
     #[test]
-    fn keychain_auth_failure_is_missing_so_sidecar_can_load() {
-        assert_eq!(
+    fn keychain_auth_failure_is_unavailable_so_legacy_data_is_not_migrated_over_it() {
+        assert!(matches!(
             keychain_read_error_state(
                 "The user name or passphrase you entered is not correct.".into()
             ),
-            ApiKeyState::Missing
-        );
+            ApiKeyState::Unavailable(_)
+        ));
         assert!(matches!(
             keychain_read_error_state("keychain read timed out".into()),
             ApiKeyState::Unavailable(_)
         ));
+    }
+
+    #[test]
+    fn custom_provider_does_not_fall_back_when_canonical_read_is_unavailable() {
+        assert_eq!(
+            custom_provider_state(
+                ApiKeyState::Unavailable("synthetic read failure".into()),
+                ApiKeyState::Configured("stale alias".into()),
+                ApiKeyState::Missing,
+            ),
+            ApiKeyState::Unavailable("synthetic read failure".into())
+        );
+        assert_eq!(
+            custom_provider_state(
+                ApiKeyState::Missing,
+                ApiKeyState::Configured("legacy ASR alias".into()),
+                ApiKeyState::Configured("legacy cleanup alias".into()),
+            ),
+            ApiKeyState::Configured("legacy ASR alias".into())
+        );
     }
 
     #[test]

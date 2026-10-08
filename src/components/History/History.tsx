@@ -1,18 +1,23 @@
+import { Select } from "../Select";
 import { invoke } from "@tauri-apps/api/core";
-import { Check, CheckCircle2, CircleHelp, CircleX, Copy, Download, Eraser, History as HistoryIcon, LoaderCircle, Pencil, RotateCcw, Save, Trash2, TriangleAlert, Wand2, X } from "lucide-react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { Check, CheckCircle2, CircleHelp, CircleX, Copy, Download, Eraser, History as HistoryIcon, LoaderCircle, Pencil, RotateCcw, Save, Trash2, TriangleAlert, Wand2 } from "lucide-react";
+import { Fragment, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { mergeDictionary } from "../../lib/dictionaryImport";
-import { colors, radius, focusRingClass } from "../../lib/theme";
+import { secondaryButtonClass, compactButtonClass, dangerActionButtonClass, ghostButtonClass, inputClass, colors, radius, focusRingClass } from "../../lib/theme";
+import { ActionMenu } from "../ActionMenu";
 import { IconButton } from "../IconButton";
 import { useI18n } from "../../lib/i18n";
 import { deliveryReasonLabels } from "../../lib/deliveryCopy";
 import { ConfirmDialog } from "../ConfirmDialog";
-import { SettingsAlert, SettingsGroup, SettingsPageHeader, SettingsShell } from "../SettingsLayout";
+import { SettingsAlert, SettingsPageHeader, SettingsShell } from "../SettingsLayout";
 
 export type HistoryItem = {
   id: number;
   created_at: string;
   raw_text: string;
+  asr_text?: string | null;
+  engine?: string | null;
+  provider_cleaned_candidate?: string | null;
   final_text: string;
   cleanup_status?: string | null;
   duration: number;
@@ -21,6 +26,8 @@ export type HistoryItem = {
   status: string;
   delivery_method?: string | null;
   fallback_reason?: string | null;
+  delivery_error_code?: string | null;
+  delivery_user_reason?: string | null;
   context_profile_id?: string | null;
   retryable?: boolean;
   revision_count?: number;
@@ -41,15 +48,16 @@ type HistoryRevision = {
 };
 
 export function History({ items, reload, hasMore, loading, onLoadMore, error, onRetry, onQueryChange }: { items: HistoryItem[]; reload: () => void; hasMore: boolean; loading: boolean; onLoadMore: () => void; error?: string | null; onRetry?: () => void; onQueryChange?: (query: string) => void }) {
-  const { t } = useI18n();
+  const { t, language } = useI18n();
   const [query, setQuery] = useState("");
   const [dataError, setDataError] = useState<string | null>(null);
   const [dataMessage, setDataMessage] = useState<string | null>(null);
+  const [pendingExport, setPendingExport] = useState<"records" | "audio" | null>(null);
   const [confirmClear, setConfirmClear] = useState(false);
   const queryInitializedRef = useRef(false);
   const normalizedQuery = query.trim().toLowerCase();
   const visible = useMemo(
-    () => items.filter((item) => !normalizedQuery || `${item.raw_text} ${item.final_text}`.toLowerCase().includes(normalizedQuery)),
+    () => items.filter((item) => !normalizedQuery || `${item.asr_text ?? ""} ${item.provider_cleaned_candidate ?? ""} ${item.raw_text} ${item.final_text}`.toLowerCase().includes(normalizedQuery)),
     [items, normalizedQuery],
   );
 
@@ -64,6 +72,8 @@ export function History({ items, reload, hasMore, loading, onLoadMore, error, on
   }, [onQueryChange, query]);
 
   const exportData = async () => {
+    if (pendingExport) return;
+    setPendingExport("records");
     setDataError(null);
     setDataMessage(null);
     try {
@@ -71,10 +81,14 @@ export function History({ items, reload, hasMore, loading, onLoadMore, error, on
       setDataMessage(t("已导出到：") + path);
     } catch (reason) {
       setDataError(t("导出失败：") + String(reason));
+    } finally {
+      setPendingExport(null);
     }
   };
 
   const exportGold = async () => {
+    if (pendingExport) return;
+    setPendingExport("audio");
     setDataError(null);
     setDataMessage(null);
     try {
@@ -82,6 +96,8 @@ export function History({ items, reload, hasMore, loading, onLoadMore, error, on
       setDataMessage(t("已导出音频到：") + path);
     } catch (reason) {
       setDataError(t("导出音频失败：") + String(reason));
+    } finally {
+      setPendingExport(null);
     }
   };
 
@@ -103,28 +119,34 @@ export function History({ items, reload, hasMore, loading, onLoadMore, error, on
 
   return (
     <SettingsShell>
-      <SettingsPageHeader title={t("历史")} description={t("每一次表达，都留在这里。")} actions={<div className="flex shrink-0 items-center gap-1"><IconButton label={t("下载")} aria-label={t("下载历史记录")} icon={<Download size={16} aria-hidden="true" />} onClick={() => void exportData()} /><IconButton label={t("导出音频")} aria-label={t("导出保留的音频")} icon={<Download size={16} aria-hidden="true" />} onClick={() => void exportGold()} /><IconButton label={t("清空")} aria-label={t("清空全部数据")} tone="danger" icon={<Eraser size={16} aria-hidden="true" />} disabled={loading} onClick={() => void clearAll()} /></div>} />
-      <div className="mt-7 flex flex-wrap items-center justify-between gap-3 border-y border-border py-3">
-        <input aria-label={t("搜索历史记录")} value={query} onChange={(event) => setQuery(event.target.value)} placeholder={t("搜索历史…")} className={`h-9 w-64 max-w-full ${radius.control} border ${colors.border} ${colors.bg.elevated} px-3 text-sm text-primary outline-none transition-colors placeholder:text-tertiary focus:border-accent ${focusRingClass}`} />
+      <SettingsPageHeader title={t("历史记录")} description={t("每一次表达，都留在这里。")} actions={
+        <div className="flex flex-wrap items-center gap-2">
+          <button type="button" aria-label={t("导出记录")} aria-busy={pendingExport === "records"} disabled={pendingExport !== null} className={`${secondaryButtonClass} w-40 whitespace-nowrap`} onClick={() => void exportData()}><Download size={15} className="shrink-0" aria-hidden="true" />{t(pendingExport === "records" ? "导出中…" : "导出记录")}</button>
+          <button type="button" aria-label={t("导出音频")} aria-busy={pendingExport === "audio"} disabled={pendingExport !== null} className={`${secondaryButtonClass} w-40 whitespace-nowrap`} onClick={() => void exportGold()}><Download size={15} className="shrink-0" aria-hidden="true" />{t(pendingExport === "audio" ? "导出中…" : "导出音频")}</button>
+          <IconButton label={t("清空")} aria-label={t("清空全部数据")} tone="danger" icon={<Eraser size={16} aria-hidden="true" />} disabled={loading || pendingExport !== null} onClick={() => void clearAll()} />
+        </div>
+      } />
+      {dataMessage && <p role="status" className="mt-3 break-words text-xs leading-5 text-success-ink">{dataMessage}</p>}
+      {dataError && <p role="alert" className="mt-3 break-words text-xs leading-5 text-error-ink">{dataError}</p>}
+      <div className="mt-6 flex flex-wrap items-center justify-between gap-3 border-y border-border py-3">
+        <input aria-label={t("搜索历史记录")} value={query} onChange={(event) => setQuery(event.target.value)} placeholder={t("搜索历史…")} className={`${inputClass} w-64 max-w-full`} />
         <p className="text-xs text-tertiary">{items.length ? `${items.length}${hasMore ? "+" : ""} ${t("条")} · ${hasMore ? t("还有更早记录") : t("已显示全部")}` : ""}</p>
       </div>
-      {dataMessage && <p role="status" className="mt-4 text-xs text-success">{dataMessage}</p>}
-      {dataError && <p role="alert" className="mt-4 text-xs text-error">{dataError}</p>}
       {error && <div className="mt-4"><SettingsAlert onRetry={onRetry ?? reload} retryLabel={t("重新加载")}>{error}</SettingsAlert></div>}
       {loading && items.length === 0 ? (
         <HistoryLoading />
       ) : visible.length ? (
         <>
-          <SettingsGroup title={t("记录")} description={`${visible.length}${hasMore ? "+" : ""} ${t("条")}`}>
-            {visible.map((item) => (
-              <HistoryRow
-                key={item.id}
-                item={item}
-                reload={reload}
-                windowed={visible.length > 50}
-              />
-            ))}
-          </SettingsGroup>
+          <div className="mt-6">
+            {visible.map((item, index) => {
+              const day = historyDay(item.created_at, t, language);
+              const previous = index > 0 ? historyDay(visible[index - 1].created_at, t, language) : null;
+              return <Fragment key={item.id}>
+                {day.key !== previous?.key && <h2 className="vf-history-date px-5 pb-2 pt-6 text-sm font-semibold leading-5 text-primary first:pt-0">{day.label}</h2>}
+                <HistoryRow item={item} reload={reload} windowed={visible.length > 50} />
+              </Fragment>;
+            })}
+          </div>
           {hasMore && <LoadMoreButton loading={loading} searching={Boolean(query.trim())} onClick={onLoadMore} />}
         </>
       ) : items.length ? (
@@ -140,8 +162,8 @@ export function History({ items, reload, hasMore, loading, onLoadMore, error, on
       <ConfirmDialog
         open={confirmClear}
         title={t("清空全部数据")}
-        description={t("这会删除全部历史文字、恢复音频、金标 wav 和本地用量，但不会删除 Keychain 中的 API Key，且无法撤销。确定继续吗？")}
-        confirmLabel={t("确定继续")}
+        description={t("这会删除全部历史文字及迁移备份、恢复音频、训练音频和本地用量。Keychain 中的 API Key 会保留。删除后无法恢复，确定继续吗？")}
+        confirmLabel={t("清空全部数据")}
         cancelLabel={t("取消")}
         onCancel={() => setConfirmClear(false)}
         onConfirm={() => void confirmClearAll()}
@@ -160,12 +182,43 @@ function HistoryRow({ item, reload, windowed = false }: { item: HistoryItem; rel
   const [revisions, setRevisions] = useState<HistoryRevision[] | null>(null);
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(item.final_text || item.raw_text);
+  const [showReclean, setShowReclean] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const copyTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => () => { if (copyTimer.current) clearTimeout(copyTimer.current); }, []);
   const [operation, setOperation] = useState("cleanup");
   const [dictionaryCandidates, setDictionaryCandidates] = useState<DictionarySuggestion[]>([]);
+  const actionsRef = useRef<HTMLDivElement>(null);
+  const editorRef = useRef<HTMLTextAreaElement>(null);
+  const cancelDeleteRef = useRef<HTMLButtonElement>(null);
+  const editFocusPending = useRef(false);
+  const deleteTriggerRef = useRef<HTMLButtonElement | null>(null);
   const status = statusPresentation(item.status, t);
   const StatusIcon = status.icon;
   const reason = displayReason(item, t);
   const cleanupLabel = cleanupStatusLabel(item.cleanup_status, t);
+  const canRetry = Boolean(item.retryable && (item.status === "failed" || item.status === "degraded"));
+  useLayoutEffect(() => {
+    if (editing) {
+      editFocusPending.current = true;
+      editorRef.current?.focus({ preventScroll: true });
+    } else if (editFocusPending.current) {
+      editFocusPending.current = false;
+      actionsRef.current?.querySelector<HTMLButtonElement>("[data-history-edit]")?.focus({ preventScroll: true });
+    }
+  }, [editing]);
+  useLayoutEffect(() => {
+    if (confirmingDelete) cancelDeleteRef.current?.focus({ preventScroll: true });
+  }, [confirmingDelete]);
+  const cancelEditing = () => {
+    setDraft(item.final_text || item.raw_text);
+    setEditing(false);
+    setError(null);
+  };
+  const cancelDelete = () => {
+    setConfirmingDelete(false);
+    deleteTriggerRef.current?.focus({ preventScroll: true });
+  };
 
   const run = async (command: string, args: Record<string, unknown> = {}, reloadAfter = false): Promise<boolean> => {
     setBusy(true);
@@ -242,48 +295,70 @@ function HistoryRow({ item, reload, windowed = false }: { item: HistoryItem; rel
   };
 
   return (
-    <div className={`flex flex-wrap items-center gap-3 border-t border-border px-4 py-4 first:border-t-0 sm:px-5${windowed ? " history-list--windowed" : ""}`}>
+    <div className={`vf-history-row flex flex-wrap items-start gap-3 border-t border-border px-5 py-4 first:border-t-0${windowed ? " history-list--windowed" : ""}`} onKeyDown={(event) => {
+      if (event.key !== "Escape" || event.nativeEvent.isComposing || busy) return;
+      if (!editing && !confirmingDelete) return;
+      event.preventDefault();
+      event.stopPropagation();
+      if (editing) cancelEditing();
+      else cancelDelete();
+    }}>
       <span role="img" aria-label={busy ? t("处理中…") : status.label} className="flex h-7 w-7 shrink-0 items-center justify-center">
         {busy ? <LoaderCircle size={16} className="animate-spin text-secondary motion-reduce:animate-none" aria-hidden="true" /> : <StatusIcon size={16} className={status.iconClass} aria-hidden="true" />}
       </span>
       <div className="min-w-0 flex-1">
         {editing ? (
-          <textarea aria-label={t("编辑整理结果")} value={draft} onChange={(event) => setDraft(event.target.value)} rows={3} className={`w-full rounded-lg border border-border bg-elevated px-3 py-2 text-sm text-primary outline-none focus:border-accent ${focusRingClass}`} />
-        ) : <p className="truncate text-sm text-primary">{item.final_text || item.raw_text || t("识别失败")}</p>}
-        <p className="mt-1 flex flex-wrap items-center gap-x-1.5 gap-y-1 text-xs text-tertiary"><span>{relativeTime(item.created_at, t, language)} · {formatDuration(item.duration, language)} {t("秒")}</span>{cleanupLabel && <><span aria-hidden="true">·</span><span>{cleanupLabel}</span></>}{(item.revision_count ?? 0) > 0 && <><span aria-hidden="true">·</span><span>{item.revision_count} {t("个版本")}</span></>}</p>
-        {(item.raw_text && item.final_text) && <button type="button" className="mt-2 text-xs text-secondary underline decoration-border underline-offset-2 transition-colors hover:text-primary" onClick={() => setShowRaw((value) => !value)}>{showRaw ? t("隐藏原文") : t("查看原文")}</button>}
-        {item.revision_count ? <button type="button" className="ml-3 mt-2 text-xs text-secondary underline decoration-border underline-offset-2 transition-colors hover:text-primary" disabled={busy} onClick={() => void toggleRevisions()}>{showRevisions ? t("隐藏版本") : t("查看版本")}</button> : null}
-        {showRaw && item.raw_text && <div className="mt-2 space-y-1 rounded-lg bg-elevated px-3 py-2 text-xs"><p className="text-tertiary">{t("清理前")}</p><p className="whitespace-pre-wrap text-secondary">{item.raw_text}</p><p className="pt-1 text-tertiary">{t("清理后")}</p><p className="text-tertiary">{t("当前版本")}</p><p className="whitespace-pre-wrap text-primary">{item.final_text || item.raw_text}</p></div>}
+          <div>
+            <textarea ref={editorRef} aria-label={t("编辑整理结果")} value={draft} disabled={busy} onChange={(event) => setDraft(event.target.value)} rows={3} className={`w-full rounded-lg border border-border bg-elevated px-3 py-2 text-sm text-primary outline-none focus:border-accent ${focusRingClass}`} />
+            <p className="mt-1 text-xs text-secondary">{t("编辑中，保存后生效；Esc 可取消。")}</p>
+          </div>
+        ) : <p className="line-clamp-2 whitespace-pre-wrap break-words text-sm leading-5 text-primary">{item.final_text || item.raw_text || t("识别失败")}</p>}
+        <p className="mt-1 flex flex-wrap items-center gap-x-1.5 gap-y-1 text-xs text-tertiary"><span>{relativeTime(item.created_at, t, language)} · {formatDuration(item.duration, language)} {t("秒")}</span>{item.engine && <><span aria-hidden="true">·</span><span>{item.engine}</span></>}{cleanupLabel && <><span aria-hidden="true">·</span><span>{cleanupLabel}</span></>}{(item.revision_count ?? 0) > 0 && <><span aria-hidden="true">·</span><span>{item.revision_count} {t("个版本")}</span></>}</p>
+        {showRaw && (item.asr_text || item.provider_cleaned_candidate || item.raw_text) && <div className="mt-2 space-y-1 rounded-lg bg-elevated px-3 py-2 text-xs">{item.asr_text != null && <><p className="text-tertiary">{t("ASR 识别原文")}</p><p className="whitespace-pre-wrap text-secondary">{item.asr_text}</p></>}{item.provider_cleaned_candidate != null && <><p className="pt-1 text-tertiary">{t("服务商整理候选")}</p><p className="whitespace-pre-wrap text-secondary">{item.provider_cleaned_candidate}</p></>}{item.raw_text && <><p className="pt-1 text-tertiary">{t("清理前")}</p><p className="whitespace-pre-wrap text-secondary">{item.raw_text}</p></>}<p className="pt-1 text-tertiary">{t("清理后")}</p><p className="text-tertiary">{t("当前版本")}</p><p className="whitespace-pre-wrap text-primary">{item.final_text || item.raw_text}</p></div>}
         {showRevisions && revisions && <RevisionList rawText={item.raw_text} revisions={revisions} t={t} />}
         {reason && <p className={`mt-1 text-xs ${status.detailClass}`}>{reason}</p>}
-        {dictionaryCandidates.length > 0 && !editing && <div className="mt-2 flex flex-wrap items-center gap-1.5 text-xs"><span className="text-tertiary">{t("可能的词典建议")}</span>{dictionaryCandidates.map((candidate) => <button key={candidate.pair_key} type="button" className="rounded-md border border-border px-2 py-1 text-secondary hover:bg-elevated hover:text-primary" disabled={busy} onClick={() => void confirmDictionaryCandidate(candidate)}>{t("确认")} “{candidate.before_span} → {candidate.after}”</button>)}</div>}
+        {dictionaryCandidates.length > 0 && !editing && <div className="mt-2 flex flex-wrap items-center gap-1.5 text-xs"><span className="text-tertiary">{t("可能的词典建议")}</span>{dictionaryCandidates.map((candidate) => <button key={candidate.pair_key} type="button" className={compactButtonClass} disabled={busy} onClick={() => void confirmDictionaryCandidate(candidate)}>{t("确认")} “{candidate.before_span} → {candidate.after}”</button>)}</div>}
       </div>
-      <div className="flex shrink-0 items-center gap-1">
+      <div ref={actionsRef} className="vf-history-actions ml-auto flex shrink-0 flex-wrap items-center justify-end gap-1">
         {editing ? (
-          <IconButton label={t("保存版本")} aria-label={t("保存历史版本")} icon={<Save size={15} aria-hidden="true" />} disabled={busy || !draft.trim()} onClick={() => void (async () => { if (await run("save_history_revision", { final_text: draft, revision_reason: "manual_edit" }, true)) { setEditing(false); await suggestDictionaryCandidates(item.raw_text, draft); } })()} />
-        ) : <IconButton label={t("编辑")} aria-label={t("编辑这条历史记录")} icon={<Pencil size={15} aria-hidden="true" />} disabled={busy || !(item.final_text || item.raw_text)} onClick={() => { setDraft(item.final_text || item.raw_text); setEditing(true); }} />}
-        <IconButton label={t("复制")} aria-label={t("复制这条历史记录到剪贴板")} icon={<Copy size={15} aria-hidden="true" />} disabled={busy} onClick={() => void run("repaste_history")} />
-        <select aria-label={t("重新整理模式")} value={operation} disabled={busy} onChange={(event) => setOperation(event.target.value)} className="h-8 rounded-md border border-border bg-elevated px-1 text-xs text-secondary">
-          <option value="cleanup">{t("忠实整理")}</option>
-          <option value="rewrite">{t("改写")}</option>
-          <option value="shorten">{t("缩短")}</option>
-          <option value="formalize">{t("正式一点")}</option>
-          <option value="casualize">{t("口语一点")}</option>
-        </select>
-        <IconButton label={t("重新整理")} aria-label={t("从原文重新整理")} icon={<Wand2 size={15} aria-hidden="true" />} disabled={busy || !item.raw_text} onClick={() => void run("reclean_history", { operation }, true)} />
-        {item.retryable && (item.status === "failed" || item.status === "degraded") && (
-          <IconButton label={t("重试")} aria-label={t("重试这条历史记录")} icon={<RotateCcw size={15} aria-hidden="true" />} disabled={busy} onClick={() => void run("retry_dictation", {}, true)} />
-        )}
-        {confirmingDelete ? (
-          <span className="flex items-center gap-1">
-            <IconButton label={t("确认删除")} tone="warning" aria-label={t("确认删除这条历史记录")} icon={<Check size={15} aria-hidden="true" />} disabled={busy} onClick={() => { setConfirmingDelete(false); void run("delete_history", {}, true); }} />
-            <IconButton label={t("取消删除")} aria-label={t("取消删除")} icon={<X size={15} aria-hidden="true" />} disabled={busy} onClick={() => setConfirmingDelete(false)} />
-          </span>
-        ) : (
-          <IconButton label={t("删除")} tone="danger" aria-label={`${t("删除")} ${item.final_text || item.raw_text || item.id}`} icon={<Trash2 size={15} aria-hidden="true" />} disabled={busy} onClick={() => setConfirmingDelete(true)} />
-        )}
+          <>
+            <button type="button" aria-label={t("保存历史版本")} className={compactButtonClass} disabled={busy || !draft.trim()} onClick={() => void (async () => { if (await run("save_history_revision", { final_text: draft, revision_reason: "manual_edit" }, true)) { setEditing(false); await suggestDictionaryCandidates(item.raw_text, draft); } })()}><Save size={15} aria-hidden="true" />{t(busy ? "保存中…" : "保存版本")}</button>
+            <button type="button" aria-label={t("取消编辑")} disabled={busy} className={ghostButtonClass} onClick={cancelEditing}>{t("取消")}</button>
+          </>
+        ) : <IconButton data-history-edit label={t("编辑")} aria-label={t("编辑这条历史记录")} icon={<Pencil size={15} aria-hidden="true" />} disabled={busy || !(item.final_text || item.raw_text)} onClick={() => { setConfirmingDelete(false); setDraft(item.final_text || item.raw_text); setEditing(true); }} />}
+        <button type="button" aria-label={t("复制这条历史记录到剪贴板")} className={`${ghostButtonClass} w-24 whitespace-nowrap`} disabled={busy || editing} onClick={() => void (async () => {
+          setCopied(false);
+          if (copyTimer.current) clearTimeout(copyTimer.current);
+          if (await run("repaste_history")) {
+            setCopied(true);
+            if (copyTimer.current) clearTimeout(copyTimer.current);
+            copyTimer.current = setTimeout(() => setCopied(false), 2000);
+          }
+        })()}>{copied ? <Check size={16} aria-hidden="true" /> : <Copy size={16} aria-hidden="true" />}{t(copied ? "已复制" : "复制")}</button>
+        <span className="inline-flex h-9 w-9 shrink-0" aria-hidden={!canRetry || undefined}>{canRetry && <IconButton label={t("重试")} aria-label={t("重试这条历史记录")} icon={<RotateCcw size={15} aria-hidden="true" />} disabled={busy || editing} onClick={() => void run("retry_dictation", {}, true)} />}</span>
+        <ActionMenu label={t("更多操作")} disabled={busy || editing} items={[
+          ...((item.asr_text || item.provider_cleaned_candidate || (item.raw_text && item.final_text)) ? [{ label: t(showRaw ? "隐藏原文" : "查看原文"), onSelect: () => setShowRaw((value) => !value) }] : []),
+          ...(item.revision_count ? [{ label: t(showRevisions ? "隐藏版本" : "查看版本"), onSelect: () => void toggleRevisions() }] : []),
+          { label: t("重新整理"), icon: <Wand2 size={16} aria-hidden="true" />, disabled: !item.raw_text, onSelect: () => setShowReclean(true) },
+          { label: t("删除记录"), icon: <Trash2 size={16} aria-hidden="true" />, danger: true, onSelect: () => {
+            deleteTriggerRef.current = actionsRef.current?.querySelector<HTMLButtonElement>("[aria-haspopup='menu']") ?? null;
+            setConfirmingDelete(true);
+          } },
+        ]} />
       </div>
-      {error && <p role="alert" className="basis-full text-xs text-error">{error}</p>}
+      {confirmingDelete && <div className="flex basis-full flex-wrap items-center justify-end gap-2">
+        <button type="button" aria-label={t("确认删除这条历史记录")} className={dangerActionButtonClass} disabled={busy || editing} onClick={() => { setConfirmingDelete(false); void run("delete_history", {}, true); }}><Trash2 size={15} aria-hidden="true" />{t("确认删除")}</button>
+        <button ref={cancelDeleteRef} type="button" aria-label={t("取消删除")} className={ghostButtonClass} disabled={busy} onClick={cancelDelete}>{t("取消")}</button>
+      </div>}
+      {showReclean && <div className="flex basis-full flex-wrap items-center gap-2 rounded-lg bg-elevated p-3">
+        <Select aria-label={t("重新整理模式")} value={operation} disabled={busy || editing} onValueChange={(value) => setOperation(value)} className={`${inputClass} w-40`}>
+          <option value="cleanup">{t("忠实整理")}</option><option value="rewrite">{t("改写")}</option><option value="shorten">{t("缩短")}</option><option value="formalize">{t("正式一点")}</option><option value="casualize">{t("口语一点")}</option>
+        </Select>
+        <button type="button" aria-label={t("从原文重新整理")} aria-busy={busy} disabled={busy || editing || !item.raw_text} onClick={() => void run("reclean_history", { operation }, true)} className={secondaryButtonClass}>{t(busy ? "处理中…" : "重新整理")}</button>
+        <button type="button" disabled={busy} onClick={() => setShowReclean(false)} className={ghostButtonClass}>{t("收起")}</button>
+      </div>}
+      {error && <p role="alert" className="basis-full text-xs text-error-ink">{error}</p>}
+      <span role="status" className="sr-only">{copied ? t("已复制") : ""}</span>
     </div>
   );
 }
@@ -320,24 +395,28 @@ const degradedReasonLabels: Record<string, string> = {
 
 function statusPresentation(status: string, t: (source: string) => string) {
   if (status === "failed") {
-    return { label: t("识别失败"), icon: CircleX, surfaceClass: "bg-error/10", iconClass: "text-error", detailClass: "text-error" };
+    return { label: t("识别失败"), icon: CircleX, surfaceClass: "bg-error/10", iconClass: "text-error-ink", detailClass: "text-error-ink" };
   }
   if (status === "degraded") {
-    return { label: t("已保留原文"), icon: TriangleAlert, surfaceClass: "bg-warning/10", iconClass: "text-warning", detailClass: "text-warning" };
+    return { label: t("已保留原文"), icon: TriangleAlert, surfaceClass: "bg-warning/10", iconClass: "text-warning-ink", detailClass: "text-warning-ink" };
   }
   if (status === "unverified") {
-    return { label: t("已复制"), icon: TriangleAlert, surfaceClass: "bg-warning/10", iconClass: "text-warning", detailClass: "text-warning" };
+    return { label: t("交付未确认"), icon: TriangleAlert, surfaceClass: "bg-warning/10", iconClass: "text-warning-ink", detailClass: "text-warning-ink" };
   }
   if (status === "copied") {
-    return { label: t("已复制"), icon: CheckCircle2, surfaceClass: "bg-success/10", iconClass: "text-success", detailClass: "text-secondary" };
+    return { label: t("已复制"), icon: CheckCircle2, surfaceClass: "bg-success/10", iconClass: "text-success-ink", detailClass: "text-secondary" };
+  }
+  if (status === "history") {
+    return { label: t("已保存到历史记录"), icon: HistoryIcon, surfaceClass: "bg-elevated", iconClass: "text-secondary", detailClass: "text-secondary" };
   }
   if (status === "ok") {
-    return { label: t("已完成"), icon: CheckCircle2, surfaceClass: "bg-success/10", iconClass: "text-success", detailClass: "text-secondary" };
+    return { label: t("已完成"), icon: CheckCircle2, surfaceClass: "bg-success/10", iconClass: "text-success-ink", detailClass: "text-secondary" };
   }
   return { label: t("状态未知"), icon: CircleHelp, surfaceClass: "bg-elevated", iconClass: "text-tertiary", detailClass: "text-secondary" };
 }
 
 function displayReason(item: HistoryItem, t: (source: string) => string): string | null {
+  if (item.delivery_user_reason) return t(item.delivery_user_reason);
   const messages = [
     item.degraded_reason ? degradedReasonLabels[item.degraded_reason] : undefined,
     item.fallback_reason ? deliveryReasonLabels[item.fallback_reason] : undefined,
@@ -347,7 +426,9 @@ function displayReason(item: HistoryItem, t: (source: string) => string): string
     return t("处理失败，请检查结果或重试");
   }
   if (item.status === "failed") return t("处理失败，没有生成可用文字，可重试");
-  if (item.status === "unverified") return t("已复制，请按 ⌘V");
+  if (item.status === "unverified") {
+    return t("自动粘贴未确认，请先检查输入框；文字仍在剪贴板或历史记录中");
+  }
   if (item.status === "degraded" || item.degraded) return t("处理未完成，原始转录已保留，可重试");
   return null;
 }
@@ -356,6 +437,7 @@ function cleanupStatusLabel(status: string | null | undefined, t: (source: strin
   if (status === "ai_success") return t("AI 已整理");
   if (status === "ai_failed_local") return t("AI 失败，已本地整理");
   if (status === "ai_failed_raw") return t("AI 失败，已保留原文");
+  if (status === "preservation_guard") return t("已阻止可能改变原意的整理");
   if (status === "local_only") return t("仅本地整理");
   if (status === "snippet_bypass") return t("语音片段");
   return null;
@@ -397,6 +479,18 @@ function parseUtcTimestamp(value: string): Date | null {
   return Number.isNaN(dated.getTime()) ? null : dated;
 }
 
+function historyDay(value: string, t: (source: string) => string, language: string) {
+  const date = parseUtcTimestamp(value);
+  if (!date) return { key: value, label: value || t("日期未知") };
+  const key = `${date.getFullYear()}-${date.getMonth()}-${date.getDate()}`;
+  const today = new Date();
+  const yesterday = new Date(today);
+  yesterday.setDate(today.getDate() - 1);
+  const dayKey = (day: Date) => `${day.getFullYear()}-${day.getMonth()}-${day.getDate()}`;
+  const label = key === dayKey(today) ? t("今天") : key === dayKey(yesterday) ? t("昨天") : new Intl.DateTimeFormat(language === "zh" ? "zh-CN" : "en", { year: "numeric", month: "long", day: "numeric" }).format(date);
+  return { key, label };
+}
+
 function relativeTime(value: string, t: (source: string) => string, language: string) {
   const dated = parseUtcTimestamp(value);
   if (!dated) return value;
@@ -426,7 +520,7 @@ function revisionReasonLabel(reason: string, t: (source: string) => string) {
 function Empty() {
   const { t } = useI18n();
   return (
-    <div className="flex min-h-[260px] flex-col items-center justify-center border-t border-border text-center">
+    <div className="flex min-h-[260px] flex-col items-center justify-center text-center">
       <div className="mb-4 flex h-10 w-10 items-center justify-center rounded-xl bg-elevated text-tertiary"><HistoryIcon size={19} aria-hidden="true" /></div>
       <p className="text-base font-medium text-primary">{t("还没有记录，按热键说一句吧")}</p>
       <p className="mt-2 text-sm text-tertiary">{t("你的语音记录会出现在这里。")}</p>

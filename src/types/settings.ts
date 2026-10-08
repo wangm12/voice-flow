@@ -1,4 +1,5 @@
-import type { WritingMode } from "../components/ContextSettings";
+import type { ActivationMode } from "../lib/activationCopy";
+import type { ContextMapping, WritingMode } from "../components/ContextSettings";
 import type { Snippet } from "../components/SnippetsSettings";
 import type { UiLanguagePreference } from "../lib/i18n";
 import type { ProviderId } from "../lib/providers";
@@ -41,7 +42,8 @@ export type Settings = {
   keep_success_audio?: boolean;
   onboarded: boolean;
   cleanup_enabled: boolean;
-  cleanup_intensity?: "off" | "light" | "standard" | "heavy";
+  strict_offline_enabled?: boolean;
+  cleanup_intensity?: "auto" | "off" | "light" | "standard" | "heavy";
   accurate_asr_provider?: ProviderId;
   accurate_asr_model?: string;
   accurate_asr_base_url?: string;
@@ -53,11 +55,11 @@ export type Settings = {
   vision_model?: string;
   show_tray_icon: boolean;
   hotkey: string;
-  activation_mode: string;
+  activation_mode: ActivationMode;
   hotkey_error?: string | null;
   context_enabled: boolean;
   browser_access_enabled: boolean;
-  context_mappings: unknown[];
+  context_mappings: ContextMapping[];
   writing_modes: WritingMode[];
   snippets: Snippet[];
   output_mode: string;
@@ -67,6 +69,42 @@ export type Settings = {
   dictionary_learn_enabled?: boolean;
   input_device: string;
   input_gain?: number;
+  verbatim_hotkey?: string;
+  translation_hotkey?: string;
+  extra_recording_buffer_ms?: number;
+  audio_feedback_enabled?: boolean;
+  audio_feedback_volume?: number;
+  vad_enabled?: boolean;
+  always_on_microphone?: boolean;
+  clamshell_microphone?: string;
+  autostart_enabled?: boolean;
+  whats_new_last_seen_version?: string;
+  debug_mode?: boolean;
+  fuzzy_dictionary_enabled?: boolean;
+
+};
+
+export type OnDeviceModelStatus = {
+  id: string;
+  label: string;
+  bytes: number;
+  sha256: string | null;
+  state: string;
+  inference_ready: boolean;
+  downloaded_bytes: number;
+  error: string | null;
+  revision: string | null;
+  file_count: number;
+  platform_supported: boolean;
+  runtime_status: string;
+  loaded: boolean;
+};
+
+export type LocalCleanupStatus = {
+  available: boolean;
+  status: string;
+  message: string;
+  model: string;
 };
 
 export type SaveSettings = (

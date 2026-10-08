@@ -4,7 +4,10 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::context::ContextFamily;
-use crate::screen_text::{ScreenTextContext, ScreenTextSource, MAX_CHARS, MAX_TOKENS};
+use crate::screen_text::{
+    ContextEvidenceItem, ContextEvidenceKind, ContextEvidenceSource, ScreenTextContext,
+    ScreenTextSource, MAX_TOKENS,
+};
 
 static VISION_CAPTURE_COUNT: AtomicUsize = AtomicUsize::new(0);
 
@@ -15,6 +18,18 @@ pub struct MemoryImage {
     pub png: Vec<u8>,
     pub width: u32,
     pub height: u32,
+}
+
+impl Drop for MemoryImage {
+    fn drop(&mut self) {
+        self.png.fill(0);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapturedContextImage {
+    pub context: ScreenTextContext,
+    pub image: MemoryImage,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,7 +95,9 @@ pub fn capture_locked_window(window_id: Option<u64>) -> Result<MemoryImage, Capt
     capture_locked_window_id(window_id)
 }
 
-/// Phase 3 capture. Dictation stop must never call this.
+/// Capture a current window only after its caller verifies the App grant and
+/// Screen Recording permission. Automatic fallback and the manual action both
+/// use the same in-memory one-window path.
 pub fn capture_for_vision(window_id: Option<u64>) -> Result<MemoryImage, CaptureError> {
     VISION_CAPTURE_COUNT.fetch_add(1, Ordering::SeqCst);
     capture_locked_window(window_id)
@@ -286,52 +303,84 @@ fn ocr_png_vision(png: &[u8]) -> Vec<String> {
 }
 
 pub fn merge_ocr_tokens(ctx: &ScreenTextContext, tokens: Vec<String>) -> ScreenTextContext {
+    merge_image_terms(
+        ctx,
+        tokens,
+        ContextEvidenceSource::Ocr,
+        ScreenTextSource::AxOcr,
+    )
+}
+
+pub fn merge_vision_terms(ctx: &ScreenTextContext, tokens: Vec<String>) -> ScreenTextContext {
+    merge_image_terms(
+        ctx,
+        tokens,
+        ContextEvidenceSource::CloudVision,
+        ScreenTextSource::CloudVision,
+    )
+}
+
+fn merge_image_terms(
+    ctx: &ScreenTextContext,
+    tokens: Vec<String>,
+    source: ContextEvidenceSource,
+    source_label: ScreenTextSource,
+) -> ScreenTextContext {
     let mut merged = ctx.clone();
-    merged.source = ScreenTextSource::AxOcr;
-    for token in tokens {
-        let trimmed = token.trim();
-        if trimmed.is_empty() {
-            continue;
+    for line in tokens {
+        for token in crate::screen_text::terms_from_ocr_line(&line) {
+            if merged
+                .evidence
+                .items
+                .iter()
+                .any(|item| item.kind == ContextEvidenceKind::Term && item.value == token)
+            {
+                continue;
+            }
+            let current_terms = merged
+                .evidence
+                .items
+                .iter()
+                .filter(|item| item.kind == ContextEvidenceKind::Term)
+                .count();
+            if current_terms >= MAX_TOKENS {
+                merged.truncated = true;
+                merged.evidence.truncated = true;
+                return merged;
+            }
+            let next_chars = merged.usable_chars() + token.chars().count();
+            if next_chars > crate::screen_text::MAX_CHARS {
+                merged.truncated = true;
+                merged.evidence.truncated = true;
+                return merged;
+            }
+            merged.evidence.items.push(ContextEvidenceItem {
+                source,
+                kind: ContextEvidenceKind::Term,
+                value: token,
+                confidence_milli: None,
+                truncated: false,
+            });
         }
-        if merged.tokens.iter().any(|existing| existing == trimmed) {
-            continue;
-        }
-        if merged.tokens.len() >= MAX_TOKENS {
-            merged.truncated = true;
-            break;
-        }
-        let next_chars = merged.usable_chars() + trimmed.chars().count();
-        if next_chars > MAX_CHARS {
-            merged.truncated = true;
-            break;
-        }
-        merged.tokens.push(trimmed.to_owned());
+    }
+    if merged
+        .evidence
+        .items
+        .iter()
+        .any(|item| item.source == source)
+    {
+        merged.source = source_label;
     }
     merged
 }
 
-pub fn maybe_ocr(
-    enabled: bool,
-    recording_ok: bool,
-    family: ContextFamily,
-    sensitive: bool,
-    ctx: &ScreenTextContext,
-    window_id: Option<u64>,
-) -> Option<ScreenTextContext> {
-    maybe_ocr_with(
-        enabled,
-        recording_ok,
-        family,
-        sensitive,
-        ctx,
-        window_id,
-        capture_locked_window,
-        ocr_memory_image,
-    )
-}
-
-pub fn maybe_ocr_with<C, O>(
-    enabled: bool,
+/// Capture at most one current window image for a recording. Local OCR and a
+/// permitted cloud-vision fallback can share the returned in-memory image.
+#[allow(clippy::too_many_arguments)]
+pub fn capture_for_context_with<C, O>(
+    context_enabled: bool,
+    source_granted: bool,
+    run_local_ocr: bool,
     recording_ok: bool,
     family: ContextFamily,
     sensitive: bool,
@@ -339,40 +388,68 @@ pub fn maybe_ocr_with<C, O>(
     window_id: Option<u64>,
     capture: C,
     ocr: O,
-) -> Option<ScreenTextContext>
+) -> Option<CapturedContextImage>
 where
     C: FnOnce(Option<u64>) -> Result<MemoryImage, CaptureError>,
     O: FnOnce(&MemoryImage) -> Vec<String>,
 {
-    if !enabled || !recording_ok || sensitive || family_blocks_ocr(family) || !ctx.is_thin() {
+    if !context_enabled
+        || !source_granted
+        || !recording_ok
+        || sensitive
+        || family_blocks_ocr(family)
+        || !ctx.is_thin()
+        || window_id.is_none_or(|id| id == 0)
+    {
         return None;
     }
     let image = capture(window_id).ok()?;
-    let tokens = ocr(&image);
-    drop(image);
-    Some(merge_ocr_tokens(ctx, tokens))
+    let context = if run_local_ocr {
+        merge_ocr_tokens(ctx, ocr(&image))
+    } else {
+        ctx.clone()
+    };
+    Some(CapturedContextImage { context, image })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn term(value: &str) -> ContextEvidenceItem {
+        ContextEvidenceItem {
+            source: ContextEvidenceSource::Ax,
+            kind: ContextEvidenceKind::Term,
+            value: value.into(),
+            confidence_milli: None,
+            truncated: false,
+        }
+    }
+
     fn thin_ctx() -> ScreenTextContext {
         ScreenTextContext {
-            tokens: vec!["Hi".into()],
-            snippets: Vec::new(),
+            evidence: crate::screen_text::ContextEvidence {
+                items: vec![term("Hi")],
+                ..Default::default()
+            },
             family: ContextFamily::PersonalChat,
             source: ScreenTextSource::Ax,
+            provider_source: None,
             truncated: false,
         }
     }
 
     fn thick_ctx() -> ScreenTextContext {
         ScreenTextContext {
-            tokens: vec!["abcdefghijklmnopqrstuvwxyz0123456789 extra words here".into()],
-            snippets: Vec::new(),
+            evidence: crate::screen_text::ContextEvidence {
+                items: vec![term(
+                    "abcdefghijklmnopqrstuvwxyz0123456789 extra words here",
+                )],
+                ..Default::default()
+            },
             family: ContextFamily::PersonalChat,
             source: ScreenTextSource::Ax,
+            provider_source: None,
             truncated: false,
         }
     }
@@ -381,13 +458,17 @@ mod tests {
     fn ocr_skipped_when_phase1_has_fifty_chars() {
         let ctx = thick_ctx();
         assert!(ctx.usable_chars() >= 50);
-        assert!(maybe_ocr(
+        assert!(capture_for_context_with(
+            true,
+            true,
             true,
             true,
             ContextFamily::PersonalChat,
             false,
             &ctx,
             Some(42),
+            |_| panic!("AX-sufficient context must skip window capture"),
+            |_| panic!("AX-sufficient context must skip OCR"),
         )
         .is_none());
     }
@@ -405,60 +486,152 @@ mod tests {
     }
 
     #[test]
-    fn ocr_does_not_write_disk() {
-        let mut wrote_path = false;
-        let result = maybe_ocr_with(
+    fn ocr_skipped_when_disabled_or_no_permission_or_sensitive() {
+        let ctx = thin_ctx();
+        let skipped =
+            |context_enabled, source_granted, recording_ok, family, sensitive, window_id| {
+                capture_for_context_with(
+                    context_enabled,
+                    source_granted,
+                    true,
+                    recording_ok,
+                    family,
+                    sensitive,
+                    &ctx,
+                    window_id,
+                    |_| panic!("guarded capture path must not capture"),
+                    |_| panic!("guarded capture path must not OCR"),
+                )
+                .is_none()
+            };
+        assert!(skipped(
+            false,
+            true,
+            true,
+            ContextFamily::PersonalChat,
+            false,
+            Some(1)
+        ));
+        assert!(skipped(
+            true,
+            false,
+            true,
+            ContextFamily::PersonalChat,
+            false,
+            Some(1)
+        ));
+        assert!(skipped(
+            true,
+            true,
+            false,
+            ContextFamily::PersonalChat,
+            false,
+            Some(1)
+        ));
+        assert!(skipped(
+            true,
+            true,
+            true,
+            ContextFamily::Terminal,
+            false,
+            Some(1)
+        ));
+        assert!(skipped(
+            true,
+            true,
+            true,
+            ContextFamily::FormFilling,
+            false,
+            Some(1)
+        ));
+        assert!(skipped(
+            true,
+            true,
+            true,
+            ContextFamily::PersonalChat,
+            true,
+            Some(1)
+        ));
+        assert!(skipped(
+            true,
+            true,
+            true,
+            ContextFamily::PersonalChat,
+            false,
+            None
+        ));
+    }
+
+    #[test]
+    fn a_single_current_window_image_is_shared_with_local_ocr() {
+        use std::cell::Cell;
+        let capture_calls = Cell::new(0);
+        let ocr_calls = Cell::new(0);
+        let captured = capture_for_context_with(
+            true,
+            true,
             true,
             true,
             ContextFamily::PersonalChat,
             false,
             &thin_ctx(),
-            Some(7),
+            Some(5),
             |window_id| {
-                assert_eq!(window_id, Some(7));
-                wrote_path = false;
+                assert_eq!(window_id, Some(5));
+                capture_calls.set(capture_calls.get() + 1);
                 Ok(MemoryImage {
-                    png: b"png-bytes".to_vec(),
-                    width: 200,
-                    height: 100,
+                    png: b"memory-only-image".to_vec(),
+                    width: 10,
+                    height: 10,
                 })
             },
             |image| {
-                assert_eq!(image.png, b"png-bytes");
-                vec!["晓雯".into()]
+                assert_eq!(image.png, b"memory-only-image");
+                ocr_calls.set(ocr_calls.get() + 1);
+                vec!["VoiceFlow".into()]
             },
-        );
-        assert!(!wrote_path);
-        let merged = result.expect("thin Phase 1 should OCR");
-        assert_eq!(merged.source, ScreenTextSource::AxOcr);
-        assert!(merged.tokens.iter().any(|token| token == "晓雯"));
+        )
+        .expect("permitted thin context captures one window");
+        assert_eq!(capture_calls.get(), 1);
+        assert_eq!(ocr_calls.get(), 1);
+        assert_eq!(captured.image.png, b"memory-only-image");
+        assert!(captured.context.evidence.items.iter().any(|item| {
+            item.source == ContextEvidenceSource::Ocr && item.value == "VoiceFlow"
+        }));
     }
 
     #[test]
-    fn ocr_skipped_when_disabled_or_no_permission_or_sensitive() {
-        let ctx = thin_ctx();
-        assert!(maybe_ocr(
+    fn vision_only_capture_skips_local_ocr_and_retains_one_memory_image() {
+        use std::cell::Cell;
+        let capture_calls = Cell::new(0);
+        let ocr_calls = Cell::new(0);
+        let captured = capture_for_context_with(
+            true,
+            true,
             false,
             true,
             ContextFamily::PersonalChat,
             false,
-            &ctx,
-            Some(1)
+            &thin_ctx(),
+            Some(6),
+            |_| {
+                capture_calls.set(capture_calls.get() + 1);
+                Ok(MemoryImage {
+                    png: b"memory-only-image".to_vec(),
+                    width: 10,
+                    height: 10,
+                })
+            },
+            |_| {
+                ocr_calls.set(ocr_calls.get() + 1);
+                Vec::new()
+            },
         )
-        .is_none());
-        assert!(maybe_ocr(
-            true,
-            false,
-            ContextFamily::PersonalChat,
-            false,
-            &ctx,
-            Some(1)
-        )
-        .is_none());
-        assert!(maybe_ocr(true, true, ContextFamily::Terminal, false, &ctx, Some(1)).is_none());
-        assert!(maybe_ocr(true, true, ContextFamily::FormFilling, false, &ctx, Some(1)).is_none());
-        assert!(maybe_ocr(true, true, ContextFamily::PersonalChat, true, &ctx, Some(1)).is_none());
-        assert!(maybe_ocr(true, true, ContextFamily::PersonalChat, false, &ctx, None).is_none());
+        .expect("cloud fallback can reuse the one captured image");
+        assert_eq!(capture_calls.get(), 1);
+        assert_eq!(ocr_calls.get(), 0);
+        assert_eq!(captured.image.png, b"memory-only-image");
+        assert_eq!(captured.context.source, ScreenTextSource::Ax);
     }
 
     #[test]

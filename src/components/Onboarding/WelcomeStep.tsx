@@ -7,7 +7,7 @@ export function WelcomeStep() {
   return (
     <div className="flex min-h-[420px] flex-col justify-center">
       <div className="mb-14 flex h-[68px] w-full items-center justify-center">
-        <MainPillPreview live compact />
+        <MainPillPreview live />
       </div>
       <div className="w-full max-w-[620px]">
         <div className="space-y-1">

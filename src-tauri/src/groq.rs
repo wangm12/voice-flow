@@ -2,6 +2,10 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 pub async fn validate_key(key: &str) -> String {
+    if crate::network_policy::ensure_cloud_allowed().is_err() {
+        return "blocked_offline".into();
+    }
+    let cloud_cancellation = crate::network_policy::cloud_request_token();
     let key = key.trim();
     if key.is_empty() {
         return "invalid".into();
@@ -15,12 +19,15 @@ pub async fn validate_key(key: &str) -> String {
         }
     };
 
-    let response = match client
+    let request = client
         .get("https://api.groq.com/openai/v1/models")
         .bearer_auth(key)
-        .send()
-        .await
-    {
+        .send();
+    let response = match tokio::select! {
+        biased;
+        _ = cloud_cancellation.cancelled() => return "blocked_offline".into(),
+        result = request => result,
+    } {
         Ok(response) => response,
         Err(error) => {
             log::warn!("Groq key validation network error: {error}");
@@ -70,5 +77,22 @@ mod tests {
     #[tokio::test]
     async fn empty_key_is_invalid() {
         assert_eq!(validate_key("  ").await, "invalid");
+    }
+
+    #[tokio::test]
+    #[ignore = "opt-in live validation of a configured Groq credential; prints status only"]
+    async fn live_validate_configured_groq_key_file() {
+        let path = std::env::var_os("VOICEFLOW_GROQ_VALIDATION_KEY_FILE")
+            .expect("set VOICEFLOW_GROQ_VALIDATION_KEY_FILE to a readable key file");
+        let key = std::fs::read_to_string(path).expect("read configured Groq key in memory");
+        let status = validate_key(&key).await;
+        assert!(
+            matches!(
+                status.as_str(),
+                "valid" | "invalid" | "rate_limited" | "server_error" | "network_error"
+            ),
+            "unexpected sanitized validation status"
+        );
+        eprintln!("Groq key validation status: {status}");
     }
 }

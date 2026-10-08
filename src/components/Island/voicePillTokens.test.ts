@@ -77,6 +77,7 @@ describe("voice pill state tokens", () => {
     });
     expect(caption).toContain("Chrome Canary · General");
     expect(caption).toContain("已达上限 · 按热键结束");
+    expect(caption).toMatch(/^已达上限 · 按热键结束/);
   });
 
   it("prefers error and degraded captions over the context label", () => {
@@ -111,6 +112,9 @@ describe("voice pill state tokens", () => {
     expect(voicePillCaptionNeedsWide("degraded", { fallbackReason: "target_changed" })).toBe(true);
     expect(voicePillCaptionNeedsWide("error")).toBe(true);
     expect(voicePillCaptionNeedsWide("copied")).toBe(true);
+    expect(voicePillCaptionNeedsWide("recording_limited")).toBe(true);
+    expect(voicePillCaptionNeedsWide("processing", { phase: "soniox_recovery" })).toBe(true);
+    expect(voicePillCaptionNeedsWide("processing", { phase: "cleanup" })).toBe(false);
     expect(voicePillCaptionNeedsWide("recording")).toBe(false);
     expect(voicePillCaptionNeedsWide("recording", { partialText: "你好" })).toBe(false);
   });
@@ -190,7 +194,7 @@ describe("voice pill state tokens", () => {
   it("surfaces delivery fallback reasons in the caption chip", () => {
     expect(
       pillCaption("done", undefined, undefined, { fallbackReason: "target_changed" }),
-    ).toBe("输入目标已变化，文字已复制到剪贴板，请手动粘贴");
+    ).toBe("已复制，请手动粘贴");
   });
 
   it("surfaces terminal selected-action captions on copied state", () => {
@@ -201,7 +205,7 @@ describe("voice pill state tokens", () => {
       pillCaption("copied", undefined, undefined, {
         fallbackReason: "selected_action_clipboard_fallback",
       }),
-    ).toBe("目标变化，结果已复制");
+    ).toBe("已复制，请手动粘贴");
     expect(pillCaption("copied")).toBe("已复制到剪贴板，请手动粘贴");
   });
 
@@ -214,7 +218,7 @@ describe("voice pill state tokens", () => {
   it("prefers actionable fallback copy over generic degraded caption", () => {
     expect(
       pillCaption("degraded", undefined, undefined, { fallbackReason: "target_changed" }),
-    ).toBe("输入目标已变化，文字已复制到剪贴板，请手动粘贴");
+    ).toBe("已复制，请手动粘贴");
     expect(pillCaption("degraded")).toBe("部分结果已保存，请检查后再使用");
     expect(
       pillCaption("degraded", undefined, undefined, { fallbackReason: "some_unknown_reason" }),

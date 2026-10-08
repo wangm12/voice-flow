@@ -1,8 +1,10 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::path::Path;
 
 use crate::asr::{self, AsrError};
 use crate::llm::{self, CleanupEffort, LlmError};
+use crate::ondevice_asr;
 use crate::providers;
 use crate::store::Settings;
 
@@ -69,6 +71,27 @@ impl Default for EngineDraft {
     }
 }
 
+pub fn draft_from_settings(settings: &Settings) -> EngineDraft {
+    EngineDraft {
+        asr_provider: settings.asr_provider,
+        cleanup_provider: settings.cleanup_provider,
+        asr_base_url: settings.resolved_provider_base(settings.asr_provider),
+        cleanup_base_url: settings.resolved_provider_base(settings.cleanup_provider),
+        asr_model: settings.asr_model.clone(),
+        cleanup_model: settings.cleanup_model.clone(),
+        api_key: settings.api_key.clone(),
+        asr_api_key: settings.asr_api_key.clone(),
+        cleanup_api_key: settings.cleanup_api_key.clone(),
+        provider_keys: settings.provider_api_keys.clone(),
+        custom_base_url: settings.custom_base_url.clone(),
+        custom_asr: settings.custom_asr,
+        custom_llm: settings.custom_llm,
+        ollama_base_url: settings.ollama_base_url.clone(),
+        local_whisper_base_url: settings.local_whisper_base_url.clone(),
+        cleanup_enabled: settings.cleanup_enabled,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProbeErrorKind {
@@ -78,6 +101,8 @@ pub enum ProbeErrorKind {
     Path,
     Provider,
     MissingKey,
+    OnDeviceModelMissing,
+    OnDeviceInferenceUnavailable,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -124,6 +149,7 @@ pub struct ProbeResult {
 }
 
 impl ProbeResult {
+    #[cfg(test)]
     pub fn succeeded(&self) -> bool {
         self.asr.ok && self.cleanup.ok
     }
@@ -151,10 +177,14 @@ pub fn classify_asr_error(error: &AsrError) -> ProbeErrorKind {
     match error {
         AsrError::Network(_) | AsrError::Timeout => ProbeErrorKind::Address,
         AsrError::Unauthorized(_) => ProbeErrorKind::Key,
+        AsrError::OnDeviceModelMissing(_) => ProbeErrorKind::OnDeviceModelMissing,
+        AsrError::OnDeviceInferenceUnavailable(_) => ProbeErrorKind::OnDeviceInferenceUnavailable,
         AsrError::Other(message) => classify_status_body(status_from_message(message), message),
-        AsrError::Server(_) | AsrError::RateLimited(_) | AsrError::EmptyResult => {
-            ProbeErrorKind::Provider
-        }
+        AsrError::Server(_)
+        | AsrError::RetryableServer { .. }
+        | AsrError::RateLimited(_)
+        | AsrError::EmptyResult
+        | AsrError::ContextAuthorizationChanged => ProbeErrorKind::Provider,
     }
 }
 
@@ -163,7 +193,9 @@ pub fn classify_llm_error(error: &LlmError) -> ProbeErrorKind {
         LlmError::Network(_) | LlmError::Timeout => ProbeErrorKind::Address,
         LlmError::Unauthorized => ProbeErrorKind::Key,
         LlmError::Other(message) => classify_status_body(status_from_message(message), message),
-        LlmError::Server(_) | LlmError::RateLimited(_) => ProbeErrorKind::Provider,
+        LlmError::Server(_) | LlmError::RateLimited(_) | LlmError::ContextAuthorizationChanged => {
+            ProbeErrorKind::Provider
+        }
     }
 }
 
@@ -216,6 +248,9 @@ fn resolve_side_key(
     if !stored_legacy.trim().is_empty() {
         return Ok(stored_legacy.trim().to_owned());
     }
+    if provider == EngineProvider::OnDevice {
+        return Ok(String::new());
+    }
     if provider.allows_empty_key()
         && providers::is_loopback_url(&draft_provider_base(draft, provider))
     {
@@ -254,7 +289,9 @@ fn draft_provider_base(draft: &EngineDraft, provider: EngineProvider) -> String 
             &draft.custom_base_url,
             nonempty(&draft.asr_base_url, &draft.cleanup_base_url),
         ),
-        EngineProvider::Groq => String::new(),
+        EngineProvider::DashScope => nonempty(&draft.asr_base_url, provider.default_base_url()),
+        EngineProvider::AssemblyAi => provider.default_base_url().to_owned(),
+        EngineProvider::Groq | EngineProvider::OnDevice => String::new(),
         other => other.default_base_url().to_owned(),
     }
 }
@@ -268,7 +305,15 @@ fn nonempty(value: &str, fallback: impl Into<String>) -> String {
     }
 }
 
-fn draft_asr_url(draft: &EngineDraft) -> String {
+fn draft_asr_url(draft: &EngineDraft) -> Option<String> {
+    if !draft.asr_provider.has_http_asr()
+        && !matches!(
+            draft.asr_provider,
+            EngineProvider::Soniox | EngineProvider::DashScope
+        )
+    {
+        return None;
+    }
     let override_base = draft.asr_base_url.trim();
     let base = if !override_base.is_empty() {
         override_base.to_owned()
@@ -279,6 +324,14 @@ fn draft_asr_url(draft: &EngineDraft) -> String {
 }
 
 fn draft_cleanup_url(draft: &EngineDraft) -> String {
+    if draft.cleanup_provider == EngineProvider::Ollama {
+        let base = if draft.ollama_base_url.trim().is_empty() {
+            EngineProvider::Ollama.default_base_url()
+        } else {
+            draft.ollama_base_url.trim()
+        };
+        return crate::ollama_local::chat_endpoint(base);
+    }
     let override_base = draft.cleanup_base_url.trim();
     let base = if !override_base.is_empty() {
         override_base.to_owned()
@@ -288,6 +341,7 @@ fn draft_cleanup_url(draft: &EngineDraft) -> String {
     providers::resolve_llm_endpoint(draft.cleanup_provider, &base)
 }
 
+#[cfg(test)]
 pub fn apply_engine_draft(settings: &mut Settings, draft: &EngineDraft) {
     settings.asr_provider = draft.asr_provider;
     settings.asr_model = draft_asr_model(draft);
@@ -311,6 +365,11 @@ pub fn apply_engine_draft(settings: &mut Settings, draft: &EngineDraft) {
     }
     if draft.asr_provider.is_custom() {
         settings.asr_base_url = settings.custom_base_url.clone();
+    } else if draft.asr_provider == EngineProvider::DashScope {
+        settings.asr_base_url = nonempty(
+            &draft.asr_base_url,
+            EngineProvider::DashScope.default_base_url(),
+        );
     } else {
         settings.asr_base_url.clear();
     }
@@ -356,6 +415,12 @@ pub fn apply_engine_draft(settings: &mut Settings, draft: &EngineDraft) {
 }
 
 fn draft_asr_model(draft: &EngineDraft) -> String {
+    if matches!(
+        draft.asr_provider,
+        EngineProvider::AssemblyAi | EngineProvider::DashScope
+    ) {
+        return draft.asr_provider.default_asr_model().to_owned();
+    }
     let model = draft.asr_model.trim();
     if draft.asr_provider.is_groq() {
         if asr::is_groq_asr_model(model) {
@@ -403,20 +468,98 @@ fn probe_wav() -> Vec<u8> {
     cursor.into_inner()
 }
 
-pub async fn probe_engine_draft(draft: &EngineDraft, stored: &Settings) -> ProbeResult {
-    let asr = match resolve_asr_key(draft, stored) {
-        Ok(key) => match asr::probe_transcription(
-            &draft_asr_url(draft),
-            probe_wav(),
-            &key,
-            &draft_asr_model(draft),
-        )
-        .await
-        {
-            Ok(()) => ProbeStageResult::success(),
-            Err(error) => ProbeStageResult::failure(classify_asr_error(&error), error.to_string()),
-        },
-        Err(error) => error,
+pub async fn probe_engine_draft(
+    draft: &EngineDraft,
+    stored: &Settings,
+    models_root: &Path,
+) -> ProbeResult {
+    probe_engine_draft_stages(draft, stored, models_root, true, true).await
+}
+
+/// Probe the parts of a settings draft whose service access is required to
+/// save the selected engine configuration. Soniox is configured-only during
+/// settings save; its WebSocket is opened only by dictation or an explicit
+/// probe. AssemblyAI Dictation supplies an optional cleanup candidate for
+/// eligible recordings, so a common cleanup key is only an optional fallback
+/// and must not block saving the fused provider.
+pub async fn probe_engine_draft_for_settings_save(
+    draft: &EngineDraft,
+    stored: &Settings,
+    models_root: &Path,
+) -> ProbeResult {
+    let probe_asr = draft.asr_provider != EngineProvider::Soniox;
+    let probe_cleanup = draft.asr_provider != EngineProvider::AssemblyAi;
+    probe_engine_draft_stages(draft, stored, models_root, probe_asr, probe_cleanup).await
+}
+
+async fn probe_engine_draft_stages(
+    draft: &EngineDraft,
+    stored: &Settings,
+    models_root: &Path,
+    probe_asr: bool,
+    probe_cleanup: bool,
+) -> ProbeResult {
+    if probe_asr
+        && crate::network_policy::is_strict_offline()
+        && draft.asr_provider != EngineProvider::OnDevice
+    {
+        return ProbeResult {
+            asr: ProbeStageResult::failure(
+                ProbeErrorKind::Provider,
+                crate::network_policy::STRICT_OFFLINE_MESSAGE,
+            ),
+            cleanup: ProbeStageResult::skipped(),
+        };
+    }
+    let asr = if !probe_asr {
+        ProbeStageResult::skipped()
+    } else if draft.asr_provider == EngineProvider::OnDevice {
+        let model = draft_asr_model(draft);
+        if !crate::ondevice_models::is_mlx_model(&model) {
+            ProbeStageResult::failure(
+                ProbeErrorKind::OnDeviceInferenceUnavailable,
+                "the selected local model is not supported by the MLX inference runtime",
+            )
+        } else if ondevice_asr::model_files_are_ready(models_root, &model) {
+            let runtime = crate::ondevice_runtime::shared_runtime(models_root)
+                .status()
+                .await;
+            if matches!(runtime.runtime_status.as_str(), "runtime_ready" | "loaded") {
+                ProbeStageResult::success()
+            } else {
+                ProbeStageResult::failure(
+                    ProbeErrorKind::OnDeviceInferenceUnavailable,
+                    runtime.error.unwrap_or_else(|| {
+                        "local MLX runtime handshake is unavailable on this device".into()
+                    }),
+                )
+            }
+        } else {
+            ProbeStageResult::failure(
+                ProbeErrorKind::OnDeviceModelMissing,
+                "on-device model is not downloaded",
+            )
+        }
+    } else {
+        match resolve_asr_key(draft, stored) {
+            Ok(key) => match draft_asr_url(draft) {
+                Some(url) => {
+                    match asr::probe_transcription(&url, probe_wav(), &key, &draft_asr_model(draft))
+                        .await
+                    {
+                        Ok(()) => ProbeStageResult::success(),
+                        Err(error) => {
+                            ProbeStageResult::failure(classify_asr_error(&error), error.to_string())
+                        }
+                    }
+                }
+                None => ProbeStageResult::failure(
+                    ProbeErrorKind::Provider,
+                    "selected ASR provider has no HTTP endpoint",
+                ),
+            },
+            Err(error) => error,
+        }
     };
     if !asr.ok {
         return ProbeResult {
@@ -424,10 +567,30 @@ pub async fn probe_engine_draft(draft: &EngineDraft, stored: &Settings) -> Probe
             cleanup: ProbeStageResult::skipped(),
         };
     }
-    if !draft.cleanup_enabled {
+    if !probe_cleanup || !draft.cleanup_enabled {
         return ProbeResult {
             asr,
             cleanup: ProbeStageResult::skipped(),
+        };
+    }
+    if crate::network_policy::is_strict_offline()
+        && draft.cleanup_provider != EngineProvider::Ollama
+    {
+        return ProbeResult {
+            asr,
+            cleanup: ProbeStageResult::failure(
+                ProbeErrorKind::Provider,
+                crate::network_policy::STRICT_OFFLINE_MESSAGE,
+            ),
+        };
+    }
+    if !draft.cleanup_provider.has_llm() {
+        return ProbeResult {
+            asr,
+            cleanup: ProbeStageResult::failure(
+                ProbeErrorKind::Provider,
+                "OnDevice cannot be used for cleanup",
+            ),
         };
     }
     let cleanup = match resolve_cleanup_key(draft, stored) {
@@ -463,6 +626,10 @@ pub async fn probe_engine_draft(draft: &EngineDraft, stored: &Settings) -> Probe
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn unused_models_root() -> std::path::PathBuf {
+        std::env::temp_dir().join("voiceflow-probe-unused-models")
+    }
 
     fn custom_asr_draft(url: &str, model: &str) -> EngineDraft {
         EngineDraft {
@@ -519,6 +686,7 @@ mod tests {
         let result = probe_engine_draft(
             &custom_asr_draft("http://127.0.0.1:1", "whisper-1"),
             &Settings::default(),
+            &unused_models_root(),
         )
         .await;
         assert!(!result.asr.ok);
@@ -533,6 +701,7 @@ mod tests {
         let result = probe_engine_draft(
             &custom_asr_draft(&endpoint, "whisper-1"),
             &Settings::default(),
+            &unused_models_root(),
         )
         .await;
         assert_eq!(result.asr.error_kind, Some(ProbeErrorKind::Key));
@@ -550,6 +719,7 @@ mod tests {
         let result = probe_engine_draft(
             &custom_asr_draft(&endpoint, "no-such-model"),
             &Settings::default(),
+            &unused_models_root(),
         )
         .await;
         assert_eq!(result.asr.error_kind, Some(ProbeErrorKind::Model));
@@ -567,6 +737,7 @@ mod tests {
         let result = probe_engine_draft(
             &custom_asr_draft(&endpoint, "whisper-1"),
             &Settings::default(),
+            &unused_models_root(),
         )
         .await;
         assert!(result.asr.ok);
@@ -586,7 +757,7 @@ mod tests {
         let chat_endpoint = crate::test_http::spawn_response(
             200,
             "text/event-stream",
-            "data: {\"choices\":[{\"delta\":{\"content\":\"嗯 那个 你好\"}}]}\n\ndata: [DONE]\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"嗯 那个 你好\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
             &[],
         )
         .await;
@@ -603,7 +774,7 @@ mod tests {
             cleanup_enabled: true,
             ..EngineDraft::default()
         };
-        let result = probe_engine_draft(&draft, &Settings::default()).await;
+        let result = probe_engine_draft(&draft, &Settings::default(), &unused_models_root()).await;
         assert!(result.asr.ok, "{}", result.asr.message);
         assert!(result.cleanup.ok, "{}", result.cleanup.message);
         assert!(result.succeeded());
@@ -628,7 +799,7 @@ mod tests {
             cleanup_enabled: false,
             ..EngineDraft::default()
         };
-        let result = probe_engine_draft(&draft, &Settings::default()).await;
+        let result = probe_engine_draft(&draft, &Settings::default(), &unused_models_root()).await;
         assert!(result.asr.ok, "{}", result.asr.message);
         assert!(result.succeeded());
     }
@@ -645,7 +816,8 @@ mod tests {
         let chat_endpoint = crate::test_http::spawn_response(
             200,
             "application/json",
-            r#"{"content":[{"type":"text","text":"嗯 那个 你好"}]}"#.as_bytes(),
+            r#"{"content":[{"type":"text","text":"嗯 那个 你好"}],"stop_reason":"end_turn"}"#
+                .as_bytes(),
             &[],
         )
         .await;
@@ -664,10 +836,131 @@ mod tests {
             cleanup_enabled: true,
             ..EngineDraft::default()
         };
-        let result = probe_engine_draft(&draft, &Settings::default()).await;
+        let result = probe_engine_draft(&draft, &Settings::default(), &unused_models_root()).await;
         assert!(result.asr.ok, "{}", result.asr.message);
         assert!(result.cleanup.ok, "{}", result.cleanup.message);
         assert!(result.succeeded());
+    }
+
+    #[tokio::test]
+    async fn probe_on_device_missing_model_is_not_missing_key_or_http() {
+        let draft = EngineDraft {
+            asr_provider: EngineProvider::OnDevice,
+            asr_model: "qwen3-asr-0.6b".into(),
+            cleanup_enabled: false,
+            ..EngineDraft::default()
+        };
+        let missing_root = std::env::temp_dir().join(format!(
+            "voiceflow-on-device-missing-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&missing_root);
+        std::fs::create_dir_all(&missing_root).unwrap();
+        let result = probe_engine_draft(&draft, &Settings::default(), &missing_root).await;
+        assert!(!result.asr.ok);
+        assert_eq!(
+            result.asr.error_kind,
+            Some(ProbeErrorKind::OnDeviceModelMissing)
+        );
+        assert_ne!(result.asr.error_kind, Some(ProbeErrorKind::MissingKey));
+        assert_ne!(result.asr.error_kind, Some(ProbeErrorKind::Provider));
+        assert_ne!(result.asr.error_kind, Some(ProbeErrorKind::Model));
+        let _ = std::fs::remove_dir_all(missing_root);
+    }
+
+    #[tokio::test]
+    async fn probe_on_device_files_ready_reports_missing_inference_runtime() {
+        let draft = EngineDraft {
+            asr_provider: EngineProvider::OnDevice,
+            asr_model: "sensevoice-small".into(),
+            cleanup_enabled: false,
+            ..EngineDraft::default()
+        };
+        let models_root = std::env::temp_dir().join(format!(
+            "voiceflow-on-device-ready-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let dir = models_root.join("sensevoice-small");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("model.int8.onnx"), b"fixture-onnx").unwrap();
+        std::fs::write(dir.join("tokens.txt"), b"fixture-tokens").unwrap();
+        std::fs::write(
+            crate::ondevice_asr::archive_sha_path(&models_root, "sensevoice-small"),
+            crate::ondevice_models::SENSEVOICE_ARCHIVE_SHA256,
+        )
+        .unwrap();
+        let result = probe_engine_draft(&draft, &Settings::default(), &models_root).await;
+        assert!(!result.asr.ok, "downloaded files are not inference-ready");
+        assert_eq!(
+            result.asr.error_kind,
+            Some(ProbeErrorKind::OnDeviceInferenceUnavailable)
+        );
+        assert!(!result.succeeded());
+        let _ = std::fs::remove_dir_all(models_root);
+    }
+
+    #[tokio::test]
+    async fn probe_llm_only_cleanup_without_key_is_missing_key() {
+        for cleanup_provider in [EngineProvider::DeepSeek, EngineProvider::Anthropic] {
+            let asr_endpoint = crate::test_http::spawn_response(
+                200,
+                "application/json",
+                br#"{"text":"hello","segments":[],"words":[]}"#,
+                &[],
+            )
+            .await;
+            let draft = EngineDraft {
+                asr_provider: EngineProvider::Custom,
+                cleanup_provider,
+                asr_base_url: asr_endpoint.clone(),
+                cleanup_base_url: "http://127.0.0.1:1".into(),
+                custom_base_url: asr_endpoint,
+                asr_model: "whisper-1".into(),
+                cleanup_model: cleanup_provider.default_llm_model().into(),
+                asr_api_key: "asr".into(),
+                cleanup_enabled: true,
+                ..EngineDraft::default()
+            };
+            let result =
+                probe_engine_draft(&draft, &Settings::default(), &unused_models_root()).await;
+            assert!(result.asr.ok, "{}", result.asr.message);
+            assert_eq!(
+                result.cleanup.error_kind,
+                Some(ProbeErrorKind::MissingKey),
+                "{cleanup_provider:?} cleanup must require a key, not treat !has_http_asr as OnDevice"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn probe_llm_only_asr_is_missing_key_not_on_device() {
+        for asr_provider in [EngineProvider::DeepSeek, EngineProvider::Anthropic] {
+            let draft = EngineDraft {
+                asr_provider,
+                cleanup_enabled: false,
+                ..EngineDraft::default()
+            };
+            let result =
+                probe_engine_draft(&draft, &Settings::default(), &unused_models_root()).await;
+            assert!(!result.asr.ok);
+            assert_eq!(
+                result.asr.error_kind,
+                Some(ProbeErrorKind::MissingKey),
+                "{asr_provider:?} must not take the OnDevice empty-key path"
+            );
+            assert_ne!(
+                result.asr.error_kind,
+                Some(ProbeErrorKind::OnDeviceModelMissing)
+            );
+        }
     }
 
     #[test]

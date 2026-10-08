@@ -2,19 +2,47 @@ import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { useState } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { flushAnimationFrames } from "../test/flushRaf";
-import { SelectedPreviewDialog, type SelectedActionPreview } from "./SelectedPreviewDialog";
+import { isSelectedActionPreview, SelectedPreviewDialog, type SelectedActionPreview } from "./SelectedPreviewDialog";
 
 afterEach(() => {
   cleanup();
 });
 
-const preview = {
+const preview: SelectedActionPreview = {
+  transaction_id: "tx-translation-1",
+  action_sequence: 1,
+  kind: "selected",
+  operation: "translate",
+  target_kind: "selection",
+  target_label: "current_field",
+  source_text: "原文",
+  instruction: "翻译成英文",
+  delivery_mode: "replace_or_copy",
+  delivery_notice: "copy_if_target_changed",
   selected_text: "原文",
   transcript: "翻译成英文",
   final_text: "Original text",
+  replace_allowed: true,
 };
 
 describe("SelectedPreviewDialog", () => {
+  it("shows the editable result before a collapsed source without nested text scrollers", () => {
+    render(<SelectedPreviewDialog preview={{ ...preview, source_text: "很长的来源文本" }} draft={preview.final_text} onDraftChange={() => undefined} onCancel={() => undefined} onCopy={() => undefined} onConfirm={() => undefined} />);
+    const result = screen.getByRole("textbox", { name: "VoiceFlow 生成结果" });
+    const source = screen.getByText("很长的来源文本");
+    expect(result.compareDocumentPosition(source) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(source.closest("details")).not.toHaveAttribute("open");
+    expect(source).not.toBeVisible();
+    fireEvent.click(screen.getByText("查看来源和指令"));
+    expect(source).toBeVisible();
+    expect(source).not.toHaveClass("overflow-y-auto");
+  });
+  it("requires a positive action sequence and a contract-safe target token", () => {
+    expect(isSelectedActionPreview(preview)).toBe(true);
+    expect(isSelectedActionPreview({ ...preview, action_sequence: 0 })).toBe(false);
+    expect(isSelectedActionPreview({ ...preview, target_label: "Private app title" })).toBe(false);
+  });
+
   it("dismisses with Escape and restores opener focus", async () => {
     const onCancel = vi.fn();
 
@@ -102,7 +130,7 @@ describe("SelectedPreviewDialog", () => {
     );
 
     const dialog = screen.getByRole("dialog");
-    const replace = screen.getByRole("button", { name: "替换原文" });
+    const replace = screen.getByRole("button", { name: "确认" });
     dialog.focus();
     fireEvent.keyDown(window, { key: "Tab" });
     expect(dialog.contains(document.activeElement)).toBe(true);
@@ -155,6 +183,15 @@ describe("SelectedPreviewDialog", () => {
     function Harness() {
       const [preview, setPreview] = useState<SelectedActionPreview | null>({
         kind: "screen",
+        transaction_id: "tx-screen-1",
+        action_sequence: 2,
+        operation: "screen_assist",
+        target_kind: "screen",
+        target_label: "captured_screen",
+        source_text: "",
+        instruction: "把标题改短",
+        delivery_mode: "replace_or_copy",
+        delivery_notice: "copy_if_target_changed",
         selected_text: "",
         transcript: "把标题改短",
         final_text: "周五开会",
@@ -175,8 +212,9 @@ describe("SelectedPreviewDialog", () => {
     }
 
     render(<Harness />);
+    expect(screen.getByRole("dialog", { name: "看屏幕预览" })).toBeInTheDocument();
     expect(screen.getByRole("img", { name: "窗口截图" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "替换原文" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "确认" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "只复制" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "取消" })).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "取消" }));
@@ -205,5 +243,120 @@ describe("SelectedPreviewDialog", () => {
     expect(layout).toBeInstanceOf(HTMLElement);
     expect((layout as HTMLElement).inert).toBe(true);
     expect(screen.getByRole("dialog")).toBeInTheDocument();
+  });
+
+  it("shows fixed operation and target labels without rendering backend target labels", () => {
+    render(
+      <SelectedPreviewDialog
+        preview={preview}
+        draft={preview.final_text}
+        onDraftChange={() => undefined}
+        onCancel={() => undefined}
+        onCopy={() => undefined}
+        onConfirm={() => undefined}
+      />,
+    );
+
+    expect(screen.getByText("翻译")).toBeInTheDocument();
+    expect(screen.getByText("选中文本")).toBeInTheDocument();
+    expect(screen.getByText("原文")).toBeInTheDocument();
+    expect(screen.getByText("翻译成英文")).toBeInTheDocument();
+    expect(screen.getByText("如果确认前目标或来源发生变化，VoiceFlow 会只复制结果，不会覆盖新内容。")).toBeInTheDocument();
+    expect(screen.queryByText("当前文本框")).not.toBeInTheDocument();
+  });
+
+  it("makes clipboard-only confirmation explicit and keeps the copy-only target message", () => {
+    const clipboardPreview: SelectedActionPreview = {
+      ...preview,
+      operation: "draft_reply",
+      target_kind: "empty_composer",
+      delivery_mode: "replace_or_copy",
+      delivery_notice: "clipboard_only",
+      replace_allowed: false,
+      source_text: "Authorized nearby context",
+    };
+    render(
+      <SelectedPreviewDialog
+        preview={clipboardPreview}
+        draft={clipboardPreview.final_text}
+        onDraftChange={() => undefined}
+        onCancel={() => undefined}
+        onCopy={() => undefined}
+        onConfirm={() => undefined}
+      />,
+    );
+
+    expect(screen.getByText("起草回复")).toBeInTheDocument();
+    expect(screen.getByText("空白回复输入框")).toBeInTheDocument();
+    expect(screen.getByText("此目标目前只支持复制；确认后不会插入或发送。")).toBeInTheDocument();
+    expect(screen.getByText("回复只会作为草稿写入当前输入框或复制，不会发送。")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "确认并复制" })).toBeEnabled();
+  });
+
+  it("prevents duplicate copy or confirm while busy, while leaving cancellation available", () => {
+    render(
+      <SelectedPreviewDialog
+        preview={preview}
+        draft={preview.final_text}
+        onDraftChange={() => undefined}
+        onCancel={() => undefined}
+        onCopy={() => undefined}
+        onConfirm={() => undefined}
+        busy
+      />,
+    );
+
+    expect(screen.getByRole("textbox", { name: "VoiceFlow 生成结果" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "只复制" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "确认" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "只复制" })).toHaveAttribute("aria-busy", "true");
+    expect(screen.getByRole("button", { name: "确认" })).toHaveAttribute("aria-busy", "true");
+    expect(screen.getByRole("status")).toHaveTextContent("处理中…");
+    expect(screen.getByRole("button", { name: "取消" })).toBeEnabled();
+  });
+
+  it.each([
+    ["rewrite", "改写"],
+    ["shorten", "精简"],
+    ["translate", "翻译"],
+    ["organize", "结构整理"],
+    ["draft_reply", "起草回复"],
+    ["modify_exact", "按指令修改值或术语"],
+    ["screen_assist", "看屏幕"],
+  ] as const)("uses the fixed label for %s", (operation, label) => {
+    render(
+      <SelectedPreviewDialog
+        preview={{ ...preview, operation }}
+        draft={preview.final_text}
+        onDraftChange={() => undefined}
+        onCancel={() => undefined}
+        onCopy={() => undefined}
+        onConfirm={() => undefined}
+      />,
+    );
+
+    expect(screen.getByText(label)).toBeInTheDocument();
+    expect(screen.queryByText(preview.target_label)).not.toBeInTheDocument();
+  });
+
+  it.each([
+    ["selection", "选中文本"],
+    ["field_text", "当前文本框"],
+    ["empty_composer", "空白回复输入框"],
+    ["screen", "已捕获的屏幕"],
+  ] as const)("uses the fixed label for target %s", (target_kind, label) => {
+    render(
+      <SelectedPreviewDialog
+        preview={{ ...preview, target_kind }}
+        draft={preview.final_text}
+        onDraftChange={() => undefined}
+        onCancel={() => undefined}
+        onCopy={() => undefined}
+        onConfirm={() => undefined}
+      />,
+    );
+
+    expect(screen.getByText(label)).toBeInTheDocument();
+    expect(screen.queryByText(preview.target_label)).not.toBeInTheDocument();
   });
 });

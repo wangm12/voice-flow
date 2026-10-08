@@ -8,8 +8,8 @@
 | --- | --- |
 | [README.md](../README.md) | 产品说明、设置页、本地开发、签名 |
 | [privacy.md](privacy.md) | 数据流、本地保留、Keychain、删除 |
-| [end-to-end-workflows.md](end-to-end-workflows.md) | 口述 / 长录音 / 选区 / 看屏幕 / Undo |
-| [cleanup-evaluation.md](cleanup-evaluation.md) | AI 整理评测协议 |
+| [end-to-end-workflows.md](end-to-end-workflows.md) | 首次配置 / 本机麦克风自检 / 词典反馈 / batch 预取 / Soniox 实时流与恢复 / AssemblyAI Dictation + raw Sync / Qwen Audio Message / 口述 / 长录音与完整音频恢复 / 六类选中文本操作 / 手动看屏幕 / 后端交付撤销命令 |
+| [cleanup-evaluation.md](cleanup-evaluation.md) | 确定性本地整理评测、显式 WAV → ASR → 整理评测入口与可选 live provider 协议（不是当前 runtime/E2E 验收结果） |
 | [asr-cleanup-later-and-wont.md](asr-cleanup-later-and-wont.md) | 以后再做 / 明确不做 |
 | [release-checklist.md](release-checklist.md) | 发布前检查 |
 | [context-e2e-checklist.md](context-e2e-checklist.md) | Context / 交付手工验收 |

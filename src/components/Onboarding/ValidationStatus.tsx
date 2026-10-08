@@ -17,10 +17,10 @@ export function ValidationStatus({ status, validating }: { status: string | null
     return (
         <span key={status} role={status === "valid" ? "status" : "alert"} aria-live="polite" className={`${tagClass} vf-status-enter ${
             status === "valid"
-              ? "bg-success/10 text-success"
+              ? "bg-success/10 text-success-ink"
               : status === "invalid"
-                ? "bg-error/10 text-error"
-                : "bg-warning/10 text-warning"
+                ? "bg-error/10 text-error-ink"
+                : "bg-warning/10 text-warning-ink"
           }`}
         >
           {status === "valid" && <Check {...iconPropsSm} aria-hidden="true" />}

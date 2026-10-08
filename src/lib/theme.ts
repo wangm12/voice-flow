@@ -12,13 +12,13 @@ export const colors = {
   border: "border-border",
   accent: {
     text: "text-accent",
-    background: "bg-accent",
-    foreground: "text-accent-foreground",
+    background: "bg-action",
+    foreground: "text-action-foreground",
   },
   semantic: {
-    success: "text-success",
-    warning: "text-warning",
-    error: "text-error",
+    success: "text-success-ink",
+    warning: "text-warning-ink",
+    error: "text-error-ink",
     successBackground: "bg-success",
     warningBackground: "bg-warning",
     errorBackground: "bg-error",
@@ -31,72 +31,39 @@ export const radius = {
   pill: "rounded-full",
 } as const;
 
-export const shadow = {
-  card: "shadow-card",
-  elevated: "shadow-elevated",
-} as const;
-
-export const easing = {
-  emphasized: "cubic-bezier(0.2, 0, 0, 1)",
-} as const;
-
 export const controlSize = {
-  button: "h-9",
+  button: "h-10",
   tag: "h-7",
-  input: "h-9",
-  icon: "h-9 w-9",
-  iconSm: "h-7 w-7",
-} as const;
-
-export const cssVariables = {
-  colors: {
-    base: "var(--color-base)",
-    card: "var(--color-card)",
-    elevated: "var(--color-elevated)",
-    primary: "var(--color-primary)",
-    secondary: "var(--color-secondary)",
-    tertiary: "var(--color-tertiary)",
-    border: "var(--color-border)",
-    accent: "var(--color-accent)",
-    success: "var(--color-success)",
-    warning: "var(--color-warning)",
-    error: "var(--color-error)",
-  },
-  shadow: {
-    card: "var(--shadow-card)",
-    elevated: "var(--shadow-elevated)",
-  },
-  easing: {
-    emphasized: "var(--ease-emphasized)",
-  },
-} as const;
-
-export const textClass = {
-  title: "text-2xl font-semibold tracking-tight text-primary",
-  subtitle: "text-sm text-secondary",
-  body: "text-sm font-normal text-primary",
-  caption: "text-xs font-normal text-tertiary",
+  input: "h-10",
+  icon: "h-10 w-10",
+  iconSm: "h-8 w-8",
 } as const;
 
 export const focusRingClass =
-  "focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent focus-visible:outline-offset-2";
+  "focus-visible:outline focus-visible:outline-2 focus-visible:outline-focus focus-visible:outline-offset-0";
 
 const buttonBase =
-  `inline-flex items-center justify-center gap-1.5 text-sm font-medium transition-colors duration-150 active:scale-[0.98] motion-reduce:active:scale-100 ${focusRingClass} disabled:cursor-not-allowed`;
+  `vf-button inline-flex shrink-0 items-center justify-center gap-2 font-medium transition-colors duration-150 motion-reduce:transition-none ${focusRingClass} disabled:cursor-not-allowed`;
 
-export const buttonClass = `${radius.control} ${controlSize.button} ${buttonBase} ${colors.accent.background} ${colors.accent.foreground} px-4 hover:opacity-90 disabled:opacity-40`;
+export const buttonClass = `${radius.control} ${controlSize.button} ${buttonBase} text-sm border border-action-border ${colors.accent.background} ${colors.accent.foreground} px-3 enabled:hover:bg-action-hover enabled:active:bg-action-pressed`;
 
-export const secondaryButtonClass = `${radius.control} ${controlSize.button} ${buttonBase} border ${colors.border} ${colors.bg.card} px-4 ${colors.text.secondary} hover:bg-elevated hover:text-primary disabled:opacity-30`;
+export const secondaryButtonClass = `${radius.control} ${controlSize.button} ${buttonBase} text-sm border border-transparent ${colors.bg.elevated} px-3 ${colors.text.secondary} enabled:hover:bg-accent-soft enabled:hover:text-primary enabled:active:bg-border enabled:active:text-primary`;
 
-export const ghostButtonClass = `${radius.control} ${controlSize.button} ${buttonBase} px-3 ${colors.text.tertiary} hover:text-primary hover:bg-elevated/60`;
+export const ghostButtonClass = `${radius.control} ${controlSize.button} ${buttonBase} text-sm px-3 ${colors.text.secondary} enabled:hover:text-primary enabled:hover:bg-elevated enabled:active:bg-border enabled:active:text-primary`;
 
-export const compactButtonClass = `${radius.control} ${controlSize.button} inline-flex items-center justify-center gap-1 px-3 text-xs font-medium border ${colors.border} ${colors.text.secondary} transition-colors hover:bg-elevated hover:text-primary ${focusRingClass}`;
+export const compactButtonClass = `${radius.control} h-8 ${buttonBase} px-3 text-xs border border-transparent ${colors.bg.elevated} ${colors.text.secondary} enabled:hover:bg-accent-soft enabled:hover:text-primary enabled:active:bg-border enabled:active:text-primary`;
+
+export const dangerButtonClass = `${radius.control} ${controlSize.button} ${buttonBase} text-sm border border-error-ink bg-error/5 px-3 text-error-ink enabled:hover:bg-error/10 enabled:active:bg-error/15`;
+
+export const dangerActionButtonClass = `${radius.control} ${controlSize.button} ${buttonBase} text-sm border border-error-ink bg-danger-action px-3 text-danger-action-foreground enabled:hover:bg-danger-action-hover enabled:active:bg-danger-action-pressed`;
+
+export const compactDangerButtonClass = `${radius.control} h-8 ${buttonBase} text-xs border border-error-ink bg-error/5 px-3 text-error-ink enabled:hover:bg-error/10 enabled:active:bg-error/15`;
+
+export const inputClass = `vf-input ${radius.control} ${controlSize.input} min-w-0 border border-transparent bg-elevated px-3 text-sm text-primary placeholder:text-tertiary outline-none transition-colors duration-150 ${focusRingClass} disabled:cursor-not-allowed`;
 
 export const tagClass = `${radius.pill} inline-flex h-7 items-center gap-1.5 px-2.5 text-xs font-medium`;
 
-export const iconBoxClass = `flex ${controlSize.icon} shrink-0 items-center justify-center rounded-xl border ${colors.border} ${colors.bg.elevated} ${colors.text.primary}`;
-
-export const linkButtonClass = `${colors.accent.text} transition-opacity duration-150 hover:opacity-80`;
+export const linkButtonClass = `${colors.accent.text} transition-opacity duration-150 hover:underline underline-offset-4 ${focusRingClass}`;
 
 export function validationMessage(status: string, translate: (source: string) => string = (source) => source): string {
   switch (status) {

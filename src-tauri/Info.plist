@@ -3,12 +3,12 @@
 <plist version="1.0">
 <dict>
   <key>NSMicrophoneUsageDescription</key>
-  <string>VoiceFlow 只会在录音时使用麦克风，将你的语音转换为文字。</string>
+  <string>VoiceFlow 使用麦克风将你的语音转换为文字。默认仅在录音时打开设备；若你开启常开麦克风，空闲时设备保持打开，但音频样本不保存、不发送。</string>
   <key>NSAccessibilityUsageDescription</key>
-  <string>VoiceFlow 只使用辅助功能权限，将文字插入当前获得焦点的输入框。</string>
+  <string>VoiceFlow 使用辅助功能识别当前应用、焦点输入框，并在输入和插入文字时核对目标。只有在你为匹配的 App 单独授权后，才会提取有限的无障碍选区或附近文本；手动选中文本操作只读取选区。默认听写不会采集周边屏幕文本。</string>
   <key>NSAppleEventsUsageDescription</key>
   <string>启用浏览器上下文检测后，VoiceFlow 才会读取当前站点信息，并仅将结果保存在本机。</string>
   <key>NSScreenCaptureUsageDescription</key>
-  <string>VoiceFlow may capture the front dictation window to read on-screen words locally when the user enables window text recognition. Not used for default dictation.</string>
+  <string>在匹配 App 单独授权本机 OCR 或云端视觉后，VoiceFlow 可在无障碍上下文不足时截取一次当前窗口。本机识别只在单独授权 OCR 时运行；只有同时授权该 App 的云端视觉与文本发送后，且无障碍或本机 OCR 上下文仍不足，才会把图发送给你配置的视觉服务商。独立的“看屏幕”快捷键需要你主动触发。默认听写不会截屏。</string>
 </dict>
 </plist>

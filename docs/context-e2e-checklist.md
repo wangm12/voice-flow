@@ -1,6 +1,6 @@
 # VoiceFlow Context & Delivery E2E Verification Checklist
 
-更新时间：2026-09-08（清单仍适用；自动化数字以当前测试为准）
+更新时间：2026-09-26（当前边界见 §18；自动化数字以本次测试为准）
 
 这份 checklist 用于验证 VoiceFlow 的全部上下文来源、Prompt policy、目标保护、交付方式和 History 结果。它覆盖自动化测试和真实 macOS 外部 App 测试。
 
@@ -8,19 +8,21 @@
 
 | Context / capability | 当前状态 | 验收方式 |
 | --- | --- | --- |
-| Native App context | 已实现 | resolver 单测 + 真实 macOS App |
+| Native App context | 已实现；真实 App 验收待做 | resolver fixtures + §18 native matrix |
 | Window context | 已实现 | target guard + 真实多窗口切换 |
-| Focused input context | 已实现 | AX target guard + 真实输入框 |
-| Browser domain context | 已实现 | browser resolver + 真实浏览器 |
+| Focused input context | 已实现；外部 App 字段验收待做 | AX target guard + positive field cues；IDE/GitHub app-aware rules；§18 |
+| Browser domain context | 已实现；真实 Browser E2E 待做 | browser resolver + §18 native matrix |
 | Active Browser Tab context | 已实现 | tab token/window guard + 真实 Tab 切换 |
 | User App mapping | 已实现 | Settings + resolver + 真实 App |
 | Writing mode | 已实现 | Prompt policy + cleanup corpus |
 | Manual context override | 已实现 | policy override + target guard |
 | Selected text context | 已实现 | preview-first + 真实选区 |
 | Clipboard safety context | 已实现 | clipboard sentinel + cancellation/fallback |
-| Image / screen context | 已实现（Phase 1 AX + 可选本机 OCR + 看屏幕热键） | 默认听写零截屏；看屏幕才截一张内存图并走 preview；§18 |
+| Text / image context | 已实现（逐 App grants + 有界 AX / 本机 OCR / 云端回退 + 独立看屏幕热键） | 新 grants 默认 off；自动云端图像需具体 App + 独立文字 permission；§18 |
 
-截图进 LLM 只发生在用户自己录了看屏幕热键且配置了视觉模型之后。区域框选仍未做（§18.3 保持未实现）。会议录音、Spark、生图仍然不做。
+自动窗口图像可在具体 App 规则明确允许 cloud vision、provider text use 和屏幕录制权限后，作为 AX / OCR 不足时的一图回退。独立看屏幕热键仍是单独的用户动作；两条路径都不会截整屏。区域框选仍未做（§18.1 保持未实现）。会议录音、Spark、生图仍然不做。
+
+IDE、GitHub issue/review 和搜索框只按当前 focused editable field 的正向 AX 线索分类。缺少字段线索时保留 `Unknown` 或通用分类；窗口标题、应用名或网站域名不能单独把任意字段改成 chat / prompt。
 
 ## 2. 状态和证据约定
 
@@ -161,8 +163,8 @@
 
 | App | 预期 family | 通过 |
 | --- | --- | --- |
-| Cursor | PromptOrCode | [ ] |
-| VS Code | PromptOrCode | [ ] |
+| Cursor | PromptOrCode; field kind from focused AX cues | [ ] |
+| VS Code | PromptOrCode; field kind from focused AX cues | [ ] |
 | Terminal / iTerm / Warp | Terminal | [ ] |
 | Apple Mail / Outlook | Email | [ ] |
 | Slack / Microsoft Teams | WorkChat | [ ] |
@@ -172,6 +174,8 @@
 
 ### 5.2 Native App 预期
 
+- [ ] Cursor / VS Code 只有 focused `AXDescription` / `AXTitle` 明确标出 chat / composer / prompt 时才分类为 `CodingPrompt`
+- [ ] Cursor / VS Code 的 editor 和 terminal 需各自有 focused field cues；缺少或通用 field metadata 保持 `Unknown`
 - [ ] Cursor / VS Code 保留代码、路径、命令、版本和技术 token
 - [ ] Cursor / VS Code 不自动生成未说出的代码
 - [ ] Terminal 保留 flags、path、引号、大小写和 command syntax
@@ -194,7 +198,7 @@
 | Slack / Teams | WorkChat | [ ] |
 | Notion / Google Docs / Google Drive | Document | [ ] |
 | Google / Bing / DuckDuckGo | BrowserSearch | [ ] |
-| GitHub / GitLab | DeveloperCollaboration | [ ] |
+| GitHub / GitLab | DeveloperCollaboration by domain; GitHub issue / PR fields use focused-field policy; positive Search uses BrowserSearch | [ ] |
 | Linear / Asana / Trello | ProjectManagement | [ ] |
 | Google Calendar / Todoist | CalendarTask | [ ] |
 | X / Twitter / Reddit | SocialMedia | [ ] |
@@ -207,6 +211,7 @@
 - [ ] Search 保留关键词结构，不扩写成长文章
 - [ ] Google Docs / Notion 保留段落，不自动总结
 - [ ] GitHub / GitLab 保留 issue、URL、path、command 和技术词
+- [ ] GitHub issue / pull-request path 与 focused field label 同时明确时，title 是 Form、body / description 是 Document、reply / comment / review 是 Chat；缺任一证据就保持通用 field 分类
 - [ ] Project Management 不新增负责人、日期或项目事实
 - [ ] Calendar / Todoist 保留日期、时间、地点和 next action
 - [ ] SocialMedia 保留原始语气和自然简洁度
@@ -276,6 +281,8 @@
 - [ ] 普通 editable input 可以尝试写入
 - [ ] Secure field 禁止自动注入
 - [ ] Unknown field 不自动注入
+- [ ] 任何 positive Search field 都使用 BrowserSearch 风格；显式 AppMapping 仍优先
+- [ ] GitHub issue / pull-request 的 title、body / description 和 comment / reply 按正向 AX field label 区分；GitHub host 或 page path 缺失时不应用该细分
 - [ ] 输入框变化时 fail-closed
 - [ ] 不写入错误控件
 - [ ] AX 无法验证时显示 unverified 或 Clipboard fallback
@@ -513,69 +520,67 @@ Clipboard 不是 LLM context，而是 delivery safety context。
 - [ ] fallback reason 正确
 - [ ] 没有写错 App / Window / Tab
 
-## 17. Undo Context Safety
+## 17. Backend Undo Context Safety
 
-- [ ] verified paste 后 3 秒内点击 Undo
-- [ ] 超过 3 秒点击 Undo
-- [ ] 插入后继续编辑再点击 Undo
-- [ ] 插入后切换 App 再点击 Undo
-- [ ] 插入后切换 Window 再点击 Undo
-- [ ] 插入后切换 Browser Tab 再点击 Undo
-- [ ] 连续插入两次后点击 Undo
-- [ ] double-click Undo
-- [ ] unverified paste 没有 Undo
+当前 HUD 没有交付 Undo 按钮。以下条目核对保留的 `undo_last_delivery` 后端命令，使用隔离测试入口或后端测试；词典学习提示的「撤销」单独验证。
+
+- [ ] verified paste 后 3 秒内调用 Undo 命令
+- [ ] 超过 3 秒调用 Undo 命令
+- [ ] 插入后继续编辑再调用 Undo 命令
+- [ ] 插入后切换 App 再调用 Undo 命令
+- [ ] 插入后切换 Window 再调用 Undo 命令
+- [ ] 插入后切换 Browser Tab 再调用 Undo 命令
+- [ ] 同窗口切换到文字、描述和几何位置均相同的另一输入框，Undo 返回 stale_target
+- [ ] 粘贴读回期间快速 A → B → A，再切到 B 调用 Undo 命令；不能撤销 B
+- [ ] 连续插入两次后调用 Undo 命令
+- [ ] 连续两次调用 Undo 命令
+- [ ] unverified paste 没有有效 Undo 事务
 
 预期：
 
     目标未变化 + focused input 未变化 → 允许 Undo
     目标变化或用户继续编辑 → stale_target，不发送 Cmd+Z
 
-## 18. Image / Screen Context
+## 18. Context Sources and Screen Images
 
-当前状态：Phase 1 AX + Phase 2 opt-in 本机 OCR + Phase 3 看屏幕热键。
+### Current behavior and permissions
 
-本轮安全边界：
+- `context_enabled` gates automatic content extraction. Local scene classification and minimum target / insertion safety metadata continue when it is off.
+- Existing AppMappings now carry AND selectors for App bundle, executable, browser host, page path prefix, and focused field. Missing values fail any specified selector. Rank matching rules by host presence and specificity, path presence and specificity, focused field, App / executable selectors, selector count; lexicographically ascending mapping ID breaks only a complete specificity tie.
+- `source_permissions.ax_text`, `local_ocr`, `cloud_vision`, and `context_text_to_providers` default to false. They are separate from scene metadata and from the global `window_ocr_enabled` OCR switch. The settings migration carries an explicitly enabled legacy global OCR choice only into `local_ocr` for mappings that existed at migration time; it grants neither AX text, provider text, nor cloud vision.
+- AX, OCR, and vision evidence is bounded, source-tagged, session / target bound, in memory only, and never serialized to History or export. ASR receives relevant terms; cleanup receives only separately authorized snippets as untrusted data. OCR runs locally, but OCR-derived text may leave this Mac when `context_text_to_providers` is enabled.
+- AX content sufficient for context skips image capture. If context remains insufficient, local OCR requires the per-App `local_ocr` grant, global OCR switch, and Screen Recording permission. Automatic cloud fallback additionally requires `cloud_vision`, `context_text_to_providers`, a concrete App / executable selector, configured vision capability, and Screen Recording permission. At most one current-window image is captured per recording and shared between OCR and cloud fallback; no whole-screen capture is used. Images stay in memory and never enter History / export / logs.
+- Focused-field classification is app-aware only where positive local AX evidence exists. Known IDEs classify a field as `CodingPrompt` only when the focused description / title says chat, composer, or prompt; otherwise-unclassified or generic IDE fields stay `Unknown`. GitHub issue / pull-request refinement requires both `github.com` issue / PR path evidence and an editable-field label: title → `Form` / `FormFilling`, body / description → `Document`, and comment / reply / review → `Chat` within `DeveloperCollaboration`. The generic classifier remains the fallback for other sites and fields.
+- A positively classified `Search` field selects the built-in `BrowserSearch` family before app / domain defaults, while preserving the built-in app identity. A matching explicit AppMapping still wins. Search classification requires focused-field evidence; no window-title or domain guess is used.
+- Raw AX labels and browser paths are consumed only during local classification. They do not enter `ContextSnapshot`, History, HUD labels, or provider prompts; only the coarse field kind may be retained with a policy for safe retry behavior.
+- Permission changes cancel pending prefetch, clear captured evidence, and advance an in-memory policy revision. Evidence from before a revoke stays unusable after a later regrant; stale captures and responses cannot update the current HUD. The original audio stays available to the normal context-free ASR / cleanup fallback. Provider, credential, and model selection remain the user's configured choices.
+- Manual selected-text actions authorize only the selected text for that action. They do not attach automatic nearby AX content. The independent manual look-at-screen hotkey keeps its explicit per-action permission and preview; its grant does not enable automatic context.
+- `style_examples_approved` is a separate default-off provider permission. Legacy style pairs remain in Settings but are omitted until reviewed and approved. Automatic three-hit short-style observations enter pending `style_drafts`; confirming a draft is explicit approval. Global and per-App learning switches and source permissions still apply. Secure fields and protected banking / HR / SSO / password-manager presets remain blocked.
+- HUD source badge reports only the actually projected source (`none`, `ax`, `ocr`, or `cloud_vision`) with a fixed label and optional user-authored rule label. It never carries evidence text, URL, title, PID, or target identity. History stores no source evidence or image metadata.
 
-- [x] 默认听写没有截图进 LLM 的入口
-- [x] 未经用户触发（看屏幕热键）不会把窗口图发给 LLM
-- [x] 不会持续录屏
-- [x] 默认听写不会把截图上传给 LLM；Phase 3 只发一张用户触发的窗口图
-- [x] Phase 1/2 屏幕字是 token，不是整段邮件进 History
-- [x] 不会把截图保存到 History
-- [x] 图片存在时不会改变默认听写 cleanup policy
+### Automated regression coverage
 
-已实现后继续核对：
+Existing Rust fixtures cover selector AND semantics and deterministic specificity, host/path boundaries and missing evidence, browser query / fragment target changes, generic conservative IDE and chat/search field cases, text-off reader suppression, per-source projection gates, single-window capture sharing, sufficient-AX/OCR cloud fallback skipping, provider unavailable / timeout / cancellation / stale results, context grant revocation across an ASR retry with the same audio, safe evidence serialization, settings migration, and style approval / pending-draft rules. GitHub host/path refinement still requires native AX acceptance evidence. Fixture coverage is not native App or cloud-provider evidence.
 
-### 18.1 Image capture
+### Native and provider E2E prerequisites / current evidence
 
-- [ ] 用户明确触发后才采集
-- [ ] 只采集指定 Window 或屏幕区域
-- [ ] Screen Recording 权限拒绝时安全失败
-- [ ] 不采集后台 Window
-- [ ] 不持续录屏
-- [ ] 不把图片落盘
-- [ ] 图片尺寸和压缩大小有限制
+Use synthetic blank documents and no personal workspace or inbox content. The Phase 3 handoff identifies TextEdit, Cursor, Chrome, Safari, and WeChat as installed targets for native checks. VS Code and Slack were absent in that handoff, and no vision model was configured there, so no native VS Code / Slack field evidence or cloud-vision success can be claimed from it. Static Cursor NLS / DOM hints are not AX observations. Final post-Phase 7 native AX / OCR / provider acceptance and full E2E remain pending; mark each native check only after observing it on the actual App and recording sanitized evidence outside the repository.
 
-### 18.2 Vision processing
+Native E2E checklist:
 
-- [ ] 图片只发送到用户配置的 vision provider
-- [ ] 图片中的文字、代码和表格识别正确
-- [ ] 图片中的敏感信息不会进入普通 History
-- [ ] 图片内 prompt injection 不会被执行
-- [ ] AI 失败不会显示普通成功
-- [ ] 结果必须先进入 preview
-- [ ] preview 确认前不能写入目标 App
+- [ ] With no content grant, ordinary dictation makes zero contextual AX-reader calls and captures no image.
+- [ ] Enable only AX text for a synthetic TextEdit field; verify a matched rule and fixed `AX text` badge, with no raw title / text shown by HUD.
+- [ ] In Cursor, verify native `AXTitle` / `AXDescription` / role cues for chat, editor, and terminal independently. Missing field metadata must stay unknown; do not treat arbitrary editor content as prompt instructions.
+- [ ] In Chrome / Safari, verify host + path mapping and a query / fragment target switch against the same synthetic field; a stale response must be discarded.
+- [ ] In WeChat, verify a synthetic composer and search field separately; do not read a real conversation.
+- [ ] With synthetic blank content, test OCR-only local permission, provider-text off, Screen Recording denied / granted, and AX / OCR sufficient cases. Confirm the one-window capture counter or equivalent sanitized evidence.
+- [ ] With a specifically configured vision model, verify one permitted image is shared with OCR then sent only as insufficiency fallback; revoke permission or cancel while waiting and confirm no late HUD / History change.
+- [ ] Verify `style_examples_approved` off/on and learning disabled/enabled with synthetic drafts; no unapproved pair enters provider requests.
+- [ ] Keep manual selected-text and manual look-at-screen tests separate from automatic context grants.
 
-### 18.3 Image + selected region
+### 18.1 Image selection
 
-当前未实现（整窗一张图，没有框选）。下面留给以后验收，不要标成已通过。
-
-- [ ] 可以选择图片区域
-- [ ] OCR / vision 只处理所选区域
-- [ ] 区域变化会使 preview 失效
-- [ ] Window / App 变化会使 preview 失效
-- [ ] 支持 copy-only fallback
-- [ ] 不保存原图和 OCR 原文
+Region selection / crop UI is not implemented. The supported image scope is one current window; there is no full-screen capture or selected-region path.
 
 ## 19. History 与 Context 结果
 
@@ -633,3 +638,34 @@ Clipboard 不是 LLM context，而是 delivery safety context。
 
 真实 macOS 外部 App、Browser Tab、Accessibility、输入框写入、Clipboard 和当前默认整理模型质量评测完成前，不能把产品标记为 prod-ready.
 
+## 可选录音与启动验收
+
+- [ ] 「编辑哪种语气」只选择编辑对象；试跑旁标明当前草稿或已保存配置。在「语气」输入脱敏样例：默认无请求；点击试跑才处理，未保存修改会对比 saved / draft，模型、本地-only、provider fallback 和 guard fallback 分别标记。关闭或修改 Prompt / 样例后，迟到结果不会出现，也没有 History / App 写入。
+- [ ] 录音与输出里设置翻译快捷键和目标语言；全局输出保持原模式。按它启动时 HUD 显示目标语言，结束后普通热键恢复原模式。取消 / 启动失败不留下翻译模式；用另一枚键结束现有录音不切换模式，松开非启动键不结束按住录音。
+- [ ] 翻译键与主键 / 选中操作 / 看屏幕 / 跳过整理键的别名冲突被拒绝，Backspace / Delete 清空、Esc 保留。主键变更或注册失败后所有辅助热键可继续使用；设置翻译键不修改全局按法。
+- [ ] 当前场景整理关闭或缺少凭据时，翻译键在采集前报错；严格离线没有云请求。provider 失败和保护拒绝继续显示现有回退状态，不标成已翻译成功。
+- [ ] 翻译键直接口述正文，无「翻译成……」前缀也按固定目标处理；轻量 / 标准 / 重度与长短录音共享 Translate 授权，正文提及其他语言不切换目标。AssemblyAI 用 raw Sync 后的共同整理翻译。
+
+以下项目需在实际 macOS 应用包上手工执行；单元测试不能替代这些结论。
+
+- [ ] 麦克风连续三次录音：同设备复用，Idle 不产生 spool、预取或上传；关闭选项和权限撤销释放设备。
+- [ ] 合盖切换到指定输入设备；不存在的设备明确报错；开启／关闭盖后下一会话重新选择。
+- [ ] 普通及跳过整理热键短按、按住、Idle release、取消和重新注册行为正确；AssemblyAI raw Sync 和共同 LLM 禁用可从本次请求验证。
+- [ ] 250ms 尾部音频、取消即时性、自动上限、设备断开和 Soniox 完整恢复。
+- [ ] 冷启动及第二实例 CLI 动作、登录 --background 不显示或抢焦点；手动打开显示设置；系统登录启动状态与 UI 一致。
+- [ ] Secure Input + 已确认复制、剪贴板写入失败、输入状态不确定的文案分别正确。
+- [ ] macOS 打包后存在反馈 WAV、唯一 release-notes 来源、MLX sidecar、Metal 资源和第三方声明；开始／结束提示音及更新说明可用。
+
+## 首次使用、麦克风自检和学习反馈验收
+
+- [ ] 新配置默认只显示云端 / 本机路线，展开高级项能选择服务商、模型和区域；已有非默认服务商仍保留并自动展开。
+- [ ] On Device 就绪后引导关闭云端整理，Cohere 固定语言与运行时能力检查不能跳过；完成听写试用后可直接完成，也可主动试用选中文本。
+- [ ] 只进入主流程时保留已有文字操作开关与快捷键，录音 / 处理期间不能用导航离开试用。
+- [ ] 完成保存和读取设置期间不能进入可选试用；复制、仅历史、未确认和降级完成后，已打开的词典页刷新实际替换次数。
+- [ ] 麦克风自检不触发服务请求或创建音频文件；实际设备、合盖选择、增益与显示一致；验证安静输入、较轻声音、过高峰值、断开设备、权限撤销。
+- [ ] 自检最多 30 秒；停止 / 关闭设置 / 隐藏窗口或失去焦点 / 切换设备或增益时结束；正式听写优先且迟到自检取消不能停止录音；开启常开麦克风时恢复空闲流。
+- [ ] 真实确认或自动晋升的词在后续本机替换时累计处理次数；正确原稿、提示词命中、保守场景与语气试跑不计入。History 重新整理按同一语义统计，不把次数当作交付或准确率。
+- [ ] 学习反馈读取失败显示重试且保留最近成功数据；没有生效规则的词条隐藏收益；旧数据库迁移不回填收益，清空全部数据删除新表及迁移备份。
+
+- [ ] 服务在当前配置与其他服务之间移动时，每个服务只有一个密钥输入，草稿及错误不丢失；打开、收起管理区不增加探测。
+- [ ] 历史加载更多后同日标题不重复；顺序、查询和分页保持原样。更多操作支持方向键、Escape、外部点击与焦点返回，编辑时菜单不可用。

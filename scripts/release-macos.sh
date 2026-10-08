@@ -41,6 +41,18 @@ if [[ -z "$bundle" ]]; then
   exit 1
 fi
 
+if [[ "$(uname -m)" == "arm64" ]]; then
+  sidecar="$bundle/Contents/Resources/voiceflow-mlx-sidecar"
+  colocated_metallib="$bundle/Contents/Resources/mlx.metallib"
+  metallib="$bundle/Contents/Resources/mlx-swift_Cmlx.bundle/Contents/Resources/default.metallib"
+  if [[ ! -x "$sidecar" || ! -s "$colocated_metallib" || ! -s "$metallib" ]] \
+    || ! cmp -s "$colocated_metallib" "$metallib"; then
+    echo "The Apple silicon app is missing its signed MLX sidecar or Metal resources." >&2
+    exit 1
+  fi
+  codesign --verify --strict --verbose=2 "$sidecar"
+fi
+
 codesign --verify --deep --strict --verbose=2 "$bundle"
 notarize="$(printenv VOICEFLOW_NOTARIZE || true)"
 if [[ "$notarize" == "1" ]]; then

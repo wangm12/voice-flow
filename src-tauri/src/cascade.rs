@@ -40,6 +40,13 @@ pub enum CascadeWinner {
     None,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CascadeTranscript {
+    pub text: String,
+    pub asr_text: String,
+    pub provider_cleaned_candidate: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CascadeTimeout;
 
@@ -49,9 +56,10 @@ fn usable_text(text: Option<&str>) -> bool {
 
 pub fn pick_winner(
     primary: Option<&str>,
-    accurate: Result<Option<String>, CascadeTimeout>,
+    accurate: Result<Option<CascadeTranscript>, CascadeTimeout>,
 ) -> CascadeWinner {
-    let accurate_ok = matches!(accurate, Ok(Some(ref text)) if !text.trim().is_empty());
+    let accurate_ok =
+        matches!(accurate, Ok(Some(ref transcript)) if !transcript.text.trim().is_empty());
     if accurate_ok {
         return CascadeWinner::Accurate;
     }
@@ -65,23 +73,25 @@ pub fn pick_winner(
 pub fn winning_text<'a>(
     winner: CascadeWinner,
     primary: Option<&'a str>,
-    accurate: Option<&'a str>,
+    accurate: Option<&'a CascadeTranscript>,
 ) -> Option<&'a str> {
     match winner {
         CascadeWinner::Primary => primary.filter(|text| !text.trim().is_empty()),
-        CascadeWinner::Accurate => accurate.filter(|text| !text.trim().is_empty()),
+        CascadeWinner::Accurate => accurate
+            .map(|transcript| transcript.text.as_str())
+            .filter(|text| !text.trim().is_empty()),
         CascadeWinner::None => None,
     }
 }
 
 pub fn cleanup_winner_once<T>(
     primary: Option<&str>,
-    accurate: Result<Option<String>, CascadeTimeout>,
+    accurate: Result<Option<CascadeTranscript>, CascadeTimeout>,
     cleanup: impl FnOnce(&str) -> T,
 ) -> Option<T> {
     let accurate_text = accurate.as_ref().ok().and_then(|text| text.clone());
     let winner = pick_winner(primary, accurate);
-    winning_text(winner, primary, accurate_text.as_deref()).map(cleanup)
+    winning_text(winner, primary, accurate_text.as_ref()).map(cleanup)
 }
 
 pub fn hallucination_bag_hit(text: &str) -> bool {
@@ -97,12 +107,12 @@ pub fn hallucination_bag_hit(text: &str) -> bool {
         .any(|sentence| crate::spoken_revision::is_hallucination_text(sentence.trim()))
 }
 
-fn usable_accurate_text(text: &str) -> Option<String> {
-    if text.trim().is_empty() || hallucination_bag_hit(text) {
-        None
-    } else {
-        Some(text.to_owned())
-    }
+fn usable_accurate_transcript(transcript: &crate::asr::Transcript) -> Option<CascadeTranscript> {
+    (!transcript.text.trim().is_empty()).then(|| CascadeTranscript {
+        text: transcript.text.clone(),
+        asr_text: transcript.original_text().to_owned(),
+        provider_cleaned_candidate: transcript.provider_cleaned_candidate.clone(),
+    })
 }
 
 pub async fn accurate_shot(
@@ -110,10 +120,10 @@ pub async fn accurate_shot(
     audio: Vec<u8>,
     options: AsrOptions,
     timeout: Duration,
-) -> Result<Option<String>, CascadeTimeout> {
+) -> Result<Option<CascadeTranscript>, CascadeTimeout> {
     match tokio::time::timeout(timeout, provider.transcribe_batch(audio, options)).await {
         Err(_) => Err(CascadeTimeout),
-        Ok(Ok(transcript)) => Ok(usable_accurate_text(&transcript.text)),
+        Ok(Ok(transcript)) => Ok(usable_accurate_transcript(&transcript)),
         Ok(Err(_)) => Ok(None),
     }
 }
@@ -140,10 +150,10 @@ pub fn cascade_input_for(
 pub async fn maybe_run_accurate<F, Fut>(
     input: &CascadeInput,
     run: F,
-) -> Result<Option<String>, CascadeTimeout>
+) -> Result<Option<CascadeTranscript>, CascadeTimeout>
 where
     F: FnOnce() -> Fut,
-    Fut: std::future::Future<Output = Result<Option<String>, CascadeTimeout>>,
+    Fut: std::future::Future<Output = Result<Option<CascadeTranscript>, CascadeTimeout>>,
 {
     if should_run_accurate(input) {
         run().await
@@ -213,10 +223,18 @@ mod tests {
         assert!(!is_mixed_cjk_english("Python only"));
     }
 
+    fn candidate(text: &str) -> CascadeTranscript {
+        CascadeTranscript {
+            text: text.to_owned(),
+            asr_text: text.to_owned(),
+            provider_cleaned_candidate: None,
+        }
+    }
+
     #[test]
     fn pick_winner_accurate_ok_beats_primary() {
         assert_eq!(
-            pick_winner(Some("primary draft"), Ok(Some("accurate".into()))),
+            pick_winner(Some("primary draft"), Ok(Some(candidate("accurate")))),
             CascadeWinner::Accurate
         );
     }
@@ -232,7 +250,7 @@ mod tests {
     #[test]
     fn pick_winner_primary_none_accurate_ok_uses_accurate() {
         assert_eq!(
-            pick_winner(None, Ok(Some("accurate only".into()))),
+            pick_winner(None, Ok(Some(candidate("accurate only")))),
             CascadeWinner::Accurate
         );
     }
@@ -251,7 +269,7 @@ mod tests {
             CascadeWinner::Primary
         );
         assert_eq!(
-            pick_winner(Some("primary draft"), Ok(Some(String::new()))),
+            pick_winner(Some("primary draft"), Ok(Some(candidate("")))),
             CascadeWinner::Primary
         );
     }
@@ -276,7 +294,7 @@ mod tests {
         let mut calls = 0usize;
         let cleaned = cleanup_winner_once(
             Some("primary draft"),
-            Ok(Some("accurate winner".into())),
+            Ok(Some(candidate("accurate winner"))),
             |text| {
                 calls += 1;
                 format!("cleaned:{text}")
@@ -289,8 +307,13 @@ mod tests {
     fn mock_transcript(text: &str) -> crate::asr::Transcript {
         crate::asr::Transcript {
             text: text.to_owned(),
+            asr_text: Some(text.to_owned()),
+            provider_cleaned_candidate: None,
+            language: None,
+            confidence: None,
             segments: Vec::new(),
             words: Vec::new(),
+            tokens: Vec::new(),
             limits: crate::asr::RateLimits::default(),
         }
     }
@@ -313,7 +336,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn accurate_shot_ok_returns_text_error_or_empty_is_none() {
+    async fn accurate_shot_preserves_provider_text_and_rejects_empty() {
         let ok = crate::asr::MockAsrProvider::new(
             Ok(mock_transcript("晓雯在写 Python")),
             std::time::Duration::ZERO,
@@ -326,7 +349,7 @@ mod tests {
                 std::time::Duration::from_millis(50),
             )
             .await,
-            Ok(Some("晓雯在写 Python".into()))
+            Ok(Some(candidate("晓雯在写 Python")))
         );
 
         let empty = crate::asr::MockAsrProvider::new(
@@ -344,19 +367,19 @@ mod tests {
             Ok(None)
         );
 
-        let hallucination = crate::asr::MockAsrProvider::new(
+        let outro = crate::asr::MockAsrProvider::new(
             Ok(mock_transcript("Thanks for watching the show.")),
             std::time::Duration::ZERO,
         );
         assert_eq!(
             accurate_shot(
-                &hallucination,
+                &outro,
                 b"wav".to_vec(),
                 crate::asr::AsrOptions::default(),
                 std::time::Duration::from_millis(50),
             )
             .await,
-            Ok(None)
+            Ok(Some(candidate("Thanks for watching the show.")))
         );
     }
 
@@ -375,7 +398,7 @@ mod tests {
             },
             || {
                 runs += 1;
-                async { Ok(Some("should not run".into())) }
+                async { Ok(Some(candidate("should not run"))) }
             },
         )
         .await;
@@ -384,10 +407,10 @@ mod tests {
 
         let fired = maybe_run_accurate(&configured(|input| input.low_confidence = true), || {
             runs += 1;
-            async { Ok(Some("accurate".into())) }
+            async { Ok(Some(candidate("accurate"))) }
         })
         .await;
-        assert_eq!(fired, Ok(Some("accurate".into())));
+        assert_eq!(fired, Ok(Some(candidate("accurate"))));
         assert_eq!(runs, 1);
     }
 }

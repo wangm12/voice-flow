@@ -20,18 +20,613 @@ const LINE_COMMANDS: &[(&str, &str)] = &[
 ];
 
 /// Apply spoken layout to already-punctuated ASR text.
+#[cfg(test)]
 pub fn apply(text: &str, family: ContextFamily, confidence: f32) -> String {
-    let spoken = apply_line_commands(text);
-    if family == ContextFamily::Email && confidence >= 0.75 {
-        let (greeting, rest) = peel_greeting(&spoken);
-        let (body, closing) = peel_closing(&rest);
-        return drop_spoken_item_backtracks(&join_layout_parts(&[
-            greeting,
-            apply_lists(&body, family),
-            closing,
-        ]));
+    apply_layout_stages(text, family, confidence, false).text
+}
+
+pub(crate) struct AppliedLayout {
+    pub(crate) text: String,
+    pub(crate) source_preserved: bool,
+}
+
+struct LayoutStage {
+    text: String,
+    consumed_syntax_ranges: Vec<std::ops::Range<usize>>,
+}
+
+struct LayoutPipeline {
+    text: String,
+    source_preserved: bool,
+}
+
+impl LayoutStage {
+    fn unchanged(text: &str) -> Self {
+        Self {
+            text: text.to_owned(),
+            consumed_syntax_ranges: Vec::new(),
+        }
     }
-    drop_spoken_item_backtracks(&apply_lists(&spoken, family))
+}
+
+fn apply_layout_stages(
+    source: &str,
+    family: ContextFamily,
+    confidence: f32,
+    guard_source: bool,
+) -> LayoutPipeline {
+    let mut current = source.to_owned();
+    let mut source_preserved = true;
+    for transform in [
+        apply_heading_body_stage as fn(&str) -> LayoutStage,
+        apply_labeled_fields_stage,
+        apply_following_three_points_stage,
+        apply_paragraph_markers_stage,
+        apply_line_commands_stage,
+    ] {
+        let stage = transform(&current);
+        apply_layout_stage(&mut current, stage, guard_source, &mut source_preserved);
+    }
+    if family == ContextFamily::Email && confidence >= 0.75 {
+        let stage = apply_email_layout_stage(&current);
+        apply_layout_stage(&mut current, stage, guard_source, &mut source_preserved);
+    }
+    let lists = apply_lists_stage(&current, family);
+    apply_layout_stage(&mut current, lists, guard_source, &mut source_preserved);
+    let backtracks = apply_backtracks_stage(&current);
+    apply_layout_stage(
+        &mut current,
+        backtracks,
+        guard_source,
+        &mut source_preserved,
+    );
+    LayoutPipeline {
+        text: current,
+        source_preserved,
+    }
+}
+
+fn apply_layout_stage(
+    current: &mut String,
+    stage: LayoutStage,
+    guard_source: bool,
+    source_preserved: &mut bool,
+) {
+    if guard_source
+        && !preserves_source_protected_content_after_layout(
+            current,
+            &stage.text,
+            &stage.consumed_syntax_ranges,
+        )
+    {
+        *source_preserved = false;
+        return;
+    }
+    *current = stage.text;
+}
+
+fn apply_heading_body_stage(text: &str) -> LayoutStage {
+    let Some(parsed) = parse_heading_body(text) else {
+        return LayoutStage::unchanged(text);
+    };
+    LayoutStage {
+        text: format!("{}\n\n{}", parsed.title, parsed.body),
+        consumed_syntax_ranges: parsed.syntax_ranges.to_vec(),
+    }
+}
+
+struct ParsedHeadingBody<'a> {
+    title: &'a str,
+    body: &'a str,
+    syntax_ranges: Vec<std::ops::Range<usize>>,
+}
+
+fn parse_heading_body(text: &str) -> Option<ParsedHeadingBody<'_>> {
+    let trimmed_start = text.len() - text.trim_start().len();
+    if is_inside_explicit_quote(text, trimmed_start) || is_inside_code(text, trimmed_start) {
+        return None;
+    }
+    let trimmed = text.trim();
+    let (title_start, body_markers) = if trimmed.starts_with("标题是") {
+        ("标题是".len(), &["正文是", "正文"][..])
+    } else if trimmed.starts_with("标题叫") {
+        ("标题叫".len(), &["正文是", "正文"][..])
+    } else if starts_with_ignore_ascii_case(trimmed, "heading ") {
+        ("heading ".len(), &["body is", "body"][..])
+    } else if starts_with_ignore_ascii_case(trimmed, "title ") {
+        let title_len = if starts_with_ignore_ascii_case(trimmed, "title is ") {
+            "title is ".len()
+        } else {
+            "title ".len()
+        };
+        (title_len, &["body is", "body"][..])
+    } else if starts_with_ignore_ascii_case(trimmed, "title: ") {
+        ("title: ".len(), &["body:", "body is", "body"][..])
+    } else {
+        return None;
+    };
+    let remainder = &trimmed[title_start..];
+    let (body_at, body_marker) = body_markers
+        .iter()
+        .filter_map(|marker| {
+            find_unquoted_marker_with_scope(remainder, trimmed_start + title_start, text, marker)
+                .map(|index| (index, *marker))
+        })
+        .min_by_key(|(index, _)| *index)?;
+    let title_offset = trimmed_start + title_start;
+    let (title, mut syntax_ranges) =
+        trim_layout_label_with_ranges(&remainder[..body_at], title_offset);
+    let body_offset = title_offset + body_at + body_marker.len();
+    let (body, body_ranges) =
+        trim_layout_label_with_ranges(&remainder[body_at + body_marker.len()..], body_offset);
+    if title.is_empty() || body.is_empty() {
+        return None;
+    }
+    syntax_ranges.extend(body_ranges);
+    syntax_ranges.push(trimmed_start..trimmed_start + title_start);
+    syntax_ranges.push(title_offset + body_at..title_offset + body_at + body_marker.len());
+    Some(ParsedHeadingBody {
+        title,
+        body,
+        syntax_ranges,
+    })
+}
+
+fn apply_paragraph_markers_stage(text: &str) -> LayoutStage {
+    let Some(parsed) = parse_paragraph_markers(text) else {
+        return LayoutStage::unchanged(text);
+    };
+    LayoutStage {
+        text: format!("{}\n\n{}", parsed.first, parsed.second),
+        consumed_syntax_ranges: parsed.syntax_ranges.to_vec(),
+    }
+}
+
+struct ParsedParagraphMarkers<'a> {
+    first: &'a str,
+    second: &'a str,
+    syntax_ranges: Vec<std::ops::Range<usize>>,
+}
+
+fn parse_paragraph_markers(text: &str) -> Option<ParsedParagraphMarkers<'_>> {
+    let trimmed_start = text.len() - text.trim_start().len();
+    if is_inside_explicit_quote(text, trimmed_start) || is_inside_code(text, trimmed_start) {
+        return None;
+    }
+    let trimmed = text.trim_start();
+    if !starts_with_ignore_ascii_case(trimmed, "first paragraph") {
+        return None;
+    }
+    let first_len = "first paragraph".len();
+    let (second_at, second_len) = find_any_unquoted_marker_with_scope(
+        &trimmed[first_len..],
+        trimmed_start + first_len,
+        text,
+        &["second paragraph"],
+    )?;
+    let split_at = first_len + second_at;
+    let first_offset = trimmed_start + first_len;
+    let (first, mut syntax_ranges) =
+        trim_layout_label_with_ranges(&trimmed[first_len..split_at], first_offset);
+    let second_offset = trimmed_start + split_at + second_len;
+    let (second, second_ranges) =
+        trim_layout_label_with_ranges(&trimmed[split_at + second_len..], second_offset);
+    if first.is_empty() || second.is_empty() {
+        return None;
+    }
+    syntax_ranges.extend(second_ranges);
+    syntax_ranges.push(trimmed_start..trimmed_start + first_len);
+    syntax_ranges.push(trimmed_start + split_at..trimmed_start + split_at + second_len);
+    Some(ParsedParagraphMarkers {
+        first,
+        second,
+        syntax_ranges,
+    })
+}
+
+fn apply_labeled_fields_stage(text: &str) -> LayoutStage {
+    const ENGLISH_FIELDS: &[(&str, &str)] = &[
+        ("owner", "Owner"),
+        ("deadline", "Deadline"),
+        ("risk", "Risk"),
+        ("status", "Status"),
+        ("blocker", "Blocker"),
+        ("next step", "Next step"),
+    ];
+    const CHINESE_FIELDS: &[(&str, &str)] = &[
+        ("负责人", "负责人"),
+        ("截止日期", "截止日期"),
+        ("风险", "风险"),
+        ("状态", "状态"),
+        ("阻塞项", "阻塞项"),
+        ("下一步", "下一步"),
+    ];
+    let needs = find_unquoted_marker(text, "needs");
+    let cjk_needs = find_unquoted_marker(text, "需要");
+    let (fields, needs_at, needs_len) = if let Some(index) = needs {
+        (ENGLISH_FIELDS, index, "needs".len())
+    } else if let Some(index) = cjk_needs {
+        (CHINESE_FIELDS, index, "需要".len())
+    } else {
+        return LayoutStage::unchanged(text);
+    };
+    let tail_offset = needs_at + needs_len;
+    let tail = &text[tail_offset..];
+    let mut found = fields
+        .iter()
+        .filter_map(|(label, display)| {
+            find_unquoted_marker_with_scope(tail, tail_offset, text, label).map(|relative| {
+                (
+                    needs_at + needs_len + relative,
+                    label.len(),
+                    *label,
+                    *display,
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    found.sort_by_key(|item| item.0);
+    if found.len() < 2 {
+        return LayoutStage::unchanged(text);
+    }
+    let first_label_start = found[0].0;
+    let before_label = text[needs_at + needs_len..first_label_start]
+        .trim_matches(|ch: char| ch.is_whitespace() || matches!(ch, ':' | '：' | ',' | '，'));
+    if !before_label.is_empty() {
+        return LayoutStage::unchanged(text);
+    }
+    let preamble = text[..needs_at + needs_len].trim_end();
+    let mut items = Vec::new();
+    let mut consumed_syntax_ranges = found
+        .iter()
+        .map(|(start, label_len, _, _)| *start..*start + *label_len)
+        .collect::<Vec<_>>();
+    for (index, (start, label_len, _label, display)) in found.iter().enumerate() {
+        let value_start = start + label_len;
+        let value_end = found
+            .get(index + 1)
+            .map(|next| next.0)
+            .unwrap_or(text.len());
+        let (value, removed_syntax) = trim_field_value_with_ranges(
+            &text[value_start..value_end],
+            fields.as_ptr() == ENGLISH_FIELDS.as_ptr(),
+        );
+        if value.is_empty() {
+            return LayoutStage::unchanged(text);
+        }
+        consumed_syntax_ranges.extend(
+            removed_syntax
+                .into_iter()
+                .map(|range| value_start + range.start..value_start + range.end),
+        );
+        items.push(format!("- {display}: {value}"));
+    }
+    LayoutStage {
+        text: format!("{preamble}:\n{}", items.join("\n")),
+        consumed_syntax_ranges,
+    }
+}
+
+fn trim_field_value_with_ranges(
+    value: &str,
+    english_fields: bool,
+) -> (String, Vec<std::ops::Range<usize>>) {
+    let mut value_offset = value.len() - value.trim_start_matches(is_layout_label_char).len();
+    let (mut value, mut ranges) = trim_layout_label_with_ranges(value, 0);
+    let leading = value.len()
+        - value
+            .trim_start_matches(|ch: char| {
+                ch.is_whitespace() || matches!(ch, ',' | '，' | ';' | '；')
+            })
+            .len();
+    if leading > 0 {
+        ranges.push(value_offset..value_offset + leading);
+        value = &value[leading..];
+        value_offset += leading;
+    }
+    if english_fields {
+        if let Some(rest) = strip_ascii_prefix_ignore_case(value, "and ") {
+            ranges.push(value_offset..value_offset + "and ".len());
+            value_offset += "and ".len();
+            value = rest;
+        }
+        if strip_ascii_suffix_ignore_case(value, " and").is_some() {
+            let start = value.len() - " and".len();
+            ranges.push(value_offset + start..value_offset + value.len());
+            value = &value[..start];
+        }
+    } else {
+        if let Some(rest) = value.strip_prefix("以及") {
+            ranges.push(value_offset..value_offset + "以及".len());
+            value_offset += "以及".len();
+            value = rest;
+        }
+        if value.ends_with("以及") {
+            let start = value.len() - "以及".len();
+            ranges.push(value_offset + start..value_offset + value.len());
+            value = &value[..start];
+        }
+    }
+    let (value, trim_ranges) = trim_layout_label_with_ranges(value, value_offset);
+    ranges.extend(trim_ranges);
+    (value.to_owned(), ranges)
+}
+
+fn strip_ascii_prefix_ignore_case<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
+    value
+        .get(..prefix.len())
+        .filter(|head| head.eq_ignore_ascii_case(prefix))
+        .map(|_| &value[prefix.len()..])
+}
+
+fn strip_ascii_suffix_ignore_case<'a>(value: &'a str, suffix: &str) -> Option<&'a str> {
+    value
+        .get(value.len().saturating_sub(suffix.len())..)
+        .filter(|tail| tail.eq_ignore_ascii_case(suffix))
+        .map(|_| &value[..value.len() - suffix.len()])
+}
+
+fn apply_following_three_points_stage(text: &str) -> LayoutStage {
+    let markers = ["以下三点", "以下三个点", "the following three points"];
+    let Some((marker_at, marker_len)) = markers
+        .iter()
+        .find_map(|marker| find_unquoted_marker(text, marker).map(|at| (at, marker.len())))
+    else {
+        return LayoutStage::unchanged(text);
+    };
+    let remainder_start = marker_at + marker_len;
+    let remainder = &text[remainder_start..];
+    let mut items = None;
+    let mut consumed_delimiter_ranges = Vec::new();
+    let mut consumed_item_trim_ranges = Vec::new();
+    for delimiter in ["；", ";", "、"] {
+        let (segments, delimiter_ranges) =
+            split_unquoted_segments(remainder, remainder_start, text, delimiter);
+        let mut pieces = Vec::new();
+        let mut trim_ranges = Vec::new();
+        for (segment, offset) in &segments {
+            let (piece, ranges) = trim_layout_label_with_ranges(segment, *offset);
+            if !piece.is_empty() {
+                pieces.push(piece);
+            }
+            trim_ranges.extend(ranges);
+        }
+        if pieces.len() == 3 {
+            items = Some(pieces);
+            consumed_delimiter_ranges = delimiter_ranges;
+            consumed_item_trim_ranges = trim_ranges;
+            break;
+        }
+    }
+    let Some(items) = items else {
+        return LayoutStage::unchanged(text);
+    };
+    let (prefix, prefix_trim_ranges) = trim_layout_label_with_ranges(&text[..marker_at], 0);
+    let list = items
+        .iter()
+        .map(|item| format!("- {item}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let result = if prefix.is_empty() {
+        list
+    } else {
+        format!("{prefix}\n{list}")
+    };
+    LayoutStage {
+        text: result,
+        consumed_syntax_ranges: std::iter::once(marker_at..marker_at + marker_len)
+            .chain(prefix_trim_ranges)
+            .chain(consumed_delimiter_ranges)
+            .chain(consumed_item_trim_ranges)
+            .collect(),
+    }
+}
+
+fn find_marker(haystack: &str, marker: &str) -> Option<usize> {
+    if marker.is_ascii() {
+        let lower = haystack.to_ascii_lowercase();
+        lower.find(&marker.to_ascii_lowercase()).filter(|start| {
+            is_ascii_word_left(haystack, *start)
+                && is_ascii_word_right(haystack, start + marker.len())
+        })
+    } else {
+        haystack.find(marker)
+    }
+}
+
+fn find_unquoted_marker(haystack: &str, marker: &str) -> Option<usize> {
+    find_unquoted_marker_with_scope(haystack, 0, haystack, marker)
+}
+
+fn find_any_unquoted_marker_with_scope(
+    haystack: &str,
+    source_offset: usize,
+    full_source: &str,
+    markers: &[&str],
+) -> Option<(usize, usize)> {
+    markers
+        .iter()
+        .filter_map(|marker| {
+            find_unquoted_marker_with_scope(haystack, source_offset, full_source, marker)
+                .map(|at| (at, marker.len()))
+        })
+        .min_by_key(|(at, _)| *at)
+}
+
+fn find_unquoted_marker_with_scope(
+    haystack: &str,
+    source_offset: usize,
+    full_source: &str,
+    marker: &str,
+) -> Option<usize> {
+    let code_ranges = code_literal_ranges(full_source);
+    let mut search_from = 0;
+    while search_from < haystack.len() {
+        let relative = find_marker(&haystack[search_from..], marker)?;
+        let start = search_from + relative;
+        let source_start = source_offset + start;
+        if !is_inside_explicit_quote(full_source, source_start)
+            && !code_ranges
+                .iter()
+                .any(|range| range.start <= source_start && source_start < range.end)
+        {
+            return Some(start);
+        }
+        let ch = haystack[start..].chars().next()?;
+        search_from = start + ch.len_utf8();
+    }
+    None
+}
+
+fn trim_layout_label_with_ranges(
+    text: &str,
+    source_offset: usize,
+) -> (&str, Vec<std::ops::Range<usize>>) {
+    let start = text
+        .char_indices()
+        .find(|(_, ch)| !is_layout_label_char(*ch))
+        .map_or(text.len(), |(index, _)| index);
+    let end = text
+        .char_indices()
+        .rev()
+        .find(|(_, ch)| !is_layout_label_char(*ch))
+        .map_or(start, |(index, ch)| index + ch.len_utf8());
+    let mut ranges = Vec::new();
+    if start > 0 {
+        ranges.push(source_offset..source_offset + start);
+    }
+    if end < text.len() {
+        ranges.push(source_offset + end..source_offset + text.len());
+    }
+    (&text[start..end], ranges)
+}
+
+fn is_layout_label_char(ch: char) -> bool {
+    ch.is_whitespace() || matches!(ch, ':' | '：' | ',' | '，' | ';' | '；')
+}
+
+fn split_unquoted_segments<'a>(
+    text: &'a str,
+    source_offset: usize,
+    full_source: &str,
+    delimiter: &str,
+) -> (Vec<(&'a str, usize)>, Vec<std::ops::Range<usize>>) {
+    let code_ranges = code_literal_ranges(full_source);
+    let mut pieces = Vec::new();
+    let mut delimiter_ranges = Vec::new();
+    let mut piece_start = 0;
+    let mut search_from = 0;
+    while let Some(relative) = text[search_from..].find(delimiter) {
+        let delimiter_start = search_from + relative;
+        if !is_literal_position(full_source, source_offset + delimiter_start, &code_ranges) {
+            pieces.push((
+                &text[piece_start..delimiter_start],
+                source_offset + piece_start,
+            ));
+            delimiter_ranges.push(
+                source_offset + delimiter_start..source_offset + delimiter_start + delimiter.len(),
+            );
+            piece_start = delimiter_start + delimiter.len();
+        }
+        search_from = delimiter_start + delimiter.len();
+    }
+    pieces.push((&text[piece_start..], source_offset + piece_start));
+    (pieces, delimiter_ranges)
+}
+
+pub(crate) fn code_literal_ranges(text: &str) -> Vec<std::ops::Range<usize>> {
+    let mut ranges = Vec::new();
+    let mut offset = 0;
+    let mut fence: Option<(char, usize, usize)> = None;
+    for line in text.split_inclusive('\n') {
+        let line_without_newline = line.strip_suffix('\n').unwrap_or(line);
+        let leading = line_without_newline.len() - line_without_newline.trim_start().len();
+        let remainder = &line_without_newline[leading..];
+        let marker = remainder.chars().next();
+        let run = marker.filter(|ch| matches!(ch, '`' | '~')).map_or(0, |ch| {
+            remainder
+                .chars()
+                .take_while(|candidate| *candidate == ch)
+                .count()
+        });
+        if let Some((fence_char, fence_len, fence_start)) = fence {
+            let closes = marker == Some(fence_char)
+                && run >= fence_len
+                && remainder[remainder
+                    .char_indices()
+                    .take(run)
+                    .last()
+                    .map_or(0, |(index, ch)| index + ch.len_utf8())..]
+                    .trim()
+                    .is_empty()
+                && leading <= 3;
+            if closes {
+                ranges.push(fence_start..offset + line.len());
+                fence = None;
+            }
+        } else if leading <= 3 && run >= 3 {
+            fence = Some((marker.unwrap_or('`'), run, offset));
+        }
+        offset += line.len();
+    }
+    if let Some((_, _, start)) = fence {
+        ranges.push(start..text.len());
+    }
+
+    let mut index = 0;
+    while index < text.len() {
+        if ranges
+            .iter()
+            .any(|range| range.start <= index && index < range.end)
+        {
+            index = ranges
+                .iter()
+                .filter(|range| range.start <= index && index < range.end)
+                .map(|range| range.end)
+                .max()
+                .unwrap_or(index + 1);
+            continue;
+        }
+        if !text[index..].starts_with('`') {
+            index += text[index..].chars().next().map_or(1, char::len_utf8);
+            continue;
+        }
+        let run = text[index..]
+            .bytes()
+            .take_while(|byte| *byte == b'`')
+            .count();
+        if run >= 3 {
+            index += run;
+            continue;
+        }
+        let content_start = index + run;
+        let mut cursor = content_start;
+        let mut close = None;
+        while cursor < text.len() {
+            let Some(relative) = text[cursor..].find('`') else {
+                break;
+            };
+            let candidate = cursor + relative;
+            let candidate_run = text[candidate..]
+                .bytes()
+                .take_while(|byte| *byte == b'`')
+                .count();
+            if candidate_run == run {
+                close = Some(candidate + candidate_run);
+                break;
+            }
+            cursor = candidate + candidate_run.max(1);
+        }
+        if let Some(end) = close {
+            ranges.push(index..end);
+            index = end;
+        } else {
+            ranges.push(index..text.len());
+            break;
+        }
+    }
+    ranges.sort_by_key(|range| range.start);
+    ranges
 }
 
 fn lists_disabled(family: ContextFamily) -> bool {
@@ -54,18 +649,48 @@ struct Marker {
     kind: MarkerKind,
 }
 
-fn apply_lists(text: &str, family: ContextFamily) -> String {
+fn apply_lists_stage(text: &str, family: ContextFamily) -> LayoutStage {
     if lists_disabled(family) {
-        return text.to_string();
+        return LayoutStage::unchanged(text);
     }
-    text.split("\n\n")
-        .map(format_list_block)
-        .collect::<Vec<_>>()
-        .join("\n\n")
+    let code_ranges = code_literal_ranges(text);
+    let mut out = String::with_capacity(text.len());
+    let mut consumed_syntax_ranges = Vec::new();
+    let mut source_offset = 0;
+    for (index, block) in text.split("\n\n").enumerate() {
+        if index > 0 {
+            out.push_str("\n\n");
+            source_offset += 2;
+        }
+        let block_end = source_offset + block.len();
+        let contains_code = code_ranges
+            .iter()
+            .any(|range| range.start < block_end && source_offset < range.end);
+        if contains_code {
+            out.push_str(block);
+        } else if let Some((formatted, ranges)) =
+            format_list_block(block, source_offset, text, &code_ranges)
+        {
+            out.push_str(&formatted);
+            consumed_syntax_ranges.extend(ranges);
+        } else {
+            out.push_str(block);
+        }
+        source_offset = block_end;
+    }
+    LayoutStage {
+        text: out,
+        consumed_syntax_ranges,
+    }
 }
 
-fn format_list_block(block: &str) -> String {
-    let markers = collect_markers(block);
+fn format_list_block(
+    block: &str,
+    source_offset: usize,
+    full_source: &str,
+    code_ranges: &[std::ops::Range<usize>],
+) -> Option<(String, Vec<std::ops::Range<usize>>)> {
+    let markers = collect_markers(block, source_offset, full_source, code_ranges);
     let numbered = markers
         .iter()
         .filter(|item| item.kind == MarkerKind::Numbered)
@@ -77,15 +702,20 @@ fn format_list_block(block: &str) -> String {
         .copied()
         .collect::<Vec<_>>();
     if numbered.len() >= 2 {
-        return render_list(block, &numbered, MarkerKind::Numbered);
+        return render_list(block, source_offset, &numbered, MarkerKind::Numbered);
     }
     if bullets.len() >= 2 {
-        return render_list(block, &bullets, MarkerKind::Bullet);
+        return render_list(block, source_offset, &bullets, MarkerKind::Bullet);
     }
-    block.to_string()
+    None
 }
 
-fn render_list(block: &str, markers: &[Marker], kind: MarkerKind) -> String {
+fn render_list(
+    block: &str,
+    source_offset: usize,
+    markers: &[Marker],
+    kind: MarkerKind,
+) -> Option<(String, Vec<std::ops::Range<usize>>)> {
     let preamble = block[..markers[0].start].trim();
     let mut items = Vec::new();
     for (index, marker) in markers.iter().enumerate() {
@@ -99,7 +729,7 @@ fn render_list(block: &str, markers: &[Marker], kind: MarkerKind) -> String {
         }
     }
     if items.len() < 2 {
-        return block.to_string();
+        return None;
     }
     let mut out = String::new();
     if !preamble.is_empty() {
@@ -119,14 +749,44 @@ fn render_list(block: &str, markers: &[Marker], kind: MarkerKind) -> String {
         }
         out.push_str(item);
     }
-    out
+    Some((
+        out,
+        markers
+            .iter()
+            .map(|marker| source_offset + marker.start..source_offset + marker.end)
+            .collect(),
+    ))
 }
 
-fn drop_spoken_item_backtracks(text: &str) -> String {
-    text.split("\n\n")
-        .map(rewrite_list_backtrack_block)
-        .collect::<Vec<_>>()
-        .join("\n\n")
+fn apply_backtracks_stage(text: &str) -> LayoutStage {
+    let code_ranges = code_literal_ranges(text);
+    let quote_ranges = explicit_quote_ranges(text);
+    let mut out = String::with_capacity(text.len());
+    let mut consumed_syntax_ranges = Vec::new();
+    let mut source_offset = 0;
+    for (index, block) in text.split("\n\n").enumerate() {
+        if index > 0 {
+            out.push_str("\n\n");
+            source_offset += 2;
+        }
+        let block_end = source_offset + block.len();
+        let contains_literal = code_ranges
+            .iter()
+            .chain(quote_ranges.iter())
+            .any(|range| range.start < block_end && source_offset < range.end);
+        if contains_literal {
+            out.push_str(block);
+        } else {
+            let stage = rewrite_list_backtrack_block(block, source_offset, text, &code_ranges);
+            out.push_str(&stage.text);
+            consumed_syntax_ranges.extend(stage.consumed_syntax_ranges);
+        }
+        source_offset = block_end;
+    }
+    LayoutStage {
+        text: out,
+        consumed_syntax_ranges,
+    }
 }
 
 struct ListItem {
@@ -134,16 +794,32 @@ struct ListItem {
     discarded: bool,
 }
 
-fn rewrite_list_backtrack_block(block: &str) -> String {
+fn rewrite_list_backtrack_block(
+    block: &str,
+    source_offset: usize,
+    full_source: &str,
+    code_ranges: &[std::ops::Range<usize>],
+) -> LayoutStage {
     let mut preamble = Vec::new();
     let mut items: Vec<ListItem> = Vec::new();
     let mut numbered_source = false;
     let mut bullet_source = false;
-    for line in block.lines() {
-        let trimmed = line.trim_end();
-        let stripped = strip_trailing_backtrack(line);
-        let discarded_here = stripped != trimmed;
+    let mut consumed_syntax_ranges = Vec::new();
+    let mut line_offset = 0;
+    for segment in block.split_inclusive('\n') {
+        let line = segment.strip_suffix('\n').unwrap_or(segment);
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        let (stripped, backtrack_ranges) =
+            strip_trailing_backtrack(line, source_offset + line_offset, full_source, code_ranges);
+        let discarded_here = !backtrack_ranges.is_empty();
+        consumed_syntax_ranges.extend(backtrack_ranges);
         if is_list_line(&stripped) {
+            if let Some(prefix) = list_prefix_range(&stripped) {
+                consumed_syntax_ranges.push(
+                    source_offset + line_offset + prefix.start
+                        ..source_offset + line_offset + prefix.end,
+                );
+            }
             if stripped.trim_start().starts_with("- ") {
                 bullet_source = true;
             } else {
@@ -162,9 +838,17 @@ fn rewrite_list_backtrack_block(block: &str) -> String {
         } else if !stripped.is_empty() {
             preamble.push(stripped);
         }
+        line_offset += segment.len();
     }
     if items.is_empty() {
-        return preamble.join("\n");
+        let rewritten = preamble.join("\n");
+        if rewritten == block {
+            consumed_syntax_ranges.clear();
+        }
+        return LayoutStage {
+            text: rewritten,
+            consumed_syntax_ranges,
+        };
     }
     let mut candidates = Vec::new();
     for (index, item) in items.iter().enumerate() {
@@ -189,7 +873,11 @@ fn rewrite_list_backtrack_block(block: &str) -> String {
         }
     }
     if kept.is_empty() {
-        return preamble.join("\n");
+        let rewritten = preamble.join("\n");
+        return LayoutStage {
+            text: rewritten,
+            consumed_syntax_ranges,
+        };
     }
     let mut out = preamble;
     for (index, item) in kept.iter().enumerate() {
@@ -201,7 +889,28 @@ fn rewrite_list_backtrack_block(block: &str) -> String {
             out.push(item.clone());
         }
     }
-    out.join("\n")
+    let rewritten = out.join("\n");
+    if rewritten == block {
+        consumed_syntax_ranges.clear();
+    }
+    LayoutStage {
+        text: rewritten,
+        consumed_syntax_ranges,
+    }
+}
+
+fn list_prefix_range(line: &str) -> Option<std::ops::Range<usize>> {
+    let trimmed = line.trim_start();
+    let start = line.len() - trimmed.len();
+    if trimmed.starts_with("- ") {
+        return Some(start..start + 2);
+    }
+    let digits = trimmed.chars().take_while(|ch| ch.is_ascii_digit()).count();
+    (digits > 0
+        && trimmed
+            .get(digits..)
+            .is_some_and(|rest| rest.starts_with(". ")))
+    .then_some(start..start + digits + 2)
 }
 
 fn strip_trailing_punct(text: &str) -> String {
@@ -214,62 +923,113 @@ fn strip_trailing_punct(text: &str) -> String {
     .to_string()
 }
 
-fn strip_trailing_backtrack(text: &str) -> String {
-    let mut value = text.trim_end().to_string();
+fn strip_trailing_backtrack(
+    text: &str,
+    source_offset: usize,
+    full_source: &str,
+    code_ranges: &[std::ops::Range<usize>],
+) -> (String, Vec<std::ops::Range<usize>>) {
+    let mut end = text.trim_end().len();
+    let mut consumed_ranges = Vec::new();
     loop {
-        let Some(next) = strip_one_trailing_backtrack(&value) else {
+        let current = &text[..end];
+        let Some((next_end, marker_start)) =
+            strip_one_trailing_backtrack(current, source_offset, full_source, code_ranges)
+        else {
             break;
         };
-        if next == value {
+        if next_end >= end {
             break;
         }
-        value = next;
+        consumed_ranges.push(source_offset + marker_start..source_offset + end);
+        end = next_end;
     }
-    value.trim_end().to_string()
+    (text[..end].trim_end().to_owned(), consumed_ranges)
 }
 
 fn is_trailing_marker_punct(ch: char) -> bool {
     matches!(ch, ',' | '，' | '.' | '。' | '!' | '！' | ' ' | '\t')
 }
 
-fn strip_one_trailing_backtrack(text: &str) -> Option<String> {
+fn strip_one_trailing_backtrack(
+    text: &str,
+    source_offset: usize,
+    full_source: &str,
+    code_ranges: &[std::ops::Range<usize>],
+) -> Option<(usize, usize)> {
     const MARKER: &str = "不对";
     let trimmed = text.trim_end_matches(is_trailing_marker_punct);
     let Some(index) = trimmed.rfind(MARKER) else {
-        return strip_trailing_english_backtrack(text);
+        return strip_trailing_english_backtrack(text, source_offset, full_source, code_ranges);
     };
     let after = &trimmed[index + MARKER.len()..];
-    if !after.chars().all(is_trailing_marker_punct) {
-        return strip_trailing_english_backtrack(text);
+    if !after.chars().all(is_trailing_marker_punct)
+        || is_literal_position(full_source, source_offset + index, code_ranges)
+    {
+        return strip_trailing_english_backtrack(text, source_offset, full_source, code_ranges);
     }
     let before = trimmed[..index].trim_end_matches(is_trailing_marker_punct);
     let Some(particle) = before.chars().next_back() else {
-        return strip_trailing_english_backtrack(text);
+        return strip_trailing_english_backtrack(text, source_offset, full_source, code_ranges);
     };
     if !matches!(particle, '哦' | '啊' | '喔' | '唔') {
-        return strip_trailing_english_backtrack(text);
+        return strip_trailing_english_backtrack(text, source_offset, full_source, code_ranges);
     }
     let cut = before.len() - particle.len_utf8();
-    Some(before[..cut].trim_end().to_string())
+    Some((before[..cut].trim_end().len(), cut))
 }
 
-fn strip_trailing_english_backtrack(text: &str) -> Option<String> {
+fn strip_trailing_english_backtrack(
+    text: &str,
+    source_offset: usize,
+    full_source: &str,
+    code_ranges: &[std::ops::Range<usize>],
+) -> Option<(usize, usize)> {
     let lower = text.to_ascii_lowercase();
     for marker in ["scratch that", "oh, wait", "oh wait", "oh, no", "oh no"] {
-        if let Some(index) = lower.rfind(marker) {
+        let mut search_end = lower.len();
+        while let Some(index) = lower[..search_end].rfind(marker) {
             let after = lower[index + marker.len()..].trim_end_matches(is_trailing_marker_punct);
-            if after.is_empty() {
-                return Some(text[..index].trim_end().to_string());
+            if after.is_empty()
+                && !is_literal_position(full_source, source_offset + index, code_ranges)
+            {
+                return Some((text[..index].trim_end().len(), index));
             }
+            search_end = index;
         }
     }
     None
 }
 
-fn collect_markers(text: &str) -> Vec<Marker> {
+fn is_literal_position(text: &str, index: usize, code_ranges: &[std::ops::Range<usize>]) -> bool {
+    is_inside_explicit_quote(text, index)
+        || code_ranges
+            .iter()
+            .any(|range| range.start <= index && index < range.end)
+}
+
+fn collect_markers(
+    text: &str,
+    source_offset: usize,
+    full_source: &str,
+    code_ranges: &[std::ops::Range<usize>],
+) -> Vec<Marker> {
     let mut markers = Vec::new();
     let mut index = 0;
     while index < text.len() {
+        let source_index = source_offset + index;
+        if is_inside_explicit_quote(full_source, source_index)
+            || code_ranges
+                .iter()
+                .any(|range| range.start <= source_index && source_index < range.end)
+        {
+            index += text[index..]
+                .chars()
+                .next()
+                .expect("rest is non-empty")
+                .len_utf8();
+            continue;
+        }
         if let Some(marker) = match_marker_at(text, index) {
             index = marker.end;
             markers.push(marker);
@@ -431,21 +1191,85 @@ const ENGLISH_ORDINALS: &[&str] = &[
     "eighth",
     "ninth",
     "tenth",
-    "one",
-    "two",
-    "three",
-    "four",
-    "five",
-    "six",
-    "seven",
-    "eight",
-    "nine",
-    "ten",
 ];
 
 const ORDINAL_FOLLOW_DENY: &[&str] = &[
-    "of", "all", "people", "person", "time", "times", "more", "day", "days", "week", "weeks",
-    "month", "months", "year", "years", "thing", "things", "place", "half",
+    "of",
+    "all",
+    "people",
+    "person",
+    "time",
+    "times",
+    "more",
+    "day",
+    "days",
+    "week",
+    "weeks",
+    "month",
+    "months",
+    "year",
+    "years",
+    "thing",
+    "things",
+    "place",
+    "half",
+    "option",
+    "options",
+    "choice",
+    "choices",
+    "is",
+    "are",
+    "was",
+    "were",
+    "seems",
+    "seem",
+    "feels",
+    "feel",
+    "looks",
+    "look",
+    "sounds",
+    "sound",
+    "approach",
+    "approaches",
+    "phase",
+    "phases",
+    "stage",
+    "stages",
+    "step",
+    "steps",
+    "part",
+    "parts",
+    "section",
+    "sections",
+    "chapter",
+    "chapters",
+    "item",
+    "items",
+    "attempt",
+    "attempts",
+    "draft",
+    "drafts",
+    "project",
+    "projects",
+    "idea",
+    "ideas",
+    "thought",
+    "thoughts",
+    "version",
+    "versions",
+    "page",
+    "pages",
+    "paragraph",
+    "paragraphs",
+    "round",
+    "rounds",
+    "costs",
+    "cost",
+];
+
+const ORDINAL_PRECEDING_DENY: &[&str] = &[
+    "the", "a", "an", "this", "that", "each", "every", "my", "our", "your", "his", "her", "its",
+    "another", "and", "but", "in", "on", "at", "during", "before", "after", "from", "until",
 ];
 
 fn match_english_ordinal(text: &str, start: usize) -> Option<usize> {
@@ -461,12 +1285,31 @@ fn match_english_ordinal(text: &str, start: usize) -> Option<usize> {
         if !is_ascii_word_right(text, end) {
             continue;
         }
+        if previous_ascii_word(text, start).is_some_and(|word| {
+            ORDINAL_PRECEDING_DENY
+                .iter()
+                .any(|item| word.eq_ignore_ascii_case(item))
+        }) {
+            continue;
+        }
         if following_word_denied(text, end) {
             continue;
         }
         return Some(end);
     }
     None
+}
+
+fn previous_ascii_word(text: &str, start: usize) -> Option<&str> {
+    let before = text[..start].trim_end();
+    let word_start = before
+        .char_indices()
+        .rev()
+        .find(|(_, ch)| !ch.is_ascii_alphabetic())
+        .map(|(index, ch)| index + ch.len_utf8())
+        .unwrap_or(0);
+    let word = before.get(word_start..)?;
+    (!word.is_empty() && word.chars().all(|ch| ch.is_ascii_alphabetic())).then_some(word)
 }
 
 fn following_word_denied(text: &str, end: usize) -> bool {
@@ -510,25 +1353,193 @@ fn match_bullet(text: &str, start: usize) -> Option<usize> {
         if from.eq_ignore_ascii_case("bullet") && following_word_denied_for_bullet(text, end) {
             continue;
         }
-        if is_cjk_command(from)
-            && is_cjk_left_boundary(text, start)
-            && is_cjk_right_boundary(text, end)
-        {
-            return Some(end);
-        } else if is_ascii_word_left(text, start) && is_ascii_word_right(text, end) {
+        let has_boundaries = if is_cjk_command(from) {
+            is_cjk_left_boundary(text, start) && is_cjk_right_boundary(text, end)
+        } else {
+            is_ascii_word_left(text, start) && is_ascii_word_right(text, end)
+        };
+        if has_boundaries {
             return Some(end);
         }
     }
     None
 }
 
-/// Punctuate, then apply spoken layout. Used by the three cleanup entry points.
+/// Punctuate and apply spoken layout through the legacy test helper.
+#[cfg(test)]
 pub fn apply_after_punctuation(text: &str, family: ContextFamily, confidence: f32) -> String {
-    apply(&crate::spoken_punctuation::apply(text), family, confidence)
+    let applied = apply_after_punctuation_with_provenance(text, family, confidence);
+    if applied.source_preserved {
+        applied.text
+    } else {
+        text.to_owned()
+    }
+}
+
+pub(crate) fn apply_after_punctuation_with_provenance(
+    text: &str,
+    family: ContextFamily,
+    confidence: f32,
+) -> AppliedLayout {
+    let punctuation = crate::spoken_punctuation::apply_with_provenance(text);
+    let punctuation_preserved = preserves_source_protected_content_after_layout(
+        text,
+        &punctuation.text,
+        &punctuation.consumed_syntax_ranges,
+    );
+    let layout_input = if punctuation_preserved {
+        punctuation.text.clone()
+    } else {
+        text.to_owned()
+    };
+    let layout = apply_layout_stages(&layout_input, family, confidence, true);
+    AppliedLayout {
+        text: layout.text,
+        source_preserved: punctuation_preserved && layout.source_preserved,
+    }
 }
 
 pub fn has_structural_layout(text: &str) -> bool {
     text.contains('\n') || list_prefix_count(text) > 0
+}
+
+/// Preserve transcript words that were explicitly arranged into headings,
+/// paragraphs, or list items. Punctuation, case, and line prefixes may change;
+/// removing or reordering dictated content rejects the candidate.
+pub fn preserves_explicit_layout_content(source: &str, candidate: &str) -> bool {
+    if !has_structural_layout(source) {
+        return true;
+    }
+    let source = layout_content_chars(source);
+    let candidate = layout_content_chars(candidate);
+    let mut candidate_index = 0;
+    for source_char in source {
+        let Some(relative) = candidate[candidate_index..]
+            .iter()
+            .position(|candidate_char| *candidate_char == source_char)
+        else {
+            return false;
+        };
+        candidate_index += relative + 1;
+    }
+    true
+}
+
+/// Require layout and indentation to survive cleanup after best-effort repair.
+pub fn preserves_required_layout(source: &str, candidate: &str) -> bool {
+    if !has_structural_layout(source) {
+        return !has_structural_layout(candidate);
+    }
+    if !preserves_explicit_layout_content(source, candidate)
+        || newline_count(source) != newline_count(candidate)
+        || list_prefix_count(source) != list_prefix_count(candidate)
+    {
+        return false;
+    }
+    let source_lines = source.lines().collect::<Vec<_>>();
+    let candidate_lines = candidate.lines().collect::<Vec<_>>();
+    if source_lines.len() != candidate_lines.len() {
+        return false;
+    }
+    let preserve_indentation = source.contains("```")
+        || source_lines.iter().any(|line| {
+            let indent = line.len() - line.trim_start_matches([' ', '\t']).len();
+            indent > 0
+        });
+    if preserve_indentation {
+        return source == candidate;
+    }
+    source_lines
+        .iter()
+        .zip(candidate_lines)
+        .all(|(before, after)| {
+            if before.trim().is_empty() {
+                return after.trim().is_empty();
+            }
+            if is_list_line(before) && !is_list_line(after) {
+                return false;
+            }
+            preserves_line_content(before, after)
+        })
+}
+
+pub(crate) fn preserves_source_protected_content(source: &str, candidate: &str) -> bool {
+    crate::protected_span::preserves(
+        source,
+        candidate,
+        Some(crate::llm::CleanupOperation::Cleanup),
+    )
+}
+
+pub(crate) fn preserves_source_protected_content_after_layout(
+    source: &str,
+    candidate: &str,
+    consumed_syntax_ranges: &[std::ops::Range<usize>],
+) -> bool {
+    let mut syntax_ranges = consumed_syntax_ranges.to_vec();
+    syntax_ranges.sort_by_key(|range| range.start);
+    let code_ranges = code_literal_ranges(source);
+    let quote_ranges = explicit_quote_ranges(source);
+    let protected_spans =
+        crate::protected_span::protected_spans(source, Some(crate::llm::CleanupOperation::Cleanup));
+    let mut previous_end = 0;
+    for (index, range) in syntax_ranges.iter().enumerate() {
+        if range.start >= range.end
+            || range.end > source.len()
+            || !source.is_char_boundary(range.start)
+            || !source.is_char_boundary(range.end)
+            || (index > 0 && range.start < previous_end)
+            || code_ranges
+                .iter()
+                .chain(quote_ranges.iter())
+                .any(|literal| range.start < literal.end && literal.start < range.end)
+        {
+            return false;
+        }
+        previous_end = range.end;
+        if protected_spans.iter().any(|span| {
+            range.start < span.end_byte
+                && span.start_byte < range.end
+                && !(range.start <= span.start_byte && span.end_byte <= range.end)
+        }) {
+            return false;
+        }
+    }
+    let mut source_without_syntax_terms = source.to_owned();
+    for range in syntax_ranges.iter().rev() {
+        let replacement = " ".repeat(source[range.start..range.end].chars().count());
+        source_without_syntax_terms.replace_range(range.clone(), &replacement);
+    }
+    preserves_source_protected_content(&source_without_syntax_terms, candidate)
+}
+
+fn preserves_line_content(source: &str, candidate: &str) -> bool {
+    let source = layout_content_chars(&strip_list_prefix(source));
+    let candidate = layout_content_chars(&strip_list_prefix(candidate));
+    let mut candidate_index = 0;
+    for source_char in source {
+        let Some(relative) = candidate[candidate_index..]
+            .iter()
+            .position(|candidate_char| *candidate_char == source_char)
+        else {
+            return false;
+        };
+        candidate_index += relative + 1;
+    }
+    true
+}
+
+fn layout_content_chars(text: &str) -> Vec<char> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let line = strip_list_prefix(line);
+        out.extend(
+            line.chars()
+                .filter(|ch| is_content_char(*ch))
+                .flat_map(char::to_lowercase),
+        );
+    }
+    out
 }
 
 /// If the LLM flattened spoken line breaks or list prefixes, restore the
@@ -696,6 +1707,15 @@ fn join_layout_parts(parts: &[String]) -> String {
         .join("\n")
 }
 
+fn apply_email_layout_stage(text: &str) -> LayoutStage {
+    let (greeting, rest) = peel_greeting(text);
+    let (body, closing) = peel_closing(&rest);
+    LayoutStage {
+        text: join_layout_parts(&[greeting, body, closing]),
+        consumed_syntax_ranges: Vec::new(),
+    }
+}
+
 const EMAIL_GREETINGS: &[&str] = &["hello", "hey", "dear", "hi", "您好", "你好"];
 const EMAIL_CLOSINGS: &[&str] = &[
     "best regards",
@@ -718,6 +1738,9 @@ const CJK_NAME_STOP: &[char] = &[
 
 fn peel_greeting(text: &str) -> (String, String) {
     let start = skip_leading_whitespace(text, 0);
+    if is_inside_explicit_quote(text, start) || is_inside_code(text, start) {
+        return (String::new(), text.to_owned());
+    }
     let rest = &text[start..];
     for &from in EMAIL_GREETINGS {
         if !starts_with_ignore_ascii_case(rest, from) {
@@ -798,13 +1821,11 @@ fn is_signature_function_word(word: &str) -> bool {
 
 fn consume_cjk_name(text: &str, start: usize) -> usize {
     let mut end = start;
-    let mut count = 0usize;
-    for ch in text[start..].chars() {
+    for (count, ch) in text[start..].chars().enumerate() {
         if !is_cjk_letter(ch) || CJK_NAME_STOP.contains(&ch) || count >= 4 {
             break;
         }
         end += ch.len_utf8();
-        count += 1;
     }
     end
 }
@@ -829,8 +1850,21 @@ fn peel_closing(text: &str) -> (String, String) {
 
 fn find_last_closing(text: &str) -> Option<(usize, usize)> {
     let mut found = None;
+    let code_ranges = code_literal_ranges(text);
     let mut index = 0;
     while index < text.len() {
+        if is_inside_explicit_quote(text, index)
+            || code_ranges
+                .iter()
+                .any(|range| range.start <= index && index < range.end)
+        {
+            index += text[index..]
+                .chars()
+                .next()
+                .expect("rest is non-empty")
+                .len_utf8();
+            continue;
+        }
         if let Some(end) = match_token_from(text, index, EMAIL_CLOSINGS) {
             let cjk = is_cjk_command(&text[index..end]);
             let ok = if cjk {
@@ -883,15 +1917,17 @@ fn cjk_len(text: &str) -> usize {
     text.chars().filter(|ch| is_cjk_letter(*ch)).count()
 }
 
-fn apply_line_commands(text: &str) -> String {
+fn apply_line_commands_stage(text: &str) -> LayoutStage {
     let mut out = String::with_capacity(text.len());
     let mut index = 0;
+    let mut consumed_syntax_ranges = Vec::new();
     while index < text.len() {
         if let Some((end, replacement)) = match_line_command_at(text, index) {
             while out.ends_with(char::is_whitespace) {
                 out.pop();
             }
             out.push_str(replacement);
+            consumed_syntax_ranges.push(index..end);
             index = skip_leading_whitespace(text, end);
             continue;
         }
@@ -899,11 +1935,17 @@ fn apply_line_commands(text: &str) -> String {
         out.push(ch);
         index += ch.len_utf8();
     }
-    out
+    LayoutStage {
+        text: out,
+        consumed_syntax_ranges,
+    }
 }
 
 fn match_line_command_at(text: &str, start: usize) -> Option<(usize, &'static str)> {
     if !text.is_char_boundary(start) {
+        return None;
+    }
+    if is_inside_explicit_quote(text, start) || is_inside_code(text, start) {
         return None;
     }
     let rest = &text[start..];
@@ -919,7 +1961,11 @@ fn match_line_command_at(text: &str, start: usize) -> Option<(usize, &'static st
             if negated_cjk_break(text, start) {
                 continue;
             }
-            if text[end..].starts_with('符') {
+            let after = text[end..].trim_start();
+            if ["符", "功能", "按钮", "选项", "命令", "指令", "这个功能"]
+                .iter()
+                .any(|word| after.starts_with(word))
+            {
                 continue;
             }
         } else {
@@ -927,6 +1973,14 @@ fn match_line_command_at(text: &str, start: usize) -> Option<(usize, &'static st
                 continue;
             }
             if followed_by_character_word(text, end) {
+                continue;
+            }
+            if followed_by_layout_noun(text, end) {
+                continue;
+            }
+            if !from.eq_ignore_ascii_case("start a new paragraph")
+                && previous_ascii_word(text, start).is_some_and(is_plain_layout_reference)
+            {
                 continue;
             }
             if negated_english_break(text, start) {
@@ -963,6 +2017,53 @@ fn negated_english_break(text: &str, start: usize) -> bool {
 fn followed_by_character_word(text: &str, end: usize) -> bool {
     let rest = text[end..].trim_start();
     starts_with_ignore_ascii_case(rest, "character") && is_ascii_word_right(rest, "character".len())
+}
+
+fn followed_by_layout_noun(text: &str, end: usize) -> bool {
+    const DENIED: &[&str] = &[
+        "feature", "function", "button", "option", "command", "commands", "item", "items",
+        "setting", "settings", "of", "for", "in", "with", "is", "was", "are", "means", "would",
+        "could", "will", "can", "to", "contains", "reads", "output", "this", "that",
+    ];
+    let rest = text[end..].trim_start();
+    DENIED.iter().any(|word| {
+        starts_with_ignore_ascii_case(rest, word) && is_ascii_word_right(rest, word.len())
+    })
+}
+
+fn is_plain_layout_reference(word: &str) -> bool {
+    const DENIED: &[&str] = &[
+        "a", "an", "the", "this", "that", "these", "those", "our", "their", "another", "each",
+        "every", "first", "last", "next",
+    ];
+    DENIED
+        .iter()
+        .any(|candidate| word.eq_ignore_ascii_case(candidate))
+}
+
+pub(crate) fn is_inside_explicit_quote(text: &str, start: usize) -> bool {
+    explicit_quote_ranges(text)
+        .iter()
+        .any(|range| range.start < start && start < range.end)
+}
+
+fn explicit_quote_ranges(text: &str) -> Vec<std::ops::Range<usize>> {
+    let code_ranges = code_literal_ranges(text);
+    crate::spoken_revision::literal_ranges(text)
+        .into_iter()
+        // Keep a quote range that encloses a code fence; filter only code's own range.
+        .filter(|range| {
+            !code_ranges
+                .iter()
+                .any(|code| code.start == range.start && code.end == range.end)
+        })
+        .collect()
+}
+
+fn is_inside_code(text: &str, index: usize) -> bool {
+    code_literal_ranges(text)
+        .iter()
+        .any(|range| range.start <= index && index < range.end)
 }
 
 fn skip_leading_whitespace(text: &str, start: usize) -> usize {
@@ -1132,6 +2233,26 @@ mod tests {
     }
 
     #[test]
+    fn comparative_first_and_second_options_stay_prose() {
+        assert_eq!(
+            layout("The second option feels clearer but the first is less expensive"),
+            "The second option feels clearer but the first is less expensive"
+        );
+    }
+
+    #[test]
+    fn distinct_ordinal_noun_phrases_stay_prose() {
+        assert_eq!(
+            layout("The second phase took five days and the third phase took six days"),
+            "The second phase took five days and the third phase took six days"
+        );
+        assert_eq!(
+            layout("My first thought differs from her second idea"),
+            "My first thought differs from her second idea"
+        );
+    }
+
+    #[test]
     fn a_single_bullet_or_yaodian_stays_prose() {
         assert_eq!(layout("今天会议的要点是进度"), "今天会议的要点是进度");
         assert_eq!(
@@ -1153,13 +2274,13 @@ mod tests {
     }
 
     #[test]
-    fn english_ordinals_and_number_words_become_lists() {
+    fn english_ordinals_and_explicit_number_markers_become_lists() {
         assert_eq!(
             layout("first finish the design second write tests"),
             "1. finish the design\n2. write tests"
         );
         assert_eq!(
-            layout("one finish the report two send it"),
+            layout("number one finish the report number two send it"),
             "1. finish the report\n2. send it"
         );
         assert_eq!(
@@ -1188,8 +2309,25 @@ mod tests {
         assert_eq!(layout("一是先验证数据"), "一是先验证数据");
         assert_eq!(layout("version 1.2 and 1.3"), "version 1.2 and 1.3");
         assert_eq!(
+            layout("The cold room was minus six point five degrees Celsius"),
+            "The cold room was minus six point five degrees Celsius"
+        );
+        assert_eq!(
+            layout("The report lists six incidents and five follow-up checks"),
+            "The report lists six incidents and five follow-up checks"
+        );
+        assert_eq!(
             layout("this is one of the options"),
             "this is one of the options"
+        );
+    }
+
+    #[test]
+    fn production_preparation_preserves_decimal_measurements() {
+        let input = "The cold room was minus six point five degrees Celsius";
+        assert_eq!(
+            crate::prepare_spoken_transcript(input, ContextFamily::General, 0.9),
+            input
         );
     }
 

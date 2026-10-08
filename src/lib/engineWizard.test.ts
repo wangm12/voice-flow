@@ -71,6 +71,18 @@ describe("engine wizard rules", () => {
     expect(isEngineConnected({ ...groqConnected, api_key_configured: false, provider_keys: {} })).toBe(false);
   });
 
+  it("treats selected OpenAI ASR and cleanup keys as connected without a Groq key", () => {
+    expect(isEngineConnected({
+      ...groqConnected,
+      api_key_configured: false,
+      asr_provider: "openai",
+      asr_model: "whisper-1",
+      cleanup_provider: "openai",
+      cleanup_model: "gpt-4o-mini",
+      provider_keys: { openai: { configured: true, hint: "••••token" } },
+    })).toBe(true);
+  });
+
   it("allows ASR-only when cleanup is disabled", () => {
     expect(
       isEngineConnected({
@@ -168,6 +180,26 @@ describe("engine wizard rules", () => {
     expect(maskSecret("gsk_abcdefghij")).toBe("••••fghij");
     expect(maskSecret("only")).toBe("••••only");
     expect(maskSecret("   ")).toBe("");
+  });
+
+  it("treats OnDevice ready as a disk flag, not a loopback key", () => {
+    const draft = emptyDraft({
+      asrProvider: "on_device",
+      asrModel: "sensevoice-small",
+    });
+    const settings = {
+      ...groqConnected,
+      api_key_configured: false,
+      provider_keys: {},
+      asr_provider: "on_device" as const,
+      asr_model: "sensevoice-small",
+      cleanup_enabled: false,
+    };
+    expect(step2Ready(draft, settings)).toBe(false);
+    expect(step2Ready(draft, settings, false)).toBe(false);
+    expect(step2Ready(draft, settings, true)).toBe(true);
+    expect(isEngineConnected(settings)).toBe(false);
+    expect(isEngineConnected(settings, true)).toBe(true);
   });
 
   it("shows Groq hostname without exposing a custom URL", () => {

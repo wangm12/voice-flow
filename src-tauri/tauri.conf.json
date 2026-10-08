@@ -1,12 +1,12 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "VoiceFlow",
-  "version": "0.1.0",
+  "version": "0.1.4",
   "identifier": "com.voiceflow.desktop",
   "build": {
-    "beforeDevCommand": "npm run dev",
+    "beforeDevCommand": "bash \"${PWD%/src-tauri}/src-tauri/mlx-sidecar/scripts/package.sh\" --dev && npm run dev",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "npm run build",
+    "beforeBuildCommand": "npm run build && bash \"${PWD%/src-tauri}/src-tauri/mlx-sidecar/scripts/package.sh\"",
     "frontendDist": "../dist"
   },
   "app": {
@@ -17,9 +17,14 @@
         "title": "VoiceFlow 设置",
         "width": 1035,
         "height": 750,
-        "minWidth": 720,
-        "minHeight": 520,
-        "decorations": true
+        "resizable": false,
+        "maximizable": false,
+        "center": true,
+        "decorations": true,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true,
+        "trafficLightPosition": { "x": 20, "y": 16 },
+        "visible": false
       },
       {
         "label": "island",
@@ -45,6 +50,11 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "resources": {
+      "target/mlx-sidecar/stage/": "",
+      "../THIRD_PARTY_NOTICES.md": "THIRD_PARTY_NOTICES.md",
+      "resources/": "resources/"
+    },
     "macOS": {
       "minimumSystemVersion": "13.0",
       "entitlements": "Entitlements.plist",

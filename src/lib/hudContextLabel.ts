@@ -1,3 +1,10 @@
+import { translationLanguageOptions } from "./translationLanguages";
+
+export function formatHudTranslationLabel(target: string | null | undefined, translate: (source: string) => string): string | null {
+  const language = translationLanguageOptions.find((option) => option.value === target);
+  return language ? `${translate("翻译")} → ${language.label}` : null;
+}
+
 export const HUD_STYLE_LABELS: Record<string, string> = {
   general: "通用",
   email: "邮件",
@@ -15,6 +22,22 @@ export const HUD_STYLE_LABELS: Record<string, string> = {
   social_media: "社交",
   customer_support: "客服",
 };
+
+export type HudContextSource = "none" | "ax" | "ocr" | "cloud_vision";
+
+const HUD_CONTEXT_SOURCE_LABELS: Record<Exclude<HudContextSource, "none">, string> = {
+  ax: "辅助功能文字",
+  ocr: "本机 OCR",
+  cloud_vision: "云端视觉",
+};
+
+export function formatHudContextSource(
+  source: HudContextSource | null | undefined,
+  translate: (source: string) => string = (value) => value,
+): string | null {
+  if (!source || source === "none" || !(source in HUD_CONTEXT_SOURCE_LABELS)) return null;
+  return translate(HUD_CONTEXT_SOURCE_LABELS[source]);
+}
 
 function isUnknownAppName(app: string): boolean {
   const trimmed = app.trim();

@@ -86,5 +86,6 @@ export function useSettingsPersistence({
     setSaveError,
     flushPendingSave,
     retryPendingSave,
+    unsavedFields: Object.keys(pendingPatch.current),
   };
 }

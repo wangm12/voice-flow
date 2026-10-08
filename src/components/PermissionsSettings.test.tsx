@@ -18,7 +18,7 @@ describe("PermissionsSettings", () => {
 
     expect(screen.getByText("麦克风")).toBeInTheDocument();
     expect(screen.getByText("自动粘贴")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "开启权限" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "开启自动粘贴" })).toBeInTheDocument();
     expect(screen.getByText("已允许")).toBeInTheDocument();
   });
 
@@ -27,7 +27,7 @@ describe("PermissionsSettings", () => {
     const onRefresh = vi.fn().mockResolvedValue(undefined);
     render(<PermissionsSettings permissions={{ microphone: false, microphone_status: "denied", accessibility: false }} onRefresh={onRefresh} />);
 
-    fireEvent.click(screen.getAllByRole("button", { name: "打开设置" })[0]);
+    fireEvent.click(screen.getByRole("button", { name: "打开麦克风设置" }));
 
     await waitFor(() => {
       expect(invokeMock).toHaveBeenCalledWith("open_privacy_settings", { pane: "microphone" });
@@ -41,7 +41,7 @@ describe("PermissionsSettings", () => {
     const onRefresh = vi.fn().mockResolvedValue(undefined);
     render(<PermissionsSettings permissions={{ microphone: false, microphone_status: "not_determined", accessibility: false }} onRefresh={onRefresh} />);
 
-    fireEvent.click(screen.getAllByRole("button", { name: "开启权限" })[0]);
+    fireEvent.click(screen.getByRole("button", { name: "允许麦克风" }));
 
     await waitFor(() => {
       expect(invokeMock).toHaveBeenCalledWith("request_microphone_permission");
@@ -54,7 +54,7 @@ describe("PermissionsSettings", () => {
     const onRefresh = vi.fn().mockResolvedValue(undefined);
     render(<PermissionsSettings permissions={{ microphone: false, microphone_status: "not_determined", accessibility: false }} onRefresh={onRefresh} />);
 
-    fireEvent.click(screen.getAllByRole("button", { name: "开启权限" })[0]);
+    fireEvent.click(screen.getByRole("button", { name: "允许麦克风" }));
 
     await waitFor(() => {
       expect(invokeMock).toHaveBeenCalledWith("request_microphone_permission");
@@ -69,7 +69,7 @@ describe("PermissionsSettings", () => {
     const onRefresh = vi.fn().mockResolvedValue(undefined);
     render(<PermissionsSettings permissions={{ microphone: true, microphone_status: "authorized", accessibility: false }} onRefresh={onRefresh} />);
 
-    fireEvent.click(screen.getByRole("button", { name: "开启权限" }));
+    fireEvent.click(screen.getByRole("button", { name: "开启自动粘贴" }));
 
     await waitFor(() => {
       expect(invokeMock).toHaveBeenCalledWith("request_accessibility_permission");
@@ -83,7 +83,7 @@ describe("PermissionsSettings", () => {
     const onRefresh = vi.fn().mockResolvedValue(undefined);
     render(<PermissionsSettings permissions={{ microphone: true, microphone_status: "authorized", accessibility: false }} onRefresh={onRefresh} />);
 
-    fireEvent.click(screen.getByRole("button", { name: "开启权限" }));
+    fireEvent.click(screen.getByRole("button", { name: "开启自动粘贴" }));
 
     await waitFor(() => {
       expect(invokeMock).toHaveBeenCalledWith("request_accessibility_permission");
@@ -103,7 +103,7 @@ describe("PermissionsSettings", () => {
     );
 
     expect(screen.getByText("屏幕录制")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "打开设置" }));
+    fireEvent.click(screen.getByRole("button", { name: "打开屏幕录制设置" }));
 
     await waitFor(() => {
       expect(invokeMock).toHaveBeenCalledWith("open_privacy_settings", { pane: "screen" });
@@ -118,5 +118,25 @@ describe("PermissionsSettings", () => {
     fireEvent.click(screen.getByRole("button", { name: "重新检测" }));
 
     await waitFor(() => expect(onRefresh).toHaveBeenCalledOnce());
+  });
+
+  it("prevents repeated requests while busy and shows the actual error before allowing a retry", async () => {
+    let rejectRequest!: (reason: Error) => void;
+    invokeMock.mockImplementationOnce(() => new Promise((_, reject) => { rejectRequest = reject; }));
+    const onRefresh = vi.fn().mockResolvedValue(undefined);
+    render(<PermissionsSettings permissions={{ microphone: false, microphone_status: "not_determined", accessibility: false }} onRefresh={onRefresh} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "允许麦克风" }));
+    const busy = screen.getByRole("button", { name: "处理中…" });
+    expect(busy).toBeDisabled();
+    expect(busy).toHaveAttribute("aria-busy", "true");
+    fireEvent.click(busy);
+    expect(invokeMock).toHaveBeenCalledOnce();
+    expect(screen.getByRole("button", { name: "重新检测" })).toBeDisabled();
+
+    rejectRequest(new Error("无法打开麦克风授权"));
+    expect(await screen.findByRole("alert")).toHaveTextContent("无法打开麦克风授权");
+    expect(screen.getByRole("button", { name: "允许麦克风" })).toBeEnabled();
+    expect(onRefresh).not.toHaveBeenCalled();
   });
 });

@@ -1,5 +1,26 @@
 import { describe, expect, it } from "vitest";
-import { formatHudContextLabel, formatHudIntensityLabel } from "./hudContextLabel";
+import { formatHudContextLabel, formatHudContextSource, formatHudIntensityLabel, formatHudTranslationLabel } from "./hudContextLabel";
+
+it("shows only supported translation targets with a localized action label", () => {
+  expect(formatHudTranslationLabel("ja", (value) => value)).toBe("翻译 → 日本語");
+  expect(formatHudTranslationLabel("en", () => "Translate")).toBe("Translate → English");
+  expect(formatHudTranslationLabel("untrusted text", (value) => value)).toBeNull();
+  expect(formatHudTranslationLabel(null, (value) => value)).toBeNull();
+});
+
+describe("formatHudContextSource", () => {
+  it("formats only the allowlisted source kind", () => {
+    expect(formatHudContextSource("ax")).toBe("辅助功能文字");
+    expect(formatHudContextSource("ocr")).toBe("本机 OCR");
+    expect(formatHudContextSource("cloud_vision")).toBe("云端视觉");
+    expect(formatHudContextSource("none")).toBeNull();
+    expect(formatHudContextSource(null)).toBeNull();
+  });
+
+  it("translates fixed source labels without accepting caller text", () => {
+    expect(formatHudContextSource("ax", (value) => value === "辅助功能文字" ? "Accessibility text" : value)).toBe("Accessibility text");
+  });
+});
 
 describe("formatHudContextLabel", () => {
   it("composes a known app with a Chinese style label", () => {

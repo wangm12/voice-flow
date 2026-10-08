@@ -14,6 +14,9 @@ export function friendlySettingsError(
 ): string {
   const message = settingsErrorMessage(reason);
   const normalized = message.toLowerCase();
+  if (normalized.includes("translation hotkey")) {
+    return translate(normalized.includes("conflicts") ? "翻译快捷键与其他快捷键冲突，请选择不同的组合键。" : "翻译快捷键需要有效的组合键，请重新设置。");
+  }
   if (
     normalized.includes("credential_storage")
     || normalized.includes("failed to store api key securely")

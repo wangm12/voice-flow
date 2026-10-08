@@ -1,17 +1,26 @@
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use tauri::{AppHandle, Emitter};
-use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
+use tauri_plugin_global_shortcut::{GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 
 static HOTKEYS_SUSPENDED: AtomicBool = AtomicBool::new(false);
 static LAST_REGISTERED: Mutex<Option<(String, String)>> = Mutex::new(None);
 static CANCEL_REGISTERED: AtomicBool = AtomicBool::new(false);
 static REGISTRATION_ERROR: Mutex<Option<String>> = Mutex::new(None);
 static SELECTED_ACTION_REGISTERED: Mutex<Option<String>> = Mutex::new(None);
+static TRANSLATION_ACTION_REGISTERED: Mutex<Option<String>> = Mutex::new(None);
+static VERBATIM_ACTION_REGISTERED: Mutex<Option<String>> = Mutex::new(None);
 static SCREEN_ACTION_REGISTERED: Mutex<Option<String>> = Mutex::new(None);
 
-pub const HYBRID_HOLD_MS: u64 = 280;
+use crate::dictation::{HotkeySource, ModeTrigger};
+
+static GESTURE_ID: AtomicU64 = AtomicU64::new(0);
+static COMBO_GESTURES: Mutex<Vec<Arc<Mutex<ComboGesture>>>> = Mutex::new(Vec::new());
+
+pub(crate) fn next_gesture_id() -> u64 {
+    GESTURE_ID.fetch_add(1, Ordering::Relaxed).wrapping_add(1)
+}
 
 /// macOS Option+/ emits `÷`. muda only accepts the physical `Slash` key name.
 pub(crate) fn canonicalize_hotkey(hotkey: &str) -> String {
@@ -32,33 +41,30 @@ pub(crate) fn canonicalize_hotkey(hotkey: &str) -> String {
     parts.join("+")
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HybridReleaseAction {
-    Stop,
-    KeepRecording,
-    Ignore,
-}
-
-pub fn hybrid_release_action(elapsed_ms: u64, started_this_press: bool) -> HybridReleaseAction {
-    if !started_this_press {
-        return HybridReleaseAction::Ignore;
+pub(crate) fn bindings_equal(left: &str, right: &str) -> bool {
+    if crate::modifier_hotkey::is_fn_only(left) && crate::modifier_hotkey::is_fn_only(right) {
+        return true;
     }
-    if elapsed_ms >= HYBRID_HOLD_MS {
-        HybridReleaseAction::Stop
-    } else {
-        HybridReleaseAction::KeepRecording
+    match (
+        canonicalize_hotkey(left).parse::<Shortcut>(),
+        canonicalize_hotkey(right).parse::<Shortcut>(),
+    ) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => left.trim() == right.trim(),
     }
 }
 
-pub(crate) fn combo_hotkey_event(
-    activation_mode: &str,
-    state: ShortcutState,
-) -> Option<&'static str> {
-    match (activation_mode, state) {
-        ("hybrid", ShortcutState::Pressed) => Some("hotkey://press"),
-        ("hybrid", ShortcutState::Released) => Some("hotkey://release"),
-        (_, ShortcutState::Pressed) => Some("hotkey://toggle"),
-        _ => None,
+pub(crate) fn reset_pressed_state() {
+    for gesture in COMBO_GESTURES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+    {
+        gesture
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .state
+            .reset();
     }
 }
 
@@ -75,11 +81,50 @@ fn set_registration_error(error: Option<String>) {
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = error;
 }
 
+fn clear_auxiliary_registration_tracking() {
+    COMBO_GESTURES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
+    crate::modifier_hotkey::unregister();
+    *TRANSLATION_ACTION_REGISTERED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = None;
+    *SELECTED_ACTION_REGISTERED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = None;
+    *SCREEN_ACTION_REGISTERED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = None;
+    *VERBATIM_ACTION_REGISTERED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = None;
+}
+
 pub fn set_suspended(suspended: bool) {
     HOTKEYS_SUSPENDED.store(suspended, Ordering::SeqCst);
     if suspended {
+        crate::dictation::invalidate_pending_inputs();
         crate::modifier_hotkey::reset_state();
+        reset_pressed_state();
     }
+}
+
+pub(crate) async fn resume_after_release() {
+    crate::modifier_hotkey::wait_for_key_release().await;
+    crate::modifier_hotkey::arm_after_release();
+    for slot in COMBO_GESTURES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+    {
+        slot.lock().unwrap_or_else(|e| e.into_inner()).state = ModeGesture::default();
+    }
+    set_suspended(false);
+}
+
+pub(crate) fn invalidate_registration_cache() {
+    *LAST_REGISTERED.lock().unwrap_or_else(|e| e.into_inner()) = None;
 }
 
 pub async fn pause_for_capture(app: &AppHandle) -> Result<(), String> {
@@ -91,33 +136,26 @@ pub async fn pause_for_capture(app: &AppHandle) -> Result<(), String> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     dispatcher
         .run_on_main_thread(move || {
-            let _ = main_app.global_shortcut().unregister_all();
-            let _ = tx.send(());
+            let result = main_app
+                .global_shortcut()
+                .unregister_all()
+                .map_err(|error| error.to_string());
+            if result.is_ok() {
+                clear_auxiliary_registration_tracking();
+            }
+            let _ = tx.send(result);
         })
         .map_err(|error| {
             set_suspended(false);
             format!("hotkey pause dispatch failed: {error}")
         })?;
-    if rx.await.is_err() {
-        set_suspended(false);
-        return Err("hotkey pause dispatch was cancelled".to_owned());
-    }
+    rx.await
+        .map_err(|_| "hotkey pause dispatch was cancelled".to_owned())??;
     CANCEL_REGISTERED.store(false, Ordering::SeqCst);
     if let Ok(mut last) = LAST_REGISTERED.lock() {
         *last = None;
     }
     Ok(())
-}
-
-#[allow(dead_code)]
-pub fn unregister_all(app: &AppHandle) {
-    unregister_cancel(app);
-    crate::modifier_hotkey::unregister();
-    let _ = app.global_shortcut().unregister_all();
-    CANCEL_REGISTERED.store(false, Ordering::SeqCst);
-    if let Ok(mut last) = LAST_REGISTERED.lock() {
-        *last = None;
-    }
 }
 
 /// Register a global Escape cancel shortcut **only while a recording is
@@ -141,17 +179,13 @@ pub fn register_cancel(app: &AppHandle) {
                 return;
             }
         };
-        if let Err(error) = app
-            .global_shortcut()
-            .on_shortcut(shortcut, |app, _, event| {
-                if !is_suspended() && event.state == ShortcutState::Pressed {
-                    let app = app.clone();
-                    tauri::async_runtime::spawn(async move {
-                        let _ = app.emit("hotkey://cancel", ());
-                    });
-                }
-            })
-        {
+        if let Err(error) = app.global_shortcut().on_shortcut(shortcut, |_, _, event| {
+            if !is_suspended() && event.state == ShortcutState::Pressed {
+                crate::modifier_hotkey::reset_state();
+                reset_pressed_state();
+                crate::dictation::interrupt_hotkeys();
+            }
+        }) {
             CANCEL_REGISTERED.store(false, Ordering::SeqCst);
             log::error!("failed to register cancel shortcut: {error}");
         }
@@ -190,45 +224,23 @@ pub fn register(app: &AppHandle, hotkey: &str, activation_mode: &str) -> Result<
         return Ok(());
     }
 
-    if crate::modifier_hotkey::is_modifier_only(hotkey) {
-        let plugin = app.global_shortcut();
-        let _ = plugin.unregister_all();
-        CANCEL_REGISTERED.store(false, Ordering::SeqCst);
-        if let Err(error) = crate::modifier_hotkey::register(app, hotkey, activation_mode) {
-            set_registration_error(Some(error.clone()));
-            let _ = app.emit("dictation://error", error.clone());
-            return Err(error);
-        }
+    let plugin = app.global_shortcut();
+    plugin.unregister_all().map_err(map_register_error(app))?;
+    clear_auxiliary_registration_tracking();
+    CANCEL_REGISTERED.store(false, Ordering::SeqCst);
+    if crate::modifier_hotkey::is_modifier_only(hotkey)
+        && !crate::modifier_hotkey::is_fn_only(hotkey)
+    {
+        *LAST_REGISTERED.lock().unwrap_or_else(|e| e.into_inner()) = Some(signature);
+        set_registration_error(Some(
+            "旧的单独修饰键已暂停。请选择 Fn 或组合快捷键。".into(),
+        ));
+        return Ok(());
+    }
+    if crate::modifier_hotkey::is_fn_only(hotkey) {
+        crate::modifier_hotkey::register(app, HotkeySource::Dictation, activation_mode)?;
     } else {
-        crate::modifier_hotkey::unregister();
-        let plugin = app.global_shortcut();
-        let _ = plugin.unregister_all();
-        CANCEL_REGISTERED.store(false, Ordering::SeqCst);
-
-        let shortcut: Shortcut = match hotkey.parse() {
-            Ok(shortcut) => shortcut,
-            Err(error) => {
-                let message = format!("invalid hotkey `{hotkey}`: {error}");
-                set_registration_error(Some(message.clone()));
-                return Err(message);
-            }
-        };
-
-        let mode = activation_mode.to_string();
-        plugin
-            .on_shortcut(shortcut, move |app, _, event| {
-                if is_suspended() {
-                    return;
-                }
-                let Some(event_name) = combo_hotkey_event(&mode, event.state) else {
-                    return;
-                };
-                let app = app.clone();
-                tauri::async_runtime::spawn(async move {
-                    let _ = app.emit(event_name, ());
-                });
-            })
-            .map_err(map_register_error(app))?;
+        register_combo(app, hotkey, activation_mode, HotkeySource::Dictation)?;
     }
 
     *LAST_REGISTERED.lock().unwrap_or_else(|e| e.into_inner()) = Some(signature);
@@ -319,6 +331,9 @@ pub fn register_selected_action(app: &AppHandle, hotkey: &str) -> Result<(), Str
     if hotkey.trim().is_empty() {
         return Ok(());
     }
+    if crate::modifier_hotkey::is_modifier_only(&hotkey) {
+        return Ok(());
+    }
     let shortcut: Shortcut = hotkey
         .parse()
         .map_err(|error| format!("invalid selected action hotkey `{hotkey}`: {error}"))?;
@@ -354,6 +369,9 @@ pub fn register_screen_action(app: &AppHandle, hotkey: &str) -> Result<(), Strin
     if hotkey.trim().is_empty() {
         return Ok(());
     }
+    if crate::modifier_hotkey::is_modifier_only(&hotkey) {
+        return Ok(());
+    }
     let shortcut: Shortcut = hotkey
         .parse()
         .map_err(|error| format!("invalid look-at-screen hotkey `{hotkey}`: {error}"))?;
@@ -368,6 +386,228 @@ pub fn register_screen_action(app: &AppHandle, hotkey: &str) -> Result<(), Strin
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(hotkey.to_owned());
     Ok(())
+}
+
+fn unregister_mode_action_on_main(app: &AppHandle, registered: &Mutex<Option<String>>) {
+    let previous = registered
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take();
+    if let Some(previous) = previous {
+        if let Ok(shortcut) = previous.parse::<Shortcut>() {
+            let _ = app.global_shortcut().unregister(shortcut);
+        }
+    }
+}
+
+#[derive(Default)]
+struct ModeGesture {
+    pressed: Option<u64>,
+    blocked_until_release: bool,
+}
+impl ModeGesture {
+    fn event(&mut self, mode: &str, state: ShortcutState) -> Option<(ModeTrigger, u64)> {
+        if state == ShortcutState::Released {
+            self.blocked_until_release = false;
+            let id = self.pressed.take()?;
+            return (mode == "hold_to_talk").then_some((ModeTrigger::Release, id));
+        }
+        if self.pressed.is_some() || self.blocked_until_release {
+            return None;
+        }
+        let id = next_gesture_id();
+        self.pressed = Some(id);
+        Some((
+            if mode == "hold_to_talk" {
+                ModeTrigger::Press
+            } else {
+                ModeTrigger::Toggle
+            },
+            id,
+        ))
+    }
+
+    fn reset(&mut self) {
+        self.blocked_until_release |= self.pressed.take().is_some();
+    }
+
+    fn modifiers_released(&mut self, mode: &str) -> Option<(ModeTrigger, u64)> {
+        let id = self.pressed.take()?;
+        self.blocked_until_release = true;
+        (mode == "hold_to_talk").then_some((ModeTrigger::Release, id))
+    }
+}
+
+struct ComboGesture {
+    state: ModeGesture,
+    mode: String,
+    source: HotkeySource,
+    required_flags: u64,
+}
+
+fn required_flags(shortcut: &Shortcut) -> u64 {
+    let mut flags = 0;
+    for (modifier, flag) in [
+        (Modifiers::SHIFT, 1 << 17),
+        (Modifiers::CONTROL, 1 << 18),
+        (Modifiers::ALT, 1 << 19),
+        (Modifiers::SUPER, 1 << 20),
+    ] {
+        if shortcut.mods.contains(modifier) {
+            flags |= flag;
+        }
+    }
+    flags
+}
+
+// Observe modifier state only. Releasing either part of a held combination
+// ends its own recording even if Carbon delays HotKeyReleased until main-key up.
+pub(crate) fn modifiers_changed(flags: u64) {
+    for slot in COMBO_GESTURES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+    {
+        let mut gesture = slot.lock().unwrap_or_else(|e| e.into_inner());
+        if flags & gesture.required_flags != gesture.required_flags {
+            let mode = gesture.mode.clone();
+            if let Some((trigger, id)) = gesture.state.modifiers_released(&mode) {
+                crate::dictation::enqueue_hotkey(gesture.source, trigger, id);
+            }
+        }
+    }
+}
+
+fn register_combo(
+    app: &AppHandle,
+    hotkey: &str,
+    mode: &str,
+    source: HotkeySource,
+) -> Result<(), String> {
+    let shortcut: Shortcut = hotkey
+        .parse()
+        .map_err(|error| format!("invalid hotkey `{hotkey}`: {error}"))?;
+    if mode == "hold_to_talk" {
+        crate::modifier_hotkey::ensure_listener(app.clone())?;
+    }
+    let gesture = Arc::new(Mutex::new(ComboGesture {
+        state: ModeGesture::default(),
+        mode: mode.into(),
+        source,
+        required_flags: required_flags(&shortcut),
+    }));
+    let callback_gesture = gesture.clone();
+    app.global_shortcut()
+        .on_shortcut(shortcut, move |_, _, event| {
+            if is_suspended() || crate::modifier_hotkey::is_paste_suppressed() {
+                return;
+            }
+            let mut gesture = callback_gesture.lock().unwrap_or_else(|e| e.into_inner());
+            let mode = gesture.mode.clone();
+            if let Some((trigger, id)) = gesture.state.event(&mode, event.state) {
+                crate::dictation::enqueue_hotkey(source, trigger, id);
+            }
+        })
+        .map_err(map_register_error(app))?;
+    COMBO_GESTURES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(gesture);
+    Ok(())
+}
+
+/// Register the optional verbatim shortcut. Empty means off. Uses the same
+/// activation semantics as the main dictation hotkey but never calls
+/// `unregister_all`.
+pub fn register_verbatim_action(
+    app: &AppHandle,
+    hotkey: &str,
+    activation_mode: &str,
+) -> Result<(), String> {
+    register_mode_action(
+        app,
+        hotkey,
+        activation_mode,
+        HotkeySource::Verbatim,
+        &VERBATIM_ACTION_REGISTERED,
+    )
+}
+
+pub fn register_translation_action(
+    app: &AppHandle,
+    hotkey: &str,
+    activation_mode: &str,
+) -> Result<(), String> {
+    register_mode_action(
+        app,
+        hotkey,
+        activation_mode,
+        HotkeySource::Translation,
+        &TRANSLATION_ACTION_REGISTERED,
+    )
+}
+
+fn register_mode_action(
+    app: &AppHandle,
+    hotkey: &str,
+    activation_mode: &str,
+    source: HotkeySource,
+    registered: &Mutex<Option<String>>,
+) -> Result<(), String> {
+    unregister_mode_action_on_main(app, registered);
+    crate::modifier_hotkey::unregister_source(source);
+    COMBO_GESTURES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|slot| slot.lock().unwrap_or_else(|e| e.into_inner()).source != source);
+    let hotkey = canonicalize_hotkey(hotkey);
+    if hotkey.trim().is_empty() {
+        return Ok(());
+    }
+    if crate::modifier_hotkey::is_fn_only(&hotkey) {
+        crate::modifier_hotkey::register(app, source, activation_mode)?;
+    } else if !crate::modifier_hotkey::is_modifier_only(&hotkey) {
+        register_combo(app, &hotkey, activation_mode, source)?;
+    }
+    *registered.lock().unwrap_or_else(|e| e.into_inner()) = Some(hotkey);
+    Ok(())
+}
+
+pub async fn apply_verbatim_action_hotkey(
+    app: &AppHandle,
+    hotkey: &str,
+    activation_mode: &str,
+) -> Result<(), String> {
+    apply_mode_action_hotkey(app, hotkey, activation_mode, register_verbatim_action).await
+}
+
+pub async fn apply_translation_action_hotkey(
+    app: &AppHandle,
+    hotkey: &str,
+    activation_mode: &str,
+) -> Result<(), String> {
+    apply_mode_action_hotkey(app, hotkey, activation_mode, register_translation_action).await
+}
+
+async fn apply_mode_action_hotkey(
+    app: &AppHandle,
+    hotkey: &str,
+    activation_mode: &str,
+    register: fn(&AppHandle, &str, &str) -> Result<(), String>,
+) -> Result<(), String> {
+    let hotkey = hotkey.to_owned();
+    let mode = activation_mode.to_owned();
+    let dispatcher = app.clone();
+    let app_for_thread = app.clone();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    dispatcher
+        .run_on_main_thread(move || {
+            let result = register(&app_for_thread, &hotkey, &mode);
+            let _ = tx.send(result);
+        })
+        .map_err(|error| format!("mode hotkey dispatch failed: {error}"))?;
+    rx.await
+        .map_err(|_| "mode hotkey dispatch was cancelled".to_owned())?
 }
 
 pub async fn apply_screen_action_hotkey(app: &AppHandle, hotkey: &str) -> Result<(), String> {
@@ -411,75 +651,78 @@ pub async fn apply_selected_action_hotkey(
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
-    fn hybrid_hold_release_stops() {
-        assert_eq!(hybrid_release_action(400, true), HybridReleaseAction::Stop);
-    }
-
-    #[test]
-    fn hybrid_short_tap_release_keeps_recording() {
-        assert_eq!(
-            hybrid_release_action(80, true),
-            HybridReleaseAction::KeepRecording
-        );
-    }
-
-    #[test]
-    fn hybrid_hold_threshold_is_280ms() {
-        assert_eq!(HYBRID_HOLD_MS, 280);
-        assert_eq!(hybrid_release_action(280, true), HybridReleaseAction::Stop);
-        assert_eq!(
-            hybrid_release_action(279, true),
-            HybridReleaseAction::KeepRecording
-        );
-    }
-
-    #[test]
-    fn hybrid_release_without_this_press_starting_is_ignored() {
-        assert_eq!(
-            hybrid_release_action(400, false),
-            HybridReleaseAction::Ignore
-        );
-        assert_eq!(
-            hybrid_release_action(80, false),
-            HybridReleaseAction::Ignore
-        );
-    }
-
-    #[test]
-    fn tap_mode_toggles_on_press_only() {
-        assert_eq!(
-            combo_hotkey_event("tap", ShortcutState::Pressed),
-            Some("hotkey://toggle")
-        );
-        assert_eq!(combo_hotkey_event("tap", ShortcutState::Released), None);
-    }
-
-    #[test]
-    fn option_slash_is_canonicalized_to_slash_not_divide() {
+    fn option_slash_is_canonicalized() {
         assert_eq!(
             canonicalize_hotkey("CmdOrControl+Alt+÷"),
-            "CmdOrControl+Alt+Slash"
-        );
-        assert_eq!(
-            canonicalize_hotkey("CmdOrControl+Alt+/"),
             "CmdOrControl+Alt+Slash"
         );
         assert!(canonicalize_hotkey("CmdOrControl+Alt+÷")
             .parse::<Shortcut>()
             .is_ok());
     }
-
     #[test]
-    fn hybrid_mode_emits_press_and_release() {
+    fn tap_deduplicates_repeat_but_accepts_a_second_real_press_immediately() {
+        let mut gesture = ModeGesture::default();
+        let first = gesture.event("tap", ShortcutState::Pressed).unwrap();
+        assert_eq!(first.0, ModeTrigger::Toggle);
+        assert!(gesture.event("tap", ShortcutState::Pressed).is_none());
+        assert!(gesture.event("tap", ShortcutState::Released).is_none());
+        let second = gesture.event("tap", ShortcutState::Pressed).unwrap();
+        assert_eq!(second.0, ModeTrigger::Toggle);
+        assert_ne!(first.1, second.1);
+    }
+    #[test]
+    fn hold_release_always_ends_the_matching_press() {
+        let mut gesture = ModeGesture::default();
+        assert!(gesture
+            .event("hold_to_talk", ShortcutState::Released)
+            .is_none());
+        let (trigger, id) = gesture
+            .event("hold_to_talk", ShortcutState::Pressed)
+            .unwrap();
+        assert_eq!(trigger, ModeTrigger::Press);
+        assert!(gesture
+            .event("hold_to_talk", ShortcutState::Pressed)
+            .is_none());
         assert_eq!(
-            combo_hotkey_event("hybrid", ShortcutState::Pressed),
-            Some("hotkey://press")
+            gesture.event("hold_to_talk", ShortcutState::Released),
+            Some((ModeTrigger::Release, id))
         );
+    }
+    #[test]
+    fn modifier_first_release_ends_hold_once_and_waits_for_main_key_up() {
+        let mut gesture = ModeGesture::default();
+        let (_, id) = gesture
+            .event("hold_to_talk", ShortcutState::Pressed)
+            .unwrap();
         assert_eq!(
-            combo_hotkey_event("hybrid", ShortcutState::Released),
-            Some("hotkey://release")
+            gesture.modifiers_released("hold_to_talk"),
+            Some((ModeTrigger::Release, id))
         );
+        assert!(gesture
+            .event("hold_to_talk", ShortcutState::Pressed)
+            .is_none());
+        assert!(gesture
+            .event("hold_to_talk", ShortcutState::Released)
+            .is_none());
+        assert!(gesture
+            .event("hold_to_talk", ShortcutState::Pressed)
+            .is_some());
+    }
+    #[test]
+    fn cancel_does_not_allow_a_held_key_repeat_to_start_another_session() {
+        let mut gesture = ModeGesture::default();
+        gesture.event("tap", ShortcutState::Pressed);
+        gesture.reset();
+        assert!(gesture.event("tap", ShortcutState::Pressed).is_none());
+        gesture.event("tap", ShortcutState::Released);
+        assert!(gesture.event("tap", ShortcutState::Pressed).is_some());
+    }
+    #[test]
+    fn equivalent_bindings_include_fn_aliases_and_modifier_aliases() {
+        assert!(bindings_equal("Fn", "Globe"));
+        assert!(bindings_equal("CmdOrControl+Alt+Space", "Super+Alt+Space"));
+        assert!(!bindings_equal("Fn", "Shift"));
     }
 }

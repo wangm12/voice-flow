@@ -84,6 +84,7 @@ pub fn validate_snippets(snippets: &[Snippet]) -> Result<(), String> {
 
 /// Snippets only fire when the entire normalized utterance matches. A phrase
 /// inside a longer dictation never expands.
+#[cfg(test)]
 pub fn resolve_exact(snippets: &[Snippet], utterance: &str) -> Option<String> {
     resolve_exact_with_clipboard(snippets, utterance, None)
 }
@@ -93,6 +94,14 @@ pub fn resolve_exact_with_clipboard(
     utterance: &str,
     clipboard: Option<&str>,
 ) -> Option<String> {
+    matching_snippet(snippets, utterance)
+        .map(|snippet| apply_placeholders(&snippet.expansion, clipboard))
+}
+
+pub(crate) fn matching_snippet<'a>(
+    snippets: &'a [Snippet],
+    utterance: &str,
+) -> Option<&'a Snippet> {
     let phrase = normalize_phrase(utterance);
     if phrase.is_empty() {
         return None;
@@ -100,7 +109,6 @@ pub fn resolve_exact_with_clipboard(
     snippets
         .iter()
         .find(|snippet| snippet.enabled && normalize_phrase(&snippet.trigger) == phrase)
-        .map(|snippet| apply_placeholders(&snippet.expansion, clipboard))
 }
 
 /// True when an exact snippet match would substitute `{{clipboard}}`.

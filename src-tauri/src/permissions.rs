@@ -99,6 +99,31 @@ pub fn request_microphone(result: tokio::sync::oneshot::Sender<bool>) -> Result<
     Ok(())
 }
 
+/// Ask macOS for microphone access only while permission is undecided. The
+/// dictation shortcut is an explicit request to record, so the first start can
+/// trigger the system prompt instead of failing before capture.
+pub async fn request_microphone_if_needed() -> Result<bool, String> {
+    #[cfg(target_os = "macos")]
+    {
+        match check().microphone_status.as_str() {
+            "authorized" => Ok(true),
+            "denied" | "restricted" => Ok(false),
+            "not_determined" => {
+                let (sender, receiver) = tokio::sync::oneshot::channel();
+                request_microphone(sender)?;
+                receiver
+                    .await
+                    .map_err(|_| "microphone permission request was cancelled".to_owned())
+            }
+            _ => Err("microphone permission status could not be determined".into()),
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Ok(true)
+    }
+}
+
 pub fn open_privacy_settings(pane: &str) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
@@ -106,6 +131,7 @@ pub fn open_privacy_settings(pane: &str) -> Result<(), String> {
             "accessibility" => "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_Accessibility",
             "microphone" => "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_Microphone",
             "screen" => "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_ScreenCapture",
+            "keyboard" => "x-apple.systempreferences:com.apple.Keyboard-Settings.extension",
             _ => return Err(format!("unknown pane: {pane}")),
         };
         std::process::Command::new("open")

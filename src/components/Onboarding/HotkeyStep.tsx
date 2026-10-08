@@ -1,8 +1,9 @@
+import { useState } from "react";
 import { HotkeyRecorder } from "../HotkeyRecorder";
-import { HotkeyUsageGuide } from "../HotkeyUsageGuide";
 import { ActivationModeSelector } from "../ActivationModeSelector";
 import type { ActivationMode } from "../../lib/activationCopy";
-import { formatHotkeyDisplay, isModifierOnlyHotkey } from "../../lib/hotkeyFormat";
+import { FnHotkeyNote } from "../FnHotkeyNote";
+import { formatHotkeyDisplay } from "../../lib/hotkeyFormat";
 import { useI18n } from "../../lib/i18n";
 import { TryItStep } from "./TryItStep";
 
@@ -16,6 +17,8 @@ export function HotkeyStep({
   error,
   onHotkeyChange,
   onSelectedActionHotkeyChange,
+  onActivationModeChange,
+  modeSaving = false,
 }: {
   trial: "dictation" | "selected_action";
   hotkey: string;
@@ -24,20 +27,23 @@ export function HotkeyStep({
   recording: boolean;
   processing: boolean;
   error: string | null;
-  onHotkeyChange: (hotkey: string, activationMode?: ActivationMode, options?: { persist?: boolean }) => void;
-  onSelectedActionHotkeyChange: (hotkey: string, _mode?: ActivationMode, options?: { persist?: boolean }) => void;
+  onHotkeyChange: (hotkey: string, options?: { persist?: boolean }) => void;
+  onActivationModeChange: (mode: ActivationMode) => void;
+  modeSaving?: boolean;
+  onSelectedActionHotkeyChange: (hotkey: string, options?: { persist?: boolean }) => void;
 }) {
   const { t } = useI18n();
+  const [captureBusy, setCaptureBusy] = useState(false);
   const isDictation = trial === "dictation";
   const currentHotkey = isDictation ? hotkey : selectedActionHotkey;
   const currentHotkeyDisplay = formatHotkeyDisplay(currentHotkey);
 
   return (
     <div>
-      <h1 className="text-2xl font-semibold tracking-tight">
+      <h1 className="text-[28px] font-semibold leading-tight tracking-tight">
         {isDictation ? t("设置语音输入快捷键") : t("设置选中文本操作快捷键")}
       </h1>
-      <p className="mt-1.5 text-sm text-secondary">
+      <p className="mt-2 text-[13px] leading-6 text-secondary">
         {isDictation
           ? t("用它在任何 App 中开始或结束录音。设置好后，马上在下面试用。")
           : t("选中文字后，用它让 VoiceFlow 自动翻译、缩短或改写。设置好后，马上在下面试用。")}
@@ -52,13 +58,15 @@ export function HotkeyStep({
         </p>
         <div className="mt-3">
           <HotkeyRecorder
+            disabled={recording || processing || modeSaving}
+            onCaptureBusyChange={setCaptureBusy}
             value={currentHotkey}
             captureTarget={trial}
-            onChange={(value, mode, options) => {
+            onChange={(value, options) => {
               if (isDictation) {
-                onHotkeyChange(value, mode, options);
+                onHotkeyChange(value, options);
               } else {
-                onSelectedActionHotkeyChange(value, mode, options);
+                onSelectedActionHotkeyChange(value, options);
               }
             }}
           />
@@ -66,13 +74,14 @@ export function HotkeyStep({
         {isDictation && (
           <div className="mt-4">
             <ActivationModeSelector
-              value={isModifierOnlyHotkey(currentHotkey) ? "double_tap" : activationMode}
-              modifierOnly={isModifierOnlyHotkey(currentHotkey)}
-              onChange={(mode) => onHotkeyChange(currentHotkey, mode, { persist: true })}
+              value={activationMode}
+              hotkey={currentHotkey}
+              disabled={recording || processing || modeSaving || captureBusy}
+              onChange={onActivationModeChange}
             />
+            <FnHotkeyNote hotkey={currentHotkey} />
           </div>
         )}
-        <HotkeyUsageGuide hotkey={currentHotkey} activationMode={isDictation ? activationMode : "tap"} />
       </div>
 
       <TryItStep

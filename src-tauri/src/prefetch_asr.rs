@@ -1,13 +1,20 @@
 //! Silent batch ASR prefetching.
 //!
-//! Groq's transcription API accepts completed audio files, so this is not
-//! streaming ASR. This module submits the same bounded chunks used by the
-//! long-recording path while capture is still active. Completed transcripts
-//! stay in the background for the final-ASR path; they are never shown on the
-//! HUD, clipboard, History, or paste. Callers retain completed results and use
-//! the normal final-ASR path for missing chunks.
+//! Batch providers accept completed audio files, so this is not streaming
+//! ASR. This module submits the same bounded chunks used by the long-recording
+//! path while capture is still active. Completed transcripts stay in the
+//! background for the final-ASR path; they are never shown on the HUD,
+//! clipboard, History, or paste. Callers retain completed results and use the
+//! normal final-ASR path for missing chunks. True realtime streaming providers
+//! bypass this module and send the captured PCM directly.
 
-use crate::{asr, chunker::AudioChunk, metrics, queue};
+use crate::{
+    asr,
+    chunker::{AudioChunk, AudioChunkIdentity},
+    context::TargetAppGuard,
+    metrics, queue,
+};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -19,6 +26,102 @@ const CHANNEL_CAPACITY: usize = 4;
 pub const WARMUP_CHUNK_SECS: usize = 10;
 pub const WARMUP_OVERLAP_SECS: usize = 2;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PrefetchRequestIdentity([u8; 32]);
+
+impl PrefetchRequestIdentity {
+    pub fn new(provider: &str, endpoint: Option<&str>, options: &asr::AsrOptions) -> Self {
+        let mut hasher = Sha256::new();
+        hash_field(&mut hasher, provider);
+        hash_optional_field(&mut hasher, endpoint);
+        // Credentials affect routing and are included only in this ephemeral
+        // digest; the credential itself is never stored in the result.
+        hash_field(&mut hasher, &options.api_key);
+        hash_optional_field(&mut hasher, options.language.as_deref());
+        hash_optional_field(&mut hasher, options.prompt.as_deref());
+        hash_field(&mut hasher, &options.model);
+        hasher.update((options.keywords.len() as u64).to_le_bytes());
+        for keyword in &options.keywords {
+            hash_field(&mut hasher, keyword);
+        }
+        Self(hasher.finalize().into())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PrefetchSessionBinding {
+    pub recording_generation: u64,
+    pub configuration_generation: u64,
+    target_identity: [u8; 32],
+}
+
+impl PrefetchSessionBinding {
+    pub fn new(
+        recording_generation: u64,
+        configuration_generation: u64,
+        target: &TargetAppGuard,
+    ) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(b"voiceflow-target-identity-v1");
+        hasher.update(target.pid.to_le_bytes());
+        hash_optional_field(&mut hasher, target.bundle_id.as_deref());
+        hash_optional_field(&mut hasher, target.browser_host.as_deref());
+        hash_option_u64(&mut hasher, target.browser_target_token);
+        hash_option_u64(&mut hasher, target.window_token);
+        hash_option_u64(&mut hasher, target.window_id);
+        hash_option_u64(&mut hasher, target.input_token);
+        hasher.update([u8::from(target.secure_input)]);
+        Self {
+            recording_generation,
+            configuration_generation,
+            target_identity: hasher.finalize().into(),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn test_default() -> Self {
+        Self {
+            recording_generation: 0,
+            configuration_generation: 0,
+            target_identity: [0; 32],
+        }
+    }
+
+    pub fn matches_target(&self, target: &TargetAppGuard) -> bool {
+        self.target_identity
+            == Self::new(
+                self.recording_generation,
+                self.configuration_generation,
+                target,
+            )
+            .target_identity
+    }
+}
+
+fn hash_field(hasher: &mut Sha256, value: &str) {
+    hasher.update((value.len() as u64).to_le_bytes());
+    hasher.update(value.as_bytes());
+}
+
+fn hash_optional_field(hasher: &mut Sha256, value: Option<&str>) {
+    if let Some(value) = value {
+        hasher.update([1]);
+        hash_field(hasher, value);
+    } else {
+        hasher.update([0]);
+    }
+}
+
+fn hash_option_u64(hasher: &mut Sha256, value: Option<u64>) {
+    match value {
+        Some(value) => {
+            hasher.update([1]);
+            hasher.update(value.to_le_bytes());
+        }
+        None => hasher.update([0]),
+    }
+}
+
 pub enum PrefetchMessage {
     Warmup(AudioChunk),
     Chunk(AudioChunk),
@@ -27,17 +130,32 @@ pub enum PrefetchMessage {
     },
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct PrefetchedTranscript {
+    pub request_identity: PrefetchRequestIdentity,
+    pub chunk_index: usize,
+    /// Keep the complete adapter result so metadata, confidence, limits, and
+    /// provider-original text survive silent prefetch reuse.
+    pub transcript: asr::Transcript,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PrefetchedWarmup {
+    pub request_identity: PrefetchRequestIdentity,
+    pub sample_identity: AudioChunkIdentity,
+    pub transcript: asr::Transcript,
+}
+
 const HUD_PARTIAL_MAX_CHARS: usize = 280;
 
 /// Concatenate completed non-warmup chunk transcripts for HUD display.
 /// Index order, space-separated, trimmed, capped at 280 chars with ellipsis.
-pub fn hud_partial_text(transcripts: &HashMap<usize, String>) -> String {
-    let mut indexes: Vec<usize> = transcripts.keys().copied().collect();
-    indexes.sort_unstable();
-    let joined = indexes
+pub fn hud_partial_text(transcripts: &HashMap<AudioChunkIdentity, PrefetchedTranscript>) -> String {
+    let mut completed: Vec<&PrefetchedTranscript> = transcripts.values().collect();
+    completed.sort_by_key(|entry| entry.chunk_index);
+    let joined = completed
         .into_iter()
-        .filter_map(|index| transcripts.get(&index))
-        .map(|text| text.trim())
+        .map(|entry| entry.transcript.text.trim())
         .filter(|text| !text.is_empty())
         .collect::<Vec<_>>()
         .join(" ");
@@ -56,11 +174,49 @@ fn cap_hud_partial(text: &str) -> String {
     truncated
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct PrefetchAsrResult {
+    /// Session-scoped provenance for every result in this container.
+    pub session_binding: Option<PrefetchSessionBinding>,
     /// Silent warmup output used only by final short-recording assembly.
-    pub warmup: Option<String>,
-    pub transcripts: HashMap<usize, String>,
+    pub warmup: Option<PrefetchedWarmup>,
+    /// Results are keyed by exact samples, never by a positional chunk index.
+    pub transcripts: HashMap<AudioChunkIdentity, PrefetchedTranscript>,
+}
+
+impl PrefetchAsrResult {
+    pub fn belongs_to(
+        &self,
+        recording_generation: u64,
+        configuration_generation: u64,
+        target: &TargetAppGuard,
+    ) -> bool {
+        self.session_binding.is_some_and(|binding| {
+            binding.recording_generation == recording_generation
+                && binding.configuration_generation == configuration_generation
+                && binding.matches_target(target)
+        })
+    }
+
+    pub fn transcripts_for_request(
+        &self,
+        request_identity: PrefetchRequestIdentity,
+    ) -> HashMap<AudioChunkIdentity, asr::Transcript> {
+        self.transcripts
+            .iter()
+            .filter(|(_, transcript)| transcript.request_identity == request_identity)
+            .map(|(sample_identity, transcript)| (*sample_identity, transcript.transcript.clone()))
+            .collect()
+    }
+
+    pub fn warmup_for_request(
+        &self,
+        request_identity: PrefetchRequestIdentity,
+    ) -> Option<&PrefetchedWarmup> {
+        self.warmup
+            .as_ref()
+            .filter(|warmup| warmup.request_identity == request_identity)
+    }
 }
 
 /// Bounded batch-prefetch inbox shared by capture and the ASR worker.
@@ -89,6 +245,17 @@ impl PrefetchInbox {
 
 pub type HudPartialEmit = Arc<dyn Fn(u64, String) + Send + Sync>;
 
+pub struct PrefetchSessionConfig {
+    pub metrics: metrics::Metrics,
+    pub metric_group: metrics::MetricGroup,
+    pub cancellation: CancellationToken,
+    pub hud_partial: Option<HudPartialEmit>,
+    pub session_generation: u64,
+    pub session_binding: PrefetchSessionBinding,
+    pub request_identity: PrefetchRequestIdentity,
+    pub quota_scope: queue::RequestScope,
+}
+
 pub struct PrefetchAsrSession {
     sender: mpsc::Sender<PrefetchMessage>,
     cancellation: CancellationToken,
@@ -114,14 +281,24 @@ impl PrefetchAsrSession {
         gate: Arc<queue::RequestGate>,
         provider: Arc<dyn asr::AsrProvider>,
         options: asr::AsrOptions,
-        metrics: metrics::Metrics,
-        cancellation: CancellationToken,
-        hud_partial: Option<HudPartialEmit>,
-        session_generation: u64,
+        config: PrefetchSessionConfig,
     ) -> Self {
+        let PrefetchSessionConfig {
+            metrics,
+            metric_group,
+            cancellation,
+            hud_partial,
+            session_generation,
+            session_binding,
+            request_identity,
+            quota_scope,
+        } = config;
         let sender = inbox.sender.clone();
         let drops = Arc::clone(&inbox.drops);
-        let results = Arc::new(Mutex::new(PrefetchAsrResult::default()));
+        let results = Arc::new(Mutex::new(PrefetchAsrResult {
+            session_binding: Some(session_binding),
+            ..PrefetchAsrResult::default()
+        }));
         let shared_results = Arc::clone(&results);
         let worker_cancellation = cancellation.clone();
         tokio::spawn(async move {
@@ -166,19 +343,22 @@ impl PrefetchAsrSession {
                     }
                 };
                 let chunk_index = chunk.index;
+                let sample_identity = chunk.identity;
                 let provider = provider.clone();
                 let options = options.clone();
-                let _latency = metrics.timer(metrics::MetricKind::PrefetchAsr);
-                let result = queue::execute_with_retry_cancelled(
+                let _latency =
+                    metrics.timer_for(metrics::MetricKind::PrefetchAsr, metric_group.clone());
+                let result = queue::execute_with_retry_scoped_cancelled(
                     &gate,
                     queue::RequestKind::Asr,
+                    &quota_scope,
                     || provider.prefetch_chunk(wav.clone(), options.clone()),
                     worker_cancellation.clone(),
                 )
                 .await;
                 match result {
                     Ok(transcript) => {
-                        gate.update_asr(&transcript.limits);
+                        gate.update_asr_for(&quota_scope, &transcript.limits);
                         if !transcript.text.trim().is_empty() {
                             let mut results = shared_results
                                 .lock()
@@ -186,9 +366,20 @@ impl PrefetchAsrSession {
                             if is_warmup {
                                 // Warmup remains silent-only: it is never
                                 // inserted into the indexed long results.
-                                results.warmup = Some(transcript.text);
+                                results.warmup = Some(PrefetchedWarmup {
+                                    request_identity,
+                                    sample_identity,
+                                    transcript,
+                                });
                             } else {
-                                results.transcripts.insert(chunk_index, transcript.text);
+                                results.transcripts.insert(
+                                    sample_identity,
+                                    PrefetchedTranscript {
+                                        request_identity,
+                                        chunk_index,
+                                        transcript,
+                                    },
+                                );
                                 let text = hud_partial_text(&results.transcripts);
                                 drop(results);
                                 if let Some(emit) = &hud_partial {
@@ -204,6 +395,7 @@ impl PrefetchAsrSession {
                         log::warn!(
                             "batch ASR prefetch chunk {chunk_index} failed; final ASR will retry it: {error}"
                         );
+                        metrics.record_error(&metric_group, "prefetch_asr_failed");
                         failed = true;
                     }
                 }
@@ -255,12 +447,50 @@ mod tests {
     use super::*;
 
     fn sample_chunk(index: usize) -> AudioChunk {
+        let samples = vec![0.0; 16];
+        let source_start_sample = index * 16;
         AudioChunk {
             index,
-            samples: vec![0.0; 16],
+            identity: AudioChunkIdentity::from_samples_at(source_start_sample, &samples),
+            samples,
+            source_start_sample,
             start_secs: index as f32,
             end_secs: index as f32 + 1.0,
         }
+    }
+
+    fn test_request_identity() -> PrefetchRequestIdentity {
+        PrefetchRequestIdentity::new(
+            "groq",
+            Some("https://api.groq.com/v1"),
+            &asr::AsrOptions::default(),
+        )
+    }
+
+    fn transcript(text: &str) -> asr::Transcript {
+        asr::Transcript {
+            text: text.to_owned(),
+            asr_text: Some(text.to_owned()),
+            provider_cleaned_candidate: None,
+            segments: Vec::new(),
+            words: Vec::new(),
+            tokens: Vec::new(),
+            limits: asr::RateLimits::default(),
+            language: None,
+            confidence: None,
+        }
+    }
+
+    fn prefetched(index: usize, text: &str) -> (AudioChunkIdentity, PrefetchedTranscript) {
+        let identity = sample_chunk(index).identity;
+        (
+            identity,
+            PrefetchedTranscript {
+                request_identity: test_request_identity(),
+                chunk_index: index,
+                transcript: transcript(text),
+            },
+        )
     }
 
     #[test]
@@ -278,8 +508,13 @@ mod tests {
     async fn finish_retains_completed_chunks_after_an_inbox_drop() {
         let (sender, _receiver) = mpsc::channel(CHANNEL_CAPACITY);
         let completed = PrefetchAsrResult {
-            warmup: Some("warmup only".to_owned()),
-            transcripts: HashMap::from([(2, "already complete".to_owned())]),
+            session_binding: None,
+            warmup: Some(PrefetchedWarmup {
+                request_identity: test_request_identity(),
+                sample_identity: sample_chunk(0).identity,
+                transcript: transcript("warmup only"),
+            }),
+            transcripts: HashMap::from([prefetched(2, "already complete")]),
         };
         let session = PrefetchAsrSession {
             sender,
@@ -296,10 +531,10 @@ mod tests {
     #[test]
     fn hud_partial_text_joins_completed_chunks_in_index_order() {
         let transcripts = HashMap::from([
-            (2, "  two  ".to_owned()),
-            (0, "one".to_owned()),
-            (5, String::new()),
-            (1, "  ".to_owned()),
+            prefetched(2, "  two  "),
+            prefetched(0, "one"),
+            prefetched(5, ""),
+            prefetched(1, "  "),
         ]);
 
         assert_eq!(hud_partial_text(&transcripts), "one two");
@@ -308,7 +543,7 @@ mod tests {
     #[test]
     fn hud_partial_text_caps_at_280_chars_with_ellipsis() {
         let long = "x".repeat(300);
-        let transcripts = HashMap::from([(0, long)]);
+        let transcripts = HashMap::from([prefetched(0, &long)]);
         let text = hud_partial_text(&transcripts);
 
         assert_eq!(text.chars().count(), 280);
@@ -319,12 +554,23 @@ mod tests {
     #[test]
     fn hud_partial_text_does_not_include_warmup_and_is_display_only() {
         let result = PrefetchAsrResult {
-            warmup: Some("warmup must stay silent".to_owned()),
-            transcripts: HashMap::from([(1, "visible".to_owned())]),
+            session_binding: None,
+            warmup: Some(PrefetchedWarmup {
+                request_identity: test_request_identity(),
+                sample_identity: sample_chunk(0).identity,
+                transcript: transcript("warmup must stay silent"),
+            }),
+            transcripts: HashMap::from([prefetched(1, "visible")]),
         };
 
         assert_eq!(hud_partial_text(&result.transcripts), "visible");
-        assert_eq!(result.warmup.as_deref(), Some("warmup must stay silent"));
+        assert_eq!(
+            result
+                .warmup
+                .as_ref()
+                .map(|warmup| warmup.transcript.text.as_str()),
+            Some("warmup must stay silent")
+        );
     }
 
     type HudEvents = Arc<Mutex<Vec<(u64, String)>>>;
@@ -359,22 +605,24 @@ mod tests {
                 .unwrap_or_else(|| Ok(String::new()));
             Box::pin(async move {
                 reply.map(|text| asr::Transcript {
+                    asr_text: Some(text.clone()),
+                    provider_cleaned_candidate: None,
                     text,
+                    language: None,
+                    confidence: None,
                     segments: Vec::new(),
                     words: Vec::new(),
+                    tokens: Vec::new(),
                     limits: asr::RateLimits::default(),
                 })
             })
         }
 
         fn capabilities(&self) -> asr::AsrCapabilities {
-            asr::AsrCapabilities {
-                batch_transcription: true,
-                background_prefetch: true,
-                realtime_streaming: false,
-                cancellation: true,
-                word_timestamps: false,
-            }
+            asr::asr_capabilities_for(
+                "https://api.groq.com/openai/v1/audio/transcriptions",
+                "whisper-large-v3",
+            )
         }
     }
 
@@ -390,14 +638,20 @@ mod tests {
             Arc::new(queue::RequestGate::new(None)),
             provider,
             asr::AsrOptions::default(),
-            metrics::Metrics::default(),
-            CancellationToken::new(),
-            Some(Arc::new(move |generation, text| {
-                hud.lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .push((generation, text));
-            })),
-            generation,
+            PrefetchSessionConfig {
+                metrics: metrics::Metrics::default(),
+                metric_group: metrics::MetricGroup::unknown("prefetch"),
+                session_binding: PrefetchSessionBinding::test_default(),
+                cancellation: CancellationToken::new(),
+                hud_partial: Some(Arc::new(move |generation, text| {
+                    hud.lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .push((generation, text));
+                })),
+                session_generation: generation,
+                request_identity: test_request_identity(),
+                quota_scope: queue::RequestScope::new("mock", None, "mock-model", ""),
+            },
         );
         (inbox, session)
     }
@@ -410,10 +664,16 @@ mod tests {
             Arc::new(queue::RequestGate::new(None)),
             provider,
             asr::AsrOptions::default(),
-            metrics::Metrics::default(),
-            CancellationToken::new(),
-            None,
-            1,
+            PrefetchSessionConfig {
+                metrics: metrics::Metrics::default(),
+                metric_group: metrics::MetricGroup::unknown("prefetch"),
+                session_binding: PrefetchSessionBinding::test_default(),
+                cancellation: CancellationToken::new(),
+                hud_partial: None,
+                session_generation: 1,
+                request_identity: test_request_identity(),
+                quota_scope: queue::RequestScope::new("mock", None, "mock-model", ""),
+            },
         );
         (inbox, session)
     }
@@ -427,8 +687,12 @@ mod tests {
         let result = session.finish(Duration::from_secs(2)).await;
 
         assert_eq!(
-            result.transcripts,
-            HashMap::from([(0, "hello ".to_owned()), (1, " later".to_owned())])
+            result
+                .transcripts
+                .values()
+                .map(|entry| (entry.chunk_index, entry.transcript.text.as_str()))
+                .collect::<HashMap<_, _>>(),
+            HashMap::from([(0, "hello "), (1, " later")])
         );
     }
 
@@ -443,8 +707,12 @@ mod tests {
         let result = session.finish(Duration::from_secs(2)).await;
 
         assert_eq!(
-            result.transcripts,
-            HashMap::from([(0, "hello ".to_owned()), (1, " later".to_owned())])
+            result
+                .transcripts
+                .values()
+                .map(|entry| (entry.chunk_index, entry.transcript.text.as_str()))
+                .collect::<HashMap<_, _>>(),
+            HashMap::from([(0, "hello "), (1, " later")])
         );
         assert_eq!(
             hud.lock()
@@ -464,7 +732,13 @@ mod tests {
         );
         assert!(warmup_inbox.try_send(PrefetchMessage::Warmup(sample_chunk(0))));
         let warmup_result = warmup_session.finish(Duration::from_secs(2)).await;
-        assert_eq!(warmup_result.warmup.as_deref(), Some("warmup only"));
+        assert_eq!(
+            warmup_result
+                .warmup
+                .as_ref()
+                .map(|warmup| warmup.transcript.text.as_str()),
+            Some("warmup only")
+        );
         assert!(warmup_hud
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())

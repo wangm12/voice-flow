@@ -17,6 +17,7 @@ export type DictationState =
 export type ProcessingPhase =
   | "finalizing_audio"
   | "asr"
+  | "soniox_recovery"
   | "cascade_accurate"
   | "cleanup"
   | "delivery"
@@ -53,7 +54,7 @@ const HUD_FINAL_STATES = new Set<DictationState>([
   "degraded",
 ]);
 
-export type HudBorderBeamColor = "colorful" | "sunset";
+export type HudBorderBeamColor = "mono";
 export type HudBorderBeamSize = "md" | "line";
 export type HudBorderBeamConfig = {
   size: HudBorderBeamSize;
@@ -64,14 +65,14 @@ export type HudBorderBeamConfig = {
 
 export const HUD_LISTENING_BEAM: HudBorderBeamConfig = {
   size: "md",
-  colorVariant: "colorful",
+  colorVariant: "mono",
   strength: 1,
   duration: 3.2,
 };
 
 export const HUD_THINKING_BEAM: HudBorderBeamConfig = {
   size: "line",
-  colorVariant: "colorful",
+  colorVariant: "mono",
   strength: 0.7,
 };
 

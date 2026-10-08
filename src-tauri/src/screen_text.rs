@@ -2,11 +2,14 @@
 //! PIDs, and raw URLs never enter the extract payload.
 #![allow(dead_code)]
 
-use crate::context::ContextFamily;
+use crate::context::{ContextFamily, FocusKind, TargetAppGuard};
 use std::time::Duration;
 
 pub const MAX_TOKENS: usize = 40;
 pub const MAX_CHARS: usize = 2000;
+pub const MAX_SELECTED_CHARS: usize = 800;
+pub const MAX_NEARBY_CHARS: usize = 400;
+pub const MAX_NEARBY_ITEMS: usize = 2;
 #[allow(dead_code)]
 pub const EXTRACT_TIMEOUT: Duration = Duration::from_millis(350);
 
@@ -14,57 +17,327 @@ pub const EXTRACT_TIMEOUT: Duration = Duration::from_millis(350);
 pub enum ScreenTextSource {
     #[default]
     Ax,
-    #[allow(dead_code)]
     AxOcr,
+    CloudVision,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextEvidenceSource {
+    Ax,
+    Ocr,
+    CloudVision,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextEvidenceKind {
+    Scene,
+    Term,
+    SelectedText,
+    NearbyText,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextEvidenceItem {
+    pub source: ContextEvidenceSource,
+    pub kind: ContextEvidenceKind,
+    pub value: String,
+    pub confidence_milli: Option<u16>,
+    pub truncated: bool,
+}
+
+/// Per-recording, source-tagged evidence. The target/session binding is local
+/// memory only; callers must not serialize this value.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ContextEvidence {
+    pub items: Vec<ContextEvidenceItem>,
+    pub target_guard: Option<TargetAppGuard>,
+    pub session_generation: Option<u64>,
+    /// Immutable content permissions captured when this recording began.
+    /// Current settings are intersected with these before every request so a
+    /// later settings change cannot broaden already captured evidence.
+    pub capture_permissions: Option<crate::context::ContextSourcePermissions>,
+    /// Monotonic in-memory source-policy generation. A revoke followed by a
+    /// regrant cannot make evidence from the earlier policy usable again.
+    pub policy_revision: Option<u64>,
+    pub truncated: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ScreenTextContext {
-    pub tokens: Vec<String>,
-    pub snippets: Vec<String>,
+    pub evidence: ContextEvidence,
     pub family: ContextFamily,
     pub source: ScreenTextSource,
+    /// Set only after an allowed source was projected into an ASR request.
+    pub provider_source: Option<ContextEvidenceSource>,
     pub truncated: bool,
 }
 
 impl ScreenTextContext {
     #[allow(dead_code)]
     pub fn proper_noun_count(&self) -> usize {
-        self.tokens.len()
+        self.evidence
+            .items
+            .iter()
+            .filter(|item| item.kind == ContextEvidenceKind::Term)
+            .count()
     }
 
     pub fn usable_chars(&self) -> usize {
-        self.tokens
+        self.evidence
+            .items
             .iter()
-            .map(|token| token.chars().count())
+            .map(|item| item.value.chars().count())
             .sum::<usize>()
-            + self
-                .snippets
-                .iter()
-                .map(|snippet| snippet.chars().count())
-                .sum::<usize>()
     }
 
-    pub fn visible_context_text(&self) -> String {
-        let mut parts = Vec::with_capacity(self.tokens.len() + self.snippets.len());
-        parts.extend(self.tokens.iter().cloned());
-        parts.extend(self.snippets.iter().cloned());
-        let mut text = parts.join(" ");
-        if text.chars().count() > MAX_CHARS {
-            text = text.chars().take(MAX_CHARS).collect();
+    pub fn asr_terms(&self, permissions: crate::context::ContextSourcePermissions) -> Vec<String> {
+        if !permissions.context_text_to_providers {
+            return Vec::new();
         }
-        text
+        self.granted_terms(permissions)
+    }
+
+    pub fn granted_terms(
+        &self,
+        permissions: crate::context::ContextSourcePermissions,
+    ) -> Vec<String> {
+        self.evidence
+            .items
+            .iter()
+            .filter(|item| {
+                item.kind == ContextEvidenceKind::Term
+                    && source_is_granted(item.source, permissions)
+            })
+            .map(|item| item.value.clone())
+            .take(MAX_TOKENS)
+            .collect()
+    }
+
+    pub fn cleanup_projection(
+        &self,
+        permissions: crate::context::ContextSourcePermissions,
+    ) -> Option<String> {
+        if !permissions.context_text_to_providers {
+            return None;
+        }
+        let mut parts = Vec::new();
+        let mut used = 0usize;
+        for item in &self.evidence.items {
+            if !matches!(
+                item.kind,
+                ContextEvidenceKind::Term
+                    | ContextEvidenceKind::SelectedText
+                    | ContextEvidenceKind::NearbyText
+            ) || !source_is_granted(item.source, permissions)
+            {
+                continue;
+            }
+            let remaining = MAX_CHARS.saturating_sub(used);
+            if remaining == 0 {
+                break;
+            }
+            let value: String = item.value.chars().take(remaining).collect();
+            if value.trim().is_empty() {
+                continue;
+            }
+            used = used.saturating_add(value.chars().count());
+            parts.push(format!(
+                "[source={}, kind={}] {}",
+                evidence_source_label(item.source),
+                evidence_kind_label(item.kind),
+                value
+            ));
+        }
+        (!parts.is_empty()).then(|| parts.join("\n"))
+    }
+
+    pub fn projected_source(
+        &self,
+        permissions: crate::context::ContextSourcePermissions,
+    ) -> Option<ContextEvidenceSource> {
+        if !permissions.context_text_to_providers {
+            return None;
+        }
+        [
+            ContextEvidenceSource::CloudVision,
+            ContextEvidenceSource::Ocr,
+            ContextEvidenceSource::Ax,
+        ]
+        .into_iter()
+        .find(|source| {
+            self.evidence.items.iter().any(|item| {
+                item.source == *source
+                    && matches!(
+                        item.kind,
+                        ContextEvidenceKind::Term
+                            | ContextEvidenceKind::SelectedText
+                            | ContextEvidenceKind::NearbyText
+                    )
+                    && source_is_granted(*source, permissions)
+            })
+        })
+    }
+
+    pub fn projected_asr_source(
+        &self,
+        permissions: crate::context::ContextSourcePermissions,
+        included_terms: &[String],
+    ) -> Option<ContextEvidenceSource> {
+        if !permissions.context_text_to_providers {
+            return None;
+        }
+        [
+            ContextEvidenceSource::CloudVision,
+            ContextEvidenceSource::Ocr,
+            ContextEvidenceSource::Ax,
+        ]
+        .into_iter()
+        .find(|source| {
+            self.evidence.items.iter().any(|item| {
+                item.source == *source
+                    && item.kind == ContextEvidenceKind::Term
+                    && source_is_granted(*source, permissions)
+                    && included_terms.contains(&item.value)
+            })
+        })
     }
 
     #[allow(dead_code)]
     pub fn is_thin(&self) -> bool {
         self.usable_chars() < 20
     }
+
+    pub fn bind_to(&mut self, guard: &TargetAppGuard, session_generation: u64) {
+        self.evidence.target_guard = Some(guard.clone());
+        self.evidence.session_generation = Some(session_generation);
+    }
+
+    pub fn bind_to_with_permissions(
+        &mut self,
+        guard: &TargetAppGuard,
+        session_generation: u64,
+        permissions: crate::context::ContextSourcePermissions,
+    ) {
+        self.bind_to(guard, session_generation);
+        self.evidence.capture_permissions = Some(permissions);
+    }
+
+    pub fn bind_to_with_policy_revision(
+        &mut self,
+        guard: &TargetAppGuard,
+        session_generation: u64,
+        permissions: crate::context::ContextSourcePermissions,
+        policy_revision: u64,
+    ) {
+        self.bind_to_with_permissions(guard, session_generation, permissions);
+        self.evidence.policy_revision = Some(policy_revision);
+    }
+
+    pub fn is_bound_to(&self, guard: &TargetAppGuard, session_generation: u64) -> bool {
+        self.evidence.target_guard.as_ref() == Some(guard)
+            && self.evidence.session_generation == Some(session_generation)
+    }
+}
+
+/// Keep the AX call behind the same switch tested by production code, so the
+/// disabled path can prove it never invokes the native reader.
+pub fn capture_ax_if_allowed(
+    context_enabled: bool,
+    permissions: crate::context::ContextSourcePermissions,
+    read: impl FnOnce() -> ScreenTextContext,
+) -> ScreenTextContext {
+    if context_enabled && permissions.ax_text {
+        read()
+    } else {
+        ScreenTextContext::default()
+    }
+}
+
+pub fn capture_ax_if_contextual(
+    context_enabled: bool,
+    permissions: crate::context::ContextSourcePermissions,
+    family: ContextFamily,
+    focus_kind: FocusKind,
+    has_input_identity: bool,
+    read: impl FnOnce() -> ScreenTextContext,
+) -> ScreenTextContext {
+    let protected_field = matches!(
+        focus_kind,
+        FocusKind::Unknown | FocusKind::Secure | FocusKind::Terminal | FocusKind::Form
+    ) || (family == ContextFamily::PromptOrCode
+        && focus_kind == FocusKind::Code);
+    if !has_input_identity || protected_field {
+        return ScreenTextContext {
+            family,
+            ..ScreenTextContext::default()
+        };
+    }
+    let mut screen = capture_ax_if_allowed(context_enabled, permissions, read);
+    screen.family = family;
+    screen
+}
+
+fn source_is_granted(
+    source: ContextEvidenceSource,
+    permissions: crate::context::ContextSourcePermissions,
+) -> bool {
+    match source {
+        ContextEvidenceSource::Ax => permissions.ax_text,
+        ContextEvidenceSource::Ocr => permissions.local_ocr,
+        ContextEvidenceSource::CloudVision => permissions.cloud_vision,
+    }
+}
+
+pub fn evidence_source_label(source: ContextEvidenceSource) -> &'static str {
+    match source {
+        ContextEvidenceSource::Ax => "ax",
+        ContextEvidenceSource::Ocr => "ocr",
+        ContextEvidenceSource::CloudVision => "cloud_vision",
+    }
+}
+
+pub fn terms_from_ocr_line(line: &str) -> Vec<String> {
+    let mut terms = Vec::new();
+    let mut current = String::new();
+    let push_current = |terms: &mut Vec<String>, current: &mut String| {
+        let value = current.trim_matches(['.', '-', '_']).trim();
+        if value.chars().count() >= 2
+            && !is_numeric_only(value)
+            && !terms.iter().any(|term| term == value)
+        {
+            terms.push(value.chars().take(48).collect());
+        }
+        current.clear();
+    };
+    for character in line.chars() {
+        if character.is_alphanumeric() || matches!(character, '.' | '-' | '_') {
+            current.push(character);
+        } else {
+            push_current(&mut terms, &mut current);
+            if terms.len() == 40 {
+                break;
+            }
+        }
+    }
+    push_current(&mut terms, &mut current);
+    terms.truncate(40);
+    terms
+}
+
+fn evidence_kind_label(kind: ContextEvidenceKind) -> &'static str {
+    match kind {
+        ContextEvidenceKind::Scene => "scene",
+        ContextEvidenceKind::Term => "term",
+        ContextEvidenceKind::SelectedText => "selected_text",
+        ContextEvidenceKind::NearbyText => "nearby_text",
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct AxWindowFixture {
     pub family: ContextFamily,
+    pub focus_kind: FocusKind,
+    pub known_ide: bool,
     pub counterpart: Option<String>,
     pub bubbles: Vec<String>,
     pub email_recipients: Vec<String>,
@@ -86,63 +359,87 @@ pub struct AxWindowFixture {
 }
 
 pub fn extract_from_fixture(fix: &AxWindowFixture) -> ScreenTextContext {
-    if layer1_forbidden(fix) {
+    let mut items = vec![ContextEvidenceItem {
+        source: ContextEvidenceSource::Ax,
+        kind: ContextEvidenceKind::Scene,
+        value: crate::context::family_id(fix.family).to_owned(),
+        confidence_milli: Some(950),
+        truncated: false,
+    }];
+    if layer1_forbidden(fix)
+        || matches!(fix.focus_kind, FocusKind::Unknown | FocusKind::Secure)
+        || (fix.known_ide && matches!(fix.focus_kind, FocusKind::Code | FocusKind::Terminal))
+    {
         return ScreenTextContext {
+            evidence: ContextEvidence {
+                items,
+                ..ContextEvidence::default()
+            },
             family: fix.family,
             source: ScreenTextSource::Ax,
             ..ScreenTextContext::default()
         };
     }
 
-    let mut tokens = Vec::new();
-    let mut snippets = Vec::new();
+    if fix.focus_kind == FocusKind::Search {
+        if let Some(selected) = &fix.selected_text {
+            push_evidence(&mut items, ContextEvidenceKind::SelectedText, selected);
+        }
+        return apply_caps(items, fix.family);
+    }
 
     match fix.family {
         ContextFamily::PersonalChat | ContextFamily::WorkChat | ContextFamily::SocialMedia => {
-            if let Some(name) = fix.counterpart.as_deref() {
-                push_token(&mut tokens, name);
-            }
-            for bubble in last_visible_bubbles(&fix.bubbles) {
-                push_snippet(&mut snippets, bubble);
+            if fix.focus_kind == FocusKind::Search {
+                if let Some(selected) = &fix.selected_text {
+                    push_evidence(&mut items, ContextEvidenceKind::SelectedText, selected);
+                }
+            } else if fix.focus_kind == FocusKind::Chat {
+                if let Some(name) = fix.counterpart.as_deref() {
+                    push_evidence(&mut items, ContextEvidenceKind::Term, name);
+                }
+                for bubble in last_visible_bubbles(&fix.bubbles) {
+                    push_evidence(&mut items, ContextEvidenceKind::NearbyText, bubble);
+                }
             }
         }
         ContextFamily::Email => {
             for recipient in &fix.email_recipients {
-                push_token(&mut tokens, recipient);
+                push_evidence(&mut items, ContextEvidenceKind::Term, recipient);
             }
             if let Some(subject) = &fix.email_subject {
-                push_snippet(&mut snippets, subject);
+                push_evidence(&mut items, ContextEvidenceKind::NearbyText, subject);
             }
         }
         ContextFamily::PromptOrCode | ContextFamily::DeveloperCollaboration => {
             for name in &fix.ide_filenames {
                 if is_allowed_filename(name) {
-                    push_token(&mut tokens, name);
+                    push_evidence(&mut items, ContextEvidenceKind::Term, name);
                 }
             }
             for symbol in &fix.ide_symbols {
-                push_token(&mut tokens, symbol);
+                push_evidence(&mut items, ContextEvidenceKind::Term, symbol);
             }
-            if let Some(selected) = &fix.selected_text {
-                push_snippet(&mut snippets, selected);
+            if matches!(fix.focus_kind, FocusKind::Chat | FocusKind::CodingPrompt) {
+                if let Some(selected) = &fix.selected_text {
+                    push_evidence(&mut items, ContextEvidenceKind::SelectedText, selected);
+                }
             }
         }
         ContextFamily::Document | ContextFamily::NotesJournaling => {
             if let Some(name) = &fix.document_name {
-                push_token(&mut tokens, name);
+                push_evidence(&mut items, ContextEvidenceKind::Term, name);
             }
             if let Some(selected) = &fix.selected_text {
-                push_snippet(&mut snippets, selected);
+                push_evidence(&mut items, ContextEvidenceKind::SelectedText, selected);
             }
-            // Live extract fills document_name / selection. Tests may place
-            // nearby AX tokens in ide_symbols; keep them as tokens only.
             for symbol in &fix.ide_symbols {
-                push_token(&mut tokens, symbol);
+                push_evidence(&mut items, ContextEvidenceKind::Term, symbol);
             }
         }
         ContextFamily::BrowserSearch => {
             if let Some(selected) = &fix.selected_text {
-                push_snippet(&mut snippets, selected);
+                push_evidence(&mut items, ContextEvidenceKind::SelectedText, selected);
             }
         }
         ContextFamily::Terminal | ContextFamily::FormFilling => {}
@@ -151,12 +448,11 @@ pub fn extract_from_fixture(fix: &AxWindowFixture) -> ScreenTextContext {
         | ContextFamily::CustomerSupport
         | ContextFamily::General => {
             if let Some(selected) = &fix.selected_text {
-                push_snippet(&mut snippets, selected);
+                push_evidence(&mut items, ContextEvidenceKind::SelectedText, selected);
             }
         }
     }
-
-    apply_caps(tokens, snippets, fix.family)
+    apply_caps(items, fix.family)
 }
 
 pub fn extract_with_reader<F>(reader: F) -> ScreenTextContext
@@ -195,12 +491,27 @@ pub fn screen_context_for_session(
 
 pub fn extract_live(
     family: ContextFamily,
+    focus_kind: FocusKind,
     guard: &crate::context::TargetAppGuard,
 ) -> ScreenTextContext {
     let guard = guard.clone();
-    let mut ctx =
-        extract_with_reader(move || extract_from_fixture(&live_fixture_from_guard(family, &guard)));
+    let mut ctx = extract_with_reader(move || {
+        let mut fixture = live_fixture_from_guard(family, &guard);
+        fixture.focus_kind = focus_kind;
+        extract_from_fixture(&fixture)
+    });
     ctx.family = family;
+    ctx
+}
+
+pub fn extract_live_for_session(
+    family: ContextFamily,
+    focus_kind: FocusKind,
+    guard: &crate::context::TargetAppGuard,
+    session_generation: u64,
+) -> ScreenTextContext {
+    let mut ctx = extract_live(family, focus_kind, guard);
+    ctx.bind_to(guard, session_generation);
     ctx
 }
 
@@ -208,12 +519,16 @@ pub fn resolve_screen_at_stop(
     expected: &crate::context::TargetAppGuard,
     live: &crate::context::TargetAppGuard,
     _family: ContextFamily,
+    session_generation: u64,
     extract: impl FnOnce() -> ScreenTextContext,
 ) -> Option<ScreenTextContext> {
     if crate::context::focus_mismatch_reason(expected, live).is_some() {
         return None;
     }
-    Some(extract())
+    let mut ctx = extract();
+    ctx.evidence.session_generation = Some(session_generation);
+    ctx.bind_to(expected, session_generation);
+    Some(ctx)
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -232,9 +547,11 @@ pub struct LiveAxSnapshot {
 pub fn fixture_from_live_ax(
     family: ContextFamily,
     guard: &crate::context::TargetAppGuard,
+    focus_kind: FocusKind,
     snap: LiveAxSnapshot,
 ) -> AxWindowFixture {
     let mut fix = empty_live_fixture(family, guard);
+    fix.focus_kind = focus_kind;
     if !snap.focused_role.is_empty() {
         fix.focused_role = snap.focused_role;
         if fix.focused_role == "AXSecureTextField" {
@@ -258,6 +575,8 @@ fn empty_live_fixture(
 ) -> AxWindowFixture {
     AxWindowFixture {
         family,
+        focus_kind: FocusKind::Unknown,
+        known_ide: is_known_ide_bundle(guard.bundle_id.as_deref()),
         counterpart: None,
         bubbles: Vec::new(),
         email_recipients: Vec::new(),
@@ -282,6 +601,19 @@ fn empty_live_fixture(
     }
 }
 
+fn is_known_ide_bundle(bundle_id: Option<&str>) -> bool {
+    matches!(
+        bundle_id,
+        Some(
+            "com.todesktop.230313mzl4w4u92"
+                | "com.microsoft.VSCode"
+                | "com.microsoft.VSCodeInsiders"
+                | "com.apple.dt.Xcode"
+                | "dev.zed.Zed"
+        )
+    )
+}
+
 fn live_fixture_from_guard(
     family: ContextFamily,
     guard: &crate::context::TargetAppGuard,
@@ -292,7 +624,7 @@ fn live_fixture_from_guard(
     }
     #[cfg(target_os = "macos")]
     if let Some(snap) = macos_live_ax::read_live_ax(guard) {
-        return fixture_from_live_ax(family, guard, snap);
+        return fixture_from_live_ax(family, guard, FocusKind::Unknown, snap);
     }
     fix
 }
@@ -301,6 +633,7 @@ fn layer1_forbidden(fix: &AxWindowFixture) -> bool {
     fix.secure
         || fix.banking_preset
         || fix.focused_role == "AXSecureTextField"
+        || fix.focus_kind == FocusKind::Form
         || matches!(
             fix.family,
             ContextFamily::Terminal | ContextFamily::FormFilling
@@ -354,69 +687,71 @@ fn usable_text(value: &str) -> Option<String> {
     Some(trimmed.to_string())
 }
 
-fn push_token(tokens: &mut Vec<String>, value: &str) {
-    if let Some(token) = usable_text(value) {
-        if !tokens.iter().any(|existing| existing == &token) {
-            tokens.push(token);
-        }
-    }
-}
-
-fn push_snippet(snippets: &mut Vec<String>, value: &str) {
+fn push_evidence(items: &mut Vec<ContextEvidenceItem>, kind: ContextEvidenceKind, value: &str) {
     if let Some(snippet) = usable_text(value) {
-        snippets.push(snippet);
+        if kind == ContextEvidenceKind::Term
+            && items
+                .iter()
+                .any(|item| item.kind == kind && item.value == snippet)
+        {
+            return;
+        }
+        items.push(ContextEvidenceItem {
+            source: ContextEvidenceSource::Ax,
+            kind,
+            value: snippet,
+            confidence_milli: None,
+            truncated: false,
+        });
     }
 }
 
-fn apply_caps(
-    tokens: Vec<String>,
-    snippets: Vec<String>,
-    family: ContextFamily,
-) -> ScreenTextContext {
-    let mut truncated = tokens.len() > MAX_TOKENS;
-    let mut kept_tokens = Vec::new();
+fn apply_caps(items: Vec<ContextEvidenceItem>, family: ContextFamily) -> ScreenTextContext {
+    let mut truncated = false;
+    let mut kept = Vec::new();
     let mut used = 0usize;
-    for token in tokens.into_iter().take(MAX_TOKENS) {
-        let n = token.chars().count();
+    let mut terms = 0usize;
+    let mut selected = 0usize;
+    let mut nearby = 0usize;
+    let mut scene = 0usize;
+    for mut item in items {
+        let (item_limit, count, count_limit) = match item.kind {
+            ContextEvidenceKind::Scene => (64, &mut scene, 1),
+            ContextEvidenceKind::Term => (120, &mut terms, MAX_TOKENS),
+            ContextEvidenceKind::SelectedText => (MAX_SELECTED_CHARS, &mut selected, 1),
+            ContextEvidenceKind::NearbyText => (MAX_NEARBY_CHARS, &mut nearby, MAX_NEARBY_ITEMS),
+        };
+        if *count >= count_limit {
+            truncated = true;
+            continue;
+        }
+        let value_len = item.value.chars().count();
+        if value_len > item_limit {
+            item.value = item.value.chars().take(item_limit).collect();
+            item.truncated = true;
+            truncated = true;
+        }
+        let n = item.value.chars().count();
         if used.saturating_add(n) > MAX_CHARS {
             truncated = true;
             break;
         }
         used = used.saturating_add(n);
-        kept_tokens.push(token);
-    }
-
-    let mut kept_snippets = Vec::new();
-    for snippet in snippets {
-        let n = snippet.chars().count();
-        if used.saturating_add(n) > MAX_CHARS {
-            let remain = MAX_CHARS.saturating_sub(used);
-            if remain > 0 {
-                kept_snippets.push(snippet.chars().take(remain).collect());
-            }
-            truncated = true;
-            break;
-        }
-        used = used.saturating_add(n);
-        kept_snippets.push(snippet);
+        *count += 1;
+        kept.push(item);
     }
 
     ScreenTextContext {
-        tokens: kept_tokens,
-        snippets: kept_snippets,
+        evidence: ContextEvidence {
+            items: kept,
+            truncated,
+            ..ContextEvidence::default()
+        },
         family,
         source: ScreenTextSource::Ax,
+        provider_source: None,
         truncated,
     }
-}
-
-fn title_counterpart(title: &str) -> Option<String> {
-    let first = title
-        .split(['-', '—', '|', '·'])
-        .next()
-        .unwrap_or(title)
-        .trim();
-    usable_text(first)
 }
 
 fn looks_like_email(value: &str) -> bool {
@@ -450,7 +785,7 @@ fn document_basename(value: &str) -> Option<String> {
 mod macos_live_ax {
     use super::{
         document_basename, is_allowed_filename, looks_like_email, looks_like_identifier,
-        title_counterpart, usable_text, LiveAxSnapshot,
+        usable_text, LiveAxSnapshot,
     };
     use crate::context::{ContextFamily, TargetAppGuard};
     use core::ffi::c_void;
@@ -527,17 +862,6 @@ mod macos_live_ax {
                 .and_then(document_basename),
             ..LiveAxSnapshot::default()
         };
-        if let Some(title) = copy_string_attr(&window, "AXTitle") {
-            if let Some(name) = title_counterpart(&title) {
-                snap.counterpart = Some(name);
-            }
-            if snap.document_name.is_none() {
-                snap.document_name = document_basename(&title);
-            }
-            if let Some(subject) = usable_text(&title) {
-                snap.email_subject = Some(subject);
-            }
-        }
         if let Some(focused) = &focused {
             if let Some(value) = copy_string_attr(focused, "AXValue") {
                 collect_value_tokens(&mut snap, ContextFamily::General, &value);
@@ -653,6 +977,8 @@ mod macos_live_ax {
 fn empty_fix() -> AxWindowFixture {
     AxWindowFixture {
         family: ContextFamily::General,
+        focus_kind: FocusKind::Unknown,
+        known_ide: false,
         counterpart: None,
         bubbles: Vec::new(),
         email_recipients: Vec::new(),
@@ -674,10 +1000,193 @@ fn empty_fix() -> AxWindowFixture {
 mod tests {
     use super::*;
 
+    fn all_permissions() -> crate::context::ContextSourcePermissions {
+        crate::context::ContextSourcePermissions {
+            ax_text: true,
+            local_ocr: true,
+            cloud_vision: true,
+            context_text_to_providers: true,
+        }
+    }
+
+    fn item(
+        source: ContextEvidenceSource,
+        kind: ContextEvidenceKind,
+        value: &str,
+    ) -> ContextEvidenceItem {
+        ContextEvidenceItem {
+            source,
+            kind,
+            value: value.into(),
+            confidence_milli: Some(900),
+            truncated: false,
+        }
+    }
+
+    #[test]
+    fn disabled_context_and_text_grants_never_call_or_project_ax_reader_content() {
+        use std::cell::Cell;
+
+        let calls = Cell::new(0);
+        let result = capture_ax_if_allowed(false, all_permissions(), || {
+            calls.set(calls.get() + 1);
+            ScreenTextContext::default()
+        });
+        assert_eq!(calls.get(), 0);
+        assert!(content_is_empty(&result));
+
+        let result = capture_ax_if_allowed(true, Default::default(), || {
+            calls.set(calls.get() + 1);
+            ScreenTextContext::default()
+        });
+        assert_eq!(calls.get(), 0);
+        assert!(content_is_empty(&result));
+    }
+
+    #[test]
+    fn missing_or_conservative_field_identity_never_calls_ax_reader() {
+        use std::cell::Cell;
+
+        let calls = Cell::new(0);
+        for (family, focus, has_input) in [
+            (ContextFamily::PersonalChat, FocusKind::Unknown, true),
+            (ContextFamily::Terminal, FocusKind::Terminal, true),
+            (ContextFamily::PromptOrCode, FocusKind::Code, true),
+            (ContextFamily::Email, FocusKind::Email, false),
+        ] {
+            let result =
+                capture_ax_if_contextual(true, all_permissions(), family, focus, has_input, || {
+                    calls.set(calls.get() + 1);
+                    ScreenTextContext::default()
+                });
+            assert!(content_is_empty(&result));
+        }
+        assert_eq!(calls.get(), 0);
+
+        let result = capture_ax_if_contextual(
+            true,
+            all_permissions(),
+            ContextFamily::PromptOrCode,
+            FocusKind::CodingPrompt,
+            true,
+            || {
+                calls.set(calls.get() + 1);
+                ScreenTextContext::default()
+            },
+        );
+        assert_eq!(calls.get(), 1);
+        assert_eq!(result.family, ContextFamily::PromptOrCode);
+    }
+
+    #[test]
+    fn provider_text_permission_gates_ax_and_ocr_derived_context() {
+        let ctx = ScreenTextContext {
+            evidence: ContextEvidence {
+                items: vec![
+                    item(
+                        ContextEvidenceSource::Ax,
+                        ContextEvidenceKind::Term,
+                        "AXName",
+                    ),
+                    item(
+                        ContextEvidenceSource::Ocr,
+                        ContextEvidenceKind::Term,
+                        "OCRName",
+                    ),
+                    item(
+                        ContextEvidenceSource::CloudVision,
+                        ContextEvidenceKind::Term,
+                        "VisionName",
+                    ),
+                    item(
+                        ContextEvidenceSource::Ocr,
+                        ContextEvidenceKind::SelectedText,
+                        "private OCR excerpt",
+                    ),
+                ],
+                ..ContextEvidence::default()
+            },
+            family: ContextFamily::Document,
+            ..ScreenTextContext::default()
+        };
+        let mut permissions = all_permissions();
+        permissions.context_text_to_providers = false;
+        assert!(ctx.asr_terms(permissions).is_empty());
+        assert!(ctx.cleanup_projection(permissions).is_none());
+        assert!(ctx.granted_terms(permissions).contains(&"OCRName".into()));
+
+        permissions.context_text_to_providers = true;
+        permissions.cloud_vision = false;
+        permissions.local_ocr = false;
+        assert_eq!(ctx.asr_terms(permissions), vec!["AXName"]);
+        assert!(!ctx
+            .cleanup_projection(permissions)
+            .unwrap_or_default()
+            .contains("private OCR excerpt"));
+        assert_eq!(
+            ctx.projected_source(permissions),
+            Some(ContextEvidenceSource::Ax)
+        );
+    }
+
+    #[test]
+    fn evidence_binding_and_snapshot_serialization_are_local_only() {
+        let guard = crate::context::TargetAppGuard {
+            pid: 42,
+            bundle_id: Some("com.example.Editor".into()),
+            browser_host: None,
+            browser_target_token: None,
+            window_token: Some(8),
+            window_id: Some(8),
+            input_token: Some(9),
+            secure_input: false,
+        };
+        let mut screen = ScreenTextContext::default();
+        screen.bind_to(&guard, 17);
+        assert!(screen.is_bound_to(&guard, 17));
+        assert!(!screen.is_bound_to(&guard, 18));
+
+        let mut snapshot = crate::context::ContextSnapshot::general();
+        snapshot.target_guard = guard;
+        snapshot.evidence = ContextEvidence {
+            items: vec![item(
+                ContextEvidenceSource::Ax,
+                ContextEvidenceKind::NearbyText,
+                "private snippet https://user:pass@example.com/path?secret=yes",
+            )],
+            target_guard: screen.evidence.target_guard.clone(),
+            session_generation: Some(17),
+            truncated: false,
+            capture_permissions: None,
+            policy_revision: None,
+        };
+        let serialized = serde_json::to_string(&snapshot).unwrap();
+        assert!(!serialized.contains("private snippet"));
+        assert!(!serialized.contains("example.com"));
+        assert!(!serialized.contains("user:pass"));
+        assert!(!serialized.contains("session_generation"));
+    }
+
+    fn nearby_count(ctx: &ScreenTextContext) -> usize {
+        ctx.evidence
+            .items
+            .iter()
+            .filter(|item| item.kind == ContextEvidenceKind::NearbyText)
+            .count()
+    }
+
+    fn content_is_empty(ctx: &ScreenTextContext) -> bool {
+        ctx.evidence
+            .items
+            .iter()
+            .all(|item| item.kind == ContextEvidenceKind::Scene || item.value.is_empty())
+    }
+
     #[test]
     fn chat_reads_counterpart_and_two_bubbles() {
         let ctx = extract_from_fixture(&AxWindowFixture {
             family: ContextFamily::PersonalChat,
+            focus_kind: FocusKind::Chat,
             counterpart: Some("晓雯".into()),
             bubbles: vec!["在吗".into(), "晚点回你".into()],
             window_title: "晓雯 - 微信".into(),
@@ -685,10 +1194,15 @@ mod tests {
             pid: 4242,
             ..empty_fix()
         });
-        assert!(ctx.tokens.iter().any(|t| t == "晓雯"));
-        assert_eq!(ctx.snippets.len(), 2);
-        assert_eq!(ctx.proper_noun_count(), ctx.tokens.len());
-        let text = ctx.visible_context_text();
+        assert!(ctx.asr_terms(all_permissions()).iter().any(|t| t == "晓雯"));
+        assert_eq!(nearby_count(&ctx), 2);
+        assert_eq!(
+            ctx.proper_noun_count(),
+            ctx.asr_terms(all_permissions()).len()
+        );
+        let text = ctx
+            .cleanup_projection(all_permissions())
+            .unwrap_or_default();
         assert!(!text.contains("微信"));
         assert!(!text.contains("4242"));
         assert!(!text.contains("https://"));
@@ -700,26 +1214,50 @@ mod tests {
     fn email_excludes_body() {
         let mut fix = empty_fix();
         fix.family = ContextFamily::Email;
+        fix.focus_kind = FocusKind::Email;
         fix.email_recipients = vec!["alex@example.com".into()];
         fix.email_subject = Some("Q3 plan".into());
         fix.bubbles = vec!["THIS IS THE BODY AND MUST NOT APPEAR".into()];
         let ctx = extract_from_fixture(&fix);
-        assert!(ctx.tokens.iter().any(|t| t.contains("alex@example.com")));
-        assert!(ctx.snippets.iter().any(|s| s.contains("Q3 plan")));
-        assert!(!ctx.visible_context_text().contains("THIS IS THE BODY"));
+        assert!(ctx
+            .asr_terms(all_permissions())
+            .iter()
+            .any(|t| t.contains("alex@example.com")));
+        assert!(ctx
+            .cleanup_projection(all_permissions())
+            .is_some_and(|text| text.contains("Q3 plan")));
+        assert!(!ctx
+            .cleanup_projection(all_permissions())
+            .unwrap_or_default()
+            .contains("THIS IS THE BODY"));
+    }
+
+    #[test]
+    fn window_title_is_never_projected_as_an_email_subject() {
+        let mut fix = empty_fix();
+        fix.family = ContextFamily::Email;
+        fix.focus_kind = FocusKind::Email;
+        fix.window_title = "Quarterly layoffs plan — private mailbox".into();
+        let context = extract_from_fixture(&fix);
+        assert!(!context
+            .cleanup_projection(all_permissions())
+            .unwrap_or_default()
+            .contains("Quarterly layoffs"));
     }
 
     #[test]
     fn ide_filenames_need_extension_and_no_spaces() {
         let mut fix = empty_fix();
         fix.family = ContextFamily::PromptOrCode;
+        fix.focus_kind = FocusKind::Code;
         fix.ide_filenames = vec!["foo.ts".into(), "bad name.rs".into(), ".eslintrc".into()];
         fix.ide_symbols = vec!["handleUserAuthCallback".into()];
         let ctx = extract_from_fixture(&fix);
-        assert!(ctx.tokens.contains(&"foo.ts".into()));
-        assert!(ctx.tokens.contains(&"handleUserAuthCallback".into()));
-        assert!(!ctx.tokens.iter().any(|t| t.contains(' ')));
-        assert!(!ctx.tokens.iter().any(|t| t == ".eslintrc"));
+        let terms = ctx.asr_terms(all_permissions());
+        assert!(terms.contains(&"foo.ts".into()));
+        assert!(terms.contains(&"handleUserAuthCallback".into()));
+        assert!(!terms.iter().any(|t| t.contains(' ')));
+        assert!(!terms.iter().any(|t| t == ".eslintrc"));
     }
 
     #[test]
@@ -766,7 +1304,7 @@ mod tests {
         for fix in cases {
             let ctx = extract_from_fixture(&fix);
             assert!(
-                ctx.tokens.is_empty() && ctx.snippets.is_empty(),
+                content_is_empty(&ctx),
                 "expected empty Layer 1 for {:?} secure={} banking={} role={}",
                 fix.family,
                 fix.secure,
@@ -781,9 +1319,10 @@ mod tests {
     fn caps_forty_tokens_and_two_thousand_chars() {
         let mut fix = empty_fix();
         fix.family = ContextFamily::Document;
+        fix.focus_kind = FocusKind::Document;
         fix.ide_symbols = (0..80).map(|i| format!("Token{i}")).collect();
         let ctx = extract_from_fixture(&fix);
-        assert!(ctx.tokens.len() <= 40);
+        assert!(ctx.proper_noun_count() <= 40);
         assert!(ctx.usable_chars() <= 2000);
         assert!(ctx.truncated);
         assert!(!ctx.is_thin());
@@ -804,13 +1343,23 @@ mod tests {
         let mut live = expected.clone();
         live.pid = 2;
         live.bundle_id = Some("com.example.b".into());
-        let dropped = resolve_screen_at_stop(&expected, &live, ContextFamily::PersonalChat, || {
-            ScreenTextContext {
-                tokens: vec!["晓雯".into()],
-                family: ContextFamily::PersonalChat,
-                ..ScreenTextContext::default()
-            }
-        });
+        let dropped =
+            resolve_screen_at_stop(&expected, &live, ContextFamily::PersonalChat, 1, || {
+                ScreenTextContext {
+                    evidence: ContextEvidence {
+                        items: vec![ContextEvidenceItem {
+                            source: ContextEvidenceSource::Ax,
+                            kind: ContextEvidenceKind::Term,
+                            value: "晓雯".into(),
+                            confidence_milli: None,
+                            truncated: false,
+                        }],
+                        ..ContextEvidence::default()
+                    },
+                    family: ContextFamily::PersonalChat,
+                    ..ScreenTextContext::default()
+                }
+            });
         assert!(dropped.is_none());
     }
 
@@ -820,14 +1369,13 @@ mod tests {
             std::thread::sleep(Duration::from_millis(400));
             panic!("should have been timed out");
         });
-        assert!(ctx.tokens.is_empty());
-        assert!(ctx.snippets.is_empty());
+        assert!(content_is_empty(&ctx));
     }
 
     #[test]
     fn extractor_error_does_not_fail_session() {
         let ctx = screen_context_for_session(ContextFamily::PersonalChat, Err("ax denied"));
-        assert!(ctx.tokens.is_empty());
+        assert!(content_is_empty(&ctx));
         assert_eq!(ctx.family, ContextFamily::PersonalChat);
     }
 
@@ -852,7 +1400,7 @@ mod tests {
         );
         assert!(fix.banking_preset);
         let ctx = extract_from_fixture(&fix);
-        assert!(ctx.tokens.is_empty() && ctx.snippets.is_empty());
+        assert!(content_is_empty(&ctx));
     }
 
     #[test]
@@ -873,19 +1421,53 @@ mod tests {
         };
         let mut guard = test_guard("com.tencent.xinWeChat", None);
         guard.pid = 4242;
-        let fix = fixture_from_live_ax(ContextFamily::PersonalChat, &guard, snap);
+        let fix = fixture_from_live_ax(ContextFamily::PersonalChat, &guard, FocusKind::Chat, snap);
         let ctx = extract_from_fixture(&AxWindowFixture {
             window_title: "晓雯 - 微信".into(),
             raw_url: Some("https://wx.qq.com/chat/secret".into()),
             pid: 4242,
             ..fix
         });
-        assert!(ctx.tokens.iter().any(|token| token == "晓雯"));
-        assert_eq!(ctx.snippets.len(), 2);
-        let text = ctx.visible_context_text();
+        assert!(ctx
+            .asr_terms(all_permissions())
+            .iter()
+            .any(|token| token == "晓雯"));
+        assert_eq!(nearby_count(&ctx), 2);
+        let text = ctx
+            .cleanup_projection(all_permissions())
+            .unwrap_or_default();
         assert!(!text.contains("微信"));
         assert!(!text.contains("4242"));
         assert!(!text.contains("https://"));
         assert!(!text.contains("window_title"));
+    }
+
+    #[test]
+    fn chat_search_and_unknown_fields_do_not_project_conversation_bubbles() {
+        let search = extract_from_fixture(&AxWindowFixture {
+            family: ContextFamily::WorkChat,
+            focus_kind: FocusKind::Search,
+            selected_text: Some("release notes".into()),
+            counterpart: Some("Private coworker".into()),
+            bubbles: vec!["Private conversation text".into()],
+            ..empty_fix()
+        });
+        assert_eq!(nearby_count(&search), 0);
+        assert!(search
+            .cleanup_projection(all_permissions())
+            .is_some_and(|text| text.contains("release notes")));
+        assert!(!search
+            .cleanup_projection(all_permissions())
+            .unwrap_or_default()
+            .contains("Private"));
+
+        let unknown = extract_from_fixture(&AxWindowFixture {
+            family: ContextFamily::PersonalChat,
+            focus_kind: FocusKind::Unknown,
+            counterpart: Some("Private coworker".into()),
+            bubbles: vec!["Private conversation text".into()],
+            ..empty_fix()
+        });
+        assert!(content_is_empty(&unknown));
     }
 }

@@ -10,6 +10,7 @@ use std::collections::HashSet;
 pub const MAX_ASR_PROMPT_TOKENS: usize = 200;
 const ASR_NO_TRANSLATE: &str = "不要翻译。";
 const ASR_EMPTY_SEED: &str = "不要翻译。这个 API 的 latency 太高了。";
+const GPT_TRANSCRIBE_SCENE: &str = "今天下午在看文档。中英混合听写";
 const MAX_CLEANUP_PAIRS: usize = 8;
 const MAX_CLEANUP_PAIR_CHARS: usize = 400;
 const MAX_CONTEXT_TERMS: usize = 64;
@@ -18,13 +19,24 @@ const MAX_CONTEXT_TERMS: usize = 64;
 pub enum AsrPromptShape {
     WhisperTranscript,
     ContextTerms,
+    GptTranscribeKeywords,
+    MistralContextBias,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AsrPromptBundle {
+    pub prompt: Option<String>,
+    pub keywords: Vec<String>,
 }
 
 pub fn asr_prompt_shape_for(
     provider: crate::providers::EngineProvider,
     model: &str,
 ) -> AsrPromptShape {
-    let model = model.to_ascii_lowercase();
+    let model = model.trim().to_ascii_lowercase();
+    if model == "gpt-transcribe" || model.starts_with("gpt-transcribe-") {
+        return AsrPromptShape::GptTranscribeKeywords;
+    }
     if model.contains("qwen")
         || model.contains("sensevoice")
         || model.contains("fun-asr")
@@ -33,7 +45,12 @@ pub fn asr_prompt_shape_for(
     {
         return AsrPromptShape::ContextTerms;
     }
+    if provider == crate::providers::EngineProvider::Mistral {
+        return AsrPromptShape::MistralContextBias;
+    }
     match provider {
+        crate::providers::EngineProvider::AssemblyAi => AsrPromptShape::GptTranscribeKeywords,
+        crate::providers::EngineProvider::OnDevice => AsrPromptShape::ContextTerms,
         crate::providers::EngineProvider::Deepgram => AsrPromptShape::ContextTerms,
         crate::providers::EngineProvider::SiliconFlow if !model.contains("whisper") => {
             AsrPromptShape::ContextTerms
@@ -188,6 +205,7 @@ pub fn mapping_for_profile<'a>(
         .and_then(|id| mappings.iter().find(|mapping| mapping.id == id))
 }
 
+#[cfg(test)]
 pub fn mapping_allows_learn(mappings: &[AppMapping], profile_id: &str) -> bool {
     scene_allows_learn(mappings, profile_id, None, None)
 }
@@ -198,9 +216,10 @@ pub fn scene_allows_learn(
     bundle_id: Option<&str>,
     browser_host: Option<&str>,
 ) -> bool {
-    if let Some(mapping) = mapping_for_profile(mappings, profile_id)
-        .or_else(|| mapping_matching_target(mappings, bundle_id, browser_host))
-    {
+    if let Some(mapping) = mapping_for_profile(mappings, profile_id) {
+        return mapping.enabled && mapping.dictionary_learn_enabled;
+    }
+    if let Some(mapping) = mapping_matching_target(mappings, bundle_id, browser_host) {
         return mapping.dictionary_learn_enabled;
     }
     !is_default_learn_off_target(bundle_id, browser_host)
@@ -284,6 +303,18 @@ fn is_learn_off_host(host: &str) -> bool {
         "paycom.com",
         "namely.com",
         "justworks.com",
+        "chase.com",
+        "bankofamerica.com",
+        "wellsfargo.com",
+        "usbank.com",
+        "capitalone.com",
+        "citi.com",
+        "citibank.com",
+        "schwab.com",
+        "fidelity.com",
+        "vanguard.com",
+        "paypal.com",
+        "venmo.com",
     ];
     EXACT.contains(&host)
         || SUFFIX
@@ -303,6 +334,14 @@ pub fn apply_lexicon_replacements(
     pairs: &[LexiconPair],
     blocking: &[String],
 ) -> String {
+    apply_lexicon_replacements_with_usage(text, pairs, blocking).0
+}
+
+fn apply_lexicon_replacements_with_usage(
+    text: &str,
+    pairs: &[LexiconPair],
+    blocking: &[String],
+) -> (String, Vec<String>) {
     let mut rules: Vec<&LexiconPair> = pairs
         .iter()
         .filter(|pair| !pair.before.is_empty() && pair.before != pair.after)
@@ -327,6 +366,7 @@ pub fn apply_lexicon_replacements(
 
     let chars: Vec<char> = text.chars().collect();
     let mut output = String::new();
+    let mut applied_terms = std::collections::BTreeSet::new();
     let mut index = 0;
     while index < chars.len() {
         let mut matched: Option<&LexiconPair> = None;
@@ -349,13 +389,14 @@ pub fn apply_lexicon_replacements(
         }
         if let Some(rule) = matched {
             output.push_str(&rule.after);
+            applied_terms.insert(rule.after.clone());
             index += rule.before.chars().count();
         } else {
             output.push(chars[index]);
             index += 1;
         }
     }
-    output
+    (output, applied_terms.into_iter().collect())
 }
 
 pub fn replaceable_pairs(pairs: &[LearnPairRecord], dictionary: &[String]) -> Vec<LexiconPair> {
@@ -368,15 +409,367 @@ pub fn replaceable_pairs(pairs: &[LearnPairRecord], dictionary: &[String]) -> Ve
         .collect()
 }
 
+#[cfg(test)]
 pub fn apply_promoted_replacements(
     text: &str,
     pairs: &[LearnPairRecord],
     dictionary: &[String],
 ) -> String {
+    apply_promoted_replacements_with_usage(text, pairs, dictionary).0
+}
+
+pub fn apply_promoted_replacements_with_usage(
+    text: &str,
+    pairs: &[LearnPairRecord],
+    dictionary: &[String],
+) -> (String, Vec<String>) {
     let replaceable = replaceable_pairs(pairs, dictionary);
     let mut rules = replaceable.clone();
     rules.extend(phonetic_replace_rules(text, &replaceable));
-    apply_lexicon_replacements(text, &rules, dictionary)
+    apply_lexicon_replacements_with_usage(text, &rules, dictionary)
+}
+
+/// Explicitly enabled fuzzy matching cannot cross protected text or layout boundaries.
+pub fn apply_ascii_fuzzy_dictionary(text: &str, dictionary: &[String]) -> String {
+    let mut protected: Vec<(usize, usize)> = crate::protected_span::protected_spans(text, None)
+        .into_iter()
+        .map(|span| (span.start_byte, span.end_byte))
+        .collect();
+    // Inline/fenced code and unfinished code delimiters are never fuzzy prose.
+    let mut cursor = 0;
+    while let Some(offset) = text[cursor..].find('`') {
+        let start = cursor + offset;
+        let count = text[start..]
+            .bytes()
+            .take_while(|byte| *byte == b'`')
+            .count();
+        let content = start + count;
+        let end = text[content..]
+            .find(&text[start..content])
+            .map(|offset| content + offset + count)
+            .unwrap_or(text.len());
+        protected.push((start, end));
+        cursor = end;
+    }
+    protected.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for (start, end) in protected {
+        if let Some(last) = merged.last_mut().filter(|last| start <= last.1) {
+            last.1 = last.1.max(end);
+        } else {
+            merged.push((start, end));
+        }
+    }
+    let mut result = String::with_capacity(text.len());
+    let mut cursor = 0;
+    let append_plain = |result: &mut String, plain: &str| {
+        for line in plain.split_inclusive([
+            '\n', '\r', '\t', '\u{b}', '\u{c}', '\u{85}', '\u{2028}', '\u{2029}',
+        ]) {
+            result.push_str(&apply_ascii_fuzzy_dictionary_unprotected(
+                line, dictionary, 0.18,
+            ));
+        }
+    };
+    for (start, end) in merged {
+        append_plain(&mut result, &text[cursor..start]);
+        result.push_str(&text[start..end]);
+        cursor = end;
+    }
+    append_plain(&mut result, &text[cursor..]);
+    result
+}
+
+fn apply_ascii_fuzzy_dictionary_unprotected(
+    text: &str,
+    dictionary: &[String],
+    threshold: f64,
+) -> String {
+    if dictionary.is_empty() {
+        return text.to_string();
+    }
+
+    let dictionary_match_keys: Vec<DictionaryMatchKey> = dictionary
+        .iter()
+        .enumerate()
+        .flat_map(|(index, word)| build_dictionary_match_keys(word, index))
+        .collect();
+
+    let (leading, tokens) = split_tokens_preserving_separators(text);
+    if tokens.is_empty() {
+        return text.to_string();
+    }
+
+    let words: Vec<&str> = tokens.iter().map(|(token, _)| *token).collect();
+    let mut result = String::new();
+    result.push_str(leading);
+    let mut index = 0;
+
+    while index < words.len() {
+        let mut best_match: Option<(usize, &String, f64)> = None;
+
+        for n in (1..=3).rev() {
+            if index + n > words.len() {
+                continue;
+            }
+
+            let ngram_words = &words[index..index + n];
+            if ngram_words[..n.saturating_sub(1)]
+                .iter()
+                .any(|word| !extract_fuzzy_punctuation(word).1.is_empty())
+            {
+                continue;
+            }
+            let ngram = build_fuzzy_ngram(ngram_words);
+
+            if let Some((replacement, score)) =
+                find_fuzzy_dictionary_match(&ngram, dictionary, &dictionary_match_keys, threshold)
+            {
+                let is_better = best_match
+                    .as_ref()
+                    .is_none_or(|(_, _, best_score)| score < *best_score);
+                if is_better {
+                    best_match = Some((n, replacement, score));
+                }
+            }
+        }
+
+        if let Some((n, replacement, _)) = best_match {
+            let ngram_words = &words[index..index + n];
+            let (prefix, _) = extract_fuzzy_punctuation(ngram_words[0]);
+            let (_, suffix) = extract_fuzzy_punctuation(ngram_words[n - 1]);
+            let corrected = preserve_fuzzy_case_pattern(ngram_words[0], replacement);
+            result.push_str(&format!("{}{}{}", prefix, corrected, suffix));
+            result.push_str(tokens[index + n - 1].1);
+            index += n;
+        } else {
+            result.push_str(words[index]);
+            result.push_str(tokens[index].1);
+            index += 1;
+        }
+    }
+
+    result
+}
+
+/// Split `text` into a leading whitespace slice and `(token, following_ws)` pairs.
+/// Following slices are the original separators (spaces, tabs, newlines).
+fn split_tokens_preserving_separators(text: &str) -> (&str, Vec<(&str, &str)>) {
+    let leading_end = text
+        .char_indices()
+        .find(|(_, ch)| !ch.is_whitespace())
+        .map(|(idx, _)| idx)
+        .unwrap_or(text.len());
+    let leading = &text[..leading_end];
+
+    let mut tokens = Vec::new();
+    let mut rest = &text[leading_end..];
+    while !rest.is_empty() {
+        let token_len = rest
+            .char_indices()
+            .find(|(_, ch)| ch.is_whitespace())
+            .map(|(idx, _)| idx)
+            .unwrap_or(rest.len());
+        let token = &rest[..token_len];
+        rest = &rest[token_len..];
+        let sep_len = rest
+            .char_indices()
+            .find(|(_, ch)| !ch.is_whitespace())
+            .map(|(idx, _)| idx)
+            .unwrap_or(rest.len());
+        let sep = &rest[..sep_len];
+        rest = &rest[sep_len..];
+        tokens.push((token, sep));
+    }
+
+    (leading, tokens)
+}
+
+struct DictionaryMatchKey {
+    word_index: usize,
+    key: String,
+}
+
+fn build_fuzzy_ngram(words: &[&str]) -> String {
+    words
+        .iter()
+        .map(|word| build_fuzzy_match_key(word))
+        .collect::<Vec<_>>()
+        .concat()
+}
+
+fn build_fuzzy_match_key(word: &str) -> String {
+    word.chars()
+        .filter(|ch| ch.is_alphanumeric())
+        .flat_map(|ch| ch.to_lowercase())
+        .collect()
+}
+
+fn build_dictionary_match_keys(word: &str, word_index: usize) -> Vec<DictionaryMatchKey> {
+    let primary_key = build_fuzzy_match_key(word);
+    let mut keys = Vec::with_capacity(2);
+
+    if is_supported_fuzzy_key(&primary_key) {
+        keys.push(DictionaryMatchKey {
+            word_index,
+            key: primary_key.clone(),
+        });
+    }
+
+    if word.contains('&') {
+        let expanded_key = build_fuzzy_match_key(&word.replace('&', " and "));
+        if is_supported_fuzzy_key(&expanded_key) && expanded_key != primary_key {
+            keys.push(DictionaryMatchKey {
+                word_index,
+                key: expanded_key,
+            });
+        }
+    }
+
+    keys
+}
+
+fn is_supported_fuzzy_key(key: &str) -> bool {
+    !key.is_empty() && key.chars().all(|ch| ch.is_ascii_alphanumeric())
+}
+
+fn supports_soundex(key: &str) -> bool {
+    key.chars().filter(|ch| ch.is_ascii_alphabetic()).count() >= 6
+        && key.chars().all(|ch| ch.is_ascii_alphabetic())
+}
+
+fn find_fuzzy_dictionary_match<'a>(
+    candidate: &str,
+    dictionary: &'a [String],
+    dictionary_match_keys: &[DictionaryMatchKey],
+    threshold: f64,
+) -> Option<(&'a String, f64)> {
+    if !is_supported_fuzzy_key(candidate) || candidate.chars().count() > 50 {
+        return None;
+    }
+
+    let mut best_match: Option<&String> = None;
+    let mut best_score = f64::MAX;
+
+    for dictionary_key in dictionary_match_keys {
+        let candidate_len = candidate.chars().count();
+        let dictionary_len = dictionary_key.key.chars().count();
+        let len_diff = candidate_len.abs_diff(dictionary_len) as f64;
+        let max_len = candidate_len.max(dictionary_len) as f64;
+        let max_allowed_diff = (max_len * 0.25).max(2.0);
+        if len_diff > max_allowed_diff {
+            continue;
+        }
+
+        let edit_distance = levenshtein(candidate, &dictionary_key.key);
+        let levenshtein_score = if max_len > 0.0 {
+            edit_distance as f64 / max_len
+        } else {
+            1.0
+        };
+
+        let phonetic_match = supports_soundex(candidate)
+            && supports_soundex(&dictionary_key.key)
+            && soundex_match(candidate, &dictionary_key.key);
+
+        let combined_score = if phonetic_match {
+            levenshtein_score * 0.3
+        } else {
+            levenshtein_score
+        };
+
+        if combined_score < threshold && combined_score < best_score {
+            best_match = Some(&dictionary[dictionary_key.word_index]);
+            best_score = combined_score;
+        }
+    }
+
+    best_match.map(|matched| (matched, best_score))
+}
+
+fn preserve_fuzzy_case_pattern(original: &str, replacement: &str) -> String {
+    if original.chars().all(|ch| ch.is_uppercase()) {
+        replacement.to_uppercase()
+    } else if original.chars().next().is_some_and(|ch| ch.is_uppercase()) {
+        let mut chars: Vec<char> = replacement.chars().collect();
+        if let Some(first_char) = chars.first_mut() {
+            *first_char = first_char.to_uppercase().next().unwrap_or(*first_char);
+        }
+        chars.into_iter().collect()
+    } else {
+        replacement.to_string()
+    }
+}
+
+fn extract_fuzzy_punctuation(word: &str) -> (&str, &str) {
+    let prefix_end = word
+        .char_indices()
+        .find(|(_, ch)| ch.is_alphanumeric())
+        .map(|(index, _)| index)
+        .unwrap_or(word.len());
+    let suffix_start = word
+        .char_indices()
+        .rev()
+        .find(|(_, ch)| ch.is_alphanumeric())
+        .map(|(index, ch)| index + ch.len_utf8())
+        .unwrap_or(0);
+
+    let prefix = if prefix_end > 0 {
+        &word[..prefix_end]
+    } else {
+        ""
+    };
+    let suffix = if suffix_start < word.len() {
+        &word[suffix_start..]
+    } else {
+        ""
+    };
+
+    (prefix, suffix)
+}
+
+fn soundex_match(left: &str, right: &str) -> bool {
+    soundex_code(left) == soundex_code(right)
+}
+
+fn soundex_code(input: &str) -> String {
+    let mut chars = input.chars().filter(|ch| ch.is_ascii_alphabetic());
+    let Some(first) = chars.next() else {
+        return String::new();
+    };
+
+    let mut out = String::new();
+    out.push(first.to_ascii_uppercase());
+    let mut previous = Some(soundex_digit(first));
+
+    for ch in chars {
+        let digit = soundex_digit(ch);
+        if digit == b'0' {
+            continue;
+        }
+        if Some(digit) != previous {
+            out.push(digit as char);
+            previous = Some(digit);
+        }
+    }
+
+    while out.len() < 4 {
+        out.push('0');
+    }
+    out.truncate(4);
+    out
+}
+
+fn soundex_digit(ch: char) -> u8 {
+    match ch.to_ascii_uppercase() {
+        'B' | 'F' | 'P' | 'V' => b'1',
+        'C' | 'G' | 'J' | 'K' | 'Q' | 'S' | 'X' | 'Z' => b'2',
+        'D' | 'T' => b'3',
+        'L' => b'4',
+        'M' | 'N' => b'5',
+        'R' => b'6',
+        _ => b'0',
+    }
 }
 
 pub fn hit_pairs(text: &str, pairs: &[LexiconPair], blocking: &[String]) -> Vec<LexiconPair> {
@@ -516,13 +909,33 @@ pub fn collect_ranked_terms(
     terms
 }
 
+pub fn keywords_for_asr(terms: &[RankedTerm], max: usize) -> Vec<String> {
+    let mut keywords = Vec::new();
+    for term in terms {
+        if keywords.len() >= max {
+            break;
+        }
+        let raw = term.term.as_str();
+        if raw.contains('<') || raw.contains('>') || raw.contains('\n') || raw.contains('\r') {
+            continue;
+        }
+        let item = raw.trim();
+        if item.is_empty() || item.contains("不要翻译") {
+            continue;
+        }
+        keywords.push(item.to_owned());
+    }
+    keywords
+}
+
+#[cfg(test)]
 pub fn build_asr_prompt(
     dictionary: &[String],
     policy: Option<&ContextPolicy>,
     pairs: &[LearnPairRecord],
     scope: Option<&PromptScope>,
 ) -> Option<String> {
-    build_asr_prompt_shaped(
+    build_asr_prompt_bundle(
         dictionary,
         policy,
         pairs,
@@ -530,39 +943,118 @@ pub fn build_asr_prompt(
         AsrPromptShape::WhisperTranscript,
         None,
     )
+    .prompt
 }
 
+#[cfg(test)]
 pub fn build_asr_prompt_shaped(
+    dictionary: &[String],
+    policy: Option<&ContextPolicy>,
+    pairs: &[LearnPairRecord],
+    scope: Option<&PromptScope>,
+    shape: AsrPromptShape,
+    screen: Option<&ScreenTextContext>,
+) -> Option<String> {
+    build_asr_prompt_bundle(dictionary, policy, pairs, scope, shape, screen).prompt
+}
+
+pub fn build_asr_prompt_bundle(
     dictionary: &[String],
     _policy: Option<&ContextPolicy>,
     pairs: &[LearnPairRecord],
     scope: Option<&PromptScope>,
     shape: AsrPromptShape,
     screen: Option<&ScreenTextContext>,
-) -> Option<String> {
+) -> AsrPromptBundle {
+    build_asr_prompt_bundle_with_permissions(
+        dictionary,
+        _policy,
+        pairs,
+        scope,
+        shape,
+        screen,
+        crate::context::ContextSourcePermissions {
+            ax_text: true,
+            local_ocr: true,
+            cloud_vision: true,
+            context_text_to_providers: true,
+        },
+    )
+}
+
+pub fn build_asr_prompt_bundle_with_permissions(
+    dictionary: &[String],
+    _policy: Option<&ContextPolicy>,
+    pairs: &[LearnPairRecord],
+    scope: Option<&PromptScope>,
+    shape: AsrPromptShape,
+    screen: Option<&ScreenTextContext>,
+    screen_permissions: crate::context::ContextSourcePermissions,
+) -> AsrPromptBundle {
     let ranked = collect_ranked_terms(dictionary, pairs, scope);
+    if matches!(
+        shape,
+        AsrPromptShape::GptTranscribeKeywords | AsrPromptShape::MistralContextBias
+    ) {
+        let mut keywords = keywords_for_asr(&ranked, MAX_CONTEXT_TERMS);
+        if let Some(screen) = screen {
+            for term in screen.asr_terms(screen_permissions) {
+                if keywords.len() >= MAX_CONTEXT_TERMS {
+                    break;
+                }
+                if !keywords.contains(&term)
+                    && !term.contains(['<', '>'])
+                    && !term.contains(['\n', '\r'])
+                    && !term.trim().is_empty()
+                {
+                    keywords.push(term);
+                }
+            }
+        }
+        return AsrPromptBundle {
+            prompt: (shape == AsrPromptShape::GptTranscribeKeywords)
+                .then(|| GPT_TRANSCRIBE_SCENE.to_owned()),
+            keywords,
+        };
+    }
+    AsrPromptBundle {
+        prompt: weave_shaped_prompt(ranked, shape, screen, screen_permissions),
+        keywords: Vec::new(),
+    }
+}
+
+fn weave_shaped_prompt(
+    ranked: Vec<RankedTerm>,
+    shape: AsrPromptShape,
+    screen: Option<&ScreenTextContext>,
+    screen_permissions: crate::context::ContextSourcePermissions,
+) -> Option<String> {
     let glue_tokens = match shape {
         AsrPromptShape::WhisperTranscript => estimate_prompt_tokens("今天下午在看文档。不要翻译。"),
-        AsrPromptShape::ContextTerms => 0,
+        AsrPromptShape::ContextTerms
+        | AsrPromptShape::GptTranscribeKeywords
+        | AsrPromptShape::MistralContextBias => 0,
     };
     let budget = MAX_ASR_PROMPT_TOKENS.saturating_sub(glue_tokens);
     if budget == 0 {
         return match shape {
             AsrPromptShape::WhisperTranscript => Some(ASR_EMPTY_SEED.to_owned()),
-            AsrPromptShape::ContextTerms => None,
+            AsrPromptShape::ContextTerms
+            | AsrPromptShape::GptTranscribeKeywords
+            | AsrPromptShape::MistralContextBias => None,
         };
     }
 
     let mut screen_kept = Vec::new();
     let mut screen_used = 0usize;
     if let Some(screen) = screen {
-        for token in &screen.tokens {
-            let cost = estimate_prompt_tokens(token) + usize::from(!screen_kept.is_empty()) * 2;
+        for token in screen.asr_terms(screen_permissions) {
+            let cost = estimate_prompt_tokens(&token) + usize::from(!screen_kept.is_empty()) * 2;
             if screen_used.saturating_add(cost) > budget {
                 break;
             }
             screen_used = screen_used.saturating_add(cost);
-            screen_kept.push(token.clone());
+            screen_kept.push(token);
         }
     }
     let budget = budget.saturating_sub(screen_used);
@@ -642,6 +1134,8 @@ fn fit_woven_prompt(mut terms: Vec<String>, shape: AsrPromptShape) -> Option<Str
             }
             None
         }
+        AsrPromptShape::MistralContextBias => None,
+        AsrPromptShape::GptTranscribeKeywords => Some(GPT_TRANSCRIBE_SCENE.to_owned()),
     }
 }
 
@@ -984,9 +1478,13 @@ mod tests {
             bundle_id: None,
             executable: None,
             browser_host: None,
+            browser_path_prefix: None,
+            focused_field: None,
+            source_permissions: Default::default(),
             style_example_input: None,
             style_example_output: None,
             style_example_pairs: Vec::new(),
+            style_examples_approved: false,
             enabled: true,
             cleanup_effort: None,
             cleanup_intensity: None,
@@ -1013,6 +1511,62 @@ mod tests {
             ignored: false,
             promote_hits: 0,
         }
+    }
+
+    fn ranked(term: &str) -> RankedTerm {
+        RankedTerm {
+            term: term.into(),
+            pinned: false,
+            scope_score: 0,
+            last_used_at: None,
+            hits: 0,
+        }
+    }
+
+    #[test]
+    fn keywords_for_asr_strips_forbidden_and_caps() {
+        let mut terms = vec![
+            ranked("晓雯"),
+            ranked("不要翻译"),
+            ranked("foo<bar>"),
+            ranked("bad>item"),
+            ranked("line\nbreak"),
+            ranked("知乎"),
+        ];
+        for index in 0..80 {
+            terms.push(ranked(&format!("词{index}")));
+        }
+        let keywords = keywords_for_asr(&terms, 64);
+        assert!(!keywords.iter().any(|item| item.contains("foo<bar>")));
+        assert!(!keywords.iter().any(|item| item.contains('<')));
+        assert!(!keywords.iter().any(|item| item.contains('>')));
+        assert!(!keywords.iter().any(|item| item.contains('\n')));
+        assert!(!keywords.iter().any(|item| item.contains("不要翻译")));
+        assert_eq!(keywords.first().map(String::as_str), Some("晓雯"));
+        assert!(keywords.contains(&"知乎".to_owned()));
+        assert_eq!(keywords.len(), 64);
+    }
+
+    #[test]
+    fn keywords_for_asr_discards_original_term_with_newline_or_cr() {
+        let keywords = keywords_for_asr(
+            &[
+                ranked("foo\n"),
+                ranked("bar\r"),
+                ranked("  baz\n  "),
+                ranked("ok"),
+            ],
+            64,
+        );
+        assert_eq!(keywords, vec!["ok"]);
+        assert!(!keywords.iter().any(|item| item == "foo"));
+        assert!(!keywords.iter().any(|item| item == "bar"));
+        assert!(!keywords.iter().any(|item| item == "baz"));
+    }
+
+    #[test]
+    fn keywords_for_asr_max_zero_returns_empty() {
+        assert!(keywords_for_asr(&[ranked("晓雯")], 0).is_empty());
     }
 
     #[test]
@@ -1042,6 +1596,62 @@ mod tests {
         assert_eq!(
             apply_lexicon_replacements("学配森和派森", &pairs, &[]),
             "学Python和Python"
+        );
+    }
+
+    #[test]
+    fn replacement_usage_counts_actual_selected_rules_once_per_term() {
+        let rules = [
+            LexiconPair::new("type", "kind"),
+            LexiconPair::new("type script", "TypeScript"),
+            LexiconPair::new("配森", "Python"),
+        ];
+        let (text, used) =
+            apply_lexicon_replacements_with_usage("use type script and 配森配森", &rules, &[]);
+        assert_eq!(text, "use TypeScript and PythonPython");
+        assert_eq!(used, vec!["Python", "TypeScript"]);
+        assert!(
+            apply_lexicon_replacements_with_usage("TypeScript Python prototype", &rules, &[])
+                .1
+                .is_empty()
+        );
+        assert!(apply_lexicon_replacements_with_usage(
+            "点击超链接",
+            &[LexiconPair::new("链接", "link")],
+            &["超链接".into()]
+        )
+        .1
+        .is_empty());
+    }
+
+    #[test]
+    fn usage_only_includes_live_dictionary_replacements_including_phonetic_rules() {
+        let pair = live_pair("知呼", "知乎", "personal_chat", 3);
+        let (text, used) = apply_promoted_replacements_with_usage(
+            "今天去之乎看看",
+            std::slice::from_ref(&pair),
+            &["知乎".into()],
+        );
+        assert_eq!(text, "今天去知乎看看");
+        assert_eq!(used, vec!["知乎"]);
+        assert!(apply_promoted_replacements_with_usage(
+            "知乎",
+            std::slice::from_ref(&pair),
+            &["知乎".into()]
+        )
+        .1
+        .is_empty());
+        assert!(
+            apply_promoted_replacements_with_usage("知呼", std::slice::from_ref(&pair), &[])
+                .1
+                .is_empty()
+        );
+        let mut ignored = pair;
+        ignored.ignored = true;
+        assert!(
+            apply_promoted_replacements_with_usage("知呼", &[ignored], &["知乎".into()])
+                .1
+                .is_empty()
         );
     }
 
@@ -1225,6 +1835,39 @@ mod tests {
             asr_prompt_shape_for(crate::providers::EngineProvider::Deepgram, "nova-3"),
             AsrPromptShape::ContextTerms
         );
+        assert_eq!(
+            asr_prompt_shape_for(crate::providers::EngineProvider::OpenAi, "gpt-transcribe"),
+            AsrPromptShape::GptTranscribeKeywords
+        );
+        assert_eq!(
+            asr_prompt_shape_for(
+                crate::providers::EngineProvider::OpenAi,
+                "gpt-transcribe-latest"
+            ),
+            AsrPromptShape::GptTranscribeKeywords
+        );
+        assert_eq!(
+            asr_prompt_shape_for(
+                crate::providers::EngineProvider::OpenAi,
+                "gpt-4o-mini-transcribe"
+            ),
+            AsrPromptShape::WhisperTranscript
+        );
+    }
+
+    #[test]
+    fn asr_prompt_shape_on_device_is_context_terms() {
+        assert_eq!(
+            asr_prompt_shape_for(
+                crate::providers::EngineProvider::OnDevice,
+                "sensevoice-small"
+            ),
+            AsrPromptShape::ContextTerms
+        );
+        assert_eq!(
+            asr_prompt_shape_for(crate::providers::EngineProvider::OnDevice, "whisper-1"),
+            AsrPromptShape::ContextTerms
+        );
     }
 
     #[test]
@@ -1265,6 +1908,113 @@ mod tests {
     }
 
     #[test]
+    fn gpt_transcribe_prompt_is_a_short_scene_with_ranked_keywords() {
+        let dictionary = vec!["晓雯".into(), "知乎".into(), "TypeScript".into()];
+        let pairs = vec![
+            live_pair("小文", "晓雯", "work_chat", 1),
+            live_pair("知呼", "知乎", "personal_chat", 5),
+            live_pair("类型脚本", "TypeScript", "personal_chat", 9),
+        ];
+        let scope = PromptScope {
+            family: Some("personal_chat".into()),
+            mapping_id: None,
+            browser_host: None,
+        };
+        let bundle = build_asr_prompt_bundle(
+            &dictionary,
+            None,
+            &pairs,
+            Some(&scope),
+            AsrPromptShape::GptTranscribeKeywords,
+            None,
+        );
+        let prompt = bundle.prompt.expect("gpt-transcribe keeps a short scene");
+        assert!(
+            prompt.contains("中英混合听写"),
+            "gpt-transcribe scene should mark mixed dictation: {prompt}"
+        );
+        assert!(
+            !prompt.contains("晓雯"),
+            "proper nouns belong in keywords, not the scene: {prompt}"
+        );
+        assert!(
+            !prompt.contains("知乎"),
+            "proper nouns belong in keywords, not the scene: {prompt}"
+        );
+        assert!(
+            !prompt.contains("晓雯今天下午在知乎看文档"),
+            "do not weave a fake Whisper transcript: {prompt}"
+        );
+        assert!(bundle.keywords.contains(&"晓雯".to_owned()));
+        assert!(bundle.keywords.contains(&"知乎".to_owned()));
+        assert!(bundle.keywords.contains(&"TypeScript".to_owned()));
+    }
+
+    #[test]
+    fn gpt_transcribe_keywords_include_only_bounded_granted_screen_terms() {
+        let ctx = crate::screen_text::extract_from_fixture(&crate::screen_text::AxWindowFixture {
+            family: ContextFamily::PersonalChat,
+            focus_kind: crate::context::FocusKind::Chat,
+            known_ide: false,
+            counterpart: Some("晓雯".into()),
+            bubbles: vec!["在吗".into()],
+            email_recipients: Vec::new(),
+            email_subject: None,
+            ide_filenames: Vec::new(),
+            ide_symbols: Vec::new(),
+            selected_text: None,
+            document_name: None,
+            focused_role: "AXTextField".into(),
+            secure: false,
+            banking_preset: false,
+            window_title: "晓雯 - 微信".into(),
+            raw_url: Some("https://wx.qq.com/chat/secret".into()),
+            pid: 4242,
+        });
+        let bundle = build_asr_prompt_bundle(
+            &["TypeScript".into()],
+            None,
+            &[],
+            None,
+            AsrPromptShape::GptTranscribeKeywords,
+            Some(&ctx),
+        );
+        assert!(bundle.keywords.contains(&"TypeScript".into()));
+        assert!(bundle.keywords.contains(&"晓雯".into()));
+        // The legacy test builder has an explicit all-source grant; production
+        // requests use the permission-aware builder and a bound session.
+        let granted = build_asr_prompt_bundle_with_permissions(
+            &["TypeScript".into()],
+            None,
+            &[],
+            None,
+            AsrPromptShape::GptTranscribeKeywords,
+            Some(&ctx),
+            crate::context::ContextSourcePermissions {
+                ax_text: true,
+                context_text_to_providers: true,
+                ..Default::default()
+            },
+        );
+        assert!(granted.keywords.contains(&"晓雯".into()));
+        assert!(!granted.keywords.iter().any(|term| term == "在吗"));
+        let denied = build_asr_prompt_bundle_with_permissions(
+            &["TypeScript".into()],
+            None,
+            &[],
+            None,
+            AsrPromptShape::GptTranscribeKeywords,
+            Some(&ctx),
+            crate::context::ContextSourcePermissions {
+                ax_text: true,
+                context_text_to_providers: false,
+                ..Default::default()
+            },
+        );
+        assert_eq!(denied.keywords, vec!["TypeScript"]);
+    }
+
+    #[test]
     fn asr_prompt_for_context_engines_is_a_term_list() {
         let dictionary = vec!["晓雯".into(), "知乎".into(), "TypeScript".into()];
         let pairs = vec![
@@ -1302,6 +2052,8 @@ mod tests {
     fn asr_prompt_puts_screen_tokens_first_without_secrets() {
         let ctx = crate::screen_text::extract_from_fixture(&crate::screen_text::AxWindowFixture {
             family: ContextFamily::PersonalChat,
+            focus_kind: crate::context::FocusKind::Chat,
+            known_ide: false,
             counterpart: Some("晓雯".into()),
             bubbles: vec!["在吗".into()],
             email_recipients: Vec::new(),
@@ -1582,9 +2334,13 @@ mod tests {
             bundle_id: None,
             executable: None,
             browser_host: Some("company.myworkday.com".into()),
+            browser_path_prefix: None,
+            focused_field: None,
+            source_permissions: Default::default(),
             style_example_input: None,
             style_example_output: None,
             style_example_pairs: Vec::new(),
+            style_examples_approved: false,
             enabled: true,
             cleanup_effort: None,
             cleanup_intensity: None,
@@ -1601,7 +2357,7 @@ mod tests {
 
     #[test]
     fn mapping_can_disable_learning() {
-        let mapping = AppMapping {
+        let mut mapping = AppMapping {
             id: "wechat".into(),
             label: "微信".into(),
             family: ContextFamily::PersonalChat,
@@ -1609,15 +2365,55 @@ mod tests {
             bundle_id: Some("com.tencent.xinWeChat".into()),
             executable: None,
             browser_host: None,
+            browser_path_prefix: None,
+            focused_field: None,
+            source_permissions: Default::default(),
             style_example_input: None,
             style_example_output: None,
             style_example_pairs: Vec::new(),
+            style_examples_approved: false,
             enabled: true,
             cleanup_effort: None,
             cleanup_intensity: None,
             cleanup_enabled: true,
             dictionary_learn_enabled: false,
         };
+        assert!(!mapping_allows_learn(&[mapping.clone()], "user.wechat"));
+        mapping.enabled = false;
+        mapping.dictionary_learn_enabled = true;
         assert!(!mapping_allows_learn(&[mapping], "user.wechat"));
+    }
+}
+
+#[cfg(test)]
+mod fuzzy_regressions {
+    use super::*;
+    #[test]
+    fn fuzzy_only_matches_unprotected_words_on_same_line() {
+        let dictionary = vec!["TypeScript".into()];
+        assert_eq!(
+            apply_ascii_fuzzy_dictionary("type script", &dictionary),
+            "TypeScript"
+        );
+        for input in [
+            "type\nscript",
+            "type\r\nscript",
+            "type\tscript",
+            "type\u{b}script",
+            "type\u{c}script",
+            "type\u{85}script",
+            "type\u{2028}script",
+            "type\u{2029}script",
+            "https://type.script",
+            "/type/script",
+            "`type script`",
+            "12345 中文",
+        ] {
+            assert_eq!(
+                apply_ascii_fuzzy_dictionary(input, &dictionary),
+                input,
+                "{input}"
+            );
+        }
     }
 }

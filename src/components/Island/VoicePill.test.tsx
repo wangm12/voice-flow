@@ -4,6 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { VoicePill } from "./VoicePill";
 import { HUD_LABEL_FADE_MS, HUD_LABEL_OUT_MS, HUD_ORB_FADE_MS } from "./hudOrb";
 import { CONTEXT_LABEL_VISIBLE_MS } from "./voicePillTokens";
+import { I18nProvider } from "../../lib/i18n";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 
@@ -16,6 +17,44 @@ afterEach(() => {
 });
 
 describe("VoicePill", () => {
+  it("shows a short next step while announcing the full English delivery reason", () => {
+    render(
+      <I18nProvider initialLanguage="en">
+        <VoicePill state="copied" fallbackReason="clipboard_changed" contextLabel={null} waveformLevels={[]} progress={1} reduced />
+      </I18nProvider>,
+    );
+    expect(document.querySelector(".voice-pill-caption__text")).toHaveTextContent(
+      "Check the input field; copy from History if needed.",
+    );
+    expect(screen.getByRole("status").getAttribute("aria-label")).toContain(
+      "Another app updated the clipboard, so its newer contents were kept.",
+    );
+  });
+
+  it("keeps the English stop instruction first in a wide recording-limit caption", () => {
+    render(
+      <I18nProvider initialLanguage="en">
+        <VoicePill state="recording_limited" contextLabel="A very long application name · A custom writing template" waveformLevels={[]} progress={0} reduced />
+      </I18nProvider>,
+    );
+    const caption = document.querySelector(".voice-pill-caption");
+    expect(caption).toHaveClass("voice-pill-caption--wide");
+    expect(caption).toHaveStyle({ maxWidth: "360px" });
+    expect(caption?.textContent).toMatch(/^Limit reached · press hotkey to stop/);
+  });
+
+  it("uses the wide caption band for full-recording recovery", () => {
+    render(<VoicePill state="processing" phase="soniox_recovery" contextLabel={null} waveformLevels={[]} progress={0.35} reduced />);
+    expect(document.querySelector(".voice-pill-caption")).toHaveClass("voice-pill-caption--wide");
+    expect(document.querySelector(".voice-pill-caption")).toHaveTextContent("正在重新转写完整录音");
+  });
+
+  it("keeps delivery undo passive even when its backend transaction is available", () => {
+    render(<VoicePill state="done" undoAvailable contextLabel={null} waveformLevels={[]} progress={1} reduced />);
+    expect(screen.queryByRole("button")).not.toBeInTheDocument();
+    expect(invokeMock).not.toHaveBeenCalled();
+  });
+
   it("keeps in-progress words off the HUD while recording", () => {
     render(
       <VoicePill
@@ -188,7 +227,7 @@ describe("VoicePill", () => {
     expect(document.querySelector(".voice-pill__orb")?.getAttribute("data-orb-state")).toBe("shaping");
     expect(document.querySelector(".voice-pill__label")).toHaveTextContent("Thinking…");
     expect(document.querySelector(".voice-pill__dots--thinking")).not.toBeInTheDocument();
-    expect(document.querySelector("[data-beam-size='line']")?.getAttribute("data-beam-color")).toBe("colorful");
+    expect(document.querySelector("[data-beam-size='line']")?.getAttribute("data-beam-color")).toBe("mono");
     expect(document.querySelector("[data-beam-size='line']")?.getAttribute("data-beam-size")).toBe("line");
     expect(document.querySelector("[data-beam-size='line']")?.getAttribute("data-beam-strength")).toBe("0.7");
   });
@@ -265,8 +304,13 @@ describe("VoicePill", () => {
       />,
     );
 
-    expect(screen.getByRole("status")).toHaveAttribute("aria-label", "已复制，请按 ⌘V");
-    expect(screen.queryByText("已复制，请按 ⌘V")).not.toBeInTheDocument();
+    expect(screen.getByRole("status")).toHaveAttribute(
+      "aria-label",
+      "输入状态无法确认，未重复粘贴；请检查输入框和历史记录",
+    );
+    expect(
+      screen.getByText("先检查输入框；需要时从历史记录复制"),
+    ).toBeInTheDocument();
     expect(document.querySelector(".voice-pill--unverified")).toBeInTheDocument();
     expect(document.querySelector(".voice-pill__orb")).not.toBeInTheDocument();
     expect(document.querySelector(".voice-pill__label")).toHaveTextContent("Copied");
@@ -316,7 +360,9 @@ describe("VoicePill", () => {
       />,
     );
     expect(document.querySelector(".voice-pill-stack")).not.toHaveClass("voice-pill-stack--exit");
-    expect(document.querySelector(".voice-pill-caption")).not.toBeInTheDocument();
+    expect(document.querySelector(".voice-pill-caption")).toHaveTextContent(
+      "先检查输入框；需要时从历史记录复制",
+    );
   });
 
   it("renders exception captions only for limited, rate-limited, degraded, and error states", () => {
@@ -477,7 +523,7 @@ describe("VoicePill", () => {
     expect(screen.queryByRole("button", { name: "停止录音" })).not.toBeInTheDocument();
     expect(document.querySelector(".voice-pill__orb")).toBeInTheDocument();
     expect(document.querySelector(".voice-pill__label")).toHaveTextContent("Listening…");
-    expect(document.querySelector("[data-beam-size='md']")?.getAttribute("data-beam-color")).toBe("colorful");
+    expect(document.querySelector("[data-beam-size='md']")?.getAttribute("data-beam-color")).toBe("mono");
     expect(document.querySelector("[data-beam-size='md']")?.getAttribute("data-beam-size")).toBe("md");
     expect(document.querySelector("[data-beam-size='md']")?.getAttribute("data-beam-active")).toBe("false");
   });
@@ -511,7 +557,7 @@ describe("VoicePill", () => {
       />,
     );
 
-    expect(document.querySelector(".voice-pill-caption")).toHaveTextContent("输入目标已变化，文字已复制到剪贴板，请手动粘贴");
+    expect(document.querySelector(".voice-pill-caption")).toHaveTextContent("已复制，请手动粘贴");
     expect(document.querySelector(".voice-pill-caption")).toHaveClass("voice-pill-caption--wide");
     expect(document.querySelector(".voice-pill-caption")).toHaveStyle({ maxWidth: "360px" });
     expect(screen.getByRole("status").getAttribute("aria-label") ?? "").toContain("输入目标已变化");
@@ -615,7 +661,7 @@ describe("VoicePill", () => {
     });
     expect(document.querySelector(".voice-pill__label--out")).not.toBeInTheDocument();
     expect(document.querySelector(".voice-pill__label--in")).toHaveTextContent("Copied");
-    expect(document.querySelector(".voice-pill-caption")).toHaveTextContent("已复制到剪贴板，请手动粘贴");
+    expect(document.querySelector(".voice-pill-caption")).toHaveTextContent("已复制，请手动粘贴");
     expect(document.querySelector(".voice-pill-caption")).toHaveClass("voice-pill-caption--reveal");
 
     act(() => {
@@ -668,12 +714,16 @@ describe("VoicePill", () => {
     expect(document.querySelector(".voice-pill-caption")).toHaveTextContent("Cursor · Code");
     expect(document.querySelector(".voice-pill-caption")).toHaveClass("voice-pill-caption--exit");
     expect(document.querySelector(".voice-pill-caption")).not.toHaveClass("voice-pill-caption--warning");
-    expect(document.querySelector(".voice-pill-caption")).not.toHaveTextContent("已复制，请按 ⌘V");
+    expect(document.querySelector(".voice-pill-caption")).not.toHaveTextContent(
+      "先检查输入框；需要时从历史记录复制",
+    );
 
     act(() => {
       vi.advanceTimersByTime(HUD_LABEL_OUT_MS);
     });
-    expect(document.querySelector(".voice-pill-caption")).toHaveTextContent("已复制，请按 ⌘V");
+    expect(document.querySelector(".voice-pill-caption")).toHaveTextContent(
+      "先检查输入框；需要时从历史记录复制",
+    );
     expect(document.querySelector(".voice-pill-caption")).toHaveClass("voice-pill-caption--reveal");
     expect(document.querySelector(".voice-pill--unverified")).toBeInTheDocument();
   });
@@ -694,7 +744,7 @@ describe("VoicePill", () => {
     expect(document.querySelector(".voice-pill__label")).toHaveTextContent("Done");
   });
 
-  it("keeps the colorful md beam while listening and switches to a colorful line beam while thinking", () => {
+  it("keeps the monochrome md beam while listening and switches to a monochrome line beam while thinking", () => {
     vi.useFakeTimers();
     const { rerender } = render(
       <VoicePill
@@ -710,7 +760,7 @@ describe("VoicePill", () => {
     const thinkBeam = document.querySelector("[data-beam-size='line']");
     expect(listenBeam).toBeInstanceOf(HTMLElement);
     expect(thinkBeam).toBeInstanceOf(HTMLElement);
-    expect(listenBeam?.getAttribute("data-beam-color")).toBe("colorful");
+    expect(listenBeam?.getAttribute("data-beam-color")).toBe("mono");
     expect(listenBeam?.getAttribute("data-beam-size")).toBe("md");
     expect(listenBeam?.getAttribute("data-beam-strength")).toBe("1");
     expect(listenBeam?.getAttribute("data-beam-duration")).toBe("3.2");
@@ -733,7 +783,7 @@ describe("VoicePill", () => {
     );
     expect(document.querySelectorAll("[data-border-beam]")).toHaveLength(2);
     expect(listenBeam?.getAttribute("data-beam-active")).toBe("false");
-    expect(thinkBeam?.getAttribute("data-beam-color")).toBe("colorful");
+    expect(thinkBeam?.getAttribute("data-beam-color")).toBe("mono");
     expect(thinkBeam?.getAttribute("data-beam-size")).toBe("line");
     expect(thinkBeam?.getAttribute("data-beam-strength")).toBe("0.7");
     expect(thinkBeam?.getAttribute("data-beam-active")).toBe("true");

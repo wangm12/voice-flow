@@ -1,14 +1,22 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type EventCallback, type UnlistenFn } from "@tauri-apps/api/event";
+import { tryItHint } from "../../lib/activationCopy";
+import { formatHotkeyDisplay } from "../../lib/hotkeyFormat";
 import { VoicePill } from "./VoicePill";
+import { voicePillLearnToastHeight } from "./voicePillTokens";
 import { WAVEFORM_BAR_COUNT } from "./VoiceWaveform";
 import { useReducedMotionPreference } from "./springs";
-import { formatHudContextLabel, formatHudIntensityLabel } from "../../lib/hudContextLabel";
+import { formatHudContextLabel, formatHudContextSource, formatHudIntensityLabel, formatHudTranslationLabel, type HudContextSource } from "../../lib/hudContextLabel";
 import { useI18n } from "../../lib/i18n";
 
 type DictationState = "idle" | "starting" | "recording" | "recording_limited" | "processing" | "rate_limited" | "done" | "unverified" | "copied" | "degraded" | "history" | "error";
-type ProcessingPhase = "finalizing_audio" | "asr" | "cascade_accurate" | "cleanup" | "delivery" | "waiting_retry" | "idle";
+type ProcessingPhase = "finalizing_audio" | "asr" | "soniox_recovery" | "cascade_accurate" | "cleanup" | "delivery" | "waiting_retry" | "idle";
+type ContextSourcePayload = {
+  source: HudContextSource;
+  label: string;
+  matched_rule_label?: string | null;
+};
 type HudState = {
   sessionGeneration: number;
   state: DictationState;
@@ -18,7 +26,9 @@ type HudState = {
   contextApp: string | null;
   contextStyle: string | null;
   contextLabel: string | null;
+  contextSource: HudContextSource | null;
   cleanupIntensity: "off" | "light" | "standard" | "heavy" | null;
+  translationTargetLanguage: string | null;
   fallbackReason: string | null;
   waveformLevels: number[];
   progress: number;
@@ -26,7 +36,15 @@ type HudState = {
   totalChunks: number | null;
   selectedActionState: string | null;
   partialText: string | null;
+  recordingMode: string | null;
+  recordingHotkey: string | null;
 };
+
+export function hudTranslationFromEvent(nextState: string, current: string | null, incoming?: string | null): string | null {
+  if (!["starting", "recording", "recording_limited", "processing", "rate_limited"].includes(nextState)) return null;
+  if (incoming !== undefined) return incoming;
+  return nextState === "starting" ? null : current;
+}
 
 function emptyWaveform(): number[] {
   return Array.from({ length: WAVEFORM_BAR_COUNT }, () => 0);
@@ -87,6 +105,7 @@ export function hudProgressForState(
   if (next === "rate_limited") return currentProgress;
   if (next !== "processing") return currentProgress;
   if (phase === "asr") return 0.35;
+  if (phase === "soniox_recovery") return 0.35;
   if (phase === "cascade_accurate") return 0.5;
   if (phase === "cleanup") return 0.65;
   if (phase === "delivery") return 0.9;
@@ -123,6 +142,20 @@ export function hudContextFromEvent(
   };
 }
 
+export function hudContextSourceFromEvent(
+  nextState: string,
+  current: HudContextSource | null,
+  incoming: { context_source?: ContextSourcePayload | null },
+  newGeneration = false,
+): HudContextSource | null {
+  if (nextState === "idle" || nextState === "starting" || nextState === "recording" || nextState === "recording_limited") return null;
+  if (incoming.context_source === undefined) return newGeneration ? null : current;
+  const source = incoming.context_source?.source;
+  return typeof source === "string" && (["none", "ax", "ocr", "cloud_vision"] as const).includes(source as HudContextSource)
+    ? source as HudContextSource
+    : null;
+}
+
 export function selectedActionStateForDictation(
   current: string | null,
   next: DictationState,
@@ -144,6 +177,11 @@ type LearnToast = { pair_key: string; pair_keys?: string[]; before: string; afte
 export function IslandWindow() {
   const { t } = useI18n();
   const [learnToast, setLearnToast] = useState<LearnToast | null>(null);
+  const hasLearnToast = learnToast != null;
+  const [learnUndoError, setLearnUndoError] = useState<string | null>(null);
+  const [learnUndoBusy, setLearnUndoBusy] = useState(false);
+  const learnToastRef = useRef(learnToast);
+  learnToastRef.current = learnToast;
   const [hud, setHud] = useState<HudState>({
     sessionGeneration: 0,
     state: "idle",
@@ -153,7 +191,9 @@ export function IslandWindow() {
     contextApp: null,
     contextStyle: null,
     contextLabel: null,
+    contextSource: null,
     cleanupIntensity: null,
+    translationTargetLanguage: null,
     fallbackReason: null,
     waveformLevels: emptyWaveform(),
     progress: 0,
@@ -161,6 +201,8 @@ export function IslandWindow() {
     totalChunks: null,
     selectedActionState: null,
     partialText: null,
+    recordingMode: null,
+    recordingHotkey: null,
   });
   const reduced = useReducedMotionPreference();
 
@@ -198,16 +240,26 @@ export function IslandWindow() {
             event.payload.total_chunks,
           );
           const context = hudContextFromEvent(next, current, event.payload);
+          const contextSource = hudContextSourceFromEvent(
+            next,
+            current.contextSource,
+            event.payload,
+            eventGeneration > current.sessionGeneration,
+          );
           const nextHud = {
             sessionGeneration: eventGeneration,
             state: next,
+            recordingMode: event.payload.recording_mode ?? null,
+            recordingHotkey: event.payload.recording_hotkey ?? null,
             phase,
             retryAfterSecs: event.payload.retry_after_secs ?? null,
             undoAvailable: event.payload.undo_available ?? false,
             contextApp: context.contextApp,
             contextStyle: context.contextStyle,
             contextLabel: context.contextLabel,
+            contextSource,
             cleanupIntensity: context.cleanupIntensity,
+            translationTargetLanguage: hudTranslationFromEvent(next, current.translationTargetLanguage, event.payload.translation_target_language),
             fallbackReason: next === "idle" ? null : event.payload.fallback_reason ?? null,
             // Audio starts before the final recording state is committed. Keep
             // the live waveform continuous through that short starting phase.
@@ -225,13 +277,17 @@ export function IslandWindow() {
           };
           return current.sessionGeneration === nextHud.sessionGeneration
             && current.state === nextHud.state
+            && current.recordingMode === nextHud.recordingMode
+            && current.recordingHotkey === nextHud.recordingHotkey
             && current.phase === nextHud.phase
             && current.retryAfterSecs === nextHud.retryAfterSecs
             && current.undoAvailable === nextHud.undoAvailable
             && current.contextApp === nextHud.contextApp
             && current.contextStyle === nextHud.contextStyle
             && current.contextLabel === nextHud.contextLabel
+            && current.contextSource === nextHud.contextSource
             && current.cleanupIntensity === nextHud.cleanupIntensity
+            && current.translationTargetLanguage === nextHud.translationTargetLanguage
             && current.fallbackReason === nextHud.fallbackReason
             && current.waveformLevels === nextHud.waveformLevels
             && current.progress === nextHud.progress
@@ -343,7 +399,9 @@ export function IslandWindow() {
       }));
     });
     register<LearnToast>("learn_pairs://promoted", (event) => {
+      learnToastRef.current = event.payload;
       setLearnToast(event.payload);
+      setLearnUndoError(null);
     });
 
     return () => {
@@ -354,40 +412,55 @@ export function IslandWindow() {
   }, []);
 
   useEffect(() => {
-    if (!learnToast) return;
+    if (!hasLearnToast) return;
     void invoke("set_island_learn_interactive", { interactive: true }).catch(() => undefined);
     return () => {
       void invoke("set_island_learn_interactive", { interactive: false }).catch(() => undefined);
     };
-  }, [learnToast]);
+  }, [hasLearnToast]);
 
   const dismissLearnToast = () => {
     setLearnToast(null);
+    setLearnUndoError(null);
     void invoke("hide_island_if_idle");
+  };
+
+  const undoLearning = async () => {
+    if (!learnToast || learnUndoBusy) return;
+    const toast = learnToast;
+    setLearnUndoBusy(true);
+    setLearnUndoError(null);
+    try {
+      await Promise.all((toast.pair_keys?.length ? toast.pair_keys : [toast.pair_key]).map((pairKey) => invoke("undo_learn_pair", { pairKey })));
+      if (learnToastRef.current === toast) dismissLearnToast();
+    } catch {
+      if (learnToastRef.current === toast) setLearnUndoError(t("撤销未完成，请重试。"));
+    } finally {
+      setLearnUndoBusy(false);
+    }
   };
 
   return (
     <div className="voice-pill-stage">
-      <VoicePill state={hud.state} phase={hud.phase} retryAfterSecs={hud.retryAfterSecs} undoAvailable={hud.undoAvailable} contextLabel={formatHudIntensityLabel(hud.contextApp, hud.cleanupIntensity, t) ?? formatHudContextLabel(hud.contextApp, hud.contextStyle, hud.contextLabel, t)} fallbackReason={hud.fallbackReason} selectedActionState={hud.selectedActionState} waveformLevels={hud.waveformLevels} progress={hud.progress} chunkProgress={hud.completedChunks != null && hud.totalChunks != null ? { completed: hud.completedChunks, total: hud.totalChunks } : null} partialText={hud.partialText} reduced={reduced} />
+      <VoicePill recordingHint={hud.recordingHotkey ? tryItHint(hud.recordingMode ?? "tap", formatHotkeyDisplay(hud.recordingHotkey), t) : null} state={hud.state} phase={hud.phase} retryAfterSecs={hud.retryAfterSecs} undoAvailable={hud.undoAvailable} contextLabel={formatHudTranslationLabel(hud.translationTargetLanguage, t) ?? formatHudIntensityLabel(hud.contextApp, hud.cleanupIntensity, t) ?? formatHudContextLabel(hud.contextApp, hud.contextStyle, hud.contextLabel, t)} contextSourceLabel={formatHudContextSource(hud.contextSource, t)} fallbackReason={hud.fallbackReason} selectedActionState={hud.selectedActionState} waveformLevels={hud.waveformLevels} progress={hud.progress} chunkProgress={hud.completedChunks != null && hud.totalChunks != null ? { completed: hud.completedChunks, total: hud.totalChunks } : null} partialText={hud.partialText} reduced={reduced} />
       {learnToast && (
-        <div role="status" className="island-learn-toast">
-          <span className="island-learn-toast__text">{t("已学")} {learnToast.before}→{learnToast.after}</span>
+        <div role="status" aria-label={learnUndoError ?? undefined} className="island-learn-toast" style={{ height: voicePillLearnToastHeight }}>
+          <span className="island-learn-toast__text" title={learnUndoError ?? `${t("已学")} ${learnToast.before}→${learnToast.after}`}>
+            {learnUndoError ? t("撤销未完成") : `${t("已学")} ${learnToast.before}→${learnToast.after}`}
+          </span>
           <button
             type="button"
             className="island-learn-toast__action"
-            onClick={() => {
-              void Promise.all((learnToast.pair_keys?.length ? learnToast.pair_keys : [learnToast.pair_key]).map((pairKey) => invoke("undo_learn_pair", { pairKey })))
-                .catch(() => undefined)
-                .then(() => dismissLearnToast());
-            }}
+            disabled={learnUndoBusy}
+            onClick={() => void undoLearning()}
           >
-            {t("撤销")}
+            {t(learnUndoError ? "重试撤销" : "撤销")}
           </button>
-          <button type="button" className="island-learn-toast__action" onClick={dismissLearnToast}>{t("关闭")}</button>
+          <button type="button" disabled={learnUndoBusy} className="island-learn-toast__action" onClick={dismissLearnToast}>{t("关闭")}</button>
         </div>
       )}
     </div>
   );
 }
 
-type DictationStatePayload = { state: DictationState; session_generation?: number; phase?: ProcessingPhase; retry_after_secs?: number; completed_chunks?: number; total_chunks?: number; cleanup_status?: string | null; undo_available?: boolean; context_id?: string; context_app?: string | null; context_style?: string | null; context_label?: string; cleanup_intensity?: "off" | "light" | "standard" | "heavy" | null; delivery_method?: string; fallback_reason?: string | null };
+type DictationStatePayload = { recording_mode?: string | null; recording_hotkey?: string | null; translation_target_language?: string | null; state: DictationState; session_generation?: number; phase?: ProcessingPhase; retry_after_secs?: number; completed_chunks?: number; total_chunks?: number; cleanup_status?: string | null; undo_available?: boolean; context_id?: string; context_app?: string | null; context_style?: string | null; context_label?: string; context_source?: ContextSourcePayload | null; cleanup_intensity?: "off" | "light" | "standard" | "heavy" | null; delivery_method?: string; fallback_reason?: string | null };

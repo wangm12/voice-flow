@@ -32,14 +32,26 @@ struct TokenMatch {
     to: &'static str,
 }
 
+pub(crate) struct AppliedPunctuation {
+    pub(crate) text: String,
+    pub(crate) consumed_syntax_ranges: Vec<std::ops::Range<usize>>,
+}
+
 /// Replace standalone spoken punctuation tokens. Surrounding chat is left as-is.
+#[cfg(test)]
 pub fn apply(text: &str) -> String {
-    let matches = standalone_matches(text);
+    apply_with_provenance(text).text
+}
+
+pub(crate) fn apply_with_provenance(text: &str) -> AppliedPunctuation {
+    let code_ranges = crate::spoken_layout::code_literal_ranges(text);
+    let matches = standalone_matches(text, &code_ranges);
     let quote_count = matches.iter().filter(|item| item.from == "引号").count();
     let drop_quotes = quote_count % 2 == 1;
     let mut quote_open = true;
     let mut out = String::with_capacity(text.len());
     let mut last = 0;
+    let mut consumed_syntax_ranges = Vec::new();
     for item in matches {
         if item.from == "引号" && drop_quotes {
             continue;
@@ -48,12 +60,14 @@ pub fn apply(text: &str) -> String {
         if item.from == "引号" {
             out.push_str(if quote_open { "「" } else { "」" });
             quote_open = !quote_open;
+            consumed_syntax_ranges.push(item.start..item.end);
             last = item.end;
         } else {
             while out.ends_with(char::is_whitespace) {
                 out.pop();
             }
             out.push_str(item.to);
+            consumed_syntax_ranges.push(item.start..item.end);
             last = if item.from.is_ascii() {
                 item.end
             } else {
@@ -62,7 +76,10 @@ pub fn apply(text: &str) -> String {
         }
     }
     out.push_str(&text[last..]);
-    out
+    AppliedPunctuation {
+        text: out,
+        consumed_syntax_ranges,
+    }
 }
 
 /// Add a light terminal mark on local-only cleanup. Skip command-like scenes.
@@ -76,21 +93,33 @@ pub fn ensure_terminal(text: &str, family: ContextFamily) -> String {
     ) {
         return text.to_owned();
     }
-    let trimmed = text.trim();
-    if trimmed.is_empty() || has_terminal_mark(trimmed) {
+    let leading_end = text.len() - text.trim_start().len();
+    let content_end = text.trim_end().len();
+    if content_end <= leading_end {
         return text.to_owned();
     }
-    if is_question(trimmed) {
-        let mark = if cjk_count(trimmed) > 0 { "？" } else { "?" };
-        return format!("{trimmed}{mark}");
+    let content = &text[leading_end..content_end];
+    if has_terminal_mark(content) {
+        return text.to_owned();
     }
-    if cjk_count(trimmed) >= 4 && cjk_count(trimmed) >= latin_letter_count(trimmed) {
-        return format!("{trimmed}。");
-    }
-    if looks_like_latin_sentence(trimmed) {
-        return format!("{trimmed}.");
-    }
-    text.to_owned()
+    let mark = if is_question(content) {
+        if cjk_count(content) > 0 {
+            "？"
+        } else {
+            "?"
+        }
+    } else if cjk_count(content) >= 4 && cjk_count(content) >= latin_letter_count(content) {
+        "。"
+    } else if looks_like_latin_sentence(content) {
+        "."
+    } else {
+        return text.to_owned();
+    };
+    format!(
+        "{}{content}{mark}{}",
+        &text[..leading_end],
+        &text[content_end..]
+    )
 }
 
 fn has_terminal_mark(text: &str) -> bool {
@@ -111,6 +140,7 @@ fn is_question(text: &str) -> bool {
         return true;
     }
     let lower = text.to_ascii_lowercase();
+    let do_not_imperative = lower == "do not" || lower.starts_with("do not ");
     lower.starts_with("what ")
         || lower.starts_with("why ")
         || lower.starts_with("how ")
@@ -119,7 +149,7 @@ fn is_question(text: &str) -> bool {
         || lower.starts_with("who ")
         || lower.starts_with("is ")
         || lower.starts_with("are ")
-        || lower.starts_with("do ")
+        || (!do_not_imperative && lower.starts_with("do "))
         || lower.starts_with("does ")
         || lower.starts_with("can ")
         || lower.starts_with("could ")
@@ -158,10 +188,19 @@ fn skip_leading_whitespace(text: &str, start: usize) -> usize {
     index
 }
 
-fn standalone_matches(text: &str) -> Vec<TokenMatch> {
+fn standalone_matches(text: &str, code_ranges: &[std::ops::Range<usize>]) -> Vec<TokenMatch> {
+    if contains_spoken_url_prefix(text) {
+        // Without a complete URL parser, changing one spoken delimiter can
+        // leave a partly punctuated literal that is harder to recognize.
+        return Vec::new();
+    }
     let mut matches = Vec::new();
     let mut index = 0;
     while index < text.len() {
+        if is_in_literal(text, index, code_ranges) {
+            index += text[index..].chars().next().map_or(1, char::len_utf8);
+            continue;
+        }
         if let Some(found) = match_token_at(text, index, "引号", "") {
             index = found.end;
             matches.push(found);
@@ -183,6 +222,29 @@ fn standalone_matches(text: &str) -> Vec<TokenMatch> {
         index += ch.len_utf8();
     }
     matches
+}
+
+fn is_in_literal(text: &str, index: usize, code_ranges: &[std::ops::Range<usize>]) -> bool {
+    crate::spoken_layout::is_inside_explicit_quote(text, index)
+        || code_ranges
+            .iter()
+            .any(|range| range.start <= index && index < range.end)
+}
+
+fn contains_spoken_url_prefix(text: &str) -> bool {
+    let words = text
+        .split_whitespace()
+        .map(|word| {
+            word.trim_matches(|ch: char| ch.is_ascii_punctuation())
+                .to_ascii_lowercase()
+        })
+        .collect::<Vec<_>>();
+    words.windows(4).any(|tokens| {
+        matches!(tokens[0].as_str(), "http" | "https")
+            && tokens[1] == "colon"
+            && tokens[2] == "slash"
+            && tokens[3] == "slash"
+    })
 }
 
 fn match_token_at(
@@ -399,6 +461,17 @@ mod tests {
     }
 
     #[test]
+    fn preserves_spoken_url_delimiters_without_partial_conversion() {
+        let input =
+            "Open https colon slash slash status dot example dot net slash incident slash 42";
+        assert_eq!(apply(input), input);
+        assert_eq!(
+            crate::prepare_spoken_transcript(input, ContextFamily::General, 0.9),
+            input
+        );
+    }
+
+    #[test]
     fn maps_standalone_colon_semicolon_and_dash() {
         assert_eq!(apply("会议纪要冒号预算"), "会议纪要：预算");
         assert_eq!(apply("风险分号依赖"), "风险；依赖");
@@ -450,6 +523,33 @@ mod tests {
         assert_eq!(
             ensure_terminal("什么", ContextFamily::PersonalChat),
             "什么？"
+        );
+        assert_eq!(
+            ensure_terminal("  你好世界\n", ContextFamily::PersonalChat),
+            "  你好世界。\n"
+        );
+    }
+
+    #[test]
+    fn local_terminal_mark_keeps_do_not_imperatives_as_statements() {
+        assert_eq!(
+            ensure_terminal(
+                "Do not reopen the incident until the owner replies",
+                ContextFamily::WorkChat,
+            ),
+            "Do not reopen the incident until the owner replies."
+        );
+        assert_eq!(
+            ensure_terminal("Do not send $900 to Maya", ContextFamily::PersonalChat),
+            "Do not send $900 to Maya."
+        );
+        assert_eq!(
+            ensure_terminal("Do you have the notes", ContextFamily::WorkChat),
+            "Do you have the notes?"
+        );
+        assert_eq!(
+            ensure_terminal("Do you have the notes?", ContextFamily::WorkChat),
+            "Do you have the notes?"
         );
     }
 }

@@ -7,6 +7,7 @@ use tauri::{AppHandle, Monitor};
 const PILL_WIDTH: f64 = 172.0;
 pub const PILL_WIDTH_WITH_PARTIAL: f64 = 400.0;
 const PILL_HEIGHT: f64 = 68.0;
+const PILL_HEIGHT_WITH_WARNING: f64 = 96.0;
 /// Gap between pill bottom edge and top of dock / screen edge.
 const BOTTOM_GAP: f64 = 12.0;
 /// Used only when the reported work area is the full frame and does not
@@ -18,6 +19,14 @@ pub fn pill_window_width(has_partial: bool) -> f64 {
         PILL_WIDTH_WITH_PARTIAL
     } else {
         PILL_WIDTH
+    }
+}
+
+pub fn pill_window_height(has_warning: bool) -> f64 {
+    if has_warning {
+        PILL_HEIGHT_WITH_WARNING
+    } else {
+        PILL_HEIGHT
     }
 }
 
@@ -46,12 +55,16 @@ pub struct IslandPlacement {
     pub height: f64,
 }
 
-fn placement_for_monitor(monitor: &Monitor, pill_width: f64) -> IslandPlacement {
+fn placement_for_monitor_with_height(
+    monitor: &Monitor,
+    pill_width: f64,
+    pill_height: f64,
+) -> IslandPlacement {
     let scale = monitor.scale_factor();
     let pos = monitor.position();
     let size = monitor.size();
     let work_area = monitor.work_area();
-    placement_for_monitor_rect(
+    placement_for_monitor_rect_with_height(
         ScreenRect {
             x: pos.x as f64,
             y: pos.y as f64,
@@ -66,6 +79,7 @@ fn placement_for_monitor(monitor: &Monitor, pill_width: f64) -> IslandPlacement 
         },
         scale,
         pill_width,
+        pill_height,
     )
 }
 
@@ -133,14 +147,34 @@ pub fn placement_for_cursor_screen(app: &AppHandle) -> IslandPlacement {
 }
 
 pub fn placement_for_cursor_screen_with_width(app: &AppHandle, pill_width: f64) -> IslandPlacement {
-    if let Some(monitor) = monitor_for_cursor(app).or_else(|| app.primary_monitor().ok().flatten())
-    {
-        return placement_for_monitor(&monitor, pill_width);
-    }
-
-    placement_for_monitor_at_scale_with_width(0.0, 0.0, 1440.0, 900.0, 1.0, 56.0, pill_width)
+    placement_for_cursor_screen_with_size(app, pill_width, PILL_HEIGHT)
 }
 
+pub fn placement_for_cursor_screen_with_size(
+    app: &AppHandle,
+    pill_width: f64,
+    pill_height: f64,
+) -> IslandPlacement {
+    if let Some(monitor) = monitor_for_cursor(app).or_else(|| app.primary_monitor().ok().flatten())
+    {
+        return placement_for_monitor_with_height(&monitor, pill_width, pill_height);
+    }
+
+    placement_for_monitor_at_scale_with_size(
+        ScreenRect {
+            x: 0.0,
+            y: 0.0,
+            width: 1440.0,
+            height: 900.0,
+        },
+        1.0,
+        56.0,
+        pill_width,
+        pill_height,
+    )
+}
+
+#[cfg(test)]
 fn placement_for_monitor_at_scale(
     origin_x: f64,
     origin_y: f64,
@@ -160,6 +194,7 @@ fn placement_for_monitor_at_scale(
     )
 }
 
+#[cfg(test)]
 fn placement_for_monitor_at_scale_with_width(
     origin_x: f64,
     origin_y: f64,
@@ -169,21 +204,38 @@ fn placement_for_monitor_at_scale_with_width(
     dock_inset: f64,
     pill_width: f64,
 ) -> IslandPlacement {
-    placement_for_monitor_rect(
+    placement_for_monitor_at_scale_with_size(
         ScreenRect {
             x: origin_x,
             y: origin_y,
             width: monitor_width,
             height: monitor_height,
         },
+        scale,
+        dock_inset,
+        pill_width,
+        PILL_HEIGHT,
+    )
+}
+
+fn placement_for_monitor_at_scale_with_size(
+    frame: ScreenRect,
+    scale: f64,
+    dock_inset: f64,
+    pill_width: f64,
+    pill_height: f64,
+) -> IslandPlacement {
+    placement_for_monitor_rect_with_height(
+        frame,
         ScreenRect {
-            x: origin_x,
-            y: origin_y,
-            width: monitor_width,
-            height: monitor_height - dock_inset * scale,
+            x: frame.x,
+            y: frame.y,
+            width: frame.width,
+            height: frame.height - dock_inset * scale,
         },
         scale,
         pill_width,
+        pill_height,
     )
 }
 
@@ -203,15 +255,26 @@ fn work_area_above_dock(frame: ScreenRect, reported: ScreenRect, scale: f64) -> 
     }
 }
 
+#[cfg(test)]
 fn placement_for_monitor_rect(
     frame: ScreenRect,
     work_area: ScreenRect,
     scale: f64,
     pill_width: f64,
 ) -> IslandPlacement {
+    placement_for_monitor_rect_with_height(frame, work_area, scale, pill_width, PILL_HEIGHT)
+}
+
+fn placement_for_monitor_rect_with_height(
+    frame: ScreenRect,
+    work_area: ScreenRect,
+    scale: f64,
+    pill_width: f64,
+    pill_height: f64,
+) -> IslandPlacement {
     let work_area = work_area_above_dock(frame, work_area, scale);
     let width = pill_width * scale;
-    let height = PILL_HEIGHT * scale;
+    let height = pill_height * scale;
     let raw_x = work_area.x + (work_area.width - width) / 2.0;
     let raw_y = work_area.y + work_area.height - height - BOTTOM_GAP * scale;
     let min_x = frame.x;

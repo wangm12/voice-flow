@@ -1,6 +1,7 @@
 import { memo, useEffect, useRef, useState, type CSSProperties } from "react";
 import { BorderBeam } from "border-beam";
 import { useI18n } from "../../lib/i18n";
+import { deliveryReasonMessage } from "../../lib/deliveryCopy";
 import { VoiceHudOrb } from "./VoiceHudOrb";
 import {
   HUD_CAPTION_REVEAL_DELAY_MS,
@@ -42,7 +43,7 @@ function stateAriaLabel(state: DictationState, t: (source: string) => string): s
     case "history":
       return t("已保存到历史");
     case "unverified":
-      return t("已复制，请按 ⌘V");
+      return t("输入状态无法确认，未重复粘贴；请检查输入框和历史记录");
     case "degraded":
       return t("部分结果");
     case "error":
@@ -102,8 +103,10 @@ export const VoicePill = memo(function VoicePill({
   retryAfterSecs = null,
   undoAvailable: _undoAvailable = false,
   contextLabel,
+  contextSourceLabel = null,
   fallbackReason = null,
   selectedActionState = null,
+  recordingHint = null,
   waveformLevels,
   progress,
   chunkProgress: _chunkProgress,
@@ -115,8 +118,10 @@ export const VoicePill = memo(function VoicePill({
   retryAfterSecs?: number | null;
   undoAvailable?: boolean;
   contextLabel: string | null;
+  contextSourceLabel?: string | null;
   fallbackReason?: string | null;
   selectedActionState?: string | null;
+  recordingHint?: string | null;
   waveformLevels: number[];
   progress: number;
   chunkProgress?: {
@@ -172,9 +177,10 @@ export const VoicePill = memo(function VoicePill({
     { fallbackReason, selectedActionState, contextLabel: visibleContext, phase },
   );
   const showingPartial = false;
-  const wideCaption = voicePillCaptionNeedsWide(state, { fallbackReason });
-  const stackHidden = state === "idle" && !caption;
-  const showStackExit = isTerminal && !caption;
+  const wideCaption = voicePillCaptionNeedsWide(state, { fallbackReason, phase });
+  const hasContextSource = Boolean(contextSourceLabel?.trim()) && !fallbackReason;
+  const stackHidden = state === "idle" && !caption && !hasContextSource;
+  const showStackExit = isTerminal && !caption && !hasContextSource;
   const stackClassName = [
     "voice-pill-stack",
     stackHidden ? "voice-pill-stack--hidden" : "",
@@ -193,13 +199,20 @@ export const VoicePill = memo(function VoicePill({
       ? "warning"
       : "status";
   const statusLabel = stateAriaLabel(state, t);
-  const liveLabel = caption ? `${statusLabel}。${caption}` : statusLabel;
+  const statusDetails = [
+    deliveryReasonMessage(fallbackReason, t) ?? (state === "unverified" ? null : caption),
+    contextSourceLabel,
+    ["starting", "recording", "recording_limited"].includes(state) ? recordingHint : null,
+  ]
+    .filter((detail): detail is string => Boolean(detail) && detail !== statusLabel)
+    .join(" · ");
+  const liveLabel = statusDetails ? `${statusLabel}。${statusDetails}` : statusLabel;
   const orbConfig = hudOrbFor(state, phase, {
     reduced,
     level: perceptualLevel(waveformLevels),
     selectedActionState,
   });
-  const showOrb = shouldMountHudOrb(state, Boolean(caption)) && orbConfig != null;
+  const showOrb = shouldMountHudOrb(state, Boolean(caption) || hasContextSource) && orbConfig != null;
   const lastOrbRef = useRef<HudOrbConfig | null>(orbConfig);
   if (orbConfig) lastOrbRef.current = orbConfig;
   const [orbVisible, setOrbVisible] = useState(showOrb);
@@ -239,6 +252,26 @@ export const VoicePill = memo(function VoicePill({
   const holdTerminalChrome = captionReveal && !terminalCaptionOn && !reduced;
   const paintedCaption = holdTerminalChrome ? liveCaptionRef.current : caption;
   const paintedTone = holdTerminalChrome ? "status" : captionTone;
+  const warningCaption = Boolean(paintedCaption) && ["warning", "error"].includes(paintedTone);
+  const resultSavedToHistory = Boolean(fallbackReason) && [
+    "delivery_cancelled",
+    "clipboard_changed",
+    "clipboard_ownership_unverified",
+    "clipboard_unavailable",
+    "clipboard_write_failed",
+    "paste_mutation_uncertain",
+  ].includes(fallbackReason ?? "");
+  const warningTitle = resultSavedToHistory
+    ? t("听写已保存在历史记录")
+    : paintedTone === "error"
+    ? t("听写未能完成")
+    : state === "degraded"
+      ? t("部分结果已保存")
+      : state === "copied"
+        ? t("文字已复制")
+        : state === "unverified"
+          ? t("需要确认粘贴")
+          : t("自动粘贴未完成");
   const captionExiting = holdTerminalChrome && Boolean(liveCaptionRef.current);
   const showCaptionReveal = captionReveal && terminalCaptionOn && !reduced;
   const beam = hudBorderBeamFor(state);
@@ -285,7 +318,7 @@ export const VoicePill = memo(function VoicePill({
       }}
     >
       <div className="voice-pill__beam-host">
-        <div className={pillClassName} role="status" aria-label={liveLabel} aria-live="polite">
+        <div className={pillClassName} role="status" title={recordingHint ?? undefined} aria-label={liveLabel} aria-live="polite">
           <span
             className={progressClassName}
             style={indeterminateProgress ? undefined : { transform: `scaleX(${progressValue})` }}
@@ -359,12 +392,13 @@ export const VoicePill = memo(function VoicePill({
           </BorderBeam>
         </div>
       </div>
-      {paintedCaption && (
+      {(paintedCaption || hasContextSource) && (
         <p
           key={showCaptionReveal ? state : "live"}
           className={[
             "voice-pill-caption",
             `voice-pill-caption--${paintedTone}`,
+            warningCaption ? "voice-pill-caption--diagnostic" : "",
             showingPartial && !holdTerminalChrome ? "voice-pill-caption--partial" : "",
             wideCaption && !holdTerminalChrome ? "voice-pill-caption--wide" : "",
             showCaptionReveal ? "voice-pill-caption--reveal" : "",
@@ -372,8 +406,18 @@ export const VoicePill = memo(function VoicePill({
           ].filter(Boolean).join(" ")}
           style={wideCaption && !holdTerminalChrome ? { maxWidth: voicePillCaptionMaxWidthForPartial(true) } : undefined}
         >
-          <span className="voice-pill-caption__dot" aria-hidden="true" />
-          <span className="voice-pill-caption__text">{paintedCaption}</span>
+          {warningCaption ? (
+            <>
+              <span className="voice-pill-caption__title">{warningTitle}</span>
+              <span className="voice-pill-caption__text">{paintedCaption}</span>
+            </>
+          ) : (
+            <>
+              {paintedCaption && <span className="voice-pill-caption__dot" aria-hidden="true" />}
+              {paintedCaption && <span className="voice-pill-caption__text">{paintedCaption}</span>}
+              {hasContextSource && <span className="voice-pill-context-source">{contextSourceLabel}</span>}
+            </>
+          )}
         </p>
       )}
     </div>

@@ -8,8 +8,8 @@ use crate::prefetch_asr;
 use crate::screen_action::{clear_screen_action, clear_screen_preview};
 use crate::selected_action::{clear_selected_action, clear_selected_preview};
 use crate::{
-    audio, cancel_audio, cancel_prefetch_asr, chunker, context, emit_state, fail_for_generation,
-    hotkey, island_window, lock_recover, release_operation, start_claimed,
+    audio, cancel_audio, cancel_prefetch_asr, cancel_soniox_stream, chunker, context, emit_state,
+    fail_for_generation, hotkey, island_window, lock_recover, release_operation, start_claimed,
     start_with_error_feedback, stop_claimed, sync_modifier_hotkey_phase, AppState, StartError,
 };
 use tauri::{Emitter, State};
@@ -24,23 +24,6 @@ pub(crate) enum Phase {
     Processing,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ToggleAction {
-    Start,
-    Stop,
-    Cancel,
-    Ignore,
-}
-
-pub(crate) fn next_toggle_action(phase: Phase) -> ToggleAction {
-    match phase {
-        Phase::Idle => ToggleAction::Start,
-        Phase::Starting | Phase::Processing => ToggleAction::Cancel,
-        Phase::Recording => ToggleAction::Stop,
-        Phase::Stopping => ToggleAction::Ignore,
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OperationLease {
     Idle,
@@ -48,16 +31,56 @@ pub(crate) enum OperationLease {
     HistoryReclean,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HotkeySource {
+    Dictation,
+    Verbatim,
+    Translation,
+}
+
+#[derive(Clone)]
+enum RecordingMode {
+    Dictation,
+    Verbatim,
+    Translation(String),
+}
+
+impl RecordingMode {
+    fn source(&self) -> HotkeySource {
+        match self {
+            Self::Dictation => HotkeySource::Dictation,
+            Self::Verbatim => HotkeySource::Verbatim,
+            Self::Translation(_) => HotkeySource::Translation,
+        }
+    }
+}
+
+/// Apply a captured session choice only to a cloned settings snapshot.
+pub(crate) fn apply_session_mode(
+    settings: &mut crate::store::Settings,
+    skip: bool,
+    translation: Option<&str>,
+) {
+    if skip {
+        settings.cleanup_enabled = false;
+    }
+    if let Some(target) = translation {
+        settings.output_mode = "translation".into();
+        settings.translation_target_language = target.into();
+    }
+}
+
 pub(crate) struct DictationManager {
     pub(crate) phase: Phase,
     pub(crate) started: std::time::Instant,
-    pub(crate) gesture_lock: Option<std::time::Instant>,
     pub(crate) session_generation: u64,
     pub(crate) cancellation: CancellationToken,
     pub(crate) recording_context: Option<context::ContextSnapshot>,
-    pub(crate) hybrid_press_at: Option<std::time::Instant>,
-    pub(crate) hybrid_started_this_press: bool,
-    pub(crate) hybrid_stop_when_recording: bool,
+    pub(crate) hotkey_session: Option<HotkeySession>,
+    pub(crate) recording_source: Option<HotkeySource>,
+    pub(crate) stop_when_recording: bool,
+    pub(crate) skip_llm_cleanup: bool,
+    pub(crate) translation_target_language: Option<String>,
 }
 
 impl DictationManager {
@@ -65,13 +88,14 @@ impl DictationManager {
         Self {
             phase: Phase::Idle,
             started: std::time::Instant::now(),
-            gesture_lock: None,
             session_generation: 0,
             cancellation: CancellationToken::new(),
             recording_context: None,
-            hybrid_press_at: None,
-            hybrid_started_this_press: false,
-            hybrid_stop_when_recording: false,
+            hotkey_session: None,
+            recording_source: None,
+            stop_when_recording: false,
+            skip_llm_cleanup: false,
+            translation_target_language: None,
         }
     }
 }
@@ -79,6 +103,9 @@ impl DictationManager {
 /// Blocking recorder boundary. Production uses cpal through `audio::Recorder`;
 /// tests can inject a deterministic recorder without constructing a Tauri app.
 pub(crate) trait RecorderBackend: Send {
+    fn arm_readiness(&mut self) -> Option<std::sync::mpsc::Receiver<()>> {
+        None
+    }
     fn start(
         &mut self,
         app: Option<&tauri::AppHandle>,
@@ -89,15 +116,42 @@ pub(crate) trait RecorderBackend: Send {
         prefetch_tx: prefetch_asr::PrefetchInbox,
     ) -> Result<(), audio::AudioError>;
 
+    #[allow(clippy::too_many_arguments)]
+    fn start_streaming(
+        &mut self,
+        app: Option<&tauri::AppHandle>,
+        session: &str,
+        input_device: &str,
+        chunk_length_secs: usize,
+        input_gain: f32,
+        prefetch_tx: prefetch_asr::PrefetchInbox,
+        soniox_audio: Option<crate::soniox::SonioxAudioSender>,
+        preserve_full_audio: bool,
+    ) -> Result<(), audio::AudioError> {
+        let _ = (soniox_audio, preserve_full_audio);
+        self.start(
+            app,
+            session,
+            input_device,
+            chunk_length_secs,
+            input_gain,
+            prefetch_tx,
+        )
+    }
+
     fn stop_with_chunks(
         &mut self,
         app: Option<&tauri::AppHandle>,
+        options: audio::StopOptions,
     ) -> Result<(Vec<u8>, Vec<chunker::AudioChunk>), audio::AudioError>;
 
     fn cancel(&mut self, app: Option<&tauri::AppHandle>);
 }
 
 impl RecorderBackend for audio::Recorder {
+    fn arm_readiness(&mut self) -> Option<std::sync::mpsc::Receiver<()>> {
+        Some(audio::Recorder::arm_readiness(self))
+    }
     fn start(
         &mut self,
         app: Option<&tauri::AppHandle>,
@@ -120,11 +174,38 @@ impl RecorderBackend for audio::Recorder {
         )
     }
 
+    fn start_streaming(
+        &mut self,
+        app: Option<&tauri::AppHandle>,
+        session: &str,
+        input_device: &str,
+        chunk_length_secs: usize,
+        input_gain: f32,
+        prefetch_tx: prefetch_asr::PrefetchInbox,
+        soniox_audio: Option<crate::soniox::SonioxAudioSender>,
+        preserve_full_audio: bool,
+    ) -> Result<(), audio::AudioError> {
+        let app =
+            app.ok_or_else(|| audio::AudioError::Device("recorder app handle is required".into()))?;
+        audio::Recorder::start_with_soniox(
+            self,
+            app.clone(),
+            session,
+            input_device,
+            chunk_length_secs,
+            input_gain,
+            prefetch_tx,
+            soniox_audio,
+            preserve_full_audio,
+        )
+    }
+
     fn stop_with_chunks(
         &mut self,
         app: Option<&tauri::AppHandle>,
+        options: audio::StopOptions,
     ) -> Result<(Vec<u8>, Vec<chunker::AudioChunk>), audio::AudioError> {
-        audio::Recorder::stop_with_chunks(self, app)
+        audio::Recorder::stop_with_chunks(self, app, options)
     }
 
     fn cancel(&mut self, app: Option<&tauri::AppHandle>) {
@@ -149,6 +230,12 @@ pub(crate) fn release_operation_lease(lease: &mut OperationLease, expected: Oper
 pub(crate) struct StopClaim {
     pub(crate) started: std::time::Instant,
     pub(crate) session_generation: u64,
+    /// Generation assigned when this recording started, retained separately
+    /// from the stop/processing generation used by HUD completion guards.
+    pub(crate) recording_generation: u64,
+    pub(crate) ended_during_start: bool,
+    pub(crate) skip_llm_cleanup: bool,
+    pub(crate) translation_target_language: Option<String>,
     pub(crate) cancellation: CancellationToken,
     pub(crate) recording_context: context::ContextSnapshot,
 }
@@ -160,29 +247,54 @@ pub(crate) fn claim_start_manager(
     if manager.phase != Phase::Idle || !claim_operation(lease, OperationLease::LiveDictation) {
         return None;
     }
+    manager.skip_llm_cleanup = false;
+    manager.translation_target_language = None;
     manager.phase = Phase::Starting;
     manager.session_generation = manager.session_generation.wrapping_add(1);
     manager.cancellation = CancellationToken::new();
     manager.recording_context = None;
-    manager.hybrid_stop_when_recording = false;
+    manager.stop_when_recording = false;
+    clear_hotkey_session(manager);
     Some(manager.session_generation)
 }
 
+fn claim_start_manager_with_mode(
+    manager: &mut DictationManager,
+    lease: &mut OperationLease,
+    mode: RecordingMode,
+) -> Option<u64> {
+    let generation = claim_start_manager(manager, lease)?;
+    manager.recording_source = Some(mode.source());
+    manager.skip_llm_cleanup = matches!(mode, RecordingMode::Verbatim);
+    manager.translation_target_language = match mode {
+        RecordingMode::Translation(language) => Some(language),
+        _ => None,
+    };
+    Some(generation)
+}
+
 pub(crate) fn claim_start(state: &AppState) -> Option<u64> {
-    // Keep the global order consistent everywhere: lease before manager.
+    claim_start_with_mode(state, RecordingMode::Dictation)
+}
+fn claim_start_with_mode(state: &AppState, mode: RecordingMode) -> Option<u64> {
     let mut lease = lock_recover(&state.operation_lease);
     let mut manager = lock_recover(&state.manager);
-    claim_start_manager(&mut manager, &mut lease)
+    claim_start_manager_with_mode(&mut manager, &mut lease, mode)
 }
 
 pub(crate) fn claim_stop_manager(manager: &mut DictationManager) -> Option<StopClaim> {
     if manager.phase != Phase::Recording {
         return None;
     }
+    let recording_generation = manager.session_generation;
     manager.session_generation = manager.session_generation.wrapping_add(1);
     let claim = StopClaim {
         started: manager.started,
         session_generation: manager.session_generation,
+        recording_generation,
+        ended_during_start: manager.stop_when_recording,
+        skip_llm_cleanup: manager.skip_llm_cleanup,
+        translation_target_language: manager.translation_target_language.clone(),
         cancellation: manager.cancellation.clone(),
         recording_context: manager
             .recording_context
@@ -190,7 +302,8 @@ pub(crate) fn claim_stop_manager(manager: &mut DictationManager) -> Option<StopC
             .unwrap_or_else(context::ContextSnapshot::general),
     };
     manager.phase = Phase::Stopping;
-    manager.hybrid_stop_when_recording = false;
+    manager.hotkey_session = None;
+    manager.stop_when_recording = false;
     Some(claim)
 }
 
@@ -199,19 +312,19 @@ pub(crate) fn claim_stop(state: &AppState) -> Option<StopClaim> {
     claim_stop_manager(&mut manager)
 }
 
-/// Hybrid PTT release: stop now if recording, otherwise remember to stop once
+/// A release or second tap: stop now if recording, otherwise remember to stop once
 /// `Starting` becomes `Recording`.
-pub(crate) fn request_hybrid_stop(manager: &mut DictationManager) -> Option<StopClaim> {
+pub(crate) fn request_stop(manager: &mut DictationManager) -> Option<StopClaim> {
     if let Some(claim) = claim_stop_manager(manager) {
         return Some(claim);
     }
     if manager.phase == Phase::Starting {
-        manager.hybrid_stop_when_recording = true;
+        manager.stop_when_recording = true;
     }
     None
 }
 
-/// Commit Starting → Recording. If a hybrid PTT release arrived during
+/// Commit Starting → Recording. If an end request arrived during
 /// Starting, take the stop claim immediately.
 pub(crate) fn enter_recording(
     manager: &mut DictationManager,
@@ -221,10 +334,9 @@ pub(crate) fn enter_recording(
     manager.phase = Phase::Recording;
     manager.cancellation = CancellationToken::new();
     manager.recording_context = Some(recording_context);
-    if !manager.hybrid_stop_when_recording {
+    if !manager.stop_when_recording {
         return None;
     }
-    manager.hybrid_stop_when_recording = false;
     claim_stop_manager(manager)
 }
 
@@ -242,53 +354,33 @@ pub(crate) fn reset_starting_manager(manager: &mut DictationManager) -> u64 {
     if manager.phase == Phase::Starting {
         manager.cancellation.cancel();
         manager.phase = Phase::Idle;
+        manager.skip_llm_cleanup = false;
+        manager.translation_target_language = None;
         manager.session_generation = manager.session_generation.wrapping_add(1);
         manager.recording_context = None;
-        manager.hybrid_stop_when_recording = false;
+        manager.stop_when_recording = false;
+        clear_hotkey_session(manager);
     }
     manager.session_generation
 }
 
-pub(crate) const GESTURE_LOCK_MS: u128 = 400;
-
-pub(crate) fn take_gesture_lock(manager: &mut DictationManager) -> bool {
-    let now = std::time::Instant::now();
-    if manager
-        .gesture_lock
-        .map(|time| now.duration_since(time).as_millis() < GESTURE_LOCK_MS)
-        .unwrap_or(false)
-    {
-        return false;
-    }
-    manager.gesture_lock = Some(now);
-    true
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct HotkeySession {
+    source: HotkeySource,
+    gesture_id: u64,
+    generation: u64,
 }
 
-pub(crate) fn mark_hybrid_press(manager: &mut DictationManager, started_this_press: bool) {
-    manager.hybrid_press_at = Some(std::time::Instant::now());
-    manager.hybrid_started_this_press = started_this_press;
-}
-
-pub(crate) fn clear_hybrid_press(manager: &mut DictationManager) {
-    manager.hybrid_press_at = None;
-    manager.hybrid_started_this_press = false;
-}
-
-pub(crate) fn take_hybrid_release(
-    manager: &mut DictationManager,
-) -> crate::hotkey::HybridReleaseAction {
-    let Some(started_at) = manager.hybrid_press_at.take() else {
-        return crate::hotkey::HybridReleaseAction::Ignore;
-    };
-    let started_this_press = std::mem::replace(&mut manager.hybrid_started_this_press, false);
-    let elapsed_ms = started_at.elapsed().as_millis() as u64;
-    crate::hotkey::hybrid_release_action(elapsed_ms, started_this_press)
+fn clear_hotkey_session(manager: &mut DictationManager) {
+    manager.hotkey_session = None;
+    manager.recording_source = None;
 }
 
 pub(crate) struct CancelClaim {
     pub(crate) phase: Phase,
     pub(crate) generation: u64,
-    pub(crate) had_preview: bool,
+    pub(crate) had_action: bool,
+    pub(crate) text_action: Option<crate::TextActionIdentity>,
 }
 
 pub(crate) fn claim_cancel_manager(manager: &mut DictationManager, had_preview: bool) -> Phase {
@@ -296,35 +388,75 @@ pub(crate) fn claim_cancel_manager(manager: &mut DictationManager, had_preview: 
     if phase != Phase::Idle || had_preview {
         manager.cancellation.cancel();
         manager.phase = Phase::Idle;
+        manager.skip_llm_cleanup = false;
+        manager.translation_target_language = None;
         manager.session_generation = manager.session_generation.wrapping_add(1);
         manager.recording_context = None;
-        manager.hybrid_stop_when_recording = false;
+        manager.stop_when_recording = false;
+        clear_hotkey_session(manager);
     }
     phase
 }
 
 fn claim_cancel(state: &AppState) -> CancelClaim {
+    let text_action = crate::cancel_active_text_action(state);
+    claim_cancel_for_text_action(state, text_action)
+}
+
+fn claim_cancel_for_text_action(
+    state: &AppState,
+    text_action: Option<crate::TextActionIdentity>,
+) -> CancelClaim {
     clear_selected_action(state);
     clear_screen_action(state);
-    let had_preview = state
+    let had_selected_preview = state
         .selected_preview
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .is_some();
+    let had_screen_preview = state
+        .screen_preview
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .is_some();
+    let had_preview = had_selected_preview || had_screen_preview;
     clear_selected_preview(state);
     clear_screen_preview(state);
+    let had_action = had_preview || text_action.is_some();
     let mut manager = lock_recover(&state.manager);
-    let phase = claim_cancel_manager(&mut manager, had_preview);
+    let phase = claim_cancel_manager(&mut manager, had_action);
+    if phase != Phase::Idle || had_action {
+        crate::dictionary_learn::invalidate_learning_observers(&state.learning_observer_epoch);
+    }
     CancelClaim {
         phase,
         generation: manager.session_generation,
-        had_preview,
+        had_action,
+        text_action,
     }
 }
 
 async fn claim_cancel_entry(state: &AppState) -> CancelClaim {
     let _gate = state.hotkey_gate.lock().await;
     claim_cancel(state)
+}
+
+pub(crate) async fn cancel_text_action_by_id(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    transaction_id: &str,
+) -> Option<crate::TextActionIdentity> {
+    let claim = {
+        let _gate = state.hotkey_gate.lock().await;
+        let identity = crate::cancel_text_action_control_for_session(state, transaction_id)?;
+        claim_cancel_for_text_action(state, Some(identity))
+    };
+    let identity = claim.text_action.clone()?;
+    if identity.transaction_id != transaction_id {
+        return None;
+    }
+    execute_cancel_claim(app, state, claim).await;
+    Some(identity)
 }
 
 async fn finish_cancel_claim(app: &tauri::AppHandle, state: &AppState, release_live_lease: bool) {
@@ -344,16 +476,22 @@ async fn execute_cancel_claim(app: &tauri::AppHandle, state: &AppState, claim: C
         Phase::Starting => finish_cancel_claim(app, state, false).await,
         Phase::Recording => {
             cancel_prefetch_asr(state);
+            cancel_soniox_stream(state, claim.generation);
             cancel_audio(state, app.clone()).await;
             finish_cancel_claim(app, state, true).await;
         }
         Phase::Stopping => {
             cancel_prefetch_asr(state);
+            cancel_soniox_stream(state, claim.generation);
             finish_cancel_claim(app, state, false).await;
         }
         Phase::Processing => finish_cancel_claim(app, state, true).await,
-        Phase::Idle if claim.had_preview => finish_cancel_claim(app, state, true).await,
+        Phase::Idle if claim.had_action => finish_cancel_claim(app, state, true).await,
         Phase::Idle => {}
+    }
+    if let Some(identity) = claim.text_action {
+        crate::clear_text_action(state, &identity);
+        crate::emit_text_action_lifecycle(app, &identity, "cancelled");
     }
 }
 
@@ -366,6 +504,9 @@ pub(crate) async fn start_internal(
     app: &tauri::AppHandle,
     state: &AppState,
 ) -> Result<(), StartError> {
+    if state.exit_state.load(std::sync::atomic::Ordering::Acquire) != 0 {
+        return Ok(());
+    }
     let Some(session_generation) = claim_start_entry(state).await else {
         let _ = app.emit(
             "dictation://error",
@@ -377,46 +518,23 @@ pub(crate) async fn start_internal(
 }
 
 pub(crate) async fn stop_internal(app: &tauri::AppHandle, state: &AppState) -> Result<(), String> {
+    if state.exit_state.load(std::sync::atomic::Ordering::Acquire) != 0 {
+        return Ok(());
+    }
     let Some(claim) = claim_stop_entry(state).await else {
         return Ok(());
     };
     stop_claimed(app, state, claim).await
 }
 
+// Stop claims intentionally carry the captured recording and its ownership
+// state together. Boxing would allocate on every stop with no lifetime benefit.
+#[allow(clippy::large_enum_variant)]
 enum EntryClaim {
     Start(u64),
     Stop(StopClaim),
     Cancel(CancelClaim),
     Ignore,
-}
-
-async fn claim_toggle_entry(
-    state: &AppState,
-    confirmed: bool,
-    check_suspended: bool,
-) -> EntryClaim {
-    let _gate = state.hotkey_gate.lock().await;
-    if !confirmed || (check_suspended && hotkey::is_suspended()) {
-        return EntryClaim::Ignore;
-    }
-    let action = {
-        let mut manager = lock_recover(&state.manager);
-        let action = next_toggle_action(manager.phase);
-        if action != ToggleAction::Cancel && !take_gesture_lock(&mut manager) {
-            return EntryClaim::Ignore;
-        }
-        action
-    };
-    match action {
-        ToggleAction::Start => claim_start(state)
-            .map(EntryClaim::Start)
-            .unwrap_or(EntryClaim::Ignore),
-        ToggleAction::Stop => claim_stop(state)
-            .map(EntryClaim::Stop)
-            .unwrap_or(EntryClaim::Ignore),
-        ToggleAction::Cancel => EntryClaim::Cancel(claim_cancel(state)),
-        ToggleAction::Ignore => EntryClaim::Ignore,
-    }
 }
 
 async fn execute_entry_claim(app: &tauri::AppHandle, state: &AppState, claim: EntryClaim) {
@@ -434,73 +552,186 @@ async fn execute_entry_claim(app: &tauri::AppHandle, state: &AppState, claim: En
     }
 }
 
-pub(crate) async fn handle_hotkey_toggle(app: &tauri::AppHandle, state: &AppState) {
-    let claim = claim_toggle_entry(state, true, true).await;
-    execute_entry_claim(app, state, claim).await;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ModeTrigger {
+    Press,
+    Release,
+    Toggle,
+    Cancel,
 }
 
-pub(crate) async fn handle_hotkey_press(app: &tauri::AppHandle, state: &AppState) {
-    let claim = claim_hybrid_press_entry(state).await;
-    execute_entry_claim(app, state, claim).await;
+// A physical press/release pair gets one id in the native adapter. Claims are
+// processed in FIFO order before recorder work is spawned, so fast release
+// cannot overtake the corresponding start while the microphone initializes.
+#[derive(Clone, Copy)]
+struct HotkeyInput {
+    source: HotkeySource,
+    trigger: ModeTrigger,
+    gesture_id: u64,
+    epoch: u64,
 }
 
-pub(crate) async fn handle_hotkey_release(app: &tauri::AppHandle, state: &AppState) {
+static INPUT_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub(crate) fn invalidate_pending_inputs() {
+    INPUT_EPOCH.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+}
+
+static HOTKEY_INPUT: std::sync::OnceLock<tokio::sync::mpsc::UnboundedSender<Option<HotkeyInput>>> =
+    std::sync::OnceLock::new();
+
+pub(crate) fn enqueue_hotkey(source: HotkeySource, trigger: ModeTrigger, gesture_id: u64) {
+    if let Some(sender) = HOTKEY_INPUT.get() {
+        let _ = sender.send(Some(HotkeyInput {
+            source,
+            trigger,
+            gesture_id,
+            epoch: INPUT_EPOCH.load(std::sync::atomic::Ordering::SeqCst),
+        }));
+    }
+}
+
+pub(crate) fn interrupt_hotkeys() {
+    invalidate_pending_inputs();
+    if let Some(sender) = HOTKEY_INPUT.get() {
+        let _ = sender.send(None);
+    }
+}
+
+pub(crate) fn install_hotkey_dispatcher(app: tauri::AppHandle) {
+    use tauri::Manager;
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    if HOTKEY_INPUT.set(sender).is_err() {
+        return;
+    }
+    tauri::async_runtime::spawn(async move {
+        while let Some(input) = receiver.recv().await {
+            let state = app.state::<AppState>();
+            let claim = {
+                let _gate = state.hotkey_gate.lock().await;
+                match input {
+                    None => EntryClaim::Cancel(claim_cancel(&state)),
+                    Some(input)
+                        if input.epoch == INPUT_EPOCH.load(std::sync::atomic::Ordering::SeqCst)
+                            && !hotkey::is_suspended()
+                            && state.exit_state.load(std::sync::atomic::Ordering::Acquire) == 0 =>
+                    {
+                        let mode = match input.source {
+                            HotkeySource::Dictation => RecordingMode::Dictation,
+                            HotkeySource::Verbatim => RecordingMode::Verbatim,
+                            HotkeySource::Translation => RecordingMode::Translation(
+                                lock_recover(&state.settings)
+                                    .translation_target_language
+                                    .clone(),
+                            ),
+                        };
+                        let claim = {
+                            let mut lease = lock_recover(&state.operation_lease);
+                            let mut manager = lock_recover(&state.manager);
+                            claim_gesture(
+                                &mut manager,
+                                &mut lease,
+                                mode,
+                                input.trigger,
+                                input.gesture_id,
+                            )
+                        };
+                        if matches!(claim, EntryClaim::Cancel(_)) {
+                            EntryClaim::Cancel(claim_cancel(&state))
+                        } else {
+                            claim
+                        }
+                    }
+                    _ => EntryClaim::Ignore,
+                }
+            };
+            if !matches!(claim, EntryClaim::Ignore) {
+                let handle = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    let state = handle.state::<AppState>();
+                    execute_entry_claim(&handle, &state, claim).await;
+                });
+            }
+        }
+    });
+}
+
+fn claim_gesture(
+    manager: &mut DictationManager,
+    lease: &mut OperationLease,
+    mode: RecordingMode,
+    trigger: ModeTrigger,
+    gesture_id: u64,
+) -> EntryClaim {
+    let source = mode.source();
+    match trigger {
+        ModeTrigger::Press | ModeTrigger::Toggle if manager.phase == Phase::Idle => {
+            let Some(generation) = claim_start_manager_with_mode(manager, lease, mode) else {
+                return EntryClaim::Ignore;
+            };
+            if trigger == ModeTrigger::Press {
+                manager.hotkey_session = Some(HotkeySession {
+                    source,
+                    gesture_id,
+                    generation,
+                });
+            }
+            EntryClaim::Start(generation)
+        }
+        ModeTrigger::Toggle
+            if manager.recording_source.is_none() || manager.recording_source == Some(source) =>
+        {
+            request_stop(manager)
+                .map(EntryClaim::Stop)
+                .unwrap_or(EntryClaim::Ignore)
+        }
+        ModeTrigger::Release | ModeTrigger::Cancel => {
+            let owns_session = manager.hotkey_session.is_some_and(|owner| {
+                owner.source == source
+                    && owner.gesture_id == gesture_id
+                    && owner.generation == manager.session_generation
+            });
+            if !owns_session {
+                return EntryClaim::Ignore;
+            }
+            manager.hotkey_session = None;
+            if trigger == ModeTrigger::Cancel {
+                // Full cancellation (audio and pipeline) is claimed by the dispatcher.
+                EntryClaim::Cancel(CancelClaim {
+                    phase: manager.phase,
+                    generation: manager.session_generation,
+                    had_action: false,
+                    text_action: None,
+                })
+            } else {
+                request_stop(manager)
+                    .map(EntryClaim::Stop)
+                    .unwrap_or(EntryClaim::Ignore)
+            }
+        }
+        _ => EntryClaim::Ignore,
+    }
+}
+
+async fn handle_cli_toggle(app: &tauri::AppHandle, state: &AppState, mode: RecordingMode) {
+    if state.exit_state.load(std::sync::atomic::Ordering::Acquire) != 0 || hotkey::is_suspended() {
+        return;
+    }
     let claim = {
         let _gate = state.hotkey_gate.lock().await;
+        let mut lease = lock_recover(&state.operation_lease);
         let mut manager = lock_recover(&state.manager);
-        if hotkey::is_suspended() {
-            clear_hybrid_press(&mut manager);
-            return;
-        }
-        if !matches!(
-            take_hybrid_release(&mut manager),
-            crate::hotkey::HybridReleaseAction::Stop
-        ) {
-            return;
-        }
-        request_hybrid_stop(&mut manager)
+        claim_gesture(&mut manager, &mut lease, mode, ModeTrigger::Toggle, 0)
     };
-    let Some(claim) = claim else {
-        return;
-    };
-    let _ = stop_claimed(app, state, claim).await;
-}
-
-async fn claim_hybrid_press_entry(state: &AppState) -> EntryClaim {
-    let _gate = state.hotkey_gate.lock().await;
-    if hotkey::is_suspended() {
-        let mut manager = lock_recover(&state.manager);
-        clear_hybrid_press(&mut manager);
-        return EntryClaim::Ignore;
-    }
-    let action = {
-        let mut manager = lock_recover(&state.manager);
-        let action = next_toggle_action(manager.phase);
-        if action != ToggleAction::Cancel && !take_gesture_lock(&mut manager) {
-            return EntryClaim::Ignore;
-        }
-        mark_hybrid_press(&mut manager, action == ToggleAction::Start);
-        action
-    };
-    match action {
-        ToggleAction::Start => claim_start(state)
-            .map(EntryClaim::Start)
-            .unwrap_or(EntryClaim::Ignore),
-        ToggleAction::Stop => claim_stop(state)
-            .map(EntryClaim::Stop)
-            .unwrap_or(EntryClaim::Ignore),
-        ToggleAction::Cancel => EntryClaim::Cancel(claim_cancel(state)),
-        ToggleAction::Ignore => EntryClaim::Ignore,
-    }
-}
-
-pub(crate) async fn handle_double_tap_toggle(
-    app: &tauri::AppHandle,
-    state: &AppState,
-    confirmed: bool,
-) {
-    let claim = claim_toggle_entry(state, confirmed, true).await;
     execute_entry_claim(app, state, claim).await;
+}
+
+pub(crate) async fn handle_cli_toggle_verbatim(app: &tauri::AppHandle, state: &AppState) {
+    handle_cli_toggle(app, state, RecordingMode::Verbatim).await;
+}
+
+pub(crate) async fn handle_hotkey_toggle(app: &tauri::AppHandle, state: &AppState) {
+    handle_cli_toggle(app, state, RecordingMode::Dictation).await;
 }
 
 #[tauri::command]
@@ -567,6 +798,7 @@ mod tests {
         fn stop_with_chunks(
             &mut self,
             _app: Option<&tauri::AppHandle>,
+            _options: audio::StopOptions,
         ) -> Result<(Vec<u8>, Vec<chunker::AudioChunk>), audio::AudioError> {
             self.stops += 1;
             Ok((self.stop_audio.clone(), Vec::new()))
@@ -622,7 +854,7 @@ mod tests {
         fn stop_recorder(&mut self) -> Vec<u8> {
             let recorder: &mut dyn RecorderBackend = &mut self.recorder;
             recorder
-                .stop_with_chunks(None)
+                .stop_with_chunks(None, audio::StopOptions::default())
                 .expect("mock recorder stop")
                 .0
         }
@@ -658,67 +890,181 @@ mod tests {
             {
                 self.events.emit("dictation://result", &transcript.text);
                 self.manager.phase = Phase::Idle;
+                self.manager.skip_llm_cleanup = false;
+                self.manager.translation_target_language = None;
                 release_operation_lease(&mut self.lease, OperationLease::LiveDictation);
             }
         }
     }
 
     #[test]
-    fn hybrid_stop_during_starting_sets_pending_flag() {
+    fn quick_hold_release_during_starting_stops_after_mic_start() {
         let mut manager = DictationManager::new();
-        manager.phase = Phase::Starting;
-        manager.session_generation = 1;
+        let mut lease = OperationLease::Idle;
+        assert!(matches!(
+            claim_gesture(
+                &mut manager,
+                &mut lease,
+                RecordingMode::Dictation,
+                ModeTrigger::Press,
+                1
+            ),
+            EntryClaim::Start(1)
+        ));
+        assert!(matches!(
+            claim_gesture(
+                &mut manager,
+                &mut lease,
+                RecordingMode::Dictation,
+                ModeTrigger::Release,
+                1
+            ),
+            EntryClaim::Ignore
+        ));
+        assert!(manager.stop_when_recording);
+        let claim = enter_recording(&mut manager, context::ContextSnapshot::general()).unwrap();
+        assert!(claim.ended_during_start);
+        assert_eq!(manager.phase, Phase::Stopping);
+    }
 
-        assert!(request_hybrid_stop(&mut manager).is_none());
-        assert!(manager.hybrid_stop_when_recording);
+    #[test]
+    fn two_real_taps_during_startup_queue_stop_without_a_time_lock() {
+        let mut manager = DictationManager::new();
+        let mut lease = OperationLease::Idle;
+        assert!(matches!(
+            claim_gesture(
+                &mut manager,
+                &mut lease,
+                RecordingMode::Dictation,
+                ModeTrigger::Toggle,
+                1
+            ),
+            EntryClaim::Start(_)
+        ));
+        claim_gesture(
+            &mut manager,
+            &mut lease,
+            RecordingMode::Dictation,
+            ModeTrigger::Toggle,
+            2,
+        );
+        assert!(manager.stop_when_recording);
+        assert!(enter_recording(&mut manager, context::ContextSnapshot::general()).is_some());
+    }
+
+    #[test]
+    fn release_only_ends_its_own_source_and_gesture() {
+        for (owner, other) in [
+            (RecordingMode::Dictation, RecordingMode::Verbatim),
+            (
+                RecordingMode::Verbatim,
+                RecordingMode::Translation("en".into()),
+            ),
+            (
+                RecordingMode::Translation("zh".into()),
+                RecordingMode::Dictation,
+            ),
+        ] {
+            let mut manager = DictationManager::new();
+            let mut lease = OperationLease::Idle;
+            claim_gesture(
+                &mut manager,
+                &mut lease,
+                owner.clone(),
+                ModeTrigger::Press,
+                10,
+            );
+            enter_recording(&mut manager, context::ContextSnapshot::general());
+            assert!(matches!(
+                claim_gesture(&mut manager, &mut lease, other, ModeTrigger::Release, 10),
+                EntryClaim::Ignore
+            ));
+            assert!(matches!(
+                claim_gesture(
+                    &mut manager,
+                    &mut lease,
+                    owner.clone(),
+                    ModeTrigger::Release,
+                    9
+                ),
+                EntryClaim::Ignore
+            ));
+            assert!(matches!(
+                claim_gesture(
+                    &mut manager,
+                    &mut lease,
+                    owner.clone(),
+                    ModeTrigger::Press,
+                    11
+                ),
+                EntryClaim::Ignore
+            ));
+            assert_eq!(manager.phase, Phase::Recording);
+            assert!(matches!(
+                claim_gesture(&mut manager, &mut lease, owner, ModeTrigger::Release, 10),
+                EntryClaim::Stop(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn processing_and_stopping_ignore_new_gestures() {
+        for phase in [Phase::Processing, Phase::Stopping] {
+            let mut manager = DictationManager::new();
+            manager.phase = phase;
+            let mut lease = OperationLease::LiveDictation;
+            for trigger in [
+                ModeTrigger::Toggle,
+                ModeTrigger::Press,
+                ModeTrigger::Release,
+            ] {
+                assert!(matches!(
+                    claim_gesture(
+                        &mut manager,
+                        &mut lease,
+                        RecordingMode::Dictation,
+                        trigger,
+                        1
+                    ),
+                    EntryClaim::Ignore
+                ));
+            }
+            assert_eq!(manager.phase, phase);
+        }
+    }
+
+    #[test]
+    fn cancellation_invalidates_late_release_even_from_same_hotkey() {
+        let mut manager = DictationManager::new();
+        let mut lease = OperationLease::Idle;
+        claim_gesture(
+            &mut manager,
+            &mut lease,
+            RecordingMode::Dictation,
+            ModeTrigger::Press,
+            1,
+        );
+        claim_cancel_manager(&mut manager, false);
+        lease = OperationLease::Idle;
+        claim_gesture(
+            &mut manager,
+            &mut lease,
+            RecordingMode::Dictation,
+            ModeTrigger::Press,
+            2,
+        );
+        assert!(matches!(
+            claim_gesture(
+                &mut manager,
+                &mut lease,
+                RecordingMode::Dictation,
+                ModeTrigger::Release,
+                1
+            ),
+            EntryClaim::Ignore
+        ));
+        assert!(!manager.stop_when_recording);
         assert_eq!(manager.phase, Phase::Starting);
-    }
-
-    #[test]
-    fn entering_recording_with_pending_hybrid_stop_claims_stop() {
-        let mut manager = DictationManager::new();
-        manager.phase = Phase::Starting;
-        manager.session_generation = 1;
-        manager.hybrid_stop_when_recording = true;
-
-        let claim = enter_recording(&mut manager, context::ContextSnapshot::general());
-
-        assert!(claim.is_some());
-        assert_eq!(manager.phase, Phase::Stopping);
-        assert!(!manager.hybrid_stop_when_recording);
-    }
-
-    #[test]
-    fn hybrid_stop_while_recording_claims_immediately() {
-        let mut manager = DictationManager::new();
-        manager.phase = Phase::Recording;
-        manager.session_generation = 1;
-
-        let claim = request_hybrid_stop(&mut manager);
-
-        assert!(claim.is_some());
-        assert_eq!(manager.phase, Phase::Stopping);
-        assert!(!manager.hybrid_stop_when_recording);
-    }
-
-    #[test]
-    fn hybrid_hold_release_stops_and_short_tap_keeps_recording() {
-        let mut manager = DictationManager::new();
-        manager.hybrid_press_at = Some(std::time::Instant::now() - Duration::from_millis(400));
-        manager.hybrid_started_this_press = true;
-        assert_eq!(
-            take_hybrid_release(&mut manager),
-            crate::hotkey::HybridReleaseAction::Stop
-        );
-        assert!(manager.hybrid_press_at.is_none());
-        assert!(!manager.hybrid_started_this_press);
-
-        manager.hybrid_press_at = Some(std::time::Instant::now() - Duration::from_millis(80));
-        manager.hybrid_started_this_press = true;
-        assert_eq!(
-            take_hybrid_release(&mut manager),
-            crate::hotkey::HybridReleaseAction::KeepRecording
-        );
     }
 
     #[test]
@@ -741,8 +1087,13 @@ mod tests {
         let provider = MockAsrProvider::new(
             Ok(Transcript {
                 text: "hello".into(),
+                asr_text: None,
+                provider_cleaned_candidate: None,
+                language: None,
+                confidence: None,
                 segments: Vec::new(),
                 words: Vec::new(),
+                tokens: Vec::new(),
                 limits: RateLimits::default(),
             }),
             Duration::ZERO,
@@ -827,5 +1178,88 @@ mod tests {
         let mut harness = Harness::new();
         harness.cancel_recorder();
         assert_eq!(harness.recorder.cancels, 1);
+    }
+}
+
+#[cfg(test)]
+mod skip_session_tests {
+    use super::*;
+    #[test]
+    fn translation_is_captured_on_successful_start_and_never_changes_saved_settings() {
+        let settings = crate::store::Settings {
+            output_mode: "bullets".into(),
+            translation_target_language: "ja".into(),
+            ..crate::store::Settings::default()
+        };
+        let mut manager = DictationManager::new();
+        let mut lease = OperationLease::LiveDictation;
+        assert!(claim_start_manager_with_mode(
+            &mut manager,
+            &mut lease,
+            RecordingMode::Translation("ja".into())
+        )
+        .is_none());
+        assert!(manager.translation_target_language.is_none());
+        lease = OperationLease::Idle;
+        claim_start_manager_with_mode(
+            &mut manager,
+            &mut lease,
+            RecordingMode::Translation("ja".into()),
+        )
+        .unwrap();
+        assert!(!manager.skip_llm_cleanup);
+        enter_recording(&mut manager, context::ContextSnapshot::general());
+        let claim = claim_stop_manager(&mut manager).unwrap();
+        let mut session_settings = settings.clone();
+        apply_session_mode(
+            &mut session_settings,
+            claim.skip_llm_cleanup,
+            claim.translation_target_language.as_deref(),
+        );
+        assert_eq!(session_settings.output_mode, "translation");
+        assert_eq!(session_settings.translation_target_language, "ja");
+        assert_eq!(settings.output_mode, "bullets");
+        claim_cancel_manager(&mut manager, false);
+        assert!(manager.translation_target_language.is_none());
+        lease = OperationLease::Idle;
+        claim_start_manager_with_mode(&mut manager, &mut lease, RecordingMode::Dictation).unwrap();
+        assert!(manager.translation_target_language.is_none());
+        assert_eq!(claim.translation_target_language.as_deref(), Some("ja"));
+    }
+
+    #[test]
+    fn starting_failure_clears_translation_override() {
+        let mut manager = DictationManager::new();
+        let mut lease = OperationLease::Idle;
+        claim_start_manager_with_mode(
+            &mut manager,
+            &mut lease,
+            RecordingMode::Translation("en".into()),
+        )
+        .unwrap();
+        reset_starting_manager(&mut manager);
+        assert!(manager.translation_target_language.is_none());
+    }
+    #[test]
+    fn skip_policy_belongs_to_successfully_claimed_session() {
+        let mut manager = DictationManager::new();
+        let mut lease = OperationLease::LiveDictation;
+        assert!(
+            claim_start_manager_with_mode(&mut manager, &mut lease, RecordingMode::Verbatim)
+                .is_none()
+        );
+        assert!(!manager.skip_llm_cleanup);
+        assert!(manager.hotkey_session.is_none());
+        lease = OperationLease::Idle;
+        claim_start_manager_with_mode(&mut manager, &mut lease, RecordingMode::Verbatim).unwrap();
+        enter_recording(&mut manager, context::ContextSnapshot::general());
+        let claim = claim_stop_manager(&mut manager).unwrap();
+        assert!(claim.skip_llm_cleanup);
+        claim_cancel_manager(&mut manager, false);
+        assert!(!manager.skip_llm_cleanup);
+        lease = OperationLease::Idle;
+        claim_start_manager_with_mode(&mut manager, &mut lease, RecordingMode::Dictation).unwrap();
+        assert!(!manager.skip_llm_cleanup);
+        assert!(claim.skip_llm_cleanup);
     }
 }

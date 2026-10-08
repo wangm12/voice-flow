@@ -1,5 +1,5 @@
 import type { ButtonHTMLAttributes, ReactNode } from "react";
-import { colors, controlSize, radius } from "../lib/theme";
+import { colors, controlSize, focusRingClass, radius } from "../lib/theme";
 
 type IconButtonProps = Omit<ButtonHTMLAttributes<HTMLButtonElement>, "children"> & {
   label: string;
@@ -11,9 +11,9 @@ type IconButtonProps = Omit<ButtonHTMLAttributes<HTMLButtonElement>, "children">
 };
 
 const toneClasses = {
-  default: `${colors.text.tertiary} hover:bg-elevated hover:text-primary`,
-  warning: "text-warning hover:bg-warning/10 hover:text-warning",
-  danger: "text-tertiary hover:bg-error/10 hover:text-error",
+  default: `${colors.text.tertiary} enabled:hover:bg-elevated enabled:hover:text-primary enabled:active:bg-border enabled:active:text-primary`,
+  warning: "text-warning-ink enabled:hover:bg-warning/10 enabled:hover:text-warning-ink enabled:active:bg-warning/15",
+  danger: "text-tertiary enabled:hover:bg-error/10 enabled:hover:text-error-ink enabled:active:bg-error/15 enabled:active:text-error-ink",
 } as const;
 
 /** A consistent icon-only action with an accessible label and visible hover name. */
@@ -39,7 +39,7 @@ export function IconButton({
       sizeClass,
       radius.control,
       toneClasses[tone],
-      "transition-colors duration-150 focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent focus-visible:outline-offset-2 disabled:cursor-not-allowed disabled:opacity-50",
+      `transition-colors duration-150 motion-reduce:transition-none ${focusRingClass} disabled:cursor-not-allowed disabled:opacity-50`,
       className,
     ].filter(Boolean).join(" ");
 

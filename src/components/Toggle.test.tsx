@@ -19,19 +19,19 @@ describe("Toggle", () => {
     expect(onChange).toHaveBeenCalledWith(true);
   });
 
-  it("uses the success track and white thumb when enabled", () => {
+  it("keeps a neutral checked track and a white thumb independent of action labels", () => {
     render(<Toggle checked onChange={vi.fn()} label="自动识别" />);
 
     const toggle = screen.getByRole("switch", { name: "自动识别" });
-    expect(toggle.firstElementChild).toHaveClass("bg-success");
-    expect(toggle.lastElementChild).toHaveClass("bg-success-foreground", "translate-x-5");
+    expect(toggle.firstElementChild).toHaveClass("bg-toggle-checked");
+    expect(toggle.lastElementChild).toHaveClass("bg-toggle-thumb", "translate-x-5");
   });
 
-  it("uses the semantic card color for the unchecked thumb", () => {
+  it("keeps the unchecked thumb visible on the neutral track", () => {
     render(<Toggle checked={false} onChange={vi.fn()} label="自动识别" />);
 
     const toggle = screen.getByRole("switch", { name: "自动识别" });
-    expect(toggle.lastElementChild).toHaveClass("bg-card");
+    expect(toggle.lastElementChild).toHaveClass("bg-toggle-idle-thumb");
     expect(toggle.lastElementChild).not.toHaveClass("bg-zinc-300");
   });
 

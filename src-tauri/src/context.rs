@@ -82,9 +82,30 @@ pub struct ContextPolicy {
     pub style_example_output: Option<String>,
     #[serde(default)]
     pub style_example_pairs: Vec<StyleExamplePair>,
+    /// Legacy examples stay in Settings but are excluded from provider prompts
+    /// until the user explicitly approves them.
+    #[serde(default)]
+    pub style_examples_approved: bool,
+    /// Accessibility-classified input role captured for this dictation. It is
+    /// kept with the policy in History so retries can apply the same
+    /// conservative Auto cleanup and lexicon rules even inside a known IDE.
+    #[serde(default)]
+    pub input_kind: FocusKind,
 }
 
 impl ContextPolicy {
+    /// Persist only routing/style metadata in History. Approved example text
+    /// remains in Settings and is looked up again only for a later request if
+    /// the current mapping still carries explicit approval.
+    pub fn history_metadata(&self) -> Self {
+        let mut policy = self.clone();
+        policy.style_example_input = None;
+        policy.style_example_output = None;
+        policy.style_example_pairs.clear();
+        policy.style_examples_approved = false;
+        policy
+    }
+
     pub fn for_family(family: ContextFamily) -> Self {
         let mut policy = Self {
             artifact_kind: "general_text".into(),
@@ -106,6 +127,8 @@ impl ContextPolicy {
             style_example_input: None,
             style_example_output: None,
             style_example_pairs: Vec::new(),
+            style_examples_approved: false,
+            input_kind: FocusKind::Unknown,
         };
         match family {
             ContextFamily::Email => {
@@ -247,6 +270,10 @@ pub struct ContextSnapshot {
     pub policy: ContextPolicy,
     pub captured_at_ms: u64,
     pub browser_access_status: BrowserAccessStatus,
+    /// Raw evidence is memory-only. ContextSnapshot crosses IPC and History
+    /// serialization paths, so evidence must never be serialized by default.
+    #[serde(skip)]
+    pub evidence: crate::screen_text::ContextEvidence,
     #[serde(skip)]
     pub target_guard: TargetAppGuard,
 }
@@ -628,7 +655,9 @@ pub fn apply_manual_override_with_modes(
         source: ContextSource::ManualOverride,
         confidence: 1.0,
     };
+    let input_kind = snapshot.policy.input_kind;
     snapshot.policy = policy_for_mode(family, Some(family_id(family)), writing_modes);
+    snapshot.policy.input_kind = input_kind;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -644,12 +673,26 @@ pub struct AppMapping {
     pub executable: Option<String>,
     #[serde(default)]
     pub browser_host: Option<String>,
+    /// Local-only URL path selector. Query and fragment are never considered.
+    #[serde(default)]
+    pub browser_path_prefix: Option<String>,
+    /// Optional focused field classification; missing AX evidence fails closed.
+    #[serde(default)]
+    pub focused_field: Option<FocusKind>,
+    /// Per-target grants for automatic content extraction/use. Every new
+    /// permission defaults off, including when loading legacy mappings.
+    #[serde(default)]
+    pub source_permissions: ContextSourcePermissions,
     #[serde(default)]
     pub style_example_input: Option<String>,
     #[serde(default)]
     pub style_example_output: Option<String>,
     #[serde(default)]
     pub style_example_pairs: Vec<StyleExamplePair>,
+    /// Retained examples are not provider-approved unless the user explicitly
+    /// opts in. Missing legacy values stay false.
+    #[serde(default)]
+    pub style_examples_approved: bool,
     #[serde(default = "default_true")]
     pub enabled: bool,
     #[serde(default)]
@@ -660,6 +703,30 @@ pub struct AppMapping {
     pub cleanup_enabled: bool,
     #[serde(default = "default_true")]
     pub dictionary_learn_enabled: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ContextSourcePermissions {
+    #[serde(default)]
+    pub ax_text: bool,
+    #[serde(default)]
+    pub local_ocr: bool,
+    #[serde(default)]
+    pub cloud_vision: bool,
+    #[serde(default)]
+    pub context_text_to_providers: bool,
+}
+
+impl ContextSourcePermissions {
+    pub fn intersect(self, current: Self) -> Self {
+        Self {
+            ax_text: self.ax_text && current.ax_text,
+            local_ocr: self.local_ocr && current.local_ocr,
+            cloud_vision: self.cloud_vision && current.cloud_vision,
+            context_text_to_providers: self.context_text_to_providers
+                && current.context_text_to_providers,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -692,9 +759,18 @@ impl AppMapping {
             self.bundle_id.as_deref(),
             self.executable.as_deref(),
             self.browser_host.as_deref(),
+            self.browser_path_prefix.as_deref(),
+            self.focused_field.as_ref().map(|_| "focused_field"),
         ];
         if selectors.iter().all(|selector| selector.is_none()) {
             return Err("mapping needs a bundle id, executable, or browser host".into());
+        }
+        if selectors
+            .iter()
+            .flatten()
+            .any(|selector| selector.trim().is_empty())
+        {
+            return Err("mapping selectors cannot be empty".into());
         }
         if self
             .mode_id
@@ -707,6 +783,27 @@ impl AppMapping {
             if normalize_host(host).is_none() {
                 return Err("browser host must be a hostname without a path".into());
             }
+        }
+        if self
+            .browser_path_prefix
+            .as_deref()
+            .is_some_and(|path| !valid_path_prefix(path))
+        {
+            return Err(
+                "browser path must start with / and cannot include a query or fragment".into(),
+            );
+        }
+        if self.browser_path_prefix.is_some() && self.browser_host.is_none() {
+            return Err("browser path requires a browser host".into());
+        }
+        if self.focused_field == Some(FocusKind::Unknown) {
+            return Err("unknown cannot be used as a focused field selector".into());
+        }
+        if self.source_permissions.cloud_vision
+            && self.bundle_id.is_none()
+            && self.executable.is_none()
+        {
+            return Err("cloud vision permission requires a specific App selector".into());
         }
         if self
             .style_example_input
@@ -765,6 +862,8 @@ struct AppSignal {
     window_title: String,
     focus_kind: FocusKind,
     browser_host: Option<String>,
+    /// Used only for local, app-aware policy resolution; never copied to a snapshot.
+    browser_path: Option<String>,
     browser_target_token: Option<u64>,
     window_token: Option<u64>,
     window_id: Option<u64>,
@@ -772,14 +871,16 @@ struct AppSignal {
     browser_access_status: BrowserAccessStatus,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-enum FocusKind {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FocusKind {
     Secure,
     Search,
     Code,
     Terminal,
     Email,
     Chat,
+    CodingPrompt,
     Document,
     Form,
     Editable,
@@ -794,6 +895,153 @@ impl FocusKind {
 
     fn is_secure(self) -> bool {
         matches!(self, Self::Secure)
+    }
+}
+
+fn known_ide_process(process_name: &str) -> bool {
+    let process = process_name.to_ascii_lowercase();
+    process.contains("cursor")
+        || process.contains("visual studio code")
+        || process == "code"
+        || process.contains("xcode")
+        || process.contains("zed")
+}
+
+fn classify_focus_for_app(
+    process_name: &str,
+    role: &str,
+    subrole: &str,
+    window_title: &str,
+    focused_description: &str,
+    focused_title: &str,
+) -> FocusKind {
+    let classified = classify_focus(
+        role,
+        subrole,
+        window_title,
+        focused_description,
+        focused_title,
+    );
+    if !known_ide_process(process_name) {
+        return classified;
+    }
+    let field = format!("{focused_description} {focused_title}").to_ascii_lowercase();
+    match classified {
+        FocusKind::Chat
+            if ["chat", "composer", "prompt"]
+                .iter()
+                .any(|marker| focus_marker(&field, marker)) =>
+        {
+            FocusKind::CodingPrompt
+        }
+        FocusKind::Code
+        | FocusKind::Terminal
+        | FocusKind::Email
+        | FocusKind::Form
+        | FocusKind::Secure => classified,
+        FocusKind::Document if field.contains("document") || field.contains("notes") => classified,
+        FocusKind::Unknown
+        | FocusKind::Search
+        | FocusKind::Chat
+        | FocusKind::Document
+        | FocusKind::Editable => {
+            // A known IDE with missing or generic field metadata is not safe
+            // to assume to be a prose prompt.
+            FocusKind::Unknown
+        }
+        FocusKind::CodingPrompt => classified,
+    }
+}
+
+/// Coarse transient hint only. Raw Accessibility labels are discarded by the
+/// frontmost-window query and are never retained with this value.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum GitHubFieldHint {
+    #[default]
+    None,
+    Title,
+    Body,
+    Conversation,
+}
+
+#[cfg(target_os = "macos")]
+fn github_field_hint(
+    focus_kind: FocusKind,
+    focused_description: &str,
+    focused_title: &str,
+) -> GitHubFieldHint {
+    if !matches!(
+        focus_kind,
+        FocusKind::Form | FocusKind::Editable | FocusKind::Email | FocusKind::Chat
+    ) {
+        return GitHubFieldHint::None;
+    }
+
+    let field = format!("{focused_description} {focused_title}").to_ascii_lowercase();
+    if ["reply", "comment", "review"]
+        .iter()
+        .any(|marker| focus_marker(&field, marker))
+    {
+        return GitHubFieldHint::Conversation;
+    }
+    if ["issue title", "pull request title", "title"]
+        .iter()
+        .any(|marker| focus_marker(&field, marker))
+    {
+        return GitHubFieldHint::Title;
+    }
+    if [
+        "issue body",
+        "issue description",
+        "pull request body",
+        "pull request description",
+        "body",
+        "description",
+    ]
+    .iter()
+    .any(|marker| focus_marker(&field, marker))
+    {
+        return GitHubFieldHint::Body;
+    }
+    GitHubFieldHint::None
+}
+
+fn is_github_issue_or_review_path(path: &str) -> bool {
+    let segments = path.trim_matches('/').split('/').collect::<Vec<_>>();
+    if segments.len() < 4 || segments[0].is_empty() || segments[1].is_empty() {
+        return false;
+    }
+    let item = segments[3];
+    match segments[2].to_ascii_lowercase().as_str() {
+        "issues" => item.eq_ignore_ascii_case("new") || is_decimal_segment(item),
+        "pulls" => item.eq_ignore_ascii_case("new") || is_decimal_segment(item),
+        "pull" => is_decimal_segment(item),
+        _ => false,
+    }
+}
+
+fn is_decimal_segment(value: &str) -> bool {
+    !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+#[cfg(target_os = "macos")]
+fn classify_github_field(
+    browser_host: Option<&str>,
+    browser_path: Option<&str>,
+    focus_kind: FocusKind,
+    field_hint: GitHubFieldHint,
+) -> FocusKind {
+    if !browser_host.is_some_and(|host| host.eq_ignore_ascii_case("github.com"))
+        || !browser_path.is_some_and(is_github_issue_or_review_path)
+    {
+        return focus_kind;
+    }
+    match field_hint {
+        GitHubFieldHint::Title => FocusKind::Form,
+        GitHubFieldHint::Body => FocusKind::Document,
+        GitHubFieldHint::Conversation => FocusKind::Chat,
+        GitHubFieldHint::None => focus_kind,
     }
 }
 
@@ -830,10 +1078,13 @@ fn snapshot_for_signal_with_modes(
         profile.writing_mode_id.as_deref(),
         writing_modes,
     );
+    policy.input_kind = signal.focus_kind;
     if let Some(mapping) = mappings
         .iter()
         .find(|mapping| profile.id == format!("user.{}", mapping.id))
+        .filter(|mapping| mapping.style_examples_approved)
     {
+        policy.style_examples_approved = true;
         policy.style_example_input = mapping.style_example_input.clone();
         policy.style_example_output = mapping.style_example_output.clone();
         policy.style_example_pairs = mapping
@@ -872,6 +1123,7 @@ fn snapshot_for_signal_with_modes(
         policy,
         captured_at_ms: now_ms(),
         browser_access_status: browser_status,
+        evidence: crate::screen_text::ContextEvidence::default(),
         target_guard: TargetAppGuard {
             pid: signal.pid,
             bundle_id: signal.bundle_id.clone(),
@@ -886,22 +1138,66 @@ fn snapshot_for_signal_with_modes(
 }
 
 fn resolve_profile(signal: &AppSignal, mappings: &[AppMapping]) -> ContextProfile {
-    if let Some(mapping) = mappings.iter().find(|mapping| {
-        mapping.enabled
-            && (selector_matches(
-                mapping.browser_host.as_deref(),
-                signal.browser_host.as_deref(),
-            ) || selector_matches(mapping.bundle_id.as_deref(), signal.bundle_id.as_deref())
-                || mapping.executable.as_deref().is_some_and(|executable| {
-                    !signal.process_name.is_empty()
-                        && executable.eq_ignore_ascii_case(&signal.process_name)
-                }))
-    }) {
+    if let Some(mapping) = best_mapping_match(signal, mappings) {
         return profile_from_mapping(mapping);
+    }
+
+    // A positively identified search control is more specific than the
+    // built-in app/domain family. User AppMappings have already taken priority.
+    if signal.focus_kind == FocusKind::Search {
+        if let Some((id, _, label)) = signal.browser_host.as_deref().and_then(browser_profile) {
+            return profile(
+                id,
+                ContextFamily::BrowserSearch,
+                label,
+                "search",
+                ContextSource::FocusedInput,
+                0.86,
+            );
+        }
+        if let Some((id, _, label, _)) = signal.bundle_id.as_deref().and_then(native_profile) {
+            return profile(
+                id,
+                ContextFamily::BrowserSearch,
+                label,
+                "search",
+                ContextSource::FocusedInput,
+                0.86,
+            );
+        }
+        return profile(
+            "browser.search",
+            ContextFamily::BrowserSearch,
+            if signal.process_name.is_empty() {
+                "Search"
+            } else {
+                &signal.process_name
+            },
+            "search",
+            ContextSource::FocusedInput,
+            0.86,
+        );
     }
 
     let has_unknown_browser_host = if let Some(host) = signal.browser_host.as_deref() {
         if let Some((id, family, label)) = browser_profile(host) {
+            // GitHub's field role is refined only for an issue or pull-request
+            // route; ordinary repository pages keep the domain policy.
+            if host.eq_ignore_ascii_case("github.com")
+                && signal
+                    .browser_path
+                    .as_deref()
+                    .is_some_and(is_github_issue_or_review_path)
+            {
+                let field_profile = match signal.focus_kind {
+                    FocusKind::Document => Some((ContextFamily::Document, "document")),
+                    FocusKind::Form => Some((ContextFamily::FormFilling, "form")),
+                    _ => None,
+                };
+                if let Some((family, icon)) = field_profile {
+                    return profile(id, family, label, icon, ContextSource::FocusedInput, 0.86);
+                }
+            }
             return profile(
                 id,
                 family,
@@ -965,16 +1261,6 @@ fn resolve_profile(signal: &AppSignal, mappings: &[AppMapping]) -> ContextProfil
             "chat",
             ContextSource::NativeProcess,
             0.82,
-        );
-    }
-    if signal.focus_kind == FocusKind::Search {
-        return profile(
-            "browser.search",
-            ContextFamily::BrowserSearch,
-            &signal.process_name,
-            "search",
-            ContextSource::WindowTitle,
-            0.68,
         );
     }
     if signal.focus_kind == FocusKind::Terminal {
@@ -1072,11 +1358,134 @@ fn resolve_profile(signal: &AppSignal, mappings: &[AppMapping]) -> ContextProfil
     )
 }
 
-fn selector_matches(mapping: Option<&str>, signal: Option<&str>) -> bool {
-    match (mapping, signal) {
-        (Some(expected), Some(actual)) => expected.eq_ignore_ascii_case(actual),
-        _ => false,
+fn best_mapping_match<'a>(
+    signal: &AppSignal,
+    mappings: &'a [AppMapping],
+) -> Option<&'a AppMapping> {
+    mappings
+        .iter()
+        .filter(|mapping| mapping.enabled && mapping_matches(mapping, signal))
+        .reduce(|best, candidate| {
+            match mapping_specificity(candidate).cmp(&mapping_specificity(best)) {
+                std::cmp::Ordering::Greater => candidate,
+                std::cmp::Ordering::Less => best,
+                std::cmp::Ordering::Equal if candidate.id < best.id => candidate,
+                std::cmp::Ordering::Equal => best,
+            }
+        })
+}
+
+fn mapping_specificity(
+    mapping: &AppMapping,
+) -> (
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+) {
+    let host = mapping.browser_host.as_deref().and_then(normalize_host);
+    let path = mapping
+        .browser_path_prefix
+        .as_deref()
+        .and_then(normalize_path_prefix);
+    let host_labels = host.as_deref().map_or(0, |value| value.split('.').count());
+    let path_segments = path.as_deref().map_or(0, |value| {
+        value.split('/').filter(|part| !part.is_empty()).count()
+    });
+    let path_length = path.as_deref().map_or(0, str::len);
+    (
+        usize::from(host.is_some()),
+        host_labels,
+        usize::from(path.is_some()),
+        path_segments,
+        path_length,
+        usize::from(mapping.focused_field.is_some()),
+        usize::from(mapping.bundle_id.is_some()),
+        usize::from(mapping.executable.is_some()),
+        usize::from(mapping.bundle_id.is_some())
+            + usize::from(mapping.executable.is_some())
+            + usize::from(mapping.browser_host.is_some())
+            + usize::from(mapping.browser_path_prefix.is_some())
+            + usize::from(mapping.focused_field.is_some()),
+    )
+}
+
+fn mapping_matches(mapping: &AppMapping, signal: &AppSignal) -> bool {
+    mapping.bundle_id.as_deref().is_none_or(|expected| {
+        signal
+            .bundle_id
+            .as_deref()
+            .is_some_and(|actual| expected.eq_ignore_ascii_case(actual))
+    }) && mapping.executable.as_deref().is_none_or(|expected| {
+        !signal.process_name.is_empty() && expected.eq_ignore_ascii_case(&signal.process_name)
+    }) && mapping.browser_host.as_deref().is_none_or(|expected| {
+        signal
+            .browser_host
+            .as_deref()
+            .is_some_and(|actual| host_rule_matches(expected, actual))
+    }) && mapping
+        .browser_path_prefix
+        .as_deref()
+        .is_none_or(|expected| {
+            signal
+                .browser_path
+                .as_deref()
+                .is_some_and(|actual| path_prefix_matches(expected, actual))
+        })
+        && mapping.focused_field.is_none_or(|expected| {
+            signal.focus_kind != FocusKind::Unknown && signal.focus_kind == expected
+        })
+}
+
+fn host_rule_matches(expected: &str, actual: &str) -> bool {
+    let Some(expected) = normalize_host(expected) else {
+        return false;
+    };
+    let Some(actual) = normalize_host(actual) else {
+        return false;
+    };
+    actual == expected || actual.strip_suffix(&format!(".{expected}")).is_some()
+}
+
+fn valid_path_prefix(value: &str) -> bool {
+    let path = value.trim();
+    path.starts_with('/')
+        && !path.contains(['?', '#'])
+        && !path.contains("//")
+        && !path.chars().any(char::is_whitespace)
+}
+
+pub fn normalize_path_prefix(value: &str) -> Option<String> {
+    let path = value.trim();
+    if !valid_path_prefix(path) {
+        return None;
     }
+    if path == "/" {
+        Some(path.to_owned())
+    } else {
+        Some(path.trim_end_matches('/').to_owned())
+    }
+}
+
+fn path_prefix_matches(prefix: &str, actual: &str) -> bool {
+    if !valid_path_prefix(prefix) || !actual.starts_with('/') || actual.contains(['?', '#']) {
+        return false;
+    }
+    let prefix = if prefix.len() > 1 {
+        prefix.trim_end_matches('/')
+    } else {
+        prefix
+    };
+    actual == prefix
+        || (prefix == "/" && actual.starts_with('/'))
+        || actual
+            .strip_prefix(prefix)
+            .is_some_and(|suffix| prefix.ends_with('/') || suffix.starts_with('/'))
 }
 
 fn profile_from_window_title(signal: &AppSignal) -> Option<ContextProfile> {
@@ -1477,13 +1886,63 @@ pub fn target_matches(guard: &TargetAppGuard, current: &TargetAppGuard) -> bool 
     target_mismatch_reason(guard, current).is_none()
 }
 
-/// Same-field observation after paste only needs app/window/input identity.
-/// Skip the browser URL probe — that is for writing policy, not learning.
+/// Relaxed focus check for operations that only require the same app/window.
+/// Delivery intentionally permits the focused control to move within the
+/// recorded window; learning and selection capture use
+/// `same_field_mismatch_reason` instead.
 pub fn focus_mismatch_reason(
     guard: &TargetAppGuard,
     current: &TargetAppGuard,
 ) -> Option<&'static str> {
     target_mismatch_without_browser(guard, current)
+}
+
+/// Strict check for reading or observing one focused editable field.
+/// Unlike the delivery guard, this requires concrete matching window and input
+/// identities. Missing metadata is not enough evidence to read the field.
+/// Browser URL/tab identity is required when the caller enables those probes;
+/// missing browser identity fails closed.
+pub fn same_field_mismatch_reason(
+    guard: &TargetAppGuard,
+    current: &TargetAppGuard,
+    require_browser_identity: bool,
+) -> Option<&'static str> {
+    if let Some(reason) = target_mismatch_without_browser(guard, current) {
+        return Some(reason);
+    }
+
+    match (guard.window_id, current.window_id) {
+        (Some(expected), Some(actual)) if expected == actual => {}
+        (Some(_), Some(_)) => return Some("target_changed"),
+        (Some(_), None) => return Some("target_unavailable"),
+        (None, _) => match (guard.window_token, current.window_token) {
+            (Some(expected), Some(actual)) if expected == actual => {}
+            (Some(_), Some(_)) => return Some("target_changed"),
+            _ => return Some("target_unavailable"),
+        },
+    }
+
+    match (guard.input_token, current.input_token) {
+        (Some(expected), Some(actual)) if expected == actual => {}
+        (Some(_), Some(_)) => return Some("input_changed"),
+        _ => return Some("input_unavailable"),
+    }
+
+    if require_browser_identity && is_browser_bundle_id(guard.bundle_id.as_deref()) {
+        if guard.browser_host.is_none() || current.browser_host.is_none() {
+            return Some("target_unavailable");
+        }
+        if guard.browser_target_token.is_none() || current.browser_target_token.is_none() {
+            return Some("target_unavailable");
+        }
+        if guard.browser_host != current.browser_host
+            || guard.browser_target_token != current.browser_target_token
+        {
+            return Some("target_changed");
+        }
+    }
+
+    None
 }
 
 fn target_mismatch_without_browser(
@@ -1565,35 +2024,41 @@ pub fn target_mismatch_reason(
 }
 
 pub fn normalize_host(value: &str) -> Option<String> {
-    let value = value.trim().trim_end_matches('.').to_ascii_lowercase();
+    let value = value.trim();
     if value.is_empty() {
         return None;
     }
-    let value = value
-        .strip_prefix("https://")
-        .or_else(|| value.strip_prefix("http://"))
-        .unwrap_or(&value);
-    if value.contains('/') || value.contains('?') || value.contains('#') {
+    let url = if value.contains("://") {
+        reqwest::Url::parse(value).ok()?
+    } else {
+        reqwest::Url::parse(&format!("https://{value}")).ok()?
+    };
+    if !matches!(url.scheme(), "http" | "https")
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.path() != "/"
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
         return None;
     }
-    let host = value.split(':').next()?.trim_end_matches('.');
-    if host.is_empty() || host.chars().any(|ch| ch.is_whitespace()) {
-        return None;
-    }
-    Some(host.to_owned())
+    let host = url.host_str()?.trim_end_matches('.').to_ascii_lowercase();
+    (!host.is_empty() && !host.chars().any(char::is_whitespace)).then_some(host)
 }
 
-fn extract_host(raw_url: &str) -> Option<String> {
-    let raw_url = raw_url.trim();
-    if !(raw_url.starts_with("https://") || raw_url.starts_with("http://")) {
+fn extract_browser_location(raw_url: &str) -> Option<(String, String)> {
+    let url = reqwest::Url::parse(raw_url.trim()).ok()?;
+    if !matches!(url.scheme(), "https" | "http") {
         return None;
     }
-    let authority = raw_url.split_once("://")?.1;
-    let authority = authority.split(['/', '?', '#']).next()?;
-    normalize_host(&format!("https://{authority}"))
+    let host = url.host_str()?.trim_end_matches('.').to_ascii_lowercase();
+    if host.is_empty() {
+        return None;
+    }
+    Some((host, url.path().to_owned()))
 }
 
-fn query_browser_url(application: &str) -> Result<(String, u64), BrowserAccessStatus> {
+fn query_browser_url(application: &str) -> Result<(String, String, u64), BrowserAccessStatus> {
     let script = match application {
         "Google Chrome" => {
             "tell application \"Google Chrome\"\n  set activeTab to active tab of front window\n  return (URL of activeTab) & (ASCII character 9) & (index of activeTab as text) & (ASCII character 9) & (title of activeTab)\nend tell"
@@ -1644,7 +2109,8 @@ fn query_browser_url(application: &str) -> Result<(String, u64), BrowserAccessSt
                     .map_err(|_| BrowserAccessStatus::NeedsPermission)?;
                 let mut fields = identity.trim().split('\t');
                 let raw_url = fields.next().unwrap_or_default();
-                let host = extract_host(raw_url).ok_or(BrowserAccessStatus::NeedsPermission)?;
+                let (host, path) = extract_browser_location(raw_url)
+                    .ok_or(BrowserAccessStatus::NeedsPermission)?;
                 // Keep the full tab identity local and hash it immediately.
                 // If an adapter only returns a URL, the URL remains a safe
                 // conservative fallback; adapters with tab metadata also
@@ -1655,7 +2121,7 @@ fn query_browser_url(application: &str) -> Result<(String, u64), BrowserAccessSt
                 } else {
                     format!("{raw_url}\t{tab_metadata}")
                 };
-                return Ok((host, browser_target_token(&fingerprint_input)));
+                return Ok((host, path, browser_target_token(&fingerprint_input)));
             }
             Ok(Some(_)) => return Err(BrowserAccessStatus::NeedsPermission),
             Ok(None) if std::time::Instant::now() < deadline => {
@@ -1686,6 +2152,8 @@ fn browser_target_token(raw_url: &str) -> u64 {
 struct WindowIdentity {
     title: String,
     focus_kind: FocusKind,
+    /// Coarse field meaning only; never keep the raw focused label here.
+    github_field_hint: GitHubFieldHint,
     window_token: Option<u64>,
     window_id: Option<u64>,
     input_token: Option<u64>,
@@ -1951,7 +2419,7 @@ fn focus_marker(value: &str, marker: &str) -> bool {
 fn classify_focus(
     role: &str,
     subrole: &str,
-    window_title: &str,
+    _window_title: &str,
     focused_description: &str,
     focused_title: &str,
 ) -> FocusKind {
@@ -1965,11 +2433,11 @@ fn classify_focus(
     if !editable {
         return FocusKind::Unknown;
     }
-    let value = format!("{role_value} {window_title} {focused_description} {focused_title}")
-        .to_ascii_lowercase();
+    let value = format!("{role_value} {focused_description} {focused_title}").to_ascii_lowercase();
     if ["search", "query", "find", "address bar"]
         .iter()
         .any(|marker| focus_marker(&value, marker))
+        || value.contains("搜索")
     {
         return FocusKind::Search;
     }
@@ -1992,22 +2460,28 @@ fn classify_focus(
     {
         return FocusKind::Email;
     }
-    if ["message", "chat", "comment", "slack", "teams", "discord"]
-        .iter()
-        .any(|marker| focus_marker(&value, marker))
-    {
-        return FocusKind::Chat;
-    }
     if [
-        "document",
-        "notion",
-        "notes",
-        "journal",
-        "paragraph",
-        "rich text",
+        "issue title",
+        "issue body",
+        "issue description",
+        "new issue",
     ]
     .iter()
     .any(|marker| focus_marker(&value, marker))
+    {
+        return FocusKind::Form;
+    }
+    if ["message", "chat", "comment", "composer", "review"]
+        .iter()
+        .any(|marker| focus_marker(&value, marker))
+        || value.contains("消息")
+        || value.contains("输入消息")
+    {
+        return FocusKind::Chat;
+    }
+    if ["document", "notes", "journal", "paragraph", "rich text"]
+        .iter()
+        .any(|marker| focus_marker(&value, marker))
     {
         return FocusKind::Document;
     }
@@ -2037,7 +2511,7 @@ fn classify_focus(
 /// The raw title and focused-element metadata are hashed before they can enter
 /// a snapshot, history record, IPC payload, or provider request.
 #[cfg(target_os = "macos")]
-fn query_frontmost_window(pid: i32) -> WindowIdentity {
+fn query_frontmost_window(pid: i32, process_name: &str) -> WindowIdentity {
     const TIMEOUT_MS: u64 = 350;
     let script = r#"
 tell application "System Events"
@@ -2133,7 +2607,15 @@ end tell
     let focused_title = fields.next().unwrap_or_default().trim();
     let focused_position = fields.next().unwrap_or_default().trim();
     let focused_size = fields.next().unwrap_or_default().trim();
-    let focus_kind = classify_focus(&role, &subrole, &title, description, focused_title);
+    let focus_kind = classify_focus_for_app(
+        process_name,
+        &role,
+        &subrole,
+        &title,
+        description,
+        focused_title,
+    );
+    let github_field_hint = github_field_hint(focus_kind, description, focused_title);
     let input_token = focus_kind
         .is_editable()
         .then(|| {
@@ -2147,64 +2629,9 @@ end tell
         window_id: query_window_id(pid, &title, window_position, window_size),
         input_token,
         focus_kind,
+        github_field_hint,
         title,
     }
-}
-
-/// Best-effort local read of the focused Accessibility value. The value is
-/// used only in memory to compare the input before and after a Cmd+V; it is
-/// never serialized, persisted, or sent to a provider. `None` means macOS
-/// could not expose a readable value for this control.
-#[cfg(target_os = "macos")]
-pub fn focused_input_value() -> Option<String> {
-    const TIMEOUT_MS: u64 = 350;
-    const UNAVAILABLE: &str = "__VOICEFLOW_AX_UNAVAILABLE__";
-    let script = r#"
-tell application "System Events"
-  try
-    set p to first application process whose frontmost is true
-    set focusedElement to value of attribute "AXFocusedUIElement" of p
-    try
-      return (value of focusedElement) as text
-    on error
-      return "__VOICEFLOW_AX_UNAVAILABLE__"
-    end try
-  on error
-    return "__VOICEFLOW_AX_UNAVAILABLE__"
-  end try
-end tell
-"#;
-    let mut child = Command::new("osascript")
-        .args(["-e", script])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    let deadline = std::time::Instant::now() + Duration::from_millis(TIMEOUT_MS);
-    let output = loop {
-        match child.try_wait() {
-            Ok(Some(status)) if status.success() => break child.wait_with_output().ok()?,
-            Ok(Some(_)) => return None,
-            Ok(None) if std::time::Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(15));
-            }
-            Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
-            Err(_) => return None,
-        }
-    };
-    let value = String::from_utf8_lossy(&output.stdout)
-        .trim_end_matches(['\r', '\n'])
-        .to_owned();
-    (value != UNAVAILABLE).then_some(value)
-}
-
-#[cfg(not(target_os = "macos"))]
-pub fn focused_input_value() -> Option<String> {
-    None
 }
 
 #[cfg(target_os = "macos")]
@@ -2242,33 +2669,43 @@ fn frontmost_signal(browser_access_enabled: bool) -> AppSignal {
         // window/focused-element probe is both unnecessary for the native
         // profile preview and can trigger an avoidable macOS permission flow.
         let window = if crate::permissions::accessibility_is_trusted() {
-            query_frontmost_window(pid)
+            query_frontmost_window(pid, &process_name)
         } else {
             WindowIdentity::default()
         };
         let browser_application = browser_application(bundle_id.as_deref(), &process_name);
-        let (browser_host, browser_target_token, browser_access_status) =
+        let (browser_host, browser_path, browser_target_token, browser_access_status) =
             if let Some(browser_application) = browser_application {
                 if browser_access_enabled {
                     match query_browser_url(browser_application) {
-                        Ok((host, token)) => {
-                            (Some(host), Some(token), BrowserAccessStatus::Granted)
-                        }
-                        Err(status) => (None, None, status),
+                        Ok((host, path, token)) => (
+                            Some(host),
+                            Some(path),
+                            Some(token),
+                            BrowserAccessStatus::Granted,
+                        ),
+                        Err(status) => (None, None, None, status),
                     }
                 } else {
-                    (None, None, BrowserAccessStatus::Disabled)
+                    (None, None, None, BrowserAccessStatus::Disabled)
                 }
             } else {
-                (None, None, BrowserAccessStatus::NotApplicable)
+                (None, None, None, BrowserAccessStatus::NotApplicable)
             };
+        let focus_kind = classify_github_field(
+            browser_host.as_deref(),
+            browser_path.as_deref(),
+            window.focus_kind,
+            window.github_field_hint,
+        );
         AppSignal {
             pid,
             bundle_id,
             process_name,
             window_title: window.title,
-            focus_kind: window.focus_kind,
+            focus_kind,
             browser_host,
+            browser_path,
             browser_target_token,
             window_token: window.window_token,
             window_id: window.window_id,
@@ -2479,7 +2916,9 @@ fn snapshot_for_enabled_state(
         return detected;
     }
     let mut snapshot = detected;
+    let input_kind = snapshot.policy.input_kind;
     snapshot.policy = policy_for_mode(ContextFamily::General, Some("general"), writing_modes);
+    snapshot.policy.input_kind = input_kind;
     snapshot.profile.family = ContextFamily::General;
     snapshot.profile.writing_mode_id = Some("general".into());
     snapshot.profile.id = "general".into();
@@ -2499,6 +2938,7 @@ mod tests {
             window_title: String::new(),
             focus_kind: FocusKind::Unknown,
             browser_host: host.map(str::to_owned),
+            browser_path: None,
             browser_target_token: None,
             window_token: None,
             window_id: None,
@@ -2806,9 +3246,13 @@ mod tests {
             bundle_id: Some("com.todesktop.230313mzl4w4u92".into()),
             executable: None,
             browser_host: None,
+            browser_path_prefix: None,
+            focused_field: None,
+            source_permissions: Default::default(),
             style_example_input: None,
             style_example_output: None,
             style_example_pairs: Vec::new(),
+            style_examples_approved: false,
             enabled: true,
             cleanup_effort: None,
             cleanup_intensity: None,
@@ -2825,6 +3269,329 @@ mod tests {
     }
 
     #[test]
+    fn mapping_selectors_are_and_combined_and_specificity_beats_generic_app_rule() {
+        let generic = AppMapping {
+            id: "a-chrome".into(),
+            label: "Chrome general".into(),
+            family: ContextFamily::General,
+            mode_id: None,
+            bundle_id: Some("com.google.Chrome".into()),
+            executable: None,
+            browser_host: None,
+            browser_path_prefix: None,
+            focused_field: None,
+            source_permissions: Default::default(),
+            style_example_input: None,
+            style_example_output: None,
+            style_example_pairs: Vec::new(),
+            style_examples_approved: false,
+            enabled: true,
+            cleanup_effort: None,
+            cleanup_intensity: None,
+            cleanup_enabled: true,
+            dictionary_learn_enabled: true,
+        };
+        let gmail = AppMapping {
+            id: "z-gmail".into(),
+            label: "Gmail composer".into(),
+            family: ContextFamily::Email,
+            mode_id: None,
+            bundle_id: Some("com.google.Chrome".into()),
+            executable: None,
+            browser_host: Some("mail.google.com".into()),
+            browser_path_prefix: None,
+            focused_field: None,
+            source_permissions: Default::default(),
+            style_example_input: None,
+            style_example_output: None,
+            style_example_pairs: Vec::new(),
+            style_examples_approved: false,
+            enabled: true,
+            cleanup_effort: None,
+            cleanup_intensity: None,
+            cleanup_enabled: true,
+            dictionary_learn_enabled: true,
+        };
+        let mut signal = signal(
+            "com.google.Chrome",
+            "Google Chrome",
+            Some("mail.google.com"),
+        );
+        signal.browser_path = Some("/mail/u/0".into());
+        for mappings in [vec![generic.clone(), gmail.clone()], vec![gmail, generic]] {
+            let snapshot = snapshot_for_signal(&signal, &mappings, true);
+            assert_eq!(snapshot.profile.id, "user.z-gmail");
+            assert_eq!(snapshot.profile.family, ContextFamily::Email);
+        }
+
+        let conjunctive = AppMapping {
+            id: "chrome-on-gmail-only".into(),
+            label: "Chrome Gmail only".into(),
+            family: ContextFamily::Email,
+            mode_id: None,
+            bundle_id: Some("com.google.Chrome".into()),
+            executable: None,
+            browser_host: Some("mail.google.com".into()),
+            browser_path_prefix: Some("/mail".into()),
+            focused_field: Some(FocusKind::Email),
+            source_permissions: Default::default(),
+            style_example_input: None,
+            style_example_output: None,
+            style_example_pairs: Vec::new(),
+            style_examples_approved: false,
+            enabled: true,
+            cleanup_effort: None,
+            cleanup_intensity: None,
+            cleanup_enabled: true,
+            dictionary_learn_enabled: true,
+        };
+        assert_eq!(
+            snapshot_for_signal(&signal, std::slice::from_ref(&conjunctive), true)
+                .profile
+                .id,
+            "email.gmail"
+        );
+        signal.browser_path = Some("/mail".into());
+        signal.focus_kind = FocusKind::Email;
+        assert_eq!(
+            snapshot_for_signal(&signal, &[conjunctive], true)
+                .profile
+                .id,
+            "user.chrome-on-gmail-only"
+        );
+    }
+
+    #[test]
+    fn site_path_and_equal_tie_specificity_is_deterministic() {
+        let rule = |id: &str, bundle_id: Option<&str>, host: Option<&str>, path: Option<&str>| {
+            AppMapping {
+                id: id.into(),
+                label: id.into(),
+                family: ContextFamily::General,
+                mode_id: None,
+                bundle_id: bundle_id.map(str::to_owned),
+                executable: None,
+                browser_host: host.map(str::to_owned),
+                browser_path_prefix: path.map(str::to_owned),
+                focused_field: None,
+                source_permissions: Default::default(),
+                style_example_input: None,
+                style_example_output: None,
+                style_example_pairs: Vec::new(),
+                style_examples_approved: false,
+                enabled: true,
+                cleanup_effort: None,
+                cleanup_intensity: None,
+                cleanup_enabled: true,
+                dictionary_learn_enabled: true,
+            }
+        };
+
+        let chrome = rule("a-chrome", Some("com.google.Chrome"), None, None);
+        let mail_host = rule("z-mail", None, Some("mail.google.com"), None);
+        let gmail_signal = signal(
+            "com.google.Chrome",
+            "Google Chrome",
+            Some("mail.google.com"),
+        );
+        assert_eq!(
+            best_mapping_match(&gmail_signal, &[chrome.clone(), mail_host.clone()])
+                .unwrap()
+                .id,
+            "z-mail"
+        );
+
+        let parent_domain = rule("parent", None, Some("google.com"), None);
+        let subdomain = rule("subdomain", None, Some("mail.google.com"), None);
+        assert_eq!(
+            best_mapping_match(&gmail_signal, &[parent_domain, subdomain])
+                .unwrap()
+                .id,
+            "subdomain"
+        );
+
+        let repo = rule("repo", None, Some("github.com"), Some("/repo"));
+        let issues = rule("issues", None, Some("github.com"), Some("/repo/issues"));
+        let mut github = signal("com.google.Chrome", "Google Chrome", Some("github.com"));
+        github.browser_path = Some("/repo/issues/123".into());
+        assert_eq!(
+            best_mapping_match(&github, &[repo, issues]).unwrap().id,
+            "issues"
+        );
+
+        let tie_z = rule("z-tie", None, Some("github.com"), None);
+        let tie_a = rule("a-tie", None, Some("github.com"), None);
+        assert_eq!(
+            best_mapping_match(&github, &[tie_z.clone(), tie_a.clone()])
+                .unwrap()
+                .id,
+            "a-tie"
+        );
+        assert_eq!(
+            best_mapping_match(&github, &[tie_a, tie_z]).unwrap().id,
+            "a-tie"
+        );
+    }
+
+    #[test]
+    fn host_and_path_selectors_observe_boundaries_and_missing_signals_fail_closed() {
+        assert!(host_rule_matches("github.com", "github.com"));
+        assert!(host_rule_matches("github.com", "gist.github.com"));
+        assert!(!host_rule_matches("github.com", "evilgithub.com"));
+        assert!(path_prefix_matches("/issues", "/issues"));
+        assert!(path_prefix_matches("/issues", "/issues/123"));
+        assert!(!path_prefix_matches("/issues", "/issues-other"));
+        assert!(!path_prefix_matches("/issues", "/issues?q=private"));
+
+        let mapping = AppMapping {
+            id: "github-issues".into(),
+            label: "GitHub issues".into(),
+            family: ContextFamily::ProjectManagement,
+            mode_id: None,
+            bundle_id: None,
+            executable: None,
+            browser_host: Some("github.com".into()),
+            browser_path_prefix: Some("/issues".into()),
+            focused_field: Some(FocusKind::Chat),
+            source_permissions: Default::default(),
+            style_example_input: None,
+            style_example_output: None,
+            style_example_pairs: Vec::new(),
+            style_examples_approved: false,
+            enabled: true,
+            cleanup_effort: None,
+            cleanup_intensity: None,
+            cleanup_enabled: true,
+            dictionary_learn_enabled: true,
+        };
+        let mut signal = signal("com.google.Chrome", "Google Chrome", Some("github.com"));
+        signal.browser_path = Some("/issues/1".into());
+        assert!(!mapping_matches(&mapping, &signal));
+        signal.focus_kind = FocusKind::Chat;
+        assert!(mapping_matches(&mapping, &signal));
+        signal.browser_host = Some("evilgithub.com".into());
+        assert!(!mapping_matches(&mapping, &signal));
+        signal.browser_host = None;
+        assert!(!mapping_matches(&mapping, &signal));
+    }
+
+    #[test]
+    fn old_mapping_json_defaults_new_content_grants_off() {
+        let value = serde_json::json!({
+            "id": "legacy", "label": "Legacy", "family": "email",
+            "bundle_id": "com.example.Mail", "enabled": true,
+            "cleanup_enabled": true, "dictionary_learn_enabled": true
+        });
+        let mapping: AppMapping = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            mapping.source_permissions,
+            ContextSourcePermissions::default()
+        );
+        assert!(mapping.browser_path_prefix.is_none());
+        assert!(mapping.focused_field.is_none());
+        assert!(mapping.validate().is_ok());
+    }
+
+    #[test]
+    fn ide_field_evidence_is_conservative_but_positive_chat_is_coding_prompt() {
+        assert_eq!(
+            classify_focus_for_app("Cursor", "AXTextArea", "", "", "", ""),
+            FocusKind::Unknown
+        );
+        assert_eq!(
+            classify_focus_for_app("Cursor", "AXTextArea", "", "", "Chat", ""),
+            FocusKind::CodingPrompt
+        );
+        assert_eq!(
+            classify_focus_for_app("Cursor", "AXTextArea", "", "", "", "Editor content"),
+            FocusKind::Code
+        );
+        assert_eq!(
+            classify_focus_for_app("Cursor", "AXTextField", "", "", "Terminal input", ""),
+            FocusKind::Terminal
+        );
+        assert_eq!(
+            classify_focus_for_app(
+                "Visual Studio Code",
+                "AXTextArea",
+                "",
+                "",
+                "Chat composer",
+                ""
+            ),
+            FocusKind::CodingPrompt
+        );
+        assert_eq!(
+            classify_focus_for_app(
+                "Visual Studio Code",
+                "AXTextArea",
+                "",
+                "",
+                "Editor content",
+                ""
+            ),
+            FocusKind::Code
+        );
+        assert_eq!(
+            classify_focus_for_app(
+                "Visual Studio Code",
+                "AXTextField",
+                "",
+                "",
+                "",
+                "Terminal input"
+            ),
+            FocusKind::Terminal
+        );
+        assert_eq!(
+            classify_focus_for_app("Slack", "AXTextArea", "", "", "Message", ""),
+            FocusKind::Chat
+        );
+        assert_eq!(
+            classify_focus_for_app("WeChat", "AXTextField", "", "", "输入消息", ""),
+            FocusKind::Chat
+        );
+        assert_eq!(
+            classify_focus_for_app("Google Chrome", "AXTextArea", "", "", "Review comment", ""),
+            FocusKind::Chat
+        );
+        assert_eq!(
+            classify_focus_for_app("Google Chrome", "AXTextArea", "", "", "Issue body", ""),
+            FocusKind::Form
+        );
+        assert_eq!(
+            classify_focus_for_app("Slack", "AXTextField", "", "", "Search messages", ""),
+            FocusKind::Search
+        );
+        assert_eq!(
+            classify_focus_for_app("WeChat", "AXTextField", "", "", "搜索消息", ""),
+            FocusKind::Search
+        );
+        assert_eq!(
+            classify_focus_for_app(
+                "Google Chrome",
+                "AXTextField",
+                "Slack workspace",
+                "",
+                "",
+                ""
+            ),
+            FocusKind::Editable
+        );
+        assert_eq!(
+            classify_focus_for_app(
+                "Google Chrome",
+                "AXTextField",
+                "",
+                "",
+                "Search messages",
+                ""
+            ),
+            FocusKind::Search
+        );
+    }
+
+    #[test]
     fn save_mapping_keeps_learned_style_pairs() {
         let existing = AppMapping {
             id: "wechat".into(),
@@ -2834,6 +3601,9 @@ mod tests {
             bundle_id: Some("com.tencent.xinWeChat".into()),
             executable: None,
             browser_host: None,
+            browser_path_prefix: None,
+            focused_field: None,
+            source_permissions: Default::default(),
             style_example_input: Some("好的".into()),
             style_example_output: Some("好的哈哈".into()),
             style_example_pairs: vec![
@@ -2846,6 +3616,7 @@ mod tests {
                     output: "稍等下".into(),
                 },
             ],
+            style_examples_approved: false,
             enabled: true,
             cleanup_effort: None,
             cleanup_intensity: None,
@@ -2864,7 +3635,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_copies_three_style_pairs() {
+    fn snapshot_copies_three_explicitly_approved_style_pairs() {
         let mapping = AppMapping {
             id: "wechat".into(),
             label: "微信".into(),
@@ -2873,6 +3644,9 @@ mod tests {
             bundle_id: Some("com.tencent.xinWeChat".into()),
             executable: None,
             browser_host: None,
+            browser_path_prefix: None,
+            focused_field: None,
+            source_permissions: Default::default(),
             style_example_input: Some("a".into()),
             style_example_output: Some("b".into()),
             style_example_pairs: vec![
@@ -2889,6 +3663,7 @@ mod tests {
                     output: "f".into(),
                 },
             ],
+            style_examples_approved: true,
             enabled: true,
             cleanup_effort: None,
             cleanup_intensity: None,
@@ -2902,6 +3677,46 @@ mod tests {
         );
         assert_eq!(snapshot.policy.style_example_pairs.len(), 3);
         assert_eq!(snapshot.policy.style_example_pairs[2].output, "f");
+    }
+
+    #[test]
+    fn ambiguous_legacy_style_examples_stay_in_settings_but_are_not_projected() {
+        let mut mapping = AppMapping {
+            id: "legacy-style".into(),
+            label: "Legacy style".into(),
+            family: ContextFamily::PersonalChat,
+            mode_id: None,
+            bundle_id: Some("com.tencent.xinWeChat".into()),
+            executable: None,
+            browser_host: None,
+            browser_path_prefix: None,
+            focused_field: None,
+            source_permissions: Default::default(),
+            style_example_input: None,
+            style_example_output: None,
+            style_example_pairs: Vec::new(),
+            style_examples_approved: false,
+            enabled: true,
+            cleanup_effort: None,
+            cleanup_intensity: None,
+            cleanup_enabled: true,
+            dictionary_learn_enabled: true,
+        };
+        mapping.style_example_input = Some("private draft input".into());
+        mapping.style_example_output = Some("private draft output".into());
+        mapping.style_example_pairs = vec![StyleExamplePair {
+            input: "private draft input".into(),
+            output: "private draft output".into(),
+        }];
+        let snapshot = snapshot_for_signal(
+            &signal("com.tencent.xinWeChat", "WeChat", None),
+            &[mapping.clone()],
+            false,
+        );
+        assert!(snapshot.policy.style_example_pairs.is_empty());
+        assert!(snapshot.policy.style_example_input.is_none());
+        assert_eq!(mapping.style_example_pairs[0].input, "private draft input");
+        assert!(!mapping.style_examples_approved);
     }
 
     #[test]
@@ -2921,9 +3736,13 @@ mod tests {
             bundle_id: Some("com.todesktop.230313mzl4w4u92".into()),
             executable: None,
             browser_host: None,
+            browser_path_prefix: None,
+            focused_field: None,
+            source_permissions: Default::default(),
             style_example_input: None,
             style_example_output: None,
             style_example_pairs: Vec::new(),
+            style_examples_approved: false,
             enabled: true,
             cleanup_effort: None,
             cleanup_intensity: None,
@@ -2989,9 +3808,13 @@ mod tests {
             bundle_id: Some("com.todesktop.230313mzl4w4u92".into()),
             executable: None,
             browser_host: None,
+            browser_path_prefix: None,
+            focused_field: None,
+            source_permissions: Default::default(),
             style_example_input: None,
             style_example_output: None,
             style_example_pairs: Vec::new(),
+            style_examples_approved: false,
             enabled: true,
             cleanup_effort: None,
             cleanup_intensity: None,
@@ -3017,7 +3840,7 @@ mod tests {
             FocusKind::Unknown
         );
         assert_eq!(
-            classify_focus("AXTextArea", "", "Code", "", ""),
+            classify_focus("AXTextArea", "", "", "", "Code"),
             FocusKind::Code
         );
         assert_eq!(
@@ -3029,7 +3852,7 @@ mod tests {
             FocusKind::Chat
         );
         assert_eq!(
-            classify_focus("AXTextArea", "", "Notes", "", "Entry"),
+            classify_focus("AXTextArea", "", "", "Notes entry", ""),
             FocusKind::Document
         );
         assert_eq!(
@@ -3244,6 +4067,89 @@ mod tests {
     }
 
     #[test]
+    fn same_field_guard_requires_matching_window_and_input_identity() {
+        let original = TargetAppGuard {
+            pid: 42,
+            bundle_id: Some("com.example.editor".into()),
+            browser_host: None,
+            browser_target_token: None,
+            window_token: Some(7),
+            window_id: Some(1001),
+            input_token: Some(9),
+            secure_input: false,
+        };
+        let moved_focus = TargetAppGuard {
+            input_token: Some(10),
+            ..original.clone()
+        };
+        let missing_input_identity = TargetAppGuard {
+            input_token: None,
+            ..original.clone()
+        };
+        let missing_window_identity = TargetAppGuard {
+            window_id: None,
+            window_token: None,
+            ..original.clone()
+        };
+
+        // The relaxed delivery guard still allows same-window delivery when
+        // focus moved; observation of a field must reject that case.
+        assert_eq!(target_mismatch_reason(&original, &moved_focus), None);
+        assert_eq!(
+            same_field_mismatch_reason(&original, &moved_focus, false),
+            Some("input_changed")
+        );
+        assert_eq!(
+            same_field_mismatch_reason(&original, &missing_input_identity, false),
+            Some("input_unavailable")
+        );
+        assert_eq!(
+            same_field_mismatch_reason(&original, &missing_window_identity, false),
+            Some("target_unavailable")
+        );
+    }
+
+    #[test]
+    fn same_field_guard_requires_browser_target_when_browser_access_is_enabled() {
+        let original = TargetAppGuard {
+            pid: 42,
+            bundle_id: Some("com.google.Chrome".into()),
+            browser_host: Some("example.com".into()),
+            browser_target_token: Some(10),
+            window_token: Some(7),
+            window_id: Some(1001),
+            input_token: Some(9),
+            secure_input: false,
+        };
+        let changed_tab = TargetAppGuard {
+            browser_target_token: Some(11),
+            ..original.clone()
+        };
+        let missing_tab_probe = TargetAppGuard {
+            browser_target_token: None,
+            ..original.clone()
+        };
+        let identity_not_enabled = TargetAppGuard {
+            browser_host: None,
+            browser_target_token: None,
+            ..original.clone()
+        };
+
+        assert_eq!(
+            same_field_mismatch_reason(&original, &changed_tab, true),
+            Some("target_changed")
+        );
+        assert_eq!(
+            same_field_mismatch_reason(&original, &missing_tab_probe, true),
+            Some("target_unavailable")
+        );
+        assert_eq!(
+            same_field_mismatch_reason(&identity_not_enabled, &identity_not_enabled, false),
+            None
+        );
+    }
+
+    #[test]
     fn target_guard_rejects_same_fingerprint_from_another_window() {
         let original = TargetAppGuard {
             pid: 42,
@@ -3286,9 +4192,10 @@ mod tests {
         );
         assert_eq!(normalize_host("https://gmail.com/path"), None);
         assert_eq!(
-            extract_host("https://mail.google.com/u/0/#inbox"),
-            Some("mail.google.com".into())
+            extract_browser_location("https://user:pass@mail.google.com/u/0/?secret=x#inbox"),
+            Some(("mail.google.com".into(), "/u/0/".into()))
         );
+        assert_eq!(normalize_host("https://user:pass@mail.google.com"), None);
     }
 
     #[test]
@@ -3296,9 +4203,20 @@ mod tests {
         let first_tab = browser_target_token("https://example.com\t1\tExample");
         let second_tab = browser_target_token("https://example.com\t2\tExample");
         let renamed_tab = browser_target_token("https://example.com\t1\tRenamed");
+        let first_issue = browser_target_token(
+            "https://github.com/acme/repo/issues/42?tab=comments#issuecomment-1\t1\tIssue",
+        );
+        let other_query = browser_target_token(
+            "https://github.com/acme/repo/issues/42?tab=files#issuecomment-1\t1\tIssue",
+        );
+        let other_fragment = browser_target_token(
+            "https://github.com/acme/repo/issues/42?tab=comments#issuecomment-2\t1\tIssue",
+        );
 
         assert_ne!(first_tab, second_tab);
         assert_ne!(first_tab, renamed_tab);
+        assert_ne!(first_issue, other_query);
+        assert_ne!(first_issue, other_fragment);
     }
 
     #[test]

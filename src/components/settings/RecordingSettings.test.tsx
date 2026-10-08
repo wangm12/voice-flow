@@ -1,30 +1,38 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { selectOption } from "../../test/selectOption";
+import { invoke } from "@tauri-apps/api/core";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Settings } from "../../types/settings";
 import { RecordingSettings } from "./RecordingSettings";
+
+vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
+const invokeMock = vi.mocked(invoke);
 
 vi.mock("../HotkeyRecorder", () => ({
   HotkeyRecorder: ({
     onChange,
     captureTarget = "dictation",
+    disabled = false,
   }: {
     onChange: (
       hotkey: string,
-      activationMode?: "tap" | "double_tap" | "hybrid",
       options?: { persist?: boolean },
     ) => void;
-    captureTarget?: "dictation" | "selected_action" | "screen_action";
+    disabled?: boolean;
+    captureTarget?: "dictation" | "selected_action" | "screen_action" | "verbatim_action" | "translation_action";
   }) => (
     <>
     <button
       type="button"
-      onClick={() => onChange("Command+Shift+Space", "tap", { persist: true })}
+      disabled={disabled}
+      onClick={() => onChange("Command+Shift+Space", { persist: false })}
     >
       {`recapture-${captureTarget}`}
     </button>
     <button
       type="button"
-      onClick={() => onChange("Fn", "double_tap", { persist: true })}
+      disabled={disabled}
+      onClick={() => onChange("Fn", { persist: false })}
     >
       {`recapture-modifier-${captureTarget}`}
     </button>
@@ -52,7 +60,7 @@ const settings: Settings = {
   cleanup_enabled: true,
   show_tray_icon: true,
   hotkey: "CmdOrControl+Shift+Space",
-  activation_mode: "hybrid",
+  activation_mode: "hold_to_talk",
   context_enabled: true,
   browser_access_enabled: false,
   context_mappings: [],
@@ -66,54 +74,114 @@ const settings: Settings = {
 describe("RecordingSettings", () => {
   afterEach(() => {
     cleanup();
+  invokeMock.mockReset();
   });
 
-  it("keeps hybrid when recapture reports tap for a combo", () => {
+  it("saves a mode independently and commits page values only after native success", async () => {
+    let acknowledge!: () => void;
+    invokeMock.mockImplementation(() => new Promise<void>((resolve) => { acknowledge = resolve; }));
+    const save = vi.fn();
+    render(<RecordingSettings settings={{ ...settings, api_key_configured: false }} save={save} />);
+    fireEvent.click(screen.getByRole("radio", { name: "点按切换" }));
+    expect(invokeMock).toHaveBeenCalledWith("update_settings_patch", { patch: { activation_mode: "tap" } });
+    expect(save).not.toHaveBeenCalled();
+    expect(screen.getByRole("radio", { name: "按住说话" })).toBeChecked();
+    expect(screen.getByRole("button", { name: "recapture-dictation" })).toBeDisabled();
+    acknowledge();
+    await waitFor(() => expect(save).toHaveBeenCalledWith({ activation_mode: "tap" }, { persist: false }));
+  });
+
+  it("retains the previous mode when native save fails", async () => {
+    invokeMock.mockRejectedValueOnce(new Error("write failed"));
+    const save = vi.fn();
+    render(<RecordingSettings settings={settings} save={save} />);
+    fireEvent.click(screen.getByRole("radio", { name: "点按切换" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("write failed");
+    expect(screen.getByRole("radio", { name: "按住说话" })).toBeChecked();
+    expect(save).not.toHaveBeenCalled();
+  });
+
+  it("blocks binding and mode changes while dictation is busy", () => {
+    render(<RecordingSettings settings={settings} save={vi.fn()} dictationBusy />);
+    for (const radio of screen.getAllByRole("radio")) expect(radio).toBeDisabled();
+    expect(screen.getByRole("button", { name: "recapture-dictation" })).toBeDisabled();
+  });
+
+  it("opens keyboard settings only after an explicit Fn action", () => {
+    invokeMock.mockResolvedValue(undefined);
+    render(<RecordingSettings settings={{ ...settings, hotkey: "Fn" }} save={vi.fn()} />);
+    expect(invokeMock).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "打开键盘设置" }));
+    expect(invokeMock).toHaveBeenCalledWith("open_privacy_settings", { pane: "keyboard" });
+  });
+
+  it("sets the translation shortcut and target without changing the global output mode", () => {
+    const save = vi.fn();
+    render(<RecordingSettings settings={settings} save={save} />);
+    fireEvent.click(screen.getByRole("button", { name: /更多快捷键/ }));
+    fireEvent.click(screen.getByRole("button", { name: "recapture-translation_action" }));
+    expect(save).toHaveBeenCalledWith({ translation_hotkey: "Command+Shift+Space" }, { persist: false });
+    selectOption(screen.getByLabelText("快捷翻译目标语言"), "ja");
+    expect(save).toHaveBeenCalledWith({ translation_target_language: "ja" });
+    expect(save.mock.calls.every(([patch]) => !("output_mode" in patch) && !("activation_mode" in patch))).toBe(true);
+  });
+
+  it("saves a separate optional skip cleanup shortcut", () => {
+    const save = vi.fn();
+    render(<RecordingSettings settings={settings} save={save} />);
+    fireEvent.click(screen.getByRole("button", { name: /更多快捷键/ }));
+    fireEvent.click(screen.getByRole("button", { name: "recapture-verbatim_action" }));
+    expect(save).toHaveBeenCalledWith({ verbatim_hotkey: "Command+Shift+Space" }, { persist: false });
+  });
+
+  it("preserves the selected mode when a combination is recaptured", () => {
     const save = vi.fn();
     render(<RecordingSettings settings={settings} save={save} />);
 
     fireEvent.click(screen.getByRole("button", { name: "recapture-dictation" }));
 
     expect(save).toHaveBeenCalledWith(
-      { hotkey: "Command+Shift+Space", activation_mode: "hybrid" },
-      { persist: true },
+      { hotkey: "Command+Shift+Space" },
+      { persist: false },
     );
   });
 
-  it("forces double_tap when recapture is modifier-only", () => {
+  it("preserves the selected mode when Fn is selected", () => {
     const save = vi.fn();
     render(<RecordingSettings settings={settings} save={save} />);
 
     fireEvent.click(screen.getByRole("button", { name: "recapture-modifier-dictation" }));
 
     expect(save).toHaveBeenCalledWith(
-      { hotkey: "Fn", activation_mode: "double_tap" },
-      { persist: true },
+      { hotkey: "Fn" },
+      { persist: false },
     );
   });
 
-  it("explains that WeChat may steal a Fn-only hotkey", () => {
+  it("explains the macOS Fn conflict and offers keyboard settings", () => {
     const save = vi.fn();
     const { rerender } = render(
-      <RecordingSettings settings={{ ...settings, hotkey: "Fn", activation_mode: "double_tap" }} save={save} />,
+      <RecordingSettings settings={{ ...settings, hotkey: "Fn", activation_mode: "hold_to_talk" }} save={save} />,
     );
-    expect(screen.getByText("微信 / 微信输入法可能会占用 Fn 键，VoiceFlow 可能收不到这个快捷键。")).toBeTruthy();
+    expect(screen.getByText("Fn / 🌐 可能用于切换输入法、表情或系统听写。若有冲突，请在 macOS 键盘设置中调整；VoiceFlow 不会修改系统设置。")).toBeTruthy();
 
     rerender(<RecordingSettings settings={settings} save={save} />);
-    expect(screen.queryByText("微信 / 微信输入法可能会占用 Fn 键，VoiceFlow 可能收不到这个快捷键。")).toBeNull();
+    expect(screen.queryByText("Fn / 🌐 可能用于切换输入法、表情或系统听写。若有冲突，请在 macOS 键盘设置中调整；VoiceFlow 不会修改系统设置。")).toBeNull();
   });
 
   it("records an off-by-default look-at-screen hotkey", () => {
     const save = vi.fn();
     render(<RecordingSettings settings={settings} save={save} />);
     expect(screen.getByText("未设置快捷键，看屏幕不会触发")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /更多快捷键/ }));
     fireEvent.click(screen.getByRole("button", { name: "recapture-screen_action" }));
-    expect(save).toHaveBeenCalledWith({ screen_action_hotkey: "Command+Shift+Space" }, { persist: true });
+    expect(save).toHaveBeenCalledWith({ screen_action_hotkey: "Command+Shift+Space" }, { persist: false });
   });
 
   it("saves input gain from the recognition control", () => {
     const save = vi.fn();
     render(<RecordingSettings settings={{ ...settings, input_gain: 1 }} save={save} />);
+    fireEvent.click(screen.getByRole("button", { name: /高级录音设置/ }));
     fireEvent.change(screen.getByRole("spinbutton", { name: "输入增益" }), {
       target: { value: "2" },
     });

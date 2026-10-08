@@ -15,8 +15,8 @@ import {
 } from "../Island/voicePillTokens";
 import "../../island.css";
 
-export function MainPillPreview({ live = false, compact = false }: { live?: boolean; compact?: boolean }) {
-  const pillWidth = voicePillWidthForState("recording") - (compact ? 8 : 0);
+export function MainPillPreview({ live = false }: { live?: boolean }) {
+  const pillWidth = voicePillWidthForState("recording");
   const beam = live ? HUD_LISTENING_BEAM : HUD_THINKING_BEAM;
 
   return (
@@ -36,7 +36,7 @@ export function MainPillPreview({ live = false, compact = false }: { live?: bool
         style={{ width: pillWidth, height: voicePillHeight }}
       >
         <div
-          className={`voice-pill voice-pill--labeled voice-pill--orb${compact ? " voice-pill--onboarding-compact" : ""}`}
+          className="voice-pill voice-pill--labeled voice-pill--orb"
           style={{ width: pillWidth, height: voicePillHeight }}
         >
           <div className="voice-pill__content">

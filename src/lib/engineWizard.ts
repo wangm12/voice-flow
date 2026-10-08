@@ -1,11 +1,15 @@
 import type { Settings } from "../types/settings";
 import {
   defaultModel,
+  dashscopeEndpointForRegion,
+  dashscopeRegionFromEndpoint,
   inferProviderFromHost,
   isKnownModel,
   isLoopbackUrl,
   isProviderId,
   providerById,
+  type AsrModelProfile,
+  type DashscopeRegion,
   type ProviderId,
 } from "./providers";
 
@@ -21,6 +25,7 @@ export type EngineDraft = {
   customLlm: boolean;
   ollamaBaseUrl: string;
   localWhisperBaseUrl: string;
+  dashscopeRegion?: DashscopeRegion;
   providerKeys: Partial<Record<ProviderId, string>>;
 };
 
@@ -64,11 +69,12 @@ export function hostnameOf(url: string, provider: ProviderId): string {
   }
 }
 
-export function providerUrl(id: ProviderId, draft: Pick<EngineDraft, "customBaseUrl" | "ollamaBaseUrl" | "localWhisperBaseUrl">): string {
+export function providerUrl(id: ProviderId, draft: Pick<EngineDraft, "customBaseUrl" | "ollamaBaseUrl" | "localWhisperBaseUrl" | "dashscopeRegion">): string {
   const named = providerById(id);
   if (id === "custom") return draft.customBaseUrl.trim();
   if (id === "ollama") return draft.ollamaBaseUrl.trim() || named?.defaultBaseUrl || "";
   if (id === "local_whisper") return draft.localWhisperBaseUrl.trim() || named?.defaultBaseUrl || "";
+  if (id === "dashscope") return dashscopeEndpointForRegion(draft.dashscopeRegion ?? "beijing");
   return named?.defaultBaseUrl ?? "";
 }
 
@@ -88,17 +94,23 @@ export function providerHint(settings: Settings, id: ProviderId): string {
     ?? "";
 }
 
-export function hasProviderSecret(id: ProviderId, draft: EngineDraft, settings: Settings): boolean {
+export function hasProviderSecret(
+  id: ProviderId,
+  draft: EngineDraft,
+  settings: Settings,
+  onDeviceReady = false,
+): boolean {
+  if (id === "on_device") return onDeviceReady;
   if (draft.providerKeys[id]?.trim()) return true;
   if (providerConfigured(settings, id)) return true;
   const named = providerById(id);
   return Boolean(named?.allowsEmptyKey && isLoopbackUrl(providerUrl(id, draft)));
 }
 
-export function isAsrReady(settings: Settings): boolean {
+export function isAsrReady(settings: Settings, onDeviceReady = false): boolean {
   const id = providerOf(settings.asr_provider, settings.asr_base_url);
   const draft = draftFromSettings(settings);
-  return hasProviderSecret(id, draft, settings) && Boolean(settings.asr_model.trim());
+  return hasProviderSecret(id, draft, settings, onDeviceReady) && Boolean(settings.asr_model.trim());
 }
 
 export function isCleanupReady(settings: Settings): boolean {
@@ -107,8 +119,11 @@ export function isCleanupReady(settings: Settings): boolean {
   return hasProviderSecret(id, draft, settings) && Boolean(settings.cleanup_model.trim());
 }
 
-export function isEngineConnected(settings: Settings): boolean {
-  return isAsrReady(settings) && (!settings.cleanup_enabled || isCleanupReady(settings));
+export function isEngineConnected(settings: Settings, onDeviceReady = false): boolean {
+  const asrProvider = providerOf(settings.asr_provider, settings.asr_base_url);
+  const fusedAssemblyAiCanProvideCleanup = asrProvider === "assemblyai";
+  return isAsrReady(settings, onDeviceReady)
+    && (!settings.cleanup_enabled || fusedAssemblyAiCanProvideCleanup || isCleanupReady(settings));
 }
 
 export function draftFromSettings(settings: Settings): EngineDraft {
@@ -124,6 +139,7 @@ export function draftFromSettings(settings: Settings): EngineDraft {
     customLlm: settings.custom_llm ?? true,
     ollamaBaseUrl: settings.ollama_base_url || providerById("ollama")?.defaultBaseUrl || "",
     localWhisperBaseUrl: settings.local_whisper_base_url || providerById("local_whisper")?.defaultBaseUrl || "",
+    dashscopeRegion: dashscopeRegionFromEndpoint(settings.asr_base_url),
     providerKeys: {},
   };
 }
@@ -143,10 +159,10 @@ export function switchProvider(draft: EngineDraft, side: "asr" | "cleanup", next
   };
 }
 
-export function step2Ready(draft: EngineDraft, settings: Settings): boolean {
-  if (!draft.asrModel.trim() || !hasProviderSecret(draft.asrProvider, draft, settings)) return false;
+export function step2Ready(draft: EngineDraft, settings: Settings, onDeviceReady = false): boolean {
+  if (!draft.asrModel.trim() || !hasProviderSecret(draft.asrProvider, draft, settings, onDeviceReady)) return false;
   if (draft.asrProvider === "custom" && !draft.customBaseUrl.trim()) return false;
-  if (!settings.cleanup_enabled) return true;
+  if (!settings.cleanup_enabled || draft.asrProvider === "assemblyai") return true;
   if (!draft.cleanupModel.trim() || !hasProviderSecret(draft.cleanupProvider, draft, settings)) return false;
   if (draft.cleanupProvider === "custom" && !draft.customBaseUrl.trim()) return false;
   return true;
@@ -170,6 +186,9 @@ export function persistPatch(draft: EngineDraft, settings: Settings): Record<str
     ollama_base_url: draft.ollamaBaseUrl.trim(),
     local_whisper_base_url: draft.localWhisperBaseUrl.trim(),
   };
+  if (draft.asrProvider === "assemblyai" || draft.asrProvider === "dashscope") {
+    patch.asr_base_url = providerUrl(draft.asrProvider, draft);
+  }
   if (settings.cleanup_enabled) {
     patch.cleanup_provider = draft.cleanupProvider;
     patch.cleanup_model = draft.cleanupModel.trim();
@@ -222,11 +241,52 @@ export function maskSecret(value: string): string {
 }
 
 export function modelLabel(model: string): string {
-  for (const provider of ["groq", "openai", "deepgram", "deepseek", "anthropic", "siliconflow"] as const) {
+  for (const provider of ["groq", "openai", "deepgram", "siliconflow", "fireworks", "mistral", "soniox", "assemblyai", "dashscope", "deepseek", "anthropic"] as const) {
     const definition = providerById(provider);
     const match = [...(definition?.asrModels ?? []), ...(definition?.llmModels ?? [])]
       .find((option) => option.value === model);
     if (match) return match.label;
   }
   return model;
+}
+
+export function asrLanguageDescription(
+  profile: AsrModelProfile | undefined,
+  language: string,
+  t: (key: string) => string,
+): string {
+  if (!profile) return t("当前模型的语言行为尚未核实，请以服务商文档为准。");
+  const fixed = language !== "auto";
+  switch (profile.languageSupport) {
+    case "auto_detect_only":
+      return fixed
+        ? t("此模型只自动检测语言；当前固定语言选择不会发送。")
+        : t("此模型只使用自动语言检测。");
+    case "auto_detect_or_fixed_language":
+      return fixed
+        ? `${t("当前按单一固定语言转写：")} ${language === "zh" ? t("中文") : t("English")}`
+        : t("此模型可自动检测，也可按单一支持的语言转写。");
+    case "optional_fixed_language":
+      return fixed
+        ? `${t("当前按单一固定语言转写：")} ${language === "zh" ? t("中文") : t("English")}`
+        : t("此模型可自动检测，也可指定一种固定语言。");
+    case "explicit_language_required":
+      return language === "zh" || language === "en"
+        ? `${t("此模型要求固定语言：")} ${language === "zh" ? t("中文") : t("English")}`
+        : t("此模型要求固定使用中文或 English；自动语言检测不可用。请在录音设置中更改识别语言。");
+    case "explicit_language_list":
+      return language === "auto"
+        ? t("自动设置会显式请求中文和 English 的语言列表；这不是服务端自动检测。")
+        : `${t("当前明确发送单一识别语言：")} ${language === "zh" ? t("中文") : t("English")}`;
+    case "candidate_language_hints":
+      return fixed
+        ? t("当前语言会作为候选提示发送，不会锁定识别语言。")
+        : t("自动检测；固定语言可作为候选提示，不会锁定识别语言。");
+    case "unsupported":
+      return t("此模型不接受语言参数；当前选择不会发送。");
+  }
+}
+
+export function hasSupportedAsrLanguage(profile: AsrModelProfile | undefined, language: string): boolean {
+  return profile?.languageSupport !== "explicit_language_required" || language === "zh" || language === "en";
 }

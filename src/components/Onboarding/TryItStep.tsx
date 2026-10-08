@@ -106,11 +106,9 @@ export function TryItStep({
   };
 
   const dictationStatus = recording
-    ? activationMode === "double_tap"
-      ? t("正在录音… 再双击功能键结束")
-      : activationMode === "hybrid"
-        ? t("正在录音… 再按一次或松开结束")
-        : t("正在录音… 再按一次热键结束")
+    ? activationMode === "hold_to_talk"
+      ? t("正在录音… 松开快捷键结束")
+      : t("正在录音… 再按一次快捷键结束")
     : processing && activeTrialRef.current === "dictation"
       ? t("正在处理… 请稍候")
       : t("等待你按语音输入快捷键开始");
@@ -188,7 +186,7 @@ export function TryItStep({
         />
         <TrialStatus active={recording && activeTrialRef.current === "dictation"} processing={processing && activeTrialRef.current === "dictation"} text={dictationStatus} />
         {deliveryNote && trial === "dictation" && (
-          <p role="status" className="mt-3 text-xs text-warning">{deliveryNote}</p>
+          <p role="status" className="mt-3 text-xs text-warning-ink">{deliveryNote}</p>
         )}
       </section>}
 
@@ -211,10 +209,10 @@ export function TryItStep({
         />
         <TrialStatus active={selectedActionState === "listening" || (recording && activeTrialRef.current === "selected_action")} processing={selectedActionState === "preparing_rewrite" || (processing && activeTrialRef.current === "selected_action")} text={selectedActionStatus} />
         {deliveryNote && trial === "selected_action" && (
-          <p role="status" className="mt-3 text-xs text-warning">{deliveryNote}</p>
+          <p role="status" className="mt-3 text-xs text-warning-ink">{deliveryNote}</p>
         )}
       </section>}
-      {error && <p role="alert" className="mt-3 text-xs text-error">{error}</p>}
+      {error && <p role="alert" className="mt-3 text-xs text-error-ink">{error}</p>}
     </div>
   );
 }
@@ -222,7 +220,7 @@ export function TryItStep({
 function TrialStatus({ active, processing, text }: { active: boolean; processing: boolean; text: string }) {
   return (
     <div className="mt-3 flex items-center gap-2.5 text-xs" aria-live="polite">
-      {processing ? <Loader2 {...iconPropsLg} className="animate-spin text-secondary motion-reduce:animate-none" aria-hidden="true" /> : <Mic {...iconPropsLg} className={active ? "text-error" : "text-secondary"} aria-hidden="true" />}
+      {processing ? <Loader2 {...iconPropsLg} className="animate-spin text-secondary motion-reduce:animate-none" aria-hidden="true" /> : <Mic {...iconPropsLg} className={active ? "text-error-ink" : "text-secondary"} aria-hidden="true" />}
       <span className={active || processing ? "text-primary" : "text-secondary"}>{text}</span>
     </div>
   );

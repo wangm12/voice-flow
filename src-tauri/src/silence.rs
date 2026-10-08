@@ -3,7 +3,8 @@
 const SAMPLE_RATE: usize = 16_000;
 const FRAME: usize = SAMPLE_RATE * 30 / 1_000;
 const HOP: usize = SAMPLE_RATE * 10 / 1_000;
-const SPEECH_RMS: f32 = 0.01;
+const MIN_ACTIVITY_RMS: f32 = 0.0008;
+const MAX_ADAPTIVE_RMS: f32 = 0.01;
 const PAD_SAMPLES: usize = SAMPLE_RATE * 200 / 1_000;
 const LONG_GAP: usize = SAMPLE_RATE * 3 / 2;
 const KEPT_GAP: usize = SAMPLE_RATE * 400 / 1_000;
@@ -43,12 +44,23 @@ pub fn trim_and_compress(samples: &[f32]) -> Vec<f32> {
 }
 
 fn speech_ranges(samples: &[f32]) -> Vec<(usize, usize)> {
+    let frame_rms: Vec<(usize, f32)> = (0..samples.len())
+        .step_by(HOP)
+        .map(|index| {
+            let end = (index + FRAME).min(samples.len());
+            (index, rms(&samples[index..end]))
+        })
+        .collect();
+    let energies: Vec<f32> = frame_rms.iter().map(|(_, energy)| *energy).collect();
+    let Some(threshold) = activity_threshold(&energies) else {
+        return Vec::new();
+    };
+
     let mut ranges = Vec::new();
     let mut start = None;
-    let mut index = 0;
-    while index < samples.len() {
+    for (index, energy) in frame_rms {
         let end = (index + FRAME).min(samples.len());
-        let spoken = rms(&samples[index..end]) >= SPEECH_RMS;
+        let spoken = energy.is_finite() && energy >= threshold;
         if spoken && start.is_none() {
             start = Some(index);
         }
@@ -63,7 +75,6 @@ fn speech_ranges(samples: &[f32]) -> Vec<(usize, usize)> {
             }
             break;
         }
-        index += HOP;
     }
     merge_close(ranges)
 }
@@ -87,6 +98,35 @@ fn rms(samples: &[f32]) -> f32 {
         return 0.0;
     }
     (samples.iter().map(|sample| sample * sample).sum::<f32>() / samples.len() as f32).sqrt()
+}
+
+/// Adaptive activity threshold shared by trimming and finalize-time VAD.
+pub(crate) fn activity_threshold(energies: &[f32]) -> Option<f32> {
+    let peak = energies
+        .iter()
+        .copied()
+        .filter(|energy| energy.is_finite())
+        .fold(0.0_f32, f32::max);
+    if peak < MIN_ACTIVITY_RMS {
+        return None;
+    }
+
+    // Use the quieter part of this recording to estimate the local floor, and
+    // cap it relative to peak energy so a sustained quiet utterance is not
+    // mistaken for noise. Exact digital silence remains distinguishable.
+    let mut ordered_energy: Vec<f32> = energies
+        .iter()
+        .copied()
+        .filter(|energy| energy.is_finite())
+        .collect();
+    ordered_energy.sort_by(f32::total_cmp);
+    let lower_energy = ordered_energy[ordered_energy.len() / 5];
+    let adaptive_threshold = if lower_energy >= peak * 0.5 {
+        peak * 0.08
+    } else {
+        (lower_energy * 1.5).min(peak * 0.1)
+    };
+    Some(adaptive_threshold.clamp(MIN_ACTIVITY_RMS, MAX_ADAPTIVE_RMS))
 }
 
 #[cfg(test)]
@@ -124,5 +164,29 @@ mod tests {
     fn empty_or_silent_audio_returns_empty() {
         assert!(trim_and_compress(&[]).is_empty());
         assert!(trim_and_compress(&vec![0.0; SAMPLE_RATE]).is_empty());
+    }
+
+    #[test]
+    fn retains_low_volume_speech_alone_and_after_a_loud_phrase() {
+        let quiet: Vec<f32> = tone(SAMPLE_RATE)
+            .into_iter()
+            .map(|sample| sample * 0.02)
+            .collect();
+        let quiet_output = trim_and_compress(&quiet);
+        assert_eq!(quiet_output.len(), quiet.len());
+        assert!(rms(&quiet_output) > MIN_ACTIVITY_RMS);
+
+        let mut mixed = tone(SAMPLE_RATE);
+        mixed.extend(vec![0.0; SAMPLE_RATE * 3]);
+        mixed.extend_from_slice(&quiet);
+        let mixed_output = trim_and_compress(&mixed);
+        assert!(
+            mixed_output.len() < mixed.len(),
+            "long digital silence is compressed"
+        );
+        assert!(
+            mixed_output.ends_with(&quiet),
+            "quiet speech after a loud phrase remains intact"
+        );
     }
 }

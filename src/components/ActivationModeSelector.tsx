@@ -1,53 +1,58 @@
-import { ACTIVATION_MODES, type ActivationMode } from "../lib/activationCopy";
-import { radius } from "../lib/theme";
+import { useId } from "react";
+import { Check } from "lucide-react";
+import { ACTIVATION_MODES, recordingInstruction, type ActivationMode } from "../lib/activationCopy";
+import { formatHotkeyDisplay } from "../lib/hotkeyFormat";
 import { useI18n } from "../lib/i18n";
 
 export function ActivationModeSelector({
   value,
   onChange,
-  modifierOnly = false,
+  hotkey,
+  disabled = false,
 }: {
   value: ActivationMode | string;
   onChange: (mode: ActivationMode) => void;
-  modifierOnly?: boolean;
+  hotkey: string;
+  disabled?: boolean;
 }) {
   const { t } = useI18n();
-  const enabled = (mode: ActivationMode) => (modifierOnly ? mode === "double_tap" : mode !== "double_tap");
+  const descriptionId = useId();
+  const name = useId();
   return (
-    <div className="space-y-2" role="radiogroup" aria-label={t("激活方式")} aria-describedby={modifierOnly ? "activation-mode-modifier-hint" : undefined}>
-      {ACTIVATION_MODES.map((mode) => {
-        const active = (modifierOnly ? "double_tap" : value) === mode.id;
-        const disabled = !enabled(mode.id);
-        return (
-          <label
-            key={mode.id}
-            className={`flex gap-3 ${radius.control} border px-4 py-3 transition-colors ${
-              disabled ? "cursor-not-allowed opacity-60" : "cursor-pointer"
-            } ${
-              active ? "border-accent bg-elevated" : "border-border bg-card hover:border-border/80"
-            }`}
-          >
-            <input
-              type="radio"
-              name="activation_mode"
-              value={mode.id}
-              checked={active}
-              disabled={disabled}
-              onChange={() => onChange(mode.id)}
-              className="mt-0.5 accent-[var(--color-accent)]"
-            />
-            <span className="min-w-0">
-              <span className="block text-sm font-medium text-primary">{t(mode.label)}</span>
-              <span className="mt-0.5 block text-xs text-secondary">{t(mode.description)}</span>
-            </span>
-          </label>
-        );
-      })}
-      {modifierOnly && (
-        <p id="activation-mode-modifier-hint" className="px-1 text-xs leading-5 text-tertiary">
-          {t("功能键只能使用双击开始和结束。")}
-        </p>
-      )}
+    <div className="space-y-2" role="radiogroup" aria-label={t("录音方式")} aria-describedby={descriptionId}>
+      <div className="vf-activation-options grid grid-cols-2 gap-1 rounded-lg bg-card p-1">
+        {ACTIVATION_MODES.map((mode) => {
+          const active = value === mode.id;
+          return (
+            <label
+              key={mode.id}
+              className={`vf-activation-option relative flex min-h-8 min-w-0 items-center justify-center gap-1.5 rounded-[6px] px-2 py-1 text-center transition-colors ${
+                disabled ? "cursor-not-allowed text-disabled-foreground" : "cursor-pointer"
+              } ${
+                active ? "bg-elevated text-primary" : disabled ? "" : "text-secondary hover:bg-elevated active:bg-elevated"
+              }`}
+            >
+              <input
+                type="radio"
+                name={name}
+                value={mode.id}
+                checked={active}
+                disabled={disabled}
+                onChange={() => onChange(mode.id)}
+                className="sr-only"
+              />
+              <Check size={14} strokeWidth={2} aria-hidden="true" className={`shrink-0 ${active ? "" : "invisible"}`} />
+              <span className="min-w-0">
+                <span className="block text-sm font-medium leading-5">{t(mode.label)}</span>
+              </span>
+            </label>
+          );
+        })}
+      </div>
+      <p id={descriptionId} className="text-[13px] leading-5 text-secondary">
+        {recordingInstruction(value, formatHotkeyDisplay(hotkey), t)}
+        <span className="mt-1 block text-xs text-tertiary">{t("Esc 取消。")}</span>
+      </p>
     </div>
   );
 }

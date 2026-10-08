@@ -6,10 +6,14 @@
 //! Pure insertions (append-only typing) are never learned.
 //! Never install a global key event tap.
 
-use std::collections::{HashMap, HashSet};
+#[cfg(test)]
+use std::collections::HashMap;
+use std::collections::HashSet;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
-use crate::{context, lock_recover, store, AppState};
+use crate::{context, lexicon, lock_recover, store, AppState};
 use serde::{Deserialize, Serialize};
 use tauri::{Emitter, Manager, State};
 
@@ -193,6 +197,17 @@ pub(crate) fn list_learn_pairs(
         .map_err(|error| error.to_string())?;
     let rows = store::list_learn_pairs(&dir).map_err(|error| error.to_string())?;
     Ok(pairs_for_dictionary_settings(rows))
+}
+
+#[tauri::command]
+pub(crate) fn list_learned_term_usage(
+    app: tauri::AppHandle,
+) -> Result<Vec<store::LearnedTermUsage>, String> {
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| error.to_string())?;
+    store::list_learned_term_usage(&dir).map_err(|error| error.to_string())
 }
 
 pub(crate) fn pairs_for_dictionary_settings(
@@ -419,6 +434,9 @@ pub(crate) async fn confirm_style_draft(
     let state = app.state::<AppState>();
     let _gate = state.settings_gate.lock().await;
     let mut snapshot = lock_recover(&state.settings).clone();
+    if !snapshot.dictionary_learn_enabled || !snapshot.context_enabled {
+        return Err("Dictionary learning is disabled".into());
+    }
     if !snapshot
         .context_mappings
         .iter()
@@ -433,6 +451,18 @@ pub(crate) async fn confirm_style_draft(
         .iter_mut()
         .find(|mapping| mapping.id == draft.mapping_id)
         .ok_or_else(|| "mapping was not found".to_string())?;
+    if !mapping.enabled || !mapping.dictionary_learn_enabled {
+        return Err("App style learning is disabled".into());
+    }
+    if !mapping.source_permissions.ax_text {
+        return Err("Accessibility text permission is required to adopt this style draft".into());
+    }
+    if lexicon::is_default_learn_off_target(
+        mapping.bundle_id.as_deref(),
+        mapping.browser_host.as_deref(),
+    ) {
+        return Err("Style learning is disabled for this protected App or site".into());
+    }
     push_style_pair(
         &mut mapping.style_example_pairs,
         draft.before_excerpt.clone(),
@@ -440,6 +470,7 @@ pub(crate) async fn confirm_style_draft(
     );
     mapping.style_example_input = Some(draft.before_excerpt.clone());
     mapping.style_example_output = Some(draft.after_excerpt.clone());
+    mapping.style_examples_approved = true;
     snapshot.normalize();
     store::save_settings(&dir, &snapshot).map_err(|error| error.to_string())?;
     *lock_recover(&state.settings) = snapshot.clone();
@@ -536,16 +567,83 @@ pub enum ObserveOutcome {
     Ambiguous,
 }
 
+#[cfg(test)]
 pub fn observe_after_paste(
     post_insert_field: &str,
     expected_target: &context::TargetAppGuard,
     dictionary_learn_enabled: bool,
     limits: ObserveLimits,
+    read_value: impl FnMut() -> Option<String>,
+    read_target: impl FnMut() -> context::TargetAppGuard,
+    sleep: impl FnMut(Duration),
+) -> ObserveOutcome {
+    observe_after_paste_with_identity(
+        post_insert_field,
+        expected_target,
+        ObserveOptions {
+            dictionary_learn_enabled,
+            require_browser_identity: false,
+            limits,
+        },
+        read_value,
+        read_target,
+        sleep,
+        || true,
+        || true,
+    )
+}
+
+struct ObserveOptions {
+    dictionary_learn_enabled: bool,
+    require_browser_identity: bool,
+    limits: ObserveLimits,
+}
+
+pub(crate) fn invalidate_learning_observers(epoch: &AtomicU64) -> u64 {
+    epoch.fetch_add(1, Ordering::AcqRel).wrapping_add(1)
+}
+
+fn learning_observer_is_current(epoch: &AtomicU64, expected: u64) -> bool {
+    epoch.load(Ordering::Acquire) == expected
+}
+
+fn learning_observer_may_register(
+    epoch: &AtomicU64,
+    expected_epoch: u64,
+    cancelled: bool,
+    originating_session_is_current: bool,
+) -> bool {
+    !cancelled
+        && originating_session_is_current
+        && learning_observer_is_current(epoch, expected_epoch)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn observe_after_paste_with_identity(
+    post_insert_field: &str,
+    expected_target: &context::TargetAppGuard,
+    options: ObserveOptions,
     mut read_value: impl FnMut() -> Option<String>,
     mut read_target: impl FnMut() -> context::TargetAppGuard,
     mut sleep: impl FnMut(Duration),
+    mut same_native_field: impl FnMut() -> bool,
+    mut keep_watching: impl FnMut() -> bool,
 ) -> ObserveOutcome {
-    if !dictionary_learn_enabled || expected_target.secure_input || post_insert_field.is_empty() {
+    let ObserveOptions {
+        dictionary_learn_enabled,
+        require_browser_identity,
+        limits,
+    } = options;
+    if !dictionary_learn_enabled
+        || expected_target.secure_input
+        || post_insert_field.is_empty()
+        || context::same_field_mismatch_reason(
+            expected_target,
+            expected_target,
+            require_browser_identity,
+        )
+        .is_some()
+    {
         return ObserveOutcome::Unchanged;
     }
     if limits.interval.is_zero() {
@@ -556,19 +654,41 @@ pub fn observe_after_paste(
     let mut deadline = limits.initial;
     let mut last_settled = post_insert_field.to_string();
     while elapsed < deadline.min(limits.max_total) {
+        if !keep_watching() {
+            return ObserveOutcome::Unchanged;
+        }
         sleep(limits.interval);
+        if !keep_watching() {
+            return ObserveOutcome::Unchanged;
+        }
         elapsed = elapsed.saturating_add(limits.interval);
 
-        let current_target = read_target();
-        if context::focus_mismatch_reason(expected_target, &current_target).is_some() {
-            if let Some(current) = read_value() {
-                if !current.trim().is_empty() {
-                    last_settled = current;
-                }
-            }
-            return finalize_observe(post_insert_field, &last_settled, true);
+        let current_before_read = read_target();
+        if context::same_field_mismatch_reason(
+            expected_target,
+            &current_before_read,
+            require_browser_identity,
+        )
+        .is_some()
+            || !same_native_field()
+        {
+            return ObserveOutcome::LeftTarget;
         }
-        let Some(current) = read_value() else {
+
+        let current = read_value();
+        let current_after_read = read_target();
+        if context::same_field_mismatch_reason(
+            expected_target,
+            &current_after_read,
+            require_browser_identity,
+        )
+        .is_some()
+            || !same_native_field()
+        {
+            return ObserveOutcome::LeftTarget;
+        }
+
+        let Some(current) = current else {
             continue;
         };
         if current != last_settled {
@@ -579,7 +699,11 @@ pub fn observe_after_paste(
         }
     }
 
-    finalize_observe(post_insert_field, &last_settled, false)
+    if keep_watching() {
+        finalize_observe(post_insert_field, &last_settled, false)
+    } else {
+        ObserveOutcome::Unchanged
+    }
 }
 
 fn finalize_observe(baseline: &str, settled: &str, left_target: bool) -> ObserveOutcome {
@@ -802,6 +926,7 @@ pub struct StyleLearnApply {
     pub pairs_changed: bool,
     pub intensity_changed: bool,
     pub style_pair_key: Option<String>,
+    pub style_draft_key: Option<String>,
     pub intensity_pair_key: Option<String>,
 }
 
@@ -833,22 +958,17 @@ pub fn apply_post_paste_style_learn(
         store::upsert_learn_pair_with_scope(dir, &style_key, baseline, settled, Some(&scope))?
     {
         if row.hits >= STYLE_LEARN_HITS {
-            push_style_pair(
-                &mut mappings[mapping_index].style_example_pairs,
-                baseline.to_owned(),
-                settled.to_owned(),
-            );
-            let first = mappings[mapping_index]
-                .style_example_pairs
-                .first()
-                .map(|pair| (pair.input.clone(), pair.output.clone()));
-            if let Some((input, output)) = first {
-                mappings[mapping_index].style_example_input = Some(input);
-                mappings[mapping_index].style_example_output = Some(output);
-            }
+            let draft = store::upsert_style_draft(
+                dir,
+                mapping_id,
+                "short_style_rewrite",
+                settled,
+                baseline,
+                settled,
+            )?;
             let _ = store::set_learn_pair_hits(dir, &style_key, 0);
-            applied.pairs_changed = true;
             applied.style_pair_key = Some(style_key);
+            applied.style_draft_key = Some(draft.draft_key);
         }
     }
 
@@ -1021,9 +1141,10 @@ pub fn seed_lexicon_from_screen(
     screen: &crate::screen_text::ScreenTextContext,
     style_pairs: &mut Vec<context::StyleExamplePair>,
     scope: Option<&store::LearnPairScope>,
+    permissions: context::ContextSourcePermissions,
 ) -> anyhow::Result<()> {
     let _ = style_pairs;
-    for token in &screen.tokens {
+    for token in screen.granted_terms(permissions) {
         let token = token.trim();
         if token.is_empty() || is_blocked(token) {
             continue;
@@ -1038,30 +1159,48 @@ pub(crate) fn maybe_seed_screen_lexicon(
     state: &AppState,
     recording_context: Option<&context::ContextSnapshot>,
 ) {
-    let settings = lock_recover(&state.settings);
-    if !settings.dictionary_learn_enabled {
+    let settings = lock_recover(&state.settings).clone();
+    if !settings.dictionary_learn_enabled || !settings.context_enabled {
         return;
     }
+    let Some(recording_context) =
+        recording_context.filter(|snapshot| crate::context_target_is_current(snapshot, &settings))
+    else {
+        return;
+    };
     let Some(screen) = crate::session_screen_text(state) else {
         return;
     };
-    if screen.tokens.is_empty() {
+    let Some(mapping) =
+        lexicon::mapping_for_profile(&settings.context_mappings, &recording_context.profile.id)
+            .filter(|mapping| mapping.enabled && mapping.dictionary_learn_enabled)
+    else {
+        return;
+    };
+    if lexicon::is_default_learn_off_target(
+        recording_context.target_guard.bundle_id.as_deref(),
+        recording_context.target_guard.browser_host.as_deref(),
+    ) {
+        return;
+    }
+    let permissions = mapping
+        .source_permissions
+        .intersect(screen.evidence.capture_permissions.unwrap_or_default());
+    if screen.granted_terms(permissions).is_empty() {
         return;
     }
     if !crate::lexicon::scene_allows_learn(
         &settings.context_mappings,
-        recording_context
-            .map(|snapshot| snapshot.profile.id.as_str())
-            .unwrap_or(""),
-        recording_context.and_then(|snapshot| snapshot.target_guard.bundle_id.as_deref()),
-        recording_context.and_then(|snapshot| snapshot.target_guard.browser_host.as_deref()),
+        &recording_context.profile.id,
+        recording_context.target_guard.bundle_id.as_deref(),
+        recording_context.target_guard.browser_host.as_deref(),
     ) {
         return;
     }
-    let scope = recording_context.map(scope_from_snapshot);
+    let scope = Some(scope_from_snapshot(recording_context));
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
-        persist_screen_lexicon_locked(&app, screen, scope).await;
+        persist_screen_lexicon_locked(&app, screen, scope, permissions).await;
     });
 }
 
@@ -1069,6 +1208,7 @@ async fn persist_screen_lexicon_locked(
     app: &tauri::AppHandle,
     screen: crate::screen_text::ScreenTextContext,
     scope: Option<store::LearnPairScope>,
+    permissions: context::ContextSourcePermissions,
 ) {
     let state = app.state::<AppState>();
     let _gate = state.settings_gate.lock().await;
@@ -1076,7 +1216,32 @@ async fn persist_screen_lexicon_locked(
         return;
     };
     let mut snapshot = lock_recover(&state.settings).clone();
-    if !snapshot.dictionary_learn_enabled {
+    if !snapshot.dictionary_learn_enabled || !snapshot.context_enabled {
+        return;
+    }
+    let Some(mapping_id) = scope.as_ref().and_then(|scope| scope.mapping_id.as_deref()) else {
+        return;
+    };
+    let Some(mapping) = snapshot
+        .context_mappings
+        .iter()
+        .find(|mapping| mapping.id == mapping_id)
+    else {
+        return;
+    };
+    if !mapping.enabled
+        || !mapping.dictionary_learn_enabled
+        || lexicon::is_default_learn_off_target(
+            mapping.bundle_id.as_deref(),
+            mapping.browser_host.as_deref(),
+        )
+    {
+        return;
+    }
+    let permissions = permissions
+        .intersect(mapping.source_permissions)
+        .intersect(screen.evidence.capture_permissions.unwrap_or_default());
+    if screen.granted_terms(permissions).is_empty() {
         return;
     }
     let mut unused_pairs = Vec::new();
@@ -1086,6 +1251,7 @@ async fn persist_screen_lexicon_locked(
         &screen,
         &mut unused_pairs,
         scope.as_ref(),
+        permissions,
     ) {
         log::warn!("screen lexicon seed failed: {error}");
         return;
@@ -1244,17 +1410,20 @@ pub enum RecordPairResult {
     Ignored,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Default)]
 pub struct LearnPairTable {
     by_key: HashMap<String, LearnPairRow>,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug)]
 struct LearnPairRow {
     hits: u32,
     promoted: bool,
 }
 
+#[cfg(test)]
 impl LearnPairTable {
     pub fn hits(&self, pair_key: &str) -> Option<u32> {
         self.by_key.get(pair_key).map(|row| row.hits)
@@ -1273,6 +1442,7 @@ pub fn pair_key(before: &str, after: &str) -> String {
     format!("{}\u{1e}{}", token_key(before), token_key(after))
 }
 
+#[cfg(test)]
 pub fn record_pair(table: &mut LearnPairTable, before: &str, after: &str) -> RecordPairResult {
     if after == before {
         return RecordPairResult::Ignored;
@@ -1301,6 +1471,7 @@ pub fn record_pair(table: &mut LearnPairTable, before: &str, after: &str) -> Rec
     RecordPairResult::Pending { hits: row.hits }
 }
 
+#[cfg(test)]
 pub fn record_learn_pair(
     dir: &std::path::Path,
     dictionary: &mut Vec<String>,
@@ -1394,6 +1565,7 @@ pub(crate) fn append_dictionary_entry(dictionary: &mut Vec<String>, word: &str) 
     true
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn maybe_observe_after_paste(
     app: &tauri::AppHandle,
     state: &AppState,
@@ -1401,6 +1573,9 @@ pub(crate) fn maybe_observe_after_paste(
     verified: bool,
     target_guard: &context::TargetAppGuard,
     recording_context: Option<&context::ContextSnapshot>,
+    expected_observer_epoch: u64,
+    session_generation: u64,
+    cancellation: &tokio_util::sync::CancellationToken,
 ) {
     if !verified || target_guard.secure_input {
         return;
@@ -1408,8 +1583,39 @@ pub(crate) fn maybe_observe_after_paste(
     let Some(baseline) = post_insert_field.filter(|value| !value.is_empty()) else {
         return;
     };
-    let settings = lock_recover(&state.settings);
+    let observer_epoch = Arc::clone(&state.learning_observer_epoch);
+    let originating_session_is_current = {
+        let manager = lock_recover(&state.manager);
+        manager.phase == crate::dictation::Phase::Processing
+            && manager.session_generation == session_generation
+            && !manager.cancellation.is_cancelled()
+    };
+    if !learning_observer_may_register(
+        &observer_epoch,
+        expected_observer_epoch,
+        cancellation.is_cancelled(),
+        originating_session_is_current,
+    ) {
+        return;
+    }
+    let settings = lock_recover(&state.settings).clone();
     if !settings.dictionary_learn_enabled {
+        return;
+    }
+    let expected_context = recording_context.cloned();
+    if lexicon::is_default_learn_off_target(
+        target_guard.bundle_id.as_deref(),
+        target_guard.browser_host.as_deref(),
+    ) {
+        return;
+    }
+    let Some(mapping) = recording_context.and_then(|snapshot| {
+        lexicon::mapping_for_profile(&settings.context_mappings, &snapshot.profile.id)
+    }) else {
+        return;
+    };
+    if !mapping.enabled || !mapping.dictionary_learn_enabled || !mapping.source_permissions.ax_text
+    {
         return;
     }
     if !crate::lexicon::scene_allows_learn(
@@ -1425,24 +1631,80 @@ pub(crate) fn maybe_observe_after_paste(
     let scope = recording_context.map(scope_from_snapshot);
     let mapping_id = recording_context
         .and_then(|snapshot| style_draft_mapping_id(snapshot, &settings.context_mappings));
+    let (mappings, browser_access_enabled) = {
+        let current = lock_recover(&state.context);
+        (current.mappings.clone(), current.browser_access_enabled)
+    };
+    let settings_for_check = settings.clone();
     let baseline = baseline.to_owned();
     let expected = target_guard.clone();
     let app = app.clone();
     tokio::task::spawn_blocking(move || {
-        match observe_after_paste(
+        if !learning_observer_is_current(&observer_epoch, expected_observer_epoch) {
+            return;
+        }
+        if expected_context
+            .as_ref()
+            .is_none_or(|snapshot| !crate::context_target_is_current(snapshot, &settings_for_check))
+        {
+            return;
+        }
+        let read_target = || {
+            if browser_access_enabled {
+                context::detect_snapshot(&mappings, true).target_guard
+            } else {
+                context::probe_focus_guard()
+            }
+        };
+        let initial_target = read_target();
+        if context::same_field_mismatch_reason(&expected, &initial_target, browser_access_enabled)
+            .is_some()
+        {
+            return;
+        }
+        let Some(anchor) = crate::paste::FocusedFieldAnchor::capture(expected.pid) else {
+            return;
+        };
+        if !anchor.is_current_focus() {
+            return;
+        }
+        match observe_after_paste_with_identity(
             &baseline,
             &expected,
-            true,
-            ObserveLimits::default(),
-            context::focused_input_value,
-            context::probe_focus_guard,
+            ObserveOptions {
+                dictionary_learn_enabled: true,
+                require_browser_identity: browser_access_enabled,
+                limits: ObserveLimits::default(),
+            },
+            || anchor.read_value(),
+            read_target,
             std::thread::sleep,
+            || anchor.is_current_focus(),
+            || learning_observer_is_current(&observer_epoch, expected_observer_epoch),
         ) {
             ObserveOutcome::SingleToken { before_span, after } => {
-                persist_learn_pair(&app, &before_span, &after, scope);
+                if learning_observer_is_current(&observer_epoch, expected_observer_epoch) {
+                    persist_learn_pair(
+                        &app,
+                        &before_span,
+                        &after,
+                        scope,
+                        Arc::clone(&observer_epoch),
+                        expected_observer_epoch,
+                    );
+                }
             }
             ObserveOutcome::ShortStyleRewrite { before, after } => {
-                persist_style_intensity_learn(&app, &before, &after, mapping_id);
+                if learning_observer_is_current(&observer_epoch, expected_observer_epoch) {
+                    persist_style_intensity_learn(
+                        &app,
+                        &before,
+                        &after,
+                        mapping_id,
+                        Arc::clone(&observer_epoch),
+                        expected_observer_epoch,
+                    );
+                }
             }
             ObserveOutcome::StyleSignal {
                 excerpt,
@@ -1450,7 +1712,9 @@ pub(crate) fn maybe_observe_after_paste(
                 before_excerpt,
                 after_excerpt,
             } => {
-                if let Some(mapping_id) = mapping_id {
+                if let Some(mapping_id) = mapping_id.filter(|_| {
+                    learning_observer_is_current(&observer_epoch, expected_observer_epoch)
+                }) {
                     persist_style_draft(
                         &app,
                         &mapping_id,
@@ -1458,6 +1722,8 @@ pub(crate) fn maybe_observe_after_paste(
                         &excerpt,
                         &before_excerpt,
                         &after_excerpt,
+                        Arc::clone(&observer_epoch),
+                        expected_observer_epoch,
                     );
                 }
             }
@@ -1517,9 +1783,13 @@ fn mapping_from_style_draft_id(mapping_id: &str) -> Option<context::AppMapping> 
             bundle_id: Some(bundle.to_owned()),
             executable: None,
             browser_host: None,
+            browser_path_prefix: None,
+            focused_field: None,
+            source_permissions: Default::default(),
             style_example_input: None,
             style_example_output: None,
             style_example_pairs: Vec::new(),
+            style_examples_approved: false,
             enabled: true,
             cleanup_effort: None,
             cleanup_intensity: None,
@@ -1536,9 +1806,13 @@ fn mapping_from_style_draft_id(mapping_id: &str) -> Option<context::AppMapping> 
             bundle_id: None,
             executable: None,
             browser_host: Some(host.to_owned()),
+            browser_path_prefix: None,
+            focused_field: None,
+            source_permissions: Default::default(),
             style_example_input: None,
             style_example_output: None,
             style_example_pairs: Vec::new(),
+            style_examples_approved: false,
             enabled: true,
             cleanup_effort: None,
             cleanup_intensity: None,
@@ -1572,12 +1846,22 @@ fn persist_learn_pair(
     before: &str,
     after: &str,
     scope: Option<store::LearnPairScope>,
+    observer_epoch: Arc<AtomicU64>,
+    expected_observer_epoch: u64,
 ) {
     let app = app.clone();
     let before = before.to_string();
     let after = after.to_string();
     tauri::async_runtime::spawn(async move {
-        persist_learn_pair_locked(&app, &before, &after, scope.as_ref()).await;
+        persist_learn_pair_locked(
+            &app,
+            &before,
+            &after,
+            scope.as_ref(),
+            observer_epoch,
+            expected_observer_epoch,
+        )
+        .await;
     });
 }
 
@@ -1586,6 +1870,8 @@ fn persist_style_intensity_learn(
     baseline: &str,
     settled: &str,
     mapping_id: Option<String>,
+    observer_epoch: Arc<AtomicU64>,
+    expected_observer_epoch: u64,
 ) {
     let Some(mapping_id) = mapping_id else {
         return;
@@ -1594,7 +1880,15 @@ fn persist_style_intensity_learn(
     let baseline = baseline.to_owned();
     let settled = settled.to_owned();
     tauri::async_runtime::spawn(async move {
-        persist_style_intensity_learn_locked(&app, &baseline, &settled, &mapping_id).await;
+        persist_style_intensity_learn_locked(
+            &app,
+            &baseline,
+            &settled,
+            &mapping_id,
+            observer_epoch,
+            expected_observer_epoch,
+        )
+        .await;
     });
 }
 
@@ -1603,14 +1897,36 @@ async fn persist_style_intensity_learn_locked(
     baseline: &str,
     settled: &str,
     mapping_id: &str,
+    observer_epoch: Arc<AtomicU64>,
+    expected_observer_epoch: u64,
 ) {
     let state = app.state::<AppState>();
     let _gate = state.settings_gate.lock().await;
+    if !learning_observer_is_current(&observer_epoch, expected_observer_epoch) {
+        return;
+    }
     let Ok(dir) = app.path().app_data_dir() else {
         return;
     };
     let mut snapshot = lock_recover(&state.settings).clone();
-    if !snapshot.dictionary_learn_enabled {
+    if !snapshot.dictionary_learn_enabled || !snapshot.context_enabled {
+        return;
+    }
+    let Some(mapping) = snapshot
+        .context_mappings
+        .iter()
+        .find(|mapping| mapping.id == mapping_id)
+    else {
+        return;
+    };
+    if !mapping.enabled
+        || !mapping.dictionary_learn_enabled
+        || !mapping.source_permissions.ax_text
+        || lexicon::is_default_learn_off_target(
+            mapping.bundle_id.as_deref(),
+            mapping.browser_host.as_deref(),
+        )
+    {
         return;
     }
     let global = crate::llm::CleanupIntensity::parse(&snapshot.cleanup_intensity)
@@ -1630,6 +1946,9 @@ async fn persist_style_intensity_learn_locked(
         }
     };
     if !applied.pairs_changed && !applied.intensity_changed {
+        if applied.style_draft_key.is_some() {
+            let _ = app.emit("style_drafts://changed", ());
+        }
         return;
     }
     snapshot.normalize();
@@ -1644,6 +1963,9 @@ async fn persist_style_intensity_learn_locked(
     }
     let _ = app.emit("settings://changed", store::SettingsView::from(&snapshot));
     let _ = app.emit("learn_pairs://changed", ());
+    if applied.style_draft_key.is_some() {
+        let _ = app.emit("style_drafts://changed", ());
+    }
     let pair_keys = [
         applied.style_pair_key.clone(),
         applied.intensity_pair_key.clone(),
@@ -1651,7 +1973,10 @@ async fn persist_style_intensity_learn_locked(
     .into_iter()
     .flatten()
     .collect::<Vec<_>>();
-    if let Some(pair_key) = pair_keys.first() {
+    if let Some(pair_key) = pair_keys
+        .first()
+        .filter(|_| applied.pairs_changed || applied.intensity_changed)
+    {
         let _ = app.emit(
             "learn_pairs://promoted",
             serde_json::json!({
@@ -1666,6 +1991,7 @@ async fn persist_style_intensity_learn_locked(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn persist_style_draft(
     app: &tauri::AppHandle,
     mapping_id: &str,
@@ -1673,6 +1999,8 @@ fn persist_style_draft(
     excerpt: &str,
     before_excerpt: &str,
     after_excerpt: &str,
+    observer_epoch: Arc<AtomicU64>,
+    expected_observer_epoch: u64,
 ) {
     let app = app.clone();
     let mapping_id = mapping_id.to_owned();
@@ -1681,6 +2009,32 @@ fn persist_style_draft(
     let before_excerpt = before_excerpt.to_owned();
     let after_excerpt = after_excerpt.to_owned();
     tauri::async_runtime::spawn(async move {
+        let state = app.state::<AppState>();
+        let _gate = state.settings_gate.lock().await;
+        if !learning_observer_is_current(&observer_epoch, expected_observer_epoch) {
+            return;
+        }
+        let settings = lock_recover(&state.settings);
+        if !settings.dictionary_learn_enabled || !settings.context_enabled {
+            return;
+        }
+        let Some(mapping) = settings
+            .context_mappings
+            .iter()
+            .find(|mapping| mapping.id == mapping_id)
+        else {
+            return;
+        };
+        if !mapping.enabled
+            || !mapping.dictionary_learn_enabled
+            || !mapping.source_permissions.ax_text
+            || lexicon::is_default_learn_off_target(
+                mapping.bundle_id.as_deref(),
+                mapping.browser_host.as_deref(),
+            )
+        {
+            return;
+        }
         let Ok(dir) = app.path().app_data_dir() else {
             return;
         };
@@ -1704,14 +2058,39 @@ async fn persist_learn_pair_locked(
     before: &str,
     after: &str,
     scope: Option<&store::LearnPairScope>,
+    observer_epoch: Arc<AtomicU64>,
+    expected_observer_epoch: u64,
 ) {
     let state = app.state::<AppState>();
     let _gate = state.settings_gate.lock().await;
+    if !learning_observer_is_current(&observer_epoch, expected_observer_epoch) {
+        return;
+    }
     let Ok(dir) = app.path().app_data_dir() else {
         return;
     };
     let mut snapshot = lock_recover(&state.settings).clone();
-    if !snapshot.dictionary_learn_enabled {
+    if !snapshot.dictionary_learn_enabled || !snapshot.context_enabled {
+        return;
+    }
+    let Some(mapping_id) = scope.and_then(|scope| scope.mapping_id.as_deref()) else {
+        return;
+    };
+    let Some(mapping) = snapshot
+        .context_mappings
+        .iter()
+        .find(|mapping| mapping.id == mapping_id)
+    else {
+        return;
+    };
+    if !mapping.enabled
+        || !mapping.dictionary_learn_enabled
+        || !mapping.source_permissions.ax_text
+        || lexicon::is_default_learn_off_target(
+            mapping.bundle_id.as_deref(),
+            mapping.browser_host.as_deref(),
+        )
+    {
         return;
     }
     let result =
@@ -1830,6 +2209,7 @@ mod tests {
     };
     use crate::context::TargetAppGuard;
     use std::cell::RefCell;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     fn test_target(pid: i32, secure_input: bool) -> TargetAppGuard {
         TargetAppGuard {
@@ -2054,7 +2434,7 @@ mod tests {
     }
 
     #[test]
-    fn observe_commits_a_finished_word_when_target_changes() {
+    fn observe_never_reads_or_learns_after_the_target_changes() {
         let expected = test_target(42, false);
         let changed = test_target(99, false);
         let learned = observe_with(
@@ -2064,11 +2444,11 @@ mod tests {
             vec![Some("知乎".into())],
             vec![changed],
         );
-        assert_eq!(learned, zhihu_token());
+        assert_eq!(learned, ObserveOutcome::LeftTarget);
     }
 
     #[test]
-    fn observe_commits_a_finished_word_when_focus_changes() {
+    fn observe_never_reads_or_learns_after_focus_changes() {
         let expected = test_target(42, false);
         let mut changed = expected.clone();
         changed.input_token = Some(99);
@@ -2079,7 +2459,162 @@ mod tests {
             vec![Some("知乎".into())],
             vec![changed],
         );
-        assert_eq!(learned, zhihu_token());
+        assert_eq!(learned, ObserveOutcome::LeftTarget);
+    }
+
+    #[test]
+    fn observe_checks_identity_before_and_after_each_field_read() {
+        let expected = test_target(42, false);
+        let mut changed = expected.clone();
+        changed.input_token = Some(99);
+        let targets = RefCell::new(vec![expected.clone(), changed].into_iter());
+        let reads = RefCell::new(0);
+        let outcome = super::observe_after_paste_with_identity(
+            "知呼",
+            &expected,
+            super::ObserveOptions {
+                dictionary_learn_enabled: true,
+                require_browser_identity: false,
+                limits: ObserveLimits::default(),
+            },
+            || {
+                *reads.borrow_mut() += 1;
+                Some("知乎".into())
+            },
+            || {
+                targets
+                    .borrow_mut()
+                    .next()
+                    .unwrap_or_else(|| expected.clone())
+            },
+            |_| {},
+            || true,
+            || true,
+        );
+        assert_eq!(outcome, ObserveOutcome::LeftTarget);
+        assert_eq!(*reads.borrow(), 1);
+    }
+
+    #[test]
+    fn text_action_start_expires_an_earlier_dictation_learning_observer() {
+        let expected = test_target(42, false);
+        let epoch = AtomicU64::new(0);
+        let observer_epoch = epoch.load(Ordering::Acquire);
+        let reads = RefCell::new(0);
+        let result = super::observe_after_paste_with_identity(
+            "deploy v2",
+            &expected,
+            super::ObserveOptions {
+                dictionary_learn_enabled: true,
+                require_browser_identity: false,
+                limits: ObserveLimits::default(),
+            },
+            || {
+                *reads.borrow_mut() += 1;
+                Some("deploy v2 with correction".into())
+            },
+            || expected.clone(),
+            |_| {
+                // This is the production invalidation seam called when a
+                // text-action hotkey claims its transaction.
+                super::invalidate_learning_observers(&epoch);
+            },
+            || true,
+            || super::learning_observer_is_current(&epoch, observer_epoch),
+        );
+        assert_eq!(result, ObserveOutcome::Unchanged);
+        assert_eq!(*reads.borrow(), 0);
+        assert!(!super::learning_observer_is_current(&epoch, observer_epoch));
+    }
+
+    #[test]
+    fn late_old_paste_cannot_register_learning_after_text_action_starts() {
+        let epoch = AtomicU64::new(0);
+        let paste_origin_epoch = epoch.load(Ordering::Acquire);
+        let paste_worker_completed = true;
+        let mut field_reads = 0;
+        let mut learning_writes = 0;
+
+        assert!(paste_worker_completed);
+        super::invalidate_learning_observers(&epoch);
+        let originating_session_is_current = true;
+        if super::learning_observer_may_register(
+            &epoch,
+            paste_origin_epoch,
+            false,
+            originating_session_is_current,
+        ) {
+            // This is the production registration gate. A false result skips
+            // both native field reads and the observer's persistence path.
+            field_reads += 1;
+            learning_writes += 1;
+        }
+
+        assert_eq!(field_reads, 0);
+        assert_eq!(learning_writes, 0);
+    }
+
+    #[test]
+    fn cancelled_or_stale_dictation_cannot_register_a_correction_observer() {
+        let epoch = AtomicU64::new(4);
+        assert!(!super::learning_observer_may_register(
+            &epoch, 4, true, true
+        ));
+        assert!(!super::learning_observer_may_register(
+            &epoch, 4, false, false
+        ));
+    }
+
+    #[test]
+    fn observe_does_not_read_when_target_is_already_mismatched() {
+        let expected = test_target(42, false);
+        let changed = test_target(99, false);
+        let outcome = observe_after_paste(
+            "知呼",
+            &expected,
+            true,
+            ObserveLimits::default(),
+            || panic!("must not read a field from another app"),
+            || changed.clone(),
+            |_| {},
+        );
+        assert_eq!(outcome, ObserveOutcome::LeftTarget);
+    }
+
+    #[test]
+    fn observe_requires_the_retained_native_field_identity() {
+        let expected = test_target(42, false);
+        let outcome = super::observe_after_paste_with_identity(
+            "知呼",
+            &expected,
+            super::ObserveOptions {
+                dictionary_learn_enabled: true,
+                require_browser_identity: false,
+                limits: ObserveLimits::default(),
+            },
+            || panic!("must not read when the AX element changed"),
+            || expected.clone(),
+            |_| {},
+            || false,
+            || true,
+        );
+        assert_eq!(outcome, ObserveOutcome::LeftTarget);
+    }
+
+    #[test]
+    fn observe_disables_learning_when_field_identity_is_missing() {
+        let mut expected = test_target(42, false);
+        expected.input_token = None;
+        let outcome = observe_after_paste(
+            "知呼",
+            &expected,
+            true,
+            ObserveLimits::default(),
+            || panic!("must not read without a concrete focused field identity"),
+            || panic!("must not probe after the expected identity is unavailable"),
+            |_| panic!("must not poll without a concrete focused field identity"),
+        );
+        assert_eq!(outcome, ObserveOutcome::Unchanged);
     }
 
     #[test]
@@ -2595,7 +3130,7 @@ mod tests {
     }
 
     #[test]
-    fn observe_commits_last_settled_word_when_send_clears_the_field() {
+    fn observe_does_not_learn_when_send_clears_after_leaving_the_field() {
         let expected = test_target(42, false);
         let left = test_target(99, false);
         let learned = observe_with(
@@ -2605,7 +3140,7 @@ mod tests {
             vec![Some("知乎".into()), Some(String::new())],
             vec![expected.clone(), left],
         );
-        assert_eq!(learned, zhihu_token());
+        assert_eq!(learned, ObserveOutcome::LeftTarget);
     }
 
     #[test]
@@ -2658,9 +3193,13 @@ mod tests {
             bundle_id: Some("com.tencent.xinWeChat".into()),
             executable: None,
             browser_host: None,
+            browser_path_prefix: None,
+            focused_field: None,
+            source_permissions: Default::default(),
             style_example_input: None,
             style_example_output: None,
             style_example_pairs: Vec::new(),
+            style_examples_approved: false,
             enabled: true,
             cleanup_effort: None,
             cleanup_intensity: None,
@@ -2670,7 +3209,7 @@ mod tests {
     }
 
     #[test]
-    fn three_short_rewrites_write_a_style_pair() {
+    fn three_short_rewrites_create_an_unapproved_style_draft() {
         let dir = temp_dir("style-learn-3x");
         let mut mappings = vec![test_mapping("wechat")];
         for _ in 0..2 {
@@ -2694,12 +3233,14 @@ mod tests {
             crate::llm::CleanupIntensity::Heavy,
         )
         .unwrap();
-        assert!(applied.pairs_changed);
-        assert_eq!(mappings[0].style_example_pairs.len(), 1);
-        assert_eq!(
-            mappings[0].style_example_pairs[0].output,
-            "好的哈哈我晚点回你"
-        );
+        assert!(!applied.pairs_changed);
+        assert!(applied.style_draft_key.is_some());
+        assert!(mappings[0].style_example_pairs.is_empty());
+        assert!(!mappings[0].style_examples_approved);
+        let drafts = crate::store::list_style_drafts(&dir).unwrap();
+        assert_eq!(drafts.len(), 1);
+        assert_eq!(drafts[0].before_excerpt, "好的我会稍后回复您");
+        assert_eq!(drafts[0].after_excerpt, "好的哈哈我晚点回你");
     }
 
     #[test]
@@ -2746,15 +3287,34 @@ mod tests {
     #[test]
     fn screen_token_does_not_become_style_pair() {
         let ctx = crate::screen_text::ScreenTextContext {
-            tokens: vec!["晓雯".into()],
-            snippets: vec!["在吗".into(), "晚点回你".into()],
+            evidence: crate::screen_text::ContextEvidence {
+                items: vec![crate::screen_text::ContextEvidenceItem {
+                    source: crate::screen_text::ContextEvidenceSource::Ax,
+                    kind: crate::screen_text::ContextEvidenceKind::Term,
+                    value: "晓雯".into(),
+                    confidence_milli: None,
+                    truncated: false,
+                }],
+                ..Default::default()
+            },
             family: crate::context::ContextFamily::PersonalChat,
             ..crate::screen_text::ScreenTextContext::default()
         };
         let dir = temp_dir("screen-no-style");
         let mut dictionary = Vec::new();
         let mut pairs: Vec<crate::context::StyleExamplePair> = Vec::new();
-        seed_lexicon_from_screen(&dir, &mut dictionary, &ctx, &mut pairs, None).unwrap();
+        seed_lexicon_from_screen(
+            &dir,
+            &mut dictionary,
+            &ctx,
+            &mut pairs,
+            None,
+            crate::context::ContextSourcePermissions {
+                ax_text: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         assert!(pairs.is_empty());
         assert!(!dictionary
             .iter()
@@ -2771,16 +3331,31 @@ mod tests {
     #[test]
     fn person_name_promotes_at_two() {
         let ctx = crate::screen_text::ScreenTextContext {
-            tokens: vec!["李明".into()],
+            evidence: crate::screen_text::ContextEvidence {
+                items: vec![crate::screen_text::ContextEvidenceItem {
+                    source: crate::screen_text::ContextEvidenceSource::Ax,
+                    kind: crate::screen_text::ContextEvidenceKind::Term,
+                    value: "李明".into(),
+                    confidence_milli: None,
+                    truncated: false,
+                }],
+                ..Default::default()
+            },
             family: crate::context::ContextFamily::PersonalChat,
             ..crate::screen_text::ScreenTextContext::default()
         };
         let dir = temp_dir("screen-name-2x");
         let mut dictionary = Vec::new();
         let mut pairs = Vec::new();
-        seed_lexicon_from_screen(&dir, &mut dictionary, &ctx, &mut pairs, None).unwrap();
+        let permissions = crate::context::ContextSourcePermissions {
+            ax_text: true,
+            ..Default::default()
+        };
+        seed_lexicon_from_screen(&dir, &mut dictionary, &ctx, &mut pairs, None, permissions)
+            .unwrap();
         assert!(dictionary.is_empty());
-        seed_lexicon_from_screen(&dir, &mut dictionary, &ctx, &mut pairs, None).unwrap();
+        seed_lexicon_from_screen(&dir, &mut dictionary, &ctx, &mut pairs, None, permissions)
+            .unwrap();
         assert!(dictionary.contains(&"李明".to_string()));
         assert!(pairs.is_empty());
     }

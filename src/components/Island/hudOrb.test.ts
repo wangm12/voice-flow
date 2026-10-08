@@ -126,15 +126,15 @@ describe("hudStatusLabel", () => {
 });
 
 describe("hudBorderBeamFor", () => {
-  it("uses a colorful md beam while listening", () => {
-    expect(hudBorderBeamFor("starting")).toEqual({ size: "md", colorVariant: "colorful", strength: 1, duration: 3.2 });
-    expect(hudBorderBeamFor("recording")).toEqual({ size: "md", colorVariant: "colorful", strength: 1, duration: 3.2 });
-    expect(hudBorderBeamFor("recording_limited")).toEqual({ size: "md", colorVariant: "colorful", strength: 1, duration: 3.2 });
+  it("uses a monochrome md beam while listening", () => {
+    expect(hudBorderBeamFor("starting")).toEqual({ size: "md", colorVariant: "mono", strength: 1, duration: 3.2 });
+    expect(hudBorderBeamFor("recording")).toEqual({ size: "md", colorVariant: "mono", strength: 1, duration: 3.2 });
+    expect(hudBorderBeamFor("recording_limited")).toEqual({ size: "md", colorVariant: "mono", strength: 1, duration: 3.2 });
   });
 
-  it("uses a colorful line beam while thinking", () => {
-    expect(hudBorderBeamFor("processing")).toEqual({ size: "line", colorVariant: "colorful", strength: 0.7 });
-    expect(hudBorderBeamFor("rate_limited")).toEqual({ size: "line", colorVariant: "colorful", strength: 0.7 });
+  it("uses a monochrome line beam while thinking", () => {
+    expect(hudBorderBeamFor("processing")).toEqual({ size: "line", colorVariant: "mono", strength: 0.7 });
+    expect(hudBorderBeamFor("rate_limited")).toEqual({ size: "line", colorVariant: "mono", strength: 0.7 });
   });
 
   it("turns the beam off for idle and terminal HUD states", () => {

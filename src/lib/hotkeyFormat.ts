@@ -3,7 +3,7 @@ import { formatForDisplay } from "@tanstack/react-hotkeys";
 export const DEFAULT_DICTATION_HOTKEY = "CmdOrControl+Alt+Space";
 export const DEFAULT_SELECTED_ACTION_HOTKEY = "CmdOrControl+Alt+Slash";
 
-const TAURI_PRIMARY = new Set(["CmdOrControl", "CommandOrControl", "CmdOrCtrl"]);
+const TAURI_PRIMARY = new Set(["Mod", "CmdOrControl", "CommandOrControl", "CmdOrCtrl", "Command", "Meta", "Super"]);
 const MODIFIER_ONLY = new Set([
   "CmdOrControl",
   "CommandOrControl",
@@ -55,7 +55,7 @@ export function toTauriHotkey(tanstack: string): string {
   const modifiers = new Set<string>();
 
   for (const part of parts.slice(0, -1)) {
-    if (part === "Mod" || part === "Meta") {
+    if (TAURI_PRIMARY.has(part)) {
       modifiers.add("CmdOrControl");
     } else if (part === "Control" || part === "Ctrl") {
       modifiers.add("Control");
@@ -128,6 +128,8 @@ export function hotkeyDisplayParts(tauriHotkey: string): string[] {
 }
 
 function codeToKeyName(code: string): string | null {
+  if (["Minus", "Equal", "BracketLeft", "BracketRight", "Semicolon", "Quote", "Backquote", "Comma", "Period", "Home", "End", "PageUp", "PageDown", "Insert", "NumpadAdd", "NumpadSubtract", "NumpadMultiply", "NumpadDivide", "NumpadDecimal"].includes(code)) return code;
+  if (/^Numpad[0-9]$/.test(code)) return code;
   if (code === "Space") return "Space";
   if (code === "Slash") return "Slash";
   if (code === "Backslash") return "Backslash";
@@ -144,21 +146,11 @@ function codeToKeyName(code: string): string | null {
 }
 
 function normalizeMainKey(event: KeyboardEvent): string {
-  if (event.code === "Slash") return "Slash";
-  if (event.code === "Backslash") return "Backslash";
-  if (event.key === " " || event.code === "Space") return "Space";
-
-  if (event.key === "Dead" || event.key === "Unidentified" || event.key.length === 0) {
-    const fromCode = codeToKeyName(event.code);
-    if (fromCode) return fromCode;
-  }
-
+  // Register the physical key, not Option-generated characters or shifted punctuation.
+  const physical = codeToKeyName(event.code);
+  if (physical) return physical;
+  if (event.key === " ") return "Space";
   if (event.key.length === 1) return event.key.toUpperCase();
-  if (event.key === "Space") return "Space";
-
-  const fromCode = codeToKeyName(event.code);
-  if (fromCode) return fromCode;
-
   return event.key;
 }
 
@@ -173,15 +165,6 @@ export function sanitizeTauriHotkey(hotkey: string): string {
       return trimmed;
     })
     .join("+");
-}
-
-function modifierOnlyFromDomKey(key: string): string | null {
-  if (key === "Meta" || key === "OS") return "CmdOrControl";
-  if (key === "Alt") return "Alt";
-  if (key === "Control") return "Control";
-  if (key === "Shift") return "Shift";
-  if (key === "Fn" || key === "Function" || key === "Globe") return "Fn";
-  return null;
 }
 
 export function hotkeyFromKeyboardEvent(event: KeyboardEvent): string | null {
@@ -201,8 +184,12 @@ export function hotkeyFromKeyboardEvent(event: KeyboardEvent): string | null {
   return [...ordered, normalizeMainKey(event)].join("+");
 }
 
-export function modifierOnlyFromKeyboardEvent(event: KeyboardEvent): string | null {
-  return modifierOnlyFromDomKey(event.key);
+/** New global bindings must not take over ordinary typing or UI navigation. */
+export function isSafeCapturedHotkey(hotkey: string): boolean {
+  const parts = sanitizeTauriHotkey(hotkey).split("+");
+  const key = parts[parts.length - 1] ?? "";
+  if (/^F(?:[1-9]|1[0-9]|2[0-4])$/.test(key)) return true;
+  return parts.slice(0, -1).some((part) => TAURI_PRIMARY.has(part) || ["Control", "Ctrl", "Alt", "Option"].includes(part));
 }
 
 export function isDomModifierKey(key: string): boolean {

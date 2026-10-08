@@ -2,6 +2,19 @@ import { vi } from "vitest";
 import { createElement, type Ref } from "react";
 import "@testing-library/jest-dom/vitest";
 
+// Browser geometry and pointer APIs used by accessible portaled controls.
+if (!globalThis.ResizeObserver) globalThis.ResizeObserver = class {
+  observe() {}
+  unobserve() {}
+  disconnect() {}
+};
+if (typeof HTMLElement !== "undefined") {
+  if (!HTMLElement.prototype.scrollIntoView) HTMLElement.prototype.scrollIntoView = vi.fn();
+  if (!HTMLElement.prototype.hasPointerCapture) HTMLElement.prototype.hasPointerCapture = () => false;
+  if (!HTMLElement.prototype.setPointerCapture) HTMLElement.prototype.setPointerCapture = vi.fn();
+  if (!HTMLElement.prototype.releasePointerCapture) HTMLElement.prototype.releasePointerCapture = vi.fn();
+}
+
 vi.mock("thinking-orbs", () => ({
   ThinkingOrb: () => null,
 }));
@@ -44,4 +57,3 @@ vi.mock("border-beam", () => ({
     children as never,
   ),
 }));
-

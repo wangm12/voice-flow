@@ -18,6 +18,12 @@ static ISLAND_DESIRED_VISIBLE: AtomicBool = AtomicBool::new(false);
 static ISLAND_HAS_PARTIAL: AtomicBool = AtomicBool::new(false);
 static ISLAND_HAS_WIDE_CAPTION: AtomicBool = AtomicBool::new(false);
 static ISLAND_WIDE_APPLIED: AtomicBool = AtomicBool::new(false);
+static ISLAND_HAS_WARNING_CAPTION: AtomicBool = AtomicBool::new(false);
+static ISLAND_WARNING_APPLIED: AtomicBool = AtomicBool::new(false);
+static ISLAND_LEARN_APPLIED: AtomicBool = AtomicBool::new(false);
+// 280px toast with 12px side gutters. The CSS row is 38px plus the 4px stage gap.
+const LEARN_TOAST_WINDOW_WIDTH: f64 = 304.0;
+const LEARN_TOAST_BAND_HEIGHT: f64 = 42.0;
 /// While VoiceFlow is delivering text, the HUD must stay click-through and
 /// must not order itself in front of the target app's key window.
 static ISLAND_PASTE_YIELD: AtomicBool = AtomicBool::new(false);
@@ -79,6 +85,7 @@ pub fn is_learn_toast_interactive() -> bool {
 pub fn set_learn_toast_interactive(app: &AppHandle, interactive: bool) {
     ISLAND_LEARN_TOAST.store(interactive, Ordering::Release);
     set_interactive(app, interactive);
+    apply_island_size(app);
 }
 
 /// Make the HUD click-through and resign key before synthesized Cmd+V.
@@ -145,22 +152,44 @@ fn resign_island_key_window(window: &WebviewWindow) {
 /// hit target in WindowServer.
 pub fn set_has_partial(app: &AppHandle, has_partial: bool) {
     ISLAND_HAS_PARTIAL.store(has_partial, Ordering::Release);
-    apply_island_width(app);
+    apply_island_size(app);
 }
 
 pub fn set_has_wide_caption(app: &AppHandle, wide: bool) {
     ISLAND_HAS_WIDE_CAPTION.store(wide, Ordering::Release);
-    apply_island_width(app);
+    apply_island_size(app);
+}
+
+pub fn set_has_warning_caption(app: &AppHandle, warning: bool) {
+    ISLAND_HAS_WARNING_CAPTION.store(warning, Ordering::Release);
+    apply_island_size(app);
 }
 
 fn island_should_expand() -> bool {
     ISLAND_HAS_PARTIAL.load(Ordering::Acquire) || ISLAND_HAS_WIDE_CAPTION.load(Ordering::Acquire)
 }
 
-fn apply_island_width(app: &AppHandle) {
-    let next = island_should_expand();
-    let previous = ISLAND_WIDE_APPLIED.swap(next, Ordering::AcqRel);
-    if previous == next {
+fn island_window_size(wide: bool, warning: bool, learn_toast: bool) -> (f64, f64) {
+    let width = crate::notch::pill_window_width(wide);
+    let height = crate::notch::pill_window_height(warning);
+    if learn_toast {
+        (
+            width.max(LEARN_TOAST_WINDOW_WIDTH),
+            height + LEARN_TOAST_BAND_HEIGHT,
+        )
+    } else {
+        (width, height)
+    }
+}
+
+fn apply_island_size(app: &AppHandle) {
+    let next_wide = island_should_expand();
+    let next_tall = ISLAND_HAS_WARNING_CAPTION.load(Ordering::Acquire);
+    let next_learn = ISLAND_LEARN_TOAST.load(Ordering::Acquire);
+    let previous_wide = ISLAND_WIDE_APPLIED.swap(next_wide, Ordering::AcqRel);
+    let previous_tall = ISLAND_WARNING_APPLIED.swap(next_tall, Ordering::AcqRel);
+    let previous_learn = ISLAND_LEARN_APPLIED.swap(next_learn, Ordering::AcqRel);
+    if previous_wide == next_wide && previous_tall == next_tall && previous_learn == next_learn {
         return;
     }
     let Some(window) = app.get_webview_window("island") else {
@@ -234,10 +263,12 @@ fn show_overlay_on_main(window: &tauri::WebviewWindow, app: &AppHandle) {
 }
 
 fn position_overlay_on_main(window: &tauri::WebviewWindow, app: &AppHandle) {
-    let placement = crate::notch::placement_for_cursor_screen_with_width(
-        app,
-        crate::notch::pill_window_width(island_should_expand()),
+    let (width, height) = island_window_size(
+        island_should_expand(),
+        ISLAND_HAS_WARNING_CAPTION.load(Ordering::Acquire),
+        ISLAND_LEARN_TOAST.load(Ordering::Acquire),
     );
+    let placement = crate::notch::placement_for_cursor_screen_with_size(app, width, height);
     let _ = window.set_position(tauri::Position::Physical(tauri::PhysicalPosition {
         x: placement.x.round() as i32,
         y: placement.y.round() as i32,
@@ -423,5 +454,24 @@ mod tests {
         super::ISLAND_LEARN_TOAST.store(true, Ordering::Release);
         assert!(super::is_learn_toast_interactive());
         super::ISLAND_LEARN_TOAST.store(previous, Ordering::Release);
+    }
+
+    #[test]
+    fn learn_toast_reserves_its_row_and_preserves_active_diagnostics_when_closed() {
+        assert_eq!(
+            super::island_window_size(false, false, false),
+            (172.0, 68.0)
+        );
+        assert_eq!(
+            super::island_window_size(false, false, true),
+            (304.0, 110.0)
+        );
+        assert_eq!(super::island_window_size(true, true, true), (400.0, 138.0));
+        // Dismissal removes only the toast's band while a warning is still visible.
+        assert_eq!(super::island_window_size(true, true, false), (400.0, 96.0));
+        assert_eq!(
+            super::island_window_size(false, false, false),
+            (172.0, 68.0)
+        );
     }
 }

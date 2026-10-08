@@ -1,311 +1,144 @@
-import { useCallback, useEffect, useRef, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
-import type { ActivationMode } from "../lib/activationCopy";
-import {
-  hotkeyFromKeyboardEvent,
-  isModifierKeyCode,
-  modifierOnlyFromKeyboardEvent,
-  previewFromKeyboardEvent,
-  isModifierOnlyHotkey,
-  sanitizeTauriHotkey,
-} from "../lib/hotkeyFormat";
+import { useCallback, useEffect, useRef, useState, type RefObject } from "react";
+import { beginHotkeyCapture, type CaptureTarget } from "../lib/hotkeyCaptureSession";
+import { hotkeyFromKeyboardEvent, isModifierKeyCode, isSafeCapturedHotkey, previewFromKeyboardEvent, sanitizeTauriHotkey } from "../lib/hotkeyFormat";
 
-const DOUBLE_TAP_MS = 400;
-const KEY_RELEASE_GRACE_MS = 400;
 const identity = (source: string) => source;
+export type CapturedHotkey = { hotkey: string };
+type Phase = "idle" | "preparing" | "capturing" | "saving" | "cancelling";
+type Session = ReturnType<typeof beginHotkeyCapture>;
 
-export type CapturedHotkey = {
-  hotkey: string;
-  activationMode?: ActivationMode;
-};
-
-function errorMessage(reason: unknown): string {
-  return reason instanceof Error ? reason.message : String(reason);
+function message(reason: unknown, translate: (source: string) => string): string {
+  const text = reason instanceof Error ? reason.message : String(reason);
+  if (text.includes("原快捷键恢复失败")) return translate("原快捷键未能恢复，请重新录制或重启 VoiceFlow。");
+  if (text.includes("hotkey conflicts with another shortcut") || text.includes("快捷键冲突")) return translate("这个快捷键已用于其他功能，请换一个组合键。");
+  if (text.includes("failed to register") || text.includes("register global")) return translate("这个快捷键无法使用，可能已被系统或其他 App 占用。请换一个组合键。");
+  if (text.includes("录音或处理期间")) return translate("录音或处理期间不能修改快捷键和录音方式。");
+  if (text.includes("已有快捷键正在编辑")) return translate("已有快捷键正在编辑，请先取消。");
+  return translate("快捷键未能保存，原设置已保留。请重试。");
 }
 
-async function setHotkeysSuspended(
-  suspended: boolean,
-  captured?: CapturedHotkey | null,
-  captureTarget: "dictation" | "selected_action" | "screen_action" = "dictation",
-) {
-  await invoke("set_hotkeys_suspended", {
-    suspended,
-    capturedHotkey: captured?.hotkey ?? null,
-    capturedActivationMode: captured?.activationMode ?? null,
-    captureTarget,
-  });
-}
-
-type ModifierGesture = {
-  modifier: string | null;
-  downAt: number | null;
-  tapCount: number;
-  commitTimer: number | null;
-  awaitingSecondTap: boolean;
-};
-
-const EMPTY_GESTURE: ModifierGesture = {
-  modifier: null,
-  downAt: null,
-  tapCount: 0,
-  commitTimer: null,
-  awaitingSecondTap: false,
-};
-
-export function useHotkeyCapture({
-  onRecord,
-  onCancel,
-  translate = identity,
-  captureTarget = "dictation",
-}: {
+export function useHotkeyCapture({ onRecord, onCancel, onBusyChange, captureRef, translate = identity, captureTarget = "dictation" }: {
   onRecord: (result: CapturedHotkey) => void;
   onCancel?: () => void;
+  onBusyChange?: (busy: boolean) => void;
+  captureRef: RefObject<HTMLInputElement | null>;
   translate?: (source: string) => string;
-  captureTarget?: "dictation" | "selected_action" | "screen_action";
+  captureTarget?: CaptureTarget;
 }) {
-  const [isRecording, setIsRecording] = useState(false);
-  const [recordedHotkey, setRecordedHotkey] = useState<string | null>(null);
+  const [phase, setPhase] = useState<Phase>("idle");
   const [previewHotkey, setPreviewHotkey] = useState<string | null>(null);
-  const [detectedGesture, setDetectedGesture] = useState<ActivationMode | "waiting_second_tap" | null>(null);
+  const [captureHint, setCaptureHint] = useState<string | null>(null);
   const [captureError, setCaptureError] = useState<string | null>(null);
-  const pressedCodesRef = useRef(new Set<string>());
-  const usedModifiersRef = useRef(new Set<string>());
-  const sawNonModifierRef = useRef(false);
-  const pendingComboRef = useRef<string | null>(null);
-  const gestureRef = useRef<ModifierGesture>({ ...EMPTY_GESTURE });
-  const finishingRef = useRef(false);
-  const capturingRef = useRef(false);
-  const callbacksRef = useRef({ onRecord, onCancel });
-  callbacksRef.current = { onRecord, onCancel };
+  const [lastOutcome, setLastOutcome] = useState<"saved" | "cancelled" | null>(null);
+  const phaseRef = useRef<Phase>("idle");
+  const fnAvailable = ["dictation", "verbatim_action", "translation_action"].includes(captureTarget);
+  const sessionRef = useRef<Session | null>(null);
+  const pendingCombo = useRef<string | null>(null);
+  const lifecycleRef = useRef({ active: true });
+  const callbacks = useRef({ onRecord, onCancel, onBusyChange });
+  callbacks.current = { onRecord, onCancel, onBusyChange };
 
-  const clearGestureTimer = useCallback(() => {
-    if (gestureRef.current.commitTimer !== null) {
-      window.clearTimeout(gestureRef.current.commitTimer);
-      gestureRef.current.commitTimer = null;
-    }
+  const transition = useCallback((next: Phase) => {
+    const wasBusy = phaseRef.current !== "idle";
+    phaseRef.current = next;
+    setPhase(next);
+    if (wasBusy !== (next !== "idle")) callbacks.current.onBusyChange?.(next !== "idle");
   }, []);
+  const resetKeys = useCallback(() => { pendingCombo.current = null; }, []);
 
-  const resetCaptureState = useCallback(() => {
-    pressedCodesRef.current.clear();
-    usedModifiersRef.current.clear();
-    sawNonModifierRef.current = false;
-    pendingComboRef.current = null;
-    clearGestureTimer();
-    gestureRef.current = { ...EMPTY_GESTURE };
-    setDetectedGesture(null);
-  }, [clearGestureTimer]);
-
-  const finish = useCallback(
-    async (hotkey: string, activationMode?: ActivationMode) => {
-      if (finishingRef.current) return;
-      finishingRef.current = true;
-      setCaptureError(null);
-      resetCaptureState();
-      const normalizedHotkey = hotkey ? sanitizeTauriHotkey(hotkey) : "";
-      const normalizedActivationMode =
-        activationMode === "double_tap" && !isModifierOnlyHotkey(normalizedHotkey)
-          ? "tap"
-          : activationMode;
-      setPreviewHotkey(normalizedHotkey || null);
-      if (normalizedActivationMode) setDetectedGesture(normalizedActivationMode);
-      await new Promise((resolve) => window.setTimeout(resolve, KEY_RELEASE_GRACE_MS));
-      const captured = normalizedHotkey
-        ? { hotkey: normalizedHotkey, activationMode: normalizedActivationMode }
-        : null;
-      try {
-        await setHotkeysSuspended(false, captured, captureTarget);
-        capturingRef.current = false;
-        setIsRecording(false);
-        setRecordedHotkey(normalizedHotkey || null);
-        setPreviewHotkey(null);
-        setDetectedGesture(null);
-        if (normalizedHotkey) callbacksRef.current.onRecord({ hotkey: normalizedHotkey, activationMode: normalizedActivationMode });
-      } catch (reason) {
-        capturingRef.current = false;
-        setIsRecording(false);
-        setRecordedHotkey(null);
-        setPreviewHotkey(null);
-        setDetectedGesture(null);
-        setCaptureError(`${translate("快捷键恢复失败：")}${errorMessage(reason)}`);
-      } finally {
-        finishingRef.current = false;
-      }
-    },
-    [captureTarget, resetCaptureState, translate],
-  );
-
-  const cancelRecording = useCallback(async () => {
-    if (finishingRef.current) return;
-    finishingRef.current = true;
-    setCaptureError(null);
-    resetCaptureState();
-    setPreviewHotkey(null);
-    await new Promise((resolve) => window.setTimeout(resolve, KEY_RELEASE_GRACE_MS));
+  const finish = useCallback(async (hotkey: string | null) => {
+    const session = sessionRef.current;
+    if (!session || session.finishing) return;
+    const lifecycle = lifecycleRef.current;
+    transition(hotkey === null ? "cancelling" : "saving");
+    resetKeys();
     try {
-      await setHotkeysSuspended(false, null, captureTarget);
-      callbacksRef.current.onCancel?.();
+      const result = await session.finish(hotkey === null ? null : sanitizeTauriHotkey(hotkey));
+      if (!lifecycle.active) return;
+      setLastOutcome(result === null ? "cancelled" : "saved");
+      if (result === null) callbacks.current.onCancel?.();
+      else callbacks.current.onRecord({ hotkey: result });
     } catch (reason) {
-      setCaptureError(`${translate("快捷键恢复失败：")}${errorMessage(reason)}`);
+      if (lifecycle.active) setCaptureError(message(reason, translate));
     } finally {
-      capturingRef.current = false;
-      setIsRecording(false);
-      setRecordedHotkey(null);
-      finishingRef.current = false;
+      if (sessionRef.current === session) sessionRef.current = null;
+      if (lifecycle.active) { setPreviewHotkey(null); setCaptureHint(null); transition("idle"); }
     }
-  }, [captureTarget, resetCaptureState, translate]);
+  }, [resetKeys, transition, translate]);
+  const cancelRecording = useCallback(() => finish(null), [finish]);
 
   const startRecording = useCallback(async () => {
-    if (finishingRef.current || isRecording) return;
-    setCaptureError(null);
-    resetCaptureState();
-    setRecordedHotkey(null);
-    setPreviewHotkey(null);
+    const lifecycle = lifecycleRef.current;
+    if (!lifecycle.active || phaseRef.current !== "idle") return;
+    resetKeys(); setPreviewHotkey(null); setCaptureHint(null); setCaptureError(null); setLastOutcome(null);
+    transition("preparing");
     try {
-      await setHotkeysSuspended(true, null, captureTarget);
-      capturingRef.current = true;
-      setIsRecording(true);
+      const session = beginHotkeyCapture(captureTarget);
+      sessionRef.current = session;
+      const ready = await session.ready;
+      if (!ready || !lifecycle.active || session.finishing) return;
+      transition("capturing");
     } catch (reason) {
-      capturingRef.current = false;
-      setIsRecording(false);
-      setCaptureError(`${translate("无法开始快捷键录制：")}${errorMessage(reason)}`);
+      if (lifecycle.active && !sessionRef.current?.finishing) {
+        sessionRef.current = null;
+        setCaptureError(message(reason, translate)); transition("idle");
+      }
     }
-  }, [captureTarget, isRecording, resetCaptureState, translate]);
+  }, [captureTarget, resetKeys, transition, translate]);
 
-  const commitPreset = useCallback(
-    (hotkey: string, activationMode?: ActivationMode) => {
-      if (!capturingRef.current || finishingRef.current) return;
-      void finish(hotkey, activationMode);
-    },
-    [finish],
-  );
-
-  const tryCommitWhenAllReleased = useCallback(() => {
-    if (finishingRef.current || pressedCodesRef.current.size > 0) return;
-
-    if (sawNonModifierRef.current) {
-      const combo = pendingComboRef.current;
-       if (combo) void finish(combo, "tap");
-      return;
-    }
-
-    if (usedModifiersRef.current.size !== 1) return;
-
-    const [modifierOnly] = usedModifiersRef.current;
-    if (!modifierOnly) return;
-
-    const gesture = gestureRef.current;
-    gesture.downAt = null;
-
-    if (gesture.tapCount >= 2) {
-      void finish(modifierOnly, "double_tap");
-      return;
-    }
-
-    gesture.tapCount = 1;
-    gesture.modifier = modifierOnly;
-    gesture.awaitingSecondTap = true;
-    setDetectedGesture("waiting_second_tap");
-    gesture.commitTimer = window.setTimeout(() => {
-      gesture.commitTimer = null;
-      gesture.awaitingSecondTap = false;
-      gesture.tapCount = 0;
-      setDetectedGesture(null);
-    }, DOUBLE_TAP_MS);
+  const commitPreset = useCallback((hotkey: string) => {
+    if (phaseRef.current === "capturing") void finish(hotkey);
   }, [finish]);
+  const clearBinding = useCallback(async () => {
+    if (captureTarget === "dictation") return;
+    if (phaseRef.current === "idle") await startRecording();
+    if (phaseRef.current === "capturing") await finish("");
+  }, [captureTarget, finish, startRecording]);
 
   useEffect(() => {
-    if (!isRecording) return undefined;
-
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.repeat || finishingRef.current) return;
-
-      event.stopPropagation();
-
-      if (event.key === "Escape") {
-        event.preventDefault();
-        void cancelRecording();
-        return;
+    if (phase === "idle") return;
+    const keyDown = (event: KeyboardEvent) => {
+      if (phaseRef.current === "saving" || phaseRef.current === "cancelling") return;
+      const bare = !event.metaKey && !event.ctrlKey && !event.altKey && !event.shiftKey;
+      if (event.key === "Escape") { event.preventDefault(); event.stopPropagation(); void cancelRecording(); return; }
+      if (phaseRef.current !== "capturing" || event.target !== captureRef.current || event.repeat || event.isComposing) return;
+      if (event.key === "Tab" && !event.metaKey && !event.ctrlKey && !event.altKey) return;
+      event.preventDefault(); event.stopPropagation();
+      if (bare && ["Backspace", "Delete"].includes(event.key)) { void finish(captureTarget === "dictation" ? null : ""); return; }
+      setPreviewHotkey(previewFromKeyboardEvent(event));
+      if (isModifierKeyCode(event.code)) { setCaptureHint(translate(fnAvailable ? "请再按一个键组成快捷键；单键录音可选择 Fn。" : "请再按一个键组成快捷键。")); return; }
+      const hotkey = hotkeyFromKeyboardEvent(event);
+      if (hotkey && isSafeCapturedHotkey(hotkey)) {
+        pendingCombo.current = hotkey; setCaptureHint(translate("松开按键即可保存。"));
+      } else {
+        pendingCombo.current = null;
+        setCaptureHint(translate(fnAvailable ? "请使用 ⌘、⌥ 或 ⌃ 组成快捷键，或选择 Fn。" : "请使用 ⌘、⌥ 或 ⌃ 加上另一个键。"));
       }
-
-      if (event.key === "Backspace" || event.key === "Delete") {
-        if (!event.metaKey && !event.ctrlKey && !event.altKey && !event.shiftKey) {
-          void finish("");
-          return;
-        }
-      }
-
-      const preview = previewFromKeyboardEvent(event);
-      if (preview) setPreviewHotkey(preview);
-
-      pressedCodesRef.current.add(event.code);
-
-      if (isModifierKeyCode(event.code)) {
-        const modifierOnly = modifierOnlyFromKeyboardEvent(event);
-        if (!modifierOnly) return;
-        usedModifiersRef.current.add(modifierOnly);
-
-        const gesture = gestureRef.current;
-        const now = Date.now();
-
-        if (
-          gesture.awaitingSecondTap &&
-          gesture.modifier === modifierOnly &&
-          gesture.commitTimer !== null
-        ) {
-          clearGestureTimer();
-          gesture.awaitingSecondTap = false;
-          void finish(modifierOnly, "double_tap");
-          return;
-        } else if (!gesture.downAt) {
-          gesture.modifier = modifierOnly;
-          gesture.downAt = now;
-        }
-        return;
-      }
-
-      sawNonModifierRef.current = true;
-      clearGestureTimer();
-      gestureRef.current = { ...EMPTY_GESTURE };
-      setDetectedGesture(null);
-      const combo = hotkeyFromKeyboardEvent(event);
-      if (combo) pendingComboRef.current = combo;
     };
-
-    const onKeyUp = (event: KeyboardEvent) => {
-      if (event.repeat || finishingRef.current) return;
-
-      event.stopPropagation();
-
-      pressedCodesRef.current.delete(event.code);
-      tryCommitWhenAllReleased();
+    const keyUp = () => {
+      if (phaseRef.current !== "capturing") return;
+      // WebKit can omit keyups under Command or retain modifier flags. Hand the
+      // candidate to native code, which waits for every physical key before saving.
+      if (pendingCombo.current) void finish(pendingCombo.current);
     };
-
-    window.addEventListener("keydown", onKeyDown, true);
-    window.addEventListener("keyup", onKeyUp, true);
+    const blur = () => { resetKeys(); if (["preparing", "capturing"].includes(phaseRef.current)) void cancelRecording(); };
+    const visibility = () => { if (document.hidden) blur(); };
+    window.addEventListener("keydown", keyDown, true); window.addEventListener("keyup", keyUp, true);
+    window.addEventListener("blur", blur); document.addEventListener("visibilitychange", visibility);
     return () => {
-      window.removeEventListener("keydown", onKeyDown, true);
-      window.removeEventListener("keyup", onKeyUp, true);
-      clearGestureTimer();
+      window.removeEventListener("keydown", keyDown, true); window.removeEventListener("keyup", keyUp, true);
+      window.removeEventListener("blur", blur); document.removeEventListener("visibilitychange", visibility);
     };
-  }, [cancelRecording, clearGestureTimer, finish, isRecording, tryCommitWhenAllReleased]);
+  }, [cancelRecording, captureRef, captureTarget, finish, fnAvailable, phase, resetKeys, translate]);
 
   useEffect(() => {
+    const lifecycle = { active: true }; lifecycleRef.current = lifecycle;
     return () => {
-      if (capturingRef.current) {
-        void setHotkeysSuspended(false, null, captureTarget);
-        capturingRef.current = false;
-      }
+      lifecycle.active = false; resetKeys(); callbacks.current.onBusyChange?.(false);
+      const session = sessionRef.current;
+      if (session && !session.finishing) void session.finish(null).catch(() => undefined);
     };
-  }, [captureTarget]);
+  }, [captureTarget, resetKeys]);
 
-  return {
-    isRecording,
-    recordedHotkey,
-    previewHotkey,
-    detectedGesture,
-    captureError,
-    startRecording,
-    cancelRecording,
-    commitPreset,
-  };
+  return { phase, isRecording: phase === "capturing", isBusy: phase !== "idle", isFinishing: phase === "saving" || phase === "cancelling", previewHotkey, captureHint, captureError, lastOutcome, startRecording, cancelRecording, commitPreset, clearBinding };
 }

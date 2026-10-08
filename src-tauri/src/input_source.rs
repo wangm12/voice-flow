@@ -38,6 +38,7 @@ pub fn should_hop_tis_to_main_queue(on_main_thread: bool) -> bool {
 /// Switch to a Latin layout around `paste` when the current source looks CJK.
 /// `select_latin` must return true only if the source actually changed.
 /// `restore` then runs on the way out, including when `paste` fails.
+#[cfg(test)]
 pub fn run_with_latin_layout_if_cjk<T>(
     current_id: &str,
     current_name: &str,

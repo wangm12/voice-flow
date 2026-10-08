@@ -2,14 +2,25 @@ import { describe, expect, it } from "vitest";
 import {
   acceptsSessionGeneration,
   hudContextFromEvent,
+  hudContextSourceFromEvent,
   hudPartialAfterState,
   hudPartialFromEvent,
   hudProgressForState,
+  hudTranslationFromEvent,
   normalizeChunkProgress,
   selectedActionStateForDictation,
 } from "./IslandWindow";
 
 describe("IslandWindow session generations", () => {
+  it("keeps the session target while processing and clears it on completion or a new recording", () => {
+    expect(hudTranslationFromEvent("recording", null, "ja")).toBe("ja");
+    expect(hudTranslationFromEvent("processing", "ja")).toBe("ja");
+    expect(hudTranslationFromEvent("starting", "ja")).toBeNull();
+    expect(hudTranslationFromEvent("recording", "ja", null)).toBeNull();
+    for (const state of ["idle", "error", "copied", "degraded", "done", "unverified"]) {
+      expect(hudTranslationFromEvent(state, "ja", "ja")).toBeNull();
+    }
+  });
   it("accepts the current or a newer generation", () => {
     expect(acceptsSessionGeneration(4, 4)).toBe(true);
     expect(acceptsSessionGeneration(4, 5)).toBe(true);
@@ -77,6 +88,27 @@ describe("IslandWindow session generations", () => {
       contextLabel: null,
       cleanupIntensity: null,
     });
+  });
+
+  it("shows only the safe actual-used context source label and clears it on idle", () => {
+    expect(hudContextSourceFromEvent("processing", null, {
+      context_source: { source: "ocr", label: "On-device OCR", matched_rule_label: "Private Gmail rule" },
+    })).toBe("ocr");
+    expect(hudContextSourceFromEvent("processing", "ocr", {})).toBe("ocr");
+    expect(hudContextSourceFromEvent("idle", "ocr", {
+      context_source: { source: "ax", label: "AX text", matched_rule_label: "Private Gmail rule" },
+    })).toBeNull();
+    expect(hudContextSourceFromEvent("processing", null, {
+      context_source: { source: "none", label: "None", matched_rule_label: "Private Gmail rule" },
+    })).toBe("none");
+    expect(hudContextSourceFromEvent("recording", "ax", {}, true)).toBeNull();
+    expect(hudContextSourceFromEvent("processing", "ax", {}, true)).toBeNull();
+    expect(hudContextSourceFromEvent("recording", "ax", {
+      context_source: { source: "ax", label: "AX text" },
+    })).toBeNull();
+    expect(hudContextSourceFromEvent("processing", null, {
+      context_source: { source: "toString", label: "unsafe", matched_rule_label: "unsafe" } as never,
+    })).toBeNull();
   });
 
   it("clears HUD partials on idle or a newer session generation", () => {

@@ -1,4 +1,4 @@
-import { deliveryReasonMessage } from "../../lib/deliveryCopy";
+import { deliveryReasonHudMessage } from "../../lib/deliveryCopy";
 
 export const voicePillHeight = 40;
 // Keep the transparent native surface close to the visible HUD. A large
@@ -7,7 +7,9 @@ export const voicePillWindowWidth = 172;
 export const voicePillWindowWidthWithPartial = 400;
 export const voicePillWindowHeight = 68;
 export const voicePillCaptionHeight = 18;
+export const voicePillWarningCaptionHeight = 42;
 export const voicePillCaptionGap = 4;
+export const voicePillLearnToastHeight = 38;
 export const voicePillStagePaddingTop =
   voicePillWindowHeight - voicePillHeight - voicePillCaptionGap - voicePillCaptionHeight;
 export const voicePillCaptionMaxWidth = 164;
@@ -76,10 +78,11 @@ export function visibleContextLabel(
 
 export function voicePillCaptionNeedsWide(
   state: string,
-  options?: Pick<PillCaptionOptions, "fallbackReason" | "partialText">,
+  options?: Pick<PillCaptionOptions, "fallbackReason" | "partialText" | "phase">,
 ): boolean {
   if (options?.fallbackReason) return true;
-  return ["error", "degraded", "copied", "unverified", "rate_limited"].includes(state);
+  if (options?.phase === "soniox_recovery") return true;
+  return ["error", "degraded", "copied", "unverified", "rate_limited", "recording_limited"].includes(state);
 }
 
 export function pillCaption(
@@ -97,17 +100,17 @@ export function pillCaption(
       return base;
     }
     case "degraded": {
-      const fallbackCaption = deliveryReasonMessage(options?.fallbackReason, translate);
+      const fallbackCaption = deliveryReasonHudMessage(options?.fallbackReason, translate);
       if (fallbackCaption) return fallbackCaption;
       return translate("部分结果已保存，请检查后再使用");
     }
     case "error":
-      return translate("语音输入失败，请重试");
+      return deliveryReasonHudMessage(options?.fallbackReason, translate) ?? translate("语音输入失败，请重试");
     default:
       break;
   }
 
-  const fallbackCaption = deliveryReasonMessage(options?.fallbackReason, translate);
+  const fallbackCaption = deliveryReasonHudMessage(options?.fallbackReason, translate);
   if (fallbackCaption) return fallbackCaption;
 
   let statusCaption: string | null = null;
@@ -118,6 +121,9 @@ export function pillCaption(
   const selectedState = options?.selectedActionState;
   if (!statusCaption && state === "processing" && options?.phase === "cascade_accurate") {
     statusCaption = translate("精确重打中");
+  }
+  if (!statusCaption && state === "processing" && options?.phase === "soniox_recovery") {
+    statusCaption = translate("正在重新转写完整录音");
   }
   if (!statusCaption && state === "processing" && selectedState === "preparing_rewrite") {
     statusCaption = selectedActionCaption("preparing_rewrite", translate);
@@ -131,13 +137,21 @@ export function pillCaption(
   if (!statusCaption && selectedState && ["copied", "done", "unverified"].includes(state)) {
     statusCaption = selectedActionCaption(selectedState, translate);
   }
+  if (!statusCaption && state === "unverified") {
+    statusCaption = translate("先检查输入框；需要时从历史记录复制");
+  }
   if (!statusCaption && state === "copied") {
     statusCaption = translate("已复制到剪贴板，请手动粘贴");
   }
 
   const contextLabel = CONTEXT_LABEL_STATES.has(state) ? options?.contextLabel?.trim() || null : null;
   if (statusCaption) {
-    if (contextLabel) return `${contextLabel} · ${statusCaption}`;
+    if (contextLabel) {
+      // Keep the stop instruction first even when an app/template name is long.
+      return state === "recording_limited"
+        ? `${statusCaption} · ${contextLabel}`
+        : `${contextLabel} · ${statusCaption}`;
+    }
     return statusCaption;
   }
 

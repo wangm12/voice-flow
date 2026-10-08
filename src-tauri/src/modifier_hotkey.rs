@@ -100,11 +100,20 @@ pub fn set_paste_suppressed(suppressed: bool) {
             crate::hotkey::reset_pressed_state();
         }
     } else {
-        let _ = PASTE_SUPPRESS.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |depth| {
-            depth.checked_sub(1)
-        });
+        release_paste_suppression(&PASTE_SUPPRESS);
     }
 }
+
+fn release_paste_suppression(counter: &AtomicU32) {
+    let mut depth = counter.load(Ordering::SeqCst);
+    while depth > 0 {
+        match counter.compare_exchange_weak(depth, depth - 1, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return,
+            Err(current) => depth = current,
+        }
+    }
+}
+
 pub fn is_paste_suppressed() -> bool {
     PASTE_SUPPRESS.load(Ordering::SeqCst) > 0
 }
@@ -381,5 +390,25 @@ mod tests {
         assert_eq!(PASTE_SUPPRESS.load(Ordering::SeqCst), baseline + 1);
         drop(outer);
         assert_eq!(PASTE_SUPPRESS.load(Ordering::SeqCst), baseline);
+    }
+
+    #[test]
+    fn releasing_paste_suppression_at_zero_does_not_underflow() {
+        let counter = AtomicU32::new(0);
+        release_paste_suppression(&counter);
+        assert_eq!(counter.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn concurrent_paste_releases_preserve_the_remaining_suppression() {
+        let counter = AtomicU32::new(9);
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| release_paste_suppression(&counter));
+            }
+        });
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+        release_paste_suppression(&counter);
+        assert_eq!(counter.load(Ordering::SeqCst), 0);
     }
 }

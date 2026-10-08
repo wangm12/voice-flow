@@ -11,10 +11,12 @@ Independent Astra runtime/E2E acceptance remains pending. Static gates, protocol
 - [ ] `npm run lint`
 - [ ] `npm run build`
 - [ ] `npm audit --audit-level=high`
+- [ ] `cargo audit` in `src-tauri/`
 - [ ] `cargo fmt --manifest-path src-tauri/Cargo.toml -- --check`
 - [ ] `cargo test --manifest-path src-tauri/Cargo.toml`
 - [ ] `cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --all-features -- -D warnings`
 - [ ] `cargo check --manifest-path src-tauri/Cargo.toml --target aarch64-apple-darwin`
+- [ ] Run Rust gates from a clean checkout with no prebuilt `target/mlx-sidecar/stage`; debug builds create only an empty resource directory. Apple Silicon release packaging still builds and validates the executable and Metal bundles through `mlx-sidecar/scripts/package.sh`.
 
 ## macOS signing
 

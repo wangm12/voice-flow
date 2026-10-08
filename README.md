@@ -215,9 +215,11 @@ npm run preview --prefix website  # http://127.0.0.1:4173
 环境要求：
 
 - macOS 13+
-- Node.js
+- Node.js 22 LTS（22.13+）或 24 LTS
 - Rust toolchain
 - Xcode Command Line Tools
+
+Apple Silicon 上构建 MLX sidecar 和 Metal 资源还需要完整 Xcode；`npm run tauri dev` 和 `make dmg` 会执行 sidecar 打包脚本。普通 `cargo test` / `cargo check` / `cargo clippy` 可在干净检出中直接运行：debug build 会创建空的 MLX 资源暂存目录供 Tauri 检查，不生成或伪装可用的 MLX runtime。正式安装包仍由打包脚本生成实际 sidecar 与 Metal 资源。
 
 安装依赖并启动开发模式：
 

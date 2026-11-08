@@ -26,6 +26,18 @@ Set `VOICEFLOW_CLEANUP_EVAL_REPORT` to write the aggregate report outside the re
 
 The offline score measures whether deterministic VoiceFlow behavior matches these fixtures. It does not measure hearing, model cleanup quality, user preference, or broad factual correctness.
 
+## Deterministic edit-attribution judge (test-only)
+
+`src-tauri/src/edit_attribution.rs` contains a pure judge for origin-bound synthetic evidence: reference text, ASR and later text stages, the selected delivery path, and a stable same-field edit. It reports an attribution verdict and reason, the first differing stage, an independent cleanup-candidate assessment, and an optional scoped word-pair proposal. The judge does not read expected answers or write permissions. It has no observer, SQLite, settings, or production learning-gate dependency and is compiled only for tests.
+
+Run its synthetic fixture matrix with:
+
+```bash
+cargo test --manifest-path src-tauri/Cargo.toml --lib edit_attribution
+```
+
+This checks classification and abstention rules only. It does not exercise the native observer, learning admission, database writes, delivery, microphone/ASR quality, or human corrections.
+
 ## Reviewed audio pipeline entry point
 
 `npm run eval:audio -- --help` provides an explicit WAV → ASR → cleanup runner. It never records the microphone or reads History. Manifests, WAV files, reports and checkpoints must be outside the repository, including resolved symlink targets. `--init` creates a template with `reviewed: false`; fill in human-checked references and source/rights/de-identification notes before changing that flag. The template contains no recordings or quality evidence.

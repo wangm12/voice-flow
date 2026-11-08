@@ -13,6 +13,8 @@ mod delivery;
 mod delivery_diagnostics;
 mod dictation;
 mod dictionary_learn;
+#[cfg(test)]
+mod edit_attribution;
 mod engine;
 mod groq;
 mod history_commands;

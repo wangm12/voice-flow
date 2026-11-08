@@ -1,0 +1,40 @@
+{
+  "artifact_type": "voiceflow_clipboard_wire_fixture",
+  "schema_version": 1,
+  "items": [
+    [
+      {
+        "type": "public.utf8-plain-text",
+        "bytes": [
+          0,
+          65,
+          255
+        ]
+      },
+      {
+        "type": "org.voiceflow.research.café",
+        "bytes": [
+          10,
+          0,
+          120
+        ]
+      }
+    ],
+    [
+      {
+        "type": "org.voiceflow.research.empty",
+        "bytes": []
+      }
+    ]
+  ],
+  "expected_identity": "f43a821033ffed341a0a35e3ce3d5ffd6d1416ac411042c7eee873e2c180e181",
+  "expected_association": {
+    "snapshot_fixture_identity": "f43a821033ffed341a0a35e3ce3d5ffd6d1416ac411042c7eee873e2c180e181",
+    "snapshot_generation": "10",
+    "temporary_generation": "11",
+    "final_generation": "12",
+    "source": "macos_restore_owner_clear_write_sampled_generation_v1"
+  },
+  "framing": "voiceflow-clipboard-fixture-v1 NUL; u64le item count; per item u64le flavor count; each u64le UTF8 name length/name; u64le body length/body",
+  "scope": "externally fixed source fixture; source preparation only, no native clipboard or runtime result"
+}

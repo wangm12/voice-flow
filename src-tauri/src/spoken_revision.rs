@@ -18,7 +18,7 @@ const HALLUCINATIONS: &[&str] = &[
     "谢谢观看",
 ];
 
-const MARKERS: &[&str] = &[
+pub(crate) const MARKERS: &[&str] = &[
     "scratch that",
     "i mean",
     "no wait",
@@ -41,16 +41,138 @@ pub fn apply(text: &str) -> String {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AuthorizedCorrection {
-    /// Byte range of the superseded entity in the prepared source transcript.
-    pub source_start_byte: usize,
-    pub source_end_byte: usize,
-    /// Byte range of the replacement entity in the resolved transcript.
-    pub output_start_byte: usize,
-    pub output_end_byte: usize,
-    pub source_value: String,
-    pub replacement_value: String,
-    pub kind: crate::protected_span::ProtectedSpanKind,
+pub enum AuthorizedCorrection {
+    ProtectedEntity {
+        source_start_byte: usize,
+        source_end_byte: usize,
+        output_start_byte: usize,
+        output_end_byte: usize,
+        source_value: String,
+        replacement_value: String,
+        kind: crate::protected_span::ProtectedSpanKind,
+    },
+    ImmediateDecisionRestatement {
+        affirmative_range: std::ops::Range<usize>,
+        cue_range: std::ops::Range<usize>,
+        corrective_range: std::ops::Range<usize>,
+        output_corrective_range: std::ops::Range<usize>,
+        actor: String,
+        action: String,
+        superseded_destination: String,
+        final_destination: String,
+    },
+    SpokenRestartRemoval {
+        source_segment_range: std::ops::Range<usize>,
+        source_range: std::ops::Range<usize>,
+        filler_range: std::ops::Range<usize>,
+        abandoned_range: std::ops::Range<usize>,
+        cue_range: std::ops::Range<usize>,
+        repeated_anchor_range: std::ops::Range<usize>,
+        output_segment_range: std::ops::Range<usize>,
+    },
+    StandalonePrefaceFillerRemoval {
+        source_segment_range: std::ops::Range<usize>,
+        filler_range: std::ops::Range<usize>,
+        separator_range: std::ops::Range<usize>,
+        output_segment_range: std::ops::Range<usize>,
+    },
+}
+
+impl AuthorizedCorrection {
+    fn shift_output(&mut self, offset: usize) {
+        match self {
+            Self::ProtectedEntity {
+                output_start_byte,
+                output_end_byte,
+                ..
+            } => {
+                *output_start_byte += offset;
+                *output_end_byte += offset;
+            }
+            Self::ImmediateDecisionRestatement {
+                output_corrective_range,
+                ..
+            } => {
+                output_corrective_range.start += offset;
+                output_corrective_range.end += offset;
+            }
+            Self::SpokenRestartRemoval {
+                output_segment_range,
+                ..
+            } => {
+                output_segment_range.start += offset;
+                output_segment_range.end += offset;
+            }
+            Self::StandalonePrefaceFillerRemoval {
+                output_segment_range,
+                ..
+            } => {
+                output_segment_range.start += offset;
+                output_segment_range.end += offset;
+            }
+        }
+    }
+
+    fn source_bounds(&self) -> (usize, usize) {
+        match self {
+            Self::ProtectedEntity {
+                source_start_byte,
+                source_end_byte,
+                ..
+            } => (*source_start_byte, *source_end_byte),
+            Self::ImmediateDecisionRestatement {
+                affirmative_range,
+                corrective_range,
+                ..
+            } => (affirmative_range.start, corrective_range.end),
+            Self::SpokenRestartRemoval { source_range, .. } => {
+                (source_range.start, source_range.end)
+            }
+            Self::StandalonePrefaceFillerRemoval {
+                filler_range,
+                separator_range,
+                ..
+            } => (filler_range.start, separator_range.end),
+        }
+    }
+
+    fn output_bounds(&self) -> (usize, usize) {
+        match self {
+            Self::ProtectedEntity {
+                output_start_byte,
+                output_end_byte,
+                ..
+            } => (*output_start_byte, *output_end_byte),
+            Self::ImmediateDecisionRestatement {
+                output_corrective_range,
+                ..
+            } => (output_corrective_range.start, output_corrective_range.end),
+            Self::SpokenRestartRemoval {
+                source_range,
+                source_segment_range,
+                output_segment_range,
+                ..
+            } => {
+                let offset = source_range
+                    .start
+                    .saturating_sub(source_segment_range.start);
+                let position = output_segment_range.start.saturating_add(offset);
+                (position, position)
+            }
+            Self::StandalonePrefaceFillerRemoval {
+                filler_range,
+                source_segment_range,
+                output_segment_range,
+                ..
+            } => {
+                let offset = filler_range
+                    .start
+                    .saturating_sub(source_segment_range.start);
+                let position = output_segment_range.start.saturating_add(offset);
+                (position, position)
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,42 +190,382 @@ pub(crate) fn authorizations_match_source_and_output(
     output: &str,
     authorizations: &[AuthorizedCorrection],
 ) -> bool {
+    if source == output && authorizations.is_empty() {
+        return true;
+    }
+    let canonical = resolve_all_sentences(source);
+    let canonical_has_source_proved_removal =
+        canonical.authorizations.iter().any(|authorization| {
+            matches!(
+                authorization,
+                AuthorizedCorrection::SpokenRestartRemoval { .. }
+                    | AuthorizedCorrection::StandalonePrefaceFillerRemoval { .. }
+            )
+        });
+    let supplied_source_proved_removal = authorizations.iter().any(|authorization| {
+        matches!(
+            authorization,
+            AuthorizedCorrection::SpokenRestartRemoval { .. }
+                | AuthorizedCorrection::StandalonePrefaceFillerRemoval { .. }
+        )
+    });
+    if (canonical_has_source_proved_removal || supplied_source_proved_removal)
+        && (canonical.text != output || canonical.authorizations != authorizations)
+    {
+        return false;
+    }
     let source_spans =
         crate::protected_span::protected_spans(source, Some(crate::llm::CleanupOperation::Cleanup));
     let output_spans =
         crate::protected_span::protected_spans(output, Some(crate::llm::CleanupOperation::Cleanup));
+    let source_literals = literal_ranges(source);
     let mut previous_source_end = 0;
     let mut previous_output_end = 0;
     for authorization in authorizations {
-        if authorization.source_start_byte < previous_source_end
-            || authorization.output_start_byte < previous_output_end
-            || authorization.source_start_byte >= authorization.source_end_byte
-            || authorization.output_start_byte >= authorization.output_end_byte
-            || !source.is_char_boundary(authorization.source_start_byte)
-            || !source.is_char_boundary(authorization.source_end_byte)
-            || !output.is_char_boundary(authorization.output_start_byte)
-            || !output.is_char_boundary(authorization.output_end_byte)
-            || source.get(authorization.source_start_byte..authorization.source_end_byte)
-                != Some(authorization.source_value.as_str())
-            || output.get(authorization.output_start_byte..authorization.output_end_byte)
-                != Some(authorization.replacement_value.as_str())
-            || !source_spans.iter().any(|span| {
-                span.start_byte == authorization.source_start_byte
-                    && span.end_byte == authorization.source_end_byte
-                    && span.kind == authorization.kind
-            })
-            || !output_spans.iter().any(|span| {
-                span.start_byte == authorization.output_start_byte
-                    && span.end_byte == authorization.output_end_byte
-                    && span.kind == authorization.kind
-            })
+        let (source_start, source_end) = authorization.source_bounds();
+        let (output_start, output_end) = authorization.output_bounds();
+        if source_start < previous_source_end
+            || output_start < previous_output_end
+            || source_start >= source_end
+            || (output_start >= output_end
+                && !matches!(
+                    authorization,
+                    AuthorizedCorrection::SpokenRestartRemoval { .. }
+                        | AuthorizedCorrection::StandalonePrefaceFillerRemoval { .. }
+                ))
+            || !source.is_char_boundary(source_start)
+            || !source.is_char_boundary(source_end)
+            || !output.is_char_boundary(output_start)
+            || !output.is_char_boundary(output_end)
         {
             return false;
         }
-        previous_source_end = authorization.source_end_byte;
-        previous_output_end = authorization.output_end_byte;
+        let valid = match authorization {
+            AuthorizedCorrection::ProtectedEntity {
+                source_start_byte,
+                source_end_byte,
+                output_start_byte,
+                output_end_byte,
+                source_value,
+                replacement_value,
+                kind,
+            } => {
+                source.get(*source_start_byte..*source_end_byte) == Some(source_value.as_str())
+                    && output.get(*output_start_byte..*output_end_byte)
+                        == Some(replacement_value.as_str())
+                    && source_spans.iter().any(|span| {
+                        span.start_byte == *source_start_byte
+                            && span.end_byte == *source_end_byte
+                            && span.kind == *kind
+                    })
+                    && output_spans.iter().any(|span| {
+                        span.start_byte == *output_start_byte
+                            && span.end_byte == *output_end_byte
+                            && span.kind == *kind
+                    })
+            }
+            AuthorizedCorrection::ImmediateDecisionRestatement {
+                affirmative_range,
+                cue_range,
+                corrective_range,
+                output_corrective_range,
+                actor,
+                action,
+                superseded_destination,
+                final_destination,
+            } => {
+                let valid_source_range = |range: &std::ops::Range<usize>| {
+                    range.start < range.end
+                        && range.end <= source.len()
+                        && source.is_char_boundary(range.start)
+                        && source.is_char_boundary(range.end)
+                };
+                valid_source_range(affirmative_range)
+                    && valid_source_range(cue_range)
+                    && valid_source_range(corrective_range)
+                    && affirmative_range.end <= cue_range.start
+                    && cue_range.end <= corrective_range.start
+                    && source
+                        .get(affirmative_range.end..cue_range.start)
+                        .is_some_and(comma_only_gap)
+                    && source
+                        .get(cue_range.end..corrective_range.start)
+                        .is_some_and(comma_only_gap)
+                    && !source_literals.iter().any(|literal| {
+                        [affirmative_range, cue_range, corrective_range]
+                            .iter()
+                            .any(|range| range.start < literal.end && literal.start < range.end)
+                    })
+                    && source.get(cue_range.clone()) == Some("不")
+                    && parse_immediate_decision_parts(
+                        source.get(affirmative_range.clone()).unwrap_or_default(),
+                        source.get(cue_range.clone()).unwrap_or_default(),
+                        source.get(corrective_range.clone()).unwrap_or_default(),
+                    )
+                    .is_some_and(|facts| {
+                        facts.actor == *actor
+                            && facts.action == *action
+                            && facts.superseded_destination == *superseded_destination
+                            && facts.final_destination == *final_destination
+                    })
+                    && output.get(output_corrective_range.clone())
+                        == source.get(corrective_range.clone())
+            }
+            AuthorizedCorrection::SpokenRestartRemoval {
+                source_segment_range,
+                source_range,
+                filler_range,
+                abandoned_range,
+                cue_range,
+                repeated_anchor_range,
+                output_segment_range,
+            } => spoken_restart_authorization_matches(
+                source,
+                output,
+                source_segment_range,
+                source_range,
+                filler_range,
+                abandoned_range,
+                cue_range,
+                repeated_anchor_range,
+                output_segment_range,
+            ),
+            AuthorizedCorrection::StandalonePrefaceFillerRemoval {
+                source_segment_range,
+                filler_range,
+                separator_range,
+                output_segment_range,
+            } => standalone_preface_filler_authorization_matches(
+                source,
+                output,
+                source_segment_range,
+                filler_range,
+                separator_range,
+                output_segment_range,
+            ),
+        };
+        if !valid {
+            return false;
+        }
+        previous_source_end = source_end;
+        previous_output_end = output_end;
     }
     true
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SpokenRestartRanges {
+    source_range: std::ops::Range<usize>,
+    filler_range: std::ops::Range<usize>,
+    abandoned_range: std::ops::Range<usize>,
+    cue_range: std::ops::Range<usize>,
+    repeated_anchor_range: std::ops::Range<usize>,
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "source and output byte ranges remain distinct authorization facts"
+)]
+fn spoken_restart_authorization_matches(
+    source: &str,
+    output: &str,
+    source_segment_range: &std::ops::Range<usize>,
+    source_range: &std::ops::Range<usize>,
+    filler_range: &std::ops::Range<usize>,
+    abandoned_range: &std::ops::Range<usize>,
+    cue_range: &std::ops::Range<usize>,
+    repeated_anchor_range: &std::ops::Range<usize>,
+    output_segment_range: &std::ops::Range<usize>,
+) -> bool {
+    let valid_range = |text: &str, range: &std::ops::Range<usize>| {
+        range.start < range.end
+            && range.end <= text.len()
+            && text.is_char_boundary(range.start)
+            && text.is_char_boundary(range.end)
+    };
+    if !valid_range(source, source_segment_range)
+        || !valid_range(source, source_range)
+        || !valid_range(source, filler_range)
+        || !valid_range(source, abandoned_range)
+        || !valid_range(source, cue_range)
+        || !valid_range(source, repeated_anchor_range)
+        || !valid_range(output, output_segment_range)
+        || source_range.start < source_segment_range.start
+        || source_range.end > source_segment_range.end
+        || filler_range.start != source_range.start
+        || filler_range.end > abandoned_range.start
+        || abandoned_range.end > cue_range.start
+        || cue_range.end > source_range.end
+        || repeated_anchor_range.start < source_range.end
+        || repeated_anchor_range.end > source_segment_range.end
+    {
+        return false;
+    }
+    let Some(source_segment) = source.get(source_segment_range.clone()) else {
+        return false;
+    };
+    let Some(output_segment) = output.get(output_segment_range.clone()) else {
+        return false;
+    };
+    let Some(parsed) = parse_spoken_restart(source_segment) else {
+        return false;
+    };
+    let Some(separator_gap) =
+        source_segment.get(parsed.abandoned_range.end..parsed.cue_range.start)
+    else {
+        return false;
+    };
+    if skip_restart_separators(separator_gap, 0) != separator_gap.len() {
+        return false;
+    }
+    let localize = |range: &std::ops::Range<usize>| {
+        range.start - source_segment_range.start..range.end - source_segment_range.start
+    };
+    if localize(source_range) != parsed.source_range
+        || localize(filler_range) != parsed.filler_range
+        || localize(abandoned_range) != parsed.abandoned_range
+        || localize(cue_range) != parsed.cue_range
+        || localize(repeated_anchor_range) != parsed.repeated_anchor_range
+    {
+        return false;
+    }
+    let Some(prefix) = source_segment.get(..parsed.source_range.start) else {
+        return false;
+    };
+    let Some(suffix) = source_segment.get(parsed.source_range.end..) else {
+        return false;
+    };
+    prefix.to_owned() + suffix == output_segment
+}
+
+fn standalone_preface_filler_authorization_matches(
+    source: &str,
+    output: &str,
+    source_segment_range: &std::ops::Range<usize>,
+    filler_range: &std::ops::Range<usize>,
+    separator_range: &std::ops::Range<usize>,
+    output_segment_range: &std::ops::Range<usize>,
+) -> bool {
+    let valid_range = |text: &str, range: &std::ops::Range<usize>| {
+        range.start < range.end
+            && range.end <= text.len()
+            && text.is_char_boundary(range.start)
+            && text.is_char_boundary(range.end)
+    };
+    if source_segment_range.start != 0
+        || !valid_range(source, source_segment_range)
+        || !valid_range(source, filler_range)
+        || !valid_range(source, separator_range)
+        || !valid_range(output, output_segment_range)
+    {
+        return false;
+    }
+    let Some((canonical_filler, canonical_separator)) =
+        parse_standalone_preface_filler(source, source_segment_range)
+    else {
+        return false;
+    };
+    if filler_range != &canonical_filler || separator_range != &canonical_separator {
+        return false;
+    }
+    let Some(source_segment) = source.get(source_segment_range.clone()) else {
+        return false;
+    };
+    let Some(output_segment) = output.get(output_segment_range.clone()) else {
+        return false;
+    };
+    let Some(prefix) = source_segment.get(..filler_range.start) else {
+        return false;
+    };
+    let relative_separator_end = separator_range.end - source_segment_range.start;
+    let Some(suffix) = source_segment.get(relative_separator_end..) else {
+        return false;
+    };
+    format!("{prefix}{suffix}") == output_segment
+}
+
+fn parse_standalone_preface_filler(
+    source: &str,
+    source_segment_range: &std::ops::Range<usize>,
+) -> Option<(std::ops::Range<usize>, std::ops::Range<usize>)> {
+    if source_segment_range.start != 0 || source_segment_range.end > source.len() {
+        return None;
+    }
+    let source_segment = source.get(source_segment_range.clone())?;
+    if split_sentences(source).first().map(String::as_str) != Some(source_segment) {
+        return None;
+    }
+    let filler_start = source_segment.len() - source_segment.trim_start().len();
+    let filler_range =
+        crate::spoken_layout::standalone_filler_token_range(source, filler_start, false)?;
+    // This source-bound preface rule recognizes only these exact spoken
+    // hesitations; it does not waive other filler tokens globally.
+    if !matches!(source.get(filler_range.clone()), Some("嗯" | "呃")) {
+        return None;
+    }
+    let separator_end =
+        filler_range.end + source.get(filler_range.end..)?.chars().next()?.len_utf8();
+    let separator_range = filler_range.end..separator_end;
+    if !matches!(source.get(separator_range.clone()), Some("," | "，")) {
+        return None;
+    }
+    let literals = literal_ranges(source);
+    if literals.iter().any(|range| {
+        range.start < source_segment_range.end && source_segment_range.start < range.end
+    }) {
+        return None;
+    }
+    let protected = crate::protected_span::protected_spans(
+        source_segment,
+        Some(crate::llm::CleanupOperation::Cleanup),
+    );
+    let removed_range = filler_range.start..separator_range.end;
+    if protected
+        .iter()
+        .any(|span| span.start_byte < removed_range.end && removed_range.start < span.end_byte)
+        || crate::protected_span::contains_negation(source_segment)
+        || crate::spoken_layout::has_hypothetical_introducer(source_segment)
+        || source_segment
+            .chars()
+            .any(|ch| matches!(ch, '?' | '？' | '!' | '！'))
+        || !has_meaningful_preface_tail(&source[separator_range.end..source_segment_range.end])
+    {
+        return None;
+    }
+    Some((filler_range, separator_range))
+}
+
+fn has_meaningful_preface_tail(mut tail: &str) -> bool {
+    loop {
+        tail = tail.trim_start_matches(|ch: char| {
+            ch.is_whitespace()
+                || matches!(
+                    ch,
+                    ',' | '，'
+                        | '。'
+                        | '.'
+                        | '、'
+                        | ';'
+                        | '；'
+                        | ':'
+                        | '：'
+                        | '!'
+                        | '?'
+                        | '！'
+                        | '？'
+                )
+        });
+        if tail.is_empty() {
+            return false;
+        }
+        if let Some(filler) = crate::spoken_layout::standalone_filler_token_range(tail, 0, false) {
+            tail = &tail[filler.end..];
+            continue;
+        }
+        return tail
+            .chars()
+            .any(|ch| ch.is_ascii_alphanumeric() || is_cjk(ch));
+    }
 }
 
 pub fn is_hallucination_text(text: &str) -> bool {
@@ -176,8 +638,7 @@ fn resolve_all_sentences(text: &str) -> RevisionOutput {
         let output_offset = resolved.len();
         resolved.push_str(&segment.text);
         for mut authorization in segment.authorizations {
-            authorization.output_start_byte += output_offset;
-            authorization.output_end_byte += output_offset;
+            authorization.shift_output(output_offset);
             authorizations.push(authorization);
         }
     }
@@ -236,7 +697,7 @@ fn resolve_cross_sentence_revision(
     Some(ResolvedSegment {
         source_start_byte: previous.source_start_byte,
         text,
-        authorizations: vec![AuthorizedCorrection {
+        authorizations: vec![AuthorizedCorrection::ProtectedEntity {
             source_start_byte: source_start,
             source_end_byte: source_end,
             output_start_byte: output_start,
@@ -271,6 +732,16 @@ fn resolve_one_sentence(
     literal_ranges: &[std::ops::Range<usize>],
 ) -> (String, Option<AuthorizedCorrection>) {
     let (body, closer) = peel_closer(sentence);
+    if let Some((replaced, authorization)) =
+        apply_immediate_decision_restatement(body, source_start_byte, literal_ranges)
+    {
+        return (attach_closer(&replaced, closer), Some(authorization));
+    }
+    if let Some((replaced, authorization)) =
+        apply_source_proved_spoken_restart(sentence, source_start_byte, literal_ranges)
+    {
+        return (replaced, Some(authorization));
+    }
     if let Some((marker_start, marker_end)) = split_on_last_marker_run(body) {
         if overlaps_literal(
             literal_ranges,
@@ -320,7 +791,7 @@ fn resolve_one_sentence(
         let replacement_value = replacement[new_entity.start_byte..new_entity.end_byte].to_owned();
         return (
             text,
-            Some(AuthorizedCorrection {
+            Some(AuthorizedCorrection::ProtectedEntity {
                 source_start_byte: source_start,
                 source_end_byte: source_end,
                 output_start_byte: output_start,
@@ -332,15 +803,208 @@ fn resolve_one_sentence(
         );
     }
     if let Some((replaced, authorization)) = apply_contrast_not_a_but_b(body, source_start_byte) {
-        if !overlaps_literal(
-            literal_ranges,
-            authorization.source_start_byte,
-            authorization.source_end_byte,
-        ) {
+        let (authorization_start, authorization_end) = authorization.source_bounds();
+        if !overlaps_literal(literal_ranges, authorization_start, authorization_end) {
             return (attach_closer(&replaced, closer), Some(authorization));
         }
     }
+    if source_start_byte == 0 && full_source.get(..sentence.len()) == Some(sentence) {
+        let source_segment_range = 0..sentence.len();
+        if let Some((filler_range, separator_range)) =
+            parse_standalone_preface_filler(full_source, &source_segment_range)
+        {
+            let prefix = &sentence[..filler_range.start];
+            let suffix = &sentence[separator_range.end..];
+            let text = format!("{prefix}{suffix}");
+            let output_segment_range = 0..text.len();
+            return (
+                text,
+                Some(AuthorizedCorrection::StandalonePrefaceFillerRemoval {
+                    source_segment_range,
+                    filler_range,
+                    separator_range,
+                    output_segment_range,
+                }),
+            );
+        }
+    }
     (sentence.to_owned(), None)
+}
+
+fn apply_source_proved_spoken_restart(
+    sentence: &str,
+    source_start_byte: usize,
+    full_source_literals: &[std::ops::Range<usize>],
+) -> Option<(String, AuthorizedCorrection)> {
+    let ranges = parse_spoken_restart(sentence)?;
+    let source_range =
+        source_start_byte + ranges.source_range.start..source_start_byte + ranges.source_range.end;
+    let filler_range =
+        source_start_byte + ranges.filler_range.start..source_start_byte + ranges.filler_range.end;
+    let abandoned_range = source_start_byte + ranges.abandoned_range.start
+        ..source_start_byte + ranges.abandoned_range.end;
+    let cue_range =
+        source_start_byte + ranges.cue_range.start..source_start_byte + ranges.cue_range.end;
+    let repeated_anchor_range = source_start_byte + ranges.repeated_anchor_range.start
+        ..source_start_byte + ranges.repeated_anchor_range.end;
+    if full_source_literals.iter().any(|literal| {
+        [
+            &source_range,
+            &filler_range,
+            &abandoned_range,
+            &cue_range,
+            &repeated_anchor_range,
+        ]
+        .into_iter()
+        .any(|range| range.start < literal.end && literal.start < range.end)
+    }) {
+        return None;
+    }
+    let output = format!(
+        "{}{}",
+        &sentence[..ranges.source_range.start],
+        &sentence[ranges.source_range.end..]
+    );
+    let output_segment_range = 0..output.len();
+    Some((
+        output,
+        AuthorizedCorrection::SpokenRestartRemoval {
+            source_segment_range: source_start_byte..source_start_byte + sentence.len(),
+            source_range,
+            filler_range,
+            abandoned_range,
+            cue_range,
+            repeated_anchor_range,
+            output_segment_range,
+        },
+    ))
+}
+
+fn parse_spoken_restart(text: &str) -> Option<SpokenRestartRanges> {
+    let literals = literal_ranges(text);
+    let protected =
+        crate::protected_span::protected_spans(text, Some(crate::llm::CleanupOperation::Cleanup));
+    let cues = text.match_indices("不对不对").collect::<Vec<_>>();
+    if cues.len() != 1 {
+        return None;
+    }
+    let (cue_start, cue_value) = cues[0];
+    let cue_end = cue_start + cue_value.len();
+    let mut restart = None;
+    for (start, _) in text.char_indices() {
+        let Some(filler_range) =
+            crate::spoken_layout::standalone_filler_token_range(text, start, false)
+        else {
+            continue;
+        };
+        if text.get(filler_range.clone()) != Some("呃") || filler_range.end >= cue_start {
+            continue;
+        }
+        let prefix = &text[..filler_range.start];
+        if crate::spoken_layout::has_hypothetical_introducer(prefix)
+            || prefix
+                .chars()
+                .any(|ch| matches!(ch, '?' | '？' | '!' | '！'))
+        {
+            continue;
+        }
+        let filler_separator_end = skip_restart_separators(text, filler_range.end);
+        if filler_separator_end == filler_range.end || filler_separator_end >= cue_start {
+            continue;
+        }
+        let fragment_end = trim_restart_separator_suffix(text, filler_separator_end, cue_start);
+        if fragment_end <= filler_separator_end {
+            continue;
+        }
+        let fragment_range = filler_separator_end..fragment_end;
+        let fragment = text.get(fragment_range.clone())?;
+        if crate::spoken_layout::has_hypothetical_introducer(fragment)
+            || fragment.chars().any(|ch| {
+                matches!(
+                    ch,
+                    ',' | '，' | ';' | '；' | ':' | '：' | '?' | '？' | '!' | '！'
+                )
+            })
+            || fragment.contains("对不对")
+            || crate::protected_span::contains_negation(fragment)
+            || intersects_protected_content(text, fragment_range.start, fragment_range.end)
+            || protected.iter().any(|span| {
+                fragment_range.start < span.end_byte && span.start_byte < fragment_range.end
+            })
+            || literals.iter().any(|literal| {
+                fragment_range.start < literal.end && literal.start < fragment_range.end
+            })
+        {
+            continue;
+        }
+        let after_cue = skip_restart_separators(text, cue_end);
+        if after_cue == cue_end || after_cue >= text.len() {
+            continue;
+        }
+        let tail = &text[after_cue..];
+        let anchor_matches = tail
+            .match_indices(fragment)
+            .map(|(relative, value)| {
+                let start = after_cue + relative;
+                start..start + value.len()
+            })
+            .filter(|range| {
+                !literals
+                    .iter()
+                    .any(|literal| range.start < literal.end && literal.start < range.end)
+                    && !protected
+                        .iter()
+                        .any(|span| range.start < span.end_byte && span.start_byte < range.end)
+            })
+            .collect::<Vec<_>>();
+        if anchor_matches.len() != 1 {
+            continue;
+        }
+        let repeated_anchor_range = anchor_matches[0].clone();
+        let source_range = filler_range.start..after_cue;
+        if literals
+            .iter()
+            .any(|literal| source_range.start < literal.end && literal.start < source_range.end)
+        {
+            continue;
+        }
+        let candidate = SpokenRestartRanges {
+            source_range,
+            filler_range: filler_range.clone(),
+            abandoned_range: fragment_range,
+            cue_range: cue_start..cue_end,
+            repeated_anchor_range,
+        };
+        if restart.is_some() {
+            return None;
+        }
+        restart = Some(candidate);
+    }
+    restart
+}
+
+fn skip_restart_separators(text: &str, mut offset: usize) -> usize {
+    while let Some(ch) = text.get(offset..).and_then(|tail| tail.chars().next()) {
+        if ch.is_whitespace() || matches!(ch, ',' | '，' | '、') {
+            offset += ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    offset
+}
+
+fn trim_restart_separator_suffix(text: &str, start: usize, end: usize) -> usize {
+    let mut trimmed_end = end;
+    while trimmed_end > start {
+        let ch = text[..trimmed_end].chars().next_back().unwrap_or_default();
+        if ch.is_whitespace() || matches!(ch, ',' | '，' | '、') {
+            trimmed_end -= ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    trimmed_end
 }
 
 fn has_explicit_edit_boundary(text: &str, marker_start: usize) -> bool {
@@ -349,6 +1013,134 @@ fn has_explicit_edit_boundary(text: &str, marker_start: usize) -> bool {
         .chars()
         .next_back()
         .is_some_and(|ch| matches!(ch, ',' | '，' | ';' | '；' | ':' | '：' | '—'))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ImmediateDecisionFacts {
+    actor: String,
+    action: String,
+    superseded_destination: String,
+    final_destination: String,
+}
+
+fn parse_immediate_decision_parts(
+    affirmative: &str,
+    cue: &str,
+    corrective: &str,
+) -> Option<ImmediateDecisionFacts> {
+    if cue != "不" {
+        return None;
+    }
+    let affirmative = affirmative.trim();
+    let corrective = corrective.trim();
+    let affirmative_action = ["我要去", "我准备去", "我打算去"]
+        .into_iter()
+        .find(|prefix| {
+            affirmative
+                .get(..prefix.len())
+                .is_some_and(|value| value == *prefix)
+        })?;
+    let old_destination = affirmative[affirmative_action.len()..].trim();
+    if old_destination.is_empty()
+        || old_destination
+            .chars()
+            .any(|ch| matches!(ch, '，' | ',' | '。' | ';' | '；'))
+    {
+        return None;
+    }
+    let correction_prefix = "我决定不去";
+    let correction = corrective.strip_prefix(correction_prefix)?;
+    let split_at = correction
+        .find("，去")
+        .map(|index| (index, "，去".len()))
+        .or_else(|| correction.find(",去").map(|index| (index, ",去".len())))?;
+    let corrected_old_destination = correction[..split_at.0].trim();
+    let final_destination = correction[split_at.0 + split_at.1..].trim();
+    if corrected_old_destination.is_empty()
+        || corrected_old_destination != old_destination
+        || final_destination.is_empty()
+        || final_destination
+            .chars()
+            .any(|ch| matches!(ch, '，' | ',' | '。' | ';' | '；'))
+        || final_destination == old_destination
+    {
+        return None;
+    }
+    Some(ImmediateDecisionFacts {
+        actor: "我".into(),
+        action: "去".into(),
+        superseded_destination: old_destination.to_owned(),
+        final_destination: final_destination.to_owned(),
+    })
+}
+
+fn comma_only_gap(gap: &str) -> bool {
+    matches!(gap.trim_matches(char::is_whitespace), "," | "，")
+}
+
+fn trimmed_byte_range(text: &str, start: usize, end: usize) -> std::ops::Range<usize> {
+    let slice = &text[start..end];
+    let leading = slice.len() - slice.trim_start().len();
+    let trailing = slice.trim_end().len();
+    start + leading..start + trailing
+}
+
+fn apply_immediate_decision_restatement(
+    body: &str,
+    source_start_byte: usize,
+    literal_ranges: &[std::ops::Range<usize>],
+) -> Option<(String, AuthorizedCorrection)> {
+    let candidates = ["，不，", ",不，", "，不,", ",不,"]
+        .iter()
+        .filter_map(|delimiter| body.find(delimiter).map(|start| (start, *delimiter)))
+        .collect::<Vec<_>>();
+    let [(cue_delimiter_start, delimiter)] = candidates.as_slice() else {
+        return None;
+    };
+    let cue_offset = delimiter.find('不')?;
+    let cue_start = cue_delimiter_start + cue_offset;
+    let cue_end = cue_start + "不".len();
+    let affirmative_range = trimmed_byte_range(body, 0, *cue_delimiter_start);
+    let corrective_range =
+        trimmed_byte_range(body, *cue_delimiter_start + delimiter.len(), body.len());
+    if affirmative_range.is_empty() || corrective_range.is_empty() {
+        return None;
+    }
+    let facts = parse_immediate_decision_parts(
+        body.get(affirmative_range.clone())?,
+        body.get(cue_start..cue_end)?,
+        body.get(corrective_range.clone())?,
+    )?;
+    let absolute = |range: std::ops::Range<usize>| {
+        source_start_byte + range.start..source_start_byte + range.end
+    };
+    let affirmative_range = absolute(affirmative_range);
+    let cue_range = absolute(cue_start..cue_end);
+    let corrective_range = absolute(corrective_range);
+    if literal_ranges.iter().any(|literal| {
+        [&affirmative_range, &cue_range, &corrective_range]
+            .iter()
+            .any(|range| range.start < literal.end && literal.start < range.end)
+    }) {
+        return None;
+    }
+    let local_output_range = body.get(
+        corrective_range.start - source_start_byte..corrective_range.end - source_start_byte,
+    )?;
+    let output_corrective_range = 0..local_output_range.len();
+    Some((
+        local_output_range.to_owned(),
+        AuthorizedCorrection::ImmediateDecisionRestatement {
+            affirmative_range,
+            cue_range,
+            corrective_range,
+            output_corrective_range,
+            actor: facts.actor,
+            action: facts.action,
+            superseded_destination: facts.superseded_destination,
+            final_destination: facts.final_destination,
+        },
+    ))
 }
 
 #[derive(Clone, Copy)]
@@ -549,7 +1341,7 @@ fn apply_contrast_not_a_but_b(
     let replacement_value = replacement[new_entity.start_byte..new_entity.end_byte].to_owned();
     Some((
         replacement.to_owned(),
-        AuthorizedCorrection {
+        AuthorizedCorrection::ProtectedEntity {
             source_start_byte: source_start_byte + old_text_offset + old_entity.start_byte,
             source_end_byte: source_start_byte + old_text_offset + old_entity.end_byte,
             output_start_byte: new_entity.start_byte,
@@ -771,7 +1563,7 @@ fn skip_junk(text: &str, start: usize) -> usize {
     index
 }
 
-fn ascii_boundaries(text: &str, start: usize, end: usize) -> bool {
+pub(crate) fn ascii_boundaries(text: &str, start: usize, end: usize) -> bool {
     let left_ok = text[..start]
         .chars()
         .next_back()
@@ -999,5 +1791,358 @@ mod tests {
         assert!(out.contains("cloud"), "{out}");
         assert!(out.contains("不对"), "{out}");
         assert!(out.contains("cursor"), "{out}");
+    }
+
+    #[test]
+    fn immediate_negated_decision_restatement_is_source_bound_and_keeps_final_negation() {
+        let source = "我要去 A，不，我决定不去 A，去 B。";
+        let revision = apply_with_authorizations(source);
+        assert_eq!(revision.text, "我决定不去 A，去 B。");
+        assert_eq!(revision.authorizations.len(), 1);
+        assert!(authorizations_match_source_and_output(
+            source,
+            &revision.text,
+            &revision.authorizations
+        ));
+        let (final_text, reason, _) = crate::guard_final_output_with_reason(
+            &revision.text,
+            &revision.text,
+            crate::FinalizationContext {
+                scene: crate::ResolvedCleanupScene::observed(
+                    crate::context::ContextFamily::General,
+                    crate::context::FocusKind::Editable,
+                ),
+                operation: crate::llm::CleanupOperation::Cleanup,
+                revision_source: Some(source),
+                prepared_transcript: Some(&revision.text),
+                revision_authorizations: &revision.authorizations,
+                promoted_pair_protections: &[],
+                list_revision_proof: None,
+                structure_safe_source: None,
+                output_projection_list_revision_proof: None,
+                layout_source: None,
+                exact_fallback: false,
+            },
+        );
+        assert_eq!(reason, None);
+        assert_eq!(final_text, "我决定不去 A，去 B。");
+
+        let changed_final_destination = revision.text.replace("去 B", "去 C");
+        assert!(!authorizations_match_source_and_output(
+            source,
+            &changed_final_destination,
+            &revision.authorizations
+        ));
+
+        for raw in [
+            "如果我要去 A，不，我决定不去 A，去 B。",
+            "我要去 A，不，我决定不去 C，去 B。",
+            "我要去 A，不，我决定去 A，去 B。",
+            "我要去 A，不，我决定不去 A，去 A。",
+            "我要去 A，讨论‘不’，我决定不去 A，去 B。",
+        ] {
+            let result = apply_with_authorizations(raw);
+            assert_eq!(result.text, raw, "unproved decision rewrite: {raw}");
+            assert!(result.authorizations.is_empty());
+            assert!(authorizations_match_source_and_output(
+                raw,
+                &result.text,
+                &[]
+            ));
+        }
+    }
+
+    #[test]
+    fn source_proved_spoken_restart_is_normalized_before_shared_guards() {
+        let source = "流程是什么？具体，呃，测试不对不对，帮我看一下软件具体测试什么。第一个是准确性。第二个是稳定性。";
+        let revision = apply_with_authorizations(source);
+        assert_eq!(
+            revision.text,
+            "流程是什么？具体，帮我看一下软件具体测试什么。第一个是准确性。第二个是稳定性。"
+        );
+        assert_eq!(revision.authorizations.len(), 1);
+        assert!(authorizations_match_source_and_output(
+            source,
+            &revision.text,
+            &revision.authorizations
+        ));
+        assert!(authorizations_match_source_and_output(source, source, &[]));
+        assert!(!authorizations_match_source_and_output(
+            source,
+            &revision.text,
+            &[]
+        ));
+
+        let (final_text, reason, _) = crate::guard_final_output_with_reason(
+            &revision.text,
+            &revision.text,
+            crate::FinalizationContext {
+                scene: crate::ResolvedCleanupScene::observed(
+                    crate::context::ContextFamily::General,
+                    crate::context::FocusKind::Editable,
+                ),
+                operation: crate::llm::CleanupOperation::Cleanup,
+                revision_source: Some(source),
+                prepared_transcript: Some(&revision.text),
+                revision_authorizations: &revision.authorizations,
+                promoted_pair_protections: &[],
+                list_revision_proof: None,
+                structure_safe_source: None,
+                output_projection_list_revision_proof: None,
+                layout_source: None,
+                exact_fallback: false,
+            },
+        );
+        assert_eq!(reason, None);
+        assert_eq!(final_text, revision.text);
+
+        let changed = revision.text.replace("准确性", "稳定性");
+        assert!(!authorizations_match_source_and_output(
+            source,
+            &changed,
+            &revision.authorizations
+        ));
+
+        let separated_source = "具体，呃，测试，不对不对，帮我看一下测试。";
+        let separated = apply_with_authorizations(separated_source);
+        assert_eq!(separated.text, "具体，帮我看一下测试。");
+        assert!(authorizations_match_source_and_output(
+            separated_source,
+            &separated.text,
+            &separated.authorizations
+        ));
+
+        let mut malformed = revision.authorizations.clone();
+        if let AuthorizedCorrection::SpokenRestartRemoval { source_range, .. } = &mut malformed[0] {
+            source_range.start += 1;
+        }
+        assert!(!authorizations_match_source_and_output(
+            source,
+            &revision.text,
+            &malformed
+        ));
+        let mut overlapping = revision.authorizations.clone();
+        overlapping.extend(revision.authorizations.clone());
+        assert!(!authorizations_match_source_and_output(
+            source,
+            &revision.text,
+            &overlapping
+        ));
+    }
+
+    #[test]
+    fn standalone_preface_filler_removal_is_canonical_and_source_bound() {
+        let source = "嗯，先检查流程。第一个是稳定性。第二个是准确度。";
+        let revision = apply_with_authorizations(source);
+        assert_eq!(
+            revision.text,
+            "先检查流程。第一个是稳定性。第二个是准确度。"
+        );
+        assert_eq!(revision.authorizations.len(), 1);
+        assert!(matches!(
+            &revision.authorizations[0],
+            AuthorizedCorrection::StandalonePrefaceFillerRemoval { .. }
+        ));
+        assert!(authorizations_match_source_and_output(
+            source,
+            &revision.text,
+            &revision.authorizations
+        ));
+        assert!(authorizations_match_source_and_output(source, source, &[]));
+        assert!(!authorizations_match_source_and_output(
+            source,
+            &revision.text,
+            &[]
+        ));
+
+        let changed_output = revision.text.replace("稳定性", "延迟");
+        assert!(!authorizations_match_source_and_output(
+            source,
+            &changed_output,
+            &revision.authorizations
+        ));
+
+        let mut forged = revision.authorizations.clone();
+        if let AuthorizedCorrection::StandalonePrefaceFillerRemoval {
+            separator_range, ..
+        } = &mut forged[0]
+        {
+            separator_range.end += 1;
+        }
+        assert!(!authorizations_match_source_and_output(
+            source,
+            &revision.text,
+            &forged
+        ));
+
+        let prefixed_source = format!("引用：‘{source}’");
+        let prefixed_output = format!("引用：‘{}’", revision.text);
+        assert!(!authorizations_match_source_and_output(
+            &prefixed_source,
+            &prefixed_output,
+            &revision.authorizations
+        ));
+
+        let er_source = "呃，先检查流程。第一个是稳定性。第二个是准确度。";
+        let er_revision = apply_with_authorizations(er_source);
+        assert_eq!(
+            er_revision.text,
+            "先检查流程。第一个是稳定性。第二个是准确度。"
+        );
+        assert_eq!(er_revision.authorizations.len(), 1);
+        assert!(matches!(
+            &er_revision.authorizations[0],
+            AuthorizedCorrection::StandalonePrefaceFillerRemoval { .. }
+        ));
+        assert!(authorizations_match_source_and_output(
+            er_source,
+            &er_revision.text,
+            &er_revision.authorizations
+        ));
+    }
+
+    #[test]
+    fn standalone_preface_filler_preserves_literals_questions_and_unknowns() {
+        for source in [
+            "引用：‘嗯，测试流程。’",
+            "引用：‘呃，测试流程。’",
+            "```text\n嗯，测试流程。\n```",
+            "```text\n呃，测试流程。\n```",
+            "嗯，",
+            "呃，",
+            "嗯？",
+            "呃？",
+            "嗯嗯，测试流程。",
+            "嗯哼，测试流程。",
+            "呃呃，测试流程。",
+            "呃哈，测试流程。",
+            "额，测试流程。",
+            "Um, test the flow.",
+            "嗯，嗯。",
+            "呃，呃。",
+            "嗯，如果只是举例，测试流程。",
+            "呃，如果只是举例，测试流程。",
+            "嗯，不要删除测试流程。",
+            "呃，不要删除测试流程。",
+            "普通前言嗯，测试流程。",
+            "普通前言呃，测试流程。",
+            "呃，`API v2`。",
+        ] {
+            let revision = apply_with_authorizations(source);
+            assert_eq!(
+                revision.text, source,
+                "unproved preface filler changed: {source}"
+            );
+            assert!(revision.authorizations.is_empty());
+            assert!(authorizations_match_source_and_output(
+                source,
+                &revision.text,
+                &revision.authorizations
+            ));
+        }
+    }
+
+    #[test]
+    fn standalone_preface_filler_keeps_protected_suffix_facts_exact() {
+        let source = "嗯，测试一下这个流程，保留 API v2 和 /var/tmp/result.json。";
+        let revision = apply_with_authorizations(source);
+        assert_eq!(
+            revision.text,
+            "测试一下这个流程，保留 API v2 和 /var/tmp/result.json。"
+        );
+        assert_eq!(revision.authorizations.len(), 1);
+        assert!(matches!(
+            &revision.authorizations[0],
+            AuthorizedCorrection::StandalonePrefaceFillerRemoval { .. }
+        ));
+        assert!(authorizations_match_source_and_output(
+            source,
+            &revision.text,
+            &revision.authorizations
+        ));
+        for protected in ["这个流程", "API v2", "/var/tmp/result.json"] {
+            assert!(revision.text.contains(protected), "lost {protected}");
+        }
+
+        let er_source = "呃，测试一下这个流程，保留 API v2 和 /var/tmp/result.json。";
+        let er_revision = apply_with_authorizations(er_source);
+        assert_eq!(
+            er_revision.text,
+            "测试一下这个流程，保留 API v2 和 /var/tmp/result.json。"
+        );
+        assert!(authorizations_match_source_and_output(
+            er_source,
+            &er_revision.text,
+            &er_revision.authorizations
+        ));
+        for protected in ["这个流程", "API v2", "/var/tmp/result.json"] {
+            assert!(er_revision.text.contains(protected), "lost {protected}");
+        }
+    }
+
+    #[test]
+    fn restart_authorization_cannot_be_forged_from_a_context_free_substring() {
+        let inner = "具体，呃，测试不对不对，帮我看一下测试。";
+        let inner_revision = apply_with_authorizations(inner);
+        assert_eq!(inner_revision.authorizations.len(), 1);
+        let AuthorizedCorrection::SpokenRestartRemoval {
+            source_segment_range,
+            source_range,
+            filler_range,
+            abandoned_range,
+            cue_range,
+            repeated_anchor_range,
+            ..
+        } = &inner_revision.authorizations[0]
+        else {
+            unreachable!("the narrow restart fixture must produce its typed proof")
+        };
+
+        for (prefix, suffix) in [("引用：‘", "’"), ("假设我只是在举例，", "")] {
+            let full_source = format!("{prefix}{inner}{suffix}");
+            let full_output = format!("{prefix}{}{suffix}", inner_revision.text);
+            let source_offset = prefix.len();
+            let output_offset = prefix.len();
+            let forged = AuthorizedCorrection::SpokenRestartRemoval {
+                source_segment_range: source_offset + source_segment_range.start
+                    ..source_offset + source_segment_range.end,
+                source_range: source_offset + source_range.start..source_offset + source_range.end,
+                filler_range: source_offset + filler_range.start..source_offset + filler_range.end,
+                abandoned_range: source_offset + abandoned_range.start
+                    ..source_offset + abandoned_range.end,
+                cue_range: source_offset + cue_range.start..source_offset + cue_range.end,
+                repeated_anchor_range: source_offset + repeated_anchor_range.start
+                    ..source_offset + repeated_anchor_range.end,
+                output_segment_range: output_offset..output_offset + inner_revision.text.len(),
+            };
+            assert!(!authorizations_match_source_and_output(
+                &full_source,
+                &full_output,
+                &[forged]
+            ));
+        }
+    }
+
+    #[test]
+    fn spoken_restart_removal_preserves_literals_negation_and_unproved_cues() {
+        for source in [
+            "具体，呃，测试不对，帮我看一下测试。",
+            "如果要讨论，呃，测试不对不对，帮我看一下测试。",
+            "具体，呃，不要删除测试不对不对，帮我看一下测试。",
+            "具体，呃，测试不对不对，帮我看一下流程。",
+            "具体，呃哈，测试不对不对，帮我看一下测试。",
+            "引用：‘具体，呃，测试不对不对，帮我看一下测试。’",
+            "```text\n具体，呃，测试不对不对，帮我看一下测试。\n```",
+            "具体，呃，API v2不对不对，帮我检查 API v2。",
+        ] {
+            let revision = apply_with_authorizations(source);
+            assert_eq!(revision.text, source, "unproved restart changed: {source}");
+            assert!(revision.authorizations.is_empty());
+            assert!(authorizations_match_source_and_output(
+                source,
+                &revision.text,
+                &revision.authorizations
+            ));
+        }
     }
 }

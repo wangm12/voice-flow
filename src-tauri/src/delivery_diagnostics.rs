@@ -8,6 +8,89 @@ use tauri::Manager;
 const RETENTION_MS: u128 = 30 * 24 * 60 * 60 * 1_000;
 const MAX_LOG_BYTES: usize = 10 * 1024 * 1024;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PasteVerificationFact {
+    /// No keyboard shortcut was invoked.
+    NotAttempted,
+    /// An AX readback of the same retained field exactly matched the expected
+    /// splice during the bounded post-shortcut polling. Never used when the
+    /// splice equals the pre-paste value (identity replacement).
+    Verified,
+    /// A strict full-range read of the same retained field proved the exact
+    /// post-insert text and expected collapsed caret. Used after an AXValue
+    /// representation mismatch (including collapsed-caret insertions) and as
+    /// the only proof for identity replacement.
+    VerifiedFullRange,
+    /// The keyboard shortcut was invoked, but its dispatch result was not
+    /// enough to establish whether the target received it.
+    ShortcutOutcomeUnknown,
+    /// AX did not provide enough starting value/selection data to construct an
+    /// exact expected splice before the keyboard shortcut.
+    ExpectedSpliceUnavailable,
+    /// The target could not be confirmed as unchanged at readback. A failed
+    /// accessibility read is not proof that the app actually changed.
+    TargetUnconfirmed,
+    /// The focused field could not be confirmed as unchanged at readback. A
+    /// failed accessibility read is not proof that focus actually changed.
+    FocusedFieldUnconfirmed,
+    /// The same focused field could not provide a value for readback.
+    ReadbackUnavailable,
+    /// A value was available at the readback check, but did not match the
+    /// expected splice. This does not establish whether a later edit arrived.
+    ReadbackMismatch,
+}
+
+impl PasteVerificationFact {
+    pub(crate) const fn is_unverified_attempt(self) -> bool {
+        !matches!(
+            self,
+            Self::NotAttempted | Self::Verified | Self::VerifiedFullRange
+        )
+    }
+
+    pub(crate) const fn diagnostic_copy(self) -> (&'static str, &'static str) {
+        match self {
+            Self::NotAttempted => (
+                "paste_not_attempted",
+                "未尝试自动粘贴，听写结果保存在历史记录中",
+            ),
+            Self::Verified => (
+                "paste_verified",
+                "自动粘贴已通过输入框读回确认",
+            ),
+            Self::VerifiedFullRange => (
+                "paste_verified_full_range",
+                "自动粘贴已通过输入框完整范围读回确认",
+            ),
+            Self::ShortcutOutcomeUnknown => (
+                "paste_shortcut_outcome_unknown",
+                "已尝试触发粘贴，但系统未返回可确认结果；请检查输入框和历史记录，未重复粘贴",
+            ),
+            Self::ExpectedSpliceUnavailable => (
+                "paste_expected_splice_unavailable",
+                "已尝试粘贴，但无法构造输入框核对结果；请检查输入框和历史记录，未重复粘贴",
+            ),
+            Self::TargetUnconfirmed => (
+                "paste_target_unconfirmed_after_attempt",
+                "已尝试粘贴，但无法确认目标应用在回读时的状态；请检查输入框和历史记录，未重复粘贴",
+            ),
+            Self::FocusedFieldUnconfirmed => (
+                "paste_focus_unconfirmed_after_attempt",
+                "已尝试粘贴，但无法确认输入框焦点在回读时的状态；请检查输入框和历史记录，未重复粘贴",
+            ),
+            Self::ReadbackUnavailable => (
+                "paste_readback_unavailable",
+                "已尝试粘贴，但无法读取输入框结果；请检查输入框和历史记录，未重复粘贴",
+            ),
+            Self::ReadbackMismatch => (
+                "paste_readback_mismatch",
+                "已尝试粘贴，但本次输入框读回结果与预期不同；请检查输入框和历史记录，未重复粘贴",
+            ),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct DeliveryDiagnostic {
     pub(crate) code: &'static str,
@@ -27,8 +110,64 @@ pub(crate) struct DeliveryDiagnostic {
     pub(crate) keyboard_paste_attempted: bool,
     pub(crate) keyboard_paste_may_have_been_posted: bool,
     pub(crate) paste_verified: Option<bool>,
+    pub(crate) paste_verification: Option<PasteVerificationFact>,
+    /// The fixed delay before the single post-shortcut AX readback, when it
+    /// was reached. This is metadata only; no target value is persisted.
+    pub(crate) paste_verification_delay_ms: Option<u64>,
+    /// Bounded, content-free facts for investigating readback timing and AX
+    /// representation differences. These fields never contain target text.
+    pub(crate) paste_readback_poll_count: Option<u8>,
+    pub(crate) paste_readback_elapsed_ms: Option<u64>,
+    pub(crate) paste_expected_utf16_length: Option<u32>,
+    pub(crate) paste_actual_utf16_length: Option<u32>,
+    pub(crate) paste_readback_mismatch_kind: Option<&'static str>,
+    pub(crate) paste_full_range_attempted: bool,
     pub(crate) clipboard_restore_attempted: bool,
     pub(crate) clipboard_restored: Option<bool>,
+}
+
+impl DeliveryDiagnostic {
+    pub(crate) fn keyboard_paste_is_unverified(&self) -> bool {
+        match self.paste_verification {
+            Some(PasteVerificationFact::Verified | PasteVerificationFact::VerifiedFullRange) => {
+                !self.keyboard_paste_may_have_been_posted || self.paste_verified != Some(true)
+            }
+            Some(PasteVerificationFact::NotAttempted) => {
+                self.keyboard_paste_attempted
+                    || self.keyboard_paste_may_have_been_posted
+                    || self.paste_verified.is_some()
+            }
+            Some(fact) => fact.is_unverified_attempt(),
+            None => {
+                self.keyboard_paste_attempted
+                    || self.keyboard_paste_may_have_been_posted
+                    || self.paste_verified == Some(false)
+            }
+        }
+    }
+
+    /// Report only a destination that the producing paste owner has already
+    /// proven safe. An unverified shortcut is never downgraded to clipboard.
+    pub(crate) fn fallback_delivery_method(&self) -> &'static str {
+        if self.keyboard_paste_is_unverified() {
+            "paste_unverified"
+        } else if self.clipboard_write_owned == Some(true) {
+            "clipboard"
+        } else {
+            "history"
+        }
+    }
+
+    /// A canceled generation does not surface a copy-only completion. Preserve
+    /// the unverified paste fact in History when the keyboard attempt may have
+    /// reached the target; otherwise History remains the cancellation record.
+    pub(crate) fn cancelled_delivery_method(&self) -> &'static str {
+        if self.keyboard_paste_is_unverified() {
+            "paste_unverified"
+        } else {
+            "history"
+        }
+    }
 }
 
 #[derive(Serialize)]

@@ -2,6 +2,7 @@ import { Children, Fragment, isValidElement, useEffect, useId, useState, type Co
 import * as Primitive from "@radix-ui/react-select";
 import { Check, ChevronDown, ChevronUp } from "lucide-react";
 import { useI18n } from "../lib/i18n";
+import { useControlDescription } from "../lib/controlDescription";
 
 type Option = { value: string; label: ReactNode; text: string; disabled: boolean; group?: string };
 type SelectProps = Omit<ComponentPropsWithoutRef<"button">, "value" | "defaultValue" | "onChange" | "children" | "name"> & {
@@ -39,6 +40,7 @@ function optionsOf(children: ReactNode, group?: string): Option[] {
 /** Shared accessible select. Option children describe data, never a second visible control. */
 export function Select({ value, defaultValue, onValueChange, children, name, required, disabled, className = "", ref, onKeyDown, onPointerDown, ...props }: SelectProps) {
   const { t } = useI18n();
+  const description = useControlDescription(props["aria-describedby"]);
   const id = useId();
   const emptyValue = `__vf_empty_${id}`;
   const options = optionsOf(children);
@@ -58,7 +60,7 @@ export function Select({ value, defaultValue, onValueChange, children, name, req
       onValueChange?.(logicalValue);
     }}
   >
-    <Primitive.Trigger {...props} ref={ref} value={currentValue} className={`vf-select-trigger ${className}`}
+    <Primitive.Trigger {...props} aria-describedby={description} ref={ref} value={currentValue} className={`vf-select-trigger ${className}`}
       onKeyDown={(event) => { onKeyDown?.(event); setKeyboard(true); }}
       onPointerDown={(event) => { onPointerDown?.(event); setKeyboard(false); }}>
       <span className="vf-select-value"><Primitive.Value>{selected?.label ?? t("请选择")}</Primitive.Value></span>

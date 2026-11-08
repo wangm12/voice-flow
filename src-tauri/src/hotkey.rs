@@ -183,7 +183,7 @@ pub fn register_cancel(app: &AppHandle) {
             if !is_suspended() && event.state == ShortcutState::Pressed {
                 crate::modifier_hotkey::reset_state();
                 reset_pressed_state();
-                crate::dictation::interrupt_hotkeys();
+                crate::dictation::enqueue_full_cancel();
             }
         }) {
             CANCEL_REGISTERED.store(false, Ordering::SeqCst);
@@ -305,7 +305,7 @@ pub async fn apply_settings_hotkey(
     }
     // Note: we deliberately do NOT re-register the Escape cancel shortcut here.
     // Escape is only registered while a recording is active (see
-    // `register_cancel` callers in start_internal), so applying settings while
+    // `register_cancel` callers in the dictation entry path), so applying settings while
     // idle must leave Escape unregistered.
     Ok(())
 }

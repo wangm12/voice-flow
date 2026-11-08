@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
 import { getEnglishTranslationKeys } from "./i18n";
+import { deliveryReasonHudLabels, deliveryReasonLabels } from "./deliveryCopy";
+import { cleanupCandidateLabels, cleanupGuardReasonLabels } from "./cleanupRejection";
+import { providerLabelSources } from "./providers";
 
 const productionSources = import.meta.glob("../**/*.{ts,tsx}", {
   query: "?raw",
@@ -26,6 +29,28 @@ describe("i18n english coverage", () => {
       for (const key of extractLiteralTranslationKeys(content)) {
         if (!englishKeys.has(key)) missing.push(`${key} (${path})`);
       }
+    }
+
+    expect(missing).toEqual([]);
+  });
+
+  it("includes English entries for every exported delivery, cleanup, and provider label", () => {
+    const englishKeys = getEnglishTranslationKeys();
+    const labelMaps: ReadonlyArray<Readonly<Record<string, string>>> = [
+      deliveryReasonLabels,
+      deliveryReasonHudLabels,
+      cleanupGuardReasonLabels,
+      cleanupCandidateLabels,
+    ];
+    const missing: string[] = [];
+
+    for (const labels of labelMaps) {
+      for (const label of Object.values(labels)) {
+        if (/[\u4e00-\u9fff]/.test(label) && !englishKeys.has(label)) missing.push(label);
+      }
+    }
+    for (const label of providerLabelSources) {
+      if (/[\u4e00-\u9fff]/.test(label) && !englishKeys.has(label)) missing.push(label);
     }
 
     expect(missing).toEqual([]);

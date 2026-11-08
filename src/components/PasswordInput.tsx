@@ -39,13 +39,13 @@ export function PasswordInput({ value, onChange, id, ariaLabel, placeholder, cla
         data-valid={valid || undefined}
         className={`${inputClass} w-full pr-10 ${monospace ? "font-mono tracking-tight" : ""}` }
       />
-      <IconButton
+      {!plain && <IconButton
         size="sm"
         label={visible ? t("隐藏 API Key") : t("显示 API Key")}
         icon={visible ? <EyeOff {...iconPropsSm} /> : <Eye {...iconPropsSm} />}
         onClick={() => setVisible((current) => !current)}
         className="absolute right-1 top-1/2 z-10 -translate-y-1/2"
-      />
+      />}
     </div>
   );
 }

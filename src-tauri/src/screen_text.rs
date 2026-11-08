@@ -1136,8 +1136,10 @@ mod tests {
             bundle_id: Some("com.example.Editor".into()),
             browser_host: None,
             browser_target_token: None,
+            browser_tab_token: None,
             window_token: Some(8),
             window_id: Some(8),
+            window_identity_ambiguous: false,
             input_token: Some(9),
             secure_input: false,
         };
@@ -1335,8 +1337,10 @@ mod tests {
             bundle_id: Some("com.example.a".into()),
             browser_host: None,
             browser_target_token: None,
+            browser_tab_token: None,
             window_token: Some(1),
             window_id: Some(1),
+            window_identity_ambiguous: false,
             input_token: Some(1),
             secure_input: false,
         };
@@ -1385,8 +1389,10 @@ mod tests {
             bundle_id: Some(bundle.into()),
             browser_host: host.map(str::to_owned),
             browser_target_token: None,
+            browser_tab_token: None,
             window_token: Some(1),
             window_id: Some(1),
+            window_identity_ambiguous: false,
             input_token: Some(1),
             secure_input: false,
         }

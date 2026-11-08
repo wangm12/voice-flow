@@ -342,6 +342,15 @@ fn apply_lexicon_replacements_with_usage(
     pairs: &[LexiconPair],
     blocking: &[String],
 ) -> (String, Vec<String>) {
+    let (output, applied_terms, _) = apply_lexicon_replacements_with_facts(text, pairs, blocking);
+    (output, applied_terms)
+}
+
+fn apply_lexicon_replacements_with_facts(
+    text: &str,
+    pairs: &[LexiconPair],
+    blocking: &[String],
+) -> (String, Vec<String>, Vec<LexiconPair>) {
     let mut rules: Vec<&LexiconPair> = pairs
         .iter()
         .filter(|pair| !pair.before.is_empty() && pair.before != pair.after)
@@ -365,13 +374,34 @@ fn apply_lexicon_replacements_with_usage(
     }
 
     let chars: Vec<char> = text.chars().collect();
+    let byte_offsets = text
+        .char_indices()
+        .map(|(offset, _)| offset)
+        .chain(std::iter::once(text.len()))
+        .collect::<Vec<_>>();
+    let mut protected_ranges = crate::spoken_revision::literal_ranges(text);
+    protected_ranges.sort_by_key(|range| range.start);
     let mut output = String::new();
     let mut applied_terms = std::collections::BTreeSet::new();
+    let mut applied_pairs = Vec::new();
     let mut index = 0;
     while index < chars.len() {
         let mut matched: Option<&LexiconPair> = None;
         for rule in &rules {
             let needle: Vec<char> = rule.before.chars().collect();
+            let Some(byte_start) = byte_offsets.get(index).copied() else {
+                continue;
+            };
+            let Some(byte_end) = byte_offsets.get(index + needle.len()).copied() else {
+                continue;
+            };
+            if protected_ranges
+                .iter()
+                .any(|range| byte_start < range.end && range.start < byte_end)
+                || text[byte_start..byte_end].contains(['\n', '\r'])
+            {
+                continue;
+            }
             if !region_matches(&chars, index, &needle) {
                 continue;
             }
@@ -390,21 +420,35 @@ fn apply_lexicon_replacements_with_usage(
         if let Some(rule) = matched {
             output.push_str(&rule.after);
             applied_terms.insert(rule.after.clone());
+            if !applied_pairs.iter().any(|applied: &LexiconPair| {
+                applied.before == rule.before && applied.after == rule.after
+            }) {
+                applied_pairs.push((*rule).clone());
+            }
             index += rule.before.chars().count();
         } else {
             output.push(chars[index]);
             index += 1;
         }
     }
-    (output, applied_terms.into_iter().collect())
+    (output, applied_terms.into_iter().collect(), applied_pairs)
+}
+
+pub(crate) fn pair_is_replaceable(row: &LearnPairRecord, dictionary_contains_after: bool) -> bool {
+    row.is_live_promoted()
+        && (dictionary_contains_after || row.manual_scoped || row.auto_scoped)
+        && !row.before_surface.is_empty()
 }
 
 pub fn replaceable_pairs(pairs: &[LearnPairRecord], dictionary: &[String]) -> Vec<LexiconPair> {
-    let dict: HashSet<&str> = dictionary.iter().map(String::as_str).collect();
     pairs
         .iter()
-        .filter(|row| row.is_live_promoted() && dict.contains(row.after_surface.as_str()))
-        .filter(|row| !row.before_surface.is_empty())
+        .filter(|row| {
+            pair_is_replaceable(
+                row,
+                crate::store::dictionary_contains_word(dictionary, &row.after_surface),
+            )
+        })
         .map(|row| LexiconPair::new(&row.before_surface, &row.after_surface))
         .collect()
 }
@@ -418,15 +462,38 @@ pub fn apply_promoted_replacements(
     apply_promoted_replacements_with_usage(text, pairs, dictionary).0
 }
 
+#[cfg(test)]
 pub fn apply_promoted_replacements_with_usage(
     text: &str,
     pairs: &[LearnPairRecord],
     dictionary: &[String],
 ) -> (String, Vec<String>) {
     let replaceable = replaceable_pairs(pairs, dictionary);
-    let mut rules = replaceable.clone();
-    rules.extend(phonetic_replace_rules(text, &replaceable));
+    apply_explicit_replacements_with_usage(text, &replaceable, dictionary)
+}
+
+pub(crate) fn apply_explicit_replacements_with_usage(
+    text: &str,
+    pairs: &[LexiconPair],
+    dictionary: &[String],
+) -> (String, Vec<String>) {
+    let mut rules = pairs.to_vec();
+    for slice in nonliteral_line_slices(text) {
+        rules.extend(phonetic_replace_rules(slice, pairs));
+    }
     apply_lexicon_replacements_with_usage(text, &rules, dictionary)
+}
+
+pub(crate) fn apply_explicit_replacements_with_facts(
+    text: &str,
+    pairs: &[LexiconPair],
+    dictionary: &[String],
+) -> (String, Vec<String>, Vec<LexiconPair>) {
+    let mut rules = pairs.to_vec();
+    for slice in nonliteral_line_slices(text) {
+        rules.extend(phonetic_replace_rules(slice, pairs));
+    }
+    apply_lexicon_replacements_with_facts(text, &rules, dictionary)
 }
 
 /// Explicitly enabled fuzzy matching cannot cross protected text or layout boundaries.
@@ -435,22 +502,11 @@ pub fn apply_ascii_fuzzy_dictionary(text: &str, dictionary: &[String]) -> String
         .into_iter()
         .map(|span| (span.start_byte, span.end_byte))
         .collect();
-    // Inline/fenced code and unfinished code delimiters are never fuzzy prose.
-    let mut cursor = 0;
-    while let Some(offset) = text[cursor..].find('`') {
-        let start = cursor + offset;
-        let count = text[start..]
-            .bytes()
-            .take_while(|byte| *byte == b'`')
-            .count();
-        let content = start + count;
-        let end = text[content..]
-            .find(&text[start..content])
-            .map(|offset| content + offset + count)
-            .unwrap_or(text.len());
-        protected.push((start, end));
-        cursor = end;
-    }
+    protected.extend(
+        crate::spoken_revision::literal_ranges(text)
+            .into_iter()
+            .map(|range| (range.start, range.end)),
+    );
     protected.sort_unstable();
     let mut merged: Vec<(usize, usize)> = Vec::new();
     for (start, end) in protected {
@@ -773,17 +829,19 @@ fn soundex_digit(ch: char) -> u8 {
 }
 
 pub fn hit_pairs(text: &str, pairs: &[LexiconPair], blocking: &[String]) -> Vec<LexiconPair> {
+    let searchable = nonliteral_line_slices(text);
     let mut hits = Vec::new();
     let mut chars = 0usize;
     for pair in pairs {
         if pair.before.is_empty() {
             continue;
         }
-        if !independent_surface(text, &pair.before, pairs, blocking)
-            && !independent_surface(text, &pair.after, pairs, blocking)
-            && !phonetic_surface_hit(text, pair, pairs)
-            && !latin_fuzzy_hit(text, pair)
-        {
+        if !searchable.iter().any(|slice| {
+            independent_surface(slice, &pair.before, pairs, blocking)
+                || independent_surface(slice, &pair.after, pairs, blocking)
+                || phonetic_surface_hit(slice, pair, pairs)
+                || latin_fuzzy_hit(slice, pair)
+        }) {
             continue;
         }
         let rendered = format!("{}→{}", pair.before, pair.after);
@@ -857,15 +915,11 @@ pub fn collect_ranked_terms(
     pairs: &[LearnPairRecord],
     scope: Option<&PromptScope>,
 ) -> Vec<RankedTerm> {
-    let mut seen = HashSet::new();
     let mut terms = Vec::new();
     let scope = scope.cloned().unwrap_or_default();
 
     for row in pairs.iter().filter(|row| row.is_live_promoted()) {
-        if !dictionary.iter().any(|word| word == &row.after_surface) {
-            continue;
-        }
-        if !seen.insert(row.after_surface.clone()) {
+        if !crate::store::dictionary_contains_word(dictionary, &row.after_surface) {
             continue;
         }
         terms.push(RankedTerm {
@@ -882,11 +936,16 @@ pub fn collect_ranked_terms(
         .map(|item| item.trim())
         .filter(|item| !item.is_empty())
     {
-        if !seen.insert(word.to_owned()) {
+        if terms
+            .iter()
+            .any(|term: &RankedTerm| crate::store::dictionary_words_equal(&term.term, word))
+        {
             continue;
         }
         let row = pairs.iter().find(|item| {
-            item.after_surface == word && item.before_surface.is_empty() && item.is_live_promoted()
+            crate::store::dictionary_words_equal(&item.after_surface, word)
+                && item.before_surface.is_empty()
+                && item.is_live_promoted()
         });
         terms.push(RankedTerm {
             term: word.to_owned(),
@@ -905,6 +964,15 @@ pub fn collect_ranked_terms(
             .then(right.last_used_at.cmp(&left.last_used_at))
             .then(right.hits.cmp(&left.hits))
             .then(left.term.cmp(&right.term))
+    });
+    let mut seen = Vec::new();
+    terms.retain(|term| {
+        if crate::store::dictionary_contains_word(&seen, &term.term) {
+            false
+        } else {
+            seen.push(term.term.clone());
+            true
+        }
     });
     terms
 }
@@ -1114,6 +1182,7 @@ fn fit_woven_prompt(mut terms: Vec<String>, shape: AsrPromptShape) -> Option<Str
             while !terms.is_empty() {
                 let woven = weave_whisper_transcript(&terms);
                 if estimate_prompt_tokens(&woven) <= MAX_ASR_PROMPT_TOKENS {
+                    crate::learning_research::usage(&terms, true);
                     return Some(woven);
                 }
                 terms.remove(0);
@@ -1128,6 +1197,7 @@ fn fit_woven_prompt(mut terms: Vec<String>, shape: AsrPromptShape) -> Option<Str
             while !terms.is_empty() {
                 let woven = terms.join(" ");
                 if estimate_prompt_tokens(&woven) <= MAX_ASR_PROMPT_TOKENS {
+                    crate::learning_research::usage(&terms, true);
                     return Some(woven);
                 }
                 terms.remove(0);
@@ -1162,16 +1232,54 @@ fn weave_whisper_transcript(terms: &[String]) -> String {
     format!("{body}{ASR_NO_TRANSLATE}")
 }
 
-pub fn used_pair_keys(text: &str, pairs: &[LearnPairRecord]) -> Vec<String> {
+pub fn used_pair_keys(applied_pairs: &[LexiconPair], pairs: &[LearnPairRecord]) -> Vec<String> {
     pairs
         .iter()
         .filter(|row| row.is_live_promoted())
         .filter(|row| {
-            (!row.before_surface.is_empty() && text.contains(&row.before_surface))
-                || text.contains(&row.after_surface)
+            applied_pairs.iter().any(|applied| {
+                applied.before == row.before_surface && applied.after == row.after_surface
+            })
         })
         .map(|row| row.pair_key.clone())
         .collect()
+}
+
+fn nonliteral_line_slices(text: &str) -> Vec<&str> {
+    let mut literals = crate::spoken_revision::literal_ranges(text);
+    literals.sort_by_key(|range| range.start);
+    let mut slices = Vec::new();
+    let mut line_start = 0;
+    for line in text.split_inclusive('\n') {
+        let line_end = line_start + line.len();
+        let mut content_end = line_end;
+        while content_end > line_start {
+            if matches!(text.as_bytes()[content_end - 1], b'\n' | b'\r') {
+                content_end -= 1;
+            } else {
+                break;
+            }
+        }
+        let mut cursor = line_start;
+        for literal in literals
+            .iter()
+            .filter(|range| range.start < content_end && line_start < range.end)
+        {
+            let literal_start = literal.start.max(line_start).min(content_end);
+            if cursor < literal_start {
+                slices.push(&text[cursor..literal_start]);
+            }
+            cursor = literal.end.max(cursor).min(content_end);
+        }
+        if cursor < content_end {
+            slices.push(&text[cursor..content_end]);
+        }
+        line_start = line_end;
+    }
+    if text.is_empty() {
+        slices.push(text);
+    }
+    slices
 }
 
 fn independent_surface(
@@ -1510,6 +1618,8 @@ mod tests {
             tombstoned_at: None,
             ignored: false,
             promote_hits: 0,
+            manual_scoped: false,
+            auto_scoped: false,
         }
     }
 
@@ -1656,6 +1766,45 @@ mod tests {
     }
 
     #[test]
+    fn ascii_case_membership_preserves_rule_surface_and_ranks_before_deduplication() {
+        let mut older = live_pair("VoiceFlo", "VoiceFlow", "general", 100);
+        older.last_used_at = Some("2026-01-01".into());
+        let mut pinned = live_pair("VoiceFlo beta", "voiceflow", "general", 1);
+        pinned.pinned = true;
+        pinned.last_used_at = Some("2026-01-02".into());
+        let pairs = vec![older, pinned];
+        let dictionary = vec!["VOICEFLOW".into()];
+
+        let replacements = replaceable_pairs(&pairs, &dictionary);
+        assert_eq!(replacements[0].after, "VoiceFlow");
+        assert_eq!(replacements[1].after, "voiceflow");
+        assert_eq!(
+            apply_promoted_replacements("VoiceFlo", &pairs, &dictionary),
+            "VoiceFlow"
+        );
+
+        let ranked = collect_ranked_terms(&dictionary, &pairs, None);
+        assert_eq!(ranked.len(), 1);
+        assert_eq!(ranked[0].term, "voiceflow");
+        assert!(ranked[0].pinned);
+
+        let mut screen_term = live_pair("", "voiceflow", "general", 1);
+        screen_term.pinned = true;
+        screen_term.last_used_at = Some("2026-02-01".into());
+        let with_screen_term = collect_ranked_terms(
+            &dictionary,
+            &[pairs[0].clone(), pairs[1].clone(), screen_term],
+            None,
+        );
+        assert_eq!(with_screen_term.len(), 1);
+        assert!(with_screen_term[0].pinned);
+        assert_eq!(
+            with_screen_term[0].last_used_at.as_deref(),
+            Some("2026-02-01")
+        );
+    }
+
+    #[test]
     fn prefers_the_longest_before() {
         let pairs = [
             LexiconPair::new("type", "kind"),
@@ -1779,6 +1928,29 @@ mod tests {
     fn hit_pairs_skip_a_shorter_term_embedded_in_a_dictionary_word() {
         let pairs = [LexiconPair::new("链接", "link")];
         assert!(hit_pairs("点击超链接", &pairs, &["超链接".into()]).is_empty());
+    }
+
+    #[test]
+    fn exact_pair_replacement_hits_and_usage_skip_quoted_and_code_literals() {
+        let pair = LexiconPair::new("LOM", "LLM");
+        let source = "LOM `LOM` \"LOM\"\nLOM";
+        let (output, terms, applied) =
+            apply_explicit_replacements_with_facts(source, std::slice::from_ref(&pair), &[]);
+        assert_eq!(output, "LLM `LOM` \"LOM\"\nLLM");
+        assert_eq!(terms, vec!["LLM"]);
+        assert_eq!(applied, vec![pair.clone()]);
+        assert_eq!(
+            hit_pairs(source, std::slice::from_ref(&pair), &[]),
+            vec![pair.clone()]
+        );
+
+        let literal_only = "`LOM` and \"LOM\"";
+        let (unchanged, terms, applied) =
+            apply_explicit_replacements_with_facts(literal_only, std::slice::from_ref(&pair), &[]);
+        assert_eq!(unchanged, literal_only);
+        assert!(terms.is_empty());
+        assert!(applied.is_empty());
+        assert!(hit_pairs(literal_only, &[pair], &[]).is_empty());
     }
 
     #[test]
@@ -2414,6 +2586,25 @@ mod fuzzy_regressions {
                 input,
                 "{input}"
             );
+        }
+    }
+
+    #[test]
+    fn fuzzy_dictionary_uses_shared_quote_and_fence_literals() {
+        let dictionary = vec!["TypeScript".into()];
+        let input = "type script \"type script\"\n~~~text\ntype script\n~~~\ntype script";
+        assert_eq!(
+            apply_ascii_fuzzy_dictionary(input, &dictionary),
+            "TypeScript \"type script\"\n~~~text\ntype script\n~~~\nTypeScript"
+        );
+    }
+
+    #[test]
+    fn explicit_pair_slicing_is_safe_for_multibyte_line_endings() {
+        let pairs = vec![LexiconPair::new("demo", "Demo")];
+        for input in ["中文。", "日本語です。", "你好，世界！"] {
+            let (output, _, _) = apply_explicit_replacements_with_facts(input, &pairs, &[]);
+            assert_eq!(output, input);
         }
     }
 }

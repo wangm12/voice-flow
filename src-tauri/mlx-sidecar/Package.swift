@@ -17,6 +17,14 @@ let package = Package(
             url: "https://github.com/ml-explore/mlx-swift.git",
             exact: "0.31.4"
         ),
+        .package(
+            url: "https://github.com/ml-explore/mlx-swift-lm.git",
+            exact: "3.31.4"
+        ),
+        .package(
+            url: "https://github.com/huggingface/swift-transformers.git",
+            exact: "1.3.4"
+        ),
     ],
     targets: [
         .target(
@@ -24,6 +32,11 @@ let package = Package(
             dependencies: [
                 .product(name: "MLXAudioSTT", package: "mlx-audio-swift"),
                 .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXNN", package: "mlx-swift"),
+                .product(name: "MLXLLM", package: "mlx-swift-lm"),
+                .product(name: "MLXLMCommon", package: "mlx-swift-lm"),
+                .product(name: "MLXHuggingFace", package: "mlx-swift-lm"),
+                .product(name: "Tokenizers", package: "swift-transformers"),
             ],
             path: "Sources/VoiceFlowMLXSidecarCore"
         ),
@@ -31,6 +44,16 @@ let package = Package(
             name: "VoiceFlowMLXSidecar",
             dependencies: ["VoiceFlowMLXSidecarCore"],
             path: "Sources/VoiceFlowMLXSidecar"
+        ),
+        .testTarget(
+            name: "VoiceFlowMLXSidecarCoreTests",
+            dependencies: [
+                "VoiceFlowMLXSidecarCore",
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXNN", package: "mlx-swift"),
+                .product(name: "MLXLMCommon", package: "mlx-swift-lm"),
+            ],
+            path: "Tests/VoiceFlowMLXSidecarCoreTests"
         ),
     ]
 )

@@ -95,9 +95,10 @@ access again. Later updates that use this same certificate should keep it.
 To let GitHub Actions sign releases with this same identity:
 
   gh secret set MACOS_CERT_P12 < ${OUT_DIR}/VoiceFlow.p12.base64
-  gh secret set MACOS_CERT_PASSWORD --body '${p12_password}'
+  gh secret set MACOS_CERT_PASSWORD < ${OUT_DIR}/password.txt
 
 That password is also written to ${OUT_DIR}/password.txt. Without those two
-secrets, CI builds an unsigned DMG and permissions will reset on each GitHub
-update.
+secrets, CI requires VOICEFLOW_ALLOW_UNSIGNED=1 to build an unsigned DMG; that
+artifact is named VoiceFlow-unsigned.dmg and permissions will reset on each
+GitHub update.
 EOF

@@ -246,6 +246,8 @@ export default function Demo({ locale }: { locale: Locale }) {
             )}
             running={playback.running}
             reducedMotion={playback.reducedMotion}
+            elapsedMs={Math.max(0, playback.elapsed - demoTiming.listening)}
+            locale={locale}
           />
           <p className="phase-label" aria-live="off">
             {playback.paused && !playback.reducedMotion

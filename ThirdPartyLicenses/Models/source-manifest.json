@@ -1,0 +1,232 @@
+{
+  "artifact_type": "voiceflow-fixed-model-notice-source-manifest",
+  "distribution_boundary": {
+    "download_import_notice_materialization_added": false,
+    "notice_scope": "App resource notice and source text only; no claim of legal clearance or permission for future weight redistribution.",
+    "weights_bundled_in_reviewed_app": false
+  },
+  "included_license_assets": [
+    {
+      "bytes": 11343,
+      "output_path": "ThirdPartyLicenses/Models/Qwen3-ASR-0.6B/Qwen3-ASR-code-LICENSE-reference.txt",
+      "review_raw_path": "raw/qwen-asr-code-LICENSE",
+      "scope": "code-reference-only",
+      "sha256": "a44a6081c73ad75f0255bb2bb5cab74ef1829565a895a24e53a4f11290ab7655"
+    },
+    {
+      "bytes": 11358,
+      "output_path": "ThirdPartyLicenses/Models/Qwen3-ASR-0.6B/Apache-2.0-canonical-reference.txt",
+      "review_raw_path": "raw/Apache-2.0-official-reference.txt",
+      "scope": "canonical-terms-reference",
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+    },
+    {
+      "bytes": 11544,
+      "output_path": "ThirdPartyLicenses/Models/Qwen3.8-27B/Qwen3.8-27B-base-LICENSE.txt",
+      "review_raw_path": "raw/cleanup-base-LICENSE",
+      "scope": "exact-base-model-license",
+      "sha256": "bbedc3fda3305820b977265f01b8619d87570a6739de3a5582c3464840f1e57a"
+    }
+  ],
+  "models": [
+    {
+      "converter_input_base_commit": null,
+      "converter_revision": "eae2b51f96265328f1e7beced788adb0e4536f92",
+      "declared_base": "Qwen/Qwen3-ASR-0.6B",
+      "included_files": [
+        {
+          "bytes": 11343,
+          "output_path": "ThirdPartyLicenses/Models/Qwen3-ASR-0.6B/Qwen3-ASR-code-LICENSE-reference.txt",
+          "review_raw_path": "raw/qwen-asr-code-LICENSE",
+          "scope": "code-reference-only",
+          "sha256": "a44a6081c73ad75f0255bb2bb5cab74ef1829565a895a24e53a4f11290ab7655"
+        },
+        {
+          "bytes": 11358,
+          "output_path": "ThirdPartyLicenses/Models/Qwen3-ASR-0.6B/Apache-2.0-canonical-reference.txt",
+          "review_raw_path": "raw/Apache-2.0-official-reference.txt",
+          "scope": "canonical-terms-reference",
+          "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+        }
+      ],
+      "model_id": "mlx-community/Qwen3-ASR-0.6B-bf16",
+      "model_repository_license_status": "no full LICENSE or NOTICE listed in reviewed snapshot; base LICENSE request returned 404",
+      "observed_base_snapshot": "5eb144179a02acc5e5ba31e748d22b0cf3e303b0",
+      "publisher_license_expression": "Apache-2.0"
+    },
+    {
+      "converter_input_base_commit": null,
+      "converter_revision": "05f38c1f39e2f39619653616fe8e96a5d676358e",
+      "declared_base": "Qwen/Qwen3.8-27B",
+      "included_files": [
+        {
+          "bytes": 11544,
+          "output_path": "ThirdPartyLicenses/Models/Qwen3.8-27B/Qwen3.8-27B-base-LICENSE.txt",
+          "review_raw_path": "raw/cleanup-base-LICENSE",
+          "scope": "exact-base-model-license",
+          "sha256": "bbedc3fda3305820b977265f01b8619d87570a6739de3a5582c3464840f1e57a"
+        }
+      ],
+      "model_id": "lmstudio-community/Qwen3.8-27B-MLX-6bit",
+      "model_repository_license_status": "full LICENSE copied from exact reviewed base snapshot; no NOTICE listed in examined snapshots",
+      "observed_base_snapshot": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
+      "publisher_license_expression": "Apache-2.0"
+    },
+    {
+      "converter_input_base_commit": null,
+      "converter_revision": "e1f6c266914abc5a46e8756e02580f834a6cf8a7",
+      "declared_base": null,
+      "included_files": [
+        {
+          "bytes": 2734,
+          "output_path": "ThirdPartyLicenses/Models/Qwen3-ASR-1.7B/NOTICE.md",
+          "scope": "unreviewed-notice; authored metadata attribution only",
+          "sha256": "19f87f9ffb57560cf4fe81d7a2b798eb493ad67f1f478be88960646b12b76f08"
+        }
+      ],
+      "model_id": "mlx-community/Qwen3-ASR-1.7B-bf16",
+      "model_repository_license_status": "UNREVIEWED / 许可未审查; converted artifact, converter, full LICENSE and NOTICE unknown",
+      "observed_base_snapshot": "7278e1e70fe206f11671096ffdd38061171dd6e5",
+      "publisher_license_expression": "Apache-2.0"
+    },
+    {
+      "converter_input_base_commit": null,
+      "converter_revision": "06bbe0d853a93cbbf7c1f40cffccd4c5481459ef",
+      "declared_base": null,
+      "included_files": [
+        {
+          "bytes": 2809,
+          "output_path": "ThirdPartyLicenses/Models/Cohere-Transcribe-2B/NOTICE.md",
+          "scope": "unreviewed-notice; authored metadata attribution only",
+          "sha256": "028e2fe51014972a1cd9a7090282a9232e0177c4bf09ae290d20cdcc3aca6c39"
+        }
+      ],
+      "model_id": "beshkenadze/cohere-transcribe-03-2026-mlx-fp16",
+      "model_repository_license_status": "UNREVIEWED / 许可未审查; converted artifact, converter, full LICENSE and NOTICE unknown",
+      "observed_base_snapshot": "d552dadc2922ba6f6c1f994f8db904d52dcaf942",
+      "publisher_license_expression": "Apache-2.0"
+    }
+  ],
+  "review_evidence": {
+    "independent_review_sha256": "37f639c95a0c9847f36497617cad101271786a33d568f6c6a3313d04005873a2",
+    "machine_review_sha256": "7e4584d2037702433e274064d58a9b7c1d5eeb7750d08366a207ec6c6c4ca1af",
+    "original_fetch_body_bytes": 213508,
+    "original_fetch_cap_bytes": 4194304,
+    "original_fetch_receipt_sha256": "96dcecef1bc364c6ff9c31f44e25d1a481395c1104456a1236742094794b3aa5",
+    "review_artifact_label": "distribution-model-license-review-v1",
+    "review_id": "distribution-model-license-review-v1",
+    "scope": "The distribution-model-license-review-v1 evidence covers only the original two model entries and their listed source_assets/included_license_assets; it does not review or clear the two added converted ASR artifacts."
+  },
+  "schema_version": 1,
+  "scope": "Four fixed user-selected local model artifacts are documented; original source-asset and review evidence applies only to the two original entries. New Qwen3-ASR 1.7B and Cohere Transcribe 2B entries are metadata-only notices with license status UNREVIEWED. No weights or model runtime code.",
+  "source_assets": [
+    {
+      "bytes": 1008,
+      "file": "asr-README.md",
+      "final_url": "https://huggingface.co/api/resolve-cache/models/mlx-community/Qwen3-ASR-0.6B-bf16/eae2b51f96265328f1e7beced788adb0e4536f92/README.md?%2Fmlx-community%2FQwen3-ASR-0.6B-bf16%2Fresolve%2Feae2b51f96265328f1e7beced788adb0e4536f92%2FREADME.md=&etag=%2264013275bfa76876e5387840ca40a926e798d697%22",
+      "http_status": 200,
+      "included_in_app_overlay": false,
+      "sha256": "653c4a6795f1e059c7f904a2989bc0e1a2227ec3856880e4d2e6af5a86e0e991",
+      "url": "https://huggingface.co/mlx-community/Qwen3-ASR-0.6B-bf16/resolve/eae2b51f96265328f1e7beced788adb0e4536f92/README.md"
+    },
+    {
+      "bytes": 57456,
+      "file": "asr-base-README.md",
+      "final_url": "https://huggingface.co/api/resolve-cache/models/Qwen/Qwen3-ASR-0.6B/5eb144179a02acc5e5ba31e748d22b0cf3e303b0/README.md?%2FQwen%2FQwen3-ASR-0.6B%2Fresolve%2F5eb144179a02acc5e5ba31e748d22b0cf3e303b0%2FREADME.md=&etag=%223a67d43f21febda213ff36efdb60ef10019af7f3%22",
+      "http_status": 200,
+      "included_in_app_overlay": false,
+      "sha256": "5058416891bc47a2051557765997e8c42f8eb78a0e33c3e775bd17d4b0ba4d50",
+      "url": "https://huggingface.co/Qwen/Qwen3-ASR-0.6B/resolve/5eb144179a02acc5e5ba31e748d22b0cf3e303b0/README.md"
+    },
+    {
+      "bytes": 15,
+      "file": "asr-base-LICENSE.http-body",
+      "final_url": "https://huggingface.co/Qwen/Qwen3-ASR-0.6B/resolve/5eb144179a02acc5e5ba31e748d22b0cf3e303b0/LICENSE",
+      "http_status": 404,
+      "included_in_app_overlay": false,
+      "sha256": "f36668ddf22403a332f978057d527cf285b01468bc3431b04094a7bafa6aba59",
+      "url": "https://huggingface.co/Qwen/Qwen3-ASR-0.6B/resolve/5eb144179a02acc5e5ba31e748d22b0cf3e303b0/LICENSE"
+    },
+    {
+      "bytes": 11343,
+      "file": "qwen-asr-code-LICENSE",
+      "final_url": "https://raw.githubusercontent.com/QwenLM/Qwen3-ASR/7c6daf77a2421100f5fb066495372c00129d39ff/LICENSE",
+      "http_status": 200,
+      "included_in_app_overlay": true,
+      "sha256": "a44a6081c73ad75f0255bb2bb5cab74ef1829565a895a24e53a4f11290ab7655",
+      "url": "https://raw.githubusercontent.com/QwenLM/Qwen3-ASR/7c6daf77a2421100f5fb066495372c00129d39ff/LICENSE"
+    },
+    {
+      "bytes": 11358,
+      "file": "Apache-2.0-official-reference.txt",
+      "final_url": "https://www.apache.org/licenses/LICENSE-2.0.txt",
+      "http_status": 200,
+      "included_in_app_overlay": true,
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+      "url": "https://www.apache.org/licenses/LICENSE-2.0.txt"
+    },
+    {
+      "bytes": 2187,
+      "file": "cleanup-README.md",
+      "final_url": "https://huggingface.co/api/resolve-cache/models/lmstudio-community/Qwen3.8-27B-MLX-6bit/05f38c1f39e2f39619653616fe8e96a5d676358e/README.md?%2Flmstudio-community%2FQwen3.8-27B-MLX-6bit%2Fresolve%2F05f38c1f39e2f39619653616fe8e96a5d676358e%2FREADME.md=&etag=%22e55a5019b0b035c19beed634cb313bbd4d5d04d9%22",
+      "http_status": 200,
+      "included_in_app_overlay": false,
+      "sha256": "4716cde8a3be84577fffb6aa15ce04498920fa516ab186e1281b0689b7ccd70a",
+      "url": "https://huggingface.co/lmstudio-community/Qwen3.8-27B-MLX-6bit/resolve/05f38c1f39e2f39619653616fe8e96a5d676358e/README.md"
+    },
+    {
+      "bytes": 65012,
+      "file": "cleanup-base-README.md",
+      "final_url": "https://huggingface.co/api/resolve-cache/models/Qwen/Qwen3.8-27B/1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0/README.md?%2FQwen%2FQwen3.8-27B%2Fresolve%2F1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0%2FREADME.md=&etag=%22bc8aa0e396cd029c21cd773cca21830d0ded28ec%22",
+      "http_status": 200,
+      "included_in_app_overlay": false,
+      "sha256": "57e4bdb258ee1a7d2635c5174ebd4e56abe392505cdb5f8bbb356b0dc4293641",
+      "url": "https://huggingface.co/Qwen/Qwen3.8-27B/resolve/1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0/README.md"
+    },
+    {
+      "bytes": 11544,
+      "file": "cleanup-base-LICENSE",
+      "final_url": "https://huggingface.co/api/resolve-cache/models/Qwen/Qwen3.8-27B/1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0/LICENSE?%2FQwen%2FQwen3.8-27B%2Fresolve%2F1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0%2FLICENSE=&etag=%22f938136e3adacfd92be087f6e113b5d6d97f678f%22",
+      "http_status": 200,
+      "included_in_app_overlay": true,
+      "sha256": "bbedc3fda3305820b977265f01b8619d87570a6739de3a5582c3464840f1e57a",
+      "url": "https://huggingface.co/Qwen/Qwen3.8-27B/resolve/1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0/LICENSE"
+    },
+    {
+      "bytes": 2543,
+      "file": "asr-model-metadata.json",
+      "final_url": "https://huggingface.co/api/models/mlx-community/Qwen3-ASR-0.6B-bf16/revision/eae2b51f96265328f1e7beced788adb0e4536f92",
+      "http_status": 200,
+      "included_in_app_overlay": false,
+      "sha256": "cc716c340eda14f1605868e3812975c0f0c82c889aa73def348f67aad34e29a8",
+      "url": "https://huggingface.co/api/models/mlx-community/Qwen3-ASR-0.6B-bf16/revision/eae2b51f96265328f1e7beced788adb0e4536f92"
+    },
+    {
+      "bytes": 20715,
+      "file": "cleanup-model-metadata.json",
+      "final_url": "https://huggingface.co/api/models/lmstudio-community/Qwen3.8-27B-MLX-6bit/revision/05f38c1f39e2f39619653616fe8e96a5d676358e",
+      "http_status": 200,
+      "included_in_app_overlay": false,
+      "sha256": "fe528ab2f2428f3ae101d7c506b0e3a17d73803bad67bc8c4028c00dfb74e696",
+      "url": "https://huggingface.co/api/models/lmstudio-community/Qwen3.8-27B-MLX-6bit/revision/05f38c1f39e2f39619653616fe8e96a5d676358e"
+    },
+    {
+      "bytes": 3419,
+      "file": "asr-base-model-metadata.json",
+      "final_url": "https://huggingface.co/api/models/Qwen/Qwen3-ASR-0.6B",
+      "http_status": 200,
+      "included_in_app_overlay": false,
+      "sha256": "b30a6af0aac62b01dcd6ac1a877182e4c1bedc081314f7c3d68a503fddfd88e9",
+      "url": "https://huggingface.co/api/models/Qwen/Qwen3-ASR-0.6B"
+    },
+    {
+      "bytes": 24084,
+      "file": "cleanup-base-model-metadata.json",
+      "final_url": "https://huggingface.co/api/models/Qwen/Qwen3.8-27B",
+      "http_status": 200,
+      "included_in_app_overlay": false,
+      "sha256": "02c36d3f98118487840a4df6af7fefc3981e483630ad7712b7ddcf5aba0d6d92",
+      "url": "https://huggingface.co/api/models/Qwen/Qwen3.8-27B"
+    }
+  ]
+}

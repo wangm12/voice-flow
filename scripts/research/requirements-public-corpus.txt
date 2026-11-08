@@ -1,0 +1,2 @@
+# Research-only private environment; no runtime product dependency.
+pyarrow==23.0.1

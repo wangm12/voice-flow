@@ -1,0 +1,18 @@
+{
+  "lease": {
+    "trial_id": "10000000-0000-4000-8000-000000000001",
+    "config_generation": "7"
+  },
+  "recording_generation": "8",
+  "trigger_source": "app_command",
+  "permissions": [true, true, false],
+  "target": null,
+  "trial_current": false,
+  "readback": "unknown",
+  "clipboard_restoration": "not_needed",
+  "capture_stage": "focused_element",
+  "capture_reason": "accessibility_observation_unknown",
+  "delivery_stage": "not_entered",
+  "reason": "target_unavailable",
+  "source": "product_same_field_ax_readback_not_independent_oracle"
+}

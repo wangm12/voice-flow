@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "description": "160 synthetic, de-identified cleanup references covering multilingual dictation, authorized spoken corrections, protected values, scene-aware Auto behavior, failure fallbacks, and user-authorized snippets. Expected values are review references after authorized local corrections; they are not claims about model output.",
+  "description": "161 synthetic, de-identified cleanup references covering multilingual dictation, authorized spoken corrections, protected values, scene-aware Auto behavior, failure fallbacks, and user-authorized snippets. Expected values are review references after authorized local corrections; they are not claims about model output.",
   "cases": [
     {
       "id": "en-shared-agenda",
@@ -859,6 +859,18 @@
       ],
       "notes": "Explicitly replace the earlier UI label.",
       "authorized_local_correction": true
+    },
+    {
+      "id": "zh-punctuation-edit-description",
+      "group": "punctuation",
+      "input": "把逗号换成分号",
+      "expected": "把逗号换成分号",
+      "cleanup": "light",
+      "family": "prompt_or_code",
+      "focus_kind": "chat",
+      "mode": "normal",
+      "protected": [],
+      "notes": "This describes an edit; punctuation names remain literal rather than becoming punctuation commands."
     },
     {
       "id": "neg-en-quoted-request",

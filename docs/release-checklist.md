@@ -1,8 +1,8 @@
 # VoiceFlow release checklist
 
-This is a preflight checklist. GitHub Actions (`.github/workflows/release.yml`) builds `VoiceFlow.dmg` and attaches it to the GitHub Release. A build is not shippable until every unchecked item has an owner and evidence.
+This is a preflight checklist. GitHub Actions (`.github/workflows/release.yml`) first runs the reusable four-job CI workflow; only a passing run can build and publish the release DMG. Tag releases must match `package.json`; manual releases must run from `main`, checked before signing secrets are imported. The asset and release notes reflect the signing identity and Team ID actually resolved: signed builds use `VoiceFlow.dmg`, explicit unsigned builds use `VoiceFlow-unsigned.dmg`, and duplicate asset uploads fail without replacing the existing file. The notes describe code signing only, not notarization. A build is not shippable until every unchecked item has an owner and evidence.
 
-Independent Astra runtime/E2E acceptance remains pending. Static gates, protocol code, saved credentials, and model file status do not replace runtime, inference, account, or end-to-end evidence.
+Tie each runtime and end-to-end result to the exact build and final artifact being reviewed; static gates, saved credentials, and model-file status do not substitute for runtime or provider evidence. Default local and self-signed builds are not Apple-notarized. Claim notarization only after the explicit Developer ID path below accepts, staples, and validates the exact final DMG and its contained app.
 
 ## Automated gates
 
@@ -11,6 +11,10 @@ Independent Astra runtime/E2E acceptance remains pending. Static gates, protocol
 - [ ] `npm run lint`
 - [ ] `npm run build`
 - [ ] `npm audit --audit-level=high`
+- [ ] Production-capability tests prove a stored `debug_mode` cannot expose or persist the debug page and that formal Rust resolution ignores an external sidecar override, requiring the canonical bundled resource.
+- [ ] Default production build rejects reserved Test Groq import/status flags before Tauri startup or single-instance forwarding; the single-instance callback rejects already-forwarded reserved arguments before ordinary actions, replay, or focus. Import/status handlers and Keychain diagnostics are compiled only with `research-harness`.
+- [ ] Inspect the exact production `VoiceFlow.app` main Mach-O: record its source identity, artifact SHA-256, and architecture; confirm it uses the default feature set and contains none of `voiceflow_research_stdio_v1`, `launcher_must_verify_owned_binary`, `request_id_reused`, or `owner_not_terminal_drain_and_retry`. A scan failure or missing artifact is an error; this static check does not replace packaged-App runtime acceptance.
+- [ ] Before App ZIP submission and again on the final mounted App, the release wrapper probes the production main executable with the reserved Test Groq import/status arguments, `--research-stdio`, and a nonexistent private owned-WAV path. Each probe must retain its documented production diagnostic and exit status; they use EOF stdin and must not access credentials, user audio, models, or inference. The wrapper inventories packaged Mach-O payloads including the main executable, sidecar, Swift runtime, and framework payloads, then scans strings for `/Users/` paths. Missing/unreadable binaries, `strings`/`file`/`find` errors, or `rg` errors fail closed; only `rg` status 1 is a clean no-match result.
 - [ ] `cargo audit` in `src-tauri/`
 - [ ] `cargo fmt --manifest-path src-tauri/Cargo.toml -- --check`
 - [ ] `cargo test --manifest-path src-tauri/Cargo.toml`
@@ -20,21 +24,27 @@ Independent Astra runtime/E2E acceptance remains pending. Static gates, protocol
 
 ## macOS signing
 
-Default GitHub Releases use a stable self-signed `VoiceFlow` identity. That keeps Accessibility across updates on machines that install those DMGs. It is not notarized; first launch still needs Open Anyway or `xattr`.
+Default GitHub Releases use a stable self-signed `VoiceFlow` identity. That keeps Accessibility across updates on machines that install those DMGs. It is not notarized; first launch still needs Open Anyway or `xattr`. Signing identity or Team ID resolution and local certificate creation failures stop the build by default. Set `VOICEFLOW_ALLOW_UNSIGNED=1` only when an unsigned build is intended; it produces `VoiceFlow-unsigned.dmg`.
 
 - [ ] Run `make signing-cert` once on the maintainer Mac.
-- [ ] Add `MACOS_CERT_P12` and `MACOS_CERT_PASSWORD` from `.build/signing/`. Never commit the `.p12`.
+- [ ] Add `MACOS_CERT_P12` and `MACOS_CERT_PASSWORD` from `.build/signing/` (read the password with `gh secret set MACOS_CERT_PASSWORD < .build/signing/password.txt`). Never commit the `.p12`.
 - [ ] `make dmg` produces `.build/release/VoiceFlow.dmg` signed with that identity.
 - [ ] Hardened runtime and `src-tauri/Entitlements.plist` are reviewed for the exact shipped binary.
 - [ ] Test first launch on a clean macOS user account and confirm microphone, accessibility, and browser permission prompts.
 
-## Developer ID notarization (optional)
+## Explicit Developer ID notarization
 
-- [ ] Developer ID Application certificate is available in the signing keychain.
-- [ ] `APPLE_SIGNING_IDENTITY` and `APPLE_TEAM_ID` are supplied through the environment, never committed.
-- [ ] Build with `make notarize` (`scripts/release-macos.sh`).
-- [ ] Verify the signed app with `codesign --verify --deep --strict --verbose=2`.
-- [ ] Verify notarization with `xcrun stapler validate` and `spctl --assess --type execute`.
+- [ ] `VOICEFLOW_ALLOW_UNSIGNED=1` only opts into the distinct unsigned `VoiceFlow-unsigned.dmg` for `make dmg` when no signing identity is available; it never bypasses notarization's Developer ID identity, matching Team ID, Apple credentials, or strict App/DMG validation.
+- [ ] A valid Developer ID Application identity, matching `APPLE_TEAM_ID`, `APPLE_ID`, and `APPLE_PASSWORD` are supplied through the environment, never committed.
+- [ ] Run `make notarize`; it explicitly enables the wrapper's notarization path. When `APPLE_CERTIFICATE` and `APPLE_CERTIFICATE_PASSWORD` are supplied together, the wrapper decodes the pair inside its private temporary directory and imports it into an owned temporary keychain before the Tauri build. That keychain remains available for app and manual DMG signing; cleanup restores the original user keychain search list and deletes the owned keychain. Import or cleanup failures stop publication.
+- [ ] On a real macOS release host, confirm the shipped app has the Apple Events automation entitlement required for optional browser host/path access; this entitlement check remains a release verification item.
+- [ ] `VOICEFLOW_RELEASE_TARGET` defaults to `aarch64-apple-darwin` (arm64); set it explicitly to `universal-apple-darwin` only when a universal artifact is intended. The wrapper requires the exact architecture set and exactly one current app in its target output; missing or ambiguous apps stop the release. Retaining the universal build option does not claim Intel acceptance.
+- [ ] Platform acceptance remains pending until a real release host confirms the shipped baseline: macOS 13 for cloud and existing HTTP routes, Apple Silicon with macOS 14 or later for bundled MLX. Intel support is not accepted by the universal build option alone. Do not state a minimum-memory requirement or RSS guarantee without measured and reviewed evidence; no such figure is currently established.
+- [ ] Before App ZIP submission, the wrapper performs ASR and cleanup JSONL hello requests against the bundled MLX sidecar with private empty model/audio roots. It checks the protocol response without loading a model or running inference; launch failures, malformed responses, nonzero exits, and timeouts stop publication. Before ZIP submission and again against the final mounted App, it requires both packaged SwiftPM locks and their declared SHA-256 values, the repository `THIRD_PARTY_NOTICES.md`, the complete `Models/` and `Upstream/` relative-path/content inventories, and `DependencyTexts/` to match their sources. These gates are packaging provenance and readiness checks; they do not prove model inference quality, runtime performance, model redistribution rights, or clean-Mac Gatekeeper acceptance.
+- [ ] Confirm the App ZIP is submitted first and receives a nonempty submission ID with `Accepted`; the same App is stapled and validated before the wrapper builds a fresh DMG containing that App and an `/Applications` link.
+- [ ] Confirm the newly created DMG is signed, independently submitted with its own nonempty ID and `Accepted` result, then stapled and validated. The mounted App must still validate its stapled ticket, signature, team, architectures, and Gatekeeper policy before detach and publication.
+- [ ] Review `.build/release/VoiceFlow-notarized.receipt.json`: it records the App ZIP submission ID/status/SHA-256 and DMG submission ID/status/submission SHA-256 separately from the final post-staple DMG SHA-256. The final digest must match the published `VoiceFlow-notarized.dmg`; the private `VoiceFlow.dmg` remains a separate `make dmg` output.
+- [ ] Test the quarantined final DMG on a clean supported Mac before claiming first-launch trust. A completed local script run alone does not establish public Gatekeeper acceptance.
 
 ## Privacy and behavior acceptance
 
@@ -53,12 +63,12 @@ Default GitHub Releases use a stable self-signed `VoiceFlow` identity. That keep
 - [ ] Model file state, runtime capability handshake, per-model loading state, and loaded model are shown separately; handshake success is not presented as actual inference. Loading cancellation stops the current load while preserving saved provider/model settings and downloaded files. SenseVoice is labelled legacy files-only, cannot run MLX inference, and fails the local inference probe.
 - [ ] AssemblyAI eligible short Dictation uses its fused cleanup candidate without requiring the shared cleanup credential. If the candidate fails, shared cleanup is attempted only when its credential is available; otherwise raw/local fallback is used. Long recordings use full-coverage raw Sync chunks and at most one whole-transcript common cleanup, with local/raw fallback when that cleanup route is unavailable.
 - [ ] AssemblyAI save-time probe checks its raw Sync ASR route and skips optional shared cleanup verification. Soniox settings save stores the key as configured without a provider request; connection occurs only during dictation or an explicit provider test. Saved credentials do not imply general service verification.
-- [ ] Strict offline permits only On Device ASR; loopback LocalWhisper/custom HTTP routes and their probes are blocked, while On Device setup probing remains local and available. It also blocks cloud cleanup, retries, cascades/prefetch, vision and cloud text actions, while separately labeled model downloads remain network actions; configured loopback Ollama cleanup remains local.
+- [ ] Strict offline permits only On Device ASR; loopback LocalWhisper/custom HTTP routes and their probes are blocked, while On Device setup probing remains local and available. It also blocks cloud cleanup, retries, cascades/prefetch, vision and cloud text actions; verified local Ollama, LM Studio or VoiceFlow `on_device_mlx` cleanup remains local. Explicit model downloads remain separate network actions.
 - [ ] Cohere Transcribe requires a fixed supported language (Chinese or English) and cannot proceed in automatic language mode.
-- [ ] Local cleanup uses the explicit Ollama `qwen3.5:4b` selection and status path; VoiceFlow does not install Ollama or download its model, and unavailable cleanup uses local rules / Off without cloud fallback in strict offline mode.
+- [ ] Local cleanup may use Ollama `qwen3.5:4b`, the checked LM Studio `voiceflow-cleanup` Qwen 3.8 27B MLX 6-bit instance, or keyless `on_device_mlx`. VoiceFlow does not install Ollama / LM Studio; the pinned native model requires Apple Silicon and macOS 14 or later, with platform support checked before download requests or folder selection. This does not raise the app's macOS 13 minimum or disable HTTP/cloud and other cleanup routes on older supported Macs. Unsupported/unknown platform status keeps import/download and route apply unavailable; cancellation stays available and existing files are retained unless the user deletes the managed copy. The model requires explicit download or verified-folder import with an APFS managed clone. Cancellation keeps verified partial files; deletion removes only the managed copy. First load and warm status do not establish quality; unavailable cleanup uses local rules / Off without cloud fallback in strict offline mode.
 - [ ] Browser host/path selection stays local. Raw URL, URL credentials, query, fragment, title, PID, target identity, screen images, and unapproved style examples never enter provider payloads, History, exports, or logs.
-- [ ] Switching apps or browser tabs during processing results in clipboard fallback, never an uncertain paste.
-- [ ] A retry from history is clipboard-only because the original target guard is no longer trustworthy.
+- [ ] Switching apps or browser tabs during processing never causes an uncertain paste. Recovery offers only a destination confirmed by its owner; a target change alone does not prove clipboard content.
+- [ ] A retry from History does not reuse the original target. Report copied or saved only after the corresponding clipboard or History owner confirms it; preserve an honest unknown/error state otherwise.
 - [ ] Selected-text and screen-action ASR failures retain complete recovery audio; long recordings and History retries cover the whole audio by bounded chunks. Retrying never restores the original action source or delivery target.
 - [ ] Normal quit cancels active recording/text work and cloud requests, stops the local sidecar through bounded shutdown, and cleans its private temporary audio without deleting model files, saved choices, History, or retained recovery audio.
 - [ ] Recording limit and spool quota behavior are visible and recoverable.

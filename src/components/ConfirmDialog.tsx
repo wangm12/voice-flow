@@ -1,4 +1,4 @@
-import { useRef, type RefObject } from "react";
+import { useId, useRef, type RefObject } from "react";
 import { createPortal } from "react-dom";
 import { useDialogBehavior } from "../lib/focusTrap";
 import { buttonClass, colors, dangerActionButtonClass, focusRingClass, secondaryButtonClass } from "../lib/theme";
@@ -29,6 +29,7 @@ export function ConfirmDialog({
   onCancel: () => void;
 }) {
   const dialogRef = useRef<HTMLElement>(null);
+  const id = useId();
   const restoreFocusRef = useRef<HTMLElement | null>(null);
 
   useDialogBehavior({
@@ -49,13 +50,13 @@ export function ConfirmDialog({
         tabIndex={-1}
         role="dialog"
         aria-modal="true"
-        aria-labelledby="confirm-dialog-title"
-        aria-describedby="confirm-dialog-description"
+        aria-labelledby={`${id}-title`}
+        aria-describedby={`${id}-description`}
         onClick={(event) => event.stopPropagation()}
         className={`relative flex max-h-[calc(100dvh-3rem)] min-h-0 w-full max-w-md flex-col rounded-2xl border ${colors.border} ${colors.bg.card} p-6 shadow-elevated outline-none ${focusRingClass}`}
       >
-        <h2 id="confirm-dialog-title" className="shrink-0 text-lg font-semibold leading-6 text-primary">{title}</h2>
-        <p id="confirm-dialog-description" className="mt-2 min-h-0 overflow-y-auto overscroll-contain break-words text-[13px] leading-6 text-secondary">{description}</p>
+        <h2 id={`${id}-title`} className="shrink-0 text-lg font-semibold leading-6 text-primary">{title}</h2>
+        <p id={`${id}-description`} className="mt-2 min-h-0 overflow-y-auto overscroll-contain break-words text-[13px] leading-6 text-secondary">{description}</p>
         {error && <p role="alert" className="mt-4 max-h-24 shrink-0 overflow-y-auto break-words text-[13px] leading-5 text-error-ink">{error}</p>}
         <div className="mt-6 flex shrink-0 flex-wrap justify-end gap-2">
           <button type="button" disabled={busy} className={secondaryButtonClass} onClick={onCancel}>{cancelLabel}</button>

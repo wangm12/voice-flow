@@ -1,61 +1,35 @@
-import { VoiceHudOrb } from "../Island/VoiceHudOrb";
-import { BorderBeam } from "border-beam";
-import {
-  HUD_LISTENING_BEAM,
-  HUD_LISTENING_ORB_SPEED,
-  HUD_PILL_RADIUS_PX,
-  HUD_THINKING_BEAM,
-  HUD_THINKING_ORB_SPEED,
-} from "../Island/hudOrb";
-import {
-  voicePillHeight,
-  voicePillWidthForState,
-  voicePillWindowHeight,
-  voicePillWindowWidth,
-} from "../Island/voicePillTokens";
+import { useI18n } from "../../lib/i18n";
+import { VoicePill } from "../Island/VoicePill";
+import { voicePillWindowHeight, voicePillWindowWidth } from "../Island/voicePillTokens";
 import "../../island.css";
 
 export function MainPillPreview({ live = false }: { live?: boolean }) {
-  const pillWidth = voicePillWidthForState("recording");
-  const beam = live ? HUD_LISTENING_BEAM : HUD_THINKING_BEAM;
+  const { t } = useI18n();
 
   return (
     <div
       className="voice-pill-stage mx-auto"
+      inert
+      aria-hidden="true"
       style={{ width: voicePillWindowWidth, height: voicePillWindowHeight }}
     >
-      <BorderBeam
-        className="voice-pill__beam"
-        size={beam.size}
-        colorVariant={beam.colorVariant}
-        strength={beam.strength}
-        duration={beam.duration}
-        theme="dark"
-        borderRadius={HUD_PILL_RADIUS_PX}
-        active
-        style={{ width: pillWidth, height: voicePillHeight }}
-      >
-        <div
-          className="voice-pill voice-pill--labeled voice-pill--orb"
-          style={{ width: pillWidth, height: voicePillHeight }}
-        >
-          <div className="voice-pill__content">
-            <span className="voice-pill__indicator">
-              <span className="voice-pill__center-state voice-pill__center-state--active" aria-hidden="true">
-                <VoiceHudOrb
-                  state={live ? "breathing" : "shaping"}
-                  paused={!live}
-                  speed={live ? HUD_LISTENING_ORB_SPEED : HUD_THINKING_ORB_SPEED}
-                  dim={!live}
-                />
-              </span>
-            </span>
-            <span className="voice-pill__label" aria-hidden="true">
-              {live ? "Listening…" : "Thinking…"}
-            </span>
-          </div>
-        </div>
-      </BorderBeam>
+      <VoicePill
+        state={live ? "recording" : "processing"}
+        phase={live ? "idle" : "cleanup"}
+        phaseConfirmed={!live}
+        audioStatus={t("预设演示 · 未使用麦克风")}
+        audioDeviceName={t("演示输入设备")}
+        audioDeviceSourceLabel={t("预览")}
+        audioDeviceTitle={t("演示输入设备；未使用麦克风")}
+        contextLabel={null}
+        selectedActionState={null}
+        waveformLevels={[]}
+        lastAudioLevelAtMs={null}
+        clockNowMs={0}
+        stageElapsedMs={0}
+        progress={0}
+        reduced
+      />
     </div>
   );
 }

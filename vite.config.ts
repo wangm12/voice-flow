@@ -1,4 +1,4 @@
-import { defineConfig } from "vitest/config";
+import { configDefaults, defineConfig } from "vitest/config";
 import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
 import { resolve } from "node:path";
@@ -42,5 +42,6 @@ export default defineConfig(async () => ({
   test: {
     environment: "jsdom",
     setupFiles: resolve(__dirname, "src/test/setup.ts"),
+    exclude: [...configDefaults.exclude, "reference_projects/**"],
   },
 }));

@@ -5,6 +5,7 @@
 //! and checks a generated candidate against the plan's immutable source evidence.
 
 use crate::protected_span::{self, ProtectedSpanKind};
+use std::ops::Range;
 
 pub const MAX_ACTION_SOURCE_BYTES: usize = 16 * 1024;
 const MAX_INSTRUCTION_BYTES: usize = 4 * 1024;
@@ -25,6 +26,51 @@ pub enum TextActionSourceKind {
     Selection,
     FieldText,
     EmptyComposer,
+}
+
+/// Closed Organize variants. Recipe identity and formatting semantics are
+/// owned here so callers can carry an identifier without duplicating policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrganizeRecipe {
+    DeveloperTask,
+    WorkUpdate,
+    TodoList,
+}
+
+impl OrganizeRecipe {
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::DeveloperTask => "developer_task",
+            Self::WorkUpdate => "work_update",
+            Self::TodoList => "todo_list",
+        }
+    }
+
+    pub const fn version(self) -> u16 {
+        1
+    }
+
+    pub const fn titles(self) -> &'static [&'static str] {
+        match self {
+            Self::DeveloperTask => &["开发任务", "Developer task"],
+            Self::WorkUpdate => &["工作进展", "Work update"],
+            Self::TodoList => &["待办清单", "To-do list"],
+        }
+    }
+
+    const fn semantic_guardrail(self) -> &'static str {
+        match self {
+            Self::DeveloperTask => {
+                "Do not add a technology stack, implementation, metric, schedule, or acceptance criterion that the source does not state."
+            }
+            Self::WorkUpdate => {
+                "Do not turn a plan into completed work or create a commitment for the user."
+            }
+            Self::TodoList => {
+                "Do not infer an owner or deadline, and do not create a calendar item."
+            }
+        }
+    }
 }
 
 pub struct TextActionInput<'a> {
@@ -61,7 +107,31 @@ pub struct TextActionPlan {
     pub operation: TextActionOperation,
     pub target_language: Option<String>,
     pub authorized_changes: Vec<AuthorizedEntityChange>,
+    pub recipe: Option<OrganizeRecipe>,
     validation_evidence: ActionValidationEvidence,
+}
+
+impl TextActionPlan {
+    /// Returns the Rust-owned recipe instruction for the production prompt.
+    /// The formatting rule is bound to the exact source snapshot used to plan.
+    pub fn recipe_prompt_instruction(&self) -> Option<String> {
+        let recipe = self.recipe?;
+        let source_has_code =
+            protected_span::has_code_literals(&self.validation_evidence.source_snapshot);
+        let body_rule = if source_has_code {
+            "Copy the body byte-for-byte from the source, including whitespace, punctuation, line endings, and code indentation. Do not add list markers."
+        } else {
+            "Preserve every source character, punctuation mark, whitespace character, and its order. Add exactly one '- ' prefix before each non-empty paragraph; a paragraph boundary is an existing blank line. Do not split or merge paragraphs."
+        };
+        Some(format!(
+            "Organize recipe: {} version {}. {} Start with exactly one unformatted title line, choosing one exact title from [{}] (no '#', bold, or other wrapper). Then add exactly one LF and immediately continue with the source-preserving body; do not add a blank line. {} Preserve source leading/trailing whitespace and line endings. Do not paraphrase, split, merge, regroup, or reorder source content. Do not add section labels, facts, or missing-field guesses. Return only the title and body.",
+            recipe.id(),
+            recipe.version(),
+            recipe.semantic_guardrail(),
+            recipe.titles().join(" | "),
+            body_rule,
+        ))
+    }
 }
 
 impl std::fmt::Debug for TextActionPlan {
@@ -69,6 +139,7 @@ impl std::fmt::Debug for TextActionPlan {
         formatter
             .debug_struct("TextActionPlan")
             .field("operation", &self.operation)
+            .field("recipe", &self.recipe.map(OrganizeRecipe::id))
             .field("authorized_change_count", &self.authorized_changes.len())
             .field("has_target_language", &self.target_language.is_some())
             .finish_non_exhaustive()
@@ -83,6 +154,7 @@ pub enum TextActionPlanError {
     ReplyTargetMustBeEmpty,
     ReplyContextUnavailable,
     UnauthorizedSourceKind,
+    SourceTooLong,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,6 +177,8 @@ struct ActionValidationEvidence {
     authorized_change_kinds: Vec<ProtectedSpanKind>,
     operation_snapshot: TextActionOperation,
     target_language_snapshot: Option<String>,
+    recipe_snapshot: Option<OrganizeRecipe>,
+    recipe_layout_snapshot: Option<RecipeLayoutWitness>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -146,7 +220,18 @@ pub fn plan_text_action(input: TextActionInput<'_>) -> Result<TextActionPlan, Te
     }
 
     let unquoted_instruction = without_quoted_content(input.instruction);
-    let (operation, modification) = detect_operation(&unquoted_instruction, input.instruction)?;
+    let (operation, modification, recipe) =
+        detect_operation(&unquoted_instruction, input.instruction)?;
+    let recipe_layout_snapshot = match recipe {
+        Some(recipe) => {
+            let layout = recipe_layout(input.source_text);
+            if maximum_recipe_candidate_bytes(recipe, &layout) > MAX_ACTION_SOURCE_BYTES {
+                return Err(TextActionPlanError::SourceTooLong);
+            }
+            Some(layout)
+        }
+        None => None,
+    };
 
     let mut target_language = None;
     let mut authorized_changes = Vec::new();
@@ -205,12 +290,15 @@ pub fn plan_text_action(input: TextActionInput<'_>) -> Result<TextActionPlan, Te
         authorized_change_kinds,
         operation_snapshot: operation,
         target_language_snapshot: target_language.clone(),
+        recipe_snapshot: recipe,
+        recipe_layout_snapshot,
     };
 
     Ok(TextActionPlan {
         operation,
         target_language,
         authorized_changes,
+        recipe,
         validation_evidence,
     })
 }
@@ -224,6 +312,8 @@ pub fn validate_generated_result(
     if plan.operation != evidence.operation_snapshot
         || plan.target_language != evidence.target_language_snapshot
         || plan.authorized_changes != evidence.authorized_changes_snapshot
+        || plan.recipe != evidence.recipe_snapshot
+        || (plan.recipe.is_some() && plan.operation != TextActionOperation::Organize)
         || source != evidence.source_snapshot
     {
         return Err(TextActionGuardError::UnauthorizedEntityChange);
@@ -239,12 +329,128 @@ pub fn validate_generated_result(
         TextActionOperation::Rewrite
         | TextActionOperation::Shorten
         | TextActionOperation::Organize => {
-            validate_preserved_transform(plan.operation, source, candidate)
+            if let Some(recipe) = plan.recipe {
+                let Some(body) = recipe_body_from_candidate(recipe, candidate) else {
+                    return Err(TextActionGuardError::ProtectedFactChanged);
+                };
+                let layout = evidence
+                    .recipe_layout_snapshot
+                    .as_ref()
+                    .ok_or(TextActionGuardError::UnauthorizedEntityChange)?;
+                if body != layout.body {
+                    return Err(TextActionGuardError::ProtectedFactChanged);
+                }
+                let projected = project_recipe_layout(body, layout)
+                    .ok_or(TextActionGuardError::ProtectedFactChanged)?;
+                if projected != source {
+                    return Err(TextActionGuardError::ProtectedFactChanged);
+                }
+                validate_preserved_transform(plan.operation, source, &projected)
+            } else {
+                validate_preserved_transform(plan.operation, source, candidate)
+            }
         }
         TextActionOperation::ModifyExact => validate_exact_modification(plan, source, candidate),
         TextActionOperation::Translate => validate_translation(plan, source, candidate),
         TextActionOperation::DraftReply => validate_reply(plan, candidate),
     }
+}
+
+/// A recipe header is the only authorized title occurrence. The source is
+/// compared without projection, so a matching title inside the source remains
+/// part of the required body.
+fn recipe_body_from_candidate(recipe: OrganizeRecipe, candidate: &str) -> Option<&str> {
+    let (title, body) = candidate.split_once('\n')?;
+    let title = title.strip_suffix('\r').unwrap_or(title);
+    recipe.titles().contains(&title).then_some(body)
+}
+
+/// Source-bound layout projection. Every marker range is recorded at the
+/// moment this recipe owner inserts it; callers may project only after the
+/// candidate body matches `body` byte-for-byte.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RecipeLayoutWitness {
+    body: String,
+    inserted_markers: Vec<Range<usize>>,
+}
+
+fn recipe_layout(source: &str) -> RecipeLayoutWitness {
+    if protected_span::has_code_literals(source) {
+        return RecipeLayoutWitness {
+            body: source.to_owned(),
+            inserted_markers: Vec::new(),
+        };
+    }
+
+    let mut body = String::with_capacity(source.len().saturating_add(2));
+    let mut inserted_markers = Vec::new();
+    let mut paragraph_start = true;
+    for line in source.split_inclusive('\n') {
+        let content = line.strip_suffix('\n').unwrap_or(line);
+        let content = content.strip_suffix('\r').unwrap_or(content);
+        let blank_line = content.chars().all(char::is_whitespace);
+        if !blank_line && paragraph_start {
+            let start = body.len();
+            body.push_str("- ");
+            inserted_markers.push(start..body.len());
+            paragraph_start = false;
+        }
+        body.push_str(line);
+        if blank_line {
+            paragraph_start = true;
+        }
+    }
+    RecipeLayoutWitness {
+        body,
+        inserted_markers,
+    }
+}
+
+// Test helper delegated to the same layout owner.
+#[cfg(test)]
+fn expected_recipe_body(source: &str) -> String {
+    recipe_layout(source).body
+}
+
+fn maximum_recipe_candidate_bytes(recipe: OrganizeRecipe, layout: &RecipeLayoutWitness) -> usize {
+    // The parser accepts both LF and CRLF on the title boundary. Budget the
+    // largest allowed title and that full separator so every accepted layout
+    // remains inside the existing output cap before a request is dispatched.
+    let title_bytes = recipe
+        .titles()
+        .iter()
+        .map(|title| title.len())
+        .max()
+        .unwrap_or(0);
+    layout
+        .body
+        .len()
+        .saturating_add(title_bytes)
+        .saturating_add(2)
+}
+
+fn project_recipe_layout(body: &str, layout: &RecipeLayoutWitness) -> Option<String> {
+    if body != layout.body {
+        return None;
+    }
+    let removed_bytes = layout
+        .inserted_markers
+        .iter()
+        .map(|range| range.end.checked_sub(range.start))
+        .collect::<Option<Vec<_>>>()?
+        .into_iter()
+        .sum::<usize>();
+    let mut projected = String::with_capacity(body.len().saturating_sub(removed_bytes));
+    let mut cursor = 0;
+    for marker in &layout.inserted_markers {
+        if marker.start < cursor || marker.end > body.len() || marker.start > marker.end {
+            return None;
+        }
+        projected.push_str(&body[cursor..marker.start]);
+        cursor = marker.end;
+    }
+    projected.push_str(&body[cursor..]);
+    Some(projected)
 }
 
 fn require_transform_source(input: &TextActionInput<'_>) -> Result<(), TextActionPlanError> {
@@ -263,7 +469,15 @@ fn require_transform_source(input: &TextActionInput<'_>) -> Result<(), TextActio
 fn detect_operation(
     unquoted_instruction: &str,
     original_instruction: &str,
-) -> Result<(TextActionOperation, Option<ParsedModification>), TextActionPlanError> {
+) -> Result<
+    (
+        TextActionOperation,
+        Option<ParsedModification>,
+        Option<OrganizeRecipe>,
+    ),
+    TextActionPlanError,
+> {
+    let recipe = detect_organize_recipe(unquoted_instruction)?;
     let rewrite = has_any_cue(
         unquoted_instruction,
         &[
@@ -309,7 +523,7 @@ fn detect_operation(
             "列出要点",
             "整理成列表",
         ],
-    );
+    ) || recipe.is_some();
     let draft_reply = has_any_cue(
         unquoted_instruction,
         &[
@@ -332,7 +546,7 @@ fn detect_operation(
         if has_operation_cue {
             return Err(TextActionPlanError::AmbiguousInstruction);
         }
-        return Ok((TextActionOperation::ModifyExact, modification));
+        return Ok((TextActionOperation::ModifyExact, modification, None));
     }
     if has_modify_cue {
         return Err(TextActionPlanError::AmbiguousInstruction);
@@ -349,10 +563,594 @@ fn detect_operation(
     .filter_map(|(present, operation)| present.then_some(operation))
     .collect::<Vec<_>>();
     match recognized.as_slice() {
-        [operation] => Ok((*operation, None)),
+        [operation] => Ok((*operation, None, recipe)),
         [] => Err(TextActionPlanError::UnsupportedInstruction),
         _ => Err(TextActionPlanError::AmbiguousInstruction),
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RecipeMention {
+    start: usize,
+    end: usize,
+    recipe: OrganizeRecipe,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RecipeLabelSpan {
+    start: usize,
+    end: usize,
+    recipe: OrganizeRecipe,
+}
+
+fn detect_organize_recipe(
+    instruction: &str,
+) -> Result<Option<OrganizeRecipe>, TextActionPlanError> {
+    let mentions = recipe_mentions(instruction);
+    if mentions.is_empty() {
+        return Ok(None);
+    }
+
+    let mut recipes = Vec::new();
+    for mention in &mentions {
+        if instruction_cue_is_negated(instruction, mention.start)
+            || !recipe_command_prefix_is_allowed(instruction, mention.start)
+        {
+            return Err(TextActionPlanError::AmbiguousInstruction);
+        }
+        if !recipes.contains(&mention.recipe) {
+            recipes.push(mention.recipe);
+        }
+    }
+    if recipes.len() == 1 && has_coordinated_recipe_choice(instruction, &mentions) {
+        return Err(TextActionPlanError::AmbiguousInstruction);
+    }
+    if mentions
+        .iter()
+        .any(|mention| !recipe_tail_is_allowed(&instruction[mention.end..]))
+    {
+        return Err(TextActionPlanError::AmbiguousInstruction);
+    }
+    match recipes.as_slice() {
+        [] => Ok(None),
+        [recipe] => Ok(Some(*recipe)),
+        _ => Err(TextActionPlanError::AmbiguousInstruction),
+    }
+}
+
+fn recipe_mentions(instruction: &str) -> Vec<RecipeMention> {
+    const CUES: &[(&str, OrganizeRecipe)] = &[
+        ("整理成开发任务", OrganizeRecipe::DeveloperTask),
+        ("整理为开发任务", OrganizeRecipe::DeveloperTask),
+        ("组织成开发任务", OrganizeRecipe::DeveloperTask),
+        ("组织为开发任务", OrganizeRecipe::DeveloperTask),
+        (
+            "organize as a developer task",
+            OrganizeRecipe::DeveloperTask,
+        ),
+        (
+            "organize as a development task",
+            OrganizeRecipe::DeveloperTask,
+        ),
+        ("format as a developer task", OrganizeRecipe::DeveloperTask),
+        (
+            "format as a development task",
+            OrganizeRecipe::DeveloperTask,
+        ),
+        ("整理成工作进展", OrganizeRecipe::WorkUpdate),
+        ("整理为工作进展", OrganizeRecipe::WorkUpdate),
+        ("组织成工作进展", OrganizeRecipe::WorkUpdate),
+        ("组织为工作进展", OrganizeRecipe::WorkUpdate),
+        ("organize as a progress report", OrganizeRecipe::WorkUpdate),
+        ("format as a progress report", OrganizeRecipe::WorkUpdate),
+        ("整理成待办", OrganizeRecipe::TodoList),
+        ("整理为待办", OrganizeRecipe::TodoList),
+        ("整理成待办清单", OrganizeRecipe::TodoList),
+        ("整理为待办清单", OrganizeRecipe::TodoList),
+        ("列成待办", OrganizeRecipe::TodoList),
+        ("列成待办清单", OrganizeRecipe::TodoList),
+        ("organize as a to-do list", OrganizeRecipe::TodoList),
+        ("organize as a todo list", OrganizeRecipe::TodoList),
+        ("format as a to-do list", OrganizeRecipe::TodoList),
+        ("format as a todo list", OrganizeRecipe::TodoList),
+    ];
+
+    let mut mentions: Vec<RecipeMention> = Vec::new();
+    for (cue, recipe) in CUES {
+        for start in phrase_occurrences(instruction, cue) {
+            let end = start + cue.len();
+            if let Some(existing) = mentions
+                .iter_mut()
+                .find(|mention| mention.start == start && mention.recipe == *recipe)
+            {
+                existing.end = existing.end.max(end);
+            } else {
+                mentions.push(RecipeMention {
+                    start,
+                    end,
+                    recipe: *recipe,
+                });
+            }
+        }
+    }
+    mentions.sort_by_key(|mention| (mention.start, mention.end));
+    mentions
+}
+
+fn recipe_tail_is_allowed(tail: &str) -> bool {
+    let normalized = normalize_recipe_text(tail);
+    if normalized.is_empty() {
+        return true;
+    }
+    let mut constraint = normalized.as_str();
+    for prefix in ["and also ", "and ", "also ", "while ", "but "] {
+        if let Some(rest) = constraint.strip_prefix(prefix) {
+            constraint = rest.trim();
+            break;
+        }
+    }
+    for prefix in ["并且", "而且", "同时", "且", "并"] {
+        if let Some(rest) = constraint.strip_prefix(prefix) {
+            constraint = rest.trim();
+            break;
+        }
+    }
+
+    if constraint.is_empty() {
+        return false;
+    }
+    if constraint == "please" {
+        return true;
+    }
+
+    const ENGLISH_CONSTRAINTS: &[&str] = &[
+        "without adding facts",
+        "without adding any facts",
+        "without inventing facts",
+        "without adding content",
+        "without adding any content",
+        "without adding new content",
+        "without inventing content",
+        "do not add facts",
+        "do not add any facts",
+        "don't add facts",
+        "don't add any facts",
+        "do not invent facts",
+        "don't invent facts",
+        "do not add content",
+        "do not add any content",
+        "don't add content",
+        "don't add any content",
+        "do not invent content",
+        "don't invent content",
+        "preserve the original wording",
+        "keep the original wording",
+        "preserve the original title",
+        "keep the original title",
+        "preserve the source title",
+        "keep the source title",
+        "preserve the body title",
+        "keep the body title",
+        "preserve the title",
+        "keep the title",
+        "preserve all source content",
+    ];
+    const CHINESE_CONSTRAINTS: &[&str] = &[
+        "不要增加内容",
+        "不要增加任何内容",
+        "不要添加内容",
+        "不要添加任何内容",
+        "不要补充内容",
+        "不要补充任何内容",
+        "不要增加事实",
+        "不要增加任何事实",
+        "不要添加事实",
+        "不要补充事实",
+        "不要编造事实",
+        "不添加新内容",
+        "不要新增内容",
+        "保留原文",
+        "保留原意",
+        "保持原文",
+        "保持原意",
+        "保留标题",
+        "保持标题",
+        "保留正文标题",
+        "保持正文标题",
+        "保留正文里的",
+        "保留正文中的",
+    ];
+    ENGLISH_CONSTRAINTS.contains(&constraint) || CHINESE_CONSTRAINTS.contains(&constraint)
+}
+
+fn normalize_recipe_text(text: &str) -> String {
+    let mut normalized = String::with_capacity(text.len());
+    let mut previous_was_space = true;
+    for ch in text.chars() {
+        if ch.is_whitespace()
+            || matches!(
+                ch,
+                ',' | '，' | ';' | '；' | '.' | '。' | '!' | '！' | '?' | '？'
+            )
+        {
+            if !previous_was_space {
+                normalized.push(' ');
+            }
+            previous_was_space = true;
+        } else {
+            normalized.push(if ch.is_ascii() {
+                ch.to_ascii_lowercase()
+            } else {
+                ch
+            });
+            previous_was_space = false;
+        }
+    }
+    normalized.trim().to_owned()
+}
+
+fn has_coordinated_recipe_choice(instruction: &str, mentions: &[RecipeMention]) -> bool {
+    const LABELS: &[(&str, OrganizeRecipe)] = &[
+        ("开发任务", OrganizeRecipe::DeveloperTask),
+        ("工作进展", OrganizeRecipe::WorkUpdate),
+        ("待办清单", OrganizeRecipe::TodoList),
+        ("待办", OrganizeRecipe::TodoList),
+        ("developer task", OrganizeRecipe::DeveloperTask),
+        ("development task", OrganizeRecipe::DeveloperTask),
+        ("progress report", OrganizeRecipe::WorkUpdate),
+        ("to-do list", OrganizeRecipe::TodoList),
+        ("todo list", OrganizeRecipe::TodoList),
+    ];
+
+    let mut spans = Vec::new();
+    for (label, recipe) in LABELS {
+        for start in phrase_occurrences(instruction, label) {
+            spans.push(RecipeLabelSpan {
+                start,
+                end: start + label.len(),
+                recipe: *recipe,
+            });
+        }
+    }
+    spans.sort_by_key(|span| (span.start, span.end));
+
+    spans.windows(2).any(|pair| {
+        let [left, right] = pair else {
+            return false;
+        };
+        if left.recipe == right.recipe || !has_recipe_cue_overlap(left, right, mentions) {
+            return false;
+        }
+        is_recipe_coordinator_gap(&instruction[left.end..right.start])
+    })
+}
+
+fn has_recipe_cue_overlap(
+    left: &RecipeLabelSpan,
+    right: &RecipeLabelSpan,
+    mentions: &[RecipeMention],
+) -> bool {
+    mentions.iter().any(|mention| {
+        let overlaps_left = left.start < mention.end && mention.start < left.end;
+        let overlaps_right = right.start < mention.end && mention.start < right.end;
+        (overlaps_left && mention.recipe == left.recipe)
+            || (overlaps_right && mention.recipe == right.recipe)
+    })
+}
+
+fn is_recipe_coordinator_gap(gap: &str) -> bool {
+    let normalized = normalize_recipe_text(gap);
+    matches!(
+        normalized.as_str(),
+        "and"
+            | "and a"
+            | "and the"
+            | "or"
+            | "or a"
+            | "or the"
+            | "and or"
+            | "and or a"
+            | "或者"
+            | "或"
+            | "和"
+            | "与"
+            | "及"
+            | "以及"
+            | "并且"
+    )
+}
+
+fn phrase_occurrences(text: &str, phrase: &str) -> Vec<usize> {
+    if !phrase.is_ascii() {
+        return text.match_indices(phrase).map(|(start, _)| start).collect();
+    }
+
+    let folded = text.to_ascii_lowercase();
+    let phrase = phrase.to_ascii_lowercase();
+    folded
+        .match_indices(&phrase)
+        .filter_map(|(start, _)| {
+            let end = start + phrase.len();
+            let before_ok = start == 0
+                || !folded[..start]
+                    .chars()
+                    .next_back()
+                    .is_some_and(|ch| ch.is_ascii_alphanumeric() || ch == '_');
+            let after_ok = end == folded.len()
+                || !folded[end..]
+                    .chars()
+                    .next()
+                    .is_some_and(|ch| ch.is_ascii_alphanumeric() || ch == '_');
+            (before_ok && after_ok).then_some(start)
+        })
+        .collect()
+}
+
+fn instruction_cue_is_negated(text: &str, cue_start: usize) -> bool {
+    let prefix = &text[..cue_start];
+    if action_negative_prefix(prefix) {
+        return true;
+    }
+
+    // A prior comma or sentence mark cannot erase a direct negative command.
+    // Suffix checks still match only a closed negative phrase, never any
+    // arbitrary negation elsewhere in the instruction.
+    prefix
+        .char_indices()
+        .filter(|(_, ch)| {
+            matches!(
+                ch,
+                ',' | '，' | ';' | '；' | '.' | '!' | '?' | '。' | '！' | '？' | '\n' | '\r'
+            )
+        })
+        .any(|(index, ch)| action_negative_prefix(&prefix[index + ch.len_utf8()..]))
+}
+
+fn recipe_command_prefix_is_allowed(text: &str, cue_start: usize) -> bool {
+    let prefix = normalize_action_prefix(&text[..cue_start]);
+    const ENGLISH_PREFIXES: &[&str] = &[
+        "",
+        "please",
+        "kindly",
+        "could you",
+        "could you please",
+        "can you",
+        "can you please",
+        "would you",
+        "would you please",
+        "please help me",
+        "please help me to",
+        "help me",
+        "help me to",
+        "i want to",
+        "i want you to",
+        "i need to",
+        "i need you to",
+        "i would like you to",
+        "i'd like you to",
+        "could you kindly",
+        "would you kindly",
+        "without adding facts",
+        "without adding any facts",
+        "without adding content",
+        "without adding any content",
+        "do not add facts",
+        "don't add facts",
+        "do not add content",
+        "don't add content",
+    ];
+    const CHINESE_PREFIXES: &[&str] = &[
+        "请",
+        "请你",
+        "请帮我",
+        "请你帮我",
+        "帮我",
+        "麻烦",
+        "麻烦你",
+        "麻烦帮我",
+        "麻烦你帮我",
+        "可以帮我",
+        "能否帮我",
+        "我想",
+        "我想把这段",
+        "我想把这段文字",
+        "请帮我把这段话",
+        "请帮我把这段文字",
+        "请帮我把这段内容",
+        "帮我把这段话",
+        "帮我把这段文字",
+        "帮我把这段内容",
+        "请帮我将这段话",
+        "请帮我将这段文字",
+        "帮我将这段话",
+        "帮我将这段文字",
+        "请把这段话",
+        "把这段话",
+        "请将这段话",
+        "将这段话",
+        "请将内容",
+        "请把内容",
+        "将内容",
+        "把内容",
+        "请把这段",
+        "请把这段文字",
+        "请将这段",
+        "请将这段文字",
+        "把这段",
+        "把这段文字",
+        "将这段",
+        "将这段文字",
+        "请把这份内容",
+        "请将这份内容",
+        "把这份内容",
+        "将这份内容",
+        "请把它",
+        "请将它",
+        "把它",
+        "将它",
+        "不要增加内容",
+        "不要增加事实",
+        "不要添加内容",
+        "不要添加事实",
+        "不要补充内容",
+        "不要补充事实",
+    ];
+    ENGLISH_PREFIXES.contains(&prefix.as_str()) || CHINESE_PREFIXES.contains(&prefix.as_str())
+}
+
+fn action_negative_prefix(prefix: &str) -> bool {
+    let mut normalized = normalize_action_prefix(prefix);
+    for polite in [
+        "could you please ",
+        "can you please ",
+        "would you please ",
+        "please help me to ",
+        "please help me ",
+        "i would like you to ",
+        "i'd like you to ",
+        "i want you to ",
+        "could you ",
+        "can you ",
+        "would you ",
+        "please ",
+        "kindly ",
+        "help me to ",
+        "help me ",
+    ] {
+        if let Some(rest) = normalized.strip_prefix(polite) {
+            normalized = rest.trim().to_owned();
+            break;
+        }
+    }
+    for polite in [
+        "麻烦你帮我",
+        "麻烦帮我",
+        "请你帮我",
+        "可以帮我",
+        "能否帮我",
+        "请你",
+        "请帮我",
+        "麻烦你",
+        "麻烦",
+        "请",
+    ] {
+        if let Some(rest) = normalized.strip_prefix(polite) {
+            normalized = rest.trim().to_owned();
+            break;
+        }
+    }
+
+    const ENGLISH_NEGATIVE_PREFIXES: &[&str] = &[
+        "do not",
+        "do not under any circumstances",
+        "do not under no circumstances",
+        "do not in any circumstances",
+        "do not in any case",
+        "do not under any condition",
+        "do not by any means",
+        "do not at any time",
+        "do not ever",
+        "don't",
+        "don't under any circumstances",
+        "don't in any case",
+        "don't under any condition",
+        "don't by any means",
+        "don't under no circumstances",
+        "don't ever",
+        "does not",
+        "doesn't",
+        "will not",
+        "will not under any circumstances",
+        "won't",
+        "won't under any circumstances",
+        "would not",
+        "wouldn't",
+        "should not",
+        "shouldn't",
+        "must not",
+        "mustn't",
+        "cannot",
+        "can't",
+        "never",
+        "never under any circumstances",
+        "avoid",
+        "try not to",
+        "not",
+        "i do not",
+        "i don't",
+        "i will not",
+        "i won't",
+        "i would not",
+        "i wouldn't",
+        "i should not",
+        "i shouldn't",
+        "you do not",
+        "you don't",
+        "you will not",
+        "you won't",
+    ];
+    if ENGLISH_NEGATIVE_PREFIXES.contains(&normalized.as_str()) {
+        return true;
+    }
+
+    let compact_chinese = normalized
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect::<String>();
+    const CHINESE_NEGATIVE_PREFIXES: &[&str] = &[
+        "不要",
+        "不要在任何情况下",
+        "别",
+        "别在任何情况下",
+        "勿",
+        "请勿",
+        "切勿",
+        "禁止",
+        "千万不要",
+        "绝不要",
+        "不",
+    ];
+    CHINESE_NEGATIVE_PREFIXES.contains(&compact_chinese.as_str())
+}
+
+fn normalize_action_prefix(prefix: &str) -> String {
+    let mut normalized = String::with_capacity(prefix.len());
+    let mut previous_was_space = true;
+    for ch in prefix.chars() {
+        let separator = ch.is_whitespace()
+            || matches!(
+                ch,
+                ',' | '，'
+                    | ';'
+                    | '；'
+                    | ':'
+                    | '：'
+                    | '.'
+                    | '!'
+                    | '?'
+                    | '。'
+                    | '！'
+                    | '？'
+                    | '('
+                    | ')'
+                    | '（'
+                    | '）'
+            );
+        if separator {
+            if !previous_was_space {
+                normalized.push(' ');
+            }
+            previous_was_space = true;
+        } else {
+            normalized.push(if ch.is_ascii() {
+                ch.to_ascii_lowercase()
+            } else {
+                ch
+            });
+            previous_was_space = false;
+        }
+    }
+    normalized.trim().to_owned()
 }
 
 fn has_any_cue(text: &str, cues: &[&str]) -> bool {
@@ -1948,6 +2746,382 @@ mod tests {
     }
 
     #[test]
+    fn organize_recipe_requires_an_explicit_unquoted_unambiguous_command() {
+        let source = "One source paragraph.";
+        let cases = [
+            ("整理成开发任务", OrganizeRecipe::DeveloperTask),
+            (
+                "Organize as a development task",
+                OrganizeRecipe::DeveloperTask,
+            ),
+            ("整理成工作进展", OrganizeRecipe::WorkUpdate),
+            ("Organize as a progress report", OrganizeRecipe::WorkUpdate),
+            ("整理成待办清单", OrganizeRecipe::TodoList),
+            ("Format as a to-do list", OrganizeRecipe::TodoList),
+        ];
+        for (instruction, expected) in cases {
+            let plan = make_plan(instruction, source).expect("explicit recipe command");
+            assert_eq!(
+                plan.operation,
+                TextActionOperation::Organize,
+                "{instruction}"
+            );
+            assert_eq!(plan.recipe, Some(expected), "{instruction}");
+        }
+
+        let generic = make_plan("Organize as bullet points", "整理成待办").unwrap();
+        assert_eq!(generic.operation, TextActionOperation::Organize);
+        assert_eq!(generic.recipe, None, "source words do not select a recipe");
+        let generic_quoted = make_plan("Format the text as ‘to-do list’", source).unwrap();
+        assert_eq!(
+            generic_quoted.recipe, None,
+            "quoted words do not select a recipe"
+        );
+        assert_eq!(
+            make_plan("Please say ‘整理成待办’", source).unwrap_err(),
+            TextActionPlanError::UnsupportedInstruction,
+            "a quoted-only recipe phrase is not an action"
+        );
+
+        for instruction in [
+            "不要整理成待办",
+            "Do not under any circumstances organize as a developer task",
+            "Do not, under any circumstances, organize as a developer task",
+            "I won't organize as a developer task",
+            "Please do not organize as a developer task",
+            "Organize as a developer task is not what I want",
+            "整理成开发任务不是我要的",
+            "整理成开发任务我不需要",
+            "整理成开发任务这个不行",
+            "整理成开发任务不要",
+        ] {
+            assert_eq!(
+                make_plan(instruction, source).unwrap_err(),
+                TextActionPlanError::AmbiguousInstruction,
+                "negative recipe instruction must fail closed: {instruction}"
+            );
+        }
+
+        for (instruction, expected) in [
+            ("整理成待办并且不要增加内容", OrganizeRecipe::TodoList),
+            ("整理成待办，且不要补充事实。", OrganizeRecipe::TodoList),
+            ("请帮我整理成待办并且不要增加内容", OrganizeRecipe::TodoList),
+            (
+                "Please organize as a to-do list without adding facts",
+                OrganizeRecipe::TodoList,
+            ),
+            (
+                "Could you please organize as a to-do list without adding facts",
+                OrganizeRecipe::TodoList,
+            ),
+            (
+                "Organize as a to-do list, and do not add any content.",
+                OrganizeRecipe::TodoList,
+            ),
+            (
+                "整理成开发任务，保留正文里的‘工作进展和待办清单’",
+                OrganizeRecipe::DeveloperTask,
+            ),
+            (
+                "Organize as a developer task and preserve the title ‘work update and to-do list’",
+                OrganizeRecipe::DeveloperTask,
+            ),
+        ] {
+            assert_eq!(
+                make_plan(instruction, "Review the draft.").unwrap().recipe,
+                Some(expected),
+                "a bounded fidelity constraint does not negate the recipe: {instruction}"
+            );
+        }
+        for instruction in [
+            "Organize as a to-do list and add a deadline",
+            "整理成待办然后补充负责人",
+            "整理成待办和",
+            "整理成待办并且",
+            "整理成待办且",
+            "整理成待办并",
+            "整理成待办或者日历事项",
+            "Organize as a developer task and",
+            "Organize as a developer task or",
+            "Organize as a developer task or a calendar item",
+            "Organize as a to-do list without adding facts, but do not do that",
+        ] {
+            assert_eq!(
+                make_plan(instruction, source).unwrap_err(),
+                TextActionPlanError::AmbiguousInstruction,
+                "an unrecognized recipe tail fails closed: {instruction}"
+            );
+        }
+
+        let quoted_other_recipe = make_plan(
+            "‘developer task and work update’; please organize as a to-do list",
+            "One source paragraph.",
+        )
+        .unwrap();
+        assert_eq!(quoted_other_recipe.recipe, Some(OrganizeRecipe::TodoList));
+        let quoted_title_reference = make_plan(
+            "Organize as a to-do list and preserve the original title ‘developer task and work update’",
+            "One source paragraph.",
+        )
+        .unwrap();
+        assert_eq!(
+            quoted_title_reference.recipe,
+            Some(OrganizeRecipe::TodoList)
+        );
+        let source_mentions_other_recipes = make_plan(
+            "整理成待办",
+            "Developer task and work update are source words.",
+        )
+        .unwrap();
+        assert_eq!(
+            source_mentions_other_recipes.recipe,
+            Some(OrganizeRecipe::TodoList)
+        );
+
+        for instruction in [
+            "整理成开发任务和工作进展",
+            "整理成待办与开发任务",
+            "整理成开发任务及待办清单",
+            "Organize as a developer task and a progress report",
+            "Format as a to-do list and a development task",
+        ] {
+            assert_eq!(
+                make_plan(instruction, source).unwrap_err(),
+                TextActionPlanError::AmbiguousInstruction,
+                "shared-verb recipe coordination cannot silently select one: {instruction}"
+            );
+        }
+
+        for instruction in [
+            "整理成开发任务或工作进展",
+            "Organize as a developer task or a progress report",
+        ] {
+            assert_eq!(
+                make_plan(instruction, source).unwrap_err(),
+                TextActionPlanError::AmbiguousInstruction,
+                "a coordinated recipe choice must not silently choose one: {instruction}"
+            );
+        }
+
+        for instruction in [
+            "Rewrite and organize as a to-do list",
+            "Shorten and organize as a to-do list",
+            "Translate this and organize as a to-do list",
+            "Draft a reply and organize as a to-do list",
+            "Replace React with Preact and organize as a to-do list",
+        ] {
+            assert_eq!(
+                make_plan(instruction, "React is ready.").unwrap_err(),
+                TextActionPlanError::AmbiguousInstruction,
+                "a recipe cannot accompany another operation: {instruction}"
+            );
+        }
+
+        let legacy = make_plan("Don't organize this", source).unwrap();
+        assert_eq!(legacy.operation, TextActionOperation::Organize);
+        assert_eq!(
+            legacy.recipe, None,
+            "generic Organize detection stays unchanged"
+        );
+        assert_eq!(
+            make_plan("Organize as a work update", source).unwrap_err(),
+            TextActionPlanError::AmbiguousInstruction,
+            "the standalone update verb remains protected by exact-change detection"
+        );
+    }
+
+    #[test]
+    fn recipe_plan_binds_its_closed_identity_to_result_validation() {
+        let source = "API rollout is pending.";
+        let mut plan = make_plan("整理成开发任务", source).unwrap();
+        assert_eq!(
+            validate_generated_result(&plan, source, "开发任务\n- API rollout is pending."),
+            Ok(())
+        );
+        plan.recipe = Some(OrganizeRecipe::TodoList);
+        assert_eq!(
+            validate_generated_result(&plan, source, "待办清单\n- API rollout is pending."),
+            Err(TextActionGuardError::UnauthorizedEntityChange),
+            "changing recipe identity invalidates old source/instruction evidence"
+        );
+    }
+
+    #[test]
+    fn recipe_layout_proof_allows_only_fixed_title_and_source_order_paragraph_markers() {
+        let source = "Goal: API v1 is not ready.\n\nNext: keep React.";
+        let plan = make_plan("整理成开发任务", source).unwrap();
+        assert_eq!(
+            validate_generated_result(
+                &plan,
+                source,
+                "开发任务\n- Goal: API v1 is not ready.\n\n- Next: keep React."
+            ),
+            Ok(())
+        );
+
+        for candidate in [
+            "Developer task: API v1\n- Goal: API v1 is not ready.\n\n- Next: keep React.",
+            "未知标题\n- Goal: API v1 is not ready.\n\n- Next: keep React.",
+            "开发任务\n- Goal: API v1 is ready.\n\n- Next: keep React.",
+            "开发任务\n- Next: keep React.\n\n- Goal: API v1 is not ready.",
+            "开发任务\n- Goal: API v1 is not ready.\n\n- Next: keep React.\n- Ship Friday.",
+            "开发任务\n- Goal: API v1 is not ready.",
+        ] {
+            assert_eq!(
+                validate_generated_result(&plan, source, candidate),
+                Err(TextActionGuardError::ProtectedFactChanged),
+                "recipe body must preserve source exactly: {candidate}"
+            );
+        }
+
+        let source = "- Send the report.";
+        let plan = make_plan("整理成待办", source).unwrap();
+        let candidate = "待办清单\n- - Send the report.";
+        assert_eq!(
+            recipe_body_from_candidate(OrganizeRecipe::TodoList, candidate),
+            Some(expected_recipe_body(source).as_str()),
+            "the title and exact source layout proof already pass"
+        );
+        assert_eq!(
+            validate_generated_result(&plan, source, candidate),
+            Ok(()),
+            "the exact added outer marker must not change source-initial action-lead classification"
+        );
+        for candidate in [
+            "待办清单\n* - Send the report.",
+            "待办清单\n-  - Send the report.",
+            "待办清单\n- - Send the report.\n- extra",
+        ] {
+            assert_eq!(
+                validate_generated_result(&plan, source, candidate),
+                Err(TextActionGuardError::ProtectedFactChanged),
+                "layout projection is authorized only for exact witnessed markers: {candidate:?}"
+            );
+        }
+
+        let unicode_source = "预算1500元。\n\n下一步：Review API";
+        let unicode_plan = make_plan("整理成待办", unicode_source).unwrap();
+        assert_eq!(
+            validate_generated_result(
+                &unicode_plan,
+                unicode_source,
+                "待办清单\n- 预算1500元。\n\n- 下一步：Review API"
+            ),
+            Ok(()),
+            "witness byte ranges preserve Unicode source exactly"
+        );
+        assert_eq!(
+            validate_generated_result(
+                &unicode_plan,
+                unicode_source,
+                "待办清单\n- 预算1500元。\n\n- 下一步：Review Api"
+            ),
+            Err(TextActionGuardError::ProtectedFactChanged),
+            "Unicode body mutation remains outside the layout projection"
+        );
+
+        let duplicate_source = "One item.\n\nOne item.";
+        let duplicate_plan = make_plan("整理成待办", duplicate_source).unwrap();
+        assert_eq!(
+            validate_generated_result(&duplicate_plan, duplicate_source, "待办清单\n- One item."),
+            Err(TextActionGuardError::ProtectedFactChanged),
+            "repeated source paragraphs cannot be deleted"
+        );
+        let source = "can not run.";
+        let plan = make_plan("整理成待办", source).unwrap();
+        assert_eq!(
+            validate_generated_result(&plan, source, "待办清单\n- cannot run."),
+            Err(TextActionGuardError::ProtectedFactChanged),
+            "whitespace inside source words is not normalized away"
+        );
+
+        for (instruction, source, candidate) in [
+            (
+                "Organize as a developer task",
+                "Ship API v2 on Friday.",
+                "Developer task\n- Ship API v2 on Friday.",
+            ),
+            (
+                "Organize as a progress report",
+                "API rollout is pending.",
+                "Work update\n- API rollout is pending.",
+            ),
+            (
+                "Format as a to-do list",
+                "Review the migration.",
+                "To-do list\n- Review the migration.",
+            ),
+        ] {
+            let plan = make_plan(instruction, source).unwrap();
+            assert_eq!(
+                validate_generated_result(&plan, source, candidate),
+                Ok(()),
+                "the fixed English recipe title is valid: {candidate}"
+            );
+        }
+
+        let source = "下一步甲；完成乙";
+        let plan = make_plan("整理成工作进展", source).unwrap();
+        assert_eq!(
+            validate_generated_result(&plan, source, "工作进展\n- 完成甲；下一步乙"),
+            Err(TextActionGuardError::ProtectedFactChanged),
+            "recipe proof rejects changed attribution/order without protected terms"
+        );
+        let source = "明天上线";
+        let plan = make_plan("整理成开发任务", source).unwrap();
+        assert_eq!(
+            validate_generated_result(&plan, source, "开发任务\n- 已经上线"),
+            Err(TextActionGuardError::ProtectedFactChanged),
+            "recipe proof rejects changed facts without protected terms"
+        );
+    }
+
+    #[test]
+    fn recipe_layout_proof_preserves_source_whitespace_titles_and_code() {
+        let source = "\tFirst  \r\n\r\n  Second\r\n";
+        let plan = make_plan("整理成待办", source).unwrap();
+        assert_eq!(
+            validate_generated_result(
+                &plan,
+                source,
+                "待办清单\r\n- \tFirst  \r\n\r\n-   Second\r\n"
+            ),
+            Ok(())
+        );
+
+        let source = "# Work update\n- API v1 is pending.";
+        let plan = make_plan("整理成工作进展", source).unwrap();
+        assert_eq!(
+            validate_generated_result(
+                &plan,
+                source,
+                "工作进展\n- # Work update\n- API v1 is pending."
+            ),
+            Ok(()),
+            "source-owned title text remains in the body after title projection"
+        );
+        assert_eq!(
+            validate_generated_result(&plan, source, "工作进展\n- API v1 is pending."),
+            Err(TextActionGuardError::ProtectedFactChanged),
+            "the recipe title cannot erase a source-owned title"
+        );
+
+        let source = "Run `cargo test`.\n  cargo fmt";
+        assert!(protected_span::has_code_literals(source));
+        let plan = make_plan("整理成开发任务", source).unwrap();
+        assert_eq!(
+            validate_generated_result(&plan, source, &format!("开发任务\n{source}")),
+            Ok(()),
+            "code source stays byte-for-byte, without a list prefix"
+        );
+        assert_eq!(
+            validate_generated_result(&plan, source, &format!("开发任务\n- {source}")),
+            Err(TextActionGuardError::ProtectedFactChanged),
+            "recipe formatting cannot change code indentation or wrapper layout"
+        );
+    }
+
+    #[test]
     fn negated_exact_change_requests_are_not_authorization() {
         for instruction in [
             "Do not replace $900 with $1200.",
@@ -2021,6 +3195,71 @@ mod tests {
         assert_eq!(
             make_plan("Rewrite this", &source).unwrap_err(),
             TextActionPlanError::UnsupportedInstruction
+        );
+    }
+
+    #[test]
+    fn recipe_output_budget_is_checked_before_dispatch_for_every_allowed_title() {
+        let cases = [
+            (
+                "整理成开发任务",
+                MAX_ACTION_SOURCE_BYTES - 14 - 2 - 2,
+                "Developer task",
+                "开发任务",
+            ),
+            (
+                "整理成工作进展",
+                MAX_ACTION_SOURCE_BYTES - 12 - 2 - 2,
+                "工作进展",
+                "Work update",
+            ),
+            (
+                "整理成待办",
+                MAX_ACTION_SOURCE_BYTES - 12 - 2 - 2,
+                "待办清单",
+                "To-do list",
+            ),
+        ];
+        for (instruction, exact_source_len, longest_title, second_title) in cases {
+            let exact_source = "a".repeat(exact_source_len);
+            let plan = make_plan(instruction, &exact_source)
+                .expect("the largest accepted title plus CRLF and layout fits exactly");
+            for title in [longest_title, second_title] {
+                for separator in ["\n", "\r\n"] {
+                    let candidate = format!("{title}{separator}- {exact_source}");
+                    assert!(candidate.len() <= MAX_ACTION_SOURCE_BYTES);
+                    if title == longest_title && separator == "\r\n" {
+                        assert_eq!(candidate.len(), MAX_ACTION_SOURCE_BYTES);
+                    }
+                    assert_eq!(
+                        validate_generated_result(&plan, &exact_source, &candidate),
+                        Ok(()),
+                        "every fixed title and accepted header separator must fit"
+                    );
+                }
+            }
+
+            let one_byte_too_long = "a".repeat(exact_source_len + 1);
+            assert_eq!(
+                make_plan(instruction, &one_byte_too_long).unwrap_err(),
+                TextActionPlanError::SourceTooLong,
+                "the longest accepted title plus CRLF and body exceeds the cap by one byte"
+            );
+        }
+
+        let many_paragraphs = format!("{}a", "a\n\n".repeat(5_000));
+        assert!(many_paragraphs.len() < MAX_ACTION_SOURCE_BYTES);
+        assert_eq!(
+            make_plan("整理成待办", &many_paragraphs).unwrap_err(),
+            TextActionPlanError::SourceTooLong,
+            "all inserted paragraph markers are included in the dispatch budget"
+        );
+
+        let advertised_source_limit = "a".repeat(MAX_ACTION_SOURCE_BYTES);
+        assert_eq!(
+            make_plan("整理成待办", &advertised_source_limit).unwrap_err(),
+            TextActionPlanError::SourceTooLong,
+            "a source accepted by the capture limit but unable to fit any complete recipe output is rejected before dispatch"
         );
     }
 

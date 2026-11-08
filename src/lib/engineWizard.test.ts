@@ -2,11 +2,15 @@ import { describe, expect, it } from "vitest";
 import {
   DEFAULT_ASR_MODEL,
   DEFAULT_CLEANUP_MODEL,
+  customOriginChanged,
+  customHostChanged,
   draftFromSettings,
   hostnameOf,
+  hasProviderSecret,
   isEngineConnected,
   maskSecret,
   persistPatch,
+  probePayload,
   step2Ready,
   switchProvider,
   type EngineDraft,
@@ -58,6 +62,8 @@ function emptyDraft(overrides: Partial<EngineDraft> = {}): EngineDraft {
     customBaseUrl: "",
     customAsr: true,
     customLlm: true,
+    customCleanupParameters: {},
+    customCleanupParametersText: "",
     ollamaBaseUrl: "http://127.0.0.1:11434/v1",
     localWhisperBaseUrl: "http://127.0.0.1:9000/v1",
     providerKeys: {},
@@ -109,6 +115,51 @@ describe("engine wizard rules", () => {
         },
       }),
     ).toBe(false);
+  });
+
+  it("does not reuse a saved Custom key when the shared host changes", () => {
+    const settings = {
+      ...groqConnected,
+      custom_base_url: "https://old.example/v1",
+      provider_keys: { custom: { configured: true, hint: "••••old" } },
+    };
+    const changed = emptyDraft({ asrProvider: "custom", customBaseUrl: "https://new.example/v1" });
+    expect(hasProviderSecret("custom", changed, settings)).toBe(false);
+    expect(hasProviderSecret("custom", { ...changed, providerKeys: { custom: "new-key" } }, settings)).toBe(true);
+    expect(hasProviderSecret("custom", { ...changed, customBaseUrl: "http://127.0.0.1:8000/v1" }, settings)).toBe(true);
+  });
+
+  it("binds Custom credentials to scheme and effective port, not endpoint path", () => {
+    const settings = { ...groqConnected, custom_base_url: "https://router.example/v1" };
+    expect(customOriginChanged("https://router.example/v1", "https://router.example:8443/v1")).toBe(true);
+    expect(customOriginChanged("https://router.example/v1", "http://router.example/v1")).toBe(true);
+    expect(customOriginChanged("https://router.example/v1", "https://router.example:443/chat/completions")).toBe(false);
+    expect(customHostChanged(emptyDraft({ customBaseUrl: "https://router.example:8443/v1" }), settings)).toBe(true);
+    expect(customHostChanged(emptyDraft({ customBaseUrl: "http://router.example/v1" }), settings)).toBe(true);
+    expect(customHostChanged(emptyDraft({ customBaseUrl: "https://router.example:443/chat/completions" }), settings)).toBe(false);
+    expect(customHostChanged(emptyDraft({ customBaseUrl: "" }), settings)).toBe(true);
+  });
+
+  it("persists typed cleanup parameters and stage-scopes a probe without applying it", () => {
+    const draft = emptyDraft({
+      asrProvider: "custom",
+      cleanupProvider: "custom",
+      customBaseUrl: "https://provider.example/v1",
+      customCleanupParameters: { temperature: 0.2, extension: { enabled: false } },
+      customCleanupParametersText: '{"temperature":0.2,"extension":{"enabled":false}}',
+      providerKeys: { custom: "typed-key" },
+    });
+    expect(persistPatch(draft, groqConnected)).toMatchObject({ custom_cleanup_parameters: draft.customCleanupParameters });
+    const payload = probePayload(draft, groqConnected, { cleanupProvider: "custom", cleanupEnabled: true, probeStage: "cleanup" });
+    expect(payload.probe_stage).toBe("cleanup");
+    expect(payload.cleanup_provider).toBe("custom");
+    expect(payload.provider_keys).toEqual({ custom: "typed-key" });
+    expect(payload.custom_cleanup_parameters).toEqual(draft.customCleanupParameters);
+    expect(persistPatch(draft, groqConnected).provider_keys).toEqual({ custom: "typed-key" });
+
+    const switched = switchProvider(draft, "cleanup", "groq");
+    expect(persistPatch(switched, groqConnected).custom_cleanup_parameters).toEqual(draft.customCleanupParameters);
+    expect(probePayload(switched, groqConnected, { cleanupProvider: "groq", cleanupEnabled: true, probeStage: "cleanup" }).custom_cleanup_parameters).toEqual({});
   });
 
   it("resets the model and keeps pool keys when switching a side", () => {

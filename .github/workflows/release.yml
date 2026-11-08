@@ -28,10 +28,29 @@ env:
   NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
 
 jobs:
+  ci:
+    name: CI gates
+    uses: ./.github/workflows/ci.yml
+
+  dispatch-branch-guard:
+    name: Validate manual release branch
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require main branch before signing setup
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ] && [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "Manual releases must be run from refs/heads/main (got $GITHUB_REF)" >&2
+            exit 1
+          fi
+
   build-mac:
     name: macOS DMG
+    needs: [ci, dispatch-branch-guard]
     runs-on: macos-14
     timeout-minutes: 90
+    outputs:
+      signing_status: ${{ steps.resolve-signing.outputs.signing_status }}
+      dmg_path: ${{ steps.resolve-signing.outputs.dmg_path }}
     steps:
       - uses: actions/checkout@v4
 
@@ -58,6 +77,10 @@ jobs:
             exit 1
           fi
 
+      - name: Require main branch for manual release
+        if: github.event_name == 'workflow_dispatch'
+        run: test "$GITHUB_REF" = "refs/heads/main"
+
       - name: Import stable signing certificate
         timeout-minutes: 3
         env:
@@ -65,35 +88,49 @@ jobs:
           MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
         run: ./scripts/import-signing-cert.sh
 
+      - name: Resolve actual DMG signing state
+        id: resolve-signing
+        env:
+          VOICEFLOW_ALLOW_UNSIGNED: ${{ vars.VOICEFLOW_ALLOW_UNSIGNED }}
+        run: |
+          signing_env="$(./scripts/resolve-dmg-signing.sh)"
+          eval "$signing_env"
+          if [ -n "$APPLE_SIGNING_IDENTITY" ] && [ -n "$APPLE_TEAM_ID" ]; then
+            signing_status=signed
+            dmg_path=.build/release/VoiceFlow.dmg
+          elif [ -z "$APPLE_SIGNING_IDENTITY" ] && [ -z "$APPLE_TEAM_ID" ] && [ "$VOICEFLOW_ALLOW_UNSIGNED" = "1" ]; then
+            signing_status=unsigned
+            dmg_path=.build/release/VoiceFlow-unsigned.dmg
+          else
+            echo "error: resolver returned an invalid signing identity/team combination" >&2
+            exit 1
+          fi
+          echo "signing_status=$signing_status" >> "$GITHUB_OUTPUT"
+          echo "dmg_path=$dmg_path" >> "$GITHUB_OUTPUT"
+          echo "APPLE_SIGNING_IDENTITY=$APPLE_SIGNING_IDENTITY" >> "$GITHUB_ENV"
+          echo "APPLE_TEAM_ID=$APPLE_TEAM_ID" >> "$GITHUB_ENV"
+          echo "VOICEFLOW_ALLOW_UNSIGNED=$VOICEFLOW_ALLOW_UNSIGNED" >> "$GITHUB_ENV"
+          echo "VOICEFLOW_RELEASE_SIGNING_STATUS=$signing_status" >> "$GITHUB_ENV"
+
       - name: Package Release DMG
         run: make dmg
 
       - name: Upload DMG artifact
         uses: actions/upload-artifact@v4
         with:
-          name: macos-dmg
-          path: .build/release/VoiceFlow.dmg
+          name: macos-dmg-${{ steps.resolve-signing.outputs.signing_status }}
+          path: ${{ steps.resolve-signing.outputs.dmg_path }}
           if-no-files-found: error
 
   release:
     name: GitHub Release
-    needs: build-mac
+    needs: [ci, build-mac]
     if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v4
-
-      - uses: actions/download-artifact@v4
-        with:
-          name: macos-dmg
-          path: artifacts
-
-      - name: Require installer artifact
-        run: |
-          test -f artifacts/VoiceFlow.dmg
-          ls -lh artifacts/VoiceFlow.dmg
 
       - name: Resolve release tag
         id: tag
@@ -104,17 +141,37 @@ jobs:
             echo "name=v$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Download the resolved signing artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: macos-dmg-${{ needs.build-mac.outputs.signing_status }}
+          path: artifacts
+
+      - name: Require installer artifact
+        env:
+          SIGNING_STATUS: ${{ needs.build-mac.outputs.signing_status }}
+          DMG_PATH: ${{ needs.build-mac.outputs.dmg_path }}
+        run: |
+          asset="${DMG_PATH##*/}"
+          test -f "artifacts/$asset"
+          ls -lh "artifacts/$asset"
+          printf 'VoiceFlow release signing status: %s. This describes code signing only; it does not claim Apple notarization.\n' "$SIGNING_STATUS" > release-notes.md
+
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SIGNING_STATUS: ${{ needs.build-mac.outputs.signing_status }}
+          DMG_PATH: ${{ needs.build-mac.outputs.dmg_path }}
         run: |
           tag="${{ steps.tag.outputs.name }}"
+          asset="${DMG_PATH##*/}"
           if gh release view "$tag" >/dev/null 2>&1; then
-            gh release upload "$tag" artifacts/VoiceFlow.dmg --clobber
+            gh release upload "$tag" "artifacts/$asset"
+            gh release edit "$tag" --notes-file release-notes.md
           else
-            gh release create "$tag" artifacts/VoiceFlow.dmg \
+            gh release create "$tag" "artifacts/$asset" \
               --title "VoiceFlow $tag" \
-              --generate-notes \
+              --notes-file release-notes.md \
               --latest \
               --target "${{ github.sha }}"
           fi

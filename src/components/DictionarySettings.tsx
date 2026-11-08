@@ -1,3 +1,5 @@
+import { Select } from "./Select";
+import { useSessionDraftState } from "../lib/sessionDraft";
 import { useCallback, useEffect, useRef, useState } from "react";
 import type React from "react";
 import { invoke } from "@tauri-apps/api/core";
@@ -5,14 +7,28 @@ import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { FileText, Upload } from "lucide-react";
 import { ConfirmDialog } from "./ConfirmDialog";
+import { DictionaryLesson } from "./Onboarding/ContextualLessons";
+import { DictionaryLearningAudit } from "./DictionaryLearningAudit";
 import { SettingsAlert, SettingsDisclosure, SettingsGroup, SettingsPageHeader, SettingsRow, SettingsShell } from "./SettingsLayout";
 import { MAX_DICTIONARY_FILE_BYTES, mergeDictionary, parseDictionaryText } from "../lib/dictionaryImport";
 import { useI18n } from "../lib/i18n";
+import { friendlyDictionaryLearningError } from "../lib/settingsError";
 import { buttonClass, compactButtonClass, inputClass } from "../lib/theme";
 import { Toggle } from "./Toggle";
 import type { SaveSettings, Settings } from "../types/settings";
 
 const controlClass = inputClass;
+const DICTIONARY_PARTIAL_FAILURE_PREFIX = "learning_dictionary_partial:";
+
+function isDictionaryPartialFailure(reason: unknown): boolean {
+  let message = "";
+  if (typeof reason === "string") message = reason;
+  else if (reason instanceof Error) message = reason.message;
+  else if (reason && typeof reason === "object" && "message" in reason && typeof reason.message === "string") {
+    message = reason.message;
+  }
+  return message.startsWith(DICTIONARY_PARTIAL_FAILURE_PREFIX);
+}
 
 type LearnPair = {
   pair_key: string;
@@ -24,7 +40,11 @@ type LearnPair = {
   promote_hits?: number;
   pinned?: boolean;
   last_at?: string;
+  manual_scoped?: boolean;
+  native_bundle?: string | null;
 };
+
+type ApplicationOption = { bundle_id: string; label: string };
 
 type StyleDraft = {
   draft_key: string;
@@ -37,9 +57,10 @@ type StyleDraft = {
 
 type LearnedTermUsage = { word: string; replacement_runs: number; last_replaced_at: string };
 
-export function DictionarySettings({ settings, save }: { settings: Settings; save: SaveSettings }) {
+export function DictionarySettings({ settings, save, onOpenHistory, onOpenPreferences }: { settings: Settings; save: SaveSettings; onOpenHistory?: () => void; onOpenPreferences?: () => void }) {
   const { t } = useI18n();
-  const [newWord, setNewWord] = useState("");
+  const [newWord, setNewWord] = useSessionDraftState("dictionary:newWord", "");
+  const newWordInput = useRef<HTMLInputElement>(null);
   const [addingWord, setAddingWord] = useState(false);
   const addingWordRef = useRef(false);
   const [dictionaryFailed, setDictionaryFailed] = useState(false);
@@ -49,6 +70,11 @@ export function DictionarySettings({ settings, save }: { settings: Settings; sav
   const [pendingDeleteWord, setPendingDeleteWord] = useState<string | null>(null);
   const [pendingPairs, setPendingPairs] = useState<LearnPair[]>([]);
   const [promotedPairs, setPromotedPairs] = useState<LearnPair[]>([]);
+  const [manualApplications, setManualApplications] = useState<ApplicationOption[] | null>(null);
+  const [manualApplicationsFailed, setManualApplicationsFailed] = useState(false);
+  const [manualBefore, setManualBefore] = useSessionDraftState("dictionary:manualBefore", "");
+  const [manualAfter, setManualAfter] = useSessionDraftState("dictionary:manualAfter", "");
+  const [manualBundle, setManualBundle] = useSessionDraftState("dictionary:manualBundle", "");
   const [termUsage, setTermUsage] = useState<LearnedTermUsage[] | null>(null);
   const [styleDrafts, setStyleDrafts] = useState<StyleDraft[]>([]);
   const [pinnedTerms, setPinnedTerms] = useState<string[]>([]);
@@ -101,9 +127,21 @@ export function DictionarySettings({ settings, save }: { settings: Settings; sav
       await loadPendingPairs();
       failedLearningActionRef.current = null;
       return true;
-    } catch {
+    } catch (reason) {
       failedLearningActionRef.current = { command, args };
-      setLearningActionError(t("词典操作未完成，请重试。"));
+      const dictionaryError = friendlyDictionaryLearningError(reason, t);
+      if (dictionaryError) {
+        setLearningActionError(dictionaryError);
+      } else {
+        const message = command === "add_manual_scoped_learn_pair"
+          ? reason === "manual_pair_scope_conflict"
+            ? "同一纠正已在其他范围登记；请先在已生效替换中忘记旧规则，再添加。"
+            : reason === "manual_pair_scope_unknown"
+              ? "所选 App 已不在运行，或当前范围无法确认；请重新选择后重试。"
+              : "专用纠正未能保存；现有规则没有被覆盖，请重试。"
+          : "词典操作未完成，请重试。";
+        setLearningActionError(t(message));
+      }
       return false;
     } finally {
       learningBusyRef.current = false;
@@ -132,6 +170,45 @@ export function DictionarySettings({ settings, save }: { settings: Settings; sav
     };
   }, [loadPendingPairs]);
 
+  const [manualApplicationsLoading, setManualApplicationsLoading] = useState(false);
+  const manualApplicationsRequest = useRef(0);
+  const refreshManualApplications = useCallback(async () => {
+    const request = ++manualApplicationsRequest.current;
+    setManualApplicationsLoading(true);
+    try {
+      const applications = await invoke<ApplicationOption[]>("get_manual_learn_applications");
+      if (request !== manualApplicationsRequest.current) return;
+      const next = Array.isArray(applications) ? applications : [];
+      setManualApplications(next); setManualApplicationsFailed(false);
+      setManualBundle((current) => next.some((application) => application.bundle_id === current) ? current : "");
+    } catch {
+      if (request !== manualApplicationsRequest.current) return;
+      setManualApplicationsFailed(true);
+    } finally {
+      if (request === manualApplicationsRequest.current) setManualApplicationsLoading(false);
+    }
+  }, [setManualBundle]);
+  useEffect(() => {
+    void refreshManualApplications();
+    const onFocus = () => void refreshManualApplications();
+    window.addEventListener("focus", onFocus);
+    return () => { manualApplicationsRequest.current++; window.removeEventListener("focus", onFocus); };
+  }, [refreshManualApplications]);
+
+  const addManualPair = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!manualBundle || !manualBefore.trim() || !manualAfter.trim() || learningBusyRef.current) return;
+    const added = await runLearningAction("add_manual_scoped_learn_pair", {
+      beforeSurface: manualBefore.trim(),
+      afterSurface: manualAfter.trim(),
+      bundleId: manualBundle,
+    });
+    if (added) {
+      setManualBefore("");
+      setManualAfter("");
+    }
+  };
+
   const importText = useCallback(async (text: string, fileName: string) => {
     const extension = fileName.toLowerCase().split(".").pop();
     if (!extension || !["csv", "txt", "tsv"].includes(extension)) {
@@ -147,19 +224,24 @@ export function DictionarySettings({ settings, save }: { settings: Settings; sav
     setDictionaryMessage(null);
     try {
       const result = mergeDictionary(settingsRef.current.dictionary, parseDictionaryText(text, fileName));
-      if (result.added > 0) {
-        await invoke("add_dictionary_entries", { words: result.words });
+      if (result.requested.length > 0) {
+        await invoke("add_dictionary_entries", { words: result.requested });
       }
       const details = [
-        `${t("已导入")} ${result.added} ${t("条")}`,
+        result.requested.length > 0
+          ? t("已登记个人词条：{count} 条").replace("{count}", String(result.requested.length))
+          : t("没有找到可导入的新词条。"),
+        result.added > 0 ? t("新增词条：{count} 条").replace("{count}", String(result.added)) : null,
         result.duplicates > 0 ? `${t("重复")} ${result.duplicates} ${t("条")}` : null,
         result.invalid > 0 ? `${t("无效")} ${result.invalid} ${t("条")}` : null,
         result.limited > 0 ? `${t("超出上限")} ${result.limited} ${t("条")}` : null,
       ].filter(Boolean).join(" · ");
-      setDictionaryMessage(details || t("没有找到可导入的新词条。"));
+      setDictionaryMessage(details);
     } catch (reason) {
       setDictionaryFailed(true);
-      setDictionaryMessage(t("导入失败：") + (reason instanceof Error ? reason.message : String(reason)));
+      setDictionaryMessage(isDictionaryPartialFailure(reason)
+        ? t("词条来源已记录，但个人词典未能同步。请重新导入以重试。")
+        : t("导入失败：") + (reason instanceof Error ? reason.message : String(reason)));
     } finally {
       importingRef.current = false;
       setDictionaryImporting(false);
@@ -247,28 +329,30 @@ export function DictionarySettings({ settings, save }: { settings: Settings; sav
     const word = newWord.trim();
     if (!word) return;
     const result = mergeDictionary(settings.dictionary, [word]);
-    if (result.added === 0) {
+    if (result.requested.length === 0) {
       setDictionaryFailed(true);
       setDictionaryMessage(result.duplicates > 0 ? t("这个词条已经存在。") : t("词条无效或已达到上限。"));
       return;
     }
     addingWordRef.current = true;
     setAddingWord(true);
-    void invoke("add_dictionary_entries", { words: result.words })
+    void invoke("add_dictionary_entries", { words: result.requested })
       .then(() => {
         setNewWord((current) => current.trim() === word ? "" : current);
         setDictionaryFailed(false);
-        setDictionaryMessage(null);
+        setDictionaryMessage(result.added === 0 ? t("已有词条已登记为手动词条。") : null);
       })
-      .catch(() => {
+      .catch((reason) => {
         setDictionaryFailed(true);
-        setDictionaryMessage(t("词条无效或已达到上限。"));
+        setDictionaryMessage(isDictionaryPartialFailure(reason)
+          ? t("词条来源已记录，但个人词典未能同步。再次添加此词条可重试。")
+          : t("词条添加失败：") + (reason instanceof Error ? reason.message : String(reason)));
       })
       .finally(() => { addingWordRef.current = false; setAddingWord(false); });
   };
 
   const learnedAfters = new Set(promotedPairs.map((pair) => pair.after_surface));
-  const manualWords = settings.dictionary.filter((word) => !learnedAfters.has(word));
+  const dictionaryWords = settings.dictionary;
   const liveUsage = termUsage?.filter((item) => learnedAfters.has(item.word));
   const recentPairs = [...promotedPairs].sort((a, b) => (b.last_at ?? "").localeCompare(a.last_at ?? "")).slice(0, 3);
 
@@ -291,7 +375,7 @@ export function DictionarySettings({ settings, save }: { settings: Settings; sav
       <SettingsGroup title={t("添加词条")}>
         <SettingsRow title={t("添加个人词典词条")} description={t("输入一个词条，或从 CSV、TXT、TSV 文件导入。")}>
           <div className="flex w-full min-w-0 gap-2 sm:w-auto">
-            <input aria-label={t("添加个人词典词条")} value={newWord} onChange={(event) => setNewWord(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.nativeEvent.isComposing) { event.preventDefault(); addWord(); } }} placeholder={t("添加人名或术语…")} className={"min-w-0 flex-1 sm:w-48 " + controlClass} />
+            <input ref={newWordInput} data-delete-focus-fallback aria-label={t("添加个人词典词条")} value={newWord} onChange={(event) => setNewWord(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.nativeEvent.isComposing) { event.preventDefault(); addWord(); } }} placeholder={t("添加人名或术语…")} className={"min-w-0 flex-1 sm:w-48 " + controlClass} />
             <button type="button" onClick={addWord} aria-busy={addingWord} disabled={!newWord.trim() || addingWord} className={`${buttonClass} min-w-28`}>{t(addingWord ? "添加中…" : "添加")}</button>
           </div>
         </SettingsRow>
@@ -318,33 +402,61 @@ export function DictionarySettings({ settings, save }: { settings: Settings; sav
         </div>
         {dictionaryMessage && <p role={dictionaryFailed ? "alert" : "status"} className={`px-5 pb-4 text-xs leading-5 ${dictionaryFailed ? "text-error-ink" : "text-secondary"}`}>{dictionaryMessage}</p>}
       </SettingsGroup>
-      <SettingsGroup title={t("词条列表")} description={`${manualWords.length} ${t("条")}`}>
-        {manualWords.length > 0 ? manualWords.map((word) => (
-          <div key={word} className="flex flex-wrap items-center gap-3 px-5 py-4 text-sm">
+      <DictionaryLesson onAddTerm={() => newWordInput.current?.focus()} onOpenHistory={onOpenHistory} onOpenPreferences={onOpenPreferences} />
+      <SettingsGroup title={t("词条列表")} description={`${dictionaryWords.length} ${t("条")}`}>
+        {dictionaryWords.length > 0 ? dictionaryWords.map((word) => (
+          <div key={word} data-focus-row className="flex flex-wrap items-center gap-3 px-5 py-4 text-sm">
             <span className="min-w-0 flex-1 break-words text-primary">{word}</span>
             <button type="button" disabled={learningBusy} aria-label={`${pinnedTerms.includes(word) ? t("取消置顶") : t("置顶")} ${word}`} onClick={() => void runLearningAction("pin_dictionary_term", { word, pinned: !pinnedTerms.includes(word) })} className={compactButtonClass}>{pinnedTerms.includes(word) ? t("已置顶") : t("置顶")}</button>
             <button type="button" disabled={learningBusy} aria-label={`${t("删除")} ${word}`} onClick={() => { setLearningActionError(null); setPendingDeleteWord(word); }} className={`${compactButtonClass} enabled:hover:bg-error/10 enabled:hover:text-error-ink`}>{t("删除")}</button>
           </div>
-        )) : <p className="px-5 py-6 text-sm text-secondary">{t("没有手加或导入的词条。")}</p>}
+        )) : <p className="px-5 py-6 text-sm text-secondary">{t("当前没有个人词典词条。")}</p>}
       </SettingsGroup>
       <SettingsGroup title={t("词典学习")}>
-        <SettingsRow title={t("学习词条")} description={t("默认第 3 次静默纠正，人名第 2 次；也可在历史或本页确认。继续打字不会学习。")}>
+        <SettingsRow title={t("学习词条")} description={t("普通词需 3 次、人名需 2 次不同听写中的纠正；同一听写重复保存只计一次。也可在历史或本页确认，继续打字不会学习。")}>
           <Toggle checked={settings.dictionary_learn_enabled !== false} onChange={(checked) => save({ dictionary_learn_enabled: checked })} label={t("学习词条")} />
+        </SettingsRow>
+        <SettingsRow title={t("本机观察插入后的改动")} description={t("仅在 VoiceFlow 已确认插入后，短暂读取同一输入框，并只学习唯一插入片段内的改动；按当前 App 范围学习，不读取其他屏幕文字，也不会发送这些改动。关闭后撤销这项独立授权；若该 App 已单独授权读取辅助功能文字，该权限仍可能允许观察。") }>
+          <Toggle checked={settings.local_edit_learning_enabled === true} onChange={(checked) => save({ local_edit_learning_enabled: checked })} label={t("本机观察插入后的改动")} />
         </SettingsRow>
       </SettingsGroup>
       {pendingPairs.length > 0 && (
         <SettingsGroup title={t("待确认的纠正")}>
           {pendingPairs.map((pair) => (
             <div key={pair.pair_key} role="group" aria-label={`${pair.before_surface} → ${pair.after_surface}`} className="flex flex-wrap items-center gap-3 px-5 py-4 text-sm">
-              <span className="min-w-0 flex-1 break-words text-primary">{pair.before_surface} <span className="text-secondary">→</span> <strong className="font-medium">{pair.after_surface}</strong><span className="mt-1 block text-xs tabular-nums text-secondary">{pair.hits}/{pair.promote_hits || 3} {t("次纠正记录")}</span></span>
+              <span className="min-w-0 flex-1 break-words text-primary">{pair.before_surface} <span className="text-secondary">→</span> <strong className="font-medium">{pair.after_surface}</strong><span className="mt-1 block text-xs tabular-nums text-secondary">{pair.hits} {t("次纠正记录")}</span></span>
               <button type="button" disabled={learningBusy} onClick={() => void runLearningAction("promote_learn_pair", { pairKey: pair.pair_key, beforeSurface: pair.before_surface, afterSurface: pair.after_surface })} className={compactButtonClass}>{t("确认")}</button>
               <button type="button" disabled={learningBusy} onClick={() => void runLearningAction("ignore_learn_pair", { pairKey: pair.pair_key })} className={`${compactButtonClass} enabled:hover:bg-error/10 enabled:hover:text-error-ink`}>{t("忽略")}</button>
             </div>
           ))}
         </SettingsGroup>
       )}
+      <SettingsGroup title={t("手动添加 App 专用纠正")} description={t("明确选择一个正在运行的原生 App；规则只在所选 App 生效，不改全局个人词典，也不改历史记录。可随时忘记撤销。") }>
+        <form onSubmit={(event) => void addManualPair(event)} className="grid gap-3 px-5 py-4 sm:grid-cols-2">
+          <label className="grid gap-1.5 text-sm text-secondary">
+            <span>{t("听写识别为")}</span>
+            <input aria-label={t("听写识别为")} className={controlClass} value={manualBefore} onChange={(event) => setManualBefore(event.target.value)} maxLength={256} />
+          </label>
+          <label className="grid gap-1.5 text-sm text-secondary">
+            <span>{t("应替换为")}</span>
+            <input aria-label={t("应替换为")} className={controlClass} value={manualAfter} onChange={(event) => setManualAfter(event.target.value)} maxLength={256} />
+          </label>
+          <label className="grid gap-1.5 text-sm text-secondary sm:col-span-2">
+            <span>{t("仅在此 App 生效")}</span>
+            <Select aria-label={t("仅在此 App 生效")} className={controlClass} value={manualBundle} onValueChange={setManualBundle} disabled={manualApplicationsLoading || manualApplicationsFailed || manualApplications == null || manualApplications.length === 0}>
+              <option value="">{t("选择一个正在运行的原生 App")}</option>
+              {(manualApplications ?? []).map((application) => <option key={application.bundle_id} value={application.bundle_id}>{application.label}</option>)}
+            </Select>
+          </label>
+          {manualApplicationsFailed ? <p role="alert" className="text-xs text-error-ink sm:col-span-2">{t("无法读取当前运行的 App；请重试后再添加。")}</p> : manualApplications?.length === 0 ? <p role="status" className="text-xs text-secondary sm:col-span-2">{t("目前没有可选的运行中原生 App。")}</p> : null}
+          <div className="flex flex-wrap justify-between gap-2 sm:col-span-2">
+            <button type="button" disabled={manualApplicationsLoading} aria-busy={manualApplicationsLoading} onClick={() => void refreshManualApplications()} className={compactButtonClass}>{t(manualApplicationsLoading ? "正在刷新…" : "刷新 App 列表")}</button>
+            <button type="submit" disabled={learningBusy || manualApplicationsLoading || manualApplicationsFailed || !manualBundle || !manualBefore.trim() || !manualAfter.trim()} className={buttonClass}>{learningBusy ? t("保存中…") : t("添加专用纠正")}</button>
+          </div>
+        </form>
+      </SettingsGroup>
       {styleDrafts.length > 0 && (
-        <SettingsGroup title={t("待确认口癖")} description={t("确认后会覆盖该 App 现有的风格样例。")}>
+        <SettingsGroup title={t("待确认口癖")} description={t("确认会保存这组样例，并批准用于该 App 后续的整理请求。可在语气的 App 规则中撤销批准。")}>
           {styleDrafts.map((draft) => (
             <div key={draft.draft_key} className="flex flex-wrap items-center gap-3 px-5 py-4 text-sm">
               <span className="min-w-0 flex-1 text-primary">{draft.mapping_id} · {t(draft.style_key === "fewer_periods" ? "少用句号" : draft.style_key === "more_questions" ? "爱用问号" : "标点密度")} · {draft.excerpt}</span>
@@ -363,8 +475,10 @@ export function DictionarySettings({ settings, save }: { settings: Settings; sav
                 {pair.before_surface} → {pair.after_surface}
                 <span className="ml-2 text-xs text-tertiary">{pair.hits} {t("次纠正记录")}</span>
                 {pair.promote_hits === 2 ? <span className="ml-2 text-xs text-tertiary">{t("人名")}</span> : null}
+                {pair.native_bundle ? <span className="mt-1 block text-xs text-secondary">{t("适用 App：")} {manualApplications?.find((application) => application.bundle_id === pair.native_bundle)?.label ?? pair.native_bundle}</span> : null}
+                {pair.manual_scoped ? <span className="mt-1 block text-xs text-secondary">{t("仅本机词典规则；不会写入全局词条")}</span> : null}
               </span>
-              <button type="button" disabled={learningBusy} aria-label={`${pinned ? t("取消置顶") : t("置顶")} ${pair.after_surface}`} onClick={() => void runLearningAction("pin_dictionary_term", { word: pair.after_surface, pinned: !pinned })} className={compactButtonClass}>{pinned ? t("已置顶") : t("置顶")}</button>
+              {!pair.manual_scoped && <button type="button" disabled={learningBusy} aria-label={`${pinned ? t("取消置顶") : t("置顶")} ${pair.after_surface}`} onClick={() => void runLearningAction("pin_dictionary_term", { word: pair.after_surface, pinned: !pinned })} className={compactButtonClass}>{pinned ? t("已置顶") : t("置顶")}</button>}
               <button type="button" disabled={learningBusy} onClick={() => void runLearningAction("undo_learn_pair", { pairKey: pair.pair_key })} className={`${compactButtonClass} enabled:hover:bg-error/10 enabled:hover:text-error-ink`}>{t("忘记")}</button>
             </div>
           );
@@ -400,11 +514,12 @@ export function DictionarySettings({ settings, save }: { settings: Settings; sav
         </div>)}
       </SettingsGroup>}
       </SettingsDisclosure>
+      <DictionaryLearningAudit />
       <ConfirmDialog
         open={pendingStyleDraft != null}
         title={t("确认口癖样例")}
         danger={false}
-        description={t("会覆盖该 App 现有的风格样例。")}
+        description={`${t("将这组纠错前后文字保存为该 App 的风格样例，并允许用于后续整理请求。现在不会发送；可在语气的 App 规则中撤销批准。")}${pendingStyleDraft ? ` ${t("示例输入")}：${pendingStyleDraft.before_excerpt} → ${t("期望输出")}：${pendingStyleDraft.after_excerpt}` : ""}`}
         confirmLabel={t("确认")}
         cancelLabel={t("取消")}
         busy={learningBusy}

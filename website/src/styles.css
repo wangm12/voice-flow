@@ -2187,3 +2187,6 @@ h2 {
     transform: none;
   }
 }
+
+.site:lang(zh-CN) :is(h1, h2, h3, p, .eyebrow, .mini-label) { letter-spacing: 0; }
+.setup-note { max-width: 52ch; margin: 8px auto 0; color: var(--muted); font-size: 12px; line-height: 1.7; }

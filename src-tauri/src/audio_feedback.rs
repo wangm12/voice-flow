@@ -6,6 +6,7 @@ use std::sync::Arc;
 #[cfg(test)]
 use std::sync::Mutex;
 
+use crate::audio::CaptureCueHandle;
 use tauri::{AppHandle, Manager};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,20 +93,50 @@ impl AfplayPlayer {
     }
 }
 
+fn feedback_filename(sound: FeedbackSound) -> &'static str {
+    match sound {
+        FeedbackSound::Start => "feedback_start.wav",
+        FeedbackSound::Stop => "feedback_stop.wav",
+    }
+}
+
 /// Create the process inside its waiter so even failure to create the thread
 /// cannot leave a spawned child without an owner. Playback stays off the caller.
 fn spawn_feedback_process(
-    mut command: Command,
+    command: Command,
+    cue: Option<CaptureCueHandle>,
 ) -> std::io::Result<std::thread::JoinHandle<std::io::Result<(u32, ExitStatus)>>> {
+    spawn_feedback_process_with_wait(command, cue, |mut child| {
+        let pid = child.id();
+        child.wait().map(|status| (pid, status))
+    })
+}
+
+fn spawn_feedback_process_with_wait<W>(
+    mut command: Command,
+    cue: Option<CaptureCueHandle>,
+    wait_child: W,
+) -> std::io::Result<std::thread::JoinHandle<std::io::Result<(u32, ExitStatus)>>>
+where
+    W: FnOnce(std::process::Child) -> std::io::Result<(u32, ExitStatus)> + Send + 'static,
+{
     std::thread::Builder::new()
         .name("voice-flow-feedback".into())
         .spawn(move || {
-            let result = command.spawn().and_then(|mut child| {
-                let pid = child.id();
-                child.wait().map(|status| (pid, status))
-            });
-            if let Err(error) = &result {
-                log::warn!("feedback playback failed: {error}");
+            if let Some(cue) = &cue {
+                cue.begin();
+            }
+            let result = command.spawn().and_then(wait_child);
+            let success = matches!(&result, Ok((_, status)) if status.success());
+            if let Some(cue) = &cue {
+                cue.finish(success);
+            }
+            match &result {
+                Err(error) => log::warn!("feedback playback failed: {error}"),
+                Ok((_, status)) if !status.success() => {
+                    log::warn!("feedback playback exited unsuccessfully: {status}")
+                }
+                _ => {}
             }
             result
         })
@@ -113,10 +144,7 @@ fn spawn_feedback_process(
 
 impl FeedbackPlayer for AfplayPlayer {
     fn play(&self, sound: FeedbackSound, volume: f32) {
-        let filename = match sound {
-            FeedbackSound::Start => "feedback_start.wav",
-            FeedbackSound::Stop => "feedback_stop.wav",
-        };
+        let filename = feedback_filename(sound);
         let path = feedback_wav_path(self.app.as_ref(), filename);
         if !path.exists() {
             log::warn!("feedback wav missing: {}", path.display());
@@ -130,7 +158,7 @@ impl FeedbackPlayer for AfplayPlayer {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        if let Err(error) = spawn_feedback_process(command) {
+        if let Err(error) = spawn_feedback_process(command, None) {
             log::warn!("feedback playback could not start: {error}");
         }
     }
@@ -196,9 +224,40 @@ pub fn clear_test_player() {
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
 }
 
-pub fn play_start(app: &AppHandle, enabled: bool, user_volume: f32) {
-    let player = product_player(Some(app));
-    play_feedback(player.as_ref(), enabled, FeedbackSound::Start, user_volume);
+pub fn play_start(app: &AppHandle, enabled: bool, user_volume: f32, cue: Option<CaptureCueHandle>) {
+    #[cfg(test)]
+    if PLAYER_OVERRIDE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_some()
+    {
+        let player = product_player(Some(app));
+        play_feedback(player.as_ref(), enabled, FeedbackSound::Start, user_volume);
+        return;
+    }
+    if !enabled {
+        return;
+    }
+    let volume = afplay_volume(user_volume);
+    if volume <= 0.0 {
+        return;
+    }
+    let path = feedback_wav_path(Some(app), feedback_filename(FeedbackSound::Start));
+    if !path.exists() {
+        log::warn!("feedback wav missing: {}", path.display());
+        return;
+    }
+    let mut command = Command::new("afplay");
+    command
+        .arg("-v")
+        .arg(format!("{volume:.3}"))
+        .arg(path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    if let Err(error) = spawn_feedback_process(command, cue) {
+        log::warn!("feedback playback could not start: {error}");
+    }
 }
 
 pub fn play_stop(app: &AppHandle, enabled: bool, user_volume: f32) {
@@ -224,7 +283,7 @@ mod tests {
             .stdin(Stdio::from(OwnedFd::from(input)))
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        let waiter = spawn_feedback_process(command).unwrap();
+        let waiter = spawn_feedback_process(command, None).unwrap();
         assert!(!waiter.is_finished());
         drop(hold_open);
         let (pid, status) = waiter.join().unwrap().unwrap();
@@ -240,6 +299,79 @@ mod tests {
             std::io::Error::last_os_error().raw_os_error(),
             Some(libc::ECHILD)
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_helper_owns_cue_until_wait_and_marks_only_success() {
+        use std::os::{fd::OwnedFd, unix::net::UnixStream};
+
+        let cue = CaptureCueHandle::test_handle(16_000);
+        let (input, hold_open) = UnixStream::pair().unwrap();
+        let mut command = Command::new("/bin/cat");
+        command
+            .stdin(Stdio::from(OwnedFd::from(input)))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let (wait_started_tx, wait_started_rx) = std::sync::mpsc::channel();
+        let waiter =
+            spawn_feedback_process_with_wait(command, Some(cue.clone()), move |mut child| {
+                wait_started_tx.send(()).unwrap();
+                let pid = child.id();
+                child.wait().map(|status| (pid, status))
+            })
+            .unwrap();
+        wait_started_rx.recv().unwrap();
+        assert_eq!(cue.test_observation().0, Some(0));
+        assert_eq!(cue.test_observation().1, None);
+        drop(hold_open);
+        let (_, status) = waiter.join().unwrap().unwrap();
+        assert!(status.success());
+        // No accepted packet covered the process envelope, so success stays pending
+        // until a later packet can map it to source samples.
+        assert_eq!(cue.test_observation().1, None);
+        assert_eq!(cue.test_observation().0, Some(0));
+
+        let failed = CaptureCueHandle::test_handle(16_000);
+        let mut command = Command::new("/usr/bin/false");
+        command.stdout(Stdio::null()).stderr(Stdio::null());
+        let (_, status) = spawn_feedback_process(command, Some(failed.clone()))
+            .unwrap()
+            .join()
+            .unwrap()
+            .unwrap();
+        assert!(!status.success());
+        assert_eq!(failed.test_observation().1, None);
+
+        let wait_failed = CaptureCueHandle::test_handle(16_000);
+        let mut command = Command::new("/bin/cat");
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let result =
+            spawn_feedback_process_with_wait(command, Some(wait_failed.clone()), |mut child| {
+                let _pid = child.id();
+                let _status = child.wait()?;
+                Err(std::io::Error::other(
+                    "injected wait result failure after real child reap",
+                ))
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+        assert!(result.is_err());
+        assert_eq!(wait_failed.test_observation().1, None);
+
+        let missing = CaptureCueHandle::test_handle(16_000);
+        let mut command = Command::new("/voice-flow-missing-feedback-fixture");
+        command.stdout(Stdio::null()).stderr(Stdio::null());
+        assert!(spawn_feedback_process(command, Some(missing.clone()))
+            .unwrap()
+            .join()
+            .unwrap()
+            .is_err());
+        assert_eq!(missing.test_observation().1, None);
     }
 
     #[test]
@@ -285,13 +417,13 @@ mod tests {
     }
 
     #[test]
-    fn resolve_feedback_wav_falls_back_to_manifest_resources() {
-        let resolved = resolve_feedback_wav(None, "feedback_start.wav");
-        let expected = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("resources")
-            .join("feedback_start.wav");
+    fn resolve_feedback_wav_uses_explicit_manifest_resource_dir() {
+        let resource_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let expected = resource_dir.join("resources").join("feedback_start.wav");
+        assert!(expected.is_file(), "bundled feedback asset must exist");
+
+        let resolved = resolve_feedback_wav(Some(&resource_dir), "feedback_start.wav");
         assert_eq!(resolved, expected);
-        assert!(resolved.exists());
     }
 
     #[test]

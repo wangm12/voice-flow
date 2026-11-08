@@ -222,6 +222,18 @@ async fn transcribe_inner(
 
     let session_deadline = TokioInstant::now() + SESSION_TIMEOUT;
     let start_message = run_task_message(&task_id, &vocabulary);
+    let mut facts = crate::observations::ResolvedRequest::new(
+        "qwen_message_websocket",
+        endpoint.as_str(),
+        QWEN_MESSAGE_MODEL,
+        QWEN_MESSAGE_MODEL,
+    );
+    if let Some(parameters) = start_message.pointer("/payload/parameters") {
+        facts
+            .fields_constructed
+            .insert("parameters".into(), parameters.clone());
+    }
+    crate::observations::asr_request(facts);
     send_control_message(
         &mut socket,
         Message::Text(start_message.to_string().into()),
@@ -1015,6 +1027,17 @@ fn build_transcript(
             language_is_consistent = false;
         }
     }
+    crate::asr::observe_parsed_asr(&text, "provider_final_stream", "task_finished", None);
+    crate::observations::asr_filter(
+        &text,
+        &text,
+        if text.is_empty() {
+            "provider_empty"
+        } else {
+            "speech_text"
+        },
+        None,
+    );
     if text.trim().is_empty() {
         return Err(AdapterFailure {
             error: AsrError::EmptyResult,

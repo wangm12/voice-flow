@@ -1,4 +1,5 @@
 import type { Settings } from "../types/settings";
+import type { JsonObject } from "./customCleanupParameters";
 import {
   defaultModel,
   dashscopeEndpointForRegion,
@@ -23,6 +24,8 @@ export type EngineDraft = {
   customBaseUrl: string;
   customAsr: boolean;
   customLlm: boolean;
+  customCleanupParameters: JsonObject;
+  customCleanupParametersText: string;
   ollamaBaseUrl: string;
   localWhisperBaseUrl: string;
   dashscopeRegion?: DashscopeRegion;
@@ -87,6 +90,31 @@ export function providerConfigured(settings: Settings, id: ProviderId): boolean 
   return false;
 }
 
+export function customOriginChanged(previous: string, next: string): boolean {
+  const originOf = (value: string) => {
+    const raw = value.trim();
+    if (!raw) return null;
+    try {
+      const url = new URL(raw.includes("://") ? raw : `https://${raw}`);
+      return url.protocol === "http:" || url.protocol === "https:"
+        ? url.origin.toLowerCase()
+        : null;
+    } catch {
+      return null;
+    }
+  };
+  const previousOrigin = originOf(previous);
+  const nextOrigin = originOf(next);
+  if (previousOrigin && nextOrigin) return previousOrigin !== nextOrigin;
+  return previous.trim() !== next.trim();
+}
+
+export function customHostChanged(draft: EngineDraft, settings: Settings): boolean {
+  const savedUrl = settings.custom_base_url?.trim() || settings.asr_base_url?.trim() || settings.cleanup_base_url?.trim() || "";
+  const nextUrl = draft.customBaseUrl.trim();
+  return customOriginChanged(savedUrl, nextUrl);
+}
+
 export function providerHint(settings: Settings, id: ProviderId): string {
   return settings.provider_keys?.[id]?.hint
     ?? (id === "groq" ? settings.api_key_hint : null)
@@ -101,7 +129,14 @@ export function hasProviderSecret(
   onDeviceReady = false,
 ): boolean {
   if (id === "on_device") return onDeviceReady;
+  // Native MLX cleanup has no server URL or API key. Model readiness is
+  // checked independently by the model-store/runtime boundary.
+  if (id === "on_device_mlx") return true;
   if (draft.providerKeys[id]?.trim()) return true;
+  if (id === "custom") {
+    const nextUrl = draft.customBaseUrl.trim();
+    if (customHostChanged(draft, settings)) return isLoopbackUrl(nextUrl);
+  }
   if (providerConfigured(settings, id)) return true;
   const named = providerById(id);
   return Boolean(named?.allowsEmptyKey && isLoopbackUrl(providerUrl(id, draft)));
@@ -134,9 +169,13 @@ export function draftFromSettings(settings: Settings): EngineDraft {
     cleanupProvider,
     asrModel: settings.asr_model || defaultModel(asrProvider, "asr"),
     cleanupModel: settings.cleanup_model || defaultModel(cleanupProvider, "llm"),
-    customBaseUrl: settings.custom_base_url ?? settings.asr_base_url ?? settings.cleanup_base_url ?? "",
-    customAsr: settings.custom_asr ?? true,
-    customLlm: settings.custom_llm ?? true,
+    customBaseUrl: settings.custom_base_url?.trim() || settings.asr_base_url?.trim() || settings.cleanup_base_url?.trim() || "",
+    customAsr: asrProvider === "custom" || (settings.custom_asr ?? true),
+    customLlm: cleanupProvider === "custom" || (settings.custom_llm ?? true),
+    customCleanupParameters: settings.custom_cleanup_parameters ?? {},
+    customCleanupParametersText: settings.custom_cleanup_parameters && Object.keys(settings.custom_cleanup_parameters).length > 0
+      ? JSON.stringify(settings.custom_cleanup_parameters, null, 2)
+      : "",
     ollamaBaseUrl: settings.ollama_base_url || providerById("ollama")?.defaultBaseUrl || "",
     localWhisperBaseUrl: settings.local_whisper_base_url || providerById("local_whisper")?.defaultBaseUrl || "",
     dashscopeRegion: dashscopeRegionFromEndpoint(settings.asr_base_url),
@@ -150,12 +189,14 @@ export function switchProvider(draft: EngineDraft, side: "asr" | "cleanup", next
       ...draft,
       asrProvider: next,
       asrModel: defaultModel(next, "asr"),
+      ...(next === "custom" ? { customAsr: true } : {}),
     };
   }
   return {
     ...draft,
     cleanupProvider: next,
     cleanupModel: defaultModel(next, "llm"),
+    ...(next === "custom" ? { customLlm: true } : {}),
   };
 }
 
@@ -181,8 +222,9 @@ export function persistPatch(draft: EngineDraft, settings: Settings): Record<str
     asr_provider: draft.asrProvider,
     asr_model: draft.asrModel.trim(),
     custom_base_url: draft.customBaseUrl.trim(),
-    custom_asr: draft.customAsr,
-    custom_llm: draft.customLlm,
+    custom_asr: draft.asrProvider === "custom",
+    custom_llm: draft.cleanupProvider === "custom",
+    custom_cleanup_parameters: draft.customCleanupParameters,
     ollama_base_url: draft.ollamaBaseUrl.trim(),
     local_whisper_base_url: draft.localWhisperBaseUrl.trim(),
   };
@@ -209,6 +251,7 @@ export function probePayload(draft: EngineDraft, settings: Settings, overrides?:
   asrProvider: ProviderId;
   cleanupProvider: ProviderId;
   cleanupEnabled: boolean;
+  probeStage: "asr" | "cleanup" | "both";
 }>) {
   const asrProvider = overrides?.asrProvider ?? draft.asrProvider;
   const cleanupProvider = overrides?.cleanupProvider ?? draft.cleanupProvider;
@@ -221,8 +264,10 @@ export function probePayload(draft: EngineDraft, settings: Settings, overrides?:
     asr_model: asrProvider === draft.asrProvider ? draft.asrModel.trim() : defaultModel(asrProvider, "asr"),
     cleanup_model: cleanupProvider === draft.cleanupProvider ? draft.cleanupModel.trim() : defaultModel(cleanupProvider, "llm"),
     custom_base_url: draft.customBaseUrl.trim(),
-    custom_asr: draft.customAsr,
-    custom_llm: draft.customLlm,
+    custom_asr: asrProvider === "custom",
+    custom_llm: cleanupProvider === "custom",
+    custom_cleanup_parameters: cleanupProvider === "custom" ? draft.customCleanupParameters : {},
+    probe_stage: overrides?.probeStage ?? "both",
     ollama_base_url: draft.ollamaBaseUrl.trim(),
     local_whisper_base_url: draft.localWhisperBaseUrl.trim(),
     provider_keys: keys,
@@ -241,7 +286,7 @@ export function maskSecret(value: string): string {
 }
 
 export function modelLabel(model: string): string {
-  for (const provider of ["groq", "openai", "deepgram", "siliconflow", "fireworks", "mistral", "soniox", "assemblyai", "dashscope", "deepseek", "anthropic"] as const) {
+  for (const provider of ["groq", "openai", "deepgram", "siliconflow", "fireworks", "mistral", "soniox", "assemblyai", "dashscope", "deepseek", "anthropic", "lmstudio"] as const) {
     const definition = providerById(provider);
     const match = [...(definition?.asrModels ?? []), ...(definition?.llmModels ?? [])]
       .find((option) => option.value === model);

@@ -1,3 +1,4 @@
+import { ModelCard } from "./ModelCard";
 import { Autocomplete } from "../Autocomplete";
 import { Select } from "../Select";
 import { useEffect, useState } from "react";
@@ -46,6 +47,7 @@ export function EngineConfigStep({
   dashscopeRegion,
   onDashscopeRegionChange,
   onDeviceReady,
+  localCleanupDefault = false,
   onDeviceModels,
   onDeviceActionId,
   onDeviceActionError,
@@ -70,6 +72,7 @@ export function EngineConfigStep({
   dashscopeRegion: DashscopeRegion;
   onDashscopeRegionChange: (value: DashscopeRegion) => void;
   onDeviceReady: boolean;
+  localCleanupDefault?: boolean;
   onDeviceModels: OnDeviceModelStatus[];
   onDeviceActionId: string | null;
   onDeviceActionError: string | null;
@@ -146,8 +149,8 @@ export function EngineConfigStep({
               : dashscope
                 ? t("Qwen Audio 3.1 Message 使用已选地区的 WebSocket 原始转写接口；这不是普通 HTTP flash 接口。")
                 : groq
-                  ? t("VoiceFlow 使用 Groq 将语音转换成文字。输入访问密钥，验证通过后即可开始。")
-                  : t("选择语音转写服务。新服务需要密钥；验证成功后会保存在本机钥匙串。")}
+                  ? t("VoiceFlow 使用 Groq 将语音转换成文字。可先保存密钥，服务探测和听写试用由你主动开始。")
+                  : t("选择语音转写服务并保存到本机钥匙串。保存配置不连接服务；可以另行点击测试。")}
       </p>
       {strictOfflineBlocked && (
         <p role="status" className="mt-2 rounded-lg bg-elevated px-3 py-2 text-xs leading-5 text-warning-ink">
@@ -158,15 +161,26 @@ export function EngineConfigStep({
       <div role="group" aria-label={t("选择首次使用路线")} className="mt-6 flex flex-wrap gap-2">
         <button type="button" aria-pressed={groq} disabled={validating} onClick={() => { if (!groq) onAsrProviderChange("groq"); }} className={`flex-1 rounded-lg border px-4 py-3 text-left outline-none ${focusRingClass} ${groq ? "border-accent bg-elevated" : "border-border hover:bg-elevated"}`}>
           <span className="block text-sm font-medium">{t("推荐云端路线")}</span>
-          <span className="mt-1 block text-xs text-secondary">{t("Groq · 填写密钥后验证并试用")}</span>
+          <span className="mt-1 block text-xs text-secondary">{t("Groq · 保存密钥后可选探测与试用")}</span>
         </button>
         <button type="button" aria-pressed={onDevice} disabled={validating || (onDeviceModels.length > 0 && !hasSupportedDeviceModel && !onDevice)} onClick={() => { if (!onDevice) onAsrProviderChange("on_device"); }} className={`flex-1 rounded-lg border px-4 py-3 text-left outline-none ${focusRingClass} ${onDevice ? "border-accent bg-elevated" : "border-border hover:bg-elevated"}`}>
           <span className="block text-sm font-medium">{t("本机路线")}</span>
           <span className="mt-1 block text-xs text-secondary">{t("Apple Silicon · 手动下载模型")}</span>
         </button>
       </div>
-      {onDevice && <p className="mt-3 text-xs leading-5 text-secondary">{t("首次使用本机路线只做转写，不调用云端整理。之后可在语音服务中配置 AI 整理。")}</p>}
+      {onDevice && localCleanupDefault && <p className="mt-3 text-xs leading-5 text-secondary">{t("首次使用本机路线只做转写，不调用云端整理。之后可在语音服务中配置 AI 整理。")}</p>}
 
+      <label className="mt-4 block text-xs font-medium text-secondary" htmlFor="onboarding-language">{t("识别语言")}
+        <Select id="onboarding-language" value={language} disabled={validating} onValueChange={onLanguageChange} className="mt-1 h-9 w-full rounded-lg border border-border bg-elevated px-3 text-sm text-primary">
+          <option value="auto" disabled={profile?.languageSupport === "explicit_language_required"}>{t(profile?.languageSupport === "explicit_language_required" ? "自动（此模型不支持）" : "自动检测")}</option><option value="zh">{t("中文")}</option><option value="en">English</option>
+        </Select>
+      </label>
+      <p className="mt-2 text-xs text-secondary">{t("可以保存配置后继续，探测和试用均可稍后进行。完成引导不会自动发送测试音频或整理样例。")}</p>
+      <details className="mt-3 text-xs leading-5 text-secondary">
+        <summary className="cursor-pointer font-medium">{t("这些检查分别代表什么？")}</summary>
+        <p className="mt-2">{t("已保存凭据、服务探测、模型文件、能力握手和一次转写分别记录，任何一项都不代替其他检查。")}</p>
+        {groq && <p className="mt-2">{t("Groq 密钥验证仅检查身份认证，不代表所选模型已识别成功。")}</p>}
+      </details>
       <fieldset disabled={validating} className="mt-4 border-y border-border">
         <legend className="sr-only">{t("连接语音服务")}</legend>
         <details open={!groq && !onDevice ? true : undefined} className="vf-inline-disclosure py-4">
@@ -294,22 +308,13 @@ export function EngineConfigStep({
 
         {onDevice ? (
           <div className="border-t border-border py-4">
-            {profile?.languageSupport === "explicit_language_required" && (
-              <label className="mb-4 block text-xs font-medium text-secondary">
-                {t("识别语言")}
-                <Select
-                  aria-label={t("识别语言")}
-                  value={language}
-                  onValueChange={(value) => onLanguageChange(value)}
-                  className="mt-1 h-9 w-full rounded-lg border border-border bg-elevated px-3 text-sm text-primary"
-                >
-                  <option value="auto" disabled>{t("自动（此模型不支持）")}</option>
-                  <option value="zh">{t("中文")}</option>
-                  <option value="en">English</option>
-                </Select>
-              </label>
+            <ModelCard model={selectedOnDeviceModel}>
+            {(asrModel === "qwen3-asr-1.7b" || asrModel === "cohere-transcribe-2b") && (
+              <div role="note" className="mt-2 space-y-0.5 text-xs leading-5 text-warning-ink">
+                <p>{t("许可未审查")}</p>
+                <p>{t("参考官方模型卡声明 Apache-2.0；此固定 MLX 转换产物许可未审查。")}</p>
+              </div>
             )}
-            <p className="text-sm font-medium text-primary">{t("本机模型")}</p>
             <p className="mt-1 text-xs leading-relaxed text-secondary">
               {selectedOnDeviceModel
                 ? `${deviceStateCopy(selectedOnDeviceModel.state, t)} · ${deviceRuntimeCopy(selectedOnDeviceModel.runtime_status, t)}`
@@ -318,7 +323,8 @@ export function EngineConfigStep({
             {selectedOnDeviceModel?.state === "downloading" && (
               <p className="mt-1 text-xs text-tertiary">{formatBytes(selectedOnDeviceModel.downloaded_bytes)} / {formatBytes(selectedOnDeviceModel.bytes)}</p>
             )}
-            {selectedOnDeviceModel?.error && <p className="mt-1 text-xs text-error-ink">{selectedOnDeviceModel.error}</p>}
+            {selectedOnDeviceModel?.error_category === "disk_full" && <p className="mt-1 text-xs text-error-ink">{t("检查可用空间后重试下载。")}</p>}
+            {selectedOnDeviceModel?.error && <p className="mt-1 text-xs text-tertiary">{selectedOnDeviceModel.error}</p>}
             {selectedOnDeviceModel?.id === "sensevoice-small" && <p className="mt-1 text-xs text-warning-ink">{t("SenseVoice 是旧版文件保留项；没有 MLX 推理支持，不能用于本机听写。")}</p>}
             {selectedOnDeviceModel?.runtime_status === "loading"
               ? <p className="mt-1 text-xs text-warning-ink">{t("本机模型正在加载；加载完成后会单独显示运行时状态。")}</p>
@@ -350,6 +356,7 @@ export function EngineConfigStep({
                 >{selectedOnDeviceModel?.platform_supported === false ? t("当前设备不支持") : onDeviceActionId === asrModel ? t("准备中…") : selectedOnDeviceModel?.state === "corrupt" ? t("重新下载") : t("下载模型")}</button>
               ) : null}
             </div>
+            </ModelCard>
             {onDeviceModels.filter((model) => model.state === "downloading" && model.id !== asrModel).map((model) => (
               <div key={model.id} className="mt-2 flex flex-wrap items-center justify-between gap-2 text-xs text-tertiary">
                 <span>{model.label} · {formatBytes(model.downloaded_bytes)} / {formatBytes(model.bytes)}</span>

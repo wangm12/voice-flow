@@ -50,6 +50,66 @@ pub struct JobHandle {
     downloaded_bytes: Arc<AtomicU64>,
 }
 
+struct DownloadWriter {
+    file: File,
+    hasher: Sha256,
+    written: u64,
+}
+
+impl DownloadWriter {
+    fn create(path: &Path) -> Result<Self, String> {
+        let file = File::create(path).map_err(|error| error.to_string())?;
+        restrict_file_mode(path)?;
+        Ok(Self {
+            file,
+            hasher: Sha256::new(),
+            written: 0,
+        })
+    }
+
+    fn write_chunk(
+        &mut self,
+        chunk: &[u8],
+        expected_bytes: u64,
+        progress: Option<(Arc<AtomicU64>, u64)>,
+        exceeds_message: &str,
+    ) -> Result<(), String> {
+        self.written = self
+            .written
+            .checked_add(chunk.len() as u64)
+            .ok_or_else(|| exceeds_message.to_owned())?;
+        if self.written > expected_bytes {
+            return Err(exceeds_message.into());
+        }
+        self.file
+            .write_all(chunk)
+            .map_err(|error| error.to_string())?;
+        self.hasher.update(chunk);
+        if let Some((downloaded_bytes, base)) = progress {
+            downloaded_bytes.store(base.saturating_add(self.written), Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
+    fn finish(
+        self,
+        expected_bytes: u64,
+        expected_sha256: &str,
+        size_mismatch_message: &str,
+        hash_mismatch_message: &str,
+    ) -> Result<(), String> {
+        if self.written != expected_bytes {
+            return Err(size_mismatch_message.into());
+        }
+        self.file.sync_all().map_err(|error| error.to_string())?;
+        let digest = hex::encode(self.hasher.finalize());
+        if !digest.eq_ignore_ascii_case(expected_sha256) {
+            return Err(hash_mismatch_message.into());
+        }
+        Ok(())
+    }
+}
+
 impl DownloadManager {
     pub fn new() -> Self {
         Self {
@@ -306,6 +366,13 @@ fn status_from_info(
         runtime.runtime_status == "loaded"
             && runtime.loaded_model_id.as_deref() == Some(info.id.as_str())
     });
+    let error = if downloading {
+        None
+    } else {
+        manager
+            .last_error(&info.id)
+            .or_else(|| runtime.and_then(|runtime| runtime.error.clone()))
+    };
     OnDeviceModelStatus {
         id: info.id.clone(),
         label: info.label,
@@ -329,19 +396,23 @@ fn status_from_info(
         } else {
             0
         },
-        error: if downloading {
-            None
-        } else {
-            manager
-                .last_error(&info.id)
-                .or_else(|| runtime.and_then(|runtime| runtime.error.clone()))
-        },
+        error_category: error
+            .as_deref()
+            .and_then(download_error_category)
+            .map(str::to_owned),
+        error,
         revision: info.revision,
         file_count: info.file_count,
         platform_supported: info.platform_supported,
         runtime_status: runtime_status.to_owned(),
         loaded,
     }
+}
+
+fn download_error_category(message: &str) -> Option<&'static str> {
+    let normalized = message.to_ascii_lowercase();
+    (normalized.contains("no space left on device") || normalized.contains("enospc"))
+        .then_some("disk_full")
 }
 
 pub fn sanitize_download_error(message: &str) -> String {
@@ -624,10 +695,11 @@ where
     };
 
     let write_result = async {
-        let mut file = File::create(&partial).map_err(|error| error.to_string())?;
-        restrict_file_mode(&partial)?;
-        let mut hasher = Sha256::new();
-        let mut written = 0u64;
+        let writer_path = partial.clone();
+        let mut writer = tokio::task::spawn_blocking(move || DownloadWriter::create(&writer_path))
+            .await
+            .map_err(|error| format!("download writer task failed: {error}"))??;
+        let expected_sha = expected_sha.to_owned();
         loop {
             tokio::select! {
                 _ = handle.cancel.cancelled() => {
@@ -644,15 +716,20 @@ where
                             if chunk.is_empty() {
                                 continue;
                             }
-                            written = written
-                                .checked_add(chunk.len() as u64)
-                                .ok_or_else(|| "archive too large".to_string())?;
-                            if written > expected_bytes {
-                                return Err("archive exceeds pinned size".into());
-                            }
-                            file.write_all(chunk).map_err(|error| error.to_string())?;
-                            hasher.update(chunk);
-                            handle.downloaded_bytes.store(written, Ordering::Relaxed);
+                            let owned_chunk = chunk.to_vec();
+                            let downloaded_bytes = Arc::clone(&handle.downloaded_bytes);
+                            writer = tokio::task::spawn_blocking(move || {
+                                writer.write_chunk(
+                                    &owned_chunk,
+                                    expected_bytes,
+                                    Some((downloaded_bytes, 0)),
+                                    "archive exceeds pinned size",
+                                )?;
+                                Ok::<_, String>(writer)
+                            })
+                            .await
+                            .map_err(|error| format!("download writer task failed: {error}"))??;
+                            handle.downloaded_bytes.store(writer.written, Ordering::Relaxed);
                         }
                     }
                 }
@@ -661,16 +738,16 @@ where
         if handle.cancel.is_cancelled() {
             return Err("download cancelled".into());
         }
-        if written != expected_bytes {
-            return Err("archive size mismatch".into());
-        }
-        file.sync_all().map_err(|error| error.to_string())?;
-        drop(file);
-        let digest = hex::encode(hasher.finalize());
-        if !digest.eq_ignore_ascii_case(expected_sha) {
-            return Err("archive hash mismatch".into());
-        }
-        Ok(())
+        tokio::task::spawn_blocking(move || {
+            writer.finish(
+                expected_bytes,
+                &expected_sha,
+                "archive size mismatch",
+                "archive hash mismatch",
+            )
+        })
+        .await
+        .map_err(|error| format!("download writer task failed: {error}"))?
     }
     .await;
     if let Err(error) = write_result {
@@ -855,7 +932,15 @@ async fn download_mlx_model(
         }
         validate_manifest_path(file.path)?;
         let staged_file = staging.join(file.path);
-        if verify_pinned_file(&staged_file, file.bytes, file.sha256)? {
+        let verify_path = staged_file.clone();
+        let expected_bytes = file.bytes;
+        let expected_sha = file.sha256.to_owned();
+        let verified = tokio::task::spawn_blocking(move || {
+            verify_pinned_file(&verify_path, expected_bytes, &expected_sha)
+        })
+        .await
+        .map_err(|error| format!("model verification task failed: {error}"))??;
+        if verified {
             completed_bytes = completed_bytes.saturating_add(file.bytes);
             handle
                 .downloaded_bytes
@@ -881,51 +966,16 @@ async fn download_mlx_model(
                 response.status().as_u16()
             ));
         }
-        let mut stream = response.bytes_stream();
-        let mut output = File::create(&temporary).map_err(|error| error.to_string())?;
-        restrict_file_mode(&temporary)?;
-        let mut hasher = Sha256::new();
-        let mut written = 0u64;
-        loop {
-            tokio::select! {
-                _ = handle.cancel.cancelled() => {
-                    remove_path(&temporary);
-                    return Err("download cancelled".into());
-                }
-                item = stream.next() => {
-                    match item {
-                        None => break,
-                        Some(Err(error)) => {
-                            remove_path(&temporary);
-                            return Err(sanitize_download_error(&error.to_string()));
-                        }
-                        Some(Ok(chunk)) => {
-                            written = written
-                                .checked_add(chunk.len() as u64)
-                                .ok_or_else(|| "model file exceeds pinned size".to_owned())?;
-                            if written > file.bytes {
-                                remove_path(&temporary);
-                                return Err("model file exceeds pinned size".into());
-                            }
-                            output.write_all(&chunk).map_err(|error| error.to_string())?;
-                            hasher.update(&chunk);
-                            handle.downloaded_bytes.store(
-                                completed_bytes.saturating_add(written),
-                                Ordering::Relaxed,
-                            );
-                        }
-                    }
-                }
-            }
-        }
-        if written != file.bytes
-            || !hex::encode(hasher.finalize()).eq_ignore_ascii_case(file.sha256)
-        {
-            remove_path(&temporary);
-            return Err("model file size or checksum mismatch".into());
-        }
-        output.sync_all().map_err(|error| error.to_string())?;
-        drop(output);
+        write_mlx_file_stream(
+            response.bytes_stream(),
+            &temporary,
+            file.bytes,
+            file.sha256,
+            Arc::clone(&handle.downloaded_bytes),
+            completed_bytes,
+            &handle.cancel,
+        )
+        .await?;
         fs::rename(&temporary, &staged_file).map_err(|error| error.to_string())?;
         restrict_file_mode(&staged_file)?;
         completed_bytes = completed_bytes.saturating_add(file.bytes);
@@ -954,6 +1004,69 @@ async fn download_mlx_model(
         return Err("download cancelled".into());
     }
     replace_model_dir(&staging, &model_dir(models_root, &handle.id))?;
+    Ok(())
+}
+
+async fn write_mlx_file_stream<S, B, E>(
+    mut stream: S,
+    temporary: &Path,
+    expected_bytes: u64,
+    expected_sha256: &str,
+    downloaded_bytes: Arc<AtomicU64>,
+    base: u64,
+    cancel: &CancellationToken,
+) -> Result<(), String>
+where
+    S: futures_util::Stream<Item = Result<B, E>> + Unpin,
+    B: AsRef<[u8]> + Send + 'static,
+    E: std::fmt::Display,
+{
+    let writer_path = temporary.to_path_buf();
+    let mut writer = tokio::task::spawn_blocking(move || DownloadWriter::create(&writer_path))
+        .await
+        .map_err(|error| format!("model writer task failed: {error}"))??;
+    let write_result = async {
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => return Err("download cancelled".into()),
+                item = stream.next() => match item {
+                    None => break,
+                    Some(Err(error)) => return Err(sanitize_download_error(&error.to_string())),
+                    Some(Ok(chunk)) => {
+                        let bytes = chunk.as_ref().to_vec();
+                        let downloaded_bytes = Arc::clone(&downloaded_bytes);
+                        writer = tokio::task::spawn_blocking(move || {
+                            writer.write_chunk(
+                                &bytes,
+                                expected_bytes,
+                                Some((downloaded_bytes, base)),
+                                "model file exceeds pinned size",
+                            )?;
+                            Ok::<_, String>(writer)
+                        })
+                        .await
+                        .map_err(|error| format!("model writer task failed: {error}"))??;
+                    }
+                }
+            }
+        }
+        let expected_sha256 = expected_sha256.to_owned();
+        tokio::task::spawn_blocking(move || {
+            writer.finish(
+                expected_bytes,
+                &expected_sha256,
+                "model file size or checksum mismatch",
+                "model file size or checksum mismatch",
+            )
+        })
+        .await
+        .map_err(|error| format!("model writer task failed: {error}"))?
+    }
+    .await;
+    if let Err(error) = write_result {
+        remove_path(temporary);
+        return Err(error);
+    }
     Ok(())
 }
 
@@ -1138,6 +1251,67 @@ mod tests {
             encoder.finish().unwrap();
         }
         encoded
+    }
+
+    #[tokio::test]
+    async fn oversized_stream_removes_unverified_partial_archive() {
+        let root = temp_root("oversized-stream-cleanup");
+        let manager = DownloadManager::default();
+        let result = install_from_stream(
+            &manager,
+            &root,
+            "sensevoice-small",
+            stream::iter([Ok::<_, std::io::Error>(vec![0u8; 8])]),
+            "00",
+            4,
+        )
+        .await;
+        assert!(result
+            .expect_err("oversized stream must fail")
+            .contains("exceeds pinned size"));
+        assert!(!partial_path(&root, "sensevoice-small").exists());
+        assert!(!extracting_path(&root, "sensevoice-small").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn oversized_mlx_file_stream_cleans_temporary_after_writer_failure() {
+        let root = temp_root("mlx-file-oversized-cleanup");
+        let temporary = root.join(".tiny-model.bin.download");
+        let staged = root.join("tiny-model.bin");
+        let downloaded_bytes = Arc::new(AtomicU64::new(0));
+        let result = write_mlx_file_stream(
+            stream::iter([Ok::<_, std::io::Error>(b"too long".to_vec())]),
+            &temporary,
+            4,
+            "00000000",
+            downloaded_bytes,
+            0,
+            &CancellationToken::new(),
+        )
+        .await;
+
+        let temporary_exists = temporary.exists();
+        let staged_exists = staged.exists();
+        let committed_marker_exists = root.join(MLX_INSTALLED_MANIFEST).exists();
+        fs::remove_dir_all(&root).unwrap();
+
+        assert_eq!(
+            result.expect_err("oversized MLX file stream must fail"),
+            "model file exceeds pinned size"
+        );
+        assert!(
+            !temporary_exists,
+            "the .download temporary must be removed after the writer worker settles"
+        );
+        assert!(
+            !staged_exists,
+            "failed file must not be renamed into staging"
+        );
+        assert!(
+            !committed_marker_exists,
+            "failed file must not publish the installed manifest"
+        );
     }
 
     #[test]
@@ -1451,5 +1625,71 @@ mod tests {
         assert!(!partial_path(&root, SENSEVOICE_ID).exists());
         assert_eq!(DEFAULT_MODEL_ID, SENSEVOICE_ID);
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn archive_hash_mismatch_propagates_from_blocking_writer_and_cleans_partial() {
+        let root = temp_root("archive-hash-mismatch");
+        let manager = DownloadManager::new();
+        let (bytes, _) = tiny_ready_archive();
+        let expected_bytes = bytes.len() as u64;
+        let stream = stream::iter([Ok::<_, String>(bytes)]);
+
+        let error = install_from_stream(
+            &manager,
+            &root,
+            SENSEVOICE_ID,
+            stream,
+            &"0".repeat(64),
+            expected_bytes,
+        )
+        .await
+        .expect_err("a checksum mismatch from the blocking writer must fail install");
+
+        assert_eq!(error, "archive hash mismatch");
+        assert!(!partial_path(&root, SENSEVOICE_ID).exists());
+        assert!(!extracting_path(&root, SENSEVOICE_ID).exists());
+        assert!(!model_dir(&root, SENSEVOICE_ID).exists());
+        assert_eq!(
+            manager.last_error(SENSEVOICE_ID).as_deref(),
+            Some("archive hash mismatch")
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn disk_full_is_classified() {
+        assert_eq!(
+            download_error_category("write failed: No space left on device"),
+            Some("disk_full")
+        );
+        assert_eq!(download_error_category("request timed out"), None);
+    }
+
+    #[test]
+    fn enospc_manager_failure_is_exposed_as_disk_full_status() {
+        let manager = DownloadManager::default();
+        let job = manager.begin(SENSEVOICE_ID).unwrap();
+        let error = std::io::Error::from_raw_os_error(28).to_string();
+        manager.finish(SENSEVOICE_ID, job.generation, Some(error.clone()));
+
+        let status = status_from_info(
+            Path::new("/unused-test-model-root"),
+            &manager,
+            crate::ondevice_asr::OnDeviceModelInfo {
+                id: SENSEVOICE_ID.to_owned(),
+                label: SENSEVOICE_LABEL.to_owned(),
+                state: OnDeviceModelState::Missing,
+                inference_ready: false,
+                revision: None,
+                bytes: 0,
+                file_count: 0,
+                platform_supported: true,
+            },
+            None,
+        );
+        let serialized = serde_json::to_value(status).unwrap();
+        assert_eq!(serialized["error"], error);
+        assert_eq!(serialized["error_category"], "disk_full");
     }
 }

@@ -256,7 +256,30 @@
   background: var(--color-sidebar);
 }
 .vf-settings-shell { container: settings / inline-size; }
+.vf-settings-shell--flush-bottom {
+  margin-bottom: calc(0px - var(--space-page));
+  padding-bottom: 0;
+}
 .vf-settings-scroll-pane { scrollbar-gutter: stable; }
+.vf-engine-settings {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+}
+.vf-engine-settings--with-footer { min-height: calc(100vh - var(--space-page)); }
+.vf-engine-page-content { min-width: 0; flex: 1 0 auto; outline: none; }
+.vf-engine-footer {
+  margin-inline: calc(var(--space-page) * -1);
+  margin-top: auto;
+  padding-inline: var(--space-page);
+}
+.vf-engine-settings [id^="provider-key-"],
+.vf-engine-settings [id^="provider-custom-"],
+.vf-engine-settings [id^="engine-"] { scroll-margin-block: 80px; }
+@container settings (max-width: 560px) {
+  .vf-engine-footer { justify-content: stretch; }
+  .vf-engine-footer > button { flex: 1 1 100%; }
+}
 .vf-settings-group--plain > .vf-settings-group-body { background: transparent; border: 0; }
 .vf-settings :where(p, label, h1, h2, h3) { overflow-wrap: anywhere; }
 .vf-settings-row-control > div { min-width: 0; max-width: 100%; }
@@ -368,6 +391,9 @@
 }
 .vf-settings details > summary {
   padding: var(--space-tight) 0;
+}
+.vf-engine-settings .vf-advanced-connections > fieldset > details > summary {
+  padding: var(--space-row) 20px;
 }
 .vf-settings-row-control {
   gap: var(--space-tight);
@@ -490,3 +516,19 @@
 .vf-autocomplete[data-invalid="true"] { border-color: transparent; outline: 2px solid var(--color-error-ink); }
 .vf-autocomplete-toggle { display: inline-flex; flex-shrink: 0; align-items: center; justify-content: center; height: 28px; width: 20px; color: var(--color-secondary); }
 .vf-autocomplete-content { min-width: var(--radix-popover-trigger-width); max-height: min(320px, var(--radix-popover-content-available-height)); overflow-y: auto; }
+
+/* Chinese and Japanese glyphs keep their full square reading measure. */
+.vf-settings:lang(zh) :is(p, label, h1, h2, h3),
+.vf-settings:lang(ja) :is(p, label, h1, h2, h3),
+.vf-particle-text:lang(zh),
+.vf-particle-text:lang(ja) {
+  letter-spacing: 0;
+}
+
+.vf-save-bar {
+  position: sticky;
+  bottom: 0;
+  z-index: 10;
+  border-top: 1px solid var(--color-border);
+  background: var(--color-card);
+}

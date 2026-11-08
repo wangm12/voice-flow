@@ -1,0 +1,1654 @@
+{
+  "groups": [
+    {
+      "id": "normal",
+      "label": "正常流程"
+    },
+    {
+      "id": "microphone",
+      "label": "麦克风与录音"
+    },
+    {
+      "id": "processing",
+      "label": "处理与模型"
+    },
+    {
+      "id": "delivery",
+      "label": "光标输入与剪贴板"
+    },
+    {
+      "id": "recovery",
+      "label": "保存与恢复"
+    },
+    {
+      "id": "learning",
+      "label": "学习与选中文本"
+    }
+  ],
+  "cases": [
+    {
+      "id": "idle",
+      "group": "normal",
+      "name": "待机",
+      "title": "",
+      "subtitle": "",
+      "icon": "notice",
+      "action": "details",
+      "detail": "没有听写任务时，不展示常驻胶囊。使用已设置的快捷键开始。",
+      "primary": "查看恢复方式",
+      "route": "settings",
+      "motion": null,
+      "hidden": true,
+      "note": "不显示 HUD",
+      "proposed": false,
+      "sources": [
+        {
+          "kind": "dictation",
+          "value": "idle"
+        }
+      ],
+      "message": "没有听写任务时，不展示常驻胶囊。使用已设置的快捷键开始。"
+    },
+    {
+      "id": "starting",
+      "group": "normal",
+      "name": "开始录音",
+      "title": "准备录音",
+      "subtitle": "",
+      "icon": "mic",
+      "action": "stop",
+      "detail": "麦克风就绪后才进入录音状态。光束表示活动，不表示已经收到声音。",
+      "primary": "查看恢复方式",
+      "route": "settings",
+      "motion": "line",
+      "hidden": false,
+      "note": "活动状态；小方块可终止",
+      "proposed": false,
+      "sources": [
+        {
+          "kind": "dictation",
+          "value": "starting"
+        }
+      ],
+      "message": "麦克风就绪后才进入录音状态。光束表示活动，不表示已经收到声音。"
+    },
+    {
+      "id": "recording-airpods",
+      "group": "normal",
+      "name": "AirPods 录音",
+      "title": "录音中",
+      "subtitle": "AirPods Pro",
+      "icon": "notes",
+      "action": "stop",
+      "detail": "显示实际打开的输入设备。本例目标为备忘录；00:08 是固定演示时间。",
+      "primary": "查看恢复方式",
+      "route": "settings",
+      "motion": "rotate",
+      "hidden": false,
+      "note": "活动状态；小方块可终止",
+      "proposed": false,
+      "sources": [
+        {
+          "kind": "dictation",
+          "value": "recording"
+        },
+        {
+          "kind": "capture",
+          "value": "receiving_audio"
+        }
+      ],
+      "message": "显示实际打开的输入设备。本例目标为备忘录；00:08 是固定演示时间。"
+    },
+    {
+      "id": "recording-builtin",
+      "group": "normal",
+      "name": "内置麦克风录音",
+      "title": "录音中",
+      "subtitle": "MacBook 麦克风",
+      "icon": "notes",
+      "action": "stop",
+      "detail": "实际输入来自内置麦克风，设备名和标题左对齐。录音中显示计时。",
+      "primary": "查看恢复方式",
+      "route": "settings",
+      "motion": "rotate",
+      "hidden": false,
+      "note": "活动状态；小方块可终止",
+      "proposed": false,
+      "sources": [],
+      "message": "实际输入来自内置麦克风，设备名和标题左对齐。录音中显示计时。"
+    },
+    {
+      "id": "processing",
+      "group": "normal",
+      "name": "统一处理状态",
+      "title": "处理中",
+      "subtitle": "",
+      "icon": "orb",
+      "action": "stop",
+      "detail": "识别、整理、精确重打、完整录音恢复和交付等待共用这一个外观，不逐阶段更换文案，也不显示重试倒计时。",
+      "primary": "查看恢复方式",
+      "route": "settings",
+      "motion": "line",
+      "hidden": false,
+      "note": "活动状态；小方块可终止",
+      "proposed": false,
+      "sources": [
+        {
+          "kind": "dictation",
+          "value": "processing"
+        },
+        {
+          "kind": "phase",
+          "value": "finalizing_audio"
+        },
+        {
+          "kind": "phase",
+          "value": "asr"
+        },
+        {
+          "kind": "phase",
+          "value": "soniox_recovery"
+        },
+        {
+          "kind": "phase",
+          "value": "cascade_accurate"
+        },
+        {
+          "kind": "phase",
+          "value": "cleanup"
+        },
+        {
+          "kind": "phase",
+          "value": "delivery"
+        },
+        {
+          "kind": "phase",
+          "value": "idle"
+        }
+      ],
+      "message": "识别、整理、精确重打、完整录音恢复和交付等待共用这一个外观，不逐阶段更换文案，也不显示重试倒计时。"
+    },
+    {
+      "id": "success",
+      "group": "normal",
+      "name": "已确认输入",
+      "title": "",
+      "subtitle": "",
+      "icon": "notice",
+      "action": "details",
+      "detail": "只有独立确认本次文字已正确输入，才直接隐藏。没有完成提示，不展示 Saved。",
+      "primary": "查看恢复方式",
+      "route": "settings",
+      "motion": null,
+      "hidden": true,
+      "note": "确认输入后直接消失",
+      "proposed": false,
+      "sources": [
+        {
+          "kind": "dictation",
+          "value": "done"
+        }
+      ],
+      "message": "只有独立确认本次文字已正确输入，才直接隐藏。没有完成提示，不展示 Saved。"
+    },
+    {
+      "id": "cancelled",
+      "group": "normal",
+      "name": "主动取消",
+      "title": "",
+      "subtitle": "",
+      "icon": "notice",
+      "action": "details",
+      "detail": "主动取消后停止活动动效并隐藏。已经保存的结果仍可在历史记录中检查，不把取消包装成错误。",
+      "primary": "查看恢复方式",
+      "route": "settings",
+      "motion": null,
+      "hidden": true,
+      "note": "取消后直接消失",
+      "proposed": false,
+      "sources": [
+        {
+          "kind": "delivery_reason",
+          "value": "delivery_cancelled"
+        }
+      ],
+      "message": "主动取消后停止活动动效并隐藏。已经保存的结果仍可在历史记录中检查，不把取消包装成错误。"
+    },
+    {
+      "id": "mic-waiting",
+      "group": "microphone",
+      "name": "等待第一帧音频",
+      "title": "等待麦克风",
+      "subtitle": "尚未收到音频",
+      "icon": "mic",
+      "action": "stop",
+      "detail": "设备已打开，但尚未收到采集帧。暂停录音环绕光，避免声称正在收音。收到新帧后再进入录音中。",
+      "primary": "查看恢复方式",
+      "route": "settings",
+      "motion": null,
+      "hidden": false,
+      "note": "等待真实音频帧；小方块可取消",
+      "proposed": false,
+      "sources": [
+        {
+          "kind": "capture",
+          "value": "waiting_first_frame"
+        }
+      ],
+      "message": "设备已打开，但尚未收到采集帧。暂停录音环绕光，避免声称正在收音。收到新帧后再进入录音中。"
+    },
+    {
+      "id": "mic-empty",
+      "group": "microphone",
+      "name": "一直没有采集帧",
+      "title": "麦克风没有输入",
+      "subtitle": "检查所选设备",
+      "icon": "mic-off",
+      "action": "details",
+      "detail": "尚未收到任何音频帧。本例未获得可恢复音频。检查设备与权限；不展示假音量，也不声称有录音可重试。",
+      "primary": "选择麦克风",
+      "route": "microphone",
+      "motion": null,
+      "hidden": false,
+      "note": "静态提示；点击查看恢复操作",
+      "proposed": false,
+      "sources": [
+        {
+          "kind": "capture",
+          "value": "no_audio_yet"
+        }
+      ],
+      "message": "没有收到麦克风音频。请检查所选输入设备是否连接，再重新开始录音。"
+    },
+    {
+      "id": "mic-stale",
+      "group": "microphone",
+      "name": "采集帧停止更新",
+      "title": "麦克风没有响应",
+      "subtitle": "检查连接后重试",
+      "icon": "mic-off",
+      "action": "details",
+      "detail": "最近没有新的音频帧。停止声音驱动动效；这与安静环境中的低音量不同。已采集部分是否保存，需以恢复结果为准。",
+      "primary": "选择麦克风",
+      "route": "microphone",
+      "motion": null,
+      "hidden": false,
+      "note": "静态提示；点击查看恢复操作",
+      "proposed": false,
+      "sources": [
+        {
+          "kind": "capture",
+          "value": "no_recent_audio"
+        }
+      ],
+      "message": "麦克风暂时没有响应。请检查设备连接；需要时换用内置麦克风再试。"
+    },
+    {
+      "id": "mic-interrupted",
+      "group": "microphone",
+      "name": "AirPods 断开 / 采集中断",
+      "title": "麦克风已断开",
+      "subtitle": "检查输入设备",
+      "icon": "mic-off",
+      "action": "details",
+      "detail": "本例 AirPods 输入流中断。结束当前采集，说明恢复结果；重新选择输入设备后再开始，不假装本轮仍在收音。",
+      "primary": "选择麦克风",
+      "route": "microphone",
+      "motion": null,
+      "hidden": false,
+      "note": "静态提示；点击查看恢复操作",
+      "proposed": false,
+      "sources": [
+        {
+          "kind": "capture",
+          "value": "device_error"
+        },
+        {
+          "kind": "delivery_reason",
+          "value": "audio_error"
+        }
+      ],
+      "message": "AirPods 已断开，录音已停止。请重新连接耳机，或选择其他麦克风后再开始。已录下的内容可到历史记录中检查。"
+    },
+    {
+      "id": "mic-unavailable",
+      "group": "microphone",
+      "name": "设备无法打开",
+      "title": "无法打开麦克风",
+      "subtitle": "换一个输入设备",
+      "icon": "mic-off",
+      "action": "details",
+      "detail": "麦克风不可用或无法启动，没有可重试的本次音频。先选择可用设备。",
+      "primary": "选择麦克风",
+      "route": "microphone",
+      "motion": null,
+      "hidden": false,
+      "note": "静态提示；点击查看恢复操作",
+      "proposed": false,
+      "sources": [
+        {
+          "kind": "capture",
+          "value": "unavailable"
+        },
+        {
+          "kind": "recovery",
+          "value": "no_audio"
+        }
+      ],
+      "message": "无法启动所选麦克风。请连接设备，或选择另一个输入设备后重试。"
+    },
+    {
+      "id": "mic-permission",
+      "group": "microphone",
+      "name": "缺少麦克风权限",
+      "title": "需要麦克风权限",
+      "subtitle": "在系统设置中开启",
+      "icon": "lock",
+      "action": "details",
+      "detail": "没有麦克风权限，不能开始采集。不播放录音动画。用户在系统设置中授权后可再次尝试。",
+      "primary": "打开麦克风设置",
+      "route": "microphone-permission",
+      "motion": null,
+      "hidden": false,
+      "note": "静态提示；点击查看恢复操作",
+      "proposed": false,
+      "sources": [
+        {
+          "kind": "delivery_reason",
+          "value": "microphone_required"
+        }
+      ],
+      "message": "VoiceFlow 需要麦克风权限才能录音。请在系统设置中允许访问，然后重新开始听写。"
+    },
+    {
+      "id": "no-speech",
+      "group": "microphone",
+      "name": "有音频，但未检测到语音",
+      "title": "没有检测到语音",
+      "subtitle": "检查麦克风后重试",
+      "icon": "mic-off",
+      "action": "details",
+      "detail": "采集与语音检测是不同状态。本例有采集帧，但未检测到可辨认语音，不发送空文字到整理或粘贴。",
+      "primary": "检查麦克风",
+      "route": "microphone",
+      "motion": null,
+      "hidden": false,
+      "note": "静态提示；点击查看恢复操作",
+      "proposed": false,
+      "sources": [
+        {
+          "kind": "capture",
+          "value": "no_speech"
+        },
+        {
+          "kind": "delivery_reason",
+          "value": "no_speech"
+        }
+      ],
+      "message": "这次没有检测到语音。请检查麦克风是否选对，靠近麦克风说话后再试。"
+    },
+    {
+      "id": "recording-limit",
+      "group": "microphone",
+      "name": "录音达到长度上限",
+      "title": "录音已达上限",
+      "subtitle": "停止并处理本段",
+      "icon": "clock",
+      "action": "stop",
+      "detail": "已达到本次配置的录音上限。小方块结束录音并处理已采集内容；不把普通时限当成设备故障。",
+      "primary": "查看恢复方式",
+      "route": "settings",
+      "motion": null,
+      "hidden": false,
+      "note": "静态提示；小方块结束本段",
+      "proposed": false,
+      "sources": [
+        {
+          "kind": "dictation",
+          "value": "recording_limited"
+        }
+      ],
+      "message": "已达到本次配置的录音上限。小方块结束录音并处理已采集内容；不把普通时限当成设备故障。"
+    },
+    {
+      "id": "mic-switching",
+      "group": "microphone",
+      "name": "重新连接 / 切换设备",
+      "title": "连接麦克风",
+      "subtitle": "等待设备就绪",
+      "icon": "mic",
+      "action": "stop",
+      "detail": "补充设计：仅在原生层明确开始一次设备重新打开时显示。不能由 UI 计时猜测连接成功，也不意味着能在一段录音里无缝切换。",
+      "primary": "查看恢复方式",
+      "route": "settings",
+      "motion": "line",
+      "hidden": false,
+      "note": "活动状态；小方块可终止",
+      "proposed": true,
+      "sources": [],
+      "message": "补充设计：仅在原生层明确开始一次设备重新打开时显示。不能由 UI 计时猜测连接成功，也不意味着能在一段录音里无缝切换。"
+    },
+    {
+      "id": "app-switch-recording",
+      "group": "microphone",
+      "name": "录音时切到另一个 App",
+      "title": "录音中",
+      "subtitle": "目标：备忘录",
+      "icon": "notes",
+      "action": "stop",
+      "detail": "录音时切换到 Safari，不重新绑定原目标。是否允许输入在最终交付时检查。此提示是补充设计，不能据此保证锁定原输入框或原光标。",
+      "primary": "查看恢复方式",
+      "route": "settings",
+      "motion": "rotate",
+      "hidden": false,
+      "note": "目标图标保持；交付时再次检查",
+      "proposed": true,
+      "sources": [],
+      "message": "录音时切换到 Safari，不重新绑定原目标。是否允许输入在最终交付时检查。此提示是补充设计，不能据此保证锁定原输入框或原光标。"
+    },
+    {
+      "id": "retry-wait",
+      "group": "processing",
+      "name": "内部等待 / 限流重试",
+      "title": "处理中",
+      "subtitle": "",
+      "icon": "orb",
+      "action": "stop",
+      "detail": "内部重试和限流等待保持同样的处理中外观。具体状态、倒计时与尝试次数进入详情，不在胶囊中逐条播报。",
+      "primary": "查看恢复方式",
+      "route": "settings",
+      "motion": "line",
+      "hidden": false,
+      "note": "活动状态；小方块可终止",
+      "proposed": false,
+      "sources": [
+        {
+          "kind": "dictation",
+          "value": "rate_limited"
+        },
+        {
+          "kind": "phase",
+          "value": "waiting_retry"
+        },
+        {
+          "kind": "cleanup_failure",
+          "value": "rate_limited"
+        }
+      ],
+      "message": "内部重试和限流等待保持同样的处理中外观。具体状态、倒计时与尝试次数进入详情，不在胶囊中逐条播报。"
+    },
+    {
+      "id": "model-loading",
+      "group": "processing",
+      "name": "本地模型加载中",
+      "title": "处理中",
+      "subtitle": "",
+      "icon": "orb",
+      "action": "stop",
+      "detail": "补充设计：有确认的前台请求正在等待模型时沿用处理中；后台预加载不弹出 HUD。取消仍应保持可用。",
+      "primary": "查看恢复方式",
+      "route": "settings",
+      "motion": "line",
+      "hidden": false,
+      "note": "活动状态；小方块可终止",
+      "proposed": true,
+      "sources": [],
+      "message": "补充设计：有确认的前台请求正在等待模型时沿用处理中；后台预加载不弹出 HUD。取消仍应保持可用。"
+    },
+    {
+      "id": "offline",
+      "group": "processing",
+      "name": "网络不可用",
+      "title": "无法连接服务",
+      "subtitle": "录音已保存",
+      "icon": "offline",
+      "action": "details",
+      "detail": "本例已确认完整录音写入历史，网络请求失败。可以从历史记录重试；不自动改用云端或本地的其他模型。",
+      "primary": "查看历史并重试",
+      "route": "history",
+      "motion": null,
+      "hidden": false,
+      "note": "本例确认音频已保存后才用此文案",
+      "proposed": false,
+      "sources": [
+        {
+          "kind": "cleanup_failure",
+          "value": "network"
+        }
+      ],
+      "message": "暂时无法连接语音服务。这段录音已保存到历史记录，可以在网络恢复后重试。"
+    },
+    {
+      "id": "asr-timeout",
+      "group": "processing",
+      "name": "识别超时",
+      "title": "处理超时",
+      "subtitle": "录音已保存",
+      "icon": "clock",
+      "action": "details",
+      "detail": "本例已确认录音写入历史。停止本次处理，丢弃迟到的交付；从历史重试，不把旧结果插到新位置。",
+      "primary": "查看历史并重试",
+      "route": "history",
+      "motion": null,
+      "hidden": false,
+      "note": "音频未确认保存时改用恢复未知状态",
+      "proposed": false,
+      "sources": [
+        {
+          "kind": "backend_reason",
+          "value": "processing_timeout"
+        },
+        {
+          "kind": "backend_reason",
+          "value": "local_processing_timeout"
+        }
+      ],
+      "message": "处理时间过长，本次任务已停止。这段录音已保存，可以到历史记录中重新处理。"
+    },
+    {
+      "id": "service-key",
+      "group": "processing",
+      "name": "密钥缺失 / 认证失败",
+      "title": "需要配置服务",
+      "subtitle": "检查密钥与账户",
+      "icon": "lock",
+      "action": "details",
+      "detail": "API key 缺失或服务拒绝认证。设置入口先定位当前服务；不在 HUD 展示密钥或原始错误正文。",
+      "primary": "打开服务设置",
+      "route": "service",
+      "motion": null,
+      "hidden": false,
+      "note": "静态提示；点击查看恢复操作",
+      "proposed": false,
+      "sources": [
+        {
+          "kind": "backend_reason",
+          "value": "api_key_required"
+        },
+        {
+          "kind": "cleanup_failure",
+          "value": "unauthorized"
+        }
+      ],
+      "message": "当前服务缺少有效的访问凭据。请检查密钥、账户与服务设置，然后重试。"
+    },
+    {
+      "id": "service-unavailable",
+      "group": "processing",
+      "name": "服务错误 / 未知处理错误",
+      "title": "暂时无法处理",
+      "subtitle": "查看恢复方式",
+      "icon": "notice",
+      "action": "details",
+      "detail": "没有足够证据判断结果或录音已保存。详情引导检查历史与恢复信息，不声称已经复制或已保存。",
+      "primary": "检查历史",
+      "route": "history",
+      "motion": null,
+      "hidden": false,
+      "note": "静态提示；点击查看恢复操作",
+      "proposed": false,
+      "sources": [
+        {
+          "kind": "dictation",
+          "value": "error"
+        },
+        {
+          "kind": "backend_reason",
+          "value": "dictation_error"
+        },
+        {
+          "kind": "cleanup_failure",
+          "value": "server"
+        },
+        {
+          "kind": "cleanup_failure",
+          "value": "other"
+        }
+      ],
+      "message": "本次听写未能完成。请先检查历史记录中是否有可恢复的录音或文字，再决定是否重新录制。"
+    },
+    {
+      "id": "setup-required",
+      "group": "processing",
+      "name": "尚未完成首次配置",
+      "title": "还差一步设置",
+      "subtitle": "完成配置后使用",
+      "icon": "settings",
+      "action": "details",
+      "detail": "首次设置尚未完成。打开对应引导步骤，不在没有模型或权限时表现为录音成功。",
+      "primary": "继续设置",
+      "route": "onboarding",
+      "motion": null,
+      "hidden": false,
+      "note": "静态提示；点击查看恢复操作",
+      "proposed": false,
+      "sources": [
+        {
+          "kind": "backend_reason",
+          "value": "onboarding_required"
+        }
+      ],
+      "message": "请先完成麦克风、模型或服务配置，再开始使用听写。"
+    },
+    {
+      "id": "model-missing",
+      "group": "processing",
+      "name": "本地模型缺失 / 不匹配",
+      "title": "模型暂不可用",
+      "subtitle": "打开模型设置",
+      "icon": "model",
+      "action": "details",
+      "detail": "包括模型未下载、身份不匹配、服务不可达或运行时不可用。具体原因放在详情；不偷偷换模型或切云端。",
+      "primary": "打开模型设置",
+      "route": "models",
+      "motion": null,
+      "hidden": false,
+      "note": "静态提示；点击查看恢复操作",
+      "proposed": false,
+      "sources": [
+        {
+          "kind": "cleanup_failure",
+          "value": "local_native"
+        }
+      ],
+      "message": "所选本地模型当前无法使用。请到模型设置检查下载和运行状态，修复后重试。"
+    },
+    {
+      "id": "model-corrupt",
+      "group": "processing",
+      "name": "模型校验 / 文件损坏",
+      "title": "模型需要修复",
+      "subtitle": "检查模型文件",
+      "icon": "model",
+      "action": "details",
+      "detail": "补充设计：仅在模型管理器已明确报告校验或文件错误时显示，提供验证或重新下载入口，不自行把一次推理失败归因于损坏。",
+      "primary": "打开模型设置",
+      "route": "models",
+      "motion": null,
+      "hidden": false,
+      "note": "静态提示；点击查看恢复操作",
+      "proposed": true,
+      "sources": [],
+      "message": "模型文件未通过检查。请到模型设置检查文件，必要时重新下载。"
+    },
+    {
+      "id": "cleanup-fallback",
+      "group": "processing",
+      "name": "整理失败，原稿已保留",
+      "title": "整理未完成",
+      "subtitle": "原稿可在历史查看",
+      "icon": "document",
+      "action": "details",
+      "detail": "本例已确认 ASR 原稿保存成功，整理请求失败或返回空内容。原稿与整理候选分开保存。是否已交付以独立交付状态为准，本例不重复粘贴。",
+      "primary": "查看原稿",
+      "route": "history",
+      "motion": null,
+      "hidden": false,
+      "note": "结果保留与交付结果分别判断",
+      "proposed": false,
+      "sources": [
+        {
+          "kind": "backend_reason",
+          "value": "llm_cleanup_empty"
+        },
+        {
+          "kind": "cleanup_failure",
+          "value": "timeout"
+        },
+        {
+          "kind": "cleanup_failure",
+          "value": "context_authorization_changed"
+        }
+      ],
+      "message": "这次文字整理没有完成，识别原稿已保存在历史记录。请先查看原稿，需要时可再次整理。"
+    },
+    {
+      "id": "cleanup-guard",
+      "group": "processing",
+      "name": "整理内容未通过保真检查",
+      "title": "已保留原稿",
+      "subtitle": "整理未通过检查",
+      "icon": "shield",
+      "action": "details",
+      "detail": "本例保真检查拒绝了整理候选，原稿已确认保存。用户可查看原稿与候选差异；不把模型候选当作成功整理结果。",
+      "primary": "检查历史结果",
+      "route": "history",
+      "motion": null,
+      "hidden": false,
+      "note": "静态提示；点击查看恢复操作",
+      "proposed": false,
+      "sources": [
+        {
+          "kind": "backend_reason",
+          "value": "preservation_guard"
+        },
+        {
+          "kind": "cleanup_failure",
+          "value": "guard"
+        }
+      ],
+      "message": "整理结果可能改变了原意，已保留识别原稿。请到历史记录检查后再使用。"
+    },
+    {
+      "id": "partial-result",
+      "group": "processing",
+      "name": "长录音 / 部分结果",
+      "title": "仅有部分结果",
+      "subtitle": "检查完整录音",
+      "icon": "document",
+      "action": "details",
+      "detail": "只完成部分识别或整理。本例恢复录音已保留；必须查看覆盖缺口，不把部分文字悄悄标成完整。",
+      "primary": "查看恢复记录",
+      "route": "history",
+      "motion": null,
+      "hidden": false,
+      "note": "静态提示；点击查看恢复操作",
+      "proposed": false,
+      "sources": [
+        {
+          "kind": "dictation",
+          "value": "degraded"
+        }
+      ],
+      "message": "这次只得到了部分文字。请检查历史记录中的完整录音和未处理部分，再继续使用结果。"
+    },
+    {
+      "id": "empty-result",
+      "group": "processing",
+      "name": "有语音却返回空文字",
+      "title": "没有生成文字",
+      "subtitle": "检查历史录音",
+      "icon": "document",
+      "action": "details",
+      "detail": "补充设计：已检测到语音但服务返回空结果，与无语音区分。本例音频已确认保存；不执行 cleanup 或空文字输入。",
+      "primary": "查看历史录音",
+      "route": "history",
+      "motion": null,
+      "hidden": false,
+      "note": "静态提示；点击查看恢复操作",
+      "proposed": true,
+      "sources": [],
+      "message": "这段录音检测到了语音，但没有得到识别文字。录音已保存，可以到历史记录中重试。"
+    },
+    {
+      "id": "copied",
+      "group": "delivery",
+      "name": "复制成功，未自动输入",
+      "title": "文字已复制",
+      "subtitle": "按 ⌘V 手动粘贴",
+      "icon": "clipboard",
+      "action": "details",
+      "detail": "仅在确认写入剪贴板后显示。本例没有自动输入；用户可自行粘贴。此按钮查看结果，不再次触发键盘粘贴。",
+      "primary": "查看文字",
+      "route": "result",
+      "motion": null,
+      "hidden": false,
+      "note": "静态提示；点击查看恢复操作",
+      "proposed": false,
+      "sources": [
+        {
+          "kind": "dictation",
+          "value": "copied"
+        },
+        {
+          "kind": "delivery_reason",
+          "value": "retry_clipboard_only"
+        },
+        {
+          "kind": "delivery_reason",
+          "value": "reclean_clipboard_only"
+        }
+      ],
+      "message": "文字已复制到剪贴板。请将光标放到需要输入的位置，按 ⌘V 粘贴。"
+    },
+    {
+      "id": "target-changed",
+      "group": "delivery",
+      "name": "交付前切换目标 App",
+      "title": "输入目标已变化",
+      "subtitle": "文字已复制",
+      "icon": "target",
+      "action": "details",
+      "detail": "本例交付前目标变成其他 App，未自动插入，且已确认安全复制。若剪贴板所有权不确定，改用仅存历史状态。",
+      "primary": "查看文字",
+      "route": "result",
+      "motion": null,
+      "hidden": false,
+      "note": "本例已确认复制；不跨 App 追着粘贴",
+      "proposed": false,
+      "sources": [
+        {
+          "kind": "delivery_reason",
+          "value": "target_changed"
+        }
+      ],
+      "message": "输入目标已经变化，因此没有自动输入。文字已复制，你可以在正确的位置手动粘贴。"
+    },
+    {
+      "id": "input-changed",
+      "group": "delivery",
+      "name": "输入框 / 浏览器标签变化",
+      "title": "输入框已变化",
+      "subtitle": "结果已存历史",
+      "icon": "target",
+      "action": "details",
+      "detail": "本例未执行自动插入，结果已确认存入历史。不抢回原窗口、不在另一个输入框里重试。",
+      "primary": "查看历史结果",
+      "route": "history",
+      "motion": null,
+      "hidden": false,
+      "note": "静态提示；点击查看恢复操作",
+      "proposed": false,
+      "sources": [
+        {
+          "kind": "delivery_reason",
+          "value": "input_changed"
+        }
+      ],
+      "message": "输入框或浏览器标签已经变化，未自动输入。结果已保存在历史记录中，请检查后再复制。"
+    },
+    {
+      "id": "no-input",
+      "group": "delivery",
+      "name": "无焦点 / 只读输入框",
+      "title": "请先选择输入框",
+      "subtitle": "文字已复制",
+      "icon": "cursor",
+      "action": "details",
+      "detail": "本例目标不是可编辑输入框，已确认复制。点击恢复只查看文字，不盲目自动粘贴。",
+      "primary": "查看文字",
+      "route": "result",
+      "motion": null,
+      "hidden": false,
+      "note": "静态提示；点击查看恢复操作",
+      "proposed": false,
+      "sources": [
+        {
+          "kind": "delivery_reason",
+          "value": "input_unavailable"
+        }
+      ],
+      "message": "没有找到可编辑的输入框。文字已复制，请先选中输入位置，再按 ⌘V 粘贴。"
+    },
+    {
+      "id": "target-unknown",
+      "group": "delivery",
+      "name": "目标无法确认",
+      "title": "无法确认输入目标",
+      "subtitle": "结果已存历史",
+      "icon": "target",
+      "action": "details",
+      "detail": "本例没有可靠的目标身份，因此未自动插入。文字已确认保存到历史。",
+      "primary": "查看历史结果",
+      "route": "history",
+      "motion": null,
+      "hidden": false,
+      "note": "静态提示；点击查看恢复操作",
+      "proposed": false,
+      "sources": [
+        {
+          "kind": "delivery_reason",
+          "value": "target_unavailable"
+        }
+      ],
+      "message": "无法确认当前输入位置，因此没有自动输入。结果已保存在历史记录中。"
+    },
+    {
+      "id": "accessibility",
+      "group": "delivery",
+      "name": "缺少辅助功能权限",
+      "title": "需要辅助功能权限",
+      "subtitle": "开启后可自动输入",
+      "icon": "lock",
+      "action": "details",
+      "detail": "麦克风可以工作，但未获得辅助功能权限，不能安全执行自动插入。本例结果已保存在历史；开启权限不会自动粘贴旧结果。",
+      "primary": "打开辅助功能设置",
+      "route": "accessibility",
+      "motion": null,
+      "hidden": false,
+      "note": "静态提示；点击查看恢复操作",
+      "proposed": false,
+      "sources": [
+        {
+          "kind": "selected_action",
+          "value": "accessibility_required"
+        },
+        {
+          "kind": "delivery_reason",
+          "value": "accessibility_required"
+        }
+      ],
+      "message": "需要辅助功能权限才能自动输入。请在系统设置中允许 VoiceFlow；本次结果可在历史记录查看。"
+    },
+    {
+      "id": "browser-permission",
+      "group": "delivery",
+      "name": "浏览器访问权限缺失",
+      "title": "需要浏览器权限",
+      "subtitle": "允许后可安全输入",
+      "icon": "lock",
+      "action": "details",
+      "detail": "缺少确认网页目标所需的浏览器访问权限。本例仅存历史；设置完成后由用户决定是否复制，不自动回放旧粘贴。",
+      "primary": "查看权限说明",
+      "route": "browser-permission",
+      "motion": null,
+      "hidden": false,
+      "note": "静态提示；点击查看恢复操作",
+      "proposed": false,
+      "sources": [
+        {
+          "kind": "delivery_reason",
+          "value": "browser_permission_required"
+        }
+      ],
+      "message": "需要浏览器访问权限才能确认网页中的输入位置。本次结果已保存在历史记录，开启权限后再开始新的听写。"
+    },
+    {
+      "id": "secure-input",
+      "group": "delivery",
+      "name": "安全输入阻止插入",
+      "title": "无法在此处输入",
+      "subtitle": "结果已存历史",
+      "icon": "lock",
+      "action": "details",
+      "detail": "系统或当前控件处于安全输入模式，不尝试绕过，也不强制切换焦点。本例文字已保存到历史。",
+      "primary": "查看历史结果",
+      "route": "history",
+      "motion": null,
+      "hidden": false,
+      "note": "静态提示；点击查看恢复操作",
+      "proposed": false,
+      "sources": [
+        {
+          "kind": "delivery_reason",
+          "value": "secure_input"
+        }
+      ],
+      "message": "当前输入位置受到系统保护，无法自动输入。结果已保存在历史记录中，请在合适的位置手动使用。"
+    },
+    {
+      "id": "paste-failed",
+      "group": "delivery",
+      "name": "明确的输入失败",
+      "title": "没有完成输入",
+      "subtitle": "结果已存历史",
+      "icon": "cursor",
+      "action": "details",
+      "detail": "本例已确认输入未完成并保留文字。恢复操作查看历史，不在目标不明时自动再粘贴一次。",
+      "primary": "查看历史结果",
+      "route": "history",
+      "motion": null,
+      "hidden": false,
+      "note": "静态提示；点击查看恢复操作",
+      "proposed": false,
+      "sources": [
+        {
+          "kind": "delivery_reason",
+          "value": "delivery_failed"
+        },
+        {
+          "kind": "delivery_reason",
+          "value": "paste_failed"
+        },
+        {
+          "kind": "delivery_reason",
+          "value": "keyboard_paste_failed"
+        }
+      ],
+      "message": "本次自动输入没有完成。文字已保存在历史记录中，请检查目标输入框后再复制。"
+    },
+    {
+      "id": "input-unverified",
+      "group": "delivery",
+      "name": "输入已尝试，回读无法确认",
+      "title": "已尝试输入",
+      "subtitle": "先检查输入框",
+      "icon": "notice",
+      "action": "details",
+      "detail": "可能已经输入成功，只是系统无法可靠回读。不要再发一次粘贴，也不显示输入失败。先检查目标；需要时再从历史复制。",
+      "primary": "查看历史结果",
+      "route": "history",
+      "motion": null,
+      "hidden": false,
+      "note": "不重复输入；不误报成功或失败",
+      "proposed": false,
+      "sources": [
+        {
+          "kind": "dictation",
+          "value": "unverified"
+        },
+        {
+          "kind": "delivery_reason",
+          "value": "paste_unverified"
+        },
+        {
+          "kind": "delivery_reason",
+          "value": "paste_shortcut_outcome_unknown"
+        },
+        {
+          "kind": "delivery_reason",
+          "value": "paste_expected_splice_unavailable"
+        },
+        {
+          "kind": "delivery_reason",
+          "value": "paste_target_unconfirmed_after_attempt"
+        },
+        {
+          "kind": "delivery_reason",
+          "value": "paste_focus_unconfirmed_after_attempt"
+        },
+        {
+          "kind": "delivery_reason",
+          "value": "paste_target_changed_after_attempt"
+        },
+        {
+          "kind": "delivery_reason",
+          "value": "paste_focus_changed_after_attempt"
+        },
+        {
+          "kind": "delivery_reason",
+          "value": "paste_readback_unavailable"
+        },
+        {
+          "kind": "delivery_reason",
+          "value": "paste_readback_mismatch"
+        },
+        {
+          "kind": "delivery_reason",
+          "value": "paste_mutation_uncertain"
+        }
+      ],
+      "message": "已尝试输入，但无法确认结果。请先检查输入框，避免重复粘贴。需要时可从历史记录复制文字。"
+    },
+    {
+      "id": "clipboard-changed",
+      "group": "delivery",
+      "name": "用户复制了新内容",
+      "title": "保留你的剪贴板",
+      "subtitle": "结果已存历史",
+      "icon": "clipboard",
+      "action": "details",
+      "detail": "用户在听写期间复制了新的内容，保留新剪贴板。结果已确认存入历史，只有用户明确点击复制时才替换剪贴板。",
+      "primary": "查看历史结果",
+      "route": "history",
+      "motion": null,
+      "hidden": false,
+      "note": "静态提示；点击查看恢复操作",
+      "proposed": false,
+      "sources": [
+        {
+          "kind": "delivery_reason",
+          "value": "retry_clipboard_changed"
+        },
+        {
+          "kind": "delivery_reason",
+          "value": "reclean_clipboard_changed"
+        },
+        {
+          "kind": "delivery_reason",
+          "value": "clipboard_changed"
+        }
+      ],
+      "message": "你在听写期间复制了其他内容，VoiceFlow 保留了新的剪贴板。听写结果已存入历史记录，需要时可手动复制。"
+    },
+    {
+      "id": "clipboard-unknown",
+      "group": "delivery",
+      "name": "剪贴板所有权无法确认",
+      "title": "复制状态未确认",
+      "subtitle": "先检查输入框",
+      "icon": "clipboard",
+      "action": "details",
+      "detail": "无法确认剪贴板是否变化或写入是否成功。本例文字已保存到历史；不声称已复制，也不覆盖当前内容。",
+      "primary": "查看历史结果",
+      "route": "history",
+      "motion": null,
+      "hidden": false,
+      "note": "静态提示；点击查看恢复操作",
+      "proposed": false,
+      "sources": [
+        {
+          "kind": "delivery_reason",
+          "value": "retry_clipboard_ownership_unverified"
+        },
+        {
+          "kind": "delivery_reason",
+          "value": "retry_clipboard_write_failed"
+        },
+        {
+          "kind": "delivery_reason",
+          "value": "reclean_clipboard_ownership_unverified"
+        },
+        {
+          "kind": "delivery_reason",
+          "value": "reclean_clipboard_write_failed"
+        },
+        {
+          "kind": "delivery_reason",
+          "value": "clipboard_ownership_unverified"
+        }
+      ],
+      "message": "无法确认文字是否已经复制。请先检查输入框；需要时再从历史记录复制，避免重复输入。"
+    },
+    {
+      "id": "clipboard-failed",
+      "group": "delivery",
+      "name": "剪贴板不可用 / 写入失败",
+      "title": "暂时无法复制",
+      "subtitle": "结果已存历史",
+      "icon": "clipboard",
+      "action": "details",
+      "detail": "剪贴板不可用或明确写入失败，本例文字已确认保存到历史。不能使用文字已复制的提示。",
+      "primary": "查看历史结果",
+      "route": "history",
+      "motion": null,
+      "hidden": false,
+      "note": "静态提示；点击查看恢复操作",
+      "proposed": false,
+      "sources": [
+        {
+          "kind": "delivery_reason",
+          "value": "clipboard_unavailable"
+        },
+        {
+          "kind": "delivery_reason",
+          "value": "clipboard_write_failed"
+        }
+      ],
+      "message": "暂时无法把文字写入剪贴板。结果已保存在历史记录中，你可以稍后再次复制。"
+    },
+    {
+      "id": "history-only",
+      "group": "delivery",
+      "name": "按设置仅保存历史",
+      "title": "已保存到历史",
+      "subtitle": "需要时再复制",
+      "icon": "archive",
+      "action": "details",
+      "detail": "用户配置或安全降级选择只保存历史。本例确实写入成功，没有自动插入或复制。",
+      "primary": "查看历史",
+      "route": "history",
+      "motion": null,
+      "hidden": false,
+      "note": "静态提示；点击查看恢复操作",
+      "proposed": false,
+      "sources": [
+        {
+          "kind": "dictation",
+          "value": "history"
+        },
+        {
+          "kind": "delivery_reason",
+          "value": "reclean_copy_not_attempted"
+        }
+      ],
+      "message": "本次结果已保存到历史记录，没有自动输入或复制。需要时可打开记录查看。"
+    },
+    {
+      "id": "audio-saved",
+      "group": "recovery",
+      "name": "处理失败，完整录音已保存",
+      "title": "录音已保存",
+      "subtitle": "从历史继续处理",
+      "icon": "archive",
+      "action": "details",
+      "detail": "已确认完整录音保存成功，可以从历史恢复与重试。本例没有最终文字可插入。",
+      "primary": "查看历史",
+      "route": "history",
+      "motion": null,
+      "hidden": false,
+      "note": "静态提示；点击查看恢复操作",
+      "proposed": false,
+      "sources": [
+        {
+          "kind": "recovery",
+          "value": "history_saved"
+        }
+      ],
+      "message": "完整录音已保存到历史记录。你可以在那里查看、播放或重新处理这段录音。"
+    },
+    {
+      "id": "audio-retained",
+      "group": "recovery",
+      "name": "录音暂存，历史写入未确认",
+      "title": "录音已保留",
+      "subtitle": "保存到历史再重试",
+      "icon": "archive",
+      "action": "details",
+      "detail": "恢复音频仍在本机暂存，尚未确认写入历史。先执行保存到历史；成功前不把它称为历史记录。",
+      "primary": "保存到历史",
+      "route": "save-audio",
+      "motion": null,
+      "hidden": false,
+      "note": "静态提示；点击查看恢复操作",
+      "proposed": false,
+      "sources": [
+        {
+          "kind": "recovery",
+          "value": "audio_retained"
+        },
+        {
+          "kind": "delivery_reason",
+          "value": "history_save_failed_recovery_kept"
+        }
+      ],
+      "message": "录音仍保留在本机，尚未成功写入历史记录。请先保存到历史，再继续处理。"
+    },
+    {
+      "id": "audio-saving",
+      "group": "recovery",
+      "name": "正在写入恢复录音",
+      "title": "保存录音中",
+      "subtitle": "请稍候",
+      "icon": "archive",
+      "action": "busy",
+      "detail": "保存按钮处于忙碌状态，防止重复提交。录音恢复 ticket 与会话绑定。",
+      "primary": "保存中",
+      "route": "none",
+      "motion": null,
+      "hidden": false,
+      "note": "按钮禁用；本例模拟忙碌状态",
+      "proposed": false,
+      "sources": [],
+      "message": "保存按钮处于忙碌状态，防止重复提交。录音恢复 ticket 与会话绑定。"
+    },
+    {
+      "id": "audio-save-failed",
+      "group": "recovery",
+      "name": "保存到历史失败，暂存仍在",
+      "title": "保存尚未完成",
+      "subtitle": "录音仍在本机保留",
+      "icon": "archive",
+      "action": "details",
+      "detail": "本例确认暂存音频仍在，保存到历史失败。可再次保存，不删除暂存、不丢掉录音。",
+      "primary": "重试保存",
+      "route": "save-audio",
+      "motion": null,
+      "hidden": false,
+      "note": "静态提示；点击查看恢复操作",
+      "proposed": false,
+      "sources": [],
+      "message": "录音仍保留在本机，但写入历史记录没有完成。请检查可用空间后重试保存。"
+    },
+    {
+      "id": "audio-unknown",
+      "group": "recovery",
+      "name": "无法确认是否保存了音频",
+      "title": "请检查历史记录",
+      "subtitle": "录音状态无法确认",
+      "icon": "notice",
+      "action": "details",
+      "detail": "没有确认保存或保留音频的证据。引导检查历史，不虚构录音已保存的承诺。",
+      "primary": "检查历史",
+      "route": "history",
+      "motion": null,
+      "hidden": false,
+      "note": "静态提示；点击查看恢复操作",
+      "proposed": false,
+      "sources": [
+        {
+          "kind": "recovery",
+          "value": "unknown_failure"
+        }
+      ],
+      "message": "无法确认这段录音是否已保存。请先检查历史记录；如果没有找到，可能需要重新录制。"
+    },
+    {
+      "id": "storage-full",
+      "group": "recovery",
+      "name": "历史写入失败 / 磁盘空间",
+      "title": "无法保存到历史",
+      "subtitle": "检查可用空间",
+      "icon": "archive",
+      "action": "details",
+      "detail": "本例历史写入失败，且未确认有可恢复副本。提示检查存储空间；若确认暂存音频仍在，应改用录音已保留状态。",
+      "primary": "查看存储说明",
+      "route": "storage",
+      "motion": null,
+      "hidden": false,
+      "note": "静态提示；点击查看恢复操作",
+      "proposed": false,
+      "sources": [
+        {
+          "kind": "delivery_reason",
+          "value": "history_save_failed"
+        }
+      ],
+      "message": "无法将本次内容保存到历史记录。请检查磁盘可用空间和存储设置后重试。"
+    },
+    {
+      "id": "recovery-dismiss-failed",
+      "group": "recovery",
+      "name": "关闭恢复提示失败",
+      "title": "提示尚未关闭",
+      "subtitle": "可再次尝试",
+      "icon": "notice",
+      "action": "details",
+      "detail": "原恢复 ticket 尚未被原生层成功关闭。保留可恢复内容与入口，不能只在前端隐藏后声称已完成。",
+      "primary": "重试关闭",
+      "route": "dismiss",
+      "motion": null,
+      "hidden": false,
+      "note": "静态提示；点击查看恢复操作",
+      "proposed": false,
+      "sources": [],
+      "message": "暂时无法关闭这条恢复提示。你可以重试关闭，或先处理需要保留的录音。"
+    },
+    {
+      "id": "learned",
+      "group": "learning",
+      "name": "词典已学习一条纠正",
+      "title": "已记住这个词",
+      "subtitle": "L O M → LLM",
+      "icon": "dictionary",
+      "action": "details",
+      "detail": "本例纠正已确认晋升到词典。只学习可归因的词语纠正，不把风格编辑或整段意图变化误学为替换规则。",
+      "primary": "撤销这次学习",
+      "route": "undo",
+      "motion": null,
+      "hidden": false,
+      "note": "仅在本例确有学习晋升时提示",
+      "proposed": false,
+      "sources": [],
+      "message": "已将“L O M → LLM”加入个人词典，下次遇到时会使用这个词。如果这次学习不正确，可以撤销。"
+    },
+    {
+      "id": "learn-undo",
+      "group": "learning",
+      "name": "词典撤销中",
+      "title": "正在撤销学习",
+      "subtitle": "请稍候",
+      "icon": "dictionary",
+      "action": "busy",
+      "detail": "撤销正在进行，禁用重复提交。撤销失败时保留重试入口。",
+      "primary": "撤销中",
+      "route": "none",
+      "motion": null,
+      "hidden": false,
+      "note": "按钮禁用；不显示假成功",
+      "proposed": false,
+      "sources": [],
+      "message": "撤销正在进行，禁用重复提交。撤销失败时保留重试入口。"
+    },
+    {
+      "id": "learn-undo-failed",
+      "group": "learning",
+      "name": "词典撤销失败",
+      "title": "撤销尚未完成",
+      "subtitle": "可以再次尝试",
+      "icon": "dictionary",
+      "action": "details",
+      "detail": "仍未确认撤销，不能显示已删除或已忘记。保留重试撤销与关闭入口。",
+      "primary": "重试撤销",
+      "route": "undo",
+      "motion": null,
+      "hidden": false,
+      "note": "静态提示；点击查看恢复操作",
+      "proposed": false,
+      "sources": [],
+      "message": "尚未确认撤销这次词典学习。你可以再次尝试；确认前这条词语规则仍可能生效。"
+    },
+    {
+      "id": "learn-undone",
+      "group": "learning",
+      "name": "词典撤销完成",
+      "title": "",
+      "subtitle": "",
+      "icon": "notice",
+      "action": "details",
+      "detail": "撤销已确认完成后隐藏学习提示，不额外再弹成功 HUD。",
+      "primary": "查看恢复方式",
+      "route": "settings",
+      "motion": null,
+      "hidden": true,
+      "note": "确认撤销后直接隐藏",
+      "proposed": false,
+      "sources": [],
+      "message": "撤销已确认完成后隐藏学习提示，不额外再弹成功 HUD。"
+    },
+    {
+      "id": "wait-selection",
+      "group": "learning",
+      "name": "选中文本操作：等待选区",
+      "title": "先选中一段文字",
+      "subtitle": "再说出修改要求",
+      "icon": "cursor",
+      "action": "details",
+      "detail": "快捷文本操作尚未获得选区。提示选择文字，不把整篇文档或整个窗口当作用户选中内容。",
+      "primary": "查看操作说明",
+      "route": "selection",
+      "motion": null,
+      "hidden": false,
+      "note": "静态提示；点击查看恢复操作",
+      "proposed": false,
+      "sources": [
+        {
+          "kind": "selected_action",
+          "value": "waiting_for_selection"
+        }
+      ],
+      "message": "请先在目标应用中选中需要修改的文字，然后使用快捷键说出修改要求。"
+    },
+    {
+      "id": "selected-listening",
+      "group": "learning",
+      "name": "选中文本操作：听取指令",
+      "title": "录音中",
+      "subtitle": "修改选中文字",
+      "icon": "notes",
+      "action": "stop",
+      "detail": "听取操作期间保持相同录音外观。停止后进入统一处理中。",
+      "primary": "查看恢复方式",
+      "route": "settings",
+      "motion": "rotate",
+      "hidden": false,
+      "note": "活动状态；小方块可终止",
+      "proposed": false,
+      "sources": [
+        {
+          "kind": "selected_action",
+          "value": "listening"
+        }
+      ],
+      "message": "听取操作期间保持相同录音外观。停止后进入统一处理中。"
+    },
+    {
+      "id": "selected-processing",
+      "group": "learning",
+      "name": "选中文本操作：改写",
+      "title": "处理中",
+      "subtitle": "",
+      "icon": "orb",
+      "action": "stop",
+      "detail": "改写准备与执行都用统一处理中。替换前再确认原选区与目标。",
+      "primary": "查看恢复方式",
+      "route": "settings",
+      "motion": "line",
+      "hidden": false,
+      "note": "活动状态；小方块可终止",
+      "proposed": false,
+      "sources": [
+        {
+          "kind": "selected_action",
+          "value": "preparing_rewrite"
+        }
+      ],
+      "message": "改写准备与执行都用统一处理中。替换前再确认原选区与目标。"
+    },
+    {
+      "id": "selected-replaced",
+      "group": "learning",
+      "name": "选中文本替换已确认",
+      "title": "",
+      "subtitle": "",
+      "icon": "notice",
+      "action": "details",
+      "detail": "选中文字替换已经确认完成，直接隐藏。",
+      "primary": "查看恢复方式",
+      "route": "settings",
+      "motion": null,
+      "hidden": true,
+      "note": "不显示 HUD",
+      "proposed": false,
+      "sources": [
+        {
+          "kind": "selected_action",
+          "value": "replaced"
+        }
+      ],
+      "message": "选中文字替换已经确认完成，直接隐藏。"
+    },
+    {
+      "id": "selected-copied",
+      "group": "learning",
+      "name": "选区目标变化，结果已复制",
+      "title": "修改结果已复制",
+      "subtitle": "原选区已变化",
+      "icon": "clipboard",
+      "action": "details",
+      "detail": "原选区不再匹配，本例没有替换，已确认把修改结果复制。由用户决定粘贴位置。",
+      "primary": "查看修改结果",
+      "route": "result",
+      "motion": null,
+      "hidden": false,
+      "note": "静态提示；点击查看恢复操作",
+      "proposed": false,
+      "sources": [
+        {
+          "kind": "selected_action",
+          "value": "copied_instead"
+        },
+        {
+          "kind": "delivery_reason",
+          "value": "selected_action_clipboard_fallback"
+        }
+      ],
+      "message": "原来的选中文字已经变化，没有自动替换。修改结果已复制，你可以检查后手动粘贴。"
+    }
+  ],
+  "coverage": {
+    "dictation": {
+      "idle": "idle",
+      "starting": "starting",
+      "recording": "recording-airpods",
+      "recording_limited": "recording-limit",
+      "processing": "processing",
+      "rate_limited": "retry-wait",
+      "done": "success",
+      "unverified": "input-unverified",
+      "copied": "copied",
+      "degraded": "partial-result",
+      "history": "history-only",
+      "error": "service-unavailable"
+    },
+    "phase": {
+      "finalizing_audio": "processing",
+      "asr": "processing",
+      "soniox_recovery": "processing",
+      "cascade_accurate": "processing",
+      "cleanup": "processing",
+      "delivery": "processing",
+      "idle": "processing",
+      "waiting_retry": "retry-wait"
+    },
+    "capture": {
+      "waiting_first_frame": "mic-waiting",
+      "receiving_audio": "recording-airpods",
+      "no_audio_yet": "mic-empty",
+      "no_recent_audio": "mic-stale",
+      "device_error": "mic-interrupted",
+      "unavailable": "mic-unavailable",
+      "no_speech": "no-speech"
+    },
+    "recovery": {
+      "history_saved": "audio-saved",
+      "audio_retained": "audio-retained",
+      "unknown_failure": "audio-unknown",
+      "no_audio": "mic-unavailable"
+    },
+    "selected_action": {
+      "waiting_for_selection": "wait-selection",
+      "listening": "selected-listening",
+      "preparing_rewrite": "selected-processing",
+      "accessibility_required": "accessibility",
+      "replaced": "selected-replaced",
+      "copied_instead": "selected-copied"
+    },
+    "delivery_reason": {
+      "delivery_failed": "paste-failed",
+      "delivery_cancelled": "cancelled",
+      "history_save_failed": "storage-full",
+      "history_save_failed_recovery_kept": "audio-retained",
+      "microphone_required": "mic-permission",
+      "audio_error": "mic-interrupted",
+      "no_speech": "no-speech",
+      "accessibility_required": "accessibility",
+      "browser_permission_required": "browser-permission",
+      "secure_input": "secure-input",
+      "input_unavailable": "no-input",
+      "input_changed": "input-changed",
+      "target_changed": "target-changed",
+      "target_unavailable": "target-unknown",
+      "paste_failed": "paste-failed",
+      "retry_clipboard_only": "copied",
+      "retry_clipboard_changed": "clipboard-changed",
+      "retry_clipboard_ownership_unverified": "clipboard-unknown",
+      "retry_clipboard_write_failed": "clipboard-unknown",
+      "reclean_clipboard_only": "copied",
+      "reclean_clipboard_changed": "clipboard-changed",
+      "reclean_clipboard_ownership_unverified": "clipboard-unknown",
+      "reclean_clipboard_write_failed": "clipboard-unknown",
+      "reclean_copy_not_attempted": "history-only",
+      "paste_unverified": "input-unverified",
+      "paste_shortcut_outcome_unknown": "input-unverified",
+      "paste_expected_splice_unavailable": "input-unverified",
+      "paste_target_unconfirmed_after_attempt": "input-unverified",
+      "paste_focus_unconfirmed_after_attempt": "input-unverified",
+      "paste_target_changed_after_attempt": "input-unverified",
+      "paste_focus_changed_after_attempt": "input-unverified",
+      "paste_readback_unavailable": "input-unverified",
+      "paste_readback_mismatch": "input-unverified",
+      "selected_action_clipboard_fallback": "selected-copied",
+      "clipboard_changed": "clipboard-changed",
+      "clipboard_ownership_unverified": "clipboard-unknown",
+      "clipboard_unavailable": "clipboard-failed",
+      "clipboard_write_failed": "clipboard-failed",
+      "keyboard_paste_failed": "paste-failed",
+      "paste_mutation_uncertain": "input-unverified"
+    },
+    "backend_reason": {
+      "api_key_required": "service-key",
+      "onboarding_required": "setup-required",
+      "processing_timeout": "asr-timeout",
+      "dictation_error": "service-unavailable",
+      "llm_cleanup_empty": "cleanup-fallback",
+      "preservation_guard": "cleanup-guard",
+      "local_processing_timeout": "asr-timeout"
+    },
+    "cleanup_failure": {
+      "network": "offline",
+      "timeout": "cleanup-fallback",
+      "context_authorization_changed": "cleanup-fallback",
+      "unauthorized": "service-key",
+      "rate_limited": "retry-wait",
+      "server": "service-unavailable",
+      "guard": "cleanup-guard",
+      "local_native": "model-missing",
+      "other": "service-unavailable"
+    }
+  },
+  "sourceFiles": [
+    "src/components/Island/hudOrb.ts",
+    "src/components/Island/IslandWindow.tsx",
+    "src/components/Island/voicePillTokens.ts",
+    "src/lib/deliveryCopy.ts",
+    "src-tauri/src/lib.rs",
+    "src-tauri/src/llm.rs"
+  ],
+  "notes": [
+    "All UI is a design mockup, not installed product behavior.",
+    "Short labels, recovery actions and fixed geometry are proposals based on current events.",
+    "Fixture claims such as saved/copied are conditional and stated per case.",
+    "No audio, models, clipboard, Keychain, filesystem recovery or external service is used by preview actions."
+  ]
+}

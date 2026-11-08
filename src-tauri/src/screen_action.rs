@@ -75,7 +75,7 @@ pub fn vision_model_ready(vision_model: &str) -> bool {
 pub fn vision_settings_ready(vision_provider: &str, vision_model: &str) -> bool {
     vision_model_ready(vision_model)
         && crate::engine::EngineProvider::parse(vision_provider)
-            .is_some_and(|provider| provider.has_llm())
+            .is_some_and(|provider| provider.has_vision())
 }
 
 #[cfg(test)]
@@ -308,12 +308,28 @@ fn take_current_screen_preview(
         .screen_preview
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    take_screen_preview_for_transaction_control(
+        &mut preview,
+        current_generation,
+        lease,
+        transaction_id,
+        |identity| crate::text_action_is_current(state, identity),
+    )
+}
+
+pub(crate) fn take_screen_preview_for_transaction_control(
+    preview: &mut Option<ScreenActionPreview>,
+    current_generation: u64,
+    lease: OperationLease,
+    transaction_id: &str,
+    is_current: impl Fn(&crate::TextActionIdentity) -> bool,
+) -> Result<ScreenActionPreview, String> {
     match preview.as_ref() {
         None => Err("Look-at-screen preview is no longer available".into()),
         Some(value) if value.session.identity.transaction_id != transaction_id => {
             Err("Look-at-screen preview is stale".into())
         }
-        Some(value) if !crate::text_action_is_current(state, &value.session.identity) => {
+        Some(value) if !is_current(&value.session.identity) => {
             Err("Look-at-screen preview is stale".into())
         }
         Some(value)
@@ -359,36 +375,38 @@ async fn copy_screen_preview_result(
     let commit_identity = identity.clone();
     let copied = tokio::task::spawn_blocking(move || {
         let state = worker_app.state::<AppState>();
-        crate::with_text_action_commit(&state, &commit_identity, || {
-            let result = paste::copy_if_valid(&worker_app, &text, || {
+        crate::with_text_action_copy_commit(&state, &commit_identity, || {
+            paste::copy_if_valid(&worker_app, &text, || {
                 if crate::selected_action::preview_lease_is_current(&state, session_generation) {
                     Ok(())
                 } else {
                     Err(paste::PasteError::Cancelled)
                 }
-            });
-            let terminal = result.is_ok();
-            (result, terminal)
+            })
         })
     })
     .await
-    .map_err(|error| format!("screen preview clipboard worker failed: {error}"))?
-    .map_err(|_| "Look-at-screen preview is stale".to_owned())?
-    .map_err(|error| error.to_string());
+    .map_err(|error| format!("screen preview clipboard worker failed: {error}"))?;
+    let Ok(copied) = copied else {
+        crate::selected_action::settle_cancelled_commit(app, state, &identity, session_generation)
+            .await;
+        return Err("Look-at-screen preview is stale".into());
+    };
+    let copied = copied.map_err(|error| error.to_string());
     if let Err(error) = copied {
-        if crate::selected_action::preview_lease_is_current(state, session_generation) {
-            release_operation(state, OperationLease::LiveDictation);
-        }
-        if crate::text_action_is_current(state, &identity) {
-            crate::clear_text_action(state, &identity);
-            crate::emit_text_action_lifecycle(app, &identity, "failed");
-        }
+        dictation::settle_failed_copy_during_commit(app, state, &identity, session_generation)
+            .await;
         return Err(error);
     }
     if !crate::selected_action::preview_lease_is_current(state, session_generation) {
         return Err("Look-at-screen preview is stale".into());
     }
-    emit_selected_action_state(app, "copied_instead");
+    emit_selected_action_state(
+        app,
+        "copied_instead",
+        session_generation,
+        Some(identity.action_sequence),
+    );
     finish_with_delivery(
         app,
         state,
@@ -398,6 +416,7 @@ async fn copy_screen_preview_result(
         Some("screen_action_clipboard_fallback"),
         Some(CLEANUP_STATUS_AI_SUCCESS),
         Some(session_generation),
+        None,
     )
     .await;
     crate::clear_text_action(state, &identity);
@@ -503,8 +522,7 @@ async fn paste_screen_action_text(
                     )
                 },
             );
-            let terminal =
-                result.is_ok() || matches!(result, Err(paste::PasteError::MutationUncertain));
+            let terminal = crate::selected_action::text_action_commit_is_terminal(&result);
             (result, terminal)
         })
         .map_err(|_| paste::PasteError::Cancelled)?
@@ -605,16 +623,28 @@ pub(crate) async fn confirm_screen_action_preview(
                 result.method.as_str(),
                 outcome.used_keyboard_paste,
             );
-            emit_selected_action_state(&app, "replaced");
+            if outcome.verified {
+                emit_selected_action_state(
+                    &app,
+                    "replaced",
+                    preview.session_generation,
+                    Some(preview.session.identity.action_sequence),
+                );
+            }
             finish_with_delivery(
                 &app,
                 &state,
-                if outcome.verified { "done" } else { "copied" },
+                if outcome.verified {
+                    "done"
+                } else {
+                    "unverified"
+                },
                 Some(&preview.context),
                 result.method.as_str(),
                 result.fallback_reason,
                 Some(CLEANUP_STATUS_AI_SUCCESS),
                 Some(preview.session_generation),
+                None,
             )
             .await;
             crate::clear_text_action(&state, &identity);
@@ -626,12 +656,44 @@ pub(crate) async fn confirm_screen_action_preview(
             }
             .into())
         }
-        Err(paste::PasteError::Cancelled) => Err("Look-at-screen preview is stale".into()),
+        Err(paste::PasteError::Cancelled) => {
+            crate::selected_action::settle_cancelled_commit(
+                &app,
+                &state,
+                &identity,
+                preview.session_generation,
+            )
+            .await;
+            Err("Look-at-screen preview is stale".into())
+        }
         Err(paste::PasteError::MutationUncertain) => {
             crate::clear_text_action(&state, &identity);
             release_operation(&state, OperationLease::LiveDictation);
             crate::emit_text_action_lifecycle(&app, &identity, "failed");
             Err("Text delivery could not be verified".into())
+        }
+        Err(error)
+            if crate::selected_action::text_action_delivery_terminal(Err(&error))
+                == crate::selected_action::TextActionDelivery::Unverified =>
+        {
+            // Cmd+V may already have been posted: a copy fallback invites a
+            // second paste.
+            let result = crate::delivery_result_for_paste(false, error.delivery_diagnostic());
+            finish_with_delivery(
+                &app,
+                &state,
+                "unverified",
+                Some(&preview.context),
+                result.method.as_str(),
+                result.fallback_reason,
+                Some(CLEANUP_STATUS_AI_SUCCESS),
+                Some(preview.session_generation),
+                None,
+            )
+            .await;
+            crate::clear_text_action(&state, &identity);
+            crate::emit_text_action_lifecycle(&app, &identity, "completed");
+            Ok("unverified".into())
         }
         Err(_) => {
             copy_screen_preview_result(
@@ -712,11 +774,15 @@ pub(crate) async fn cancel_screen_action_preview(
     state: State<'_, AppState>,
     transaction_id: String,
 ) -> Result<(), String> {
-    let Some(_identity) = dictation::cancel_text_action_by_id(&app, &state, &transaction_id).await
+    let Some(cancel) =
+        dictation::cancel_text_action_by_id(&app, &state, &transaction_id, "screen").await
     else {
         return Err("Look-at-screen preview is stale".into());
     };
-    emit_selected_action_state(&app, "cancelled");
+    let Some((event_generation, action_sequence)) = cancel.cancelled_event_metadata() else {
+        return Err("Text action is committing; its result will be reported".into());
+    };
+    emit_selected_action_state(&app, "cancelled", event_generation, Some(action_sequence));
     Ok(())
 }
 
@@ -726,6 +792,7 @@ mod tests {
 
     #[tokio::test]
     async fn vision_http_never_replays_redirected_images() {
+        let _network_policy_guard = crate::network_policy::strict_offline_test_guard().await;
         for status in [307, 308] {
             for automatic_context in [false, true] {
                 let sink = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

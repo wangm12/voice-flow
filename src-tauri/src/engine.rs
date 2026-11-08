@@ -33,11 +33,24 @@ pub struct EngineDraft {
     #[serde(default = "default_true")]
     pub custom_llm: bool,
     #[serde(default)]
+    pub custom_cleanup_parameters: crate::custom_cleanup_parameters::Parameters,
+    #[serde(default)]
+    pub probe_stage: ProbeScope,
+    #[serde(default)]
     pub ollama_base_url: String,
     #[serde(default)]
     pub local_whisper_base_url: String,
     #[serde(default = "default_cleanup_enabled")]
     pub cleanup_enabled: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProbeScope {
+    #[default]
+    Both,
+    Asr,
+    Cleanup,
 }
 
 fn default_cleanup_enabled() -> bool {
@@ -64,31 +77,12 @@ impl Default for EngineDraft {
             custom_base_url: String::new(),
             custom_asr: true,
             custom_llm: true,
+            custom_cleanup_parameters: Default::default(),
+            probe_stage: ProbeScope::Both,
             ollama_base_url: EngineProvider::Ollama.default_base_url().to_owned(),
             local_whisper_base_url: EngineProvider::LocalWhisper.default_base_url().to_owned(),
             cleanup_enabled: true,
         }
-    }
-}
-
-pub fn draft_from_settings(settings: &Settings) -> EngineDraft {
-    EngineDraft {
-        asr_provider: settings.asr_provider,
-        cleanup_provider: settings.cleanup_provider,
-        asr_base_url: settings.resolved_provider_base(settings.asr_provider),
-        cleanup_base_url: settings.resolved_provider_base(settings.cleanup_provider),
-        asr_model: settings.asr_model.clone(),
-        cleanup_model: settings.cleanup_model.clone(),
-        api_key: settings.api_key.clone(),
-        asr_api_key: settings.asr_api_key.clone(),
-        cleanup_api_key: settings.cleanup_api_key.clone(),
-        provider_keys: settings.provider_api_keys.clone(),
-        custom_base_url: settings.custom_base_url.clone(),
-        custom_asr: settings.custom_asr,
-        custom_llm: settings.custom_llm,
-        ollama_base_url: settings.ollama_base_url.clone(),
-        local_whisper_base_url: settings.local_whisper_base_url.clone(),
-        cleanup_enabled: settings.cleanup_enabled,
     }
 }
 
@@ -160,11 +154,13 @@ pub fn classify_status_body(status: u16, body: &str) -> ProbeErrorKind {
     if status == 401 || status == 403 {
         return ProbeErrorKind::Key;
     }
-    if status == 404
-        || lower.contains("model")
-            && (lower.contains("not") || lower.contains("invalid") || lower.contains("unknown"))
+    if lower.contains("model")
+        && (lower.contains("not") || lower.contains("invalid") || lower.contains("unknown"))
     {
         return ProbeErrorKind::Model;
+    }
+    if status == 404 {
+        return ProbeErrorKind::Path;
     }
     if status == 400 && (lower.contains("url") || lower.contains("path") || lower.contains("route"))
     {
@@ -193,9 +189,17 @@ pub fn classify_llm_error(error: &LlmError) -> ProbeErrorKind {
         LlmError::Network(_) | LlmError::Timeout => ProbeErrorKind::Address,
         LlmError::Unauthorized => ProbeErrorKind::Key,
         LlmError::Other(message) => classify_status_body(status_from_message(message), message),
-        LlmError::Server(_) | LlmError::RateLimited(_) | LlmError::ContextAuthorizationChanged => {
-            ProbeErrorKind::Provider
-        }
+        LlmError::NativeLocal(failure) => match failure.category() {
+            llm::NativeFailureCategory::Address => ProbeErrorKind::Address,
+            llm::NativeFailureCategory::Path => ProbeErrorKind::Path,
+            llm::NativeFailureCategory::Model => ProbeErrorKind::Model,
+            llm::NativeFailureCategory::Provider => ProbeErrorKind::Provider,
+        },
+        LlmError::Server(_)
+        | LlmError::RateLimited(_)
+        | LlmError::Guard(_)
+        | LlmError::CleanupRejected(_)
+        | LlmError::ContextAuthorizationChanged => ProbeErrorKind::Provider,
     }
 }
 
@@ -228,8 +232,10 @@ fn resolve_side_key(
     draft: &EngineDraft,
     stored: &Settings,
     provider: EngineProvider,
+    custom_purpose: Option<crate::store::CustomCredentialPurpose>,
     fallback_typed: &str,
     stored_legacy: &str,
+    destination_url: &str,
 ) -> Result<String, ProbeStageResult> {
     let typed = typed_provider_key(draft, provider);
     if !typed.is_empty() {
@@ -238,44 +244,79 @@ fn resolve_side_key(
     if provider.is_groq() && !draft.api_key.trim().is_empty() {
         return Ok(draft.api_key.trim().to_owned());
     }
-    if !fallback_typed.trim().is_empty() {
+    if provider == EngineProvider::Custom && !fallback_typed.trim().is_empty() {
         return Ok(fallback_typed.trim().to_owned());
     }
-    let stored_key = stored.provider_secret(provider);
+    let custom_host_changed = provider == EngineProvider::Custom
+        && crate::llm::custom_connection_origin_changed(
+            &stored.resolved_provider_base(EngineProvider::Custom),
+            destination_url,
+        );
+    if custom_host_changed {
+        if provider.allows_empty_key() && providers::is_loopback_url(destination_url) {
+            return Ok(String::new());
+        }
+        return Err(missing_key());
+    }
+    let rejected_custom_session = provider.is_custom() && stored.session_custom_credential_rejected;
+    let stored_key = if provider.is_custom() && stored.session_only_custom_credential {
+        custom_purpose
+            .map(|purpose| stored.session_custom_credential_for(purpose, destination_url))
+            .unwrap_or("")
+    } else if rejected_custom_session {
+        ""
+    } else {
+        stored.provider_secret(provider)
+    };
     if !stored_key.is_empty() {
         return Ok(stored_key.to_owned());
     }
-    if !stored_legacy.trim().is_empty() {
+    if provider.is_custom()
+        && (stored.session_only_custom_credential || stored.session_custom_credential_rejected)
+    {
+        // A recovered value is scoped to the active ASR/cleanup purpose and
+        // origin. Do not fall through to an unrelated saved stage alias.
+        return Err(missing_key());
+    }
+    if provider == EngineProvider::Custom && !stored_legacy.trim().is_empty() {
         return Ok(stored_legacy.trim().to_owned());
     }
-    if provider == EngineProvider::OnDevice {
+    if matches!(
+        provider,
+        EngineProvider::OnDevice | EngineProvider::OnDeviceMlx
+    ) {
         return Ok(String::new());
     }
-    if provider.allows_empty_key()
-        && providers::is_loopback_url(&draft_provider_base(draft, provider))
-    {
+    if provider.allows_empty_key() && providers::is_loopback_url(destination_url) {
         return Ok(String::new());
     }
     Err(missing_key())
 }
 
 fn resolve_asr_key(draft: &EngineDraft, stored: &Settings) -> Result<String, ProbeStageResult> {
+    let destination_url =
+        draft_asr_url(draft).unwrap_or_else(|| draft_provider_base(draft, draft.asr_provider));
     resolve_side_key(
         draft,
         stored,
         draft.asr_provider,
+        Some(crate::store::CustomCredentialPurpose::Asr),
         &draft.asr_api_key,
         stored.asr_api_key.as_str(),
+        &destination_url,
     )
 }
 
 fn resolve_cleanup_key(draft: &EngineDraft, stored: &Settings) -> Result<String, ProbeStageResult> {
+    let destination_url = draft_cleanup_url(draft);
     resolve_side_key(
         draft,
         stored,
         draft.cleanup_provider,
+        Some(crate::store::CustomCredentialPurpose::Cleanup),
         &draft.cleanup_api_key,
         stored.cleanup_api_key.as_str(),
+        &destination_url,
     )
 }
 
@@ -285,10 +326,7 @@ fn draft_provider_base(draft: &EngineDraft, provider: EngineProvider) -> String 
         EngineProvider::LocalWhisper => {
             nonempty(&draft.local_whisper_base_url, provider.default_base_url())
         }
-        EngineProvider::Custom => nonempty(
-            &draft.custom_base_url,
-            nonempty(&draft.asr_base_url, &draft.cleanup_base_url),
-        ),
+        EngineProvider::Custom => draft.custom_base_url.trim().to_owned(),
         EngineProvider::DashScope => nonempty(&draft.asr_base_url, provider.default_base_url()),
         EngineProvider::AssemblyAi => provider.default_base_url().to_owned(),
         EngineProvider::Groq | EngineProvider::OnDevice => String::new(),
@@ -314,12 +352,19 @@ fn draft_asr_url(draft: &EngineDraft) -> Option<String> {
     {
         return None;
     }
-    let override_base = draft.asr_base_url.trim();
-    let base = if !override_base.is_empty() {
-        override_base.to_owned()
+    let base = if draft.asr_provider == EngineProvider::Custom {
+        draft_custom_asr_base_url(draft).to_owned()
     } else {
-        draft_provider_base(draft, draft.asr_provider)
+        let override_base = draft.asr_base_url.trim();
+        if !override_base.is_empty() {
+            override_base.to_owned()
+        } else {
+            draft_provider_base(draft, draft.asr_provider)
+        }
     };
+    if draft.asr_provider == EngineProvider::Custom && base.is_empty() {
+        return None;
+    }
     providers::resolve_asr_endpoint(draft.asr_provider, &base)
 }
 
@@ -332,13 +377,48 @@ fn draft_cleanup_url(draft: &EngineDraft) -> String {
         };
         return crate::ollama_local::chat_endpoint(base);
     }
-    let override_base = draft.cleanup_base_url.trim();
-    let base = if !override_base.is_empty() {
-        override_base.to_owned()
+    if draft.cleanup_provider == EngineProvider::LmStudio {
+        return crate::lmstudio_local::chat_endpoint(EngineProvider::LmStudio.default_base_url());
+    }
+    let base = if draft.cleanup_provider == EngineProvider::Custom {
+        draft_custom_cleanup_base_url(draft).to_owned()
     } else {
-        draft_provider_base(draft, draft.cleanup_provider)
+        let override_base = draft.cleanup_base_url.trim();
+        if !override_base.is_empty() {
+            override_base.to_owned()
+        } else {
+            draft_provider_base(draft, draft.cleanup_provider)
+        }
     };
+    if draft.cleanup_provider == EngineProvider::Custom && base.is_empty() {
+        return String::new();
+    }
     providers::resolve_llm_endpoint(draft.cleanup_provider, &base)
+}
+
+fn draft_custom_asr_base_url(draft: &EngineDraft) -> &str {
+    let stage_base = draft.asr_base_url.trim();
+    if stage_base.is_empty() {
+        draft.custom_base_url.trim()
+    } else {
+        stage_base
+    }
+}
+
+fn draft_custom_cleanup_base_url(draft: &EngineDraft) -> &str {
+    let stage_base = draft.cleanup_base_url.trim();
+    if stage_base.is_empty() {
+        draft.custom_base_url.trim()
+    } else {
+        stage_base
+    }
+}
+
+fn validate_custom_probe_base_url(base: &str) -> Result<(), &'static str> {
+    if base.trim().is_empty() {
+        return Err("a custom service endpoint is required");
+    }
+    crate::asr::validate_asr_base_url(base)
 }
 
 #[cfg(test)]
@@ -349,6 +429,7 @@ pub fn apply_engine_draft(settings: &mut Settings, draft: &EngineDraft) {
     settings.cleanup_model = draft_cleanup_model(draft);
     settings.custom_asr = draft.custom_asr;
     settings.custom_llm = draft.custom_llm;
+    settings.custom_cleanup_parameters = draft.custom_cleanup_parameters.clone();
     settings.cleanup_enabled = draft.cleanup_enabled;
     let custom = nonempty(
         &draft.custom_base_url,
@@ -468,38 +549,28 @@ fn probe_wav() -> Vec<u8> {
     cursor.into_inner()
 }
 
+#[cfg(test)]
 pub async fn probe_engine_draft(
     draft: &EngineDraft,
     stored: &Settings,
     models_root: &Path,
 ) -> ProbeResult {
-    probe_engine_draft_stages(draft, stored, models_root, true, true).await
+    probe_engine_draft_with_cleanup_demand(draft, stored, models_root, || ()).await
 }
 
-/// Probe the parts of a settings draft whose service access is required to
-/// save the selected engine configuration. Soniox is configured-only during
-/// settings save; its WebSocket is opened only by dictation or an explicit
-/// probe. AssemblyAI Dictation supplies an optional cleanup candidate for
-/// eligible recordings, so a common cleanup key is only an optional fallback
-/// and must not block saving the fused provider.
-pub async fn probe_engine_draft_for_settings_save(
+pub(crate) async fn probe_engine_draft_with_cleanup_demand<F, G>(
     draft: &EngineDraft,
     stored: &Settings,
     models_root: &Path,
-) -> ProbeResult {
-    let probe_asr = draft.asr_provider != EngineProvider::Soniox;
-    let probe_cleanup = draft.asr_provider != EngineProvider::AssemblyAi;
-    probe_engine_draft_stages(draft, stored, models_root, probe_asr, probe_cleanup).await
-}
-
-async fn probe_engine_draft_stages(
-    draft: &EngineDraft,
-    stored: &Settings,
-    models_root: &Path,
-    probe_asr: bool,
-    probe_cleanup: bool,
-) -> ProbeResult {
-    if probe_asr
+    mut begin_cleanup_demand: F,
+) -> ProbeResult
+where
+    F: FnMut() -> G + Send,
+    G: Send,
+{
+    let includes_asr = draft.probe_stage != ProbeScope::Cleanup;
+    let includes_cleanup = draft.probe_stage != ProbeScope::Asr;
+    if includes_asr
         && crate::network_policy::is_strict_offline()
         && draft.asr_provider != EngineProvider::OnDevice
     {
@@ -511,7 +582,7 @@ async fn probe_engine_draft_stages(
             cleanup: ProbeStageResult::skipped(),
         };
     }
-    let asr = if !probe_asr {
+    let asr = if !includes_asr {
         ProbeStageResult::skipped()
     } else if draft.asr_provider == EngineProvider::OnDevice {
         let model = draft_asr_model(draft);
@@ -540,6 +611,13 @@ async fn probe_engine_draft_stages(
                 "on-device model is not downloaded",
             )
         }
+    } else if draft.asr_provider == EngineProvider::Custom
+        && validate_custom_probe_base_url(draft_custom_asr_base_url(draft)).is_err()
+    {
+        ProbeStageResult::failure(
+            ProbeErrorKind::Path,
+            "Custom transcription requires an explicit valid HTTP(S) endpoint",
+        )
     } else {
         match resolve_asr_key(draft, stored) {
             Ok(key) => match draft_asr_url(draft) {
@@ -561,20 +639,23 @@ async fn probe_engine_draft_stages(
             Err(error) => error,
         }
     };
-    if !asr.ok {
+    if includes_asr && !asr.ok {
         return ProbeResult {
             asr,
             cleanup: ProbeStageResult::skipped(),
         };
     }
-    if !probe_cleanup || !draft.cleanup_enabled {
+    if !includes_cleanup || (!draft.cleanup_enabled && draft.probe_stage != ProbeScope::Cleanup) {
         return ProbeResult {
             asr,
             cleanup: ProbeStageResult::skipped(),
         };
     }
     if crate::network_policy::is_strict_offline()
-        && draft.cleanup_provider != EngineProvider::Ollama
+        && !matches!(
+            draft.cleanup_provider,
+            EngineProvider::Ollama | EngineProvider::LmStudio | EngineProvider::OnDeviceMlx
+        )
     {
         return ProbeResult {
             asr,
@@ -593,32 +674,91 @@ async fn probe_engine_draft_stages(
             ),
         };
     }
-    let cleanup = match resolve_cleanup_key(draft, stored) {
-        Ok(key) => {
-            match llm::cleanup_with_model_and_limits_and_language_and_profile_and_intent(
-                &draft_cleanup_url(draft),
-                &draft_cleanup_model(draft),
-                "嗯 那个 你好",
-                &key,
-                &[],
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                CleanupEffort::Light,
-                None,
-            )
-            .await
-            {
-                Ok(_) => ProbeStageResult::success(),
-                Err(error) => {
-                    ProbeStageResult::failure(classify_llm_error(&error), error.to_string())
+    let cleanup = if draft.cleanup_provider == EngineProvider::Custom
+        && validate_custom_probe_base_url(draft_custom_cleanup_base_url(draft)).is_err()
+    {
+        ProbeStageResult::failure(
+            ProbeErrorKind::Path,
+            "Custom cleanup requires an explicit valid HTTP(S) endpoint",
+        )
+    } else if draft.cleanup_provider == EngineProvider::Custom {
+        match crate::custom_cleanup_parameters::validate(&draft.custom_cleanup_parameters) {
+            Ok(()) => match resolve_cleanup_key(draft, stored) {
+                Ok(key) => {
+                    let runtime = crate::mlx_cleanup_runtime::shared_runtime(
+                        models_root,
+                        crate::modelstore::shared_manager(),
+                    );
+                    match llm::cleanup_with_provider_and_native_runtime_and_intent_and_source(
+                        draft.cleanup_provider,
+                        &runtime,
+                        &draft_cleanup_url(draft),
+                        &draft_cleanup_model(draft),
+                        "嗯 那个 你好",
+                        &key,
+                        &[],
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        CleanupEffort::Light,
+                        None,
+                        None,
+                        None,
+                        Some(&draft.custom_cleanup_parameters),
+                    )
+                    .await
+                    {
+                        Ok(_) => ProbeStageResult::success(),
+                        Err(error) => {
+                            ProbeStageResult::failure(classify_llm_error(&error), error.to_string())
+                        }
+                    }
+                }
+                Err(error) => error,
+            },
+            Err(message) => ProbeStageResult::failure(ProbeErrorKind::Provider, message),
+        }
+    } else {
+        match resolve_cleanup_key(draft, stored) {
+            Ok(key) => {
+                let _cleanup_demand = begin_cleanup_demand();
+                let runtime = crate::mlx_cleanup_runtime::shared_runtime(
+                    models_root,
+                    crate::modelstore::shared_manager(),
+                );
+                match llm::cleanup_with_provider_and_native_runtime_and_intent_and_source(
+                    draft.cleanup_provider,
+                    &runtime,
+                    &draft_cleanup_url(draft),
+                    &draft_cleanup_model(draft),
+                    "嗯 那个 你好",
+                    &key,
+                    &[],
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    CleanupEffort::Light,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                {
+                    Ok(_) => ProbeStageResult::success(),
+                    Err(error) => {
+                        ProbeStageResult::failure(classify_llm_error(&error), error.to_string())
+                    }
                 }
             }
+            Err(error) => error,
         }
-        Err(error) => error,
     };
     ProbeResult { asr, cleanup }
 }
@@ -666,8 +806,12 @@ mod tests {
     #[test]
     fn classify_status_body_splits_key_model_and_path() {
         assert_eq!(classify_status_body(401, ""), ProbeErrorKind::Key);
+        assert_eq!(classify_status_body(404, "not found"), ProbeErrorKind::Path);
         assert_eq!(
-            classify_status_body(404, "not found"),
+            classify_status_body(
+                404,
+                r#"{"error":{"message":"The model no-such-model does not exist"}}"#,
+            ),
             ProbeErrorKind::Model
         );
         assert_eq!(
@@ -681,10 +825,48 @@ mod tests {
         assert_eq!(classify_status_body(500, "oops"), ProbeErrorKind::Provider);
     }
 
+    #[test]
+    fn classify_native_llm_errors_from_owner_categories() {
+        use crate::lmstudio_local::LocalError;
+
+        for (error, expected) in [
+            (LocalError::Unreachable, ProbeErrorKind::Address),
+            (LocalError::CliTimeout, ProbeErrorKind::Address),
+            (LocalError::InvalidEndpoint, ProbeErrorKind::Path),
+            (LocalError::ModelMismatch, ProbeErrorKind::Model),
+            (LocalError::InstanceNotReady, ProbeErrorKind::Model),
+            (
+                LocalError::InputTooLarge {
+                    input_bytes: 4097,
+                    max_bytes: 4096,
+                },
+                ProbeErrorKind::Provider,
+            ),
+            (LocalError::InstanceSourceUnknown, ProbeErrorKind::Provider),
+            (LocalError::Http, ProbeErrorKind::Provider),
+        ] {
+            let mapped = llm::map_lmstudio_error(error);
+            assert_eq!(classify_llm_error(&mapped), expected);
+        }
+    }
+
     #[tokio::test]
     async fn probe_maps_connect_failure_to_address() {
+        let _network_policy_guard = crate::network_policy::strict_offline_test_guard().await;
+        // Keep an owned, bound, non-listening loopback port alive throughout
+        // the real connection attempt instead of relying on an unowned port.
+        let unavailable = tokio::net::TcpSocket::new_v4().expect("create IPv4 socket");
+        unavailable
+            .bind("127.0.0.1:0".parse().expect("loopback socket address"))
+            .expect("bind an ephemeral loopback port");
+        let endpoint = format!(
+            "http://{}",
+            unavailable
+                .local_addr()
+                .expect("read bound loopback address")
+        );
         let result = probe_engine_draft(
-            &custom_asr_draft("http://127.0.0.1:1", "whisper-1"),
+            &custom_asr_draft(&endpoint, "whisper-1"),
             &Settings::default(),
             &unused_models_root(),
         )
@@ -697,6 +879,7 @@ mod tests {
 
     #[tokio::test]
     async fn probe_maps_unauthorized_to_key() {
+        let _network_policy_guard = crate::network_policy::strict_offline_test_guard().await;
         let endpoint = crate::test_http::spawn_response(401, "application/json", b"{}", &[]).await;
         let result = probe_engine_draft(
             &custom_asr_draft(&endpoint, "whisper-1"),
@@ -708,11 +891,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn probe_maps_unknown_model_to_model() {
+    async fn probe_maps_generic_not_found_to_path() {
+        let _network_policy_guard = crate::network_policy::strict_offline_test_guard().await;
         let endpoint = crate::test_http::spawn_response(
             404,
             "application/json",
-            br#"{"error":{"message":"model_not_found"}}"#,
+            br#"{"error":{"message":"resource not found"}}"#,
             &[],
         )
         .await;
@@ -722,11 +906,12 @@ mod tests {
             &unused_models_root(),
         )
         .await;
-        assert_eq!(result.asr.error_kind, Some(ProbeErrorKind::Model));
+        assert_eq!(result.asr.error_kind, Some(ProbeErrorKind::Path));
     }
 
     #[tokio::test]
     async fn probe_accepts_empty_asr_text_and_skips_disabled_cleanup() {
+        let _network_policy_guard = crate::network_policy::strict_offline_test_guard().await;
         let endpoint = crate::test_http::spawn_response(
             200,
             "application/json",
@@ -747,6 +932,7 @@ mod tests {
 
     #[tokio::test]
     async fn probe_runs_cleanup_against_the_draft_chat_url() {
+        let _network_policy_guard = crate::network_policy::strict_offline_test_guard().await;
         let asr_endpoint = crate::test_http::spawn_response(
             200,
             "application/json",
@@ -781,7 +967,130 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn custom_both_stage_probe_uses_shared_key_and_router_path_prefix() {
+        let _network_policy_guard = crate::network_policy::strict_offline_test_guard().await;
+        // This captures two independent stage probes on one Custom connection;
+        // the cleanup probe fixture does not consume the ASR probe transcript.
+        let (base, requests) = crate::test_http::spawn_responses_with_full_request_capture(
+            vec![
+                (
+                    200,
+                    "application/json",
+                    br#"{"text":"probe transcript","segments":[],"words":[]}"#.to_vec(),
+                ),
+                (
+                    200,
+                    "text/event-stream",
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"嗯 那个 你好\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"
+                        .as_bytes()
+                        .to_vec(),
+                ),
+            ],
+        )
+        .await;
+        let draft = EngineDraft {
+            asr_provider: EngineProvider::Custom,
+            cleanup_provider: EngineProvider::Custom,
+            custom_base_url: format!("{base}/llm/v1"),
+            asr_model: "groq/whisper-large-v3-turbo".into(),
+            cleanup_model: "groq/openai/gpt-oss-20b".into(),
+            provider_keys: BTreeMap::from([("custom".into(), "synthetic-router-key".into())]),
+            custom_cleanup_parameters: BTreeMap::from([(
+                "temperature".into(),
+                serde_json::json!(0.2),
+            )]),
+            cleanup_enabled: true,
+            ..EngineDraft::default()
+        };
+
+        let result = probe_engine_draft(&draft, &Settings::default(), &unused_models_root()).await;
+        assert!(result.asr.ok, "{}", result.asr.message);
+        assert!(result.cleanup.ok, "{}", result.cleanup.message);
+        let requests = requests.await.expect("both stage requests captured");
+        assert_eq!(requests.len(), 2);
+
+        let asr_request = String::from_utf8_lossy(&requests[0]);
+        let cleanup_request = String::from_utf8_lossy(&requests[1]);
+        assert!(asr_request.starts_with("POST /llm/v1/audio/transcriptions HTTP/1.1\r\n"));
+        assert!(cleanup_request.starts_with("POST /llm/v1/chat/completions HTTP/1.1\r\n"));
+        for request in [&asr_request, &cleanup_request] {
+            assert!(request
+                .to_ascii_lowercase()
+                .contains("authorization: bearer synthetic-router-key"));
+        }
+        let asr_multipart = asr_request.split_once("\r\n\r\n").unwrap().1;
+        assert!(asr_multipart.contains("groq/whisper-large-v3-turbo"));
+        assert!(asr_multipart.contains("verbose_json"));
+        assert!(asr_multipart.contains("timestamp_granularities[]"));
+        assert!(!asr_multipart.contains("name=\"temperature\""));
+
+        let cleanup_body = cleanup_request.split_once("\r\n\r\n").unwrap().1;
+        let cleanup_json: serde_json::Value =
+            serde_json::from_str(cleanup_body).expect("cleanup request JSON");
+        assert_eq!(cleanup_json["model"], "groq/openai/gpt-oss-20b");
+        assert_eq!(cleanup_json["temperature"], serde_json::json!(0.2));
+    }
+
+    #[tokio::test]
+    async fn custom_stage_probe_scope_sends_only_the_selected_stage_request() {
+        let _network_policy_guard = crate::network_policy::strict_offline_test_guard().await;
+        for (scope, content_type, response_body, expected_path) in [
+            (
+                ProbeScope::Asr,
+                "application/json",
+                br#"{"text":"probe transcript","segments":[],"words":[]}"#.to_vec(),
+                "/router/v1/audio/transcriptions",
+            ),
+            (
+                ProbeScope::Cleanup,
+                "text/event-stream",
+                "data: {\"choices\":[{\"delta\":{\"content\":\"嗯 那个 你好\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"
+                    .as_bytes()
+                    .to_vec(),
+                "/router/v1/chat/completions",
+            ),
+        ] {
+            let (host, request) = crate::test_http::spawn_response_with_full_request_capture(
+                200,
+                content_type,
+                response_body,
+                &[],
+            )
+            .await;
+            let draft = EngineDraft {
+                asr_provider: EngineProvider::Custom,
+                cleanup_provider: EngineProvider::Custom,
+                custom_base_url: format!("{host}/router/v1"),
+                asr_model: "groq/whisper-large-v3-turbo".into(),
+                cleanup_model: "groq/openai/gpt-oss-20b".into(),
+                provider_keys: BTreeMap::from([("custom".into(), "synthetic-router-key".into())]),
+                cleanup_enabled: true,
+                probe_stage: scope,
+                ..EngineDraft::default()
+            };
+
+            let result =
+                probe_engine_draft(&draft, &Settings::default(), &unused_models_root()).await;
+            match scope {
+                ProbeScope::Asr => {
+                    assert!(result.asr.ok, "{}", result.asr.message);
+                    assert!(result.cleanup.skipped);
+                }
+                ProbeScope::Cleanup => {
+                    assert!(result.asr.skipped);
+                    assert!(result.cleanup.ok, "{}", result.cleanup.message);
+                }
+                ProbeScope::Both => unreachable!("test only covers explicit stage scopes"),
+            }
+            let raw_request = request.await.expect("selected stage captured");
+            let request = String::from_utf8_lossy(&raw_request);
+            assert!(request.starts_with(&format!("POST {expected_path} HTTP/1.1\r\n")));
+        }
+    }
+
+    #[tokio::test]
     async fn probe_accepts_deepgram_listen_json() {
+        let _network_policy_guard = crate::network_policy::strict_offline_test_guard().await;
         let endpoint = crate::test_http::spawn_response(
             200,
             "application/json",
@@ -806,6 +1115,7 @@ mod tests {
 
     #[tokio::test]
     async fn probe_accepts_anthropic_messages_json() {
+        let _network_policy_guard = crate::network_policy::strict_offline_test_guard().await;
         let asr_endpoint = crate::test_http::spawn_response(
             200,
             "application/json",
@@ -909,6 +1219,7 @@ mod tests {
 
     #[tokio::test]
     async fn probe_llm_only_cleanup_without_key_is_missing_key() {
+        let _network_policy_guard = crate::network_policy::strict_offline_test_guard().await;
         for cleanup_provider in [EngineProvider::DeepSeek, EngineProvider::Anthropic] {
             let asr_endpoint = crate::test_http::spawn_response(
                 200,
@@ -940,8 +1251,436 @@ mod tests {
         }
     }
 
+    #[test]
+    fn on_device_mlx_cleanup_resolves_without_an_endpoint_or_secret() {
+        let draft = EngineDraft {
+            cleanup_provider: EngineProvider::OnDeviceMlx,
+            cleanup_model: EngineProvider::OnDeviceMlx.default_llm_model().into(),
+            ..EngineDraft::default()
+        };
+        assert_eq!(
+            resolve_cleanup_key(&draft, &Settings::default()).unwrap(),
+            ""
+        );
+        assert_eq!(draft_cleanup_url(&draft), "");
+    }
+
+    #[test]
+    fn generic_not_found_probe_error_is_a_path_error_unless_it_names_a_model() {
+        assert_eq!(classify_status_body(404, "not found"), ProbeErrorKind::Path);
+        assert_eq!(
+            classify_status_body(404, "model not found"),
+            ProbeErrorKind::Model
+        );
+    }
+
+    #[test]
+    fn custom_credentials_do_not_follow_a_changed_host_without_a_typed_replacement() {
+        let stored = Settings {
+            custom_base_url: "https://old.example/v1".into(),
+            provider_api_keys: std::collections::BTreeMap::from([(
+                "custom".into(),
+                "old-key".into(),
+            )]),
+            asr_api_key: "old-key".into(),
+            ..Settings::default()
+        };
+        let mut draft = EngineDraft {
+            cleanup_provider: EngineProvider::Custom,
+            custom_base_url: "https://new.example/v1".into(),
+            cleanup_model: "provider/model".into(),
+            ..EngineDraft::default()
+        };
+        assert_eq!(
+            resolve_cleanup_key(&draft, &stored).unwrap_err().error_kind,
+            Some(ProbeErrorKind::MissingKey)
+        );
+        draft
+            .provider_keys
+            .insert("custom".into(), "new-key".into());
+        assert_eq!(resolve_cleanup_key(&draft, &stored).unwrap(), "new-key");
+    }
+
+    #[test]
+    fn custom_credentials_do_not_follow_scheme_or_port_changes() {
+        let stored = Settings {
+            custom_base_url: "https://router.example/v1".into(),
+            provider_api_keys: std::collections::BTreeMap::from([(
+                "custom".into(),
+                "old-key".into(),
+            )]),
+            ..Settings::default()
+        };
+
+        for custom_base_url in ["https://router.example:8443/v1", "http://router.example/v1"] {
+            let draft = EngineDraft {
+                cleanup_provider: EngineProvider::Custom,
+                custom_base_url: custom_base_url.into(),
+                cleanup_model: "provider/model".into(),
+                ..EngineDraft::default()
+            };
+            assert_eq!(
+                resolve_cleanup_key(&draft, &stored).unwrap_err().error_kind,
+                Some(ProbeErrorKind::MissingKey)
+            );
+        }
+
+        let same_origin = EngineDraft {
+            cleanup_provider: EngineProvider::Custom,
+            custom_base_url: "https://router.example:443/chat/completions".into(),
+            cleanup_model: "provider/model".into(),
+            ..EngineDraft::default()
+        };
+        assert_eq!(
+            resolve_cleanup_key(&same_origin, &stored).unwrap(),
+            "old-key"
+        );
+    }
+
+    #[test]
+    fn custom_stage_url_resolution_does_not_fall_back_to_the_other_stage() {
+        let draft = EngineDraft {
+            asr_provider: EngineProvider::Custom,
+            cleanup_provider: EngineProvider::Custom,
+            asr_base_url: String::new(),
+            cleanup_base_url: "http://127.0.0.1:1/v1".into(),
+            ..EngineDraft::default()
+        };
+        assert_eq!(draft_custom_asr_base_url(&draft), "");
+        assert_eq!(draft_asr_url(&draft), None);
+
+        let draft = EngineDraft {
+            asr_provider: EngineProvider::Custom,
+            cleanup_provider: EngineProvider::Custom,
+            asr_base_url: "http://127.0.0.1:1/v1".into(),
+            cleanup_base_url: String::new(),
+            ..EngineDraft::default()
+        };
+        assert_eq!(draft_custom_cleanup_base_url(&draft), "");
+        assert_eq!(draft_cleanup_url(&draft), "");
+        assert!(validate_custom_probe_base_url("").is_err());
+        assert!(validate_custom_probe_base_url("ftp://router.example/v1").is_err());
+        assert!(validate_custom_probe_base_url("https://router.example/v1").is_ok());
+    }
+
+    #[test]
+    fn custom_cleanup_probe_admission_does_not_borrow_the_groq_asr_url() {
+        let draft = EngineDraft {
+            asr_provider: EngineProvider::Groq,
+            asr_base_url: "https://api.groq.com/openai/v1".into(),
+            cleanup_provider: EngineProvider::Custom,
+            custom_base_url: String::new(),
+            cleanup_base_url: String::new(),
+            cleanup_api_key: "synthetic-custom-key".into(),
+            cleanup_enabled: true,
+            probe_stage: ProbeScope::Cleanup,
+            ..EngineDraft::default()
+        };
+
+        assert_eq!(draft_custom_cleanup_base_url(&draft), "");
+        assert_eq!(draft_cleanup_url(&draft), "");
+        assert!(validate_custom_probe_base_url(draft_custom_cleanup_base_url(&draft)).is_err());
+        assert_eq!(
+            draft_asr_url(&draft).as_deref(),
+            Some("https://api.groq.com/openai/v1/audio/transcriptions")
+        );
+    }
+
+    #[test]
+    fn custom_credentials_bind_to_each_stage_resolved_destination() {
+        let stored = Settings {
+            custom_base_url: "https://stored.example/v1".into(),
+            provider_api_keys: std::collections::BTreeMap::from([(
+                "custom".into(),
+                "stored-key".into(),
+            )]),
+            ..Settings::default()
+        };
+        let draft = EngineDraft {
+            asr_provider: EngineProvider::Custom,
+            cleanup_provider: EngineProvider::Custom,
+            custom_base_url: "https://stored.example/v1".into(),
+            asr_base_url: "https://asr-override.example/v1".into(),
+            cleanup_base_url: "https://cleanup-override.example/v1".into(),
+            asr_model: "whisper-1".into(),
+            cleanup_model: "provider/model".into(),
+            ..EngineDraft::default()
+        };
+
+        assert_eq!(
+            resolve_asr_key(&draft, &stored).unwrap_err().error_kind,
+            Some(ProbeErrorKind::MissingKey),
+            "the stored Custom key must not follow the ASR destination override"
+        );
+        assert_eq!(
+            resolve_cleanup_key(&draft, &stored).unwrap_err().error_kind,
+            Some(ProbeErrorKind::MissingKey),
+            "the stored Custom key must not follow the cleanup destination override"
+        );
+    }
+
+    #[test]
+    fn recovered_custom_key_is_limited_to_its_active_stage_and_origin() {
+        let mut stored = Settings {
+            asr_provider: EngineProvider::Custom,
+            asr_base_url: "https://router-a.example/v1/asr".into(),
+            cleanup_enabled: false,
+            cleanup_api_key: "synthetic-cleanup-legacy-key".into(),
+            ..Settings::default()
+        };
+        let scope = crate::store::custom_credential_recovery_scope(
+            &stored,
+            crate::store::CustomCredentialPurpose::Asr,
+        )
+        .unwrap();
+        crate::store::adopt_interactive_custom_credential(
+            &mut stored,
+            "synthetic-session-asr-key".into(),
+            scope,
+        );
+
+        let asr_same_origin = EngineDraft {
+            asr_provider: EngineProvider::Custom,
+            asr_base_url: "https://router-a.example/v1/audio/transcriptions".into(),
+            custom_base_url: "https://router-a.example/v1".into(),
+            ..EngineDraft::default()
+        };
+        assert_eq!(
+            resolve_asr_key(&asr_same_origin, &stored).unwrap(),
+            "synthetic-session-asr-key"
+        );
+
+        let cleanup_same_origin = EngineDraft {
+            cleanup_provider: EngineProvider::Custom,
+            cleanup_base_url: "https://router-a.example/v1/chat/completions".into(),
+            custom_base_url: "https://router-a.example/v1".into(),
+            ..EngineDraft::default()
+        };
+        assert_eq!(
+            resolve_cleanup_key(&cleanup_same_origin, &stored)
+                .unwrap_err()
+                .error_kind,
+            Some(ProbeErrorKind::MissingKey),
+            "an ASR-only recovery cannot flow to cleanup or its legacy alias"
+        );
+
+        let asr_other_origin = EngineDraft {
+            asr_provider: EngineProvider::Custom,
+            asr_base_url: "https://router-b.example/v1/audio/transcriptions".into(),
+            custom_base_url: "https://router-b.example/v1".into(),
+            ..EngineDraft::default()
+        };
+        assert_eq!(
+            resolve_asr_key(&asr_other_origin, &stored)
+                .unwrap_err()
+                .error_kind,
+            Some(ProbeErrorKind::MissingKey)
+        );
+    }
+
+    #[test]
+    fn revoked_custom_recovery_cannot_reappear_through_stage_legacy_fallback() {
+        let mut stored = Settings {
+            asr_provider: EngineProvider::Custom,
+            asr_base_url: "https://router-a.example/v1/asr".into(),
+            cleanup_enabled: false,
+            cleanup_provider: EngineProvider::Groq,
+            custom_base_url: "https://router-a.example/v1".into(),
+            asr_api_key: "synthetic-old-asr-alias".into(),
+            cleanup_api_key: "synthetic-cleanup-key-from-router-b".into(),
+            ..Settings::default()
+        };
+        let scope = crate::store::custom_credential_recovery_scope(
+            &stored,
+            crate::store::CustomCredentialPurpose::Asr,
+        )
+        .unwrap();
+        crate::store::adopt_interactive_custom_credential(
+            &mut stored,
+            "synthetic-session-key-from-router-a".into(),
+            scope,
+        );
+
+        // This is the production revocation path: active Custom-purpose set
+        // changes, so the process-only value is removed and rejection becomes sticky.
+        stored.asr_provider = EngineProvider::Groq;
+        stored.cleanup_enabled = true;
+        stored.cleanup_provider = EngineProvider::Custom;
+        stored.cleanup_base_url = "https://router-b.example/v1/cleanup".into();
+        assert!(stored.clear_stale_session_custom_credential());
+        assert!(!stored.session_only_custom_credential);
+        assert!(stored.session_custom_credential_rejected);
+
+        // The shared Custom origin remains router A, but the retained cleanup
+        // alias came from router B. A later Custom probe must not revive it.
+        let cleanup_probe = EngineDraft {
+            cleanup_provider: EngineProvider::Custom,
+            custom_base_url: "https://router-a.example/v1".into(),
+            cleanup_base_url: String::new(),
+            cleanup_model: "provider/model".into(),
+            ..EngineDraft::default()
+        };
+        assert_eq!(
+            resolve_cleanup_key(&cleanup_probe, &stored)
+                .unwrap_err()
+                .error_kind,
+            Some(ProbeErrorKind::MissingKey)
+        );
+
+        let asr_probe = EngineDraft {
+            asr_provider: EngineProvider::Custom,
+            custom_base_url: "https://router-a.example/v1".into(),
+            asr_base_url: String::new(),
+            ..EngineDraft::default()
+        };
+        assert_eq!(
+            resolve_asr_key(&asr_probe, &stored).unwrap_err().error_kind,
+            Some(ProbeErrorKind::MissingKey)
+        );
+    }
+
+    #[test]
+    fn custom_stage_key_fields_do_not_fall_through_to_other_providers() {
+        let mut stored = Settings::default();
+        stored
+            .provider_api_keys
+            .insert("groq".into(), "stored-groq-key".into());
+        let mut draft = EngineDraft::default();
+        draft
+            .provider_keys
+            .insert("custom".into(), "typed-custom-key".into());
+        draft.asr_api_key = "typed-custom-key".into();
+        draft.cleanup_api_key = "typed-custom-key".into();
+
+        assert_eq!(resolve_asr_key(&draft, &stored).unwrap(), "stored-groq-key");
+        assert_eq!(
+            resolve_cleanup_key(&draft, &stored).unwrap(),
+            "stored-groq-key"
+        );
+    }
+
+    #[test]
+    fn custom_stages_do_not_reuse_a_saved_groq_credential() {
+        let stored = Settings {
+            api_key: "synthetic-groq-key".into(),
+            provider_api_keys: BTreeMap::from([("groq".into(), "synthetic-groq-key".into())]),
+            ..Settings::default()
+        };
+        let draft = EngineDraft {
+            asr_provider: EngineProvider::Custom,
+            cleanup_provider: EngineProvider::Custom,
+            custom_base_url: "https://router.example/llm/v1".into(),
+            ..EngineDraft::default()
+        };
+
+        assert_eq!(
+            resolve_asr_key(&draft, &stored).unwrap_err().error_kind,
+            Some(ProbeErrorKind::MissingKey)
+        );
+        assert_eq!(
+            resolve_cleanup_key(&draft, &stored).unwrap_err().error_kind,
+            Some(ProbeErrorKind::MissingKey)
+        );
+    }
+
+    #[tokio::test]
+    async fn non_custom_cleanup_probe_ignores_stashed_custom_parameters() {
+        let _network_policy_guard = crate::network_policy::strict_offline_test_guard().await;
+        let (endpoint, request) = crate::test_http::spawn_response_with_request_capture(
+            200,
+            "text/event-stream",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"嗯 那个 你好\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"
+                .as_bytes()
+                .to_vec(),
+            &[],
+        )
+        .await;
+        let draft = EngineDraft {
+            asr_provider: EngineProvider::OnDevice,
+            asr_model: "not-an-mlx-model".into(),
+            cleanup_provider: EngineProvider::DeepSeek,
+            cleanup_base_url: endpoint,
+            cleanup_model: "provider/model".into(),
+            cleanup_enabled: true,
+            probe_stage: ProbeScope::Cleanup,
+            provider_keys: [("deepseek".into(), "synthetic-key".into())]
+                .into_iter()
+                .collect(),
+            custom_cleanup_parameters: [
+                ("temperature".into(), serde_json::json!(0.8)),
+                (
+                    "vendor_extension".into(),
+                    serde_json::json!({"enabled": false}),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            ..EngineDraft::default()
+        };
+
+        let result = probe_engine_draft(&draft, &Settings::default(), &unused_models_root()).await;
+        assert!(result.asr.skipped);
+        let body: serde_json::Value =
+            serde_json::from_slice(&request.await.expect("cleanup request captured"))
+                .expect("valid JSON request");
+        assert_eq!(body["temperature"], serde_json::json!(0.0));
+        assert_eq!(body["max_completion_tokens"], serde_json::json!(4096));
+        assert!(!body
+            .as_object()
+            .is_some_and(|fields| fields.contains_key("vendor_extension")));
+    }
+
+    #[tokio::test]
+    async fn cleanup_only_probe_skips_invalid_asr_draft_and_runs_only_its_validation() {
+        let _network_policy_guard = crate::network_policy::strict_offline_test_guard().await;
+        let draft = EngineDraft {
+            asr_provider: EngineProvider::OnDevice,
+            asr_model: "not-an-mlx-model".into(),
+            cleanup_provider: EngineProvider::Custom,
+            cleanup_model: "provider/model".into(),
+            custom_base_url: "https://provider.example/v1".into(),
+            cleanup_enabled: true,
+            probe_stage: ProbeScope::Cleanup,
+            custom_cleanup_parameters: [(
+                "model".into(),
+                serde_json::Value::String("must be rejected".into()),
+            )]
+            .into_iter()
+            .collect(),
+            ..EngineDraft::default()
+        };
+        let result = probe_engine_draft(&draft, &Settings::default(), &unused_models_root()).await;
+        assert!(result.asr.skipped);
+        assert!(!result.cleanup.skipped);
+        assert_eq!(result.cleanup.error_kind, Some(ProbeErrorKind::Provider));
+        assert!(result.cleanup.message.contains("protocol or output"));
+    }
+
+    #[tokio::test]
+    async fn asr_only_probe_skips_invalid_cleanup_parameters() {
+        let draft = EngineDraft {
+            asr_provider: EngineProvider::OnDevice,
+            asr_model: "not-an-mlx-model".into(),
+            cleanup_provider: EngineProvider::Custom,
+            custom_cleanup_parameters: [("stream".into(), serde_json::Value::Bool(false))]
+                .into_iter()
+                .collect(),
+            probe_stage: ProbeScope::Asr,
+            cleanup_enabled: true,
+            ..EngineDraft::default()
+        };
+        let result = probe_engine_draft(&draft, &Settings::default(), &unused_models_root()).await;
+        assert!(!result.asr.skipped);
+        assert_eq!(
+            result.asr.error_kind,
+            Some(ProbeErrorKind::OnDeviceInferenceUnavailable)
+        );
+        assert!(result.cleanup.skipped);
+    }
+
     #[tokio::test]
     async fn probe_llm_only_asr_is_missing_key_not_on_device() {
+        let _network_policy_guard = crate::network_policy::strict_offline_test_guard().await;
         for asr_provider in [EngineProvider::DeepSeek, EngineProvider::Anthropic] {
             let draft = EngineDraft {
                 asr_provider,

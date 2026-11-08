@@ -1,0 +1,129 @@
+{
+  "artifact_type": "voiceflow_learning_a0_baseline_fixture",
+  "schema_version": 1,
+  "fixture_id": "learning-a0-deterministic-v1",
+  "scope": "replay inputs and frozen targets for isolated production-function probes; observed facts are generated at runtime",
+  "frozen_contract": {
+    "production_behavior": "existing production owners; probe mutates isolated fixture state only and invokes no external provider",
+    "asr_model": "not_invoked",
+    "cleanup_prompt": "not_invoked",
+    "ordinary_term_promote_hits": 3,
+    "chinese_name_promote_hits": 2,
+    "owned_wav_learning": "suppressed"
+  },
+  "native_smoke": {
+    "status": "not_run",
+    "reason": "The deterministic probes do not start a live microphone lease or inspect a native text field."
+  },
+  "probes": [
+    {
+      "id": "manual_word_ownership_after_unscoped_undo",
+      "classification": "manual_word_ownership",
+      "input": {
+        "before": "VoiceFlo",
+        "after": "VoiceFlow",
+        "global_dictionary_seed": ["VoiceFlow"],
+        "candidate_hits": 3
+      },
+      "target": {
+        "global_dictionary_word_retained": true
+      }
+    },
+    {
+      "id": "same_dictation_paste_and_history_receipts",
+      "classification": "cross_channel_origin",
+      "input": {
+        "dictation_origin_id": "fixture-dictation-01",
+        "history_text_before": "cobolt",
+        "before": "cobolt",
+        "after": "cobalt",
+        "scope": {
+          "family": "general",
+          "mapping_id": "fixture-mapping-01",
+          "native_bundle": "com.voiceflow.a0"
+        }
+      },
+      "target": {
+        "hits_after": 1
+      }
+    },
+    {
+      "id": "legacy_pending_plus_new_origin",
+      "classification": "legacy_origin_boundary",
+      "input": {
+        "before": "quortz",
+        "after": "quartz",
+        "legacy_hits_without_receipt": 2,
+        "new_paste_session_id": "fixture-new-session-01",
+        "scope": {
+          "family": "general",
+          "mapping_id": "fixture-mapping-01",
+          "native_bundle": "com.voiceflow.a0"
+        }
+      },
+      "target": {
+        "live_promoted": false,
+        "receipt_count_after_new_origin": 1,
+        "legacy_origin_known": false
+      }
+    },
+    {
+      "id": "ax_multi_hunk_content_edit",
+      "classification": "multi_hunk_content_edit",
+      "input": {
+        "post_insert_field": "repair the red cable and blue light",
+        "settled_field": "repair the green cable and amber light",
+        "limits_ms": {
+          "initial": 1,
+          "interval": 1,
+          "idle_grace": 2,
+          "max_total": 3
+        }
+      },
+      "target": {
+        "lexical_candidate_detected": false
+      }
+    },
+    {
+      "id": "ax_date_content_edit",
+      "classification": "date_content_edit",
+      "input": {
+        "post_insert_field": "Review 2026-11-04 with the team",
+        "settled_field": "Review 2026-11-05 with the team",
+        "limits_ms": {
+          "initial": 1,
+          "interval": 1,
+          "idle_grace": 2,
+          "max_total": 3
+        }
+      },
+      "target": {
+        "lexical_candidate_detected": false,
+        "history_lexical_correction_eligible": false,
+        "style_candidate_detected": false
+      }
+    },
+    {
+      "id": "changing_at_observer_deadline",
+      "classification": "dirty_deadline",
+      "input": {
+        "post_insert_field": "We use VioFlo in this project",
+        "samples": [
+          "We use VoiceF in this project",
+          "We use VoiceFlo in this project",
+          "We use VoiceFlow in this project"
+        ],
+        "limits_ms": {
+          "initial": 1,
+          "interval": 1,
+          "idle_grace": 2,
+          "max_total": 3
+        }
+      },
+      "target": {
+        "lexical_candidate_detected": false,
+        "style_candidate_detected": false
+      }
+    }
+  ]
+}

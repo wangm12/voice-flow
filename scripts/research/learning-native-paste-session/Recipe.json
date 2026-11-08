@@ -1,0 +1,49 @@
+{
+  "artifact_type": "voice_harness_recipe",
+  "schema_version": 1,
+  "run_id": "90000000-0000-4000-8000-000000000011",
+  "case_id": "90000000-0000-4000-8000-000000000012",
+  "fixture_id": "90000000-0000-4000-8000-000000000013",
+  "before": "Type: ",
+  "inserted": "VoiceFlo",
+  "selection": { "location": 6, "length": 0 },
+  "cursor_policy": "at_trigger",
+  "initial_clipboard": { "items": [] },
+  "clipboard_expectation": "unknown",
+  "trigger": {
+    "kind": "research_stdio",
+    "key_code": null,
+    "flags": null,
+    "release_after_ms": null,
+    "public_action_note": null
+  },
+  "stress": [{ "at_ms": 0, "kind": "learning_edit" }],
+  "poll_ms": 10,
+  "deadline_ms": 20000,
+  "host_lifetime_ms": 30000,
+  "read_only": false,
+  "fixture_action": "no_write",
+  "fixture_delay_ms": 0,
+  "research_session": {
+    "job_id": "90000000-0000-4000-8000-000000000015",
+    "record_ms": 500,
+    "ttl_ms": 30000,
+    "audio_identity": false,
+    "learning": {
+      "selected_state_id": "90000000-0000-4000-8000-000000000014",
+      "baseline_run": null,
+      "edit_fixture_id": "90000000-0000-4000-8000-000000000016",
+      "purpose": "correction",
+      "mapping_id": "research-owned-native-oracle-host-v1",
+      "bundle_id": "local.voiceflow.learning-oracle-fixture.v1",
+      "observer_enabled": true,
+      "post_insert_field": "Type: VoiceFlo",
+      "settled_field": "Type: VoiceFlow",
+      "terms": [{
+        "fixture_id": "90000000-0000-4000-8000-000000000017",
+        "before": "VoiceFlo",
+        "after": "VoiceFlow"
+      }]
+    }
+  }
+}

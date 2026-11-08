@@ -43,6 +43,7 @@ pub struct OnDeviceModelStatus {
     pub inference_ready: bool,
     pub downloaded_bytes: u64,
     pub error: Option<String>,
+    pub error_category: Option<String>,
     pub revision: Option<String>,
     pub file_count: usize,
     pub platform_supported: bool,
@@ -70,17 +71,46 @@ impl AsrProvider for OnDeviceAsrProvider {
         let models_root = self.models_root.clone();
         let asr_model = self.asr_model.clone();
         Box::pin(async move {
-            if !model_files_are_ready(&models_root, &asr_model) {
+            crate::observations::requested_asr_model(&options.model);
+            let manifest = mlx_model(&asr_model);
+            let mut admission = manifest.map(|m| {
+                crate::observations::LocalStageGuard::start(
+                    m.id,
+                    m.revision,
+                    crate::observations::LocalStage::ModelAdmission,
+                )
+            });
+            let state = model_state(&models_root, &asr_model);
+            if state != OnDeviceModelState::Ready {
+                if let Some(observation) = &mut admission {
+                    observation.failed(match state {
+                        OnDeviceModelState::Corrupt => "local_model_corrupt",
+                        OnDeviceModelState::Downloading => "local_model_downloading",
+                        _ => "local_model_missing",
+                    });
+                }
                 return Err(AsrError::OnDeviceModelMissing(
                     "on-device model files are not downloaded".into(),
                 ));
+            }
+            if let Some(observation) = &mut admission {
+                observation.completed(
+                    Some("marker_and_sizes_only_hash_validation_occurs_at_runtime"),
+                    None,
+                );
             }
             let language = options
                 .language
                 .as_deref()
                 .filter(|language| *language != "auto");
             crate::ondevice_runtime::shared_runtime(&models_root)
-                .transcribe(&asr_model, language, audio)
+                .transcribe(
+                    &asr_model,
+                    language,
+                    audio,
+                    options.session_generation,
+                    options.trace,
+                )
                 .await
                 .map(|(text, language)| crate::asr::Transcript {
                     text,

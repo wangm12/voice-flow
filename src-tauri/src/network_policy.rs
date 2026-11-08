@@ -1,5 +1,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
+#[cfg(test)]
+use tokio::sync::{Mutex as TestMutex, MutexGuard as TestMutexGuard};
 use tokio_util::sync::CancellationToken;
 
 static STRICT_OFFLINE: AtomicBool = AtomicBool::new(false);
@@ -55,4 +57,24 @@ pub fn cancel_cloud_requests() {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .cancel();
+}
+
+#[cfg(test)]
+static STRICT_OFFLINE_TEST_LOCK: OnceLock<TestMutex<()>> = OnceLock::new();
+
+/// Serializes tests that mutate the process-wide cloud request policy.
+#[cfg(test)]
+pub(crate) async fn strict_offline_test_guard() -> TestMutexGuard<'static, ()> {
+    STRICT_OFFLINE_TEST_LOCK
+        .get_or_init(|| TestMutex::new(()))
+        .lock()
+        .await
+}
+
+/// Acquires the same test lock from a synchronous test outside a Tokio runtime.
+#[cfg(test)]
+pub(crate) fn strict_offline_test_guard_blocking() -> TestMutexGuard<'static, ()> {
+    STRICT_OFFLINE_TEST_LOCK
+        .get_or_init(|| TestMutex::new(()))
+        .blocking_lock()
 }

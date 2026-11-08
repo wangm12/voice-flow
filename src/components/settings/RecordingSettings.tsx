@@ -1,3 +1,4 @@
+import { audioRetentionOptions as retentionOptions, historyRetentionOptions } from "../../lib/retention";
 import { Select } from "../Select";
 import { invoke } from "@tauri-apps/api/core";
 import { FnHotkeyNote } from "../FnHotkeyNote";
@@ -6,6 +7,7 @@ import { ActivationModeSelector } from "../ActivationModeSelector";
 import { HotkeyRecorder } from "../HotkeyRecorder";
 import { SettingsDisclosure, SettingsGroup, SettingsPageHeader, SettingsRow, SettingsShell, type SettingsSaveFailure } from "../SettingsLayout";
 import { Toggle } from "../Toggle";
+import { ContextLesson, SelectedLesson } from "../Onboarding/ContextualLessons";
 import { translationLanguageOptions } from "../../lib/translationLanguages";
 import { useI18n } from "../../lib/i18n";
 import { isFnOnlyHotkey } from "../../lib/hotkeyFormat";
@@ -16,23 +18,8 @@ import type { SaveSettings, Settings } from "../../types/settings";
 
 const controlClass = inputClass;
 const selectClass = `${controlClass} w-40`;
-const retentionOptions = [
-  { value: 0, label: "立即清理" },
-  { value: 1, label: "1 天" },
-  { value: 7, label: "1 周" },
-  { value: 30, label: "1 月" },
-  { value: 365, label: "1 年" },
-] as const;
-const historyRetentionOptions = [
-  { value: 7, label: "1 周" },
-  { value: 30, label: "1 月" },
-  { value: 90, label: "3 月" },
-  { value: 365, label: "1 年" },
-  { value: 3650, label: "10 年" },
-  { value: 0, label: "永久" },
-] as const;
 
-export function RecordingSettings({ settings, save, saveFailure, dictationBusy = false }: { settings: Settings; save: SaveSettings; saveFailure?: SettingsSaveFailure | null; dictationBusy?: boolean }) {
+export function RecordingSettings({ settings, save, saveFailure, dictationBusy = false, onOpenPermissions, onOpenMappings }: { settings: Settings; save: SaveSettings; saveFailure?: SettingsSaveFailure | null; dictationBusy?: boolean; onOpenPermissions?: () => void; onOpenMappings?: () => void }) {
   const { t } = useI18n();
   const [modeSaving, setModeSaving] = useState(false);
   const [modeError, setModeError] = useState<string | null>(null);
@@ -54,7 +41,7 @@ export function RecordingSettings({ settings, save, saveFailure, dictationBusy =
   const asrProfile = asrModelProfile(asrProvider, settings.asr_model);
   return (
     <SettingsShell>
-      <SettingsPageHeader title={t("录音与输出")} description={t("快捷键、识别语言、输出方式和本地存储。")} />
+      <SettingsPageHeader title={t("录音与输出")} description={t("快捷键、识别语言、输出方式和本地存储。")} saveHint={t("更改自动保存")} />
       <SettingsGroup title={t("日常听写")}>
         <SettingsRow title={t("全局快捷键")} description={t("在任何 App 中开始听写，设置自动保存。") }>
           <HotkeyRecorder
@@ -166,6 +153,7 @@ export function RecordingSettings({ settings, save, saveFailure, dictationBusy =
         locked={extraShortcutsBusy}
         error={extraShortcutsError ?? shortcutSaveError}
       >
+      <SelectedLesson firstUse={false} />
       <SettingsGroup title={t("选中文本操作")} description={t("先选中文本，再用独立快捷键说出改写、缩短、翻译或总结指令。")}>
         <SettingsRow
           title={t("启用选中文本操作")}
@@ -213,6 +201,7 @@ export function RecordingSettings({ settings, save, saveFailure, dictationBusy =
           </div>
         </div>
       </SettingsGroup>
+      <ContextLesson firstUse={false} onOpenPermissions={onOpenPermissions} onOpenMappings={onOpenMappings} />
       <SettingsGroup title={t("看屏幕")} description={t("独立快捷键，先截当前窗口再说话；结果只进预览，默认听写不会截屏。")}>
         <div className="px-5 py-4">
           <p className="text-sm font-medium text-primary">{t("看屏幕快捷键")}</p>

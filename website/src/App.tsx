@@ -274,6 +274,7 @@ export default function App() {
             </a>
           </div>
           <p className="compatibility">{copy.hero.compatibility}</p>
+          <p className="setup-note">{copy.hero.setup}</p>
         </section>
 
         <Demo locale={locale} />

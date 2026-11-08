@@ -3,6 +3,8 @@ export const MAX_DICTIONARY_FILE_BYTES = 1024 * 1024;
 
 export type DictionaryImportResult = {
   words: string[];
+  /** Unique valid requested words, using the existing spelling for case-insensitive matches. */
+  requested: string[];
   added: number;
   duplicates: number;
   invalid: number;
@@ -60,6 +62,8 @@ export function parseDictionaryText(text: string, fileName = ""): string[] {
 
 export function mergeDictionary(existing: string[], imported: string[], limit = 256): DictionaryImportResult {
   const words = [...existing];
+  const requested: string[] = [];
+  const requestedNormalized = new Set<string>();
   const seen = new Set(existing.map((word) => word.trim().toLocaleLowerCase()));
   let duplicates = 0;
   let invalid = 0;
@@ -74,6 +78,10 @@ export function mergeDictionary(existing: string[], imported: string[], limit = 
     const normalized = word.toLocaleLowerCase();
     if (seen.has(normalized)) {
       duplicates += 1;
+      if (!requestedNormalized.has(normalized)) {
+        requestedNormalized.add(normalized);
+        requested.push(words.find((existingWord) => existingWord.trim().toLocaleLowerCase() === normalized) ?? word);
+      }
       continue;
     }
     if (words.length >= limit) {
@@ -82,7 +90,9 @@ export function mergeDictionary(existing: string[], imported: string[], limit = 
     }
     seen.add(normalized);
     words.push(word);
+    requestedNormalized.add(normalized);
+    requested.push(word);
   }
 
-  return { words, added: words.length - existing.length, duplicates, invalid, limited };
+  return { words, requested, added: words.length - existing.length, duplicates, invalid, limited };
 }

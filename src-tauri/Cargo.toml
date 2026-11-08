@@ -1,5 +1,6 @@
 [package]
 name = "voiceflow"
+default-run = "voiceflow"
 version = "0.1.4"
 description = "VoiceFlow desktop voice dictation app"
 authors = ["Mingjie Wang <mingjie.wang@uber.com>"]
@@ -15,6 +16,10 @@ name = "tauri_app_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+hex = "0.4"
 tauri-build = { version = "2", features = [] }
 
 [lints.rust]
@@ -24,6 +29,8 @@ unexpected_cfgs = { level = "allow", check-cfg = ['cfg(cargo_clippy)'] }
 default = []
 macos-private-api = ["tauri/macos-private-api"]
 encrypted-spool = []
+evaluation = []
+research-harness = []
 
 [dependencies]
 tauri = { version = "2", features = ["macos-private-api", "tray-icon", "image-png"] }
@@ -59,6 +66,11 @@ sha2 = "0.10"
 hex = "0.4"
 httpdate = "1"
 
+[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
+# sha2 0.10.9 uses its runtime-detected ARMv8 SHA2 intrinsics when this
+# feature is enabled; other targets keep the portable default backend.
+sha2 = { version = "=0.10.9", features = ["asm"] }
+
 [target.'cfg(not(target_os = "macos"))'.dependencies]
 keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
 
@@ -72,3 +84,16 @@ core-foundation = "0.10"
 security-framework = { version = "3", features = ["OSX_10_15"] }
 security-framework-sys = "2"
 tauri-nspanel = { git = "https://github.com/ahkohd/tauri-nspanel", rev = "18ffb9a201fbf6fedfaa382fd4b92315ea30ab1a" }
+
+[dev-dependencies]
+tauri = { version = "2", features = ["test"] }
+
+[[bin]]
+name = "voiceflow-eval"
+path = "src/bin/voiceflow-eval.rs"
+required-features = ["evaluation"]
+
+[[bin]]
+name = "voiceflow-learning-harness"
+path = "src/bin/voiceflow-learning-harness.rs"
+required-features = ["research-harness"]

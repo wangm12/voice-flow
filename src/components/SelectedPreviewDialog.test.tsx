@@ -2,10 +2,29 @@ import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { useState } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { flushAnimationFrames } from "../test/flushRaf";
-import { isSelectedActionPreview, SelectedPreviewDialog, type SelectedActionPreview } from "./SelectedPreviewDialog";
+import { I18nProvider } from "../lib/i18n";
+import { isSelectedActionPreview, SelectedPreviewDialog, type OrganizeRecipeId, type SelectedActionPreview } from "./SelectedPreviewDialog";
 
 afterEach(() => {
   cleanup();
+});
+
+const recipePreview = (id: OrganizeRecipeId): SelectedActionPreview => ({
+  transaction_id: "tx-organize-1",
+  action_sequence: 2,
+  kind: "selected",
+  operation: "organize",
+  organize_recipe: { id, version: 1 },
+  target_kind: "selection",
+  target_label: "selected_text",
+  source_text: "完成了 API 盘点。下一步和团队确认方案。",
+  instruction: "整理成开发任务",
+  delivery_mode: "replace_or_copy",
+  delivery_notice: "copy_if_target_changed",
+  selected_text: "完成了 API 盘点。下一步和团队确认方案。",
+  transcript: "整理成开发任务",
+  final_text: "Result preview",
+  replace_allowed: true,
 });
 
 const preview: SelectedActionPreview = {
@@ -26,6 +45,96 @@ const preview: SelectedActionPreview = {
 };
 
 describe("SelectedPreviewDialog", () => {
+  it("explains recovery after capture without executing against the old selection or changing the draft", () => {
+    const onConfirm = vi.fn();
+    const onCopy = vi.fn();
+    const onDraftChange = vi.fn();
+    render(<SelectedPreviewDialog preview={preview} draft="保留的编辑结果" onDraftChange={onDraftChange} onCancel={() => undefined} onCopy={onCopy} onConfirm={onConfirm} />);
+    fireEvent.click(screen.getByRole("button", { name: "选中文本与翻译：先选来源，再确认结果" }));
+    expect(screen.getByText(/没有选区时回原输入框重新选择/)).toBeVisible();
+    expect(screen.getByRole("textbox", { name: "VoiceFlow 生成结果" })).toHaveValue("保留的编辑结果");
+    expect(onConfirm).not.toHaveBeenCalled();
+    expect(onCopy).not.toHaveBeenCalled();
+    expect(onDraftChange).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "收起说明" }));
+    fireEvent.click(screen.getByRole("button", { name: "选中文本与翻译：先选来源，再确认结果" }));
+    expect(screen.getByText(/旧选区执行/)).toBeVisible();
+    expect(screen.queryByRole("button", { name: "发送" })).not.toBeInTheDocument();
+  });
+  it("shows short recipe guidance without reading selection or changing the preview", () => {
+    const onConfirm = vi.fn();
+    const onCopy = vi.fn();
+    const onDraftChange = vi.fn();
+    const organizePreview = recipePreview("developer_task");
+    render(<SelectedPreviewDialog preview={organizePreview} draft="Edited result" onDraftChange={onDraftChange} onCancel={() => undefined} onCopy={onCopy} onConfirm={onConfirm} />);
+
+    expect(screen.getByRole("textbox", { name: "VoiceFlow 生成结果" })).toHaveValue("Edited result");
+    fireEvent.click(screen.getByRole("button", { name: "选中文本与翻译：先选来源，再确认结果" }));
+    expect(screen.getByText(/整理示例（仅为说明）/)).toBeVisible();
+    expect(screen.getByText(/保留原文用词、标点和顺序，不补写未提供的信息/)).toBeVisible();
+    expect(screen.getByText(/打开说明不会读取选区或请求模型/)).toBeVisible();
+    expect(screen.getByRole("textbox", { name: "VoiceFlow 生成结果" })).toHaveValue("Edited result");
+    expect(onConfirm).not.toHaveBeenCalled();
+    expect(onCopy).not.toHaveBeenCalled();
+    expect(onDraftChange).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["developer_task", "开发任务整理"],
+    ["work_update", "工作进展整理"],
+    ["todo_list", "待办整理"],
+  ] as const)("accepts and displays the %s recipe with actual source metadata", (id, label) => {
+    const organizePreview = recipePreview(id);
+    expect(isSelectedActionPreview(organizePreview)).toBe(true);
+    render(<SelectedPreviewDialog preview={organizePreview} draft={organizePreview.final_text} onDraftChange={() => undefined} onCancel={() => undefined} onCopy={() => undefined} onConfirm={() => undefined} />);
+
+    expect(screen.getByText(label)).toBeVisible();
+    expect(screen.queryByText("结构整理")).not.toBeInTheDocument();
+    expect(screen.getByText("选中文本")).toBeVisible();
+    expect(screen.getByText("未提供的信息不会补写")).toBeVisible();
+  });
+
+  it.each([
+    ["developer_task", "Developer task"],
+    ["work_update", "Work update"],
+    ["todo_list", "To-do list"],
+  ] as const)("localizes the %s recipe name, source and fixed note", (id, label) => {
+    const organizePreview = recipePreview(id);
+    render(
+      <I18nProvider initialLanguage="en">
+        <SelectedPreviewDialog preview={organizePreview} draft={organizePreview.final_text} onDraftChange={() => undefined} onCancel={() => undefined} onCopy={() => undefined} onConfirm={() => undefined} />
+      </I18nProvider>,
+    );
+
+    expect(screen.getByText(label)).toBeVisible();
+    expect(screen.getByText("Selected text")).toBeVisible();
+    expect(screen.getByText("Information not provided will not be added.")).toBeVisible();
+  });
+
+  it("keeps legacy previews valid and rejects malformed or mismatched recipes", () => {
+    expect(isSelectedActionPreview(preview)).toBe(true);
+    expect(isSelectedActionPreview({ ...preview, operation: "organize", organize_recipe: null })).toBe(true);
+    expect(isSelectedActionPreview({ ...preview, operation: "organize", organize_recipe: undefined })).toBe(true);
+    expect(isSelectedActionPreview({ ...preview, operation: "organize" })).toBe(true);
+
+    const malformedRecipes: unknown[] = [
+      { id: "unknown_recipe", version: 1 },
+      { id: "developer_task", version: 2 },
+      { id: "developer_task" },
+      { version: 1 },
+      { id: "developer_task", version: 1, title: "forged" },
+      [],
+    ];
+    for (const organize_recipe of malformedRecipes) {
+      expect(isSelectedActionPreview({ ...preview, operation: "organize", organize_recipe })).toBe(false);
+    }
+
+    const validRecipe = recipePreview("work_update");
+    expect(isSelectedActionPreview({ ...validRecipe, kind: "screen" })).toBe(false);
+    expect(isSelectedActionPreview({ ...validRecipe, operation: "rewrite" })).toBe(false);
+    expect(isSelectedActionPreview({ ...validRecipe, operation: "screen_assist" })).toBe(false);
+  });
+
   it("shows the editable result before a collapsed source without nested text scrollers", () => {
     render(<SelectedPreviewDialog preview={{ ...preview, source_text: "很长的来源文本" }} draft={preview.final_text} onDraftChange={() => undefined} onCancel={() => undefined} onCopy={() => undefined} onConfirm={() => undefined} />);
     const result = screen.getByRole("textbox", { name: "VoiceFlow 生成结果" });

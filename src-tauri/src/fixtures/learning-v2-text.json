@@ -1,0 +1,173 @@
+{
+  "artifact_type": "voiceflow_learning_episode_fixture",
+  "schema_version": 2,
+  "episode": {
+    "schema_version": 2,
+    "ttl_ms": 120000,
+    "episode_id": "50000000-0000-4000-8000-000000000001",
+    "arm_state_id": "50000000-0000-4000-8000-000000000002",
+    "selected_state_id": "50000000-0000-4000-8000-000000000003",
+    "baseline_run": null,
+    "edit_fixture_id": "50000000-0000-4000-8000-000000000004",
+    "purpose": "correction",
+    "source": {
+      "kind": "deterministic_text",
+      "fixture_id": "50000000-0000-4000-8000-000000000005",
+      "sha256": "3f0bcb4e1ff2a68c6521bffd2e85e1a286cfcd07c4006dded09cab54e9ac307a",
+      "byte_length": 21,
+      "rights": "synthetic"
+    },
+    "source_text_learning_authorized": true,
+    "learning_authorized": true,
+    "actor": "programmatic_fixture",
+    "authorized_text_layers": [
+      "source",
+      "post_insert",
+      "settled",
+      "final_output"
+    ],
+    "edit_states": [
+      {
+        "sequence": 0,
+        "state_id": "50000000-0000-4000-8000-000000000006",
+        "layer": "post_insert",
+        "sha256": "3f0bcb4e1ff2a68c6521bffd2e85e1a286cfcd07c4006dded09cab54e9ac307a",
+        "byte_length": 21
+      },
+      {
+        "sequence": 1,
+        "state_id": "50000000-0000-4000-8000-000000000007",
+        "layer": "settled",
+        "sha256": "1f56c9370b2287f324c9b1d2e8bbb19f567b5d281b672c12d9b6878528da6d0d",
+        "byte_length": 22
+      }
+    ],
+    "scope": {
+      "mapping_id": "controlled-learning",
+      "family": "general",
+      "native_bundle": "com.example.learning-fixture"
+    },
+    "local_only_grant": true,
+    "target_oracle": "none",
+    "terms": [
+      {
+        "fixture_id": "50000000-0000-4000-8000-000000000008",
+        "before": "VoiceFlo",
+        "after": "VoiceFlow"
+      }
+    ],
+    "operations": [
+      {
+        "operation_id": "50000000-0000-4000-8000-000000000009",
+        "source_sha256": "3f0bcb4e1ff2a68c6521bffd2e85e1a286cfcd07c4006dded09cab54e9ac307a",
+        "settled_state_sha256": "1f56c9370b2287f324c9b1d2e8bbb19f567b5d281b672c12d9b6878528da6d0d",
+        "term_fixture_id": "50000000-0000-4000-8000-000000000008"
+      },
+      {
+        "operation_id": "50000000-0000-4000-8000-000000000010",
+        "source_sha256": "3f0bcb4e1ff2a68c6521bffd2e85e1a286cfcd07c4006dded09cab54e9ac307a",
+        "settled_state_sha256": "1f56c9370b2287f324c9b1d2e8bbb19f567b5d281b672c12d9b6878528da6d0d",
+        "term_fixture_id": "50000000-0000-4000-8000-000000000008"
+      },
+      {
+        "operation_id": "50000000-0000-4000-8000-000000000011",
+        "source_sha256": "3f0bcb4e1ff2a68c6521bffd2e85e1a286cfcd07c4006dded09cab54e9ac307a",
+        "settled_state_sha256": "1f56c9370b2287f324c9b1d2e8bbb19f567b5d281b672c12d9b6878528da6d0d",
+        "term_fixture_id": "50000000-0000-4000-8000-000000000008"
+      }
+    ],
+    "followups": [
+      {
+        "task_id": "50000000-0000-4000-8000-000000000012",
+        "operation_id": "50000000-0000-4000-8000-000000000013",
+        "source": {
+          "kind": "deterministic_text",
+          "fixture_id": "50000000-0000-4000-8000-000000000014",
+          "sha256": "76201d6221777e9af8f2c3603cba07ce5359841ef90dfcfa2948952cb6c13cfa",
+          "byte_length": 29,
+          "rights": "synthetic"
+        },
+        "scope": {
+          "mapping_id": "controlled-learning",
+          "family": "general",
+          "native_bundle": "com.example.learning-fixture"
+        },
+        "term_fixture_id": "50000000-0000-4000-8000-000000000008",
+        "expected_rule_state": "promoted",
+        "expected_output_sha256": "1b2b3753d1db9be6211e9b721a762052d96bc5cbf6bc95c87ac2fa5580d33157",
+        "expected_output_byte_length": 30
+      },
+      {
+        "task_id": "50000000-0000-4000-8000-000000000016",
+        "operation_id": "50000000-0000-4000-8000-000000000017",
+        "source": {
+          "kind": "deterministic_text",
+          "fixture_id": "50000000-0000-4000-8000-000000000018",
+          "sha256": "6ad73492a1e9e353bf740eed7b176a63994f2e3fb221b444d47f6ea60477ee58",
+          "byte_length": 30,
+          "rights": "synthetic"
+        },
+        "scope": {
+          "mapping_id": "controlled-learning",
+          "family": "general",
+          "native_bundle": "com.example.learning-fixture"
+        },
+        "term_fixture_id": "50000000-0000-4000-8000-000000000008",
+        "expected_rule_state": "tombstoned",
+        "expected_output_sha256": "6ad73492a1e9e353bf740eed7b176a63994f2e3fb221b444d47f6ea60477ee58",
+        "expected_output_byte_length": 30
+      }
+    ],
+    "undo_operations": [
+      {
+        "operation_id": "50000000-0000-4000-8000-000000000015",
+        "term_fixture_id": "50000000-0000-4000-8000-000000000008",
+        "required_followup_task_id": "50000000-0000-4000-8000-000000000012"
+      }
+    ]
+  },
+  "apply_text_template": {
+    "op": "apply_text",
+    "operation": {
+      "episode_id": "50000000-0000-4000-8000-000000000001",
+      "operation_id": "50000000-0000-4000-8000-000000000009",
+      "source_fixture_id": "50000000-0000-4000-8000-000000000005",
+      "states": [
+        {
+          "sequence": 0,
+          "state_id": "50000000-0000-4000-8000-000000000006",
+          "layer": "post_insert",
+          "text": "we saw VoiceFlo today"
+        },
+        {
+          "sequence": 1,
+          "state_id": "50000000-0000-4000-8000-000000000007",
+          "layer": "settled",
+          "text": "we saw VoiceFlow today"
+        }
+      ]
+    }
+  },
+  "followup_templates": [
+    {
+      "op": "apply_followup",
+      "task_id": "50000000-0000-4000-8000-000000000012",
+      "operation_id": "50000000-0000-4000-8000-000000000013",
+      "text": "we will see VoiceFlo tomorrow",
+      "expected_output_text": "we will see VoiceFlow tomorrow"
+    },
+    {
+      "op": "undo",
+      "operation_id": "50000000-0000-4000-8000-000000000015"
+    },
+    {
+      "op": "apply_followup",
+      "task_id": "50000000-0000-4000-8000-000000000016",
+      "operation_id": "50000000-0000-4000-8000-000000000017",
+      "text": "we will see VoiceFlo next week",
+      "expected_output_text": "we will see VoiceFlo next week"
+    }
+  ],
+  "scope": "synthetic controlled input; two-state production bounded observer and production local-edit candidate guard; followups call local replacement owner plus production usage/tombstone effects; no target insertion, AX, human edit, ASR, cleanup, or quality evidence",
+  "parity_status": "synthetic_local_only_positive_voiceflo_voiceflow"
+}

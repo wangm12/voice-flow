@@ -2,6 +2,7 @@ import { useEffect, useId, useRef, useState, type ComponentPropsWithoutRef, type
 import * as Popover from "@radix-ui/react-popover";
 import { Check, ChevronDown } from "lucide-react";
 import { useI18n } from "../lib/i18n";
+import { useControlDescription } from "../lib/controlDescription";
 
 type Suggestion = { value: string; label: string; disabled?: boolean };
 type Props = Omit<ComponentPropsWithoutRef<"input">, "value" | "defaultValue" | "onChange" | "list"> & {
@@ -14,6 +15,7 @@ type Props = Omit<ComponentPropsWithoutRef<"input">, "value" | "defaultValue" | 
 /** Editable suggestions share the dropdown surface while preserving arbitrary input. */
 export function Autocomplete({ value, onValueChange, options, disabled, className = "", ref, onFocus, onBlur, onKeyDown, ...props }: Props) {
   const { t } = useI18n();
+  const description = useControlDescription(props["aria-describedby"]);
   const input = useRef<HTMLInputElement>(null);
   const id = useId();
   const [open, setOpen] = useState(false);
@@ -36,7 +38,7 @@ export function Autocomplete({ value, onValueChange, options, disabled, classNam
   return <Popover.Root open={expanded} onOpenChange={setOpen} modal={false}>
     <Popover.Anchor asChild>
       <div className={`vf-autocomplete ${className}`} data-disabled={disabled || undefined} data-invalid={props["aria-invalid"] || undefined}>
-        <input {...props} value={value} disabled={disabled} className="vf-autocomplete-input"
+        <input {...props} aria-describedby={description} value={value} disabled={disabled} className="vf-autocomplete-input"
           ref={(node) => { input.current = node; if (typeof ref === "function") ref(node); else if (ref) ref.current = node; }}
           role={options.length ? "combobox" : undefined} aria-autocomplete={options.length ? "list" : undefined}
           aria-haspopup={options.length ? "listbox" : undefined} aria-expanded={options.length ? expanded : undefined}

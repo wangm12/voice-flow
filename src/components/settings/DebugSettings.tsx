@@ -18,10 +18,12 @@ export function DebugSettings({
 }) {
   const { t } = useI18n();
   const [whatsNewPreview, setWhatsNewPreview] = useState<WhatsNewPayload | null>(null);
+  const [previewBusy, setPreviewBusy] = useState(false);
+  const [previewError, setPreviewError] = useState<string | null>(null);
 
   return (
     <SettingsShell>
-      <SettingsPageHeader title={t("调试设置")} description={t("录音缓冲、语音检测和诊断预览。")} />
+      <SettingsPageHeader title={t("调试设置")} description={t("录音缓冲、语音检测和诊断预览。")} saveHint={t("更改自动保存")} />
       <SettingsGroup title={t("录音")}>
         <SettingsRow title={t("句尾缓冲")} description={t("说完后多录一会儿，避免吞掉句尾。")}>
           <BufferNumberField
@@ -54,14 +56,19 @@ export function DebugSettings({
           <button
             type="button"
             className={secondaryButtonClass}
+            disabled={previewBusy}
+            aria-busy={previewBusy}
             onClick={() => {
+              setPreviewBusy(true); setPreviewError(null);
               void invoke<{ version: string; notes: string | null }>("preview_whats_new")
                 .then((status) => setWhatsNewPreview({ version: status.version, notes: status.notes }))
-                .catch(() => undefined);
+                .catch(() => setPreviewError(t("无法读取更新说明，请重试。")))
+                .finally(() => setPreviewBusy(false));
             }}
           >
-            {t("预览更新说明")}
+            {t(previewBusy ? "正在读取…" : "预览更新说明")}
           </button>
+          {previewError && <p role="alert" className="w-full text-xs text-error-ink">{previewError}</p>}
         </SettingsRow>
       </SettingsGroup>
       {whatsNewPreview && (

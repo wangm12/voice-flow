@@ -1,12 +1,27 @@
 import { selectOption } from "../../test/selectOption";
 import { invoke } from "@tauri-apps/api/core";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { GuideAcknowledgement } from "../../lib/onboardingGuides";
 import type { Settings } from "../../types/settings";
 import { RecordingSettings } from "./RecordingSettings";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 const invokeMock = vi.mocked(invoke);
+
+// Independent native contracts must not compete for a one-shot invoke response.
+const guideAcknowledgements = (): GuideAcknowledgement[] => [
+  { guide_id: "dictionary_learning", current_version: 1, acknowledged_version: null },
+  { guide_id: "context_screen", current_version: 1, acknowledged_version: null },
+  { guide_id: "selected_translation", current_version: 1, acknowledged_version: null },
+  { guide_id: "scene_preferences", current_version: 1, acknowledged_version: null },
+];
+type NativeFixtureHandlers = {
+  updateSettingsPatch?: (args: unknown) => Promise<void>;
+  openPrivacySettings?: (args: unknown) => Promise<void>;
+};
+let nativeHandlers: NativeFixtureHandlers;
+let unexpectedNativeCalls: string[];
 
 vi.mock("../HotkeyRecorder", () => ({
   HotkeyRecorder: ({
@@ -72,14 +87,35 @@ const settings: Settings = {
 };
 
 describe("RecordingSettings", () => {
+  beforeEach(() => {
+    invokeMock.mockReset();
+    nativeHandlers = {};
+    unexpectedNativeCalls = [];
+    invokeMock.mockImplementation(async (command, args) => {
+      if (command === "get_guide_acknowledgements") {
+        if (args !== undefined) {
+          unexpectedNativeCalls.push(`${command}: unexpected arguments`);
+          throw new Error("Guide acknowledgement reads do not take arguments");
+        }
+        return guideAcknowledgements();
+      }
+      if (command === "update_settings_patch" && nativeHandlers.updateSettingsPatch) return nativeHandlers.updateSettingsPatch(args);
+      if (command === "open_privacy_settings" && nativeHandlers.openPrivacySettings) return nativeHandlers.openPrivacySettings(args);
+      unexpectedNativeCalls.push(command);
+      throw new Error(`Unexpected native command: ${command}`);
+    });
+  });
+
   afterEach(() => {
     cleanup();
-  invokeMock.mockReset();
+    // Fail even if a consumer catches an unexpected native rejection in its UI.
+    expect(unexpectedNativeCalls).toEqual([]);
+    invokeMock.mockReset();
   });
 
   it("saves a mode independently and commits page values only after native success", async () => {
     let acknowledge!: () => void;
-    invokeMock.mockImplementation(() => new Promise<void>((resolve) => { acknowledge = resolve; }));
+    nativeHandlers.updateSettingsPatch = () => new Promise<void>((resolve) => { acknowledge = resolve; });
     const save = vi.fn();
     render(<RecordingSettings settings={{ ...settings, api_key_configured: false }} save={save} />);
     fireEvent.click(screen.getByRole("radio", { name: "点按切换" }));
@@ -89,15 +125,19 @@ describe("RecordingSettings", () => {
     expect(screen.getByRole("button", { name: "recapture-dictation" })).toBeDisabled();
     acknowledge();
     await waitFor(() => expect(save).toHaveBeenCalledWith({ activation_mode: "tap" }, { persist: false }));
+    expect(screen.getByRole("button", { name: "recapture-dictation" })).toBeEnabled();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   });
 
   it("retains the previous mode when native save fails", async () => {
-    invokeMock.mockRejectedValueOnce(new Error("write failed"));
+    nativeHandlers.updateSettingsPatch = async () => { throw new Error("write failed"); };
     const save = vi.fn();
     render(<RecordingSettings settings={settings} save={save} />);
     fireEvent.click(screen.getByRole("radio", { name: "点按切换" }));
+    expect(invokeMock).toHaveBeenCalledWith("update_settings_patch", { patch: { activation_mode: "tap" } });
     expect(await screen.findByRole("alert")).toHaveTextContent("write failed");
     expect(screen.getByRole("radio", { name: "按住说话" })).toBeChecked();
+    expect(screen.getByRole("button", { name: "recapture-dictation" })).toBeEnabled();
     expect(save).not.toHaveBeenCalled();
   });
 
@@ -108,11 +148,14 @@ describe("RecordingSettings", () => {
   });
 
   it("opens keyboard settings only after an explicit Fn action", () => {
-    invokeMock.mockResolvedValue(undefined);
+    nativeHandlers.openPrivacySettings = async (args) => { expect(args).toEqual({ pane: "keyboard" }); };
     render(<RecordingSettings settings={{ ...settings, hotkey: "Fn" }} save={vi.fn()} />);
-    expect(invokeMock).not.toHaveBeenCalled();
+    expect(invokeMock).toHaveBeenCalledWith("get_guide_acknowledgements");
+    // No permission, capture, selection or provider operation is allowed on mount.
+    expect(invokeMock.mock.calls.filter(([command]) => command !== "get_guide_acknowledgements")).toEqual([]);
     fireEvent.click(screen.getByRole("button", { name: "打开键盘设置" }));
     expect(invokeMock).toHaveBeenCalledWith("open_privacy_settings", { pane: "keyboard" });
+    expect(invokeMock.mock.calls.filter(([command]) => command === "open_privacy_settings")).toHaveLength(1);
   });
 
   it("sets the translation shortcut and target without changing the global output mode", () => {

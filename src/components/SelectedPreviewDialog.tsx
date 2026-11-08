@@ -3,6 +3,7 @@ import { useRef } from "react";
 import { createPortal } from "react-dom";
 import { Check, Copy, X } from "lucide-react";
 import { IconButton } from "./IconButton";
+import { ContextLesson, SelectedLesson } from "./Onboarding/ContextualLessons";
 import { useDialogBehavior } from "../lib/focusTrap";
 import { useI18n } from "../lib/i18n";
 import { buttonClass, colors, focusRingClass, secondaryButtonClass } from "../lib/theme";
@@ -29,6 +30,9 @@ export type TextActionErrorCode =
   | "vision_unavailable"
   | "provider_failed";
 
+export type OrganizeRecipeId = "developer_task" | "work_update" | "todo_list";
+export type OrganizeRecipe = { id: OrganizeRecipeId; version: 1 };
+
 export type SelectedActionLifecycle = {
   action_sequence: number;
   transaction_id: string;
@@ -49,6 +53,7 @@ export type SelectedActionPreview = {
   action_sequence: number;
   kind: "selected" | "screen";
   operation: TextActionOperation;
+  organize_recipe?: OrganizeRecipe | null;
   target_kind: TextActionTargetKind;
   target_label: TextActionTargetLabel;
   source_text: string;
@@ -85,6 +90,8 @@ const textActionTargetLabels: readonly TextActionTargetLabel[] = [
   "captured_screen",
 ];
 
+const organizeRecipeIds: readonly OrganizeRecipeId[] = ["developer_task", "work_update", "todo_list"];
+
 const textActionErrorCodes: readonly TextActionErrorCode[] = [
   "no_source",
   "unsupported_instruction",
@@ -96,6 +103,16 @@ const textActionErrorCodes: readonly TextActionErrorCode[] = [
   "vision_unavailable",
   "provider_failed",
 ];
+
+function isOrganizeRecipe(value: unknown): value is OrganizeRecipe {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const recipe = value as Record<PropertyKey, unknown>;
+  return Reflect.ownKeys(recipe).length === 2
+    && Object.prototype.hasOwnProperty.call(recipe, "id")
+    && Object.prototype.hasOwnProperty.call(recipe, "version")
+    && organizeRecipeIds.includes(recipe.id as OrganizeRecipeId)
+    && recipe.version === 1;
+}
 
 function hasActionIdentity(value: unknown): value is { action_sequence: number; transaction_id: string } {
   if (!value || typeof value !== "object") return false;
@@ -120,6 +137,10 @@ export function isSelectedActionError(value: unknown): value is SelectedActionEr
 export function isSelectedActionPreview(value: unknown): value is SelectedActionPreview {
   if (!value || typeof value !== "object") return false;
   const preview = value as Partial<SelectedActionPreview>;
+  const recipe = preview.organize_recipe;
+  const recipeIsValid = recipe === undefined || recipe === null || (
+    preview.kind === "selected" && preview.operation === "organize" && isOrganizeRecipe(recipe)
+  );
   return typeof preview.transaction_id === "string"
     && preview.transaction_id.length > 0
     && Number.isSafeInteger(preview.action_sequence)
@@ -136,7 +157,8 @@ export function isSelectedActionPreview(value: unknown): value is SelectedAction
     && typeof preview.selected_text === "string"
     && typeof preview.transcript === "string"
     && (preview.thumbnail === undefined || preview.thumbnail === null || typeof preview.thumbnail === "string")
-    && typeof preview.replace_allowed === "boolean";
+    && typeof preview.replace_allowed === "boolean"
+    && recipeIsValid;
 }
 
 export function SelectedPreviewDialog({
@@ -172,6 +194,11 @@ export function SelectedPreviewDialog({
     modify_exact: "按指令修改值或术语",
     screen_assist: "看屏幕",
   };
+  const organizeRecipeLabels: Record<OrganizeRecipeId, string> = {
+    developer_task: "开发任务整理",
+    work_update: "工作进展整理",
+    todo_list: "待办整理",
+  };
   const targetLabels: Record<TextActionTargetKind, string> = {
     selection: "选中文本",
     field_text: "当前文本框",
@@ -190,7 +217,7 @@ export function SelectedPreviewDialog({
   });
 
   return createPortal(
-    <div className="vf-settings fixed inset-0 z-50 flex items-center justify-center p-6">
+    <div className="vf-settings fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-6">
       <div
         role="presentation"
         className="absolute inset-0 bg-black/20 backdrop-blur-[2px]"
@@ -204,7 +231,7 @@ export function SelectedPreviewDialog({
         aria-labelledby="selected-preview-title"
         onClick={(event) => event.stopPropagation()}
         style={{ maxHeight: "calc(100dvh - 3rem)" }}
-        className={`relative flex min-h-0 w-full max-w-2xl flex-col overflow-hidden rounded-2xl border ${colors.border} ${colors.bg.card} p-6 shadow-elevated outline-none ${focusRingClass}`}
+        className={`relative flex min-h-0 w-full max-w-2xl flex-col overflow-hidden rounded-2xl border ${colors.border} ${colors.bg.card} p-4 sm:p-6 shadow-elevated outline-none ${focusRingClass}`}
       >
         <div className="flex flex-none items-start justify-between gap-4">
           <div>
@@ -214,15 +241,16 @@ export function SelectedPreviewDialog({
             <p className="mt-1 text-xs leading-5 text-tertiary">
               {isScreenAssist
                 ? t("截图和结果只在本次预览中暂存；取消会丢弃，不会保存到历史。")
-                : t("你可以编辑结果。确认前不会写入目标，取消不会产生副作用。")}
+                : t("你可以编辑结果。确认前不会写入目标；取消会关闭预览并请求结束当前事务。")}
             </p>
           </div>
           <IconButton label={t("关闭")} icon={<X size={16} aria-hidden="true" />} onClick={onCancel} />
         </div>
         <div className="mt-6 min-h-0 flex-1 space-y-4 overflow-y-auto overscroll-contain">
           <div className="flex flex-wrap gap-x-4 gap-y-1 rounded-lg border border-border bg-elevated/40 px-3 py-2 text-xs">
-            <span><span className="text-tertiary">{t("操作")}: </span><span className="font-medium text-primary">{t(operationLabels[preview.operation])}</span></span>
-            <span><span className="text-tertiary">{t("目标")}: </span><span className="font-medium text-primary">{t(targetLabels[preview.target_kind])}</span></span>
+            <span><span className="text-tertiary">{t("操作")}: </span><span className="font-medium text-primary">{t(preview.organize_recipe ? organizeRecipeLabels[preview.organize_recipe.id] : operationLabels[preview.operation])}</span></span>
+            <span><span className="text-tertiary">{t(preview.organize_recipe ? "来源" : "目标")}: </span><span className="font-medium text-primary">{t(targetLabels[preview.target_kind])}</span></span>
+            {preview.organize_recipe && <span className="text-tertiary">{t("未提供的信息不会补写")}</span>}
           </div>
           <div>
             <p className="mb-2 text-xs font-medium text-secondary">{t("VoiceFlow 生成结果")}</p>
@@ -250,6 +278,7 @@ export function SelectedPreviewDialog({
               {t("回复只会作为草稿写入当前输入框或复制，不会发送。")}
             </p>
           )}
+          {isScreenAssist ? <ContextLesson key="screen" /> : <SelectedLesson key="selected" />}
           <details className="vf-inline-disclosure border-t border-border pt-3 text-xs text-secondary">
             <summary className={`cursor-pointer rounded-md font-medium text-primary ${focusRingClass}`}>{t("查看来源和指令")}</summary>
             <div className="mt-4 space-y-4">

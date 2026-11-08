@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
 import { PermissionsSettings } from "./PermissionsSettings";
@@ -8,8 +8,9 @@ vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 const invokeMock = vi.mocked(invoke);
 
 describe("PermissionsSettings", () => {
-  afterEach(() => {
+  afterEach(async () => {
     cleanup();
+    await act(async () => {});
     invokeMock.mockReset();
   });
 
@@ -63,52 +64,50 @@ describe("PermissionsSettings", () => {
     });
   });
 
-  it("prompts for accessibility before opening System Settings", async () => {
-    invokeMock.mockResolvedValueOnce(false);
-    invokeMock.mockResolvedValueOnce(undefined);
+  it("opens a matching native AX guide without inferring permission from window or drag availability", async () => {
+    invokeMock.mockImplementation(async (command, args) => {
+      if (command !== "show_permission_guide") return undefined;
+      const request = args as { guideId: string; permission: string };
+      return { guide_id: request.guideId, permission: request.permission, bundle_path: "/Applications/Fixture.app", bundle_identifier: "test.fixture", signature_status: "valid", drag_available: true, permission_allowed: false, window_open: true, placement: "independent_movable", detail: null };
+    });
     const onRefresh = vi.fn().mockResolvedValue(undefined);
     render(<PermissionsSettings permissions={{ microphone: true, microphone_status: "authorized", accessibility: false }} onRefresh={onRefresh} />);
-
     fireEvent.click(screen.getByRole("button", { name: "开启自动粘贴" }));
-
-    await waitFor(() => {
-      expect(invokeMock).toHaveBeenCalledWith("request_accessibility_permission");
-      expect(invokeMock).toHaveBeenCalledWith("open_privacy_settings", { pane: "accessibility" });
-      expect(onRefresh).toHaveBeenCalledOnce();
-    });
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("show_permission_guide", { permission: "accessibility", guideId: expect.stringMatching(/^[0-9a-f-]{36}$/) }));
+    expect(await screen.findByText(/拖拽完成不代表已授权/)).toBeInTheDocument();
+    expect(screen.getByRole("status")).toHaveTextContent("等待本机权限检查");
+    expect(onRefresh).toHaveBeenCalledOnce();
   });
 
-  it("does not open System Settings when accessibility is granted by the native prompt", async () => {
-    invokeMock.mockResolvedValueOnce(true);
-    const onRefresh = vi.fn().mockResolvedValue(undefined);
-    render(<PermissionsSettings permissions={{ microphone: true, microphone_status: "authorized", accessibility: false }} onRefresh={onRefresh} />);
-
-    fireEvent.click(screen.getByRole("button", { name: "开启自动粘贴" }));
-
-    await waitFor(() => {
-      expect(invokeMock).toHaveBeenCalledWith("request_accessibility_permission");
-      expect(invokeMock).not.toHaveBeenCalledWith("open_privacy_settings", { pane: "accessibility" });
-      expect(onRefresh).toHaveBeenCalledOnce();
+  it("closes the same guide ID only after native permission readback grants access", async () => {
+    let guideId = "";
+    invokeMock.mockImplementation(async (command, args) => {
+      if (command !== "show_permission_guide") return undefined;
+      const request = args as { guideId: string; permission: string };
+      guideId = request.guideId;
+      return { guide_id: guideId, permission: request.permission, bundle_path: null, bundle_identifier: null, signature_status: "unknown", drag_available: false, permission_allowed: false, window_open: true, placement: "independent_movable", detail: "development" };
     });
+    const view = render(<PermissionsSettings permissions={{ microphone: true, accessibility: false }} onRefresh={vi.fn()} />);
+    fireEvent.click(screen.getByRole("button", { name: "开启自动粘贴" }));
+    await waitFor(() => expect(guideId).not.toBe(""));
+    view.rerender(<PermissionsSettings permissions={{ microphone: true, accessibility: true }} onRefresh={vi.fn()} />);
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("close_permission_guide", { guideId }));
+    expect(screen.getByRole("status")).toHaveTextContent("本机权限检查已通过");
   });
 
-  it("opens Screen Recording settings without treating it as required for dictation", async () => {
-    invokeMock.mockResolvedValue(undefined);
+  it("opens a screen guide only after explicit action and never makes it required for dictation", async () => {
+    invokeMock.mockImplementation(async (command, args) => {
+      if (command !== "show_permission_guide") return undefined;
+      const request = args as { guideId: string; permission: string };
+      return { guide_id: request.guideId, permission: request.permission, bundle_path: null, bundle_identifier: null, signature_status: "unknown", drag_available: false, permission_allowed: false, window_open: true, placement: "independent_movable", detail: null };
+    });
     const onRefresh = vi.fn().mockResolvedValue(undefined);
-    render(
-      <PermissionsSettings
-        permissions={{ microphone: true, microphone_status: "authorized", accessibility: true, screen_recording: false }}
-        onRefresh={onRefresh}
-      />,
-    );
-
-    expect(screen.getByText("屏幕录制")).toBeInTheDocument();
+    render(<PermissionsSettings permissions={{ microphone: true, accessibility: true, screen_recording: false }} onRefresh={onRefresh} />);
+    expect(invokeMock).not.toHaveBeenCalledWith("show_permission_guide", expect.anything());
     fireEvent.click(screen.getByRole("button", { name: "打开屏幕录制设置" }));
-
-    await waitFor(() => {
-      expect(invokeMock).toHaveBeenCalledWith("open_privacy_settings", { pane: "screen" });
-      expect(onRefresh).toHaveBeenCalledOnce();
-    });
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("show_permission_guide", { permission: "screen", guideId: expect.any(String) }));
+    expect(onRefresh).toHaveBeenCalledOnce();
+    expect(screen.getByText(/普通听写不截图/)).toBeInTheDocument();
   });
 
   it("exposes a manual recheck action", async () => {

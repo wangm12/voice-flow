@@ -1,0 +1,587 @@
+{
+  "artifact_type": "voiceflow_learning_phase_plan_fixture",
+  "schema_version": 3,
+  "scenario": "same_arm_A_apply_undo_A_and_B_post_undo_noop",
+  "evidence_kind": "synthetic_programmatic_owner_exercise_not_human_or_quality_gold",
+  "plan": {
+    "schema_version": 3,
+    "plan_id": "82000000-0000-4000-8000-000000000001",
+    "arm_state_id": "82000000-0000-4000-8000-000000000002",
+    "terms": [
+      {
+        "fixture_id": "80000000-0000-4000-8000-000000000003",
+        "before": "VoiceFlo",
+        "after": "VoiceFlow"
+      }
+    ],
+    "phases": [
+      {
+        "phase_id": "82000000-0000-4000-8000-000000000010",
+        "ttl_ms": 120000,
+        "scope": {
+          "mapping_id": "v3-scope-a",
+          "family": "general",
+          "native_bundle": "com.example.voiceflow.scope-a"
+        },
+        "local_only_grant": true,
+        "actor": "programmatic_fixture",
+        "target_oracle": "none",
+        "source": {
+          "kind": "deterministic_text",
+          "fixture_id": "82000000-0000-4000-8000-000000000101",
+          "sha256": "c963c9c0e55d1a763fc0a587649866da72ac89001125dad186206413973c87dc",
+          "byte_length": 15,
+          "rights": "synthetic"
+        },
+        "source_text_learning_authorized": true,
+        "learning_authorized": true,
+        "local_replacement_authorized": false,
+        "undo_authorized": false,
+        "edit_states": [
+          {
+            "sequence": 0,
+            "state_id": "82000000-0000-4000-8000-000000000102",
+            "layer": "post_insert",
+            "sha256": "c963c9c0e55d1a763fc0a587649866da72ac89001125dad186206413973c87dc",
+            "byte_length": 15
+          },
+          {
+            "sequence": 1,
+            "state_id": "82000000-0000-4000-8000-000000000103",
+            "layer": "settled",
+            "sha256": "742ac6bf12b1fb28619b53e9fec894671a0c6177b7c6d37ddebfc3eb3b736345",
+            "byte_length": 16
+          }
+        ],
+        "action": {
+          "kind": "learn_text",
+          "operation_ids": [
+            "82000000-0000-4000-8000-000000000111",
+            "82000000-0000-4000-8000-000000000112",
+            "82000000-0000-4000-8000-000000000113"
+          ],
+          "term_fixture_id": "80000000-0000-4000-8000-000000000003"
+        }
+      },
+      {
+        "phase_id": "82000000-0000-4000-8000-000000000020",
+        "ttl_ms": 120000,
+        "scope": {
+          "mapping_id": "v3-scope-a",
+          "family": "general",
+          "native_bundle": "com.example.voiceflow.scope-a"
+        },
+        "local_only_grant": true,
+        "actor": "programmatic_fixture",
+        "target_oracle": "none",
+        "source": {
+          "kind": "deterministic_text",
+          "fixture_id": "82000000-0000-4000-8000-000000000201",
+          "sha256": "bb0fd96bfc2b91fc1b6e969194bd92f66683e8187b0c798694d429b0f7ed5a6a",
+          "byte_length": 19,
+          "rights": "synthetic"
+        },
+        "source_text_learning_authorized": false,
+        "learning_authorized": false,
+        "local_replacement_authorized": true,
+        "undo_authorized": false,
+        "edit_states": [],
+        "action": {
+          "kind": "apply_followup",
+          "task_id": "82000000-0000-4000-8000-000000000202",
+          "operation_id": "82000000-0000-4000-8000-000000000203",
+          "rule_owner_phase_id": "82000000-0000-4000-8000-000000000010",
+          "term_fixture_id": "80000000-0000-4000-8000-000000000003",
+          "expected_output_sha256": "d05e5cbffacf642ccd83bc1cb74189db46a0914584c7a3f106503a3195f77e73",
+          "expected_output_byte_length": 20
+        }
+      },
+      {
+        "phase_id": "82000000-0000-4000-8000-000000000030",
+        "ttl_ms": 120000,
+        "scope": {
+          "mapping_id": "v3-scope-a",
+          "family": "general",
+          "native_bundle": "com.example.voiceflow.scope-a"
+        },
+        "local_only_grant": true,
+        "actor": "programmatic_fixture",
+        "target_oracle": "none",
+        "source": null,
+        "source_text_learning_authorized": false,
+        "learning_authorized": false,
+        "local_replacement_authorized": false,
+        "undo_authorized": true,
+        "edit_states": [],
+        "action": {
+          "kind": "undo",
+          "operation_id": "82000000-0000-4000-8000-000000000301",
+          "rule_owner_phase_id": "82000000-0000-4000-8000-000000000010",
+          "term_fixture_id": "80000000-0000-4000-8000-000000000003",
+          "required_application_phase_id": "82000000-0000-4000-8000-000000000020"
+        }
+      },
+      {
+        "phase_id": "82000000-0000-4000-8000-000000000040",
+        "ttl_ms": 120000,
+        "scope": {
+          "mapping_id": "v3-scope-a",
+          "family": "general",
+          "native_bundle": "com.example.voiceflow.scope-a"
+        },
+        "local_only_grant": true,
+        "actor": "programmatic_fixture",
+        "target_oracle": "none",
+        "source": {
+          "kind": "deterministic_text",
+          "fixture_id": "82000000-0000-4000-8000-000000000401",
+          "sha256": "bb0fd96bfc2b91fc1b6e969194bd92f66683e8187b0c798694d429b0f7ed5a6a",
+          "byte_length": 19,
+          "rights": "synthetic"
+        },
+        "source_text_learning_authorized": false,
+        "learning_authorized": false,
+        "local_replacement_authorized": true,
+        "undo_authorized": false,
+        "edit_states": [],
+        "action": {
+          "kind": "apply_followup",
+          "task_id": "82000000-0000-4000-8000-000000000402",
+          "operation_id": "82000000-0000-4000-8000-000000000403",
+          "rule_owner_phase_id": "82000000-0000-4000-8000-000000000010",
+          "term_fixture_id": "80000000-0000-4000-8000-000000000003",
+          "expected_output_sha256": "bb0fd96bfc2b91fc1b6e969194bd92f66683e8187b0c798694d429b0f7ed5a6a",
+          "expected_output_byte_length": 19
+        }
+      },
+      {
+        "phase_id": "82000000-0000-4000-8000-000000000050",
+        "ttl_ms": 120000,
+        "scope": {
+          "mapping_id": "v3-scope-b",
+          "family": "general",
+          "native_bundle": "com.example.voiceflow.scope-b"
+        },
+        "local_only_grant": true,
+        "actor": "programmatic_fixture",
+        "target_oracle": "none",
+        "source": {
+          "kind": "deterministic_text",
+          "fixture_id": "82000000-0000-4000-8000-000000000501",
+          "sha256": "bb0fd96bfc2b91fc1b6e969194bd92f66683e8187b0c798694d429b0f7ed5a6a",
+          "byte_length": 19,
+          "rights": "synthetic"
+        },
+        "source_text_learning_authorized": false,
+        "learning_authorized": false,
+        "local_replacement_authorized": true,
+        "undo_authorized": false,
+        "edit_states": [],
+        "action": {
+          "kind": "apply_followup",
+          "task_id": "82000000-0000-4000-8000-000000000502",
+          "operation_id": "82000000-0000-4000-8000-000000000503",
+          "rule_owner_phase_id": "82000000-0000-4000-8000-000000000010",
+          "term_fixture_id": "80000000-0000-4000-8000-000000000003",
+          "expected_output_sha256": "bb0fd96bfc2b91fc1b6e969194bd92f66683e8187b0c798694d429b0f7ed5a6a",
+          "expected_output_byte_length": 19
+        }
+      }
+    ]
+  },
+  "stdin_requests": [
+    {
+      "request_id": "90000000-0000-4000-8000-000000000001",
+      "command": {
+        "op": "prepare_plan",
+        "plan": {
+          "schema_version": 3,
+          "plan_id": "82000000-0000-4000-8000-000000000001",
+          "arm_state_id": "82000000-0000-4000-8000-000000000002",
+          "terms": [
+            {
+              "fixture_id": "80000000-0000-4000-8000-000000000003",
+              "before": "VoiceFlo",
+              "after": "VoiceFlow"
+            }
+          ],
+          "phases": [
+            {
+              "phase_id": "82000000-0000-4000-8000-000000000010",
+              "ttl_ms": 120000,
+              "scope": {
+                "mapping_id": "v3-scope-a",
+                "family": "general",
+                "native_bundle": "com.example.voiceflow.scope-a"
+              },
+              "local_only_grant": true,
+              "actor": "programmatic_fixture",
+              "target_oracle": "none",
+              "source": {
+                "kind": "deterministic_text",
+                "fixture_id": "82000000-0000-4000-8000-000000000101",
+                "sha256": "c963c9c0e55d1a763fc0a587649866da72ac89001125dad186206413973c87dc",
+                "byte_length": 15,
+                "rights": "synthetic"
+              },
+              "source_text_learning_authorized": true,
+              "learning_authorized": true,
+              "local_replacement_authorized": false,
+              "undo_authorized": false,
+              "edit_states": [
+                {
+                  "sequence": 0,
+                  "state_id": "82000000-0000-4000-8000-000000000102",
+                  "layer": "post_insert",
+                  "sha256": "c963c9c0e55d1a763fc0a587649866da72ac89001125dad186206413973c87dc",
+                  "byte_length": 15
+                },
+                {
+                  "sequence": 1,
+                  "state_id": "82000000-0000-4000-8000-000000000103",
+                  "layer": "settled",
+                  "sha256": "742ac6bf12b1fb28619b53e9fec894671a0c6177b7c6d37ddebfc3eb3b736345",
+                  "byte_length": 16
+                }
+              ],
+              "action": {
+                "kind": "learn_text",
+                "operation_ids": [
+                  "82000000-0000-4000-8000-000000000111",
+                  "82000000-0000-4000-8000-000000000112",
+                  "82000000-0000-4000-8000-000000000113"
+                ],
+                "term_fixture_id": "80000000-0000-4000-8000-000000000003"
+              }
+            },
+            {
+              "phase_id": "82000000-0000-4000-8000-000000000020",
+              "ttl_ms": 120000,
+              "scope": {
+                "mapping_id": "v3-scope-a",
+                "family": "general",
+                "native_bundle": "com.example.voiceflow.scope-a"
+              },
+              "local_only_grant": true,
+              "actor": "programmatic_fixture",
+              "target_oracle": "none",
+              "source": {
+                "kind": "deterministic_text",
+                "fixture_id": "82000000-0000-4000-8000-000000000201",
+                "sha256": "bb0fd96bfc2b91fc1b6e969194bd92f66683e8187b0c798694d429b0f7ed5a6a",
+                "byte_length": 19,
+                "rights": "synthetic"
+              },
+              "source_text_learning_authorized": false,
+              "learning_authorized": false,
+              "local_replacement_authorized": true,
+              "undo_authorized": false,
+              "edit_states": [],
+              "action": {
+                "kind": "apply_followup",
+                "task_id": "82000000-0000-4000-8000-000000000202",
+                "operation_id": "82000000-0000-4000-8000-000000000203",
+                "rule_owner_phase_id": "82000000-0000-4000-8000-000000000010",
+                "term_fixture_id": "80000000-0000-4000-8000-000000000003",
+                "expected_output_sha256": "d05e5cbffacf642ccd83bc1cb74189db46a0914584c7a3f106503a3195f77e73",
+                "expected_output_byte_length": 20
+              }
+            },
+            {
+              "phase_id": "82000000-0000-4000-8000-000000000030",
+              "ttl_ms": 120000,
+              "scope": {
+                "mapping_id": "v3-scope-a",
+                "family": "general",
+                "native_bundle": "com.example.voiceflow.scope-a"
+              },
+              "local_only_grant": true,
+              "actor": "programmatic_fixture",
+              "target_oracle": "none",
+              "source": null,
+              "source_text_learning_authorized": false,
+              "learning_authorized": false,
+              "local_replacement_authorized": false,
+              "undo_authorized": true,
+              "edit_states": [],
+              "action": {
+                "kind": "undo",
+                "operation_id": "82000000-0000-4000-8000-000000000301",
+                "rule_owner_phase_id": "82000000-0000-4000-8000-000000000010",
+                "term_fixture_id": "80000000-0000-4000-8000-000000000003",
+                "required_application_phase_id": "82000000-0000-4000-8000-000000000020"
+              }
+            },
+            {
+              "phase_id": "82000000-0000-4000-8000-000000000040",
+              "ttl_ms": 120000,
+              "scope": {
+                "mapping_id": "v3-scope-a",
+                "family": "general",
+                "native_bundle": "com.example.voiceflow.scope-a"
+              },
+              "local_only_grant": true,
+              "actor": "programmatic_fixture",
+              "target_oracle": "none",
+              "source": {
+                "kind": "deterministic_text",
+                "fixture_id": "82000000-0000-4000-8000-000000000401",
+                "sha256": "bb0fd96bfc2b91fc1b6e969194bd92f66683e8187b0c798694d429b0f7ed5a6a",
+                "byte_length": 19,
+                "rights": "synthetic"
+              },
+              "source_text_learning_authorized": false,
+              "learning_authorized": false,
+              "local_replacement_authorized": true,
+              "undo_authorized": false,
+              "edit_states": [],
+              "action": {
+                "kind": "apply_followup",
+                "task_id": "82000000-0000-4000-8000-000000000402",
+                "operation_id": "82000000-0000-4000-8000-000000000403",
+                "rule_owner_phase_id": "82000000-0000-4000-8000-000000000010",
+                "term_fixture_id": "80000000-0000-4000-8000-000000000003",
+                "expected_output_sha256": "bb0fd96bfc2b91fc1b6e969194bd92f66683e8187b0c798694d429b0f7ed5a6a",
+                "expected_output_byte_length": 19
+              }
+            },
+            {
+              "phase_id": "82000000-0000-4000-8000-000000000050",
+              "ttl_ms": 120000,
+              "scope": {
+                "mapping_id": "v3-scope-b",
+                "family": "general",
+                "native_bundle": "com.example.voiceflow.scope-b"
+              },
+              "local_only_grant": true,
+              "actor": "programmatic_fixture",
+              "target_oracle": "none",
+              "source": {
+                "kind": "deterministic_text",
+                "fixture_id": "82000000-0000-4000-8000-000000000501",
+                "sha256": "bb0fd96bfc2b91fc1b6e969194bd92f66683e8187b0c798694d429b0f7ed5a6a",
+                "byte_length": 19,
+                "rights": "synthetic"
+              },
+              "source_text_learning_authorized": false,
+              "learning_authorized": false,
+              "local_replacement_authorized": true,
+              "undo_authorized": false,
+              "edit_states": [],
+              "action": {
+                "kind": "apply_followup",
+                "task_id": "82000000-0000-4000-8000-000000000502",
+                "operation_id": "82000000-0000-4000-8000-000000000503",
+                "rule_owner_phase_id": "82000000-0000-4000-8000-000000000010",
+                "term_fixture_id": "80000000-0000-4000-8000-000000000003",
+                "expected_output_sha256": "bb0fd96bfc2b91fc1b6e969194bd92f66683e8187b0c798694d429b0f7ed5a6a",
+                "expected_output_byte_length": 19
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "request_id": "90000000-0000-4000-8000-000000000002",
+      "command": {
+        "op": "enter_phase",
+        "plan_id": "82000000-0000-4000-8000-000000000001",
+        "phase_id": "82000000-0000-4000-8000-000000000010"
+      }
+    },
+    {
+      "request_id": "90000000-0000-4000-8000-000000000003",
+      "command": {
+        "op": "apply_phase_text",
+        "plan_id": "82000000-0000-4000-8000-000000000001",
+        "phase_id": "82000000-0000-4000-8000-000000000010",
+        "operation_id": "82000000-0000-4000-8000-000000000111",
+        "states": [
+          {
+            "sequence": 0,
+            "state_id": "82000000-0000-4000-8000-000000000102",
+            "layer": "post_insert",
+            "text": "VoiceFlo today."
+          },
+          {
+            "sequence": 1,
+            "state_id": "82000000-0000-4000-8000-000000000103",
+            "layer": "settled",
+            "text": "VoiceFlow today."
+          }
+        ]
+      }
+    },
+    {
+      "request_id": "90000000-0000-4000-8000-000000000004",
+      "command": {
+        "op": "apply_phase_text",
+        "plan_id": "82000000-0000-4000-8000-000000000001",
+        "phase_id": "82000000-0000-4000-8000-000000000010",
+        "operation_id": "82000000-0000-4000-8000-000000000112",
+        "states": [
+          {
+            "sequence": 0,
+            "state_id": "82000000-0000-4000-8000-000000000102",
+            "layer": "post_insert",
+            "text": "VoiceFlo today."
+          },
+          {
+            "sequence": 1,
+            "state_id": "82000000-0000-4000-8000-000000000103",
+            "layer": "settled",
+            "text": "VoiceFlow today."
+          }
+        ]
+      }
+    },
+    {
+      "request_id": "90000000-0000-4000-8000-000000000005",
+      "command": {
+        "op": "apply_phase_text",
+        "plan_id": "82000000-0000-4000-8000-000000000001",
+        "phase_id": "82000000-0000-4000-8000-000000000010",
+        "operation_id": "82000000-0000-4000-8000-000000000113",
+        "states": [
+          {
+            "sequence": 0,
+            "state_id": "82000000-0000-4000-8000-000000000102",
+            "layer": "post_insert",
+            "text": "VoiceFlo today."
+          },
+          {
+            "sequence": 1,
+            "state_id": "82000000-0000-4000-8000-000000000103",
+            "layer": "settled",
+            "text": "VoiceFlow today."
+          }
+        ]
+      }
+    },
+    {
+      "request_id": "90000000-0000-4000-8000-000000000006",
+      "command": {
+        "op": "end_phase",
+        "plan_id": "82000000-0000-4000-8000-000000000001",
+        "phase_id": "82000000-0000-4000-8000-000000000010"
+      }
+    },
+    {
+      "request_id": "90000000-0000-4000-8000-000000000007",
+      "command": {
+        "op": "enter_phase",
+        "plan_id": "82000000-0000-4000-8000-000000000001",
+        "phase_id": "82000000-0000-4000-8000-000000000020"
+      }
+    },
+    {
+      "request_id": "90000000-0000-4000-8000-000000000008",
+      "command": {
+        "op": "apply_phase_followup",
+        "plan_id": "82000000-0000-4000-8000-000000000001",
+        "phase_id": "82000000-0000-4000-8000-000000000020",
+        "operation_id": "82000000-0000-4000-8000-000000000203",
+        "text": "Use VoiceFlo today."
+      }
+    },
+    {
+      "request_id": "90000000-0000-4000-8000-000000000009",
+      "command": {
+        "op": "end_phase",
+        "plan_id": "82000000-0000-4000-8000-000000000001",
+        "phase_id": "82000000-0000-4000-8000-000000000020"
+      }
+    },
+    {
+      "request_id": "90000000-0000-4000-8000-000000000010",
+      "command": {
+        "op": "enter_phase",
+        "plan_id": "82000000-0000-4000-8000-000000000001",
+        "phase_id": "82000000-0000-4000-8000-000000000030"
+      }
+    },
+    {
+      "request_id": "90000000-0000-4000-8000-000000000011",
+      "command": {
+        "op": "undo_phase",
+        "plan_id": "82000000-0000-4000-8000-000000000001",
+        "phase_id": "82000000-0000-4000-8000-000000000030",
+        "operation_id": "82000000-0000-4000-8000-000000000301"
+      }
+    },
+    {
+      "request_id": "90000000-0000-4000-8000-000000000012",
+      "command": {
+        "op": "end_phase",
+        "plan_id": "82000000-0000-4000-8000-000000000001",
+        "phase_id": "82000000-0000-4000-8000-000000000030"
+      }
+    },
+    {
+      "request_id": "90000000-0000-4000-8000-000000000013",
+      "command": {
+        "op": "enter_phase",
+        "plan_id": "82000000-0000-4000-8000-000000000001",
+        "phase_id": "82000000-0000-4000-8000-000000000040"
+      }
+    },
+    {
+      "request_id": "90000000-0000-4000-8000-000000000014",
+      "command": {
+        "op": "apply_phase_followup",
+        "plan_id": "82000000-0000-4000-8000-000000000001",
+        "phase_id": "82000000-0000-4000-8000-000000000040",
+        "operation_id": "82000000-0000-4000-8000-000000000403",
+        "text": "Use VoiceFlo today."
+      }
+    },
+    {
+      "request_id": "90000000-0000-4000-8000-000000000015",
+      "command": {
+        "op": "end_phase",
+        "plan_id": "82000000-0000-4000-8000-000000000001",
+        "phase_id": "82000000-0000-4000-8000-000000000040"
+      }
+    },
+    {
+      "request_id": "90000000-0000-4000-8000-000000000016",
+      "command": {
+        "op": "enter_phase",
+        "plan_id": "82000000-0000-4000-8000-000000000001",
+        "phase_id": "82000000-0000-4000-8000-000000000050"
+      }
+    },
+    {
+      "request_id": "90000000-0000-4000-8000-000000000017",
+      "command": {
+        "op": "apply_phase_followup",
+        "plan_id": "82000000-0000-4000-8000-000000000001",
+        "phase_id": "82000000-0000-4000-8000-000000000050",
+        "operation_id": "82000000-0000-4000-8000-000000000503",
+        "text": "Use VoiceFlo today."
+      }
+    },
+    {
+      "request_id": "90000000-0000-4000-8000-000000000018",
+      "command": {
+        "op": "end_phase",
+        "plan_id": "82000000-0000-4000-8000-000000000001",
+        "phase_id": "82000000-0000-4000-8000-000000000050"
+      }
+    },
+    {
+      "request_id": "90000000-0000-4000-8000-000000000019",
+      "command": {
+        "op": "end_plan",
+        "plan_id": "82000000-0000-4000-8000-000000000001"
+      }
+    },
+    {
+      "request_id": "90000000-0000-4000-8000-000000000020",
+      "command": {
+        "op": "quit"
+      }
+    }
+  ]
+}

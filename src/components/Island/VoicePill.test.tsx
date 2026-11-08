@@ -1,837 +1,348 @@
-import { act, cleanup, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import type { ComponentProps } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { invoke } from "@tauri-apps/api/core";
-import { VoicePill } from "./VoicePill";
-import { HUD_LABEL_FADE_MS, HUD_LABEL_OUT_MS, HUD_ORB_FADE_MS } from "./hudOrb";
-import { CONTEXT_LABEL_VISIBLE_MS } from "./voicePillTokens";
+import { VoicePill, type VoicePillRecoveryAction } from "./VoicePill";
+import { HUD_LISTENING_BEAM, HUD_THINKING_BEAM } from "./hudOrb";
 import { I18nProvider } from "../../lib/i18n";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 
-const invokeMock = vi.mocked(invoke);
-
 afterEach(() => {
   cleanup();
   vi.useRealTimers();
-  invokeMock.mockReset();
+  vi.restoreAllMocks();
 });
 
+function renderPill(props: Partial<ComponentProps<typeof VoicePill>> = {}) {
+  return render(
+    <I18nProvider initialLanguage="en">
+      <VoicePill
+        state="recording"
+        contextLabel={null}
+        waveformLevels={[]}
+        progress={0}
+        reduced
+        {...props}
+      />
+    </I18nProvider>,
+  );
+}
+
 describe("VoicePill", () => {
-  it("shows a short next step while announcing the full English delivery reason", () => {
-    render(
+  it("never shows the replaced label when the delivery state is unverified", () => {
+    renderPill({
+      state: "unverified",
+      selectedActionState: "replaced",
+      deliveryMethod: "paste_unverified",
+      fallbackReason: "paste_unverified",
+    });
+
+    expect(screen.queryByText(/replaced/i)).not.toBeInTheDocument();
+    expect(document.body.textContent).not.toContain("已替换选中文本");
+    expect(document.body.textContent).not.toMatch(/replaced/i);
+  });
+
+  it("keeps the 220×48 primary capsule and real recording target fixed", () => {
+    renderPill({
+      state: "recording",
+      sessionGeneration: 31,
+      stageElapsedMs: 65_000,
+      audioDeviceName: "AirPods Pro",
+      audioDeviceSourceLabel: "Selected input",
+      audioDeviceTitle: "Selected input: AirPods Pro",
+      audioCaptureStatus: "receiving_audio",
+      recordingTargetIcon: "data:image/png;base64,aGVsbG8=",
+    });
+
+    expect(document.querySelector(".voice-pill")).toHaveStyle({ width: "220px", height: "48px" });
+    expect(document.querySelector(".voice-pill__target-icon")).toHaveAttribute("src", "data:image/png;base64,aGVsbG8=");
+    expect(document.querySelector(".voice-pill__label")).toHaveTextContent("Recording");
+    expect(document.querySelector(".voice-pill__subtitle")).toHaveAttribute("title", "Selected input: AirPods Pro");
+    expect(screen.getByText("01:05")).toBeInTheDocument();
+  });
+
+  it("shows the waiting-for-audio source honestly and keeps the original stop square", () => {
+    renderPill({ state: "recording", audioCaptureStatus: "waiting_first_frame", sessionGeneration: 42 });
+
+    expect(screen.getByText("Waiting for microphone")).toBeInTheDocument();
+    expect(screen.getByText("No audio has arrived yet")).toBeInTheDocument();
+    const stop = screen.getByRole("button", { name: "Stop and process" });
+    const icon = stop.querySelector("svg");
+    expect(icon).toHaveAttribute("width", "20");
+    expect(icon?.querySelector("rect")).toHaveAttribute("x", "5");
+    expect(icon?.querySelector("rect")).toHaveAttribute("width", "10");
+    expect(icon?.querySelector("rect")).toHaveAttribute("height", "10");
+  });
+
+  it("animates the mono listening beam only while captured audio is fresh", () => {
+    expect(HUD_LISTENING_BEAM).toEqual({ size: "md", colorVariant: "mono", strength: 1, duration: 1.96, brightness: 1.3 });
+    const now = Date.now();
+    const { rerender } = renderPill({
+      state: "recording",
+      audioCaptureStatus: "receiving_audio",
+      waveformLevels: [0.7],
+      lastAudioLevelAtMs: now - 100,
+      clockNowMs: 0,
+      reduced: false,
+    });
+    expect(document.querySelector('[data-beam-size="md"]')).toHaveAttribute("data-beam-active", "true");
+
+    rerender(
       <I18nProvider initialLanguage="en">
-        <VoicePill state="copied" fallbackReason="clipboard_changed" contextLabel={null} waveformLevels={[]} progress={1} reduced />
+        <VoicePill
+          state="recording"
+          contextLabel={null}
+          waveformLevels={[0.7]}
+          progress={0}
+          lastAudioLevelAtMs={Date.now() - 1_000}
+          clockNowMs={0}
+          reduced={false}
+        />
       </I18nProvider>,
     );
-    expect(document.querySelector(".voice-pill-caption__text")).toHaveTextContent(
-      "Check the input field; copy from History if needed.",
-    );
-    expect(screen.getByRole("status").getAttribute("aria-label")).toContain(
-      "Another app updated the clipboard, so its newer contents were kept.",
-    );
+    expect(document.querySelector('[data-beam-size="md"]')).toHaveAttribute("data-beam-active", "false");
   });
 
-  it("keeps the English stop instruction first in a wide recording-limit caption", () => {
-    render(
+  it("uses one processing label and one cancel affordance across every backend phase", () => {
+    expect(HUD_THINKING_BEAM).toEqual({ size: "line", colorVariant: "mono", strength: 0.65, duration: 3.1, brightness: 1.3 });
+    const phases = ["finalizing_audio", "asr", "soniox_recovery", "cascade_accurate", "cleanup", "delivery", "waiting_retry"] as const;
+    const { rerender } = renderPill({ state: "processing", phase: phases[0], reduced: false, sessionGeneration: 8 });
+
+    for (const phase of phases) {
+      rerender(
+        <I18nProvider initialLanguage="en">
+          <VoicePill state="processing" phase={phase} phaseConfirmed contextLabel={null} waveformLevels={[]} progress={0.2} reduced={false} sessionGeneration={8} />
+        </I18nProvider>,
+      );
+      expect(document.querySelector(".voice-pill__label")).toHaveTextContent("Processing");
+      expect(screen.getByRole("button", { name: "Cancel dictation" })).toBeInTheDocument();
+      expect(document.querySelector("[data-orb-state='working']")).toHaveAttribute("data-orb-speed", "1.00");
+      expect(document.querySelector('[data-beam-size="line"]')).toHaveAttribute("data-beam-active", "true");
+      expect(document.querySelector(".voice-pill__elapsed")).not.toBeInTheDocument();
+      expect(document.querySelector(".voice-pill__subtitle")).not.toBeInTheDocument();
+    }
+  });
+
+  it("pauses motion for reduced-motion users", () => {
+    renderPill({ state: "processing", phase: "asr", reduced: true });
+    expect(document.querySelector('[data-beam-size="line"]')).toHaveAttribute("data-beam-active", "false");
+  });
+
+  it("provides a real generation-bound microphone settings action in the detail tray", () => {
+    const onDetailsAction = vi.fn();
+    renderPill({
+      state: "error",
+      fallbackReason: "microphone_required",
+      detailsOpen: true,
+      sessionGeneration: 55,
+      onDetailsAction,
+    });
+
+    expect(document.querySelector(".voice-pill")).toHaveStyle({ width: "220px", height: "48px" });
+    expect(document.querySelector(".voice-pill__details-title")).toHaveTextContent("Microphone permission is needed");
+    fireEvent.click(screen.getByRole("button", { name: "Open Microphone settings" }));
+    expect(onDetailsAction).toHaveBeenCalledWith("microphone", 55);
+  });
+
+  it.each(["preparing_rewrite", "preview_ready"])("keeps unverified %s text actions honest in details and announcements", (selectedActionState) => {
+    const onDetailsAction = vi.fn();
+    renderPill({
+      state: "unverified",
+      selectedActionState,
+      fallbackReason: "paste_unverified",
+      detailsOpen: true,
+      sessionGeneration: 56,
+      onDetailsAction,
+    });
+
+    expect(document.querySelector(".voice-pill__details-title")).toHaveTextContent("Input attempted");
+    expect(document.querySelector(".voice-pill__details-copy")).not.toHaveTextContent(/saved|copied|pasted/i);
+    expect(document.querySelector(".voice-pill__details-copy")).toHaveTextContent("Check the input field first");
+    expect(document.querySelector(".voice-pill__details-copy")).not.toHaveTextContent(/history/i);
+    expect(screen.queryByRole("button", { name: /history/i })).not.toBeInTheDocument();
+    expect(document.querySelector(".voice-pill__subtitle")).toHaveTextContent("Check the input field first");
+    expect(document.querySelector(".voice-pill__subtitle")).not.toHaveTextContent(/preparing rewrite/i);
+    expect(document.querySelector(".voice-pill")?.getAttribute("aria-label")).not.toMatch(/history|preparing rewrite/i);
+    expect(screen.getByRole("status")).not.toHaveTextContent(/history|preparing rewrite/i);
+    expect(onDetailsAction).not.toHaveBeenCalled();
+  });
+
+  it("keeps the History recovery action for ordinary unverified dictation", () => {
+    const onDetailsAction = vi.fn();
+    renderPill({
+      state: "unverified",
+      fallbackReason: "paste_unverified",
+      detailsOpen: true,
+      sessionGeneration: 57,
+      onDetailsAction,
+    });
+
+    expect(document.querySelector(".voice-pill__details-title")).toHaveTextContent("Input attempted");
+    expect(screen.getByRole("button", { name: "Check History" })).toBeInTheDocument();
+    expect(document.querySelector(".voice-pill__details-copy")).toHaveTextContent("History");
+    expect(document.querySelector(".voice-pill")?.getAttribute("aria-label")).toContain("History");
+    fireEvent.click(screen.getByRole("button", { name: "Check History" }));
+    expect(onDetailsAction).toHaveBeenCalledWith("history", 57);
+  });
+
+  it("announces critical cleanup alongside an unverified paste warning", () => {
+    renderPill({
+      state: "unverified",
+      fallbackReason: "paste_unverified",
+      deliveryMethod: "paste_unverified",
+      cleanupStatus: "critical_memory_pressure",
+      detailsOpen: true,
+    });
+
+    expect(document.querySelector(".voice-pill__details-title")).toHaveTextContent("Input attempted");
+    expect(document.querySelector(".voice-pill__details-text")).toHaveTextContent("paste was not retried");
+    expect(document.querySelector(".voice-pill__details-text")).toHaveTextContent("System memory pressure is critical");
+    expect(document.querySelector(".voice-pill")?.getAttribute("aria-label")).toContain("System memory pressure is critical");
+  });
+
+  it("announces the neutral local-memory notice alongside an unverified paste warning", () => {
+    renderPill({
+      state: "unverified",
+      fallbackReason: "paste_unverified",
+      deliveryMethod: "paste_unverified",
+      cleanupStatus: "local_memory_unavailable",
+      detailsOpen: true,
+    });
+
+    expect(document.querySelector(".voice-pill__details-title")).toHaveTextContent("Input attempted");
+    expect(document.querySelector(".voice-pill__details-text")).toHaveTextContent("paste was not retried");
+    expect(document.querySelector(".voice-pill__details-text")).toHaveTextContent("The local memory budget is insufficient");
+    expect(document.querySelector(".voice-pill")?.getAttribute("aria-label")).toContain("The local memory budget is insufficient");
+    expect(document.querySelector(".voice-pill__details-text")).not.toHaveTextContent("pressure is critical");
+  });
+
+  it("does not imply saved text from a generic delivery failure", () => {
+    renderPill({ state: "error", fallbackReason: "delivery_failed", detailsOpen: true });
+    expect(document.querySelector(".voice-pill__details-title")).toHaveTextContent("Text was not entered");
+    expect(document.querySelector(".voice-pill__details-copy")).not.toHaveTextContent(/saved/i);
+  });
+
+  it("shows the confirmed outcome in the subtitle instead of truncating it into the cause title", () => {
+    const { rerender } = renderPill({
+      state: "copied",
+      deliveryMethod: "clipboard",
+      fallbackReason: "target_changed",
+    });
+    expect(document.querySelector(".voice-pill__label")).toHaveTextContent("The input target changed");
+    expect(document.querySelector(".voice-pill__subtitle")).toHaveTextContent("Text copied");
+    expect(document.querySelector(".voice-pill__subtitle")).not.toHaveTextContent("The target changed");
+
+    rerender(
       <I18nProvider initialLanguage="en">
-        <VoicePill state="recording_limited" contextLabel="A very long application name · A custom writing template" waveformLevels={[]} progress={0} reduced />
+        <VoicePill state="history" contextLabel={null} waveformLevels={[]} progress={0} reduced deliveryMethod="history" fallbackReason="target_changed" />
       </I18nProvider>,
     );
-    const caption = document.querySelector(".voice-pill-caption");
-    expect(caption).toHaveClass("voice-pill-caption--wide");
-    expect(caption).toHaveStyle({ maxWidth: "360px" });
-    expect(caption?.textContent).toMatch(/^Limit reached · press hotkey to stop/);
+    expect(document.querySelector(".voice-pill__label")).toHaveTextContent("The input target changed");
+    expect(document.querySelector(".voice-pill__subtitle")).toHaveTextContent("Saved to History");
   });
 
-  it("uses the wide caption band for full-recording recovery", () => {
-    render(<VoicePill state="processing" phase="soniox_recovery" contextLabel={null} waveformLevels={[]} progress={0.35} reduced />);
-    expect(document.querySelector(".voice-pill-caption")).toHaveClass("voice-pill-caption--wide");
-    expect(document.querySelector(".voice-pill-caption")).toHaveTextContent("正在重新转写完整录音");
+  it("shows recovery actions only with a concrete recovery payload", () => {
+    const onAction = vi.fn();
+    const recoveryAction: VoicePillRecoveryAction = {
+      title: "Recording saved",
+      message: "The recording was saved to History.",
+      actionLabel: "View History",
+      busy: false,
+      error: null,
+      onAction,
+      onDismiss: vi.fn(),
+    };
+    renderPill({ state: "error", recoveryAction, detailsOpen: true });
+    fireEvent.click(screen.getByRole("button", { name: "View History" }));
+    expect(onAction).toHaveBeenCalledOnce();
+    expect(document.querySelector(".voice-pill-stack")).toHaveStyle({ width: "320px", height: "116px" });
   });
 
-  it("keeps delivery undo passive even when its backend transaction is available", () => {
-    render(<VoicePill state="done" undoAvailable contextLabel={null} waveformLevels={[]} progress={1} reduced />);
-    expect(screen.queryByRole("button")).not.toBeInTheDocument();
-    expect(invokeMock).not.toHaveBeenCalled();
-  });
+  it("lets the primary arrow open and close a recovery tray", () => {
+    const onDetailsOpenChange = vi.fn();
+    const recoveryAction: VoicePillRecoveryAction = {
+      title: "Recording saved",
+      message: "The recording was saved to History.",
+      actionLabel: "View History",
+      busy: false,
+      error: null,
+      onAction: vi.fn(),
+      onDismiss: vi.fn(),
+    };
+    const { rerender } = renderPill({ state: "error", recoveryAction, onDetailsOpenChange });
 
-  it("keeps in-progress words off the HUD while recording", () => {
-    render(
-      <VoicePill
-        state="recording"
-        contextLabel="WeChat · 口语"
-        partialText="你好世界"
-        selectedActionState={null}
-        waveformLevels={[]}
-        progress={0}
-        reduced
-      />,
+    expect(screen.queryByText("The recording was saved to History.")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "View details" }));
+    expect(onDetailsOpenChange).toHaveBeenCalledWith(true);
+
+    rerender(
+      <I18nProvider initialLanguage="en">
+        <VoicePill state="error" contextLabel={null} waveformLevels={[]} progress={0} reduced detailsOpen recoveryAction={recoveryAction} onDetailsOpenChange={onDetailsOpenChange} />
+      </I18nProvider>,
     );
-
-    expect(document.querySelector(".voice-pill-caption")).toHaveTextContent("WeChat · 口语");
-    expect(document.querySelector(".voice-pill-caption")?.textContent ?? "").not.toContain("你好世界");
-    expect(screen.getByRole("status").getAttribute("aria-label") ?? "").not.toContain("你好世界");
-    expect(document.querySelector(".voice-pill-caption")).not.toHaveClass("voice-pill-caption--partial");
-    expect(document.querySelector(".voice-pill-caption")).not.toHaveStyle({ maxWidth: "360px" });
-    expect(invokeMock).not.toHaveBeenCalled();
+    expect(screen.getByText("The recording was saved to History.")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Close details" }));
+    expect(onDetailsOpenChange).toHaveBeenCalledWith(false);
   });
 
-  it("keeps the compact caption width when recording without in-progress words", () => {
-    render(
-      <VoicePill
-        state="recording"
-        contextLabel="WeChat · 口语"
-        selectedActionState={null}
-        waveformLevels={[]}
-        progress={0}
-        reduced
-      />,
-    );
+  it("keeps a folded recovery ticket reachable while the HUD state is idle", () => {
+    const onDetailsOpenChange = vi.fn();
+    const recoveryAction: VoicePillRecoveryAction = {
+      title: "Recording saved",
+      message: "The recording was saved to History.",
+      actionLabel: "View History",
+      busy: false,
+      error: null,
+      onAction: vi.fn(),
+      onDismiss: vi.fn(),
+    };
+    renderPill({ state: "idle", recoveryAction, onDetailsOpenChange });
 
-    const caption = document.querySelector(".voice-pill-caption");
-    expect(caption).toHaveTextContent("WeChat · 口语");
-    expect(caption).not.toHaveClass("voice-pill-caption--partial");
-    expect(caption).not.toHaveStyle({ maxWidth: "360px" });
+    expect(document.querySelector(".voice-pill-stack")).not.toHaveAttribute("aria-hidden", "true");
+    fireEvent.click(screen.getByRole("button", { name: "View details" }));
+    expect(onDetailsOpenChange).toHaveBeenCalledWith(true);
   });
 
-  it("keeps error captions ahead of in-progress words", () => {
-    render(
-      <VoicePill
-        state="error"
-        contextLabel="WeChat · 口语"
-        partialText="should not appear"
-        selectedActionState={null}
-        waveformLevels={[]}
-        progress={0}
-        reduced
-      />,
-    );
-
-    expect(document.querySelector(".voice-pill-caption")).toHaveTextContent("语音输入失败，请重试");
-    expect(screen.queryByText("should not appear")).not.toBeInTheDocument();
-    expect(invokeMock).not.toHaveBeenCalled();
-  });
-
-  it("shows the context label while recording", () => {
-    render(
-      <VoicePill
-        state="recording"
-        contextLabel="Chrome Canary · General"
-        selectedActionState={null}
-        waveformLevels={[]}
-        progress={0}
-        reduced
-      />,
-    );
-
-    expect(screen.getByText("Chrome Canary · General")).toBeInTheDocument();
-    expect(document.querySelector(".voice-pill-caption")).toHaveTextContent("Chrome Canary · General");
-    expect(screen.getByRole("status").getAttribute("aria-label") ?? "").toContain("Chrome Canary · General");
-  });
-
-  it("does not bring the dismissed app caption back when thinking restates the same context", () => {
-    vi.useFakeTimers();
-    const { rerender } = render(
-      <VoicePill
-        state="recording"
-        contextLabel="Cursor · 代码"
-        selectedActionState={null}
-        waveformLevels={[]}
-        progress={0}
-        reduced
-      />,
-    );
-    expect(document.querySelector(".voice-pill-caption")).toHaveTextContent("Cursor · 代码");
-    act(() => {
-      vi.advanceTimersByTime(CONTEXT_LABEL_VISIBLE_MS);
+  it("shows a transport failure before a generic microphone subtitle", () => {
+    renderPill({
+      state: "recording",
+      audioCaptureStatus: "no_recent_audio",
+      detailsOpen: true,
+      actionError: "Could not stop recording. Try again.",
     });
-    expect(document.querySelector(".voice-pill-caption")).not.toBeInTheDocument();
 
-    rerender(
-      <VoicePill
-        state="processing"
-        phase="asr"
-        contextLabel={null}
-        selectedActionState={null}
-        waveformLevels={[]}
-        progress={0.4}
-        reduced
-      />,
-    );
-    expect(document.querySelector(".voice-pill-caption")).not.toBeInTheDocument();
-
-    rerender(
-      <VoicePill
-        state="processing"
-        phase="cleanup"
-        contextLabel="Cursor · 代码"
-        selectedActionState={null}
-        waveformLevels={[]}
-        progress={0.65}
-        reduced
-      />,
-    );
-    expect(document.querySelector(".voice-pill-caption")).not.toBeInTheDocument();
-
-    rerender(
-      <VoicePill
-        state="idle"
-        contextLabel={null}
-        selectedActionState={null}
-        waveformLevels={[]}
-        progress={0}
-        reduced
-      />,
-    );
-    rerender(
-      <VoicePill
-        state="recording"
-        contextLabel="Cursor · 代码"
-        selectedActionState={null}
-        waveformLevels={[]}
-        progress={0}
-        reduced
-      />,
-    );
-    expect(document.querySelector(".voice-pill-caption")).toHaveTextContent("Cursor · 代码");
+    expect(document.querySelector(".voice-pill__details-title")).toHaveTextContent("Microphone is not responding");
+    expect(document.querySelector(".voice-pill__details-text")).toHaveTextContent("Could not stop recording. Try again.");
+    expect(document.querySelector(".voice-pill__details-text")).not.toHaveTextContent("Check the connection and try again");
   });
 
-  it("renders 精确重打中 when the cascade accurate phase is in flight", () => {
-    render(
-      <VoicePill
-        state="processing"
-        phase="cascade_accurate"
-        contextLabel={null}
-        selectedActionState={null}
-        waveformLevels={[]}
-        progress={0.5}
-        reduced
-      />,
-    );
-    expect(document.querySelector(".voice-pill-caption")).toHaveTextContent("精确重打中");
-  });
-
-  it("shows the context label during processing", () => {
-    render(
-      <VoicePill
-        state="processing"
-        phase="cleanup"
-        contextLabel="Chrome Canary · General"
-        selectedActionState={null}
-        waveformLevels={[]}
-        progress={0}
-        reduced
-      />,
-    );
-    expect(document.querySelector(".voice-pill-caption")).toHaveTextContent("Chrome Canary · General");
-    expect(document.querySelector(".voice-pill__orb")?.getAttribute("data-orb-state")).toBe("shaping");
-    expect(document.querySelector(".voice-pill__label")).toHaveTextContent("Thinking…");
-    expect(document.querySelector(".voice-pill__dots--thinking")).not.toBeInTheDocument();
-    expect(document.querySelector("[data-beam-size='line']")?.getAttribute("data-beam-color")).toBe("mono");
-    expect(document.querySelector("[data-beam-size='line']")?.getAttribute("data-beam-size")).toBe("line");
-    expect(document.querySelector("[data-beam-size='line']")?.getAttribute("data-beam-strength")).toBe("0.7");
-  });
-
-  it("dismisses the template caption after a couple of seconds", () => {
-    vi.useFakeTimers();
-    render(
-      <VoicePill
-        state="recording"
-        contextLabel="Chrome · 通用"
-        selectedActionState={null}
-        waveformLevels={[]}
-        progress={0}
-        reduced
-      />,
-    );
-
-    expect(document.querySelector(".voice-pill-caption")).toHaveTextContent("Chrome · 通用");
-    act(() => {
-      vi.advanceTimersByTime(CONTEXT_LABEL_VISIBLE_MS - 1);
+  it("does not offer an idle-only destination while recording", () => {
+    renderPill({
+      state: "recording",
+      audioCaptureStatus: "no_recent_audio",
+      detailsOpen: true,
+      actionError: "Could not stop recording. Try again.",
     });
-    expect(document.querySelector(".voice-pill-caption")).toHaveTextContent("Chrome · 通用");
-    act(() => {
-      vi.advanceTimersByTime(1);
-    });
-    expect(document.querySelector(".voice-pill-caption")).not.toBeInTheDocument();
+
+    expect(document.querySelector(".voice-pill__details-action")).not.toBeInTheDocument();
+    expect(document.querySelector(".voice-pill__details-text")).toHaveTextContent("Could not stop recording. Try again.");
   });
 
-  it("does not leave prefetch words after the template caption dismisses", () => {
-    vi.useFakeTimers();
-    render(
-      <VoicePill
-        state="recording"
-        contextLabel="WeChat · 口语"
-        partialText="你好世界"
-        selectedActionState={null}
-        waveformLevels={[]}
-        progress={0}
-        reduced
-      />,
-    );
-
-    expect(document.querySelector(".voice-pill-caption")).toHaveTextContent("WeChat · 口语");
-    act(() => {
-      vi.advanceTimersByTime(CONTEXT_LABEL_VISIBLE_MS);
-    });
-    expect(document.querySelector(".voice-pill-caption")).not.toBeInTheDocument();
-    expect(screen.queryByText("你好世界")).not.toBeInTheDocument();
-  });
-
-  it("shows the context label while starting", () => {
-    render(
-      <VoicePill
-        state="starting"
-        contextLabel="WeChat · 口语"
-        selectedActionState={null}
-        waveformLevels={[]}
-        progress={0}
-        reduced
-      />,
-    );
-    expect(document.querySelector(".voice-pill-caption")).toHaveTextContent("WeChat · 口语");
-  });
-
-  it("hides the orb when input delivery cannot be verified", () => {
-    render(
-      <VoicePill
-        state="unverified"
-        contextLabel="Cursor · Code"
-        selectedActionState={null}
-        waveformLevels={[]}
-        progress={1}
-        reduced
-      />,
-    );
-
-    expect(screen.getByRole("status")).toHaveAttribute(
-      "aria-label",
-      "输入状态无法确认，未重复粘贴；请检查输入框和历史记录",
-    );
-    expect(
-      screen.getByText("先检查输入框；需要时从历史记录复制"),
-    ).toBeInTheDocument();
-    expect(document.querySelector(".voice-pill--unverified")).toBeInTheDocument();
-    expect(document.querySelector(".voice-pill__orb")).not.toBeInTheDocument();
-    expect(document.querySelector(".voice-pill__label")).toHaveTextContent("Copied");
-    expect(screen.queryByRole("button", { name: "撤销插入" })).not.toBeInTheDocument();
-  });
-
-  it("uses an archive indicator for history-only delivery", () => {
-    render(
-      <VoicePill
-        state="history"
-        contextLabel={null}
-        selectedActionState={null}
-        waveformLevels={[]}
-        progress={1}
-        reduced
-      />,
-    );
-
-    expect(screen.getByRole("status")).toHaveAttribute("aria-label", "已保存到历史");
-    expect(document.querySelector(".voice-pill__orb")).not.toBeInTheDocument();
-    expect(document.querySelector(".voice-pill__label")).toHaveTextContent("Saved");
-    expect(screen.queryByRole("button", { name: "撤销插入" })).not.toBeInTheDocument();
-  });
-
-  it("keeps degraded and unverified HUD states visible during the backend dwell", () => {
-    const { rerender } = render(
-      <VoicePill
-        state="degraded"
-        contextLabel={null}
-        selectedActionState={null}
-        waveformLevels={[]}
-        progress={1}
-        reduced
-      />,
-    );
-    expect(document.querySelector(".voice-pill-stack")).not.toHaveClass("voice-pill-stack--exit");
-    expect(document.querySelector(".voice-pill-caption")).toHaveTextContent("部分结果已保存");
+  it("hides immediately when the owning state is dismissed or confirmed", () => {
+    const { rerender } = renderPill({ state: "error", sessionGeneration: 9 });
+    expect(document.querySelector(".voice-pill-stack")).not.toHaveAttribute("aria-hidden", "true");
 
     rerender(
-      <VoicePill
-        state="unverified"
-        contextLabel={null}
-        selectedActionState={null}
-        waveformLevels={[]}
-        progress={1}
-        reduced
-      />,
+      <I18nProvider initialLanguage="en">
+        <VoicePill state="idle" contextLabel={null} waveformLevels={[]} progress={0} reduced hideImmediately sessionGeneration={9} />
+      </I18nProvider>,
     );
-    expect(document.querySelector(".voice-pill-stack")).not.toHaveClass("voice-pill-stack--exit");
-    expect(document.querySelector(".voice-pill-caption")).toHaveTextContent(
-      "先检查输入框；需要时从历史记录复制",
-    );
+    expect(document.querySelector(".voice-pill-stack")).toHaveAttribute("aria-hidden", "true");
+    expect(document.querySelector(".voice-pill-stack")).toHaveClass("voice-pill-stack--hidden-now");
   });
+});
 
-  it("renders exception captions only for limited, rate-limited, degraded, and error states", () => {
-    const { rerender } = render(
-      <VoicePill
-        state="recording_limited"
-        contextLabel="Chrome Canary · General"
-        selectedActionState={null}
-        waveformLevels={[]}
-        progress={1}
-        reduced
-      />,
-    );
-    expect(document.querySelector(".voice-pill-caption")).toHaveTextContent("已达上限 · 按热键结束");
-    expect(document.querySelector(".voice-pill-caption")).toHaveTextContent("Chrome Canary · General");
-    expect(document.querySelector(".voice-pill__orb--dim")).toBeInTheDocument();
-    expect(document.querySelector(".voice-pill__orb")?.getAttribute("data-orb-state")).toBe("breathing");
-    expect(screen.getByRole("status").getAttribute("aria-label") ?? "").toContain("已达上限");
-
-    rerender(
-      <VoicePill
-        state="rate_limited"
-        retryAfterSecs={12}
-        contextLabel="Chrome Canary · General"
-        selectedActionState={null}
-        waveformLevels={[]}
-        progress={0.4}
-        reduced
-      />,
-    );
-    expect(document.querySelector(".voice-pill-caption")).toHaveTextContent("处理时间比平时长");
-    expect(document.querySelector(".voice-pill-caption")).toHaveTextContent("12");
-
-    rerender(
-      <VoicePill
-        state="error"
-        contextLabel="Chrome Canary · General"
-        selectedActionState={null}
-        waveformLevels={[]}
-        progress={0}
-        reduced
-      />,
-    );
-    expect(document.querySelector(".voice-pill-caption")).toHaveTextContent("语音输入失败，请重试");
-    expect(screen.queryByText("Chrome Canary · General")).not.toBeInTheDocument();
-    expect(document.querySelector(".voice-pill--error")).toBeInTheDocument();
-    expect(document.querySelector(".voice-pill__orb")).not.toBeInTheDocument();
-    expect(document.querySelector(".voice-pill__label")).toHaveTextContent("Error");
-    expect(screen.getByRole("status").getAttribute("aria-label") ?? "").toContain("语音输入失败，请重试");
-  });
-
-  it("ticks the rate-limit caption down once per second", () => {
-    vi.useFakeTimers();
-    render(
-      <VoicePill
-        state="rate_limited"
-        retryAfterSecs={12}
-        contextLabel={null}
-        selectedActionState={null}
-        waveformLevels={[]}
-        progress={0.4}
-        reduced
-      />,
-    );
-    expect(document.querySelector(".voice-pill-caption")).toHaveTextContent("12");
-    act(() => {
-      vi.advanceTimersByTime(1000);
-    });
-    expect(document.querySelector(".voice-pill-caption")).toHaveTextContent("11");
-  });
-
-  it("shows selected-action listening copy during recording without hiding the waveform", () => {
-    render(
-      <VoicePill
-        state="recording"
-        contextLabel={null}
-        selectedActionState="listening"
-        waveformLevels={[0.2, 0.4, 0.3]}
-        progress={0}
-        reduced
-      />,
-    );
-
-    expect(document.querySelector(".voice-pill-stack")).not.toHaveClass("voice-pill-stack--hidden");
-    expect(document.querySelector(".voice-pill-caption")).toHaveTextContent("正在听取操作");
-    expect(document.querySelector(".voice-pill__center-state--active .voice-pill__orb")?.getAttribute("data-orb-state")).toBe("breathing");
-    expect(document.querySelector(".voice-pill__label")).toHaveTextContent("Listening…");
-    expect(screen.getByRole("status").getAttribute("aria-label") ?? "").toContain("正在听取操作");
-  });
-
-  it("unhides the stack for idle selected-action guidance", () => {
-    render(
-      <VoicePill
-        state="idle"
-        contextLabel={null}
-        selectedActionState="waiting_for_selection"
-        waveformLevels={[]}
-        progress={0}
-        reduced
-      />,
-    );
-
-    expect(document.querySelector(".voice-pill-stack")).not.toHaveClass("voice-pill-stack--hidden");
-    expect(document.querySelector(".voice-pill-caption")).toHaveTextContent("等待选中文本");
-    expect(document.querySelector(".voice-pill__orb")?.getAttribute("data-orb-state")).toBe("breathing");
-    expect(document.querySelector(".voice-pill__orb")?.getAttribute("data-orb-paused")).toBe("true");
-    expect(document.querySelector(".voice-pill__label")).toHaveTextContent("Thinking…");
-    expect(screen.getByRole("status").getAttribute("aria-label") ?? "").toContain("等待选中文本");
-  });
-
-  it("hides the stack when idle without any caption", () => {
-    render(
-      <VoicePill
-        state="idle"
-        contextLabel={null}
-        selectedActionState={null}
-        waveformLevels={[]}
-        progress={0}
-        reduced
-      />,
-    );
-
-    expect(document.querySelector(".voice-pill-stack")).toHaveClass("voice-pill-stack--hidden");
-    expect(document.querySelector(".voice-pill-caption")).not.toBeInTheDocument();
-    expect(document.querySelector(".voice-pill__orb")).not.toBeInTheDocument();
-  });
-
-  it("hides undo when a completed insert did not arm a transaction", () => {
-    render(
-      <VoicePill
-        state="done"
-        contextLabel={null}
-        selectedActionState={null}
-        undoAvailable={false}
-        waveformLevels={[]}
-        progress={1}
-        reduced
-      />,
-    );
-
-    expect(screen.queryByRole("button", { name: "撤销插入" })).not.toBeInTheDocument();
-    expect(invokeMock).not.toHaveBeenCalled();
-  });
-
-  it("does not show cancel or send controls on the pill", () => {
-    render(
-      <VoicePill
-        state="recording"
-        contextLabel={null}
-        selectedActionState={null}
-        waveformLevels={[]}
-        progress={0}
-        reduced
-      />,
-    );
-
-    expect(screen.queryByRole("button", { name: "取消录音" })).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "停止录音" })).not.toBeInTheDocument();
-    expect(document.querySelector(".voice-pill__orb")).toBeInTheDocument();
-    expect(document.querySelector(".voice-pill__label")).toHaveTextContent("Listening…");
-    expect(document.querySelector("[data-beam-size='md']")?.getAttribute("data-beam-color")).toBe("mono");
-    expect(document.querySelector("[data-beam-size='md']")?.getAttribute("data-beam-size")).toBe("md");
-    expect(document.querySelector("[data-beam-size='md']")?.getAttribute("data-beam-active")).toBe("false");
-  });
-
-  it("keeps selected-action guidance in the caption chip", () => {
-    render(
-      <VoicePill
-        state="idle"
-        contextLabel={null}
-        selectedActionState="accessibility_required"
-        waveformLevels={[]}
-        progress={0}
-        reduced
-      />,
-    );
-
-    expect(document.querySelector(".voice-pill-caption")).toHaveTextContent("需要辅助功能权限");
-    expect(screen.getByRole("status").getAttribute("aria-label") ?? "").toContain("需要辅助功能权限");
-  });
-
-  it("surfaces delivery fallback reasons in the caption chip", () => {
-    render(
-      <VoicePill
-        state="copied"
-        contextLabel={null}
-        fallbackReason="target_changed"
-        selectedActionState={null}
-        waveformLevels={[]}
-        progress={1}
-        reduced
-      />,
-    );
-
-    expect(document.querySelector(".voice-pill-caption")).toHaveTextContent("已复制，请手动粘贴");
-    expect(document.querySelector(".voice-pill-caption")).toHaveClass("voice-pill-caption--wide");
-    expect(document.querySelector(".voice-pill-caption")).toHaveStyle({ maxWidth: "360px" });
-    expect(screen.getByRole("status").getAttribute("aria-label") ?? "").toContain("输入目标已变化");
-  });
-
-  it("keeps terminal selected-action captions visible without exit animation", () => {
-    render(
-      <VoicePill
-        state="copied"
-        contextLabel={null}
-        selectedActionState="copied_instead"
-        waveformLevels={[]}
-        progress={1}
-        reduced
-      />,
-    );
-
-    expect(document.querySelector(".voice-pill-caption")).toHaveTextContent("目标变化，结果已复制");
-    expect(document.querySelector(".voice-pill-stack")).not.toHaveClass("voice-pill-stack--exit");
-  });
-
-  it("shows completed replacement copy on done without exit animation", () => {
-    render(
-      <VoicePill
-        state="done"
-        contextLabel={null}
-        selectedActionState="replaced"
-        waveformLevels={[]}
-        progress={1}
-        reduced
-      />,
-    );
-
-    expect(document.querySelector(".voice-pill-caption")).toHaveTextContent("已替换选中文本");
-    expect(document.querySelector(".voice-pill-stack")).not.toHaveClass("voice-pill-stack--exit");
-    expect(document.querySelector(".voice-pill__orb")).not.toBeInTheDocument();
-    expect(document.querySelector(".voice-pill__label")).toHaveTextContent("Done");
-  });
-
-  it("keeps ordinary copied state readable instead of exiting immediately", () => {
-    render(
-      <VoicePill
-        state="copied"
-        contextLabel={null}
-        selectedActionState={null}
-        waveformLevels={[]}
-        progress={1}
-        reduced
-      />,
-    );
-
-    expect(document.querySelector(".voice-pill-caption")).toHaveTextContent(
-      "已复制到剪贴板，请手动粘贴",
-    );
-    expect(document.querySelector(".voice-pill-stack")).not.toHaveClass("voice-pill-stack--exit");
-    expect(document.querySelector(".voice-pill__orb")).not.toBeInTheDocument();
-    expect(document.querySelector(".voice-pill--orb")).not.toBeInTheDocument();
-    expect(document.querySelector(".voice-pill__label")).toHaveTextContent("Copied");
-  });
-
-  it("fades the thinking orb out when paste falls back to the clipboard", () => {
-    vi.useFakeTimers();
-    const { rerender } = render(
-      <VoicePill
-        state="processing"
-        phase="delivery"
-        contextLabel={null}
-        selectedActionState={null}
-        waveformLevels={[]}
-        progress={1}
-        reduced={false}
-      />,
-    );
-
-    expect(document.querySelector(".voice-pill__orb")?.getAttribute("data-orb-state")).toBe("shaping");
-    expect(document.querySelector(".voice-pill__label")).toHaveTextContent("Thinking…");
-
-    rerender(
-      <VoicePill
-        state="copied"
-        contextLabel={null}
-        fallbackReason="paste_failed"
-        selectedActionState={null}
-        waveformLevels={[]}
-        progress={1}
-        reduced={false}
-      />,
-    );
-
-    expect(document.querySelector(".voice-pill--orb")).toBeInTheDocument();
-    expect(document.querySelector(".voice-pill--labeled")).toBeInTheDocument();
-    expect(document.querySelector(".voice-pill__center-state--active")).not.toBeInTheDocument();
-    expect(document.querySelector(".voice-pill__indicator--overlay")).not.toBeInTheDocument();
-    expect(document.querySelector(".voice-pill__orb")).toBeInTheDocument();
-    expect(document.querySelector(".voice-pill-caption")).not.toBeInTheDocument();
-    expect(document.querySelector(".voice-pill__label--out")).toHaveTextContent("Thinking…");
-    expect(document.querySelector(".voice-pill__label--in")).toHaveTextContent("Copied");
-
-    act(() => {
-      vi.advanceTimersByTime(HUD_LABEL_OUT_MS);
-    });
-    expect(document.querySelector(".voice-pill__label--out")).not.toBeInTheDocument();
-    expect(document.querySelector(".voice-pill__label--in")).toHaveTextContent("Copied");
-    expect(document.querySelector(".voice-pill-caption")).toHaveTextContent("已复制，请手动粘贴");
-    expect(document.querySelector(".voice-pill-caption")).toHaveClass("voice-pill-caption--reveal");
-
-    act(() => {
-      vi.advanceTimersByTime(HUD_LABEL_FADE_MS - HUD_LABEL_OUT_MS);
-    });
-    expect(document.querySelector(".voice-pill--labeled")).toBeInTheDocument();
-    expect(document.querySelector(".voice-pill__label")).toHaveTextContent("Copied");
-    expect(document.querySelector(".voice-pill__label--in")).not.toBeInTheDocument();
-
-    act(() => {
-      vi.advanceTimersByTime(Math.max(0, HUD_ORB_FADE_MS - HUD_LABEL_FADE_MS));
-    });
-    expect(document.querySelector(".voice-pill__orb")).not.toBeInTheDocument();
-    expect(document.querySelector(".voice-pill--orb")).not.toBeInTheDocument();
-    expect(document.querySelector(".voice-pill--labeled")).toBeInTheDocument();
-  });
-
-  it("does not flash the copied caption under a thinking pill", () => {
-    vi.useFakeTimers();
-    const { rerender } = render(
-      <VoicePill
-        state="processing"
-        phase="delivery"
-        contextLabel="Cursor · Code"
-        selectedActionState={null}
-        waveformLevels={[]}
-        progress={1}
-        reduced={false}
-      />,
-    );
-
-    expect(document.querySelector(".voice-pill-caption")).toHaveTextContent("Cursor · Code");
-    expect(document.querySelector(".voice-pill-caption")).not.toHaveClass("voice-pill-caption--warning");
-    expect(document.querySelector(".voice-pill__label")).toHaveTextContent("Thinking…");
-
-    rerender(
-      <VoicePill
-        state="unverified"
-        contextLabel="Cursor · Code"
-        fallbackReason="paste_unverified"
-        selectedActionState={null}
-        waveformLevels={[]}
-        progress={1}
-        reduced={false}
-      />,
-    );
-
-    expect(document.querySelector(".voice-pill__label--out")).toHaveTextContent("Thinking…");
-    expect(document.querySelector(".voice-pill--unverified")).not.toBeInTheDocument();
-    expect(document.querySelector(".voice-pill-caption")).toHaveTextContent("Cursor · Code");
-    expect(document.querySelector(".voice-pill-caption")).toHaveClass("voice-pill-caption--exit");
-    expect(document.querySelector(".voice-pill-caption")).not.toHaveClass("voice-pill-caption--warning");
-    expect(document.querySelector(".voice-pill-caption")).not.toHaveTextContent(
-      "先检查输入框；需要时从历史记录复制",
-    );
-
-    act(() => {
-      vi.advanceTimersByTime(HUD_LABEL_OUT_MS);
-    });
-    expect(document.querySelector(".voice-pill-caption")).toHaveTextContent(
-      "先检查输入框；需要时从历史记录复制",
-    );
-    expect(document.querySelector(".voice-pill-caption")).toHaveClass("voice-pill-caption--reveal");
-    expect(document.querySelector(".voice-pill--unverified")).toBeInTheDocument();
-  });
-
-  it("hides the orb on done instead of keeping a thinking orbit", () => {
-    render(
-      <VoicePill
-        state="done"
-        contextLabel={null}
-        selectedActionState={null}
-        waveformLevels={[]}
-        progress={1}
-        reduced={false}
-      />,
-    );
-
-    expect(document.querySelector(".voice-pill__orb")).not.toBeInTheDocument();
-    expect(document.querySelector(".voice-pill__label")).toHaveTextContent("Done");
-  });
-
-  it("keeps the monochrome md beam while listening and switches to a monochrome line beam while thinking", () => {
-    vi.useFakeTimers();
-    const { rerender } = render(
-      <VoicePill
-        state="recording"
-        contextLabel={null}
-        selectedActionState={null}
-        waveformLevels={[]}
-        progress={0}
-        reduced={false}
-      />,
-    );
-    const listenBeam = document.querySelector("[data-beam-size='md']");
-    const thinkBeam = document.querySelector("[data-beam-size='line']");
-    expect(listenBeam).toBeInstanceOf(HTMLElement);
-    expect(thinkBeam).toBeInstanceOf(HTMLElement);
-    expect(listenBeam?.getAttribute("data-beam-color")).toBe("mono");
-    expect(listenBeam?.getAttribute("data-beam-size")).toBe("md");
-    expect(listenBeam?.getAttribute("data-beam-strength")).toBe("1");
-    expect(listenBeam?.getAttribute("data-beam-duration")).toBe("3.2");
-    expect(listenBeam?.getAttribute("data-beam-active")).toBe("true");
-    expect(thinkBeam?.getAttribute("data-beam-active")).toBe("false");
-    expect(listenBeam).toHaveStyle({ position: "absolute", width: "100%", height: "100%" });
-    expect(document.querySelector(".voice-pill__beam-ghost")).toBeInTheDocument();
-    expect((thinkBeam as HTMLElement).style.getPropertyValue("--beam-x-mock")).toBe("");
-
-    rerender(
-      <VoicePill
-        state="processing"
-        phase="asr"
-        contextLabel={null}
-        selectedActionState={null}
-        waveformLevels={[]}
-        progress={0.4}
-        reduced={false}
-      />,
-    );
-    expect(document.querySelectorAll("[data-border-beam]")).toHaveLength(2);
-    expect(listenBeam?.getAttribute("data-beam-active")).toBe("false");
-    expect(thinkBeam?.getAttribute("data-beam-color")).toBe("mono");
-    expect(thinkBeam?.getAttribute("data-beam-size")).toBe("line");
-    expect(thinkBeam?.getAttribute("data-beam-strength")).toBe("0.7");
-    expect(thinkBeam?.getAttribute("data-beam-active")).toBe("true");
-    expect((thinkBeam as HTMLElement).style.getPropertyValue("--beam-x-mock")).toBe("0.0600");
-    expect(document.querySelector(".voice-pill__progress--visible")).not.toBeInTheDocument();
-    expect(document.querySelector(".voice-pill__label--out")).toHaveTextContent("Listening…");
-    expect(document.querySelector(".voice-pill__label--in")).toHaveTextContent("Thinking…");
-
-    act(() => {
-      vi.advanceTimersByTime(500);
-    });
-    const mid = Number((thinkBeam as HTMLElement).style.getPropertyValue("--beam-x-mock"));
-    expect(mid).toBeGreaterThan(0.06);
-    expect(mid).toBeLessThan(0.44);
-
-    rerender(
-      <VoicePill
-        state="copied"
-        contextLabel={null}
-        fallbackReason="paste_failed"
-        selectedActionState={null}
-        waveformLevels={[]}
-        progress={1}
-        reduced={false}
-      />,
-    );
-    expect(document.querySelector(".voice-pill__beam-layer--exit")).toBeInTheDocument();
-    expect(thinkBeam?.getAttribute("data-beam-active")).toBe("true");
-    expect(Number((thinkBeam as HTMLElement).style.getPropertyValue("--beam-x-mock"))).toBeGreaterThanOrEqual(mid);
-
-    act(() => {
-      vi.advanceTimersByTime(500);
-    });
-    expect(thinkBeam?.getAttribute("data-beam-active")).toBe("false");
-
-    rerender(
-      <VoicePill
-        state="rate_limited"
-        retryAfterSecs={8}
-        phase="waiting_retry"
-        contextLabel={null}
-        selectedActionState={null}
-        waveformLevels={[]}
-        progress={0.4}
-        reduced={false}
-      />,
-    );
-    expect(thinkBeam?.getAttribute("data-beam-active")).toBe("true");
-    expect((thinkBeam as HTMLElement).style.getPropertyValue("--beam-x-mock")).not.toBe("");
-  });
+it("announces recovery action failures without relying on visual detail text", () => {
+  renderPill({ state: "error", detailsOpen: true, detailsActionError: "Could not open History. Try again." });
+  expect(screen.getByRole("status")).toHaveTextContent("Could not open History. Try again.");
 });

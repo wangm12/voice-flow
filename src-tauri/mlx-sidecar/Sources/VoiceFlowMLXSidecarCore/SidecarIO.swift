@@ -6,14 +6,35 @@ enum JSONLineReaderError: Error {
     case readFailed
 }
 
-final class JSONLineReader {
+final class JSONLineReader: @unchecked Sendable {
     private let maximumLineBytes: Int
+    private let descriptor: Int32
+    private let ownsDescriptor: Bool
+    private let stateLock = NSLock()
+    private var stopped = false
+    private var descriptorClosed = false
     private var buffer = [UInt8](repeating: 0, count: 8_192)
     private var bufferIndex = 0
     private var bufferCount = 0
 
-    init(maximumLineBytes: Int) {
+    init(maximumLineBytes: Int, descriptor: Int32 = STDIN_FILENO, ownsDescriptor: Bool = false) {
         self.maximumLineBytes = maximumLineBytes
+        self.descriptor = descriptor
+        self.ownsDescriptor = ownsDescriptor
+    }
+
+    func cancel() {
+        stateLock.lock()
+        stopped = true
+        stateLock.unlock()
+    }
+
+    func closeOwnedDescriptor() {
+        stateLock.lock()
+        let shouldClose = ownsDescriptor && !descriptorClosed
+        descriptorClosed = descriptorClosed || shouldClose
+        stateLock.unlock()
+        if shouldClose { _ = Darwin.close(descriptor) }
     }
 
     func nextLine() throws -> Data? {
@@ -21,11 +42,26 @@ final class JSONLineReader {
         line.reserveCapacity(min(maximumLineBytes, 8_192))
 
         while true {
+            stateLock.lock()
+            let isStopped = stopped
+            stateLock.unlock()
+            if isStopped { return nil }
             if bufferIndex == bufferCount {
+                var descriptorState = pollfd(
+                    fd: descriptor,
+                    events: Int16(POLLIN | POLLHUP),
+                    revents: 0
+                )
+                let ready = Darwin.poll(&descriptorState, 1, 100)
+                if ready < 0 {
+                    if errno == EINTR { continue }
+                    throw JSONLineReaderError.readFailed
+                }
+                if ready == 0 { continue }
                 let count = buffer.withUnsafeMutableBytes { rawBuffer -> Int in
                     guard let base = rawBuffer.baseAddress else { return -1 }
                     while true {
-                        let result = Darwin.read(STDIN_FILENO, base, rawBuffer.count)
+                        let result = Darwin.read(descriptor, base, rawBuffer.count)
                         if result < 0 && errno == EINTR { continue }
                         return result
                     }
@@ -52,9 +88,19 @@ final class JSONLineReader {
     }
 }
 
+enum SidecarIOError: Error, Equatable {
+    case responseTooLarge
+}
+
 public enum SidecarIO {
+    static let maximumASRResponseLineBytes = 1_048_576
+    static let maximumASRResponsePayloadBytes = maximumASRResponseLineBytes - 1
+    static let maximumCleanupResponseLineBytes = 65_536
+    static let maximumCleanupResponsePayloadBytes = maximumCleanupResponseLineBytes - 1
+
     private static let protocolDescriptor = dup(STDOUT_FILENO)
     private static let diagnosticDescriptor = dup(STDERR_FILENO)
+    private static let writerLock = NSLock()
 
     public static func silenceThirdPartyOutput() -> Bool {
         guard protocolDescriptor >= 0, diagnosticDescriptor >= 0 else { return false }
@@ -65,16 +111,44 @@ public enum SidecarIO {
             && dup2(nullDescriptor, STDERR_FILENO) == STDERR_FILENO
     }
 
+    static func encodedResponsePayload(
+        _ response: SidecarResponse,
+        maximumBytes: Int
+    ) throws -> Data {
+        let encoded = try SidecarProtocolCodec.encodeResponse(response)
+        guard encoded.count <= maximumBytes else {
+            throw SidecarIOError.responseTooLarge
+        }
+        return encoded
+    }
+
+    static func encodedResponseFrame(
+        _ response: SidecarResponse,
+        maximumLineBytes: Int
+    ) throws -> Data {
+        guard maximumLineBytes > 0 else { throw SidecarIOError.responseTooLarge }
+        var frame = try encodedResponsePayload(response, maximumBytes: maximumLineBytes - 1)
+        frame.append(0x0A)
+        return frame
+    }
+
     public static func writeResponse(_ response: SidecarResponse, maximumBytes: Int) {
+        writeResponse(response, maximumBytes: maximumBytes, to: protocolDescriptor)
+    }
+
+    static func writeResponse(
+        _ response: SidecarResponse,
+        maximumBytes: Int,
+        to descriptor: Int32
+    ) {
         do {
-            let encoded = try SidecarProtocolCodec.encodeResponse(response)
-            guard encoded.count <= maximumBytes else {
-                writeDiagnostic(code: "response_too_large")
-                return
-            }
-            var line = encoded
+            var line = try encodedResponsePayload(response, maximumBytes: maximumBytes)
             line.append(0x0A)
-            writeAll(line, to: protocolDescriptor, failureCode: "protocol_write_failed")
+            writerLock.lock()
+            defer { writerLock.unlock() }
+            writeAll(line, to: descriptor, failureCode: "protocol_write_failed")
+        } catch SidecarIOError.responseTooLarge {
+            writeDiagnostic(code: "response_too_large")
         } catch {
             writeDiagnostic(code: "response_encoding_failed")
         }
@@ -88,6 +162,8 @@ public enum SidecarIO {
             return "_"
         })
         let message = Data("voiceflow-mlx-sidecar: \(safeCode)\n".utf8)
+        writerLock.lock()
+        defer { writerLock.unlock() }
         writeAll(message, to: diagnosticDescriptor, failureCode: nil)
     }
 

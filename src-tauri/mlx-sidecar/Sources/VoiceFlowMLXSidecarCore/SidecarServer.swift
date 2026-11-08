@@ -1,6 +1,9 @@
 import Darwin
 import Foundation
 import MLX
+import MLXNN
+import CryptoKit
+import MachO
 import MLXAudioCore
 import MLXAudioSTT
 
@@ -79,6 +82,26 @@ private enum RequestFailure: Error {
     }
 }
 
+private enum AttestationFailure: Error {
+    case parameters
+    case executableIdentity
+    case parameterLayout
+    case metalResources
+    case loadedImages(String)
+    case executableHash
+
+    var diagnosticCode: String {
+        switch self {
+        case .parameters: return "model_attestation_parameters_failed"
+        case .executableIdentity: return "model_attestation_identity_failed"
+        case .parameterLayout: return "model_attestation_layout_failed"
+        case .metalResources: return "model_attestation_metal_failed"
+        case .loadedImages(let diagnosticCode): return diagnosticCode
+        case .executableHash: return "model_attestation_executable_hash_failed"
+        }
+    }
+}
+
 private struct GeneratedChunk {
     let text: String
     let language: String?
@@ -86,9 +109,106 @@ private struct GeneratedChunk {
     let mayHaveReachedGenerationLimit: Bool
 }
 
-public final class SidecarServer {
-    private static let maximumInputBytes = 1_048_576
-    private static let maximumResponseBytes = 65_535
+private enum ASRCancellationEffectError: Error {
+    case cancelled
+}
+
+private protocol ASRCancellableEffect: Sendable {
+    func check() throws
+}
+
+final class ASRRequestCancellation: ASRCancellableEffect, @unchecked Sendable {
+    private let lock = NSLock()
+    private let original: SidecarRequest
+    private var acceptedRequest: SidecarRequest?
+    private var cancellationRequested = false
+
+    init(original: SidecarRequest) {
+        self.original = original
+    }
+
+    var acceptedCancelRequest: SidecarRequest? {
+        lock.lock()
+        defer { lock.unlock() }
+        return acceptedRequest
+    }
+
+    var isCancellationRequested: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return cancellationRequested
+    }
+
+    func accept(_ request: SidecarRequest) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard acceptedRequest == nil,
+              original.op == "transcribe",
+              original.protocolVersion == sidecarProtocolVersion,
+              original.sessionId.map(validSidecarIdentifier) == true,
+              original.modelId != nil,
+              original.modelVersion != nil,
+              request.op == "cancel",
+              request.protocolVersion == original.protocolVersion,
+              request.requestId != original.requestId,
+              validSidecarIdentifier(request.requestId),
+              request.sessionId == original.sessionId,
+              request.modelId == original.modelId,
+              request.modelVersion == original.modelVersion,
+              request.modelDirectory == nil,
+              request.audioPath == nil,
+              request.language == nil,
+              request.audioMaxBytes == nil,
+              request.maxTokensPerChunk == nil,
+              request.maxTokensTotal == nil,
+              request.messages == nil,
+              request.maxOutputTokens == nil,
+              request.stablePrefixUserBytes == nil else {
+            return false
+        }
+        acceptedRequest = request
+        cancellationRequested = true
+        return true
+    }
+
+    func cancelForShutdown() {
+        lock.lock()
+        cancellationRequested = true
+        lock.unlock()
+    }
+
+    func check() throws {
+        if isCancellationRequested { throw ASRCancellationEffectError.cancelled }
+    }
+}
+
+func validSidecarIdentifier(_ value: String) -> Bool {
+    !value.isEmpty && value.utf8.count <= 128 && value.utf8.allSatisfy {
+        ($0 >= 48 && $0 <= 57) || ($0 >= 65 && $0 <= 90) || ($0 >= 97 && $0 <= 122)
+            || $0 == 45 || $0 == 46 || $0 == 58 || $0 == 95
+    }
+}
+
+func runASRSynchronousWorker<Result: Sendable>(
+    cancellation: ASRRequestCancellation,
+    synchronize: @Sendable () -> Void,
+    operation: () throws -> Result
+) throws -> Result {
+    defer { synchronize() }
+    try cancellation.check()
+    let result = try operation()
+    try cancellation.check()
+    return result
+}
+
+actor ASRModelRuntime: ASRRuntimeHandling {
+    nonisolated let executor = DispatchSerialQueue(label: "com.voiceflow.asr.model-owner")
+    nonisolated var unownedExecutor: UnownedSerialExecutor {
+        executor.asUnownedSerialExecutor()
+    }
+
+    static let maximumInputBytes = 1_048_576
+    static let maximumResponseBytes = SidecarIO.maximumASRResponsePayloadBytes
     private static let maximumTranscriptionBytes = 48 * 1_024
     private static let chunkDurationSeconds: Float = 30
     private static let maximumTokensPerChunk = 4_096
@@ -97,49 +217,37 @@ public final class SidecarServer {
     private let modelsRoot: URL
     private let audioRoot: URL
     private var loadedModel: LoadedModel?
-    private var shouldQuit = false
+    private var loadedAttestation: LoadedAttestation?
 
-    public init(modelsRootPath: String, audioRootPath: String) {
+    init(modelsRootPath: String, audioRootPath: String) {
         self.modelsRoot = URL(fileURLWithPath: modelsRootPath, isDirectory: true)
             .standardizedFileURL.resolvingSymlinksInPath()
         self.audioRoot = URL(fileURLWithPath: audioRootPath, isDirectory: true)
             .standardizedFileURL.resolvingSymlinksInPath()
     }
 
-    public func run() async {
-        let input = JSONLineReader(maximumLineBytes: Self.maximumInputBytes)
-        while !shouldQuit {
-            do {
-                guard let line = try input.nextLine() else { break }
-                let request: SidecarRequest
-                do {
-                    request = try SidecarProtocolCodec.decodeRequest(line)
-                } catch {
-                    SidecarIO.writeResponse(
-                        Self.malformedRequestResponse(),
-                        maximumBytes: Self.maximumResponseBytes
-                    )
-                    continue
-                }
-
-                let response = await handle(request)
-                SidecarIO.writeResponse(response, maximumBytes: Self.maximumResponseBytes)
-            } catch JSONLineReaderError.lineTooLarge {
-                SidecarIO.writeResponse(
-                    Self.malformedRequestResponse(),
-                    maximumBytes: Self.maximumResponseBytes
-                )
-                break
-            } catch {
-                SidecarIO.writeDiagnostic(code: "protocol_io_failed")
-                break
-            }
-        }
+    func releaseForShutdown() async {
+        releaseModel()
     }
 
-    private func handle(_ request: SidecarRequest) async -> SidecarResponse {
-        guard validIdentifier(request.requestId),
-              request.sessionId.map(validIdentifier) ?? true else {
+    func runSynchronousWorker<Result: Sendable>(
+        cancellation: ASRRequestCancellation,
+        synchronize: @Sendable () -> Void = {
+            Stream.defaultStream(.gpu).synchronize()
+            Stream.defaultStream(.cpu).synchronize()
+        },
+        operation: () throws -> Result
+    ) throws -> Result {
+        try runASRSynchronousWorker(
+            cancellation: cancellation,
+            synchronize: synchronize,
+            operation: operation
+        )
+    }
+
+    func handleControl(_ request: SidecarRequest) async -> SidecarResponse {
+        guard validSidecarIdentifier(request.requestId),
+              request.sessionId.map(validSidecarIdentifier) ?? true else {
             return response(request, status: "error", failure: .invalidRequest)
         }
         guard request.protocolVersion == sidecarProtocolVersion else {
@@ -158,14 +266,11 @@ public final class SidecarServer {
             releaseModel()
             return response(request, status: "unloaded")
         case "transcribe":
-            return transcribe(request)
+            return response(request, status: "error", failure: .invalidRequest)
         case "cancel":
-            // Active MLX generation is synchronous. The caller terminates and
-            // restarts this child to cancel an in-flight request.
-            return response(request, status: "cancelled")
+            return response(request, status: "error", failure: .invalidRequest)
         case "quit":
             releaseModel()
-            shouldQuit = true
             return response(request, status: "completed")
         default:
             return response(request, status: "error", failure: .invalidRequest)
@@ -196,6 +301,15 @@ public final class SidecarServer {
                 let loaded = try CohereTranscribeModel.fromDirectory(modelDirectory)
                 loadedModel = .cohere(model, loaded)
             }
+            do {
+                loadedAttestation = try attestLoadedModel()
+            } catch let failure as AttestationFailure {
+                loadedAttestation = nil
+                SidecarIO.writeDiagnostic(code: failure.diagnosticCode)
+            } catch {
+                loadedAttestation = nil
+                SidecarIO.writeDiagnostic(code: "model_attestation_unclassified_failed")
+            }
             return response(request, status: "loaded")
         } catch {
             releaseModel()
@@ -204,7 +318,56 @@ public final class SidecarServer {
         }
     }
 
-    private func transcribe(_ request: SidecarRequest) -> SidecarResponse {
+    func transcribe(
+        _ request: SidecarRequest,
+        cancellation: ASRRequestCancellation
+    ) async -> SidecarResponse {
+        let transcriptionActivity = ProcessInfo.processInfo.beginActivity(
+            options: [.userInitiated],
+            reason: "Foreground local dictation transcription"
+        )
+        defer { ProcessInfo.processInfo.endActivity(transcriptionActivity) }
+        do {
+            return try runSynchronousWorker(cancellation: cancellation) {
+                let device = Device.defaultDevice()
+                return try Device.withDefaultDevice(device) {
+                    try transcribeValidated(request, cancellation: cancellation)
+                }
+            }
+        } catch ASRCancellationEffectError.cancelled {
+            Memory.clearCache()
+            return response(request, status: "cancelled")
+        } catch let failure as RequestFailure {
+            if cancellation.isCancellationRequested {
+                Memory.clearCache()
+                return response(request, status: "cancelled")
+            }
+            SidecarIO.writeDiagnostic(code: failure.response.code)
+            return response(request, status: "error", failure: failure)
+        } catch {
+            if cancellation.isCancellationRequested {
+                Memory.clearCache()
+                return response(request, status: "cancelled")
+            }
+            SidecarIO.writeDiagnostic(code: "generation_failed")
+            return response(request, status: "error", failure: .generationFailed)
+        }
+    }
+
+    private func transcribeValidated(
+        _ request: SidecarRequest,
+        cancellation: ASRRequestCancellation
+    ) throws -> SidecarResponse {
+        guard validSidecarIdentifier(request.requestId),
+              request.sessionId.map(validSidecarIdentifier) ?? true else {
+            return response(request, status: "error", failure: .invalidRequest)
+        }
+        guard request.protocolVersion == sidecarProtocolVersion else {
+            return response(request, status: "error", failure: .invalidRequest)
+        }
+        guard Self.platformSupported else {
+            return response(request, status: "unavailable", failure: .unsupportedPlatform)
+        }
         guard let model = loadedModel,
               request.modelId == model.id.rawValue,
               request.modelVersion == model.id.revision else {
@@ -233,6 +396,7 @@ public final class SidecarServer {
 
         let wav: ValidatedWAV
         do {
+            try cancellation.check()
             wav = try PrivateAudioFileReader.readValidatedWAV(
                 at: rawAudioPath,
                 audioRoot: audioRoot,
@@ -245,35 +409,33 @@ public final class SidecarServer {
         } catch {
             return response(request, status: "error", failure: .audioInvalid)
         }
+        try cancellation.check()
 
-        do {
-            let result = try generate(
-                wav,
-                language: language,
-                maxTokensPerChunk: requestedPerChunk,
-                maxTokensTotal: requestedTotal,
-                with: model
-            )
-            let completed = SidecarResponse(
-                request: request,
-                status: "completed",
-                platformSupported: Self.platformSupported,
-                loadedModelId: model.id.rawValue,
-                loadedModelVersion: model.id.revision,
-                result: result
-            )
-            guard let encoded = try? SidecarProtocolCodec.encodeResponse(completed),
-                  encoded.count <= Self.maximumResponseBytes else {
-                return response(request, status: "error", failure: .responseTooLarge)
-            }
-            return completed
-        } catch let failure as RequestFailure {
-            SidecarIO.writeDiagnostic(code: failure.response.code)
-            return response(request, status: "error", failure: failure)
-        } catch {
-            SidecarIO.writeDiagnostic(code: "generation_failed")
-            return response(request, status: "error", failure: .generationFailed)
+        let result = try generate(
+            wav,
+            language: language,
+            maxTokensPerChunk: requestedPerChunk,
+            maxTokensTotal: requestedTotal,
+            with: model,
+            cancellation: cancellation
+        )
+        try cancellation.check()
+        let completed = SidecarResponse(
+            request: request,
+            status: "completed",
+            platformSupported: Self.platformSupported,
+            loadedModelId: model.id.rawValue,
+            loadedModelVersion: model.id.revision,
+            loadedAttestation: loadedAttestation,
+            result: result
+        )
+        guard (try? SidecarIO.encodedResponsePayload(
+            completed,
+            maximumBytes: Self.maximumResponseBytes
+        )) != nil else {
+            return response(request, status: "error", failure: .responseTooLarge)
         }
+        return completed
     }
 
     private func generate(
@@ -281,14 +443,16 @@ public final class SidecarServer {
         language: String?,
         maxTokensPerChunk: Int,
         maxTokensTotal: Int,
-        with loaded: LoadedModel
+        with loaded: LoadedModel,
+        cancellation: ASRCancellableEffect
     ) throws -> TranscriptionResult {
         let audio = MLXArray(wav.samples)
-        let chunks = splitAudioIntoChunks(
+        let chunks = try splitAudioIntoChunks(
             audio,
             sampleRate: PrivateAudioFileReader.sampleRate,
             chunkDuration: Self.chunkDurationSeconds,
-            minChunkDuration: 1.0
+            minChunkDuration: 1.0,
+            checkCancellation: { try cancellation.check() }
         )
         guard !chunks.isEmpty else { throw RequestFailure.generationFailed }
 
@@ -304,6 +468,7 @@ public final class SidecarServer {
         // only a short final slice padded to its minimum input length. Count
         // original samples cumulatively and clip that padding off here.
         for (chunkAudio, _) in chunks {
+            try cancellation.check()
             guard generationTokens < maxTokensTotal else {
                 budgetExhausted = true
                 break
@@ -320,7 +485,8 @@ public final class SidecarServer {
             let output: GeneratedChunk
             switch loaded {
             case .qwen(_, let model):
-                let result = model.generate(
+                try cancellation.check()
+                let result = try model.generateCancellable(
                     audio: chunkAudio,
                     maxTokens: tokenLimit,
                     temperature: 0,
@@ -329,8 +495,10 @@ public final class SidecarServer {
                     chunkDuration: 1_200,
                     minChunkDuration: 1,
                     repetitionPenalty: 1.05,
-                    repetitionContextSize: 32
+                    repetitionContextSize: 32,
+                    checkCancellation: { try cancellation.check() }
                 )
+                try cancellation.check()
                 output = GeneratedChunk(
                     text: result.text,
                     language: language == nil ? result.language : nil,
@@ -349,7 +517,13 @@ public final class SidecarServer {
                     chunkDuration: 1_200,
                     minChunkDuration: 1
                 )
-                let result = model.generate(audio: chunkAudio, generationParameters: parameters, vad: nil)
+                try cancellation.check()
+                let result = try model.generate(
+                    audio: chunkAudio,
+                    generationParameters: parameters,
+                    checkCancellation: { try cancellation.check() }
+                )
+                try cancellation.check()
                 let effectiveTokenLimit = min(
                     tokenLimit,
                     max(0, model.config.decoder.maxSequenceLength - result.promptTokens)
@@ -470,11 +644,14 @@ public final class SidecarServer {
         ) else { return false }
 
         var foundPinnedWeights = false
-        let expectedWeights = directory.appendingPathComponent("model.safetensors").path
+        let directoryPath = directory.standardizedFileURL.path
+        let expectedWeights = directory.appendingPathComponent("model.safetensors")
+            .standardizedFileURL.path
         while let entry = enumerator.nextObject() as? URL {
-            guard entry.path.hasPrefix(directory.path + "/") else { return false }
+            let entryPath = entry.standardizedFileURL.path
+            guard entryPath.hasPrefix(directoryPath + "/") else { return false }
             guard entry.pathExtension.lowercased() == "safetensors" else { continue }
-            guard entry.path == expectedWeights else { return false }
+            guard entryPath == expectedWeights else { return false }
             var info = stat()
             guard lstat(entry.path, &info) == 0,
                   (info.st_mode & mode_t(S_IFMT)) == mode_t(S_IFREG),
@@ -504,6 +681,7 @@ public final class SidecarServer {
     }
 
     private func containsNoLinksOutsideModelDirectory(_ directory: URL) -> Bool {
+        let directoryPath = directory.standardizedFileURL.path
         guard let enumerator = FileManager.default.enumerator(
             at: directory,
             includingPropertiesForKeys: nil,
@@ -513,8 +691,9 @@ public final class SidecarServer {
             return false
         }
         while let entry = enumerator.nextObject() as? URL {
+            let entryPath = entry.standardizedFileURL.path
             var info = stat()
-            guard entry.path.hasPrefix(directory.path + "/"),
+            guard entryPath.hasPrefix(directoryPath + "/"),
                   lstat(entry.path, &info) == 0 else {
                 return false
             }
@@ -531,8 +710,130 @@ public final class SidecarServer {
         return lstat(directory.path, &info) == 0 && (info.st_mode & mode_t(S_IFMT)) == mode_t(S_IFDIR)
     }
 
+    private func attestLoadedModel() throws -> LoadedAttestation {
+        guard let loadedModel else { throw AttestationFailure.parameters }
+        let parameters: [(String, MLXArray)]
+        switch loadedModel {
+        case .qwen(_, let model): parameters = model.parameters().flattened()
+        case .cohere(_, let model): parameters = model.parameters().flattened()
+        }
+        guard !parameters.isEmpty, parameters.count <= 100_000 else {
+            throw AttestationFailure.parameters
+        }
+        let executable: URL
+        do {
+            executable = try SidecarExecutableIdentity.currentExecutableURL()
+        } catch {
+            throw AttestationFailure.executableIdentity
+        }
+        var dtypes: [String: Int] = [:]
+        var layout: [[String]] = []
+        for (name, array) in parameters.sorted(by: { $0.0 < $1.0 }) {
+            let dtype = String(describing: array.dtype)
+            dtypes[dtype, default: 0] += 1
+            layout.append([name, dtype, array.shape.map { String($0) }.joined(separator: ",")])
+        }
+        let layoutData: Data
+        do {
+            layoutData = try JSONSerialization.data(withJSONObject: layout, options: [.sortedKeys])
+        } catch {
+            throw AttestationFailure.parameterLayout
+        }
+        let metal: [String: String]
+        do {
+            metal = try SidecarExecutableIdentity.metalDigests(for: executable)
+        } catch {
+            throw AttestationFailure.metalResources
+        }
+        // Dyld's loaded image UUIDs describe the actual mapped dependency set,
+        // including shared-cache libraries for which an on-disk hash is unavailable.
+        let images: [String]
+        do {
+            images = try loadedImageUUIDs()
+        } catch let failure as LoadedImageInventoryError {
+            throw AttestationFailure.loadedImages(failure.diagnosticCode)
+        } catch {
+            throw AttestationFailure.loadedImages("model_attestation_images_enumeration_failed")
+        }
+        let executableHash: String
+        do {
+            executableHash = try SidecarExecutableIdentity.digestRegularFile(at: executable)
+        } catch {
+            throw AttestationFailure.executableHash
+        }
+        return LoadedAttestation(
+            schemaVersion: 1,
+            executableSHA256: executableHash,
+            metalSHA256: metal,
+            loadedImages: images,
+            parameterLayoutSHA256: SHA256.hash(data: layoutData).map { String(format: "%02x", $0) }.joined(),
+            parameterCount: parameters.count, parameterDtypes: dtypes,
+            decoderRecipe: "voiceflow-mlx-decoder-v1:chunks30s/min1s;temperature0;context-empty;qwen-repetition1.05/window32;inner-chunk1200s;cohere-topP1/topK0/vad-nil;ordered-trim-language-join"
+        )
+    }
+
+    private func loadedImageUUIDs() throws -> [String] {
+        let imageCount = Int(_dyld_image_count())
+        try LoadedImageInventory.validateImageCount(imageCount)
+
+        var images: [String] = []
+        images.reserveCapacity(imageCount)
+        var totalUTF8Bytes = 0
+        for index in 0..<imageCount {
+            let dyldIndex = UInt32(index)
+            guard let header = _dyld_get_image_header(dyldIndex) else {
+                throw LoadedImageInventoryError.imageHeaderUnavailable(index: index)
+            }
+            guard let name = _dyld_get_image_name(dyldIndex) else {
+                throw LoadedImageInventoryError.imageNameUnavailable(index: index)
+            }
+            guard header.pointee.magic == MH_MAGIC_64 else {
+                throw LoadedImageInventoryError.invalidImageHeader(index: index)
+            }
+            let nameBytes = strnlen(name, LoadedImageInventory.maximumEntryUTF8Bytes + 1)
+            guard nameBytes <= LoadedImageInventory.maximumEntryUTF8Bytes else {
+                throw LoadedImageInventoryError.imageNameTooLong(index: index, bytes: Int(nameBytes))
+            }
+
+            let wide = UnsafeRawPointer(header).assumingMemoryBound(to: mach_header_64.self).pointee
+            var cursor = UnsafeRawPointer(header).advanced(by: MemoryLayout<mach_header_64>.size)
+            var remaining = Int(wide.sizeofcmds)
+            var uuid: String?
+            for _ in 0..<wide.ncmds {
+                guard remaining >= MemoryLayout<load_command>.size else {
+                    throw LoadedImageInventoryError.malformedLoadCommands(index: index)
+                }
+                let command = cursor.load(as: load_command.self)
+                guard Int(command.cmdsize) >= MemoryLayout<load_command>.size,
+                      Int(command.cmdsize) <= remaining else {
+                    throw LoadedImageInventoryError.malformedLoadCommands(index: index)
+                }
+                if command.cmd == LC_UUID {
+                    guard Int(command.cmdsize) >= MemoryLayout<uuid_command>.size else {
+                        throw LoadedImageInventoryError.malformedLoadCommands(index: index)
+                    }
+                    uuid = UUID(uuid: cursor.load(as: uuid_command.self).uuid).uuidString
+                }
+                cursor = cursor.advanced(by: Int(command.cmdsize))
+                remaining -= Int(command.cmdsize)
+            }
+            guard let uuid else {
+                throw LoadedImageInventoryError.missingUUID(index: index)
+            }
+            let image = String(cString: name) + "|" + uuid
+            try LoadedImageInventory.append(
+                image,
+                index: index,
+                to: &images,
+                totalUTF8Bytes: &totalUTF8Bytes
+            )
+        }
+        return images.sorted()
+    }
+
     private func releaseModel() {
         loadedModel = nil
+        loadedAttestation = nil
         Memory.clearCache()
     }
 
@@ -547,34 +848,12 @@ public final class SidecarServer {
             platformSupported: Self.platformSupported,
             loadedModelId: loadedModel?.id.rawValue,
             loadedModelVersion: loadedModel?.id.revision,
+            loadedAttestation: loadedAttestation,
             error: failure?.response
         )
     }
 
-    private static func malformedRequestResponse() -> SidecarResponse {
-        let request = SidecarRequest(
-            protocolVersion: sidecarProtocolVersion,
-            requestId: "invalid",
-            sessionId: nil,
-            modelVersion: nil,
-            op: "invalid"
-        )
-        return SidecarResponse(
-            request: request,
-            status: "error",
-            platformSupported: platformSupported,
-            error: RequestFailure.invalidRequest.response
-        )
-    }
-
-    private func validIdentifier(_ value: String) -> Bool {
-        !value.isEmpty && value.utf8.count <= 128 && value.utf8.allSatisfy {
-            ($0 >= 48 && $0 <= 57) || ($0 >= 65 && $0 <= 90) || ($0 >= 97 && $0 <= 122)
-                || $0 == 45 || $0 == 46 || $0 == 58 || $0 == 95
-        }
-    }
-
-    private static var platformSupported: Bool {
+    static var platformSupported: Bool {
         #if arch(arm64)
         let version = ProcessInfo.processInfo.operatingSystemVersion
         return version.majorVersion >= 14

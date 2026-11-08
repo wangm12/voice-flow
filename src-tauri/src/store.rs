@@ -7,25 +7,1515 @@ use chacha20poly1305::{
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
-use std::io::Write;
+use std::io::{Read, Write};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-pub const SETTINGS_SCHEMA_VERSION: u32 = 25;
-const HISTORY_SCHEMA_VERSION: i32 = 13;
+pub const SETTINGS_SCHEMA_VERSION: u32 = 26;
+const HISTORY_SCHEMA_VERSION: i32 = 19;
 // Migration rollback copies contain historical text, so they have a finite
 // lifetime even when the user elects to keep the live history forever.
 const HISTORY_MIGRATION_BACKUP_MAX_DAYS: u64 = 7;
 const LEARN_PAIRS_PENDING_CAP: i64 = 256;
+const PENDING_HISTORY_JOB_CAP: usize = 16;
+const PENDING_HISTORY_BYTE_CAP: usize = 40 * 1024 * 1024;
+const PENDING_HISTORY_JOB_MAX_BYTES: usize = 4 * 1024 * 1024;
+const DICTIONARY_SOURCES_VERSION: u8 = 1;
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "id", rename_all = "snake_case")]
+pub(crate) enum DictionarySource {
+    Manual,
+    LegacyUnknown,
+    Rule(String),
+    Screen(String),
+    Other(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub(crate) struct DictionarySources {
+    version: u8,
+    owners: std::collections::BTreeMap<String, std::collections::BTreeSet<DictionarySource>>,
+}
+
+impl Default for DictionarySources {
+    fn default() -> Self {
+        Self {
+            version: DICTIONARY_SOURCES_VERSION,
+            owners: std::collections::BTreeMap::new(),
+        }
+    }
+}
+
+fn legacy_dictionary_sources() -> DictionarySources {
+    DictionarySources {
+        version: 0,
+        owners: std::collections::BTreeMap::new(),
+    }
+}
+
+pub(crate) fn dictionary_words_equal(left: &str, right: &str) -> bool {
+    left.eq_ignore_ascii_case(right)
+}
+
+pub(crate) fn dictionary_contains_word(dictionary: &[String], word: &str) -> bool {
+    dictionary
+        .iter()
+        .any(|candidate| dictionary_words_equal(candidate, word))
+}
+
+fn truncate_dictionary_word(word: &str) -> String {
+    let mut end = word.len().min(256);
+    while !word.is_char_boundary(end) {
+        end -= 1;
+    }
+    word[..end].to_owned()
+}
+
+fn normalized_dictionary_sources(dictionary: &mut Vec<String>, sources: &mut DictionarySources) {
+    let migrate_legacy = sources.version < DICTIONARY_SOURCES_VERSION;
+    let old_dictionary = std::mem::take(dictionary);
+    let old_owners = std::mem::take(&mut sources.owners);
+    let mut canonical_words = Vec::with_capacity(256);
+    for word in old_dictionary
+        .iter()
+        .map(|word| truncate_dictionary_word(word))
+        .chain(old_owners.keys().map(|word| truncate_dictionary_word(word)))
+    {
+        if canonical_words.len() == 256 {
+            break;
+        }
+        if !canonical_words
+            .iter()
+            .any(|known: &String| dictionary_words_equal(known, &word))
+        {
+            canonical_words.push(word);
+        }
+    }
+
+    let mut owners =
+        std::collections::BTreeMap::<String, std::collections::BTreeSet<DictionarySource>>::new();
+    for (word, word_sources) in old_owners {
+        let truncated = truncate_dictionary_word(&word);
+        let Some(canonical) = canonical_words
+            .iter()
+            .find(|known| dictionary_words_equal(known, &truncated))
+        else {
+            continue;
+        };
+        owners
+            .entry(canonical.clone())
+            .or_default()
+            .extend(word_sources);
+    }
+    for word in old_dictionary {
+        let truncated = truncate_dictionary_word(&word);
+        let Some(canonical) = canonical_words
+            .iter()
+            .find(|known| dictionary_words_equal(known, &truncated))
+        else {
+            continue;
+        };
+        let has_owner = owners
+            .get(canonical)
+            .is_some_and(|word_sources| !word_sources.is_empty());
+        if migrate_legacy || !has_owner {
+            owners
+                .entry(canonical.clone())
+                .or_default()
+                .insert(DictionarySource::LegacyUnknown);
+        }
+    }
+    owners.retain(|_, word_sources| !word_sources.is_empty());
+    for word in &canonical_words {
+        if owners.contains_key(word) {
+            dictionary.push(word.clone());
+        }
+    }
+    sources.owners = owners;
+    sources.version = DICTIONARY_SOURCES_VERSION;
+}
+
+fn dictionary_sources_need_normalization(settings: &Settings) -> bool {
+    let mut dictionary = settings.dictionary.clone();
+    let mut sources = settings.dictionary_sources.clone();
+    normalized_dictionary_sources(&mut dictionary, &mut sources);
+    dictionary != settings.dictionary || sources != settings.dictionary_sources
+}
+
+#[derive(Default)]
+struct ActiveAudioSpoolSessions {
+    sessions: std::collections::HashMap<PathBuf, SpoolReservation>,
+    root_mutations: std::collections::HashMap<
+        PathBuf,
+        std::collections::HashMap<u64, std::sync::Arc<AtomicBool>>,
+    >,
+    clearing_roots: std::collections::HashSet<PathBuf>,
+    next_generation: u64,
+}
+
+struct SpoolReservation {
+    generation: u64,
+    delete_when_released: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SpoolLeaseKind {
+    Session,
+    Artifact,
+}
+
+static ACTIVE_AUDIO_SPOOL_SESSIONS: OnceLock<Mutex<ActiveAudioSpoolSessions>> = OnceLock::new();
+
+#[cfg(test)]
+pub(crate) fn hold_root_admission_lock_for_test() -> (
+    std::sync::mpsc::Receiver<()>,
+    std::sync::mpsc::Sender<()>,
+    std::thread::JoinHandle<()>,
+) {
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let join = std::thread::spawn(move || {
+        let _guard = ACTIVE_AUDIO_SPOOL_SESSIONS
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        entered_tx.send(()).unwrap();
+        release_rx.recv().unwrap();
+    });
+    (entered_rx, release_tx, join)
+}
+static PENDING_HISTORY_BUDGET_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static PENDING_HISTORY_ACTIVE: OnceLock<Mutex<std::collections::HashSet<(PathBuf, String)>>> =
+    OnceLock::new();
+
+#[cfg(test)]
+struct HistoryPromotionTestGate {
+    data_root: PathBuf,
+    entered: std::sync::mpsc::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+struct HistoryDeleteSpoolWaitTestGate {
+    session_dir: PathBuf,
+    entered: std::sync::mpsc::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+static HISTORY_PROMOTION_TEST_GATE: OnceLock<Mutex<Option<HistoryPromotionTestGate>>> =
+    OnceLock::new();
+
+#[cfg(test)]
+static HISTORY_DELETE_SPOOL_WAIT_TEST_GATE: OnceLock<
+    Mutex<Option<HistoryDeleteSpoolWaitTestGate>>,
+> = OnceLock::new();
+
+#[cfg(test)]
+struct PendingHistoryWriteTestGate {
+    data_root: PathBuf,
+    entered: std::sync::mpsc::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+struct SpoolQuotaWriteTestGate {
+    session_dir: PathBuf,
+    entered: std::sync::mpsc::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+struct SpoolSizeWalkTestGate {
+    path: PathBuf,
+    entered: std::sync::mpsc::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+enum SpoolQuotaScanFault {
+    Error,
+    Panic,
+}
+
+#[cfg(test)]
+struct SpoolQuotaScanFaultInjection {
+    path: PathBuf,
+    fault: SpoolQuotaScanFault,
+}
+
+#[cfg(test)]
+struct AtomicRenameTestGate {
+    temp_path: PathBuf,
+    entered: std::sync::mpsc::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+static PENDING_HISTORY_WRITE_TEST_GATE: OnceLock<Mutex<Option<PendingHistoryWriteTestGate>>> =
+    OnceLock::new();
+
+#[cfg(test)]
+static SPOOL_QUOTA_WRITE_TEST_GATE: OnceLock<Mutex<Option<SpoolQuotaWriteTestGate>>> =
+    OnceLock::new();
+
+#[cfg(test)]
+static SPOOL_SIZE_WALK_TEST_GATE: OnceLock<Mutex<Option<SpoolSizeWalkTestGate>>> = OnceLock::new();
+
+#[cfg(test)]
+static SPOOL_QUOTA_SCAN_FAULT: OnceLock<Mutex<Option<SpoolQuotaScanFaultInjection>>> =
+    OnceLock::new();
+
+#[cfg(test)]
+static ATOMIC_RENAME_TEST_GATE: OnceLock<Mutex<Option<AtomicRenameTestGate>>> = OnceLock::new();
+
+#[cfg(test)]
+pub(crate) fn pause_next_history_promotion_for_test(
+    data_root: &Path,
+    entered: std::sync::mpsc::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+) {
+    *HISTORY_PROMOTION_TEST_GATE
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(HistoryPromotionTestGate {
+        data_root: normalized_data_root(data_root),
+        entered,
+        release,
+    });
+}
+
+#[cfg(test)]
+fn wait_for_history_promotion_test_gate(data_root: &Path) {
+    let gate = {
+        let mut slot = HISTORY_PROMOTION_TEST_GATE
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if slot
+            .as_ref()
+            .is_some_and(|gate| gate.data_root == normalized_data_root(data_root))
+        {
+            slot.take()
+        } else {
+            None
+        }
+    };
+    if let Some(gate) = gate {
+        let _ = gate.entered.send(());
+        let _ = gate.release.recv_timeout(Duration::from_secs(15));
+    }
+}
+
+#[cfg(test)]
+fn pause_history_delete_spool_wait_for_test(
+    session_dir: &Path,
+    entered: std::sync::mpsc::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+) {
+    *HISTORY_DELETE_SPOOL_WAIT_TEST_GATE
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(HistoryDeleteSpoolWaitTestGate {
+        session_dir: normalized_data_root(session_dir),
+        entered,
+        release,
+    });
+}
+
+#[cfg(test)]
+fn wait_for_history_delete_spool_test_gate(session_dir: &Path) {
+    let gate = {
+        let mut slot = HISTORY_DELETE_SPOOL_WAIT_TEST_GATE
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if slot
+            .as_ref()
+            .is_some_and(|gate| gate.session_dir == normalized_data_root(session_dir))
+        {
+            slot.take()
+        } else {
+            None
+        }
+    };
+    if let Some(gate) = gate {
+        let _ = gate.entered.send(());
+        let _ = gate.release.recv_timeout(Duration::from_secs(15));
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn pause_next_pending_history_write_for_test(
+    data_root: &Path,
+    entered: std::sync::mpsc::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+) {
+    *PENDING_HISTORY_WRITE_TEST_GATE
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(PendingHistoryWriteTestGate {
+        data_root: normalized_data_root(data_root),
+        entered,
+        release,
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn pause_next_spool_write_after_quota_reservation_for_test(
+    session_dir: &Path,
+    entered: std::sync::mpsc::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+) {
+    *SPOOL_QUOTA_WRITE_TEST_GATE
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(SpoolQuotaWriteTestGate {
+        session_dir: normalized_data_root(session_dir),
+        entered,
+        release,
+    });
+}
+
+#[cfg(test)]
+fn pause_next_spool_size_walk_for_test(
+    path: &Path,
+    entered: std::sync::mpsc::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+) {
+    *SPOOL_SIZE_WALK_TEST_GATE
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(SpoolSizeWalkTestGate {
+        path: normalized_data_root(path),
+        entered,
+        release,
+    });
+}
+
+#[cfg(test)]
+fn inject_spool_quota_scan_fault_for_test(path: &Path, fault: SpoolQuotaScanFault) {
+    *SPOOL_QUOTA_SCAN_FAULT
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(SpoolQuotaScanFaultInjection {
+        path: normalized_data_root(path),
+        fault,
+    });
+}
+
+#[cfg(test)]
+fn pause_next_atomic_rename_for_test(
+    temp_path: &Path,
+    entered: std::sync::mpsc::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+) {
+    *ATOMIC_RENAME_TEST_GATE
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(AtomicRenameTestGate {
+        temp_path: normalized_data_root(temp_path),
+        entered,
+        release,
+    });
+}
+
+#[cfg(test)]
+fn wait_for_spool_write_after_quota_reservation_for_test(session_dir: &Path) {
+    let gate = {
+        let mut slot = SPOOL_QUOTA_WRITE_TEST_GATE
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if slot
+            .as_ref()
+            .is_some_and(|gate| gate.session_dir == normalized_data_root(session_dir))
+        {
+            slot.take()
+        } else {
+            None
+        }
+    };
+    if let Some(gate) = gate {
+        let _ = gate.entered.send(());
+        let _ = gate.release.recv_timeout(Duration::from_secs(15));
+    }
+}
+
+#[cfg(test)]
+fn wait_for_spool_size_walk_test_gate(path: &Path) {
+    let gate = {
+        let mut slot = SPOOL_SIZE_WALK_TEST_GATE
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if slot
+            .as_ref()
+            .is_some_and(|gate| gate.path == normalized_data_root(path))
+        {
+            slot.take()
+        } else {
+            None
+        }
+    };
+    if let Some(gate) = gate {
+        let _ = gate.entered.send(());
+        let _ = gate.release.recv_timeout(Duration::from_secs(15));
+    }
+}
+
+#[cfg(test)]
+fn take_spool_quota_scan_fault_for_test(path: &Path) -> Option<SpoolQuotaScanFault> {
+    let mut slot = SPOOL_QUOTA_SCAN_FAULT
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if slot
+        .as_ref()
+        .is_some_and(|fault| fault.path == normalized_data_root(path))
+    {
+        slot.take().map(|fault| fault.fault)
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+fn wait_for_atomic_rename_test_gate(temp_path: &Path) {
+    let gate = {
+        let mut slot = ATOMIC_RENAME_TEST_GATE
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if slot
+            .as_ref()
+            .is_some_and(|gate| gate.temp_path == normalized_data_root(temp_path))
+        {
+            slot.take()
+        } else {
+            None
+        }
+    };
+    if let Some(gate) = gate {
+        let _ = gate.entered.send(());
+        let _ = gate.release.recv_timeout(Duration::from_secs(15));
+    }
+}
+
+#[cfg(test)]
+fn wait_for_pending_history_write_test_gate(data_root: &Path) {
+    let gate = {
+        let mut slot = PENDING_HISTORY_WRITE_TEST_GATE
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if slot
+            .as_ref()
+            .is_some_and(|gate| gate.data_root == normalized_data_root(data_root))
+        {
+            slot.take()
+        } else {
+            None
+        }
+    };
+    if let Some(gate) = gate {
+        let _ = gate.entered.send(());
+        let _ = gate.release.recv_timeout(Duration::from_secs(15));
+    }
+}
+
+#[derive(Default)]
+struct SpoolIoCommitState {
+    generation: u64,
+    roots: std::collections::HashMap<PathBuf, u64>,
+    scopes: std::collections::HashMap<(PathBuf, SpoolIoScope), u64>,
+}
+
+static SPOOL_IO_COMMIT_STATE: OnceLock<Mutex<SpoolIoCommitState>> = OnceLock::new();
+// `active_scans` fences same-root admissions while recursive filesystem
+// counts run without holding this mutex. The start-of-scan reservation total
+// remains charged through admission, even if a completed write releases its
+// in-flight reservation during the walk.
+#[derive(Default)]
+struct SpoolQuotaLedger {
+    reservations: std::collections::HashMap<PathBuf, u64>,
+    active_scans: std::collections::HashSet<PathBuf>,
+}
+
+static SPOOL_QUOTA_RESERVATIONS: OnceLock<(Mutex<SpoolQuotaLedger>, std::sync::Condvar)> =
+    OnceLock::new();
+
+fn spool_quota_ledger() -> &'static (Mutex<SpoolQuotaLedger>, std::sync::Condvar) {
+    SPOOL_QUOTA_RESERVATIONS.get_or_init(|| {
+        (
+            Mutex::new(SpoolQuotaLedger::default()),
+            std::sync::Condvar::new(),
+        )
+    })
+}
+
+#[cfg(test)]
+struct AtomicParentSyncFailureTest {
+    parent: PathBuf,
+}
+
+#[cfg(test)]
+static ATOMIC_PARENT_SYNC_FAILURE_TEST: OnceLock<Mutex<Option<AtomicParentSyncFailureTest>>> =
+    OnceLock::new();
+
+pub(crate) struct SpoolIoCommitPermit {
+    region: SpoolIoCommitRegion,
+    generation: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum SpoolIoScope {
+    RecoverySpool,
+    GoldAudio,
+    HistoryDatabase,
+    PendingHistoryIntent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum SpoolIoCommitRegion {
+    Root(PathBuf),
+    Scope(PathBuf, SpoolIoScope),
+}
+
+impl Drop for SpoolIoCommitPermit {
+    fn drop(&mut self) {
+        let mut state = SPOOL_IO_COMMIT_STATE
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match &self.region {
+            SpoolIoCommitRegion::Root(data_root) => {
+                if state.roots.get(data_root) == Some(&self.generation) {
+                    state.roots.remove(data_root);
+                }
+            }
+            SpoolIoCommitRegion::Scope(scope_root, scope) => {
+                let key = (scope_root.clone(), *scope);
+                if state.scopes.get(&key) == Some(&self.generation) {
+                    state.scopes.remove(&key);
+                }
+            }
+        }
+    }
+}
+
+pub(crate) fn normalized_data_root(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    normalized.push(component.as_os_str());
+                }
+            }
+            Component::Normal(_) => normalized.push(component.as_os_str()),
+        }
+    }
+    normalized
+}
+
+fn session_data_root(session_dir: &Path) -> anyhow::Result<PathBuf> {
+    session_dir
+        .parent()
+        .and_then(Path::parent)
+        .map(normalized_data_root)
+        .ok_or_else(|| anyhow::anyhow!("invalid spool session path"))
+}
+
+fn try_spool_io_commit(data_root: &Path) -> anyhow::Result<SpoolIoCommitPermit> {
+    let data_root = normalized_data_root(data_root);
+    let mut state = SPOOL_IO_COMMIT_STATE
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if state
+        .roots
+        .keys()
+        .any(|owner_root| roots_overlap(owner_root, &data_root))
+        || state
+            .scopes
+            .keys()
+            .any(|(owner_scope, _)| roots_overlap(owner_scope, &data_root))
+    {
+        anyhow::bail!("audio spool I/O is busy");
+    }
+    state.generation = state.generation.wrapping_add(1).max(1);
+    let generation = state.generation;
+    state.roots.insert(data_root.clone(), generation);
+    Ok(SpoolIoCommitPermit {
+        region: SpoolIoCommitRegion::Root(data_root),
+        generation,
+    })
+}
+
+fn spool_io_scope_root(data_root: &Path, scope: SpoolIoScope) -> PathBuf {
+    let data_root = normalized_data_root(data_root);
+    match scope {
+        SpoolIoScope::RecoverySpool => data_root.join("spool"),
+        SpoolIoScope::GoldAudio => data_root.join("gold"),
+        // These are logical lock paths. The History database also owns its
+        // WAL, SHM and migration-backup siblings, so a single typed region
+        // must cover all of them without claiming the unrelated audio roots.
+        SpoolIoScope::HistoryDatabase => data_root.join("history.sqlite"),
+        SpoolIoScope::PendingHistoryIntent => data_root.join("history-pending"),
+    }
+}
+
+pub(crate) fn try_spool_io_commit_scope(
+    data_root: &Path,
+    scope: SpoolIoScope,
+) -> anyhow::Result<SpoolIoCommitPermit> {
+    let data_root = normalized_data_root(data_root);
+    let scope_root = spool_io_scope_root(&data_root, scope);
+    let mut state = SPOOL_IO_COMMIT_STATE
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if state
+        .roots
+        .keys()
+        .any(|owner_root| roots_overlap(owner_root, &data_root))
+        || state
+            .scopes
+            .keys()
+            .any(|(owner_scope_root, _)| roots_overlap(owner_scope_root, &scope_root))
+    {
+        anyhow::bail!("audio spool I/O is busy");
+    }
+    state.generation = state.generation.wrapping_add(1).max(1);
+    let generation = state.generation;
+    state.scopes.insert((scope_root.clone(), scope), generation);
+    Ok(SpoolIoCommitPermit {
+        region: SpoolIoCommitRegion::Scope(scope_root, scope),
+        generation,
+    })
+}
+
+/// Recovery promotion is an idempotent History writer and may be requested
+/// concurrently by explicit recovery and startup maintenance. Serialize only
+/// this retained worker path with a bounded wait; capture admission and the
+/// general scope API remain non-waiting.
+fn try_history_database_commit_with_wait(data_root: &Path) -> anyhow::Result<SpoolIoCommitPermit> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match try_spool_io_commit_scope(data_root, SpoolIoScope::HistoryDatabase) {
+            Ok(permit) => return Ok(permit),
+            Err(error) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(2));
+                drop(error);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// Acquire the path-derived scope for a registered spool owner. A live session
+/// owns its exact directory; a legacy flat artifact owns its exact file. The
+/// location and kind come from the registered lease, while ancestor-wide
+/// recovery, retention, clear, and quota operations keep their root guards.
+fn try_spool_io_commit_audio_session(
+    lease: &AudioSpoolSessionLease,
+) -> anyhow::Result<SpoolIoCommitPermit> {
+    let session_dir = normalized_data_root(lease.session_dir());
+    let data_root = session_data_root(&session_dir)?;
+    if !spool_lease_can_write(lease) {
+        anyhow::bail!("audio spool lease does not own a writable path");
+    }
+    let (scope, scope_root) = match lease.inner.kind {
+        SpoolLeaseKind::Session => {
+            let spool_root = data_root.join("spool");
+            let session_id = session_dir.file_name().and_then(|value| value.to_str());
+            if session_dir.parent() != Some(spool_root.as_path())
+                || !session_id.is_some_and(valid_spool_session_id)
+            {
+                anyhow::bail!("audio spool lease does not own a live session scope");
+            }
+            (SpoolIoScope::RecoverySpool, session_dir)
+        }
+        SpoolLeaseKind::Artifact => {
+            let parent = session_dir
+                .parent()
+                .ok_or_else(|| anyhow::anyhow!("invalid spool artifact path"))?;
+            let scope = if parent == data_root.join("spool") {
+                SpoolIoScope::RecoverySpool
+            } else if parent == data_root.join("gold") {
+                SpoolIoScope::GoldAudio
+            } else {
+                anyhow::bail!("spool artifact lease is outside a managed root");
+            };
+            (scope, session_dir)
+        }
+    };
+    try_spool_io_commit_scope_at(&data_root, scope, scope_root)
+}
+
+/// A deferred removal revokes writes immediately, but its exact current owner
+/// still needs a cleanup-only permit after accepted work has drained.
+fn try_spool_io_commit_audio_session_cleanup(
+    lease: &AudioSpoolSessionLease,
+) -> anyhow::Result<SpoolIoCommitPermit> {
+    if lease.inner.kind != SpoolLeaseKind::Session || !spool_lease_is_current(lease) {
+        anyhow::bail!("audio spool cleanup lease no longer owns this session");
+    }
+    let session_dir = normalized_data_root(lease.session_dir());
+    let data_root = session_data_root(&session_dir)?;
+    let spool_root = data_root.join("spool");
+    let session_id = session_dir.file_name().and_then(|value| value.to_str());
+    if session_dir.parent() != Some(spool_root.as_path())
+        || !session_id.is_some_and(valid_spool_session_id)
+    {
+        anyhow::bail!("audio spool cleanup lease does not own a session path");
+    }
+    try_spool_io_commit_scope_at(&data_root, SpoolIoScope::RecoverySpool, session_dir)
+}
+
+fn try_spool_io_commit_scope_at(
+    data_root: &Path,
+    scope: SpoolIoScope,
+    scope_root: PathBuf,
+) -> anyhow::Result<SpoolIoCommitPermit> {
+    let data_root = normalized_data_root(data_root);
+    let scope_root = normalized_data_root(&scope_root);
+    let expected_root = spool_io_scope_root(&data_root, scope);
+    if !matches!(scope, SpoolIoScope::RecoverySpool | SpoolIoScope::GoldAudio)
+        || scope_root.parent() != Some(expected_root.as_path())
+    {
+        anyhow::bail!("invalid derived audio spool scope");
+    }
+    let mut state = SPOOL_IO_COMMIT_STATE
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if state
+        .roots
+        .keys()
+        .any(|owner_root| roots_overlap(owner_root, &data_root))
+        || state
+            .scopes
+            .keys()
+            .any(|(owner_scope_root, _)| roots_overlap(owner_scope_root, &scope_root))
+    {
+        anyhow::bail!("audio spool I/O is busy");
+    }
+    state.generation = state.generation.wrapping_add(1).max(1);
+    let generation = state.generation;
+    state.scopes.insert((scope_root.clone(), scope), generation);
+    Ok(SpoolIoCommitPermit {
+        region: SpoolIoCommitRegion::Scope(scope_root, scope),
+        generation,
+    })
+}
+
+struct SpoolQuotaReservation {
+    root: PathBuf,
+    bytes: u64,
+}
+
+impl Drop for SpoolQuotaReservation {
+    fn drop(&mut self) {
+        let (ledger, _) = spool_quota_ledger();
+        let mut ledger = ledger
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(reserved) = ledger.reservations.get_mut(&self.root) {
+            *reserved = reserved.saturating_sub(self.bytes);
+            if *reserved == 0 {
+                ledger.reservations.remove(&self.root);
+            }
+        }
+    }
+}
+
+struct SpoolQuotaScanReservation {
+    root: PathBuf,
+}
+
+impl Drop for SpoolQuotaScanReservation {
+    fn drop(&mut self) {
+        let (ledger, changed) = spool_quota_ledger();
+        let mut ledger = ledger
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        ledger.active_scans.remove(&self.root);
+        changed.notify_all();
+    }
+}
+
+fn reserve_recovery_spool_bytes(root: &Path, bytes: u64) -> anyhow::Result<SpoolQuotaReservation> {
+    let root = normalized_data_root(root);
+    let (ledger, changed) = spool_quota_ledger();
+    let mut state = ledger
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    while state.active_scans.contains(&root) {
+        state = changed
+            .wait(state)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+    }
+    state.active_scans.insert(root.clone());
+    let inflight_at_scan_start = state.reservations.get(&root).copied().unwrap_or_default();
+    drop(state);
+    let _scan = SpoolQuotaScanReservation { root: root.clone() };
+    let current = spool_size(&root)?;
+    let mut state = ledger
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let inflight =
+        inflight_at_scan_start.max(state.reservations.get(&root).copied().unwrap_or_default());
+    if current.saturating_add(inflight).saturating_add(bytes) > MAX_SPOOL_BYTES {
+        anyhow::bail!("audio spool quota exceeded");
+    }
+    *state.reservations.entry(root.clone()).or_default() += bytes;
+    drop(state);
+    drop(_scan);
+    Ok(SpoolQuotaReservation { root, bytes })
+}
+
+#[cfg(test)]
+pub(crate) fn recovery_spool_reserved_bytes_for_test(data_root: &Path) -> u64 {
+    spool_quota_ledger()
+        .0
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .reservations
+        .get(&normalized_data_root(&data_root.join("spool")))
+        .copied()
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+pub(crate) fn fail_next_atomic_parent_sync_for_test(parent: &Path) {
+    *ATOMIC_PARENT_SYNC_FAILURE_TEST
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(AtomicParentSyncFailureTest {
+        parent: normalized_data_root(parent),
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn spool_io_scope_is_busy_for_test(data_root: &Path, scope: SpoolIoScope) -> bool {
+    match try_spool_io_commit_scope(data_root, scope) {
+        Ok(permit) => {
+            drop(permit);
+            false
+        }
+        Err(_) => true,
+    }
+}
+
+fn try_spool_io_commit_pending_history(
+    data_root: &Path,
+    transaction_id: &str,
+) -> anyhow::Result<SpoolIoCommitPermit> {
+    if transaction_id.is_empty()
+        || transaction_id.len() > 96
+        || !transaction_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    {
+        anyhow::bail!("invalid pending History transaction identity");
+    }
+    // Pending-intent admission inspects the complete directory for quota and
+    // identity accounting. Its commit scope must therefore own the complete
+    // pending root, not just this transaction's destination directory.
+    try_spool_io_commit_scope(data_root, SpoolIoScope::PendingHistoryIntent)
+}
+
+fn acquire_pending_history_mutation_and_commit(
+    data_root: &Path,
+    transaction_id: &str,
+) -> anyhow::Result<(SpoolRootMutationLease, SpoolIoCommitPermit)> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let mutation = begin_spool_root_mutation(data_root)?;
+        match try_spool_io_commit_pending_history(data_root, transaction_id) {
+            Ok(commit) => return Ok((mutation, commit)),
+            Err(error)
+                if error.to_string() == "audio spool I/O is busy" && Instant::now() < deadline =>
+            {
+                drop(mutation);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct PendingHistoryActiveLease {
+    inner: std::sync::Arc<PendingHistoryActiveLeaseInner>,
+}
+
+struct PendingHistoryActiveLeaseInner {
+    key: (PathBuf, String),
+    cancelled: std::sync::atomic::AtomicBool,
+}
+
+impl Drop for PendingHistoryActiveLeaseInner {
+    fn drop(&mut self) {
+        PENDING_HISTORY_ACTIVE
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.key);
+    }
+}
+
+impl PendingHistoryActiveLease {
+    fn matches(&self, data_root: &Path, transaction_id: &str) -> bool {
+        self.inner.key == (normalized_data_root(data_root), transaction_id.to_owned())
+    }
+
+    fn ensure_writable(&self, data_root: &Path, transaction_id: &str) -> anyhow::Result<()> {
+        if !self.matches(data_root, transaction_id) {
+            anyhow::bail!("pending History owner does not match the transaction");
+        }
+        if self
+            .inner
+            .cancelled
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            anyhow::bail!("pending History transaction was cancelled");
+        }
+        Ok(())
+    }
+
+    fn poison_for_known_no_effect_cancel(
+        &self,
+        data_root: &Path,
+        transaction_id: &str,
+    ) -> anyhow::Result<()> {
+        if !self.matches(data_root, transaction_id) {
+            anyhow::bail!("pending History owner does not match the transaction");
+        }
+        self.inner
+            .cancelled
+            .store(true, std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+
+    pub(crate) fn poison_known_no_effect_cancel(&self) {
+        self.inner
+            .cancelled
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+fn new_pending_history_active_lease(key: (PathBuf, String)) -> PendingHistoryActiveLease {
+    PendingHistoryActiveLease {
+        inner: std::sync::Arc::new(PendingHistoryActiveLeaseInner {
+            key,
+            cancelled: std::sync::atomic::AtomicBool::new(false),
+        }),
+    }
+}
+
+pub(crate) fn register_pending_history_owner(
+    data_root: &Path,
+    transaction_id: &str,
+) -> anyhow::Result<PendingHistoryActiveLease> {
+    if transaction_id.is_empty()
+        || transaction_id.len() > 96
+        || !transaction_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    {
+        anyhow::bail!("invalid pending History transaction identity");
+    }
+    let key = (normalized_data_root(data_root), transaction_id.to_owned());
+    let mut active = PENDING_HISTORY_ACTIVE
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !active.insert(key.clone()) {
+        anyhow::bail!("pending History transaction identity is already owned");
+    }
+    Ok(new_pending_history_active_lease(key))
+}
+
+fn reserve_pending_history_startup_owner(
+    data_root: &Path,
+    transaction_id: &str,
+) -> Option<PendingHistoryActiveLease> {
+    let key = (normalized_data_root(data_root), transaction_id.to_owned());
+    let mut active = PENDING_HISTORY_ACTIVE
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    active
+        .insert(key.clone())
+        .then_some(new_pending_history_active_lease(key))
+}
+
+pub(crate) struct AudioSpoolSessionLease {
+    inner: std::sync::Arc<AudioSpoolSessionLeaseInner>,
+}
+
+struct AudioSpoolSessionLeaseInner {
+    session_dir: PathBuf,
+    generation: u64,
+    needs_initialization: bool,
+    kind: SpoolLeaseKind,
+}
+
+impl Clone for AudioSpoolSessionLease {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+impl AudioSpoolSessionLease {
+    pub(crate) fn session_dir(&self) -> &Path {
+        &self.inner.session_dir
+    }
+
+    pub(crate) fn needs_initialization(&self) -> bool {
+        self.inner.needs_initialization
+    }
+
+    fn generation(&self) -> u64 {
+        self.inner.generation
+    }
+
+    pub(crate) fn deletion_requested(&self) -> bool {
+        let active = ACTIVE_AUDIO_SPOOL_SESSIONS
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        active
+            .sessions
+            .get(self.session_dir())
+            .filter(|reservation| reservation.generation == self.generation())
+            .is_none_or(|reservation| reservation.delete_when_released)
+    }
+}
+
+impl Drop for AudioSpoolSessionLeaseInner {
+    fn drop(&mut self) {
+        let mut active = ACTIVE_AUDIO_SPOOL_SESSIONS
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if active
+            .sessions
+            .get(&self.session_dir)
+            .is_some_and(|reservation| reservation.generation == self.generation)
+        {
+            active.sessions.remove(&self.session_dir);
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct SpoolRootMutationLease {
+    inner: std::sync::Arc<SpoolRootMutationLeaseInner>,
+}
+
+struct SpoolRootMutationLeaseInner {
+    data_root: PathBuf,
+    active: std::sync::Arc<AtomicBool>,
+}
+
+impl SpoolRootMutationLease {
+    pub(crate) fn data_root(&self) -> &Path {
+        &self.inner.data_root
+    }
+}
+
+impl Drop for SpoolRootMutationLeaseInner {
+    fn drop(&mut self) {
+        self.active.store(false, Ordering::Release);
+    }
+}
+
+fn prune_dead_root_mutations(active: &mut ActiveAudioSpoolSessions) {
+    active.root_mutations.retain(|_, generations| {
+        generations.retain(|_, is_active| is_active.load(Ordering::Acquire));
+        !generations.is_empty()
+    });
+}
+
+pub(crate) fn begin_spool_root_mutation(
+    data_root: &Path,
+) -> anyhow::Result<SpoolRootMutationLease> {
+    let data_root = normalized_data_root(data_root);
+    let mut active = ACTIVE_AUDIO_SPOOL_SESSIONS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    prune_dead_root_mutations(&mut active);
+    if root_is_clearing(&active, &data_root) {
+        anyhow::bail!("data root is being cleared");
+    }
+    active.next_generation = active.next_generation.wrapping_add(1).max(1);
+    let generation = active.next_generation;
+    let lease_active = std::sync::Arc::new(AtomicBool::new(true));
+    active
+        .root_mutations
+        .entry(data_root.clone())
+        .or_default()
+        .insert(generation, lease_active.clone());
+    Ok(SpoolRootMutationLease {
+        inner: std::sync::Arc::new(SpoolRootMutationLeaseInner {
+            data_root,
+            active: lease_active,
+        }),
+    })
+}
+
+pub(crate) fn try_begin_spool_root_mutation(
+    data_root: &Path,
+) -> anyhow::Result<SpoolRootMutationLease> {
+    let data_root = normalized_data_root(data_root);
+    let mut active = ACTIVE_AUDIO_SPOOL_SESSIONS
+        .get_or_init(Default::default)
+        .try_lock()
+        .map_err(|_| anyhow::anyhow!("data root mutation admission is busy"))?;
+    prune_dead_root_mutations(&mut active);
+    if root_is_clearing(&active, &data_root) {
+        anyhow::bail!("data root is being cleared");
+    }
+    active.next_generation = active.next_generation.wrapping_add(1).max(1);
+    let generation = active.next_generation;
+    let lease_active = std::sync::Arc::new(AtomicBool::new(true));
+    active
+        .root_mutations
+        .entry(data_root.clone())
+        .or_default()
+        .insert(generation, lease_active.clone());
+    Ok(SpoolRootMutationLease {
+        inner: std::sync::Arc::new(SpoolRootMutationLeaseInner {
+            data_root,
+            active: lease_active,
+        }),
+    })
+}
+
+fn reserve_spool_session_path(
+    session_dir: &Path,
+    needs_initialization: bool,
+    kind: SpoolLeaseKind,
+) -> anyhow::Result<AudioSpoolSessionLease> {
+    let session_dir = normalized_data_root(session_dir);
+    let data_root = session_dir
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| anyhow::anyhow!("invalid spool session path"))?;
+    let mut active = ACTIVE_AUDIO_SPOOL_SESSIONS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if root_is_clearing(&active, data_root) {
+        anyhow::bail!("audio spool is being cleared");
+    }
+    if active.sessions.contains_key(&session_dir) {
+        anyhow::bail!("spool session is already owned by an audio worker");
+    }
+    active.next_generation = active.next_generation.wrapping_add(1).max(1);
+    let generation = active.next_generation;
+    active.sessions.insert(
+        session_dir.clone(),
+        SpoolReservation {
+            generation,
+            delete_when_released: false,
+        },
+    );
+    Ok(AudioSpoolSessionLease {
+        inner: std::sync::Arc::new(AudioSpoolSessionLeaseInner {
+            session_dir,
+            generation,
+            needs_initialization,
+            kind,
+        }),
+    })
+}
+
+fn valid_spool_session_id(session_id: &str) -> bool {
+    !session_id.is_empty()
+        && session_id.len() <= 128
+        && session_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+fn root_is_clearing(active: &ActiveAudioSpoolSessions, data_root: &Path) -> bool {
+    let data_root = normalized_data_root(data_root);
+    active
+        .clearing_roots
+        .iter()
+        .any(|clearing_root| roots_overlap(&data_root, clearing_root))
+}
+
+fn roots_overlap(left: &Path, right: &Path) -> bool {
+    let left = normalized_data_root(left);
+    let right = normalized_data_root(right);
+    left.starts_with(&right) || right.starts_with(&left)
+}
+
+pub(crate) fn lease_spool_session(session_dir: &Path) -> anyhow::Result<AudioSpoolSessionLease> {
+    // Reserve in memory before inspecting the path, then do filesystem work
+    // without holding the registry mutex. Removers see the reservation and
+    // defer instead of racing this check.
+    let lease = reserve_spool_session_path(session_dir, false, SpoolLeaseKind::Session)?;
+    let metadata = match fs::symlink_metadata(session_dir) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            drop(lease);
+            return Err(error.into());
+        }
+    };
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        drop(lease);
+        anyhow::bail!("spool session path is not a private directory");
+    }
+    Ok(lease)
+}
+
+/// Initialize a reserved live audio session on its bounded spool-owner thread.
+/// Directory creation is exclusive, so a failed start never removes or
+/// overwrites a pre-existing recovery artifact.
+pub(crate) fn initialize_audio_spool_session(lease: &AudioSpoolSessionLease) -> anyhow::Result<()> {
+    if !lease.needs_initialization() || !spool_lease_can_write(lease) {
+        anyhow::bail!("audio spool lease is not awaiting initialization");
+    }
+    let _commit = try_spool_io_commit_audio_session(lease)?;
+    let session_dir = lease.session_dir();
+    let parent = session_dir
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("invalid audio spool session path"))?;
+    let session_id = session_dir
+        .file_name()
+        .and_then(|value| value.to_str())
+        .filter(|value| valid_spool_session_id(value))
+        .ok_or_else(|| anyhow::anyhow!("invalid audio spool session id"))?;
+    ensure_private_dir(parent)?;
+    if lease.deletion_requested() {
+        anyhow::bail!("audio spool initialization was cancelled");
+    }
+    fs::create_dir(session_dir)?;
+    sync_directory(parent)?;
+    if lease.deletion_requested() {
+        let _ = fs::remove_dir_all(session_dir);
+        let _ = sync_directory(parent);
+        anyhow::bail!("audio spool initialization was cancelled");
+    }
+    let result = (|| {
+        ensure_private_dir(session_dir)?;
+        save_manifest(
+            session_dir,
+            &SpoolManifest {
+                schema_version: SPOOL_MANIFEST_VERSION,
+                session_id: session_id.to_owned(),
+                created_at_ms: now_ms(),
+                status: "active".into(),
+                chunks: Vec::new(),
+            },
+        )
+    })();
+    if let Err(error) = result {
+        // This path was created exclusively above, so cleanup cannot touch a
+        // pre-existing recovery session. It also runs on the spool owner.
+        let _ = fs::remove_dir_all(session_dir);
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn spool_session_is_leased(session_dir: &Path) -> bool {
+    ACTIVE_AUDIO_SPOOL_SESSIONS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .sessions
+        .contains_key(session_dir)
+}
+
+fn spool_lease_is_current(lease: &AudioSpoolSessionLease) -> bool {
+    ACTIVE_AUDIO_SPOOL_SESSIONS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .sessions
+        .get(lease.session_dir())
+        .is_some_and(|reservation| reservation.generation == lease.generation())
+}
+
+fn spool_lease_can_write(lease: &AudioSpoolSessionLease) -> bool {
+    ACTIVE_AUDIO_SPOOL_SESSIONS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .sessions
+        .get(lease.session_dir())
+        .is_some_and(|reservation| {
+            reservation.generation == lease.generation() && !reservation.delete_when_released
+        })
+}
+
+fn spool_artifact_is_leased(path: &Path) -> bool {
+    let path = normalized_data_root(path);
+    ACTIVE_AUDIO_SPOOL_SESSIONS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .sessions
+        .keys()
+        .any(|session_dir| path.starts_with(session_dir))
+}
+
+fn has_spool_owner_under(path: &Path) -> bool {
+    let path = normalized_data_root(path);
+    ACTIVE_AUDIO_SPOOL_SESSIONS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .sessions
+        .keys()
+        .any(|session_dir| session_dir.starts_with(&path))
+}
+
+fn defer_spool_artifact_removal_until_release(path: &Path) -> bool {
+    let path = normalized_data_root(path);
+    let mut active = ACTIVE_AUDIO_SPOOL_SESSIONS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut matched = false;
+    for (session_dir, reservation) in &mut active.sessions {
+        if path.starts_with(session_dir) || session_dir.starts_with(&path) {
+            reservation.delete_when_released = true;
+            matched = true;
+        }
+    }
+    matched
+}
+
+pub(crate) struct SpoolClearGuard {
+    data_root: PathBuf,
+}
+
+impl SpoolClearGuard {
+    pub(crate) fn owns_root(&self, data_root: &Path) -> bool {
+        self.data_root == normalized_data_root(data_root)
+    }
+}
+
+impl Drop for SpoolClearGuard {
+    fn drop(&mut self) {
+        ACTIVE_AUDIO_SPOOL_SESSIONS
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clearing_roots
+            .remove(&self.data_root);
+    }
+}
+
+fn begin_spool_clear(data_root: &Path) -> anyhow::Result<SpoolClearGuard> {
+    let data_root = normalized_data_root(data_root);
+    let mut active = ACTIVE_AUDIO_SPOOL_SESSIONS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    prune_dead_root_mutations(&mut active);
+    if root_is_clearing(&active, &data_root) {
+        anyhow::bail!("audio spool cleanup is already running");
+    }
+    let mut busy = active
+        .root_mutations
+        .iter()
+        .any(|(root, generations)| !generations.is_empty() && roots_overlap(root, &data_root));
+    for session_dir in active.sessions.keys() {
+        if session_dir.starts_with(&data_root) {
+            busy = true;
+        }
+    }
+    if busy {
+        // A rejected clear request has no deletion side effect. In particular,
+        // do not mark a live recording for deletion when reporting Busy.
+        anyhow::bail!("audio spool cleanup is still pending for an active worker");
+    }
+    active.clearing_roots.insert(data_root.clone());
+    Ok(SpoolClearGuard { data_root })
+}
+
+/// Claim the data root before any clear operation opens History or touches
+/// audit, backup, spool, gold, or diagnostics state. The guard is memory-only
+/// on Drop and must be retained by the actual bounded I/O owner.
+pub(crate) fn begin_clear_all_data(data_root: &Path) -> anyhow::Result<SpoolClearGuard> {
+    begin_spool_clear(data_root)
+}
 
 fn ensure_private_dir(path: &Path) -> anyhow::Result<()> {
+    let mut missing = Vec::new();
+    let mut cursor = path;
+    while !cursor.exists() {
+        missing.push(cursor.to_path_buf());
+        cursor = cursor
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("invalid private directory path"))?;
+    }
     fs::create_dir_all(path)?;
     #[cfg(unix)]
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    {
+        let mode = fs::metadata(path)?.permissions().mode() & 0o777;
+        if mode != 0o700 {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+            sync_directory(path)?;
+        }
+    }
+    for created in missing.iter().rev() {
+        if let Some(parent) = created.parent() {
+            sync_directory(parent)?;
+        }
+        sync_directory(created)?;
+    }
     Ok(())
+}
+
+fn sync_directory(path: &Path) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    File::open(path)?.sync_all()?;
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
+fn sync_atomic_parent_directory(path: &Path) -> anyhow::Result<()> {
+    #[cfg(test)]
+    {
+        let mut slot = ATOMIC_PARENT_SYNC_FAILURE_TEST
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if slot
+            .as_ref()
+            .is_some_and(|test| test.parent == normalized_data_root(path))
+        {
+            slot.take();
+            anyhow::bail!("injected atomic parent directory sync failure");
+        }
+    }
+    sync_directory(path)
 }
 
 fn restrict_file_mode(path: &Path) -> anyhow::Result<()> {
@@ -60,9 +1550,102 @@ fn default_ui_language() -> String {
     "system".into()
 }
 
+/// Teaching acknowledgement is not feature readiness or a permission grant.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum OnDemandGuideId {
+    DictionaryLearning,
+    ContextScreen,
+    SelectedTranslation,
+    ScenePreferences,
+}
+impl OnDemandGuideId {
+    const ALL: [Self; 4] = [
+        Self::DictionaryLearning,
+        Self::ContextScreen,
+        Self::SelectedTranslation,
+        Self::ScenePreferences,
+    ];
+    fn current_version(self) -> u32 {
+        match self {
+            Self::DictionaryLearning => 1,
+            Self::ContextScreen => 1,
+            Self::SelectedTranslation => 1,
+            Self::ScenePreferences => 1,
+        }
+    }
+}
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct GuideAcknowledgements {
+    dictionary_learning: Option<u32>,
+    context_screen: Option<u32>,
+    selected_translation: Option<u32>,
+    scene_preferences: Option<u32>,
+}
+#[derive(Debug, Serialize)]
+pub(crate) struct GuideAcknowledgementView {
+    guide_id: OnDemandGuideId,
+    current_version: u32,
+    acknowledged_version: Option<u32>,
+}
+impl GuideAcknowledgements {
+    fn slot(&mut self, id: OnDemandGuideId) -> &mut Option<u32> {
+        match id {
+            OnDemandGuideId::DictionaryLearning => &mut self.dictionary_learning,
+            OnDemandGuideId::ContextScreen => &mut self.context_screen,
+            OnDemandGuideId::SelectedTranslation => &mut self.selected_translation,
+            OnDemandGuideId::ScenePreferences => &mut self.scene_preferences,
+        }
+    }
+    pub(crate) fn acknowledge(
+        &mut self,
+        id: OnDemandGuideId,
+        version: u32,
+    ) -> Result<bool, &'static str> {
+        if version != id.current_version() {
+            return Err("guide_version_changed");
+        }
+        let slot = self.slot(id);
+        let changed = *slot != Some(version);
+        *slot = Some(version);
+        Ok(changed)
+    }
+    pub(crate) fn view(&self) -> Vec<GuideAcknowledgementView> {
+        let mut values = self.clone();
+        OnDemandGuideId::ALL
+            .into_iter()
+            .map(|id| GuideAcknowledgementView {
+                guide_id: id,
+                current_version: id.current_version(),
+                acknowledged_version: *values.slot(id),
+            })
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+/// Non-secret outcome of the last credential-store resolution. This is not a
+/// provider connectivity or credential-validity result.
+pub enum CredentialReadState {
+    Configured,
+    Missing,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CustomCredentialPurpose {
+    Asr,
+    Cleanup,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
+    /// Written only by the explicit acknowledge_guide command.
+    pub guide_acknowledgements: GuideAcknowledgements,
     #[serde(default = "current_settings_schema_version")]
     pub schema_version: u32,
     pub api_key: String,
@@ -80,6 +1663,8 @@ pub struct Settings {
     #[serde(default = "default_theme")]
     pub theme: String,
     pub dictionary: Vec<String>,
+    #[serde(default = "legacy_dictionary_sources")]
+    pub(crate) dictionary_sources: DictionarySources,
     #[serde(default = "default_hotkey")]
     pub hotkey: String,
     #[serde(default = "default_legacy_activation_mode")]
@@ -131,6 +1716,8 @@ pub struct Settings {
     #[serde(default = "default_true")]
     pub custom_llm: bool,
     #[serde(default)]
+    pub custom_cleanup_parameters: crate::custom_cleanup_parameters::Parameters,
+    #[serde(default)]
     pub ollama_base_url: String,
     #[serde(default)]
     pub strict_offline_enabled: bool,
@@ -157,6 +1744,11 @@ pub struct Settings {
     pub selected_actions_enabled: bool,
     #[serde(default = "default_dictionary_learn_enabled")]
     pub dictionary_learn_enabled: bool,
+    /// Separate local-only opt-in for watching edits in the same verified
+    /// field immediately after VoiceFlow inserts text. This never grants
+    /// screen/context capture permissions.
+    #[serde(default)]
+    pub local_edit_learning_enabled: bool,
     #[serde(default)]
     pub input_device: String,
     #[serde(default = "default_input_gain")]
@@ -194,6 +1786,22 @@ pub struct Settings {
     /// settings saves from an explicit key replacement.
     #[serde(skip)]
     pub(crate) credential_baselines: std::collections::BTreeMap<String, String>,
+    /// Non-secret result of the last secure-store resolution for each fixed
+    /// account. This remains process-only and is intentionally not persisted.
+    #[serde(skip)]
+    pub(crate) credential_read_states: std::collections::BTreeMap<String, CredentialReadState>,
+    /// A foreground reread is session-only. Keep it out of later implicit
+    /// credential fan-out/persistence until the user explicitly saves a key.
+    #[serde(skip)]
+    pub(crate) session_only_custom_credential: bool,
+    /// The active Custom origin and purposes for which a foreground-only
+    /// credential was recovered. This is process-only routing metadata.
+    #[serde(skip)]
+    pub(crate) session_custom_credential_scope: Option<CustomCredentialRecoveryScope>,
+    /// Prevents a revoked foreground-only value from falling through to an
+    /// unrelated legacy alias at a later Custom route.
+    #[serde(skip)]
+    pub(crate) session_custom_credential_rejected: bool,
 }
 
 fn default_cleanup_intensity() -> String {
@@ -281,6 +1889,7 @@ fn default_true() -> bool {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            guide_acknowledgements: GuideAcknowledgements::default(),
             schema_version: SETTINGS_SCHEMA_VERSION,
             api_key: String::new(),
             asr_api_key: String::new(),
@@ -291,6 +1900,7 @@ impl Default for Settings {
             ui_language: default_ui_language(),
             theme: default_theme(),
             dictionary: Vec::new(),
+            dictionary_sources: DictionarySources::default(),
             hotkey: default_hotkey(),
             activation_mode: "tap".into(),
             chunk_threshold_secs: 25,
@@ -319,6 +1929,7 @@ impl Default for Settings {
             custom_base_url: String::new(),
             custom_asr: true,
             custom_llm: true,
+            custom_cleanup_parameters: Default::default(),
             ollama_base_url: crate::providers::EngineProvider::Ollama
                 .default_base_url()
                 .to_owned(),
@@ -338,6 +1949,7 @@ impl Default for Settings {
             selected_action_hotkey: default_selected_action_hotkey(),
             selected_actions_enabled: default_selected_actions_enabled(),
             dictionary_learn_enabled: default_dictionary_learn_enabled(),
+            local_edit_learning_enabled: false,
             input_device: String::new(),
             input_gain: default_input_gain(),
             verbatim_hotkey: String::new(),
@@ -354,12 +1966,198 @@ impl Default for Settings {
             fuzzy_dictionary_enabled: false,
             unverified_credential_sources: std::collections::BTreeMap::new(),
             credential_baselines: std::collections::BTreeMap::new(),
+            credential_read_states: std::collections::BTreeMap::new(),
+            session_only_custom_credential: false,
+            session_custom_credential_scope: None,
+            session_custom_credential_rejected: false,
         }
     }
 }
 
 impl Settings {
+    fn normalize_dictionary_sources(&mut self) {
+        normalized_dictionary_sources(&mut self.dictionary, &mut self.dictionary_sources);
+    }
+
+    pub(crate) fn can_add_dictionary_source(&self, word: &str) -> bool {
+        let word = word.trim();
+        if word.is_empty() || word.len() > 256 {
+            return false;
+        }
+        if dictionary_contains_word(&self.dictionary, word)
+            || self
+                .dictionary_sources
+                .owners
+                .keys()
+                .any(|existing| dictionary_words_equal(existing, word))
+        {
+            return true;
+        }
+        let mut canonical_terms: Vec<&str> = Vec::new();
+        for existing in self
+            .dictionary
+            .iter()
+            .map(String::as_str)
+            .chain(self.dictionary_sources.owners.keys().map(String::as_str))
+        {
+            if !canonical_terms
+                .iter()
+                .any(|known| dictionary_words_equal(known, existing))
+            {
+                canonical_terms.push(existing);
+            }
+        }
+        canonical_terms.len() < 256
+    }
+
+    pub(crate) fn add_dictionary_source(&mut self, word: &str, source: DictionarySource) -> bool {
+        let word = word.trim().to_owned();
+        if word.is_empty() || word.len() > 256 {
+            return false;
+        }
+        self.normalize_dictionary_sources();
+        if !self.can_add_dictionary_source(&word) {
+            return false;
+        }
+        let word = self
+            .dictionary
+            .iter()
+            .find(|existing| dictionary_words_equal(existing, &word))
+            .cloned()
+            .or_else(|| {
+                self.dictionary_sources
+                    .owners
+                    .keys()
+                    .find(|existing| dictionary_words_equal(existing, &word))
+                    .cloned()
+            })
+            .unwrap_or(word);
+        let inserted = self
+            .dictionary_sources
+            .owners
+            .entry(word.to_owned())
+            .or_default()
+            .insert(source);
+        if inserted && !dictionary_contains_word(&self.dictionary, &word) {
+            self.dictionary.push(word);
+        }
+        inserted
+    }
+
+    pub(crate) fn has_dictionary_source(&self, word: &str, source: &DictionarySource) -> bool {
+        let word = word.trim();
+        self.dictionary_sources
+            .owners
+            .iter()
+            .find(|(existing, _)| dictionary_words_equal(existing, word))
+            .map(|(_, owners)| owners)
+            .is_some_and(|owners| owners.contains(source))
+    }
+
+    pub(crate) fn remove_dictionary_source(
+        &mut self,
+        word: &str,
+        source: &DictionarySource,
+    ) -> bool {
+        self.normalize_dictionary_sources();
+        let Some(canonical_word) = self
+            .dictionary_sources
+            .owners
+            .keys()
+            .find(|existing| dictionary_words_equal(existing, word))
+            .cloned()
+        else {
+            return false;
+        };
+        let Some(owners) = self.dictionary_sources.owners.get_mut(&canonical_word) else {
+            return false;
+        };
+        let removed = owners.remove(source);
+        if owners.is_empty() {
+            self.dictionary_sources.owners.remove(&canonical_word);
+            self.dictionary.retain(|entry| entry != &canonical_word);
+        }
+        removed
+    }
+
+    pub(crate) fn remove_dictionary_word(&mut self, word: &str) -> bool {
+        self.normalize_dictionary_sources();
+        let canonical_word = self
+            .dictionary_sources
+            .owners
+            .keys()
+            .find(|existing| dictionary_words_equal(existing, word))
+            .cloned();
+        let removed = canonical_word
+            .as_ref()
+            .and_then(|canonical| self.dictionary_sources.owners.remove(canonical))
+            .is_some();
+        let before = self.dictionary.len();
+        self.dictionary
+            .retain(|entry| !dictionary_words_equal(entry, word));
+        removed || self.dictionary.len() != before
+    }
+
+    pub(crate) fn reconcile_dictionary_patch(&mut self, requested: Vec<String>) -> Vec<String> {
+        let old_terms = self
+            .dictionary_sources
+            .owners
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut deduplicated = Vec::with_capacity(requested.len().min(256));
+        for word in requested {
+            let word = truncate_dictionary_word(word.trim());
+            if word.is_empty() {
+                continue;
+            }
+            let canonical = old_terms
+                .iter()
+                .chain(deduplicated.iter())
+                .find(|existing| dictionary_words_equal(existing, &word))
+                .cloned()
+                .unwrap_or(word);
+            if !deduplicated
+                .iter()
+                .any(|existing| dictionary_words_equal(existing, &canonical))
+            {
+                if deduplicated.len() == 256 {
+                    break;
+                }
+                deduplicated.push(canonical);
+            }
+        }
+        let removed = old_terms
+            .iter()
+            .filter(|word| {
+                !deduplicated
+                    .iter()
+                    .any(|requested| dictionary_words_equal(requested, word))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for word in &removed {
+            self.dictionary_sources.owners.remove(word);
+        }
+        for word in &deduplicated {
+            if !old_terms
+                .iter()
+                .any(|existing| dictionary_words_equal(existing, word))
+            {
+                self.dictionary_sources
+                    .owners
+                    .entry(word.clone())
+                    .or_default()
+                    .insert(DictionarySource::Manual);
+            }
+        }
+        self.dictionary = deduplicated;
+        self.normalize_dictionary_sources();
+        removed
+    }
+
     pub fn normalize(&mut self) {
+        self.normalize_dictionary_sources();
         if self.schema_version < SETTINGS_SCHEMA_VERSION {
             // Before schema 7, a new install was silently stored as Chinese.
             // Preserve an explicit choice for onboarded users, but let an
@@ -605,7 +2403,7 @@ impl Settings {
         // blank on disk, so treating an empty key as "incomplete custom" would
         // wipe a working custom URL during load_settings, before credentials
         // are rebound. Empty-key repair happens in
-        // `repair_incomplete_engine_sides` after keys are in memory.
+        // the load-side repair helpers only after keys are confirmed absent.
         if self.asr_provider.is_custom()
             && self.custom_base_url.trim().is_empty()
             && self.asr_base_url.trim().is_empty()
@@ -637,7 +2435,10 @@ impl Settings {
             if !crate::llm::is_supported_model(&self.cleanup_model) {
                 self.cleanup_model = default_cleanup_model();
             }
-        } else if self.cleanup_model.trim().is_empty() {
+        } else if (self.cleanup_provider == crate::engine::EngineProvider::OnDeviceMlx
+            && self.cleanup_model.trim() == crate::lmstudio_local::MODEL_VARIANT)
+            || self.cleanup_model.trim().is_empty()
+        {
             self.cleanup_model = self.cleanup_provider.default_llm_model().to_owned();
         }
         if self.ollama_base_url.trim().is_empty() {
@@ -711,14 +2512,6 @@ impl Settings {
         }
     }
 
-    /// Drop custom sides that still cannot run now that credentials are loaded.
-    /// Call this after keychain bind, never from `normalize`.
-    pub fn repair_incomplete_engine_sides(&mut self) -> bool {
-        let asr = self.repair_incomplete_asr();
-        let cleanup = self.repair_incomplete_cleanup();
-        asr || cleanup
-    }
-
     fn repair_incomplete_asr(&mut self) -> bool {
         if !self.asr_provider.is_custom() {
             return false;
@@ -728,7 +2521,7 @@ impl Settings {
         } else {
             self.custom_base_url.trim()
         };
-        let key = self.provider_secret(self.asr_provider);
+        let key = self.asr_credential();
         if !url.is_empty() && (!key.is_empty() || crate::providers::is_loopback_url(url)) {
             return false;
         }
@@ -749,7 +2542,7 @@ impl Settings {
         } else {
             self.custom_base_url.trim()
         };
-        let key = self.provider_secret(self.cleanup_provider);
+        let key = self.cleanup_credential();
         if !url.is_empty() && (!key.is_empty() || crate::providers::is_loopback_url(url)) {
             return false;
         }
@@ -781,6 +2574,8 @@ impl Settings {
         models_root: Option<&Path>,
         check_readiness: bool,
     ) -> anyhow::Result<()> {
+        crate::custom_cleanup_parameters::validate(&self.custom_cleanup_parameters)
+            .map_err(|error| anyhow::anyhow!(error))?;
         if !matches!(self.language.as_str(), "auto" | "zh" | "en") {
             anyhow::bail!("unsupported recognition language");
         }
@@ -1057,11 +2852,29 @@ impl Settings {
                 "自定义整理需要填写兼容地址。"
             });
         }
-        let key = self.provider_secret(provider);
-        let empty_ok = provider.allows_empty_key() && crate::providers::is_loopback_url(&url);
+        let key = if provider.is_custom() && self.session_only_custom_credential {
+            let purpose = if asr {
+                CustomCredentialPurpose::Asr
+            } else {
+                CustomCredentialPurpose::Cleanup
+            };
+            self.session_custom_credential_for(purpose, &url)
+        } else {
+            self.provider_secret(provider)
+        };
+        let empty_ok = provider == crate::engine::EngineProvider::OnDeviceMlx
+            || provider.allows_empty_key() && crate::providers::is_loopback_url(&url);
         if key.is_empty() && !empty_ok {
             if !check_readiness || !self.onboarded {
                 return Ok(());
+            }
+            let read_state = if provider.is_custom() {
+                self.custom_credential_read_state()
+            } else {
+                self.credential_read_state_for_slot(provider.keychain_account(), key)
+            };
+            if read_state == CredentialReadState::Unavailable {
+                anyhow::bail!("钥匙串暂时不可读取；当前设置未更改，请在前台设置中重试读取。")
             }
             if provider.is_custom() {
                 anyhow::bail!(if asr {
@@ -1076,6 +2889,11 @@ impl Settings {
     }
 
     pub fn provider_secret(&self, provider: crate::engine::EngineProvider) -> &str {
+        if provider.is_custom()
+            && (self.session_custom_credential_rejected || self.session_only_custom_credential)
+        {
+            return "";
+        }
         if let Some(key) = self
             .provider_api_keys
             .get(provider.as_str())
@@ -1097,6 +2915,181 @@ impl Settings {
             }
             _ => "",
         }
+    }
+
+    fn credential_read_state_for_slot(
+        &self,
+        slot: &str,
+        runtime_value: &str,
+    ) -> CredentialReadState {
+        self.credential_read_states
+            .get(slot)
+            .copied()
+            .unwrap_or_else(|| {
+                if runtime_value.trim().is_empty() {
+                    CredentialReadState::Missing
+                } else {
+                    CredentialReadState::Configured
+                }
+            })
+    }
+
+    pub fn custom_credential_read_state(&self) -> CredentialReadState {
+        let scope = custom_credential_recovery_scope(self, CustomCredentialPurpose::Asr)
+            .or_else(|| custom_credential_recovery_scope(self, CustomCredentialPurpose::Cleanup));
+        let Some(scope) = scope else {
+            return self.credential_read_state_for_slot(
+                "provider_custom",
+                self.provider_secret(crate::engine::EngineProvider::Custom),
+            );
+        };
+
+        let mut slots = vec!["provider_custom"];
+        if scope.include_asr_legacy {
+            slots.push("asr_api_key");
+        }
+        if scope.include_cleanup_legacy {
+            slots.push("cleanup_api_key");
+        }
+        for slot in slots {
+            let runtime_value = match slot {
+                "provider_custom" => self
+                    .provider_api_keys
+                    .get("custom")
+                    .map(String::as_str)
+                    .unwrap_or_default(),
+                "asr_api_key" => self.asr_api_key.as_str(),
+                "cleanup_api_key" => self.cleanup_api_key.as_str(),
+                _ => "",
+            };
+            match self.credential_read_state_for_slot(slot, runtime_value) {
+                CredentialReadState::Configured => return CredentialReadState::Configured,
+                CredentialReadState::Unavailable => return CredentialReadState::Unavailable,
+                CredentialReadState::Missing => {}
+            }
+        }
+        CredentialReadState::Missing
+    }
+
+    pub fn asr_credential_read_state(&self) -> CredentialReadState {
+        if self.asr_provider.is_custom() {
+            self.custom_credential_read_state()
+        } else {
+            self.credential_read_state_for_slot(
+                self.asr_provider.keychain_account(),
+                self.asr_credential(),
+            )
+        }
+    }
+
+    /// Mark non-empty runtime credentials configured after a successful
+    /// settings commit, while preserving unavailable legacy values until a
+    /// verified replacement has removed their unverified-source marker.
+    pub(crate) fn refresh_verified_credential_read_states(&mut self) {
+        let mut values = vec![
+            ("groq_api_key", self.api_key.as_str()),
+            ("asr_api_key", self.asr_api_key.as_str()),
+            ("cleanup_api_key", self.cleanup_api_key.as_str()),
+        ];
+        for (provider_id, key) in &self.provider_api_keys {
+            if let Some(provider) = crate::providers::EngineProvider::parse(provider_id) {
+                values.push((provider.keychain_account(), key.as_str()));
+            }
+        }
+        for (slot, value) in values {
+            if value.trim().is_empty() || has_unverified_source(self, slot, value) {
+                continue;
+            }
+            self.credential_read_states
+                .insert(slot.to_owned(), CredentialReadState::Configured);
+        }
+    }
+
+    pub(crate) fn preserve_credential_runtime_metadata_from(&mut self, previous: &Settings) {
+        self.unverified_credential_sources = previous.unverified_credential_sources.clone();
+        self.credential_baselines = previous.credential_baselines.clone();
+        self.credential_read_states = previous.credential_read_states.clone();
+        self.session_only_custom_credential = previous.session_only_custom_credential;
+        self.session_custom_credential_scope = previous.session_custom_credential_scope.clone();
+        self.session_custom_credential_rejected = previous.session_custom_credential_rejected;
+    }
+
+    fn session_custom_credential_scope_matches(&self) -> bool {
+        let Some(captured) = self.session_custom_credential_scope.as_ref() else {
+            return false;
+        };
+        self.provider_api_keys
+            .get("custom")
+            .is_some_and(|key| !key.trim().is_empty())
+            && custom_credential_recovery_scope(self, captured.purpose).as_ref() == Some(captured)
+    }
+
+    fn session_custom_credential_matches_base(
+        &self,
+        purpose: CustomCredentialPurpose,
+        base_url: &str,
+    ) -> bool {
+        let Some(captured) = self.session_custom_credential_scope.as_ref() else {
+            return false;
+        };
+        let purpose_is_active = match purpose {
+            CustomCredentialPurpose::Asr => captured.asr_active,
+            CustomCredentialPurpose::Cleanup => captured.cleanup_active,
+        };
+        if !self.session_only_custom_credential || !purpose_is_active {
+            return false;
+        }
+        let Some(current) = custom_credential_recovery_scope(self, purpose) else {
+            return false;
+        };
+        let mut expected = captured.clone();
+        expected.purpose = purpose;
+        current == expected
+            && canonical_http_origin(base_url).as_deref() == Some(captured.origin.as_str())
+    }
+
+    /// Return a foreground-only Custom value only to a currently active
+    /// ASR/cleanup purpose whose destination still has the captured origin.
+    /// Generic Custom consumers must use `provider_secret`, which deliberately
+    /// hides session-only values.
+    pub(crate) fn session_custom_credential_for(
+        &self,
+        purpose: CustomCredentialPurpose,
+        base_url: &str,
+    ) -> &str {
+        if !self.session_custom_credential_matches_base(purpose, base_url) {
+            return "";
+        }
+        self.provider_api_keys
+            .get("custom")
+            .map(String::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("")
+    }
+
+    /// Drop a foreground-only Custom value when the active purpose set or
+    /// effective service origin no longer matches the read that adopted it.
+    /// This only clears process memory and never touches Keychain.
+    pub(crate) fn clear_stale_session_custom_credential(&mut self) -> bool {
+        if !self.session_only_custom_credential {
+            return false;
+        }
+        if self.session_custom_credential_scope_matches() {
+            return false;
+        }
+        self.clear_session_custom_credential();
+        true
+    }
+
+    pub(crate) fn clear_session_custom_credential(&mut self) {
+        if self.session_only_custom_credential {
+            self.provider_api_keys.remove("custom");
+            self.credential_baselines.remove("provider_custom");
+            self.session_custom_credential_rejected = true;
+        }
+        self.session_only_custom_credential = false;
+        self.session_custom_credential_scope = None;
     }
 
     pub fn resolved_provider_base(&self, provider: crate::engine::EngineProvider) -> String {
@@ -1154,6 +3147,12 @@ impl Settings {
     /// Prefer a dedicated ASR key when set. Reuse the Groq key only for the
     /// Groq default or `api.groq.com`; custom hosts must supply `asr_api_key`.
     pub fn asr_credential(&self) -> &str {
+        if self.asr_provider.is_custom() && self.session_only_custom_credential {
+            return self.session_custom_credential_for(
+                CustomCredentialPurpose::Asr,
+                &self.resolved_provider_base(crate::engine::EngineProvider::Custom),
+            );
+        }
         self.provider_secret(self.asr_provider)
     }
 
@@ -1164,6 +3163,14 @@ impl Settings {
     }
 
     pub fn accurate_asr_credential(&self) -> &str {
+        let base = if !self.accurate_asr_base_url.trim().is_empty() {
+            self.accurate_asr_base_url.trim().to_owned()
+        } else {
+            self.resolved_provider_base(self.accurate_asr_provider)
+        };
+        if self.accurate_asr_provider.is_custom() && self.session_only_custom_credential {
+            return self.session_custom_credential_for(CustomCredentialPurpose::Asr, &base);
+        }
         self.provider_secret(self.accurate_asr_provider)
     }
 
@@ -1186,7 +3193,7 @@ impl Settings {
         let Some(provider) = crate::engine::EngineProvider::parse(&self.vision_provider) else {
             return false;
         };
-        if !provider.has_llm() {
+        if !provider.has_vision() {
             return false;
         }
         let key = self.provider_secret(provider);
@@ -1202,7 +3209,7 @@ impl Settings {
 
     pub fn vision_endpoint(&self) -> Option<String> {
         let provider = crate::engine::EngineProvider::parse(&self.vision_provider)?;
-        if !provider.has_llm() {
+        if !provider.has_vision() {
             return None;
         }
         Some(crate::llm::resolve_chat_url(
@@ -1211,12 +3218,23 @@ impl Settings {
     }
 
     pub fn cleanup_credential(&self) -> &str {
+        if self.cleanup_provider.is_custom() && self.session_only_custom_credential {
+            return self.session_custom_credential_for(
+                CustomCredentialPurpose::Cleanup,
+                &self.resolved_provider_base(crate::engine::EngineProvider::Custom),
+            );
+        }
         self.provider_secret(self.cleanup_provider)
     }
 
     pub fn cleanup_endpoint(&self) -> String {
         if self.cleanup_provider == crate::engine::EngineProvider::Ollama {
             return crate::ollama_local::chat_endpoint(&self.ollama_base_url);
+        }
+        if self.cleanup_provider == crate::engine::EngineProvider::LmStudio {
+            return crate::lmstudio_local::chat_endpoint(
+                crate::engine::EngineProvider::LmStudio.default_base_url(),
+            );
         }
         crate::providers::resolve_llm_endpoint(
             self.cleanup_provider,
@@ -1243,6 +3261,7 @@ impl Settings {
 }
 
 pub(crate) fn bind_asr_key_to_host(
+    provider: crate::engine::EngineProvider,
     previous_url: &str,
     next_url: &str,
     incoming_key: &str,
@@ -1251,7 +3270,12 @@ pub(crate) fn bind_asr_key_to_host(
     if !incoming_key.trim().is_empty() {
         return incoming_key.to_string();
     }
-    if crate::asr::asr_host_changed(previous_url, next_url) {
+    let host_changed = if provider == crate::engine::EngineProvider::Custom {
+        crate::llm::custom_connection_origin_changed(previous_url, next_url)
+    } else {
+        crate::asr::asr_host_changed(previous_url, next_url)
+    };
+    if host_changed {
         String::new()
     } else {
         previous_key.to_string()
@@ -1259,6 +3283,7 @@ pub(crate) fn bind_asr_key_to_host(
 }
 
 pub(crate) fn bind_cleanup_key_to_host(
+    provider: crate::engine::EngineProvider,
     previous_url: &str,
     next_url: &str,
     incoming_key: &str,
@@ -1267,7 +3292,12 @@ pub(crate) fn bind_cleanup_key_to_host(
     if !incoming_key.trim().is_empty() {
         return incoming_key.to_string();
     }
-    if crate::llm::chat_host_changed(previous_url, next_url) {
+    let host_changed = if provider == crate::engine::EngineProvider::Custom {
+        crate::llm::custom_connection_origin_changed(previous_url, next_url)
+    } else {
+        crate::llm::chat_host_changed(previous_url, next_url)
+    };
+    if host_changed {
         String::new()
     } else {
         previous_key.to_string()
@@ -1277,10 +3307,81 @@ pub(crate) fn bind_cleanup_key_to_host(
 /// Settings exposed to the webview. The backend keeps the real credential in
 /// memory/keychain, while the UI only receives whether one is configured and a
 /// non-sensitive hint for display.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CustomCredentialRecoveryScope {
+    pub origin: String,
+    pub purpose: CustomCredentialPurpose,
+    pub asr_active: bool,
+    pub cleanup_active: bool,
+    pub include_asr_legacy: bool,
+    pub include_cleanup_legacy: bool,
+}
+
+fn canonical_http_origin(base_url: &str) -> Option<String> {
+    let base_url = base_url.trim();
+    if base_url.is_empty() {
+        return None;
+    }
+    let candidate = if base_url.contains("://") {
+        base_url.to_owned()
+    } else {
+        format!("https://{base_url}")
+    };
+    let url = reqwest::Url::parse(&candidate).ok()?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return None;
+    }
+    Some(url.origin().ascii_serialization())
+}
+
+/// Build the only safe legacy-alias set for a foreground Custom reread.
+/// The primary Custom account remains first. Legacy ASR/cleanup accounts are
+/// eligible only while their own route currently uses Custom, and both active
+/// Custom purposes must resolve to the same valid origin.
+pub fn custom_credential_recovery_scope(
+    settings: &Settings,
+    purpose: CustomCredentialPurpose,
+) -> Option<CustomCredentialRecoveryScope> {
+    let asr_custom_active = settings.asr_provider.is_custom();
+    let cleanup_custom_active = settings.cleanup_enabled && settings.cleanup_provider.is_custom();
+    let requested_purpose_is_active = match purpose {
+        CustomCredentialPurpose::Asr => asr_custom_active,
+        CustomCredentialPurpose::Cleanup => cleanup_custom_active,
+    };
+    if !requested_purpose_is_active {
+        return None;
+    }
+
+    let origin = canonical_http_origin(
+        &settings.resolved_provider_base(crate::engine::EngineProvider::Custom),
+    )?;
+    // Legacy account names do not identify an origin. Only consult each one
+    // when that purpose's saved endpoint independently proves the same origin.
+    let include_asr_legacy = asr_custom_active
+        && canonical_http_origin(&settings.asr_base_url).as_deref() == Some(origin.as_str());
+    let include_cleanup_legacy = cleanup_custom_active
+        && canonical_http_origin(&settings.cleanup_base_url).as_deref() == Some(origin.as_str());
+    Some(CustomCredentialRecoveryScope {
+        origin,
+        purpose,
+        asr_active: asr_custom_active,
+        cleanup_active: cleanup_custom_active,
+        include_asr_legacy,
+        include_cleanup_legacy,
+    })
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ProviderKeyView {
+    /// A credential string is currently available in this process.
     pub configured: bool,
     pub hint: Option<String>,
+    /// Last Keychain resolution, kept separate from current session memory.
+    pub keychain_state: CredentialReadState,
 }
 
 fn credential_hint(key: &str) -> Option<String> {
@@ -1288,8 +3389,29 @@ fn credential_hint(key: &str) -> Option<String> {
     if key.is_empty() {
         return None;
     }
+    if key.chars().count() <= 5 {
+        return Some("••••".into());
+    }
     let tail: String = key.chars().rev().take(5).collect();
     Some(format!("••••{}", tail.chars().rev().collect::<String>()))
+}
+
+pub(crate) fn add_manual_dictionary_words(settings: &mut Settings, words: &[String]) -> usize {
+    words
+        .iter()
+        .filter(|word| settings.add_dictionary_source(word, DictionarySource::Manual))
+        .count()
+}
+
+pub(crate) fn remove_dictionary_word(settings: &mut Settings, word: &str) -> bool {
+    settings.remove_dictionary_word(word)
+}
+
+pub(crate) fn reconcile_dictionary_patch(
+    settings: &mut Settings,
+    requested: Vec<String>,
+) -> Vec<String> {
+    settings.reconcile_dictionary_patch(requested)
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1297,8 +3419,10 @@ pub struct SettingsView {
     pub schema_version: u32,
     pub api_key_configured: bool,
     pub api_key_hint: Option<String>,
+    pub api_key_keychain_state: CredentialReadState,
     pub asr_api_key_configured: bool,
     pub asr_api_key_hint: Option<String>,
+    pub asr_api_key_keychain_state: CredentialReadState,
     pub asr_base_url: String,
     pub asr_provider: crate::engine::EngineProvider,
     pub asr_model: String,
@@ -1307,9 +3431,11 @@ pub struct SettingsView {
     pub cleanup_base_url: String,
     pub cleanup_api_key_configured: bool,
     pub cleanup_api_key_hint: Option<String>,
+    pub cleanup_api_key_keychain_state: CredentialReadState,
     pub custom_base_url: String,
     pub custom_asr: bool,
     pub custom_llm: bool,
+    pub custom_cleanup_parameters: crate::custom_cleanup_parameters::Parameters,
     pub ollama_base_url: String,
     pub strict_offline_enabled: bool,
     pub local_whisper_base_url: String,
@@ -1351,6 +3477,7 @@ pub struct SettingsView {
     pub selected_action_hotkey: String,
     pub selected_actions_enabled: bool,
     pub dictionary_learn_enabled: bool,
+    pub local_edit_learning_enabled: bool,
     pub input_device: String,
     pub input_gain: f32,
     pub verbatim_hotkey: String,
@@ -1371,12 +3498,26 @@ fn provider_key_views(settings: &Settings) -> std::collections::BTreeMap<String,
     crate::providers::EngineProvider::ALL
         .into_iter()
         .map(|provider| {
-            let secret = settings.provider_secret(provider);
+            let secret = if provider.is_custom() && settings.session_only_custom_credential {
+                let asr = settings.asr_credential();
+                if !asr.is_empty() {
+                    asr
+                } else {
+                    settings.cleanup_credential()
+                }
+            } else {
+                settings.provider_secret(provider)
+            };
             (
                 provider.as_str().to_owned(),
                 ProviderKeyView {
                     configured: !secret.is_empty(),
                     hint: credential_hint(secret),
+                    keychain_state: if provider.is_custom() {
+                        settings.custom_credential_read_state()
+                    } else {
+                        settings.credential_read_state_for_slot(provider.keychain_account(), secret)
+                    },
                 },
             )
         })
@@ -1389,8 +3530,12 @@ impl From<&Settings> for SettingsView {
             schema_version: settings.schema_version,
             api_key_configured: !settings.api_key.is_empty(),
             api_key_hint: credential_hint(&settings.api_key),
+            api_key_keychain_state: settings
+                .credential_read_state_for_slot("groq_api_key", &settings.api_key),
             asr_api_key_configured: !settings.asr_api_key.trim().is_empty(),
             asr_api_key_hint: credential_hint(&settings.asr_api_key),
+            asr_api_key_keychain_state: settings
+                .credential_read_state_for_slot("asr_api_key", &settings.asr_api_key),
             asr_base_url: settings.asr_base_url.clone(),
             asr_provider: settings.asr_provider,
             asr_model: crate::asr::resolve_asr_model(&settings.asr_model).to_owned(),
@@ -1399,9 +3544,12 @@ impl From<&Settings> for SettingsView {
             cleanup_base_url: settings.cleanup_base_url.clone(),
             cleanup_api_key_configured: !settings.cleanup_api_key.trim().is_empty(),
             cleanup_api_key_hint: credential_hint(&settings.cleanup_api_key),
+            cleanup_api_key_keychain_state: settings
+                .credential_read_state_for_slot("cleanup_api_key", &settings.cleanup_api_key),
             custom_base_url: settings.custom_base_url.clone(),
             custom_asr: settings.custom_asr,
             custom_llm: settings.custom_llm,
+            custom_cleanup_parameters: settings.custom_cleanup_parameters.clone(),
             ollama_base_url: settings.ollama_base_url.clone(),
             strict_offline_enabled: settings.strict_offline_enabled,
             local_whisper_base_url: settings.local_whisper_base_url.clone(),
@@ -1443,6 +3591,7 @@ impl From<&Settings> for SettingsView {
             selected_action_hotkey: settings.selected_action_hotkey.clone(),
             selected_actions_enabled: settings.selected_actions_enabled,
             dictionary_learn_enabled: settings.dictionary_learn_enabled,
+            local_edit_learning_enabled: settings.local_edit_learning_enabled,
             input_device: settings.input_device.clone(),
             input_gain: settings.input_gain,
             verbatim_hotkey: settings.verbatim_hotkey.clone(),
@@ -1471,6 +3620,21 @@ pub struct HistoryItem {
     /// Provider-supplied cleanup candidate kept distinct from the ASR text and
     /// VoiceFlow's final guarded output. Null when the provider supplied none.
     pub provider_cleaned_candidate: Option<String>,
+    /// Complete cleanup text rejected by a semantic preservation guard.
+    /// Separate from provider_cleaned_candidate, which can belong to ASR.
+    pub cleanup_rejected_candidate: Option<String>,
+    /// Stage-qualified, non-sensitive preservation reason code.
+    pub cleanup_guard_reason: Option<String>,
+    /// Nullable provenance; None means this legacy/edited row has unknown provenance.
+    #[serde(default)]
+    pub cleanup_attempt_kind: Option<String>,
+    /// None is unknown for legacy rows; Some([]) is an observed no-transform result.
+    #[serde(default)]
+    pub cleanup_transformations: Option<Vec<String>>,
+    #[serde(default)]
+    pub cleanup_final_guard_reason: Option<String>,
+    #[serde(default)]
+    pub cleanup_failure_reason: Option<String>,
     /// ASR provider/model that produced the selected transcript, when known.
     pub engine: Option<String>,
     pub final_text: String,
@@ -1519,10 +3683,6 @@ pub struct Usage {
     pub audio_seconds: f64,
     pub quota: QuotaView,
 }
-#[allow(dead_code)]
-pub const ASR_DAILY_LIMIT: i64 = 2000;
-#[allow(dead_code)]
-pub const LLM_DAILY_LIMIT: i64 = 1000;
 pub const MAX_SPOOL_BYTES: u64 = 256 * 1024 * 1024;
 pub const MAX_GOLD_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const SPOOL_MANIFEST_VERSION: u32 = 1;
@@ -1572,6 +3732,75 @@ fn spool_manifest_age_secs(manifest: &SpoolManifest, now_ms: u64) -> Option<u64>
     Some((now_ms - manifest.created_at_ms) / 1_000)
 }
 
+fn spool_session_expired(
+    manifest: Option<&SpoolManifest>,
+    keep_audio_days: u64,
+    now_ms: u64,
+) -> bool {
+    let max_age = keep_audio_days.saturating_mul(86_400);
+    keep_audio_days == 0
+        || manifest
+            .and_then(|manifest| spool_manifest_age_secs(manifest, now_ms))
+            .is_none_or(|age| age > max_age)
+}
+
+fn spool_flat_artifact_expired(
+    path: &Path,
+    keep_audio_days: u64,
+    now_ms: u64,
+) -> anyhow::Result<bool> {
+    if keep_audio_days == 0 {
+        return Ok(true);
+    }
+    let modified_ms = fs::symlink_metadata(path)?
+        .modified()?
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_millis() as u64);
+    let max_age_secs = keep_audio_days.saturating_mul(86_400);
+    Ok(modified_ms.is_none_or(|modified| {
+        modified > now_ms || now_ms.saturating_sub(modified) / 1_000 > max_age_secs
+    }))
+}
+
+/// Expire spool artifacts without rebuilding audio or promoting History.
+/// The caller may provide a deterministic clock; all filesystem work still
+/// runs under the root mutation and RecoverySpool commit fences.
+pub(crate) fn expire_spool(
+    dir: &Path,
+    keep_audio_days: u64,
+    now_ms: impl FnOnce() -> u64,
+) -> anyhow::Result<()> {
+    let _mutation = begin_spool_root_mutation(dir)?;
+    let _commit = try_spool_io_commit_scope(dir, SpoolIoScope::RecoverySpool)?;
+    let now_ms = now_ms();
+    let root = dir.join("spool");
+    if !root.exists() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(&root)? {
+        let entry = entry?;
+        let path = entry.path();
+        if entry.file_type()?.is_dir() {
+            if spool_session_is_leased(&path) {
+                continue;
+            }
+            let manifest = match load_manifest(&path) {
+                Ok(manifest) if manifest.schema_version == SPOOL_MANIFEST_VERSION => Some(manifest),
+                _ => None,
+            };
+            if spool_session_expired(manifest.as_ref(), keep_audio_days, now_ms) {
+                fs::remove_dir_all(path)?;
+            }
+        } else if !spool_artifact_is_leased(&path)
+            && spool_flat_artifact_expired(&path, keep_audio_days, now_ms)?
+        {
+            fs::remove_file(path)?;
+        }
+    }
+    Ok(())
+}
+
 fn is_safe_spool_path(root: &Path, path: &Path) -> bool {
     path.starts_with(root)
         && !path
@@ -1592,10 +3821,39 @@ fn managed_audio_exists(dir: &Path, path: &Path) -> bool {
 }
 
 fn spool_size(path: &Path) -> anyhow::Result<u64> {
-    if !path.exists() {
-        return Ok(0);
+    if spool_session_is_leased(path) {
+        return spool_size_live_owner_snapshot(path);
     }
-    let metadata = fs::symlink_metadata(path)?;
+    spool_size_walk(path)
+}
+
+fn spool_size_live_owner_snapshot(path: &Path) -> anyhow::Result<u64> {
+    // Quota checks read lengths only. Audio chunks and manifests become
+    // visible by atomic rename, and any in-progress temp file is counted
+    // conservatively; recovery and content readers use the typed busy guard.
+    spool_size_walk(path)
+}
+
+fn spool_size_walk(path: &Path) -> anyhow::Result<u64> {
+    #[cfg(test)]
+    match take_spool_quota_scan_fault_for_test(path) {
+        Some(SpoolQuotaScanFault::Error) => {
+            anyhow::bail!("injected spool quota scan failure");
+        }
+        Some(SpoolQuotaScanFault::Panic) => panic!("injected spool quota scan panic"),
+        None => {}
+    }
+    #[cfg(test)]
+    wait_for_spool_size_walk_test_gate(path);
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        // Atomic replacement and a sibling owner's scoped cleanup may remove
+        // an entry after read_dir yielded it. Their quota reservations remain
+        // charged until their actual writes return, so a disappeared entry is
+        // freed space rather than an unaccounted in-flight write.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error.into()),
+    };
     if metadata.is_file() {
         return Ok(metadata.len());
     }
@@ -1603,8 +3861,18 @@ fn spool_size(path: &Path) -> anyhow::Result<u64> {
         return Ok(0);
     }
     let mut total: u64 = 0;
-    for entry in fs::read_dir(path)? {
-        total = total.saturating_add(spool_size(&entry?.path())?);
+    let entries = match fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error.into()),
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        total = total.saturating_add(spool_size_walk(&entry.path())?);
     }
     Ok(total)
 }
@@ -1685,6 +3953,82 @@ fn decrypt_spool_bytes(bytes: &[u8], key: &[u8]) -> anyhow::Result<Vec<u8>> {
 /// readable; encrypted artifacts require the history key and are never
 /// returned as ciphertext.
 pub fn read_spool_file(path: &Path) -> anyhow::Result<Vec<u8>> {
+    let Some(key) = spool_session_key_for_artifact(path) else {
+        let bytes = fs::read(path)?;
+        if bytes.starts_with(SPOOL_ENVELOPE_MAGIC) {
+            anyhow::bail!("invalid spool file path");
+        }
+        return Ok(bytes);
+    };
+    let data_root = session_data_root(&key)?;
+    let _mutation = begin_spool_root_mutation(&data_root)?;
+    let lease = reserve_spool_session_path(&key, false, spool_lease_kind_for_artifact(path, &key))?;
+    let _commit = try_spool_io_commit_audio_session(&lease)?;
+    let bytes = fs::read(path)?;
+    if bytes.starts_with(SPOOL_ENVELOPE_MAGIC) {
+        let key = crate::keychain::get_history_key()
+            .map_err(anyhow::Error::msg)?
+            .ok_or_else(|| anyhow::anyhow!("history encryption key is unavailable"))?;
+        return decrypt_spool_bytes(&bytes, &key);
+    }
+    drop(lease);
+    Ok(bytes)
+}
+
+/// Read a managed retry artifact with an explicit plaintext and on-disk size
+/// cap. The retry command runs this from the retained audio owner so a slow
+/// filesystem read cannot occupy an async runtime worker.
+pub fn read_spool_file_limited(path: &Path, max_plaintext_bytes: usize) -> anyhow::Result<Vec<u8>> {
+    let key = spool_session_key_for_artifact(path);
+    let _mutation = if let Some(key) = key.as_ref() {
+        Some(begin_spool_root_mutation(&session_data_root(key)?)?)
+    } else {
+        None
+    };
+    let _lease = key
+        .as_ref()
+        .map(|key| reserve_spool_session_path(key, false, spool_lease_kind_for_artifact(path, key)))
+        .transpose()?;
+    let _commit = _lease
+        .as_ref()
+        .map(try_spool_io_commit_audio_session)
+        .transpose()?;
+    let stored_limit = max_plaintext_bytes.saturating_add(SPOOL_ENVELOPE_HEADER_LEN);
+    let file = File::open(path)?;
+    if file.metadata()?.len() > stored_limit as u64 {
+        anyhow::bail!("audio retry artifact exceeds the bounded read size");
+    }
+    let mut bytes = Vec::new();
+    file.take(stored_limit.saturating_add(1) as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > stored_limit {
+        anyhow::bail!("audio retry artifact exceeds the bounded read size");
+    }
+    let plaintext = if bytes.starts_with(SPOOL_ENVELOPE_MAGIC) {
+        if key.is_none() {
+            anyhow::bail!("invalid spool file path");
+        }
+        let encryption_key = crate::keychain::get_history_key()
+            .map_err(anyhow::Error::msg)?
+            .ok_or_else(|| anyhow::anyhow!("history encryption key is unavailable"))?;
+        decrypt_spool_bytes(&bytes, &encryption_key)?
+    } else {
+        bytes
+    };
+    if plaintext.len() > max_plaintext_bytes {
+        anyhow::bail!("audio retry artifact exceeds the bounded read size");
+    }
+    Ok(plaintext)
+}
+
+pub(crate) fn read_audio_spool_file(
+    lease: &AudioSpoolSessionLease,
+    path: &Path,
+) -> anyhow::Result<Vec<u8>> {
+    if !path.starts_with(lease.session_dir()) || !spool_lease_can_write(lease) {
+        anyhow::bail!("audio spool lease does not own the requested file");
+    }
+    let _commit = try_spool_io_commit_audio_session(lease)?;
     let bytes = fs::read(path)?;
     if bytes.starts_with(SPOOL_ENVELOPE_MAGIC) {
         let key = crate::keychain::get_history_key()
@@ -1699,6 +4043,151 @@ pub fn read_spool_file(path: &Path) -> anyhow::Result<Vec<u8>> {
 /// app-owned spool directory. The quota is checked before writing and the
 /// final filename is installed with an atomic rename.
 pub fn write_spool_file(dir: &Path, relative: &Path, bytes: &[u8]) -> anyhow::Result<PathBuf> {
+    let key = spool_session_key_for_relative(dir, relative)?;
+    let lease = reserve_spool_session_path(
+        &key,
+        false,
+        if relative.components().count() > 1 {
+            SpoolLeaseKind::Session
+        } else {
+            SpoolLeaseKind::Artifact
+        },
+    )?;
+    if !spool_lease_can_write(&lease) {
+        anyhow::bail!("spool session deletion is pending");
+    }
+    write_spool_file_encrypted(dir, relative, bytes, Some(&lease))
+}
+
+/// Persist a chunk for the one audio worker that owns the session lease.
+/// Other readers and writers receive a typed busy error for this path.
+pub(crate) fn write_audio_spool_file(
+    lease: &AudioSpoolSessionLease,
+    dir: &Path,
+    relative: &Path,
+    bytes: &[u8],
+) -> anyhow::Result<PathBuf> {
+    let target = validated_spool_target(dir, relative)?;
+    let spool_root = dir.join("spool");
+    if lease.session_dir().parent() != Some(spool_root.as_path())
+        || !target.starts_with(lease.session_dir())
+        || !spool_lease_can_write(lease)
+    {
+        anyhow::bail!("audio spool lease does not own the requested path");
+    }
+    write_spool_file_encrypted(dir, relative, bytes, Some(lease))
+}
+
+/// Commit one PCM chunk and its manifest interval under a single derived
+/// session scope. A whole-tree scan/retention permit cannot interleave between
+/// the chunk rename and the manifest ACK, while another leased session remains
+/// free to make progress.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn write_audio_spool_chunk_with_samples(
+    lease: &AudioSpoolSessionLease,
+    dir: &Path,
+    session_dir: &Path,
+    relative: &Path,
+    index: usize,
+    start_secs: f32,
+    end_secs: f32,
+    status: &str,
+    source_start_sample: u64,
+    sample_count: u64,
+    bytes: &[u8],
+) -> anyhow::Result<PathBuf> {
+    let target = validated_spool_target(dir, relative)?;
+    let spool_root = dir.join("spool");
+    if lease.session_dir() != session_dir
+        || lease.session_dir().parent() != Some(spool_root.as_path())
+        || !target.starts_with(lease.session_dir())
+        || !spool_lease_can_write(lease)
+    {
+        anyhow::bail!("audio spool lease does not own the requested chunk");
+    }
+    if sample_count == 0 || source_start_sample.checked_add(sample_count).is_none() {
+        anyhow::bail!("invalid recovery chunk sample interval");
+    }
+    let _commit = try_spool_io_commit_audio_session(lease)?;
+    let encryption_enabled = spool_encryption_enabled();
+    let encryption_key = if encryption_enabled {
+        Some(history_encryption_key_for_write()?)
+    } else {
+        None
+    };
+    let stored_bytes = if encryption_enabled {
+        let key = encryption_key
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("history encryption key is unavailable"))?;
+        encrypt_spool_bytes(bytes, key)?
+    } else {
+        bytes.to_vec()
+    };
+    let path = write_spool_file_after_admission(&spool_root, &target, &stored_bytes, Some(lease))?;
+    record_spool_chunk_inner(
+        session_dir,
+        index,
+        start_secs,
+        end_secs,
+        status,
+        Some((source_start_sample, sample_count)),
+    )?;
+    Ok(path)
+}
+
+fn validated_spool_target(dir: &Path, relative: &Path) -> anyhow::Result<PathBuf> {
+    if relative.as_os_str().is_empty()
+        || relative.is_absolute()
+        || relative
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        anyhow::bail!("invalid spool path");
+    }
+    Ok(dir.join("spool").join(relative))
+}
+
+fn spool_session_key_for_relative(dir: &Path, relative: &Path) -> anyhow::Result<PathBuf> {
+    if relative.as_os_str().is_empty()
+        || relative.is_absolute()
+        || relative
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        anyhow::bail!("invalid spool path");
+    }
+    let first = relative
+        .components()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("invalid spool path"))?;
+    Ok(dir.join("spool").join(first.as_os_str()))
+}
+
+fn spool_session_key_for_artifact(path: &Path) -> Option<PathBuf> {
+    let managed_root = path.ancestors().find(|ancestor| {
+        ancestor
+            .file_name()
+            .is_some_and(|name| name == "spool" || name == "gold")
+    })?;
+    let relative = path.strip_prefix(managed_root).ok()?;
+    let first = relative.components().next()?;
+    Some(managed_root.join(first.as_os_str()))
+}
+
+fn spool_lease_kind_for_artifact(path: &Path, owner_path: &Path) -> SpoolLeaseKind {
+    if path == owner_path && !path.is_dir() {
+        SpoolLeaseKind::Artifact
+    } else {
+        SpoolLeaseKind::Session
+    }
+}
+
+fn write_spool_file_encrypted(
+    dir: &Path,
+    relative: &Path,
+    bytes: &[u8],
+    owner: Option<&AudioSpoolSessionLease>,
+) -> anyhow::Result<PathBuf> {
     let encryption_enabled = spool_encryption_enabled();
     let encryption_key = if encryption_enabled {
         Some(history_encryption_key_for_write()?)
@@ -1711,6 +4200,7 @@ pub fn write_spool_file(dir: &Path, relative: &Path, bytes: &[u8]) -> anyhow::Re
         bytes,
         encryption_enabled,
         encryption_key.as_ref().map(|key| key.as_slice()),
+        owner,
     )
 }
 
@@ -1720,6 +4210,7 @@ fn write_spool_file_internal(
     bytes: &[u8],
     encryption_enabled: bool,
     encryption_key: Option<&[u8]>,
+    owner: Option<&AudioSpoolSessionLease>,
 ) -> anyhow::Result<PathBuf> {
     if relative.as_os_str().is_empty()
         || relative.is_absolute()
@@ -1731,6 +4222,23 @@ fn write_spool_file_internal(
     }
     let root = dir.join("spool");
     let path = root.join(relative);
+    if spool_artifact_is_leased(&path)
+        && !owner.is_some_and(|lease| {
+            path.starts_with(lease.session_dir()) && spool_lease_can_write(lease)
+        })
+    {
+        anyhow::bail!("spool session is still owned by an audio worker");
+    }
+    if owner.is_some_and(|lease| {
+        !path.starts_with(lease.session_dir()) || !spool_lease_can_write(lease)
+    }) {
+        anyhow::bail!("audio spool lease does not own the requested path");
+    }
+    let _commit = if let Some(lease) = owner {
+        try_spool_io_commit_audio_session(lease)?
+    } else {
+        try_spool_io_commit_scope(dir, SpoolIoScope::RecoverySpool)?
+    };
     let stored_bytes = if encryption_enabled {
         let key = encryption_key
             .ok_or_else(|| anyhow::anyhow!("history encryption key is unavailable"))?;
@@ -1738,23 +4246,33 @@ fn write_spool_file_internal(
     } else {
         bytes.to_vec()
     };
-    let current = spool_size(&root)?;
-    let existing = fs::symlink_metadata(&path)
-        .map(|metadata| metadata.len())
-        .unwrap_or(0);
-    if current
-        .saturating_sub(existing)
-        .saturating_add(stored_bytes.len() as u64)
-        > MAX_SPOOL_BYTES
-    {
-        anyhow::bail!("audio spool quota exceeded");
+    write_spool_file_after_admission(&root, &path, &stored_bytes, owner)
+}
+
+fn write_spool_file_after_admission(
+    root: &Path,
+    path: &Path,
+    stored_bytes: &[u8],
+    owner: Option<&AudioSpoolSessionLease>,
+) -> anyhow::Result<PathBuf> {
+    // The reservation covers the recursive tree measurement and remains
+    // charged until the real filesystem operation returns. Concurrent live
+    // sessions can therefore use disjoint path permits without overshooting
+    // the shared spool quota.
+    let _quota = reserve_recovery_spool_bytes(root, stored_bytes.len() as u64)?;
+    #[cfg(test)]
+    if let Some(lease) = owner {
+        wait_for_spool_write_after_quota_reservation_for_test(lease.session_dir());
     }
     let parent = path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("invalid spool path"))?;
     ensure_private_dir(parent)?;
-    write_atomic_bytes(&path, &stored_bytes)?;
-    Ok(path)
+    if owner.is_some_and(|lease| !spool_lease_can_write(lease)) {
+        anyhow::bail!("audio spool lease was revoked before file commit");
+    }
+    write_atomic_bytes(path, stored_bytes)?;
+    Ok(path.to_path_buf())
 }
 
 /// Persist a successful-dictation WAV under `gold/`. Quota is independent of
@@ -1777,6 +4295,8 @@ pub fn write_gold_file(dir: &Path, file_name: &str, bytes: &[u8]) -> anyhow::Res
     };
     let root = gold_root(dir);
     let path = root.join(relative);
+    let lease = reserve_spool_session_path(&path, false, SpoolLeaseKind::Artifact)?;
+    let _commit = try_spool_io_commit_scope(dir, SpoolIoScope::GoldAudio)?;
     let stored_bytes = if encryption_enabled {
         let key = encryption_key
             .as_ref()
@@ -1797,15 +4317,83 @@ pub fn write_gold_file(dir: &Path, file_name: &str, bytes: &[u8]) -> anyhow::Res
         anyhow::bail!("gold audio quota exceeded");
     }
     ensure_private_dir(&root)?;
+    if !spool_lease_can_write(&lease) {
+        anyhow::bail!("gold audio deletion is pending");
+    }
     write_atomic_bytes(&path, &stored_bytes)?;
     Ok(path)
 }
 
+pub(crate) fn delete_audio_spool_session(lease: &AudioSpoolSessionLease) -> anyhow::Result<()> {
+    if !spool_lease_is_current(lease) {
+        anyhow::bail!("audio spool lease no longer owns this session");
+    }
+    let _commit = try_spool_io_commit_audio_session_cleanup(lease)?;
+    let parent = lease
+        .session_dir()
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("invalid audio spool session path"))?;
+    match fs::remove_dir_all(lease.session_dir()) {
+        Ok(()) => sync_directory(parent),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Settle a capture spool after its History transaction has a durable SQLite
+/// ACK. The pending intent remains available until this owner cleanup finishes,
+/// so startup can repeat the cleanup without inserting another History row.
+fn settle_capture_spool_after_history_ack(
+    data_root: &Path,
+    session_id: &str,
+    history_audio_path: Option<&Path>,
+) -> anyhow::Result<bool> {
+    if !valid_spool_session_id(session_id) {
+        anyhow::bail!("invalid capture spool identity in History intent");
+    }
+    let session_dir = data_root.join("spool").join(session_id);
+    match fs::symlink_metadata(&session_dir) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+        Err(error) => return Err(error.into()),
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+        Ok(_) => anyhow::bail!("capture spool session is not a regular private directory"),
+    }
+    if spool_session_is_leased(&session_dir) {
+        return Ok(false);
+    }
+    let lease = match lease_spool_session(&session_dir) {
+        Ok(lease) => lease,
+        Err(error) if error.to_string().contains("already owned") => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let recovery_path = session_dir.join("recovery.wav");
+    let retain_recovery = history_audio_path == Some(recovery_path.as_path());
+    if retain_recovery {
+        mark_audio_spool_status(&lease, &session_dir, "recoverable")?;
+    } else {
+        mark_audio_spool_status(&lease, &session_dir, "completed")?;
+        delete_audio_spool_session(&lease)?;
+    }
+    Ok(true)
+}
+
 fn write_atomic_bytes(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    write_atomic_bytes_with_parent_mode(path, bytes, true)
+}
+
+fn write_atomic_bytes_with_parent_mode(
+    path: &Path,
+    bytes: &[u8],
+    private_parent: bool,
+) -> anyhow::Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("invalid atomic path"))?;
-    ensure_private_dir(parent)?;
+    if private_parent {
+        ensure_private_dir(parent)?;
+    } else {
+        fs::create_dir_all(parent)?;
+    }
     let name = path
         .file_name()
         .ok_or_else(|| anyhow::anyhow!("invalid atomic filename"))?
@@ -1816,8 +4404,12 @@ fn write_atomic_bytes(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
         restrict_file_mode(&tmp)?;
         file.write_all(bytes)?;
         file.sync_all()?;
+        #[cfg(test)]
+        wait_for_atomic_rename_test_gate(&tmp);
         fs::rename(&tmp, path)?;
         restrict_file_mode(path)?;
+        file.sync_all()?;
+        sync_atomic_parent_directory(parent)?;
         Ok(())
     })();
     if write_result.is_err() {
@@ -1838,30 +4430,36 @@ fn load_manifest(session_dir: &Path) -> anyhow::Result<SpoolManifest> {
 
 fn save_manifest(session_dir: &Path, manifest: &SpoolManifest) -> anyhow::Result<()> {
     let bytes = serde_json::to_vec_pretty(manifest)?;
+    let data_root = session_data_root(session_dir)?;
+    let _quota = reserve_recovery_spool_bytes(&data_root.join("spool"), bytes.len() as u64)?;
     write_atomic_bytes(&manifest_path(session_dir), &bytes)
 }
 
+#[cfg(test)]
 pub fn begin_spool_session(root: &Path, session_id: &str) -> anyhow::Result<PathBuf> {
-    if session_id.trim().is_empty()
-        || Path::new(session_id)
-            .components()
-            .any(|component| !matches!(component, Component::Normal(_)))
-    {
+    let (session_dir, reservation) = begin_audio_spool_session(root, session_id)?;
+    initialize_audio_spool_session(&reservation)?;
+    if reservation.deletion_requested() {
+        anyhow::bail!("spool session was removed while it was being initialized");
+    }
+    drop(reservation);
+    Ok(session_dir)
+}
+
+/// Reserve a fresh live capture path without doing filesystem work. The
+/// bounded spool owner initializes it after audio capture has started; an
+/// existing recovery path is then rejected with exclusive `create_dir`.
+pub(crate) fn begin_audio_spool_session(
+    root: &Path,
+    session_id: &str,
+) -> anyhow::Result<(PathBuf, AudioSpoolSessionLease)> {
+    if !valid_spool_session_id(session_id) {
         anyhow::bail!("invalid spool session id");
     }
-    let session_dir = root.join("spool").join(session_id);
-    ensure_private_dir(&session_dir)?;
-    save_manifest(
-        &session_dir,
-        &SpoolManifest {
-            schema_version: SPOOL_MANIFEST_VERSION,
-            session_id: session_id.to_owned(),
-            created_at_ms: now_ms(),
-            status: "active".into(),
-            chunks: Vec::new(),
-        },
-    )?;
-    Ok(session_dir)
+    let requested_path = root.join("spool").join(session_id);
+    let lease = reserve_spool_session_path(&requested_path, true, SpoolLeaseKind::Session)?;
+    let session_dir = lease.session_dir().to_path_buf();
+    Ok((session_dir, lease))
 }
 
 /// Persist one complete WAV as a recoverable spool session. This is used when
@@ -1875,21 +4473,53 @@ pub fn persist_recovery_wav_session(
     let duration_secs = crate::asr::wav_duration_seconds(wav)
         .filter(|duration| duration.is_finite() && *duration > 0.0)
         .ok_or_else(|| anyhow::anyhow!("recovery WAV duration could not be read"))?;
-    let session_dir = begin_spool_session(root, session_id)?;
-    let result = (|| {
-        let audio_path = write_spool_session_file(&session_dir, "recovery.wav", wav)?;
-        mark_spool_status(&session_dir, "recoverable")?;
-        Ok(RecoveredSpool {
-            audio_path,
-            duration_secs,
-        })
-    })();
-    if result.is_err() {
-        let _ = fs::remove_dir_all(&session_dir);
-    }
-    result
+    let (session_dir, lease) = begin_audio_spool_session(root, session_id)?;
+    initialize_audio_spool_session(&lease)?;
+    let audio_path = write_audio_spool_file(
+        &lease,
+        root,
+        &PathBuf::from(session_id).join("recovery.wav"),
+        wav,
+    )?;
+    mark_audio_spool_status(&lease, &session_dir, "recoverable")?;
+    Ok(RecoveredSpool {
+        audio_path,
+        duration_secs,
+    })
 }
 
+/// Persist a complete retry WAV on behalf of the session's retained audio
+/// owner. The caller's `Vec` remains the authoritative timeline until this
+/// operation is acknowledged.
+pub(crate) fn persist_audio_spool_recovery_wav(
+    lease: &AudioSpoolSessionLease,
+    root: &Path,
+    wav: &[u8],
+) -> anyhow::Result<RecoveredSpool> {
+    if !spool_lease_can_write(lease) {
+        anyhow::bail!("audio spool lease does not own the requested session");
+    }
+    let duration_secs = crate::asr::wav_duration_seconds(wav)
+        .filter(|duration| duration.is_finite() && *duration > 0.0)
+        .ok_or_else(|| anyhow::anyhow!("recovery WAV duration could not be read"))?;
+    let session_id = lease
+        .session_dir()
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("invalid spool session path"))?;
+    let audio_path = write_audio_spool_file(
+        lease,
+        root,
+        &PathBuf::from(session_id).join("recovery.wav"),
+        wav,
+    )?;
+    mark_audio_spool_status(lease, lease.session_dir(), "recoverable")?;
+    Ok(RecoveredSpool {
+        audio_path,
+        duration_secs,
+    })
+}
+
+#[cfg(test)]
 pub fn record_spool_chunk(
     session_dir: &Path,
     index: usize,
@@ -1897,11 +4527,15 @@ pub fn record_spool_chunk(
     end_secs: f32,
     status: &str,
 ) -> anyhow::Result<()> {
+    let _lease = lease_spool_session(session_dir)?;
+    let data_root = session_data_root(session_dir)?;
+    let _commit = try_spool_io_commit_scope(&data_root, SpoolIoScope::RecoverySpool)?;
     record_spool_chunk_inner(session_dir, index, start_secs, end_secs, status, None)
 }
 
 /// Record a written chunk with exact source-timeline sample coverage.
 /// Later status-only updates through `record_spool_chunk` preserve these fields.
+#[cfg(test)]
 pub fn record_spool_chunk_with_samples(
     session_dir: &Path,
     index: usize,
@@ -1911,9 +4545,12 @@ pub fn record_spool_chunk_with_samples(
     source_start_sample: u64,
     sample_count: u64,
 ) -> anyhow::Result<()> {
+    let _lease = lease_spool_session(session_dir)?;
     if sample_count == 0 || source_start_sample.checked_add(sample_count).is_none() {
         anyhow::bail!("invalid recovery chunk sample interval");
     }
+    let data_root = session_data_root(session_dir)?;
+    let _commit = try_spool_io_commit_scope(&data_root, SpoolIoScope::RecoverySpool)?;
     record_spool_chunk_inner(
         session_dir,
         index,
@@ -1958,13 +4595,50 @@ fn record_spool_chunk_inner(
     save_manifest(session_dir, &manifest)
 }
 
+pub(crate) fn record_audio_spool_chunk_status(
+    lease: &AudioSpoolSessionLease,
+    session_dir: &Path,
+    index: usize,
+    start_secs: f32,
+    end_secs: f32,
+    status: &str,
+) -> anyhow::Result<()> {
+    if lease.session_dir() != session_dir || !spool_lease_can_write(lease) {
+        anyhow::bail!("audio spool lease does not own the requested session");
+    }
+    let _commit = try_spool_io_commit_audio_session(lease)?;
+    record_spool_chunk_inner(session_dir, index, start_secs, end_secs, status, None)
+}
+
 pub fn mark_spool_status(session_dir: &Path, status: &str) -> anyhow::Result<()> {
+    let _lease = lease_spool_session(session_dir)?;
+    let data_root = session_data_root(session_dir)?;
+    let _commit = try_spool_io_commit_scope(&data_root, SpoolIoScope::RecoverySpool)?;
+    mark_spool_status_inner(session_dir, status)
+}
+
+pub(crate) fn mark_audio_spool_status(
+    lease: &AudioSpoolSessionLease,
+    session_dir: &Path,
+    status: &str,
+) -> anyhow::Result<()> {
+    if lease.session_dir() != session_dir || !spool_lease_can_write(lease) {
+        anyhow::bail!("audio spool lease does not own the requested session");
+    }
+    let _commit = try_spool_io_commit_audio_session(lease)?;
+    mark_spool_status_inner(session_dir, status)
+}
+
+fn mark_spool_status_inner(session_dir: &Path, status: &str) -> anyhow::Result<()> {
     let mut manifest = load_manifest(session_dir)?;
     manifest.status = status.to_owned();
     save_manifest(session_dir, &manifest)
 }
 
-fn read_recovery_samples(session_dir: &Path) -> anyhow::Result<Vec<f32>> {
+fn read_recovery_samples(
+    session_dir: &Path,
+    owner: Option<&AudioSpoolSessionLease>,
+) -> anyhow::Result<Vec<f32>> {
     let chunks_dir = session_dir.join("chunks");
     if !chunks_dir.is_dir() {
         anyhow::bail!("recovery chunks are missing");
@@ -2010,7 +4684,11 @@ fn read_recovery_samples(session_dir: &Path) -> anyhow::Result<Vec<f32>> {
         .any(|chunk| chunk.source_start_sample.is_some());
     let mut decoded_chunks = Vec::with_capacity(chunks.len());
     for (index, path) in chunks {
-        let bytes = read_spool_file(&path)?;
+        let bytes = if let Some(owner) = owner {
+            read_audio_spool_file(owner, &path)?
+        } else {
+            read_spool_file(&path)?
+        };
         if bytes.len() % std::mem::size_of::<f32>() != 0 {
             anyhow::bail!("recovery audio chunk is truncated");
         }
@@ -2124,10 +4802,29 @@ fn write_spool_session_file(
     write_spool_file(root, &PathBuf::from(session_id).join(file_name), bytes)
 }
 
-fn rebuild_recovery_wav(session_dir: &Path) -> anyhow::Result<RecoveredSpool> {
-    let samples = read_recovery_samples(session_dir)?;
+fn rebuild_recovery_wav(
+    session_dir: &Path,
+    owner: Option<&AudioSpoolSessionLease>,
+) -> anyhow::Result<RecoveredSpool> {
+    let samples = read_recovery_samples(session_dir, owner)?;
     let wav = crate::chunker::encode_wav(&samples).map_err(|error| anyhow::anyhow!(error))?;
-    let audio_path = write_spool_session_file(session_dir, "recovery.wav", &wav)?;
+    let audio_path = if let Some(owner) = owner {
+        let root = session_dir
+            .parent()
+            .and_then(Path::parent)
+            .ok_or_else(|| anyhow::anyhow!("invalid spool session path"))?;
+        let session_id = session_dir
+            .file_name()
+            .ok_or_else(|| anyhow::anyhow!("invalid spool session path"))?;
+        write_audio_spool_file(
+            owner,
+            root,
+            &PathBuf::from(session_id).join("recovery.wav"),
+            &wav,
+        )?
+    } else {
+        write_spool_session_file(session_dir, "recovery.wav", &wav)?
+    };
     Ok(RecoveredSpool {
         audio_path,
         duration_secs: samples.len() as f64 / AUDIO_SAMPLE_RATE as f64,
@@ -2149,8 +4846,10 @@ fn read_existing_recovery_wav(session_dir: &Path) -> anyhow::Result<RecoveredSpo
 /// Rebuild a retryable WAV from the complete audio chunks kept for a long
 /// recording. This is also used when processing finishes in a degraded state
 /// so the user can retry the whole recording instead of losing failed chunks.
+#[cfg(test)]
 pub fn rebuild_spool_recovery(session_dir: &Path) -> anyhow::Result<RecoveredSpool> {
-    rebuild_recovery_wav(session_dir)
+    let lease = lease_spool_session(session_dir)?;
+    rebuild_recovery_wav(session_dir, Some(&lease))
 }
 
 /// Recover interrupted sessions into retryable audio artifacts. Active
@@ -2158,16 +4857,22 @@ pub fn rebuild_spool_recovery(session_dir: &Path) -> anyhow::Result<RecoveredSpo
 /// atomically-written chunks are rebuilt, while explicitly persisted single
 /// WAV recovery sessions are retained for manual retry.
 pub fn recover_spool(dir: &Path, keep_audio_days: u64) -> anyhow::Result<Vec<RecoveredSpool>> {
+    let _mutation = begin_spool_root_mutation(dir)?;
     let root = dir.join("spool");
+    if has_spool_owner_under(&root) {
+        anyhow::bail!("audio spool initialization or recovery is still owned by a worker");
+    }
     if !root.exists() {
         return Ok(Vec::new());
     }
-    let max_age = keep_audio_days.saturating_mul(86_400);
     let mut recovered = Vec::new();
     for entry in fs::read_dir(&root)? {
         let entry = entry?;
         let path = entry.path();
         if path.is_dir() {
+            if spool_session_is_leased(&path) {
+                continue;
+            }
             let manifest = match load_manifest(&path) {
                 Ok(manifest) if manifest.schema_version == SPOOL_MANIFEST_VERSION => Some(manifest),
                 Ok(manifest) => {
@@ -2192,10 +4897,7 @@ pub fn recover_spool(dir: &Path, keep_audio_days: u64) -> anyhow::Result<Vec<Rec
             // startup could extend the lifetime indefinitely. Invalid or
             // future timestamps cannot establish a trustworthy age, so expire
             // those sessions fail-closed.
-            let age = manifest
-                .as_ref()
-                .and_then(|manifest| spool_manifest_age_secs(manifest, now_ms()));
-            let expired = age.is_none_or(|age| age > max_age);
+            let expired = spool_session_expired(manifest.as_ref(), keep_audio_days, now_ms());
             let recoverable = manifest.as_ref().is_some_and(|manifest| {
                 matches!(
                     manifest.status.as_str(),
@@ -2203,7 +4905,7 @@ pub fn recover_spool(dir: &Path, keep_audio_days: u64) -> anyhow::Result<Vec<Rec
                 )
             });
             if recoverable && !expired {
-                let recovery = rebuild_recovery_wav(&path)
+                let recovery = rebuild_recovery_wav(&path, None)
                     .or_else(|chunk_error| {
                         read_existing_recovery_wav(&path).map_err(|wav_error| {
                             anyhow::anyhow!(
@@ -2228,18 +4930,79 @@ pub fn recover_spool(dir: &Path, keep_audio_days: u64) -> anyhow::Result<Vec<Rec
                 fs::remove_dir_all(path)?;
             }
         } else {
-            let age = entry
-                .metadata()
-                .and_then(|metadata| metadata.modified())
-                .ok()
-                .and_then(|modified| modified.elapsed().ok())
-                .map(|elapsed| elapsed.as_secs());
-            if age.is_none_or(|age| age > max_age) {
+            if spool_flat_artifact_expired(&path, keep_audio_days, now_ms())? {
                 fs::remove_file(path)?;
             }
         }
     }
     Ok(recovered)
+}
+
+/// Recover only the spool owned by one failed live recording. Unlike startup
+/// recovery, this path never enumerates, rewrites, or expires another session.
+pub fn recover_spool_session(
+    dir: &Path,
+    session_id: &str,
+    keep_audio_days: u64,
+) -> anyhow::Result<Option<RecoveredSpool>> {
+    if !valid_spool_session_id(session_id) {
+        anyhow::bail!("invalid spool session id");
+    }
+    let _mutation = begin_spool_root_mutation(dir)?;
+    let spool_root = dir.join("spool");
+    let session_dir = spool_root.join(session_id);
+    // A live initializer can own this ID before either directory exists.
+    // Check the memory reservation before retention shortcuts or filesystem
+    // probes so callers receive a typed busy result throughout initialization.
+    if spool_session_is_leased(&session_dir) {
+        anyhow::bail!("spool session is still owned by an audio worker");
+    }
+    // A zero-day policy means the recording is not retained at all. Do not
+    // let sub-second age truncation make a freshly written spool recoverable.
+    if keep_audio_days == 0 {
+        return Ok(None);
+    }
+    match fs::symlink_metadata(&spool_root) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+        Ok(_) => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    }
+    match fs::symlink_metadata(&session_dir) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+        Ok(_) => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    }
+    let manifest = load_manifest(&session_dir)?;
+    if manifest.schema_version != SPOOL_MANIFEST_VERSION
+        || manifest.session_id != session_id
+        || !matches!(
+            manifest.status.as_str(),
+            "active" | "recoverable" | "degraded"
+        )
+    {
+        return Ok(None);
+    }
+    let max_age = keep_audio_days.saturating_mul(86_400);
+    let Some(age) = spool_manifest_age_secs(&manifest, now_ms()) else {
+        return Ok(None);
+    };
+    if age > max_age {
+        return Ok(None);
+    }
+    let recovery = rebuild_recovery_wav(&session_dir, None)
+        .or_else(|chunk_error| {
+            read_existing_recovery_wav(&session_dir).map_err(|wav_error| {
+                anyhow::anyhow!(
+                    "chunks could not be rebuilt ({chunk_error}); stored WAV could not be read ({wav_error})"
+                )
+            })
+        })?;
+    // The WAV itself is already an independent durable artifact. A failed
+    // manifest update must not hide it from the caller's History-save attempt.
+    let _ = mark_spool_status(&session_dir, "recoverable");
+    Ok(Some(recovery))
 }
 
 fn is_safe_secret_sidecar_slot(slot: &str) -> bool {
@@ -2290,6 +5053,84 @@ pub fn clear_provider_key_sidecars(dir: &Path, provider: crate::engine::EnginePr
     if provider == crate::engine::EngineProvider::Custom {
         clear_secret_sidecar(dir, "asr_api_key");
         clear_secret_sidecar(dir, "cleanup_api_key");
+    }
+}
+
+const CUSTOM_HOST_CHANGE_CREDENTIAL_SLOTS: [&str; 3] =
+    ["provider_custom", "asr_api_key", "cleanup_api_key"];
+
+/// Remove the Custom credential and its legacy aliases before a keyless host
+/// change can be persisted. The Custom read API falls back to both legacy
+/// slots, so verify it only after every slot has been cleared.
+pub(crate) fn clear_custom_credentials_before_host_change(dir: &Path) -> anyhow::Result<()> {
+    clear_custom_credentials_before_host_change_with_backend(dir, &OsCredentialBackend)
+}
+
+fn clear_custom_credentials_before_host_change_with_backend(
+    dir: &Path,
+    backend: &dyn CredentialBackend,
+) -> anyhow::Result<()> {
+    let mut failure = None;
+    for slot in CUSTOM_HOST_CHANGE_CREDENTIAL_SLOTS {
+        if let Err(error) = backend.write(slot, "") {
+            failure.get_or_insert_with(|| {
+                anyhow::anyhow!("credential_storage: failed to clear custom {slot}: {error}")
+            });
+        }
+    }
+
+    for slot in CUSTOM_HOST_CHANGE_CREDENTIAL_SLOTS {
+        match backend.read(slot) {
+            crate::keychain::ApiKeyState::Missing => {}
+            crate::keychain::ApiKeyState::Configured(_) => {
+                failure.get_or_insert_with(|| {
+                    anyhow::anyhow!("credential_storage: custom {slot} remains after clearing")
+                });
+            }
+            crate::keychain::ApiKeyState::Unavailable(error) => {
+                failure.get_or_insert_with(|| {
+                    anyhow::anyhow!(
+                        "credential_storage: cannot verify cleared custom {slot}: {error}"
+                    )
+                });
+            }
+        }
+    }
+    if let Some(error) = failure {
+        return Err(error);
+    }
+
+    let sidecar_slots = ["provider_custom", "asr_api_key", "cleanup_api_key"];
+    for slot in sidecar_slots {
+        remove_secret_sidecar_for_host_change(dir, slot)?;
+    }
+    for slot in sidecar_slots {
+        verify_secret_sidecar_absent(dir, slot)?;
+    }
+    Ok(())
+}
+
+fn remove_secret_sidecar_for_host_change(dir: &Path, slot: &str) -> anyhow::Result<()> {
+    let path = secret_sidecar_path(dir, slot);
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(anyhow::anyhow!(
+            "credential_storage: failed to remove custom {slot} sidecar: {error}"
+        )),
+    }
+}
+
+fn verify_secret_sidecar_absent(dir: &Path, slot: &str) -> anyhow::Result<()> {
+    let path = secret_sidecar_path(dir, slot);
+    match fs::symlink_metadata(&path) {
+        Ok(_) => Err(anyhow::anyhow!(
+            "credential_storage: custom {slot} sidecar remains after clearing"
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(anyhow::anyhow!(
+            "credential_storage: cannot verify cleared custom {slot} sidecar: {error}"
+        )),
     }
 }
 
@@ -2373,7 +5214,9 @@ fn persist_secret_to_secure_store(
         crate::keychain::ApiKeyState::Configured(_) if preserve_existing => {
             anyhow::bail!("credential_storage: secure {slot} credential changed during migration")
         }
-        crate::keychain::ApiKeyState::Unavailable(error) if preserve_existing => {
+        crate::keychain::ApiKeyState::Unavailable(error)
+            if preserve_existing || !clear_replaced_sidecar =>
+        {
             anyhow::bail!("credential_storage: cannot verify existing {slot} credential: {error}")
         }
         crate::keychain::ApiKeyState::Missing
@@ -2403,6 +5246,55 @@ fn persist_secret_to_secure_store(
             anyhow::bail!("credential_storage: cannot verify secure {slot} write: {error}")
         }
     }
+}
+
+/// Adopt a value read directly from the active Groq Keychain namespace into
+/// this process only. The caller never persists this Settings snapshot.
+pub(crate) fn adopt_interactive_groq_credential(settings: &mut Settings, key: String) {
+    settings.api_key = key.clone();
+    settings
+        .provider_api_keys
+        .insert("groq".into(), key.clone());
+    settings
+        .credential_baselines
+        .insert("groq_api_key".into(), key);
+    settings
+        .unverified_credential_sources
+        .remove("settings:api_key");
+    settings
+        .unverified_credential_sources
+        .remove("sidecar:groq_api_key");
+    settings
+        .credential_read_states
+        .insert("groq_api_key".into(), CredentialReadState::Configured);
+}
+
+/// Adopt a verified Custom credential into this process only. The caller
+/// restricts reads to currently active Custom purposes sharing the captured
+/// origin; this function deliberately does not write settings or Keychain.
+pub(crate) fn adopt_interactive_custom_credential(
+    settings: &mut Settings,
+    key: String,
+    scope: CustomCredentialRecoveryScope,
+) {
+    settings
+        .provider_api_keys
+        .insert("custom".into(), key.clone());
+    settings
+        .credential_baselines
+        .insert("provider_custom".into(), key);
+    settings
+        .unverified_credential_sources
+        .remove("settings:provider:custom");
+    settings
+        .unverified_credential_sources
+        .remove("sidecar:provider_custom");
+    settings
+        .credential_read_states
+        .insert("provider_custom".into(), CredentialReadState::Configured);
+    settings.session_only_custom_credential = true;
+    settings.session_custom_credential_scope = Some(scope);
+    settings.session_custom_credential_rejected = false;
 }
 
 fn credential_source_slot(source: &str) -> Option<String> {
@@ -2459,6 +5351,16 @@ struct CredentialResolution {
     value: String,
     state: crate::keychain::ApiKeyState,
     settings_source_verified: bool,
+}
+
+fn credential_read_state_from_resolution(
+    state: &crate::keychain::ApiKeyState,
+) -> CredentialReadState {
+    match state {
+        crate::keychain::ApiKeyState::Configured(_) => CredentialReadState::Configured,
+        crate::keychain::ApiKeyState::Missing => CredentialReadState::Missing,
+        crate::keychain::ApiKeyState::Unavailable(_) => CredentialReadState::Unavailable,
+    }
 }
 
 fn resolve_legacy_credential(
@@ -2575,7 +5477,9 @@ fn load_settings_with_backend(dir: &Path, backend: &dyn CredentialBackend) -> (S
         .and_then(|bytes| serde_json::from_slice(bytes).ok())
         .unwrap_or_default();
     let schema_needs_persist = settings.schema_version < SETTINGS_SCHEMA_VERSION;
+    let dictionary_sources_need_persist = dictionary_sources_need_normalization(&settings);
     let needs_backup = schema_needs_persist
+        || dictionary_sources_need_persist
         || !settings.api_key.is_empty()
         || !settings.asr_api_key.is_empty()
         || !settings.cleanup_api_key.is_empty()
@@ -2593,7 +5497,8 @@ fn load_settings_with_backend(dir: &Path, backend: &dyn CredentialBackend) -> (S
     let hotkeys_rewritten = settings.hotkey != hotkey_before
         || settings.selected_action_hotkey != selected_action_hotkey_before;
 
-    let mut needs_persist = schema_needs_persist || hotkeys_rewritten;
+    let mut needs_persist =
+        schema_needs_persist || dictionary_sources_need_persist || hotkeys_rewritten;
     let legacy_api_key = settings.api_key.clone();
     let api_resolution = resolve_legacy_credential(
         dir,
@@ -2602,6 +5507,10 @@ fn load_settings_with_backend(dir: &Path, backend: &dyn CredentialBackend) -> (S
         (!legacy_api_key.trim().is_empty()).then_some("settings:api_key"),
         &mut settings,
         backend,
+    );
+    settings.credential_read_states.insert(
+        "groq_api_key".into(),
+        credential_read_state_from_resolution(&api_resolution.state),
     );
     settings.api_key = api_resolution.value;
     if api_resolution.settings_source_verified {
@@ -2618,6 +5527,10 @@ fn load_settings_with_backend(dir: &Path, backend: &dyn CredentialBackend) -> (S
         &mut settings,
         backend,
     );
+    settings.credential_read_states.insert(
+        "asr_api_key".into(),
+        credential_read_state_from_resolution(&asr_resolution.state),
+    );
     settings.asr_api_key = asr_resolution.value;
     if asr_resolution.settings_source_verified {
         needs_persist = true;
@@ -2632,6 +5545,10 @@ fn load_settings_with_backend(dir: &Path, backend: &dyn CredentialBackend) -> (S
         (!legacy_cleanup_key.trim().is_empty()).then_some("settings:cleanup_api_key"),
         &mut settings,
         backend,
+    );
+    settings.credential_read_states.insert(
+        "cleanup_api_key".into(),
+        credential_read_state_from_resolution(&cleanup_resolution.state),
     );
     settings.cleanup_api_key = cleanup_resolution.value;
     if cleanup_resolution.settings_source_verified {
@@ -2658,6 +5575,10 @@ fn load_settings_with_backend(dir: &Path, backend: &dyn CredentialBackend) -> (S
             source.as_deref(),
             &mut settings,
             backend,
+        );
+        settings.credential_read_states.insert(
+            provider.keychain_account().to_owned(),
+            credential_read_state_from_resolution(&resolution.state),
         );
         if resolution.settings_source_verified {
             needs_persist = true;
@@ -2760,6 +5681,40 @@ fn backup_legacy_settings(path: &Path, raw: &[u8]) -> anyhow::Result<()> {
     write_atomic_bytes(&backup, &bytes)?;
     Ok(())
 }
+
+fn backup_malformed_settings_before_write(path: &Path) -> anyhow::Result<()> {
+    let raw = match fs::read(path) {
+        Ok(raw) if serde_json::from_slice::<Settings>(&raw).is_err() => raw,
+        Ok(_) => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    let backup = path.with_file_name("settings.json.malformed.bak");
+    if backup.exists() {
+        let metadata = fs::symlink_metadata(&backup)?;
+        if !metadata.file_type().is_file() || fs::read(&backup)? != raw {
+            anyhow::bail!("malformed settings backup already exists with different contents");
+        }
+        #[cfg(unix)]
+        if metadata.permissions().mode() & 0o777 != 0o600 {
+            anyhow::bail!("malformed settings backup has unexpected permissions");
+        }
+        return Ok(());
+    }
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options.open(&backup)?;
+    file.write_all(&raw)?;
+    file.sync_all()?;
+    sync_directory(
+        backup
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("invalid settings path"))?,
+    )?;
+    Ok(())
+}
 /// Persist settings to `settings.json`. API keys are written only to the OS
 /// credential store and verified there before the settings file is updated.
 pub fn save_settings(dir: &Path, settings: &Settings) -> anyhow::Result<()> {
@@ -2774,8 +5729,55 @@ fn save_settings_with_backend(
     save_settings_with_validation(dir, settings, backend, true)
 }
 
+/// Persist a structurally valid non-service settings change without accessing
+/// credential stores. Verified credentials remain in their existing secure
+/// store; deferred legacy settings values and sidecars remain their source of
+/// truth until an explicit credential or service-route save can migrate them.
 pub fn save_configuration(dir: &Path, settings: &Settings) -> anyhow::Result<()> {
-    save_settings_with_validation(dir, settings, &OsCredentialBackend, false)
+    settings.validate_configuration()?;
+    persist_settings_without_credential_changes(dir, settings)
+}
+
+fn persist_settings_without_credential_changes(
+    dir: &Path,
+    settings: &Settings,
+) -> anyhow::Result<()> {
+    let lock = SETTINGS_WRITE_LOCK.get_or_init(|| Mutex::new(()));
+    let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    ensure_private_dir(dir)?;
+    backup_malformed_settings_before_write(&dir.join("settings.json"))?;
+
+    let mut on_disk = settings.clone();
+    on_disk.normalize_dictionary_sources();
+    on_disk.api_key.clear();
+    on_disk.asr_api_key.clear();
+    on_disk.cleanup_api_key.clear();
+    on_disk.provider_api_keys.clear();
+    for (source, value) in &settings.unverified_credential_sources {
+        let Some(field) = source.strip_prefix("settings:") else {
+            // Sidecar sources remain in place; a preference save neither
+            // reads nor removes their files.
+            continue;
+        };
+        match field {
+            "api_key" => on_disk.api_key.clone_from(value),
+            "asr_api_key" => on_disk.asr_api_key.clone_from(value),
+            "cleanup_api_key" => on_disk.cleanup_api_key.clone_from(value),
+            provider_field if provider_field.starts_with("provider:") => {
+                let provider = &provider_field["provider:".len()..];
+                if crate::providers::EngineProvider::parse(provider).is_some() {
+                    on_disk
+                        .provider_api_keys
+                        .insert(provider.to_owned(), value.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let bytes = serde_json::to_vec_pretty(&on_disk)?;
+    write_atomic_bytes(&dir.join("settings.json"), &bytes)?;
+    Ok(())
 }
 
 fn save_settings_with_validation(
@@ -2785,9 +5787,37 @@ fn save_settings_with_validation(
     check_readiness: bool,
 ) -> anyhow::Result<()> {
     settings.validate_internal(Some(&dir.join("models")), check_readiness)?;
+    persist_settings_with_backend(dir, settings, backend)
+}
+
+/// Only the typed teaching fact can change through this entry. Do not validate
+/// model availability/credentials as a prerequisite to acknowledging a guide.
+pub(crate) fn acknowledge_guide(
+    dir: &Path,
+    current: &Settings,
+    id: OnDemandGuideId,
+    version: u32,
+) -> anyhow::Result<Settings> {
+    let mut next = current.clone();
+    if next
+        .guide_acknowledgements
+        .acknowledge(id, version)
+        .map_err(anyhow::Error::msg)?
+    {
+        persist_settings_without_credential_changes(dir, &next)?;
+    }
+    Ok(next)
+}
+
+fn persist_settings_with_backend(
+    dir: &Path,
+    settings: &Settings,
+    backend: &dyn CredentialBackend,
+) -> anyhow::Result<()> {
     let lock = SETTINGS_WRITE_LOCK.get_or_init(|| Mutex::new(()));
     let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     ensure_private_dir(dir)?;
+    backup_malformed_settings_before_write(&dir.join("settings.json"))?;
     // Persist every non-empty credential before writing settings.json. A
     // legacy value may remain in memory while its migration is pending; its
     // marker prevents a transient read failure from replacing a newer secure
@@ -2834,6 +5864,9 @@ fn save_settings_with_validation(
             continue;
         }
         let slot = provider.keychain_account();
+        if provider.is_custom() && settings.session_only_custom_credential {
+            continue;
+        }
         persist_secret_to_secure_store(
             dir,
             slot,
@@ -2844,6 +5877,7 @@ fn save_settings_with_validation(
         )?;
     }
     let mut on_disk = settings.clone();
+    on_disk.normalize_dictionary_sources();
     on_disk.api_key = String::new();
     on_disk.asr_api_key = String::new();
     on_disk.cleanup_api_key = String::new();
@@ -2855,7 +5889,59 @@ fn save_settings_with_validation(
 }
 static SETTINGS_WRITE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 fn schema(c: &Connection) -> anyhow::Result<()> {
-    c.execute_batch("CREATE TABLE IF NOT EXISTS dictations (id INTEGER PRIMARY KEY, created_at TEXT NOT NULL, duration_secs REAL, raw_text TEXT, final_text TEXT, cleanup_status TEXT, engine TEXT, degraded INTEGER, degraded_reason TEXT, status TEXT, raw_audio_path TEXT, delivery_method TEXT, fallback_reason TEXT, context_profile_id TEXT, context_policy_json TEXT); CREATE TABLE IF NOT EXISTS dictation_revisions (revision_id INTEGER PRIMARY KEY, dictation_id INTEGER NOT NULL, created_at TEXT NOT NULL, final_text TEXT NOT NULL, cleanup_status TEXT, intent_json TEXT, model TEXT, context_policy_json TEXT, revision_reason TEXT NOT NULL, FOREIGN KEY(dictation_id) REFERENCES dictations(id) ON DELETE CASCADE); CREATE INDEX IF NOT EXISTS idx_dictation_revisions_dictation ON dictation_revisions(dictation_id, revision_id DESC); CREATE TABLE IF NOT EXISTS usage (day TEXT PRIMARY KEY, asr_requests INTEGER NOT NULL DEFAULT 0, llm_requests INTEGER NOT NULL DEFAULT 0, audio_seconds REAL NOT NULL DEFAULT 0);")?;
+    c.execute_batch(
+        "CREATE TABLE IF NOT EXISTS dictations (
+            id INTEGER PRIMARY KEY,
+            created_at TEXT NOT NULL,
+            duration_secs REAL,
+            raw_text TEXT,
+            final_text TEXT,
+            cleanup_status TEXT,
+            engine TEXT,
+            degraded INTEGER,
+            degraded_reason TEXT,
+            status TEXT,
+            raw_audio_path TEXT,
+            delivery_method TEXT,
+            fallback_reason TEXT,
+            context_profile_id TEXT,
+            context_policy_json TEXT
+        );
+        CREATE TABLE IF NOT EXISTS dictation_revisions (
+            revision_id INTEGER PRIMARY KEY,
+            dictation_id INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            final_text TEXT NOT NULL,
+            cleanup_status TEXT,
+            intent_json TEXT,
+            model TEXT,
+            context_policy_json TEXT,
+            revision_reason TEXT NOT NULL,
+            FOREIGN KEY(dictation_id) REFERENCES dictations(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_dictation_revisions_dictation
+            ON dictation_revisions(dictation_id, revision_id DESC);
+        CREATE TABLE IF NOT EXISTS learn_observations (
+            observation_key TEXT PRIMARY KEY,
+            source_kind TEXT NOT NULL,
+            source_history_id INTEGER,
+            source_revision_id INTEGER,
+            created_at TEXT NOT NULL,
+            rule_key TEXT,
+            dictation_origin TEXT,
+            channel TEXT,
+            proof_eligible INTEGER NOT NULL DEFAULT 0,
+            FOREIGN KEY(source_history_id) REFERENCES dictations(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_learn_observations_history
+            ON learn_observations(source_history_id);
+        CREATE TABLE IF NOT EXISTS usage (
+            day TEXT PRIMARY KEY,
+            asr_requests INTEGER NOT NULL DEFAULT 0,
+            llm_requests INTEGER NOT NULL DEFAULT 0,
+            audio_seconds REAL NOT NULL DEFAULT 0
+        );",
+    )?;
     ensure_column(c, "raw_audio_path", "TEXT")?;
     ensure_column(c, "degraded_reason", "TEXT")?;
     ensure_column(c, "delivery_method", "TEXT")?;
@@ -2872,6 +5958,33 @@ fn schema(c: &Connection) -> anyhow::Result<()> {
     ensure_column(c, "verbatim_reviewed", "INTEGER NOT NULL DEFAULT 0")?;
     ensure_column(c, "asr_text", "TEXT")?;
     ensure_column(c, "provider_cleaned_candidate", "TEXT")?;
+    ensure_column(c, "cleanup_rejected_candidate", "TEXT")?;
+    ensure_column(c, "cleanup_guard_reason", "TEXT")?;
+    ensure_column(c, "cleanup_attempt_kind", "TEXT")?;
+    ensure_column(c, "cleanup_transformations_json", "TEXT")?;
+    ensure_column(c, "cleanup_final_guard_reason", "TEXT")?;
+    ensure_column(c, "cleanup_failure_reason", "TEXT")?;
+    ensure_column(c, "transaction_id", "TEXT")?;
+    ensure_table_column(c, "learn_observations", "rule_key", "TEXT")?;
+    ensure_table_column(c, "learn_observations", "dictation_origin", "TEXT")?;
+    ensure_table_column(c, "learn_observations", "channel", "TEXT")?;
+    ensure_table_column(
+        c,
+        "learn_observations",
+        "proof_eligible",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    c.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_learn_observations_origin
+         ON learn_observations(dictation_origin);
+         CREATE UNIQUE INDEX IF NOT EXISTS idx_learn_observations_independent_proof
+         ON learn_observations(rule_key, dictation_origin)
+         WHERE proof_eligible = 1 AND rule_key IS NOT NULL AND dictation_origin IS NOT NULL;",
+    )?;
+    c.execute_batch(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_dictations_transaction_id
+         ON dictations(transaction_id) WHERE transaction_id IS NOT NULL;",
+    )?;
     c.execute_batch(
         "CREATE TABLE IF NOT EXISTS learn_pairs (
             pair_key TEXT PRIMARY KEY,
@@ -2879,7 +5992,9 @@ fn schema(c: &Connection) -> anyhow::Result<()> {
             after_surface TEXT NOT NULL,
             hits INTEGER NOT NULL,
             promoted INTEGER NOT NULL DEFAULT 0,
-            last_at TEXT NOT NULL
+            last_at TEXT NOT NULL,
+            dictionary_pending_action TEXT NOT NULL DEFAULT 'none',
+            dictionary_effect_version INTEGER NOT NULL DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS learned_term_usage (
             word TEXT PRIMARY KEY,
@@ -2904,6 +6019,33 @@ fn schema(c: &Connection) -> anyhow::Result<()> {
     ensure_table_column(c, "learn_pairs", "pinned", "INTEGER NOT NULL DEFAULT 0")?;
     ensure_table_column(c, "learn_pairs", "tombstoned_at", "TEXT")?;
     ensure_table_column(c, "learn_pairs", "ignored", "INTEGER NOT NULL DEFAULT 0")?;
+    ensure_table_column(
+        c,
+        "learn_pairs",
+        "manual_scoped",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    // Automatically learned scene pairs are separately marked from pairs the
+    // user confirmed manually. The default keeps all legacy rows inert unless
+    // their target also remains in the global dictionary.
+    ensure_table_column(
+        c,
+        "learn_pairs",
+        "auto_scoped",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_table_column(
+        c,
+        "learn_pairs",
+        "dictionary_pending_action",
+        "TEXT NOT NULL DEFAULT 'none'",
+    )?;
+    ensure_table_column(
+        c,
+        "learn_pairs",
+        "dictionary_effect_version",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
     c.pragma_update(None, "user_version", HISTORY_SCHEMA_VERSION)?;
     Ok(())
 }
@@ -2914,7 +6056,7 @@ fn open_history(dir: &Path) -> anyhow::Result<Connection> {
     let existed = path.exists();
     let connection = Connection::open(&path)?;
     restrict_file_mode(&path)?;
-    connection.execute_batch("PRAGMA foreign_keys = ON;")?;
+    connection.execute_batch("PRAGMA foreign_keys = ON; PRAGMA secure_delete = ON;")?;
     // History writes can overlap with a completion, recovery scan, or the
     // settings window loading its list. Let SQLite briefly wait for the
     // active writer instead of turning a transient lock into lost history.
@@ -2926,34 +6068,38 @@ fn open_history(dir: &Path) -> anyhow::Result<Connection> {
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let previous_version: i32 =
         connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    if existed && previous_version < HISTORY_SCHEMA_VERSION {
-        let backup = dir.join(format!("history.sqlite.v{previous_version}.bak"));
-        match fs::symlink_metadata(&backup) {
-            Ok(metadata) if metadata.file_type().is_file() => {}
-            Ok(_) => anyhow::bail!("unsafe history migration backup path"),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                let mut options = fs::OpenOptions::new();
-                options.write(true).create_new(true);
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::OpenOptionsExt;
-                    options.mode(0o600);
+    if previous_version > HISTORY_SCHEMA_VERSION {
+        anyhow::bail!("history schema {previous_version} is newer than supported schema {HISTORY_SCHEMA_VERSION}");
+    }
+    if previous_version != HISTORY_SCHEMA_VERSION {
+        if existed && previous_version < HISTORY_SCHEMA_VERSION {
+            let backup = dir.join(format!("history.sqlite.v{previous_version}.bak"));
+            match fs::symlink_metadata(&backup) {
+                Ok(metadata) if metadata.file_type().is_file() => {}
+                Ok(_) => anyhow::bail!("unsafe history migration backup path"),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    create_history_migration_backup(&connection, dir, &backup)?;
                 }
-                // create_new refuses existing links, including a link placed
-                // after the metadata check. Never overwrite another file.
-                let mut destination = options.open(&backup)?;
-                let mut source = File::open(&path)?;
-                if let Err(error) = std::io::copy(&mut source, &mut destination) {
-                    drop(destination);
-                    let _ = fs::remove_file(&backup);
-                    return Err(error.into());
-                }
-                restrict_file_mode(&backup)?;
+                Err(error) => return Err(error.into()),
             }
-            Err(error) => return Err(error.into()),
+        }
+        // Opening the already-current schema is read-only. Reissuing the
+        // CREATE/ensure statements on every History read takes a SQLite
+        // schema writer lock and can block settings/preparation reads behind
+        // an unrelated retained History transaction.
+        connection.execute_batch("BEGIN IMMEDIATE")?;
+        match schema(&connection) {
+            Ok(()) => connection.execute_batch("COMMIT")?,
+            Err(error) => {
+                let _ = connection.execute_batch("ROLLBACK");
+                return Err(error);
+            }
         }
     }
-    schema(&connection)?;
+    // Family labels identify broad app classes, not an individual target. Keep
+    // legacy family-only promoted pairs inert; query first so normal History
+    // opens stay read-only when no rows need the one-way policy migration.
+    demote_family_only_promoted_learn_pairs(&connection)?;
     restrict_history_sidecars(dir)?;
     prune_history_migration_backups(
         dir,
@@ -2961,6 +6107,109 @@ fn open_history(dir: &Path) -> anyhow::Result<Connection> {
         SystemTime::now(),
     )?;
     Ok(connection)
+}
+
+fn create_history_migration_backup(
+    connection: &Connection,
+    dir: &Path,
+    backup: &Path,
+) -> anyhow::Result<()> {
+    use std::sync::atomic::AtomicU64;
+    static NEXT_TEMP: AtomicU64 = AtomicU64::new(1);
+
+    let temp_dir = dir.join(format!(
+        ".history-backup-{}-{}",
+        std::process::id(),
+        NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+    ));
+    create_history_backup_temp_dir(&temp_dir)?;
+    let result = (|| -> anyhow::Result<()> {
+        let temporary_backup = temp_dir.join("history.sqlite");
+        connection.execute(
+            "VACUUM INTO ?1",
+            [temporary_backup.to_string_lossy().as_ref()],
+        )?;
+        restrict_file_mode(&temporary_backup)?;
+        let validation = Connection::open_with_flags(
+            &temporary_backup,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        let integrity: String =
+            validation.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+        if integrity != "ok" {
+            anyhow::bail!("migration backup integrity check failed: {integrity}");
+        }
+        drop(validation);
+        // A same-volume hard link atomically publishes the complete, checked
+        // database and fails if any file or symlink already occupies the name.
+        fs::hard_link(&temporary_backup, backup)?;
+        sync_directory(dir)?;
+        Ok(())
+    })();
+    let cleanup_result = fs::remove_dir_all(&temp_dir);
+    result?;
+    cleanup_result?;
+    Ok(())
+}
+
+fn create_history_backup_temp_dir(temp_dir: &Path) -> anyhow::Result<()> {
+    let mut owns_temp_dir = false;
+    let setup_result = (|| -> anyhow::Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+            let mut builder = fs::DirBuilder::new();
+            builder.mode(0o700);
+            builder.create(temp_dir)?;
+            owns_temp_dir = true;
+            fs::set_permissions(temp_dir, fs::Permissions::from_mode(0o700))?;
+            if fs::symlink_metadata(temp_dir)?.uid() != unsafe { libc::geteuid() } {
+                anyhow::bail!("migration backup temporary directory is not owned by this user");
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            fs::create_dir(&temp_dir)?;
+            owns_temp_dir = true;
+        }
+        Ok(())
+    })();
+    if let Err(error) = setup_result {
+        if owns_temp_dir {
+            let _ = fs::remove_dir_all(temp_dir);
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn demote_family_only_promoted_learn_pairs(connection: &Connection) -> anyhow::Result<()> {
+    let has_legacy_rows: bool = connection.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM learn_pairs
+            WHERE promoted = 1
+              AND family IS NOT NULL
+              AND family <> ''
+              AND COALESCE(mapping_id, '') = ''
+              AND COALESCE(browser_host, '') = ''
+              AND COALESCE(native_bundle, '') = ''
+        )",
+        [],
+        |row| row.get(0),
+    )?;
+    if has_legacy_rows {
+        connection.execute(
+            "UPDATE learn_pairs SET promoted = 0
+             WHERE promoted = 1
+               AND family IS NOT NULL
+               AND family <> ''
+               AND COALESCE(mapping_id, '') = ''
+               AND COALESCE(browser_host, '') = ''
+               AND COALESCE(native_bundle, '') = ''",
+            [],
+        )?;
+    }
+    Ok(())
 }
 
 /// Only names generated by open_history are owned rollback copies. Do not
@@ -3061,6 +6310,857 @@ pub struct InsertHistory<'a> {
     pub count_asr: bool,
     pub count_llm: bool,
     pub context: Option<&'a crate::context::ContextSnapshot>,
+    pub cleanup_attempt_kind: Option<&'a str>,
+    pub cleanup_transformations_json: Option<&'a str>,
+    pub cleanup_final_guard_reason: Option<&'a str>,
+    pub cleanup_failure_reason: Option<&'a str>,
+}
+
+/// Durable, content-bearing History intent written before a paste/copy side
+/// effect. It contains only fields that the normal History insert already
+/// persists; ContextPolicy must be pre-filtered with `history_metadata`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct PendingHistoryIntent {
+    pub transaction_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_spool_session_id: Option<String>,
+    pub created_at_unix_ms: i64,
+    pub raw_text: String,
+    pub asr_text: Option<String>,
+    pub provider_cleaned_candidate: Option<String>,
+    pub final_text: String,
+    pub duration_secs: f64,
+    pub degraded: bool,
+    pub degraded_reason: Option<String>,
+    pub status: String,
+    pub delivery_method: String,
+    pub fallback_reason: Option<String>,
+    pub context_profile_id: Option<String>,
+    pub context_policy_json: Option<String>,
+    pub context_family: Option<String>,
+    pub context_browser_host: Option<String>,
+    pub context_native_bundle: Option<String>,
+    pub spool_path: Option<PathBuf>,
+    pub engine: String,
+    pub cleanup_status: String,
+    pub diagnostic_code: Option<String>,
+    pub diagnostic_user_reason: Option<String>,
+    pub cleanup_rejected_candidate: Option<String>,
+    pub cleanup_guard_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cleanup_attempt_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cleanup_transformations: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cleanup_final_guard_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cleanup_failure_reason: Option<String>,
+}
+
+impl PendingHistoryIntent {
+    fn validate(&self) -> anyhow::Result<()> {
+        if self.transaction_id.is_empty()
+            || self.transaction_id.len() > 96
+            || !self
+                .transaction_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        {
+            anyhow::bail!("invalid pending History transaction identity");
+        }
+        if self
+            .capture_spool_session_id
+            .as_deref()
+            .is_some_and(|session_id| !valid_spool_session_id(session_id))
+        {
+            anyhow::bail!("invalid pending History capture spool identity");
+        }
+        if !matches!(
+            self.status.as_str(),
+            "delivery_pending"
+                | "delivery_cancelled"
+                | "ok"
+                | "degraded"
+                | "history"
+                | "copied"
+                | "unverified"
+                | "failed"
+        ) {
+            anyhow::bail!("invalid pending History delivery status");
+        }
+        if self.final_text.trim().is_empty()
+            || !self.duration_secs.is_finite()
+            || self.duration_secs < 0.0
+            || self.status.len() > 128
+            || self.delivery_method.len() > 64
+            || self
+                .cleanup_failure_reason
+                .as_deref()
+                .is_some_and(|reason| {
+                    reason.len() > 96
+                        || reason.is_empty()
+                        || !reason.bytes().all(|byte| {
+                            byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_'
+                        })
+                })
+        {
+            anyhow::bail!("invalid pending History payload");
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn pending_history_intent_for_test(
+    transaction_id: &str,
+    status: &str,
+    delivery_method: &str,
+    text: &str,
+) -> PendingHistoryIntent {
+    PendingHistoryIntent {
+        transaction_id: transaction_id.to_owned(),
+        capture_spool_session_id: None,
+        created_at_unix_ms: now_ms() as i64,
+        raw_text: text.to_owned(),
+        asr_text: Some(text.to_owned()),
+        provider_cleaned_candidate: None,
+        final_text: text.to_owned(),
+        duration_secs: 1.0,
+        degraded: false,
+        degraded_reason: None,
+        status: status.to_owned(),
+        delivery_method: delivery_method.to_owned(),
+        fallback_reason: None,
+        context_profile_id: None,
+        context_policy_json: None,
+        context_family: None,
+        context_browser_host: None,
+        context_native_bundle: None,
+        spool_path: None,
+        engine: "test-engine".into(),
+        cleanup_status: "cleanup_not_requested".into(),
+        diagnostic_code: None,
+        diagnostic_user_reason: None,
+        cleanup_rejected_candidate: None,
+        cleanup_guard_reason: None,
+        cleanup_attempt_kind: None,
+        cleanup_transformations: None,
+        cleanup_final_guard_reason: None,
+        cleanup_failure_reason: None,
+    }
+}
+
+fn pending_history_root(data_root: &Path) -> PathBuf {
+    normalized_data_root(data_root).join("history-pending")
+}
+
+fn pending_history_path(data_root: &Path, transaction_id: &str) -> anyhow::Result<PathBuf> {
+    if transaction_id.is_empty()
+        || transaction_id.len() > 96
+        || !transaction_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    {
+        anyhow::bail!("invalid pending History transaction identity");
+    }
+    Ok(pending_history_root(data_root)
+        .join(transaction_id)
+        .join("intent.json"))
+}
+
+fn pending_history_usage(root: &Path) -> anyhow::Result<(usize, u64)> {
+    match fs::symlink_metadata(root) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+        Ok(_) => anyhow::bail!("pending History directory is not a private directory"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok((0, 0)),
+        Err(error) => return Err(error.into()),
+    }
+    let mut count = 0usize;
+    let mut bytes = 0u64;
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        if !file_type.is_dir() || file_type.is_symlink() {
+            anyhow::bail!("pending History root contains an unowned entry");
+        }
+        let id = entry
+            .file_name()
+            .to_str()
+            .map(str::to_owned)
+            .filter(|id| {
+                !id.is_empty()
+                    && id.len() <= 96
+                    && id
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            })
+            .ok_or_else(|| anyhow::anyhow!("pending History root contains an invalid identity"))?;
+        let directory = entry.path();
+        let mut files = 0usize;
+        for child in fs::read_dir(&directory)? {
+            let child = child?;
+            let child_type = child.file_type()?;
+            let name = child.file_name();
+            if !child_type.is_file()
+                || child_type.is_symlink()
+                || !matches!(
+                    name.to_str(),
+                    Some("intent.json" | ".intent.pending" | ".delivery.cancelled")
+                )
+            {
+                anyhow::bail!("pending History transaction contains an unowned entry");
+            }
+            if name == ".delivery.cancelled" && child.metadata()?.len() > 96 {
+                anyhow::bail!("pending History cancellation marker is oversized");
+            }
+            files = files.saturating_add(1);
+            bytes = bytes.saturating_add(child.metadata()?.len());
+        }
+        if files > 0 {
+            count = count.saturating_add(1);
+        }
+        if files > 3 {
+            anyhow::bail!("pending History transaction exceeds its file-count bound");
+        }
+        let expected = root.join(id);
+        if normalized_data_root(&directory) != normalized_data_root(&expected) {
+            anyhow::bail!("pending History identity directory does not match its name");
+        }
+    }
+    Ok((count, bytes))
+}
+
+fn write_pending_history_atomically(
+    data_root: &Path,
+    path: &Path,
+    bytes: &[u8],
+) -> anyhow::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("invalid pending History path"))?;
+    let expected_root = normalized_data_root(&data_root.join("history-pending"));
+    if normalized_data_root(parent).parent() != Some(expected_root.as_path())
+        || path.file_name().is_none_or(|name| name != "intent.json")
+    {
+        anyhow::bail!("pending History writer does not own this intent path");
+    }
+    ensure_private_dir(parent)?;
+    let staged = parent.join(".intent.pending");
+    let write_result = (|| -> anyhow::Result<()> {
+        let mut file = File::create(&staged)?;
+        restrict_file_mode(&staged)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        #[cfg(test)]
+        wait_for_pending_history_write_test_gate(data_root);
+        fs::rename(&staged, path)?;
+        restrict_file_mode(path)?;
+        File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    if write_result.is_err() {
+        // A complete staged file is recovery-owned evidence. Leave it in
+        // place for startup reconciliation instead of deleting possibly
+        // unique transcript content after an ambiguous rename failure.
+        if fs::metadata(&staged).is_ok_and(|metadata| metadata.len() == 0) {
+            let _ = fs::remove_file(&staged);
+        }
+        if fs::read_dir(parent)
+            .ok()
+            .is_some_and(|mut entries| entries.next().is_none())
+        {
+            let _ = fs::remove_dir(parent);
+        }
+    }
+    write_result
+}
+
+fn recover_pending_history_staging(root: &Path) -> anyhow::Result<usize> {
+    let (count, _) = pending_history_usage(root)?;
+    if count == 0 {
+        return Ok(0);
+    }
+    let mut recovered = 0usize;
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let id = entry.file_name().to_str().map(str::to_owned).filter(|id| {
+            !id.is_empty()
+                && id.len() <= 96
+                && id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        });
+        let Some(id) = id else {
+            continue;
+        };
+        if pending_history_cancelled(root, &id)? {
+            let transaction_dir = entry.path();
+            fs::remove_dir_all(&transaction_dir)?;
+            if let Some(parent) = transaction_dir.parent() {
+                File::open(parent)?.sync_all()?;
+            }
+            continue;
+        }
+        let staged = entry.path().join(".intent.pending");
+        let metadata = match fs::symlink_metadata(&staged) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        if !metadata.file_type().is_file()
+            || metadata.file_type().is_symlink()
+            || metadata.len() > PENDING_HISTORY_JOB_MAX_BYTES as u64
+        {
+            anyhow::bail!("pending History staging file is not a bounded regular file");
+        }
+        let intent: PendingHistoryIntent = serde_json::from_slice(&fs::read(&staged)?)?;
+        intent.validate()?;
+        if intent.transaction_id != id {
+            anyhow::bail!("pending History staging identity does not match its directory");
+        }
+        // `root` is already the history-pending directory, whereas
+        // `pending_history_path` accepts the application data root. Keep the
+        // recovery destination under the enumerated transaction directory.
+        let final_path = entry.path().join("intent.json");
+        fs::rename(&staged, &final_path)?;
+        restrict_file_mode(&final_path)?;
+        File::open(entry.path())?.sync_all()?;
+        recovered = recovered.saturating_add(1);
+    }
+    Ok(recovered)
+}
+
+fn pending_history_cancelled(root: &Path, transaction_id: &str) -> anyhow::Result<bool> {
+    let marker = root.join(transaction_id).join(".delivery.cancelled");
+    match fs::symlink_metadata(&marker) {
+        Ok(metadata)
+            if metadata.file_type().is_file()
+                && !metadata.file_type().is_symlink()
+                && metadata.len() <= 96 =>
+        {
+            let recorded_id = fs::read_to_string(marker)?;
+            if recorded_id != transaction_id {
+                anyhow::bail!("pending History cancellation identity does not match its path");
+            }
+            Ok(true)
+        }
+        Ok(_) => anyhow::bail!("pending History cancellation marker is not a bounded file"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn active_pending_history_origin(data_root: &Path, transaction_id: &str) -> anyhow::Result<bool> {
+    let key = (normalized_data_root(data_root), transaction_id.to_owned());
+    let active = PENDING_HISTORY_ACTIVE
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .contains(&key);
+    if !active {
+        return Ok(false);
+    }
+    let root = pending_history_root(data_root);
+    if pending_history_cancelled(&root, transaction_id)? {
+        return Ok(false);
+    }
+    let path = pending_history_path(data_root, transaction_id)?;
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.file_type().is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.len() > PENDING_HISTORY_JOB_MAX_BYTES as u64
+    {
+        anyhow::bail!("pending History origin is not a bounded regular file");
+    }
+    let intent: PendingHistoryIntent = serde_json::from_slice(&fs::read(path)?)?;
+    intent.validate()?;
+    Ok(intent.transaction_id == transaction_id && intent.status != "delivery_cancelled")
+}
+
+fn discard_pending_dictation_proofs(data_root: &Path, transaction_id: &str) -> anyhow::Result<()> {
+    if !data_root.join("history.sqlite").exists() {
+        return Ok(());
+    }
+    let mut connection = open_history(data_root)?;
+    let transaction =
+        connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    transaction.execute(
+        "DELETE FROM learn_observations
+         WHERE dictation_origin = ?1
+           AND proof_eligible = 1
+           AND source_history_id IS NULL",
+        [transaction_id],
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+/// Persist one bounded recovery intent before any irreversible delivery
+/// action. The shared pending-tree scope protects quota and enumeration while
+/// remaining disjoint from History database commits and audio capture.
+pub(crate) fn write_pending_history_intent(
+    data_root: &Path,
+    intent: &PendingHistoryIntent,
+    owner: &PendingHistoryActiveLease,
+) -> anyhow::Result<()> {
+    owner.ensure_writable(data_root, &intent.transaction_id)?;
+    intent.validate()?;
+    let serialized = serde_json::to_vec(intent)?;
+    if serialized.len() > PENDING_HISTORY_JOB_MAX_BYTES {
+        anyhow::bail!("pending History payload exceeds the bounded size limit");
+    }
+    let _mutation = begin_spool_root_mutation(data_root)?;
+    let _commit = try_spool_io_commit_pending_history(data_root, &intent.transaction_id)?;
+    owner.ensure_writable(data_root, &intent.transaction_id)?;
+    let root = pending_history_root(data_root);
+    let path = pending_history_path(data_root, &intent.transaction_id)?;
+    let budget_lock = PENDING_HISTORY_BUDGET_LOCK.get_or_init(|| Mutex::new(()));
+    let _budget_guard = budget_lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    ensure_private_dir(&root)?;
+    let (count, bytes) = pending_history_usage(&root)?;
+    if pending_history_cancelled(&root, &intent.transaction_id)? {
+        anyhow::bail!("pending History identity was already cancelled");
+    }
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_file() && !metadata.file_type().is_symlink() => {}
+        Ok(_) => anyhow::bail!("pending History intent path is not a regular file"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let transaction_dir_exists = path.parent().is_some_and(Path::exists);
+    let projected_count = count.saturating_add(usize::from(!transaction_dir_exists));
+    // The old final and new staging files coexist until atomic rename, so
+    // charge the complete write while it is in flight.
+    let projected_bytes = bytes.saturating_add(serialized.len() as u64);
+    if projected_count > PENDING_HISTORY_JOB_CAP
+        || projected_bytes > PENDING_HISTORY_BYTE_CAP as u64
+    {
+        anyhow::bail!("pending History recovery capacity is full");
+    }
+    write_pending_history_atomically(data_root, &path, &serialized)?;
+    File::open(&root)?.sync_all()?;
+    Ok(())
+}
+
+pub(crate) fn remove_pending_history_intent(
+    data_root: &Path,
+    transaction_id: &str,
+) -> anyhow::Result<()> {
+    let (_mutation, _commit) =
+        acquire_pending_history_mutation_and_commit(data_root, transaction_id)?;
+    let budget_lock = PENDING_HISTORY_BUDGET_LOCK.get_or_init(|| Mutex::new(()));
+    let _budget_guard = budget_lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    remove_pending_history_intent_under_permit(data_root, transaction_id)
+}
+
+fn remove_pending_history_intent_under_permit(
+    data_root: &Path,
+    transaction_id: &str,
+) -> anyhow::Result<()> {
+    let path = pending_history_path(data_root, transaction_id)?;
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_file() && !metadata.file_type().is_symlink() => {
+            fs::remove_file(&path)?;
+            if let Some(parent) = path.parent() {
+                File::open(parent)?.sync_all()?;
+                match fs::remove_dir(parent) {
+                    Ok(()) => {
+                        if let Some(root) = parent.parent() {
+                            File::open(root)?.sync_all()?;
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::DirectoryNotEmpty => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            Ok(())
+        }
+        Ok(_) => anyhow::bail!("pending History intent path is not a regular file"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Mark a known no-side-effect cancellation before attempting cleanup. If
+/// removing the file then fails, startup recognizes the tombstone and will
+/// discard it without creating a misleading History row.
+pub(crate) fn cancel_pending_history_intent(
+    data_root: &Path,
+    transaction_id: &str,
+    owner: &PendingHistoryActiveLease,
+) -> anyhow::Result<()> {
+    owner.poison_for_known_no_effect_cancel(data_root, transaction_id)?;
+    let (_mutation, _commit) =
+        acquire_pending_history_mutation_and_commit(data_root, transaction_id)?;
+    let budget_lock = PENDING_HISTORY_BUDGET_LOCK.get_or_init(|| Mutex::new(()));
+    let _budget_guard = budget_lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let root = pending_history_root(data_root);
+    let transaction_dir = root.join(transaction_id);
+    ensure_private_dir(&transaction_dir)?;
+    let marker = transaction_dir.join(".delivery.cancelled");
+    match fs::symlink_metadata(&marker) {
+        Ok(_) => {
+            if !pending_history_cancelled(&root, transaction_id)? {
+                anyhow::bail!("pending History cancellation marker is invalid");
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let mut file = File::create(&marker)?;
+            restrict_file_mode(&marker)?;
+            file.write_all(transaction_id.as_bytes())?;
+            file.sync_all()?;
+            File::open(&transaction_dir)?.sync_all()?;
+        }
+        Err(error) => return Err(error.into()),
+    }
+    discard_pending_dictation_proofs(data_root, transaction_id)?;
+    let path = pending_history_path(data_root, transaction_id)?;
+    let staged = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("invalid pending History path"))?
+        .join(".intent.pending");
+    for candidate in [&path, &staged] {
+        match fs::symlink_metadata(candidate) {
+            Ok(metadata)
+                if metadata.file_type().is_file()
+                    && !metadata.file_type().is_symlink()
+                    && metadata.len() <= PENDING_HISTORY_JOB_MAX_BYTES as u64 =>
+            {
+                if candidate == &staged {
+                    let staged_intent: PendingHistoryIntent =
+                        serde_json::from_slice(&fs::read(candidate)?)?;
+                    staged_intent.validate()?;
+                    if staged_intent.transaction_id != transaction_id {
+                        anyhow::bail!("pending History staging identity does not match its path");
+                    }
+                } else {
+                    let intent: PendingHistoryIntent =
+                        serde_json::from_slice(&fs::read(candidate)?)?;
+                    intent.validate()?;
+                    if intent.transaction_id != transaction_id {
+                        anyhow::bail!("pending History intent identity does not match its path");
+                    }
+                }
+                fs::remove_file(candidate)?;
+            }
+            Ok(_) => anyhow::bail!("pending History intent cannot be safely cancelled"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    let marker = transaction_dir.join(".delivery.cancelled");
+    match fs::symlink_metadata(&marker) {
+        Ok(metadata) if metadata.file_type().is_file() && !metadata.file_type().is_symlink() => {
+            fs::remove_file(&marker)?;
+        }
+        Ok(_) => anyhow::bail!("pending History cancellation marker is invalid"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    File::open(&transaction_dir)?.sync_all()?;
+    match fs::remove_dir(&transaction_dir) {
+        Ok(()) => File::open(&root)?.sync_all()?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
+}
+
+/// Read the exact text owned by one live History recovery ticket. The ticket
+/// caller supplies only the stable transaction identity; the text is loaded
+/// from that transaction's validated pending intent or matching History row.
+pub(crate) fn history_recovery_text_for_transaction(
+    data_root: &Path,
+    transaction_id: &str,
+) -> anyhow::Result<String> {
+    let _mutation = begin_spool_root_mutation(data_root)?;
+    let pending_root = pending_history_root(data_root);
+    {
+        let _pending_commit = try_spool_io_commit_pending_history(data_root, transaction_id)?;
+        if pending_history_cancelled(&pending_root, transaction_id)? {
+            anyhow::bail!("History recovery was cancelled");
+        }
+        let path = pending_history_path(data_root, transaction_id)?;
+        match fs::symlink_metadata(&path) {
+            Ok(metadata)
+                if metadata.file_type().is_file()
+                    && !metadata.file_type().is_symlink()
+                    && metadata.len() <= PENDING_HISTORY_JOB_MAX_BYTES as u64 =>
+            {
+                let intent: PendingHistoryIntent = serde_json::from_slice(&fs::read(path)?)?;
+                intent.validate()?;
+                if intent.transaction_id != transaction_id {
+                    anyhow::bail!("pending History identity does not match its ticket");
+                }
+                if intent.final_text.trim().is_empty() {
+                    anyhow::bail!("History recovery has no copyable text");
+                }
+                return Ok(intent.final_text);
+            }
+            Ok(_) => anyhow::bail!("pending History recovery is not a bounded regular file"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+
+    let _history_commit = try_spool_io_commit_scope(data_root, SpoolIoScope::HistoryDatabase)?;
+    let connection = open_history(data_root)?;
+    let text = connection
+        .query_row(
+            "SELECT COALESCE(NULLIF((SELECT final_text FROM dictation_revisions WHERE dictation_id=dictations.id ORDER BY revision_id DESC LIMIT 1),''),NULLIF(final_text,''),raw_text,'') FROM dictations WHERE transaction_id=?1",
+            [transaction_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("History transaction has no copyable text"))?;
+    Ok(text)
+}
+
+/// Promote a pending History intent exactly once. The transaction ID is a
+/// unique database key, so a crash after SQLite commit but before deleting the
+/// sidecar cannot create a duplicate on the next startup.
+pub(crate) fn promote_pending_history_intent(
+    data_root: &Path,
+    transaction_id: &str,
+    owner: &PendingHistoryActiveLease,
+) -> anyhow::Result<()> {
+    owner.ensure_writable(data_root, transaction_id)?;
+    let _mutation = begin_spool_root_mutation(data_root)?;
+    let _intent_commit = try_spool_io_commit_pending_history(data_root, transaction_id)?;
+    owner.ensure_writable(data_root, transaction_id)?;
+    let pending_root = pending_history_root(data_root);
+    if pending_history_cancelled(&pending_root, transaction_id)? {
+        discard_pending_dictation_proofs(data_root, transaction_id)?;
+        let transaction_dir = pending_root.join(transaction_id);
+        fs::remove_dir_all(&transaction_dir)?;
+        File::open(&pending_root)?.sync_all()?;
+        return Ok(());
+    }
+    let path = pending_history_path(data_root, transaction_id)?;
+    let metadata = fs::symlink_metadata(&path)?;
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        anyhow::bail!("pending History intent is not a regular file");
+    }
+    if metadata.len() > PENDING_HISTORY_JOB_MAX_BYTES as u64 {
+        anyhow::bail!("pending History intent exceeds the bounded read size");
+    }
+    let intent: PendingHistoryIntent = serde_json::from_slice(&fs::read(&path)?)?;
+    intent.validate()?;
+    if intent.transaction_id != transaction_id {
+        anyhow::bail!("pending History intent identity does not match its path");
+    }
+    if intent.status == "delivery_cancelled" {
+        drop(_intent_commit);
+        remove_pending_history_intent(data_root, transaction_id)?;
+        return Ok(());
+    }
+    drop(_intent_commit);
+    let _history_commit = try_spool_io_commit_scope(data_root, SpoolIoScope::HistoryDatabase)?;
+    let mut connection = open_history(data_root)?;
+    let transaction =
+        connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let existing_id = transaction
+        .query_row(
+            "SELECT id FROM dictations WHERE transaction_id=?1",
+            [&intent.transaction_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?;
+    if existing_id.is_none() {
+        let interrupted = intent.status == "delivery_pending";
+        let status = if interrupted {
+            "delivery_unconfirmed"
+        } else {
+            intent.status.as_str()
+        };
+        let delivery_method = if interrupted {
+            "unknown"
+        } else {
+            intent.delivery_method.as_str()
+        };
+        let fallback_reason = if interrupted {
+            Some("delivery_state_unknown_after_restart")
+        } else {
+            intent.fallback_reason.as_deref()
+        };
+        let cleanup_transformations_json = intent
+            .cleanup_transformations
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
+        insert_history_with_status_and_candidate_on_connection(
+            &transaction,
+            InsertHistory {
+                dir: data_root,
+                raw: &intent.raw_text,
+                asr_text: intent.asr_text.as_deref(),
+                engine: Some(&intent.engine),
+                final_text: &intent.final_text,
+                cleanup_status: Some(&intent.cleanup_status),
+                duration: intent.duration_secs,
+                degraded: intent.degraded,
+                degraded_reason: intent.degraded_reason.as_deref(),
+                status: status.to_owned(),
+                delivery_method: Some(delivery_method),
+                fallback_reason,
+                spool: intent.spool_path.as_deref(),
+                count_asr: true,
+                count_llm: true,
+                context: None,
+                cleanup_attempt_kind: intent.cleanup_attempt_kind.as_deref(),
+                cleanup_transformations_json: cleanup_transformations_json.as_deref(),
+                cleanup_final_guard_reason: intent.cleanup_final_guard_reason.as_deref(),
+                cleanup_failure_reason: intent.cleanup_failure_reason.as_deref(),
+            },
+            intent.provider_cleaned_candidate.as_deref(),
+            None,
+            intent.cleanup_rejected_candidate.as_deref(),
+            intent.cleanup_guard_reason.as_deref(),
+        )?;
+        let inserted_id = transaction.last_insert_rowid();
+        transaction.execute(
+            "UPDATE dictations SET transaction_id=?1, created_at=datetime(?2 / 1000, 'unixepoch'), context_profile_id=?3, context_policy_json=?4, context_family=?5, context_browser_host=?6, context_native_bundle=?7, delivery_error_code=?8, delivery_user_reason=?9 WHERE id=?10",
+            params![
+                intent.transaction_id,
+                intent.created_at_unix_ms,
+                intent.context_profile_id,
+                intent.context_policy_json,
+                intent.context_family,
+                intent.context_browser_host,
+                intent.context_native_bundle,
+                if interrupted { Some("delivery_unconfirmed_after_restart") } else { intent.diagnostic_code.as_deref() },
+                if interrupted { Some("Delivery was interrupted before its final result was recorded.") } else { intent.diagnostic_user_reason.as_deref() },
+                inserted_id
+            ],
+        )?;
+    }
+    let history_id = transaction.query_row(
+        "SELECT id FROM dictations WHERE transaction_id = ?1",
+        [&intent.transaction_id],
+        |row| row.get::<_, i64>(0),
+    )?;
+    transaction.execute(
+        "UPDATE learn_observations
+         SET source_history_id = ?1
+         WHERE dictation_origin = ?2
+           AND proof_eligible = 1
+           AND source_history_id IS NULL",
+        params![history_id, intent.transaction_id],
+    )?;
+    #[cfg(test)]
+    wait_for_history_promotion_test_gate(data_root);
+    transaction.commit()?;
+    drop(_history_commit);
+    // The row commit is the durable ACK. Keep the intent until its capture
+    // spool has been retained or removed; startup repeats this idempotently if
+    // the process exits between the database commit and spool cleanup.
+    let capture_spool_settled = match intent.capture_spool_session_id.as_deref() {
+        Some(session_id) => settle_capture_spool_after_history_ack(
+            data_root,
+            session_id,
+            intent.spool_path.as_deref(),
+        )?,
+        None => true,
+    };
+    if capture_spool_settled {
+        let _ = remove_pending_history_intent(data_root, transaction_id);
+    }
+    Ok(())
+}
+
+pub(crate) fn promote_all_pending_history_intents(data_root: &Path) -> anyhow::Result<usize> {
+    let root = pending_history_root(data_root);
+    let intents = {
+        let _mutation = begin_spool_root_mutation(data_root)?;
+        let _commit = try_spool_io_commit_scope(data_root, SpoolIoScope::PendingHistoryIntent)?;
+        recover_pending_history_staging(&root)?;
+        let (count, _) = pending_history_usage(&root)?;
+        if count == 0 {
+            return Ok(0);
+        }
+        let mut intents = fs::read_dir(&root)?
+            .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().into_owned()))
+            .collect::<Result<Vec<_>, _>>()?;
+        intents.sort();
+        intents
+    };
+    let mut promoted = 0usize;
+    let mut first_error: Option<anyhow::Error> = None;
+    for transaction_id in intents {
+        if !transaction_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            || transaction_id.is_empty()
+            || transaction_id.len() > 96
+        {
+            first_error.get_or_insert_with(|| {
+                anyhow::anyhow!("pending History root contains an invalid identity")
+            });
+            continue;
+        }
+        let Some(active_owner) = reserve_pending_history_startup_owner(data_root, &transaction_id)
+        else {
+            // A live dictation still owns this immutable transaction. Startup
+            // maintenance must not promote its pre-delivery status while the
+            // native delivery result is still being decided.
+            continue;
+        };
+        let inspected = (|| -> anyhow::Result<bool> {
+            let _mutation = begin_spool_root_mutation(data_root)?;
+            let _commit = try_spool_io_commit_pending_history(data_root, &transaction_id)?;
+            if pending_history_cancelled(&root, &transaction_id)? {
+                discard_pending_dictation_proofs(data_root, &transaction_id)?;
+                let transaction_dir = root.join(&transaction_id);
+                fs::remove_dir_all(&transaction_dir)?;
+                File::open(&root)?.sync_all()?;
+                return Ok(true);
+            }
+            let intent_path = pending_history_path(data_root, &transaction_id)?;
+            let metadata = fs::symlink_metadata(&intent_path)?;
+            if !metadata.file_type().is_file()
+                || metadata.file_type().is_symlink()
+                || metadata.len() > PENDING_HISTORY_JOB_MAX_BYTES as u64
+            {
+                anyhow::bail!("pending History intent is not a bounded regular file");
+            }
+            let intent: PendingHistoryIntent = serde_json::from_slice(&fs::read(intent_path)?)?;
+            intent.validate()?;
+            if intent.transaction_id != transaction_id {
+                anyhow::bail!("pending History identity does not match its directory");
+            }
+            Ok(false)
+        })();
+        match inspected {
+            Ok(true) => continue,
+            Ok(false) => {}
+            Err(error) => {
+                first_error.get_or_insert(error);
+                continue;
+            }
+        }
+        match promote_pending_history_intent(data_root, &transaction_id, &active_owner) {
+            Ok(()) => promoted = promoted.saturating_add(1),
+            Err(error) => {
+                first_error.get_or_insert(error);
+            }
+        }
+    }
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(promoted),
+    }
 }
 
 #[cfg(test)]
@@ -3088,10 +7188,14 @@ pub fn insert_history(
         count_asr: true,
         count_llm: true,
         context: None,
+        cleanup_attempt_kind: None,
+        cleanup_transformations_json: None,
+        cleanup_final_guard_reason: None,
+        cleanup_failure_reason: None,
     })
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 pub fn insert_history_with_context(
     dir: &Path,
     raw: &str,
@@ -3115,6 +7219,7 @@ pub fn insert_history_with_context(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub fn insert_history_with_delivery(
     dir: &Path,
     raw: &str,
@@ -3143,6 +7248,7 @@ pub fn insert_history_with_delivery(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub fn insert_history_with_delivery_and_spool(
     dir: &Path,
     raw: &str,
@@ -3173,6 +7279,10 @@ pub fn insert_history_with_delivery_and_spool(
         count_asr: true,
         count_llm: true,
         context: Some(context),
+        cleanup_attempt_kind: None,
+        cleanup_transformations_json: None,
+        cleanup_final_guard_reason: None,
+        cleanup_failure_reason: None,
     })
 }
 
@@ -3269,6 +7379,49 @@ pub fn insert_history_with_asr_candidate_and_delivery_and_spool_and_cleanup_diag
     cleanup_status: &str,
     diagnostic: Option<&crate::delivery_diagnostics::DeliveryDiagnostic>,
 ) -> anyhow::Result<()> {
+    insert_history_with_asr_candidate_and_delivery_and_spool_and_cleanup_rejection(
+        dir,
+        raw,
+        asr_text,
+        provider_cleaned_candidate,
+        final_text,
+        duration,
+        degraded,
+        degraded_reason,
+        status,
+        delivery_method,
+        fallback_reason,
+        context,
+        spool,
+        engine,
+        cleanup_status,
+        diagnostic,
+        None,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn insert_history_with_asr_candidate_and_delivery_and_spool_and_cleanup_rejection(
+    dir: &Path,
+    raw: &str,
+    asr_text: Option<&str>,
+    provider_cleaned_candidate: Option<&str>,
+    final_text: &str,
+    duration: f64,
+    degraded: bool,
+    degraded_reason: Option<&str>,
+    status: &str,
+    delivery_method: &str,
+    fallback_reason: Option<&str>,
+    context: &crate::context::ContextSnapshot,
+    spool: Option<&Path>,
+    engine: &str,
+    cleanup_status: &str,
+    diagnostic: Option<&crate::delivery_diagnostics::DeliveryDiagnostic>,
+    cleanup_rejected_candidate: Option<&str>,
+    cleanup_guard_reason: Option<&str>,
+) -> anyhow::Result<()> {
     insert_history_with_status_and_candidate(
         InsertHistory {
             dir,
@@ -3287,9 +7440,15 @@ pub fn insert_history_with_asr_candidate_and_delivery_and_spool_and_cleanup_diag
             count_asr: true,
             count_llm: true,
             context: Some(context),
+            cleanup_attempt_kind: None,
+            cleanup_transformations_json: None,
+            cleanup_final_guard_reason: None,
+            cleanup_failure_reason: None,
         },
         provider_cleaned_candidate,
         diagnostic,
+        cleanup_rejected_candidate,
+        cleanup_guard_reason,
     )
 }
 
@@ -3351,6 +7510,10 @@ pub fn insert_failed_history(
         count_asr: false,
         count_llm: false,
         context: None,
+        cleanup_attempt_kind: None,
+        cleanup_transformations_json: None,
+        cleanup_final_guard_reason: None,
+        cleanup_failure_reason: None,
     })
 }
 
@@ -3379,19 +7542,103 @@ pub fn insert_failed_history_with_context(
         count_asr: false,
         count_llm: false,
         context: Some(context),
+        cleanup_attempt_kind: None,
+        cleanup_transformations_json: None,
+        cleanup_final_guard_reason: None,
+        cleanup_failure_reason: None,
     })
 }
+
+/// Insert one failed-ASR History row for a recovery WAV at most once. The
+/// acknowledged path is the stable identity retained across a lost caller
+/// reply; a repeated owner attempt cannot create a duplicate row.
+pub fn insert_failed_history_with_context_once(
+    dir: &Path,
+    duration: f64,
+    spool: &Path,
+    context: &crate::context::ContextSnapshot,
+    engine: &str,
+) -> anyhow::Result<()> {
+    let _history_commit = try_spool_io_commit_scope(dir, SpoolIoScope::HistoryDatabase)?;
+    let audio_path = spool.to_string_lossy().into_owned();
+    let mut connection = open_history(dir)?;
+    let transaction =
+        connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let already_recorded: i64 = transaction.query_row(
+        "SELECT COUNT(*) FROM dictations WHERE raw_audio_path=?",
+        [&audio_path],
+        |row| row.get(0),
+    )?;
+    if already_recorded > 0 {
+        transaction.commit()?;
+        return Ok(());
+    }
+    insert_history_with_status_and_candidate_on_connection(
+        &transaction,
+        InsertHistory {
+            dir,
+            raw: "",
+            asr_text: None,
+            engine: Some(engine),
+            final_text: "",
+            cleanup_status: None,
+            duration,
+            degraded: false,
+            degraded_reason: Some("asr_failed"),
+            status: "failed".to_owned(),
+            delivery_method: Some("none"),
+            fallback_reason: Some("asr_failed"),
+            spool: Some(spool),
+            count_asr: false,
+            count_llm: false,
+            context: Some(context),
+            cleanup_attempt_kind: None,
+            cleanup_transformations_json: None,
+            cleanup_final_guard_reason: None,
+            cleanup_failure_reason: None,
+        },
+        None,
+        None,
+        None,
+        None,
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
 fn insert_history_with_status(input: InsertHistory) -> anyhow::Result<()> {
-    insert_history_with_status_and_candidate(input, None, None)
+    insert_history_with_status_and_candidate(input, None, None, None, None)
 }
 
 fn insert_history_with_status_and_candidate(
     input: InsertHistory,
     provider_cleaned_candidate: Option<&str>,
     diagnostic: Option<&crate::delivery_diagnostics::DeliveryDiagnostic>,
+    cleanup_rejected_candidate: Option<&str>,
+    cleanup_guard_reason: Option<&str>,
+) -> anyhow::Result<()> {
+    let _history_commit = try_spool_io_commit_scope(input.dir, SpoolIoScope::HistoryDatabase)?;
+    let c = open_history(input.dir)?;
+    insert_history_with_status_and_candidate_on_connection(
+        &c,
+        input,
+        provider_cleaned_candidate,
+        diagnostic,
+        cleanup_rejected_candidate,
+        cleanup_guard_reason,
+    )
+}
+
+fn insert_history_with_status_and_candidate_on_connection(
+    c: &Connection,
+    input: InsertHistory<'_>,
+    provider_cleaned_candidate: Option<&str>,
+    diagnostic: Option<&crate::delivery_diagnostics::DeliveryDiagnostic>,
+    cleanup_rejected_candidate: Option<&str>,
+    cleanup_guard_reason: Option<&str>,
 ) -> anyhow::Result<()> {
     let InsertHistory {
-        dir,
+        dir: _,
         raw,
         asr_text,
         engine,
@@ -3407,8 +7654,11 @@ fn insert_history_with_status_and_candidate(
         count_asr,
         count_llm,
         context,
+        cleanup_attempt_kind,
+        cleanup_transformations_json,
+        cleanup_final_guard_reason,
+        cleanup_failure_reason,
     } = input;
-    let c = open_history(dir)?;
     let context_profile_id = context.map(|snapshot| snapshot.profile.id.as_str());
     let context_policy_json = context
         .map(|snapshot| serde_json::to_string(&snapshot.policy.history_metadata()))
@@ -3424,7 +7674,7 @@ fn insert_history_with_status_and_candidate(
             snapshot.target_guard.bundle_id.clone()
         }
     });
-    c.execute("INSERT INTO dictations (created_at,duration_secs,raw_text,final_text,cleanup_status,engine,degraded,degraded_reason,status,raw_audio_path,delivery_method,fallback_reason,context_profile_id,context_policy_json,context_family,context_browser_host,context_native_bundle,asr_text,provider_cleaned_candidate,delivery_error_code,delivery_user_reason) VALUES (datetime('now'),?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", params![duration, raw, final_text, cleanup_status, engine.unwrap_or("unknown"), degraded as i32, degraded_reason, status, spool.map(|p| p.to_string_lossy().to_string()), delivery_method, fallback_reason, context_profile_id, context_policy_json, context_family, context_browser_host, context_native_bundle, asr_text, provider_cleaned_candidate, diagnostic.map(|item| item.code), diagnostic.map(|item| item.user_reason)])?;
+    c.execute("INSERT INTO dictations (created_at,duration_secs,raw_text,final_text,cleanup_status,engine,degraded,degraded_reason,status,raw_audio_path,delivery_method,fallback_reason,context_profile_id,context_policy_json,context_family,context_browser_host,context_native_bundle,asr_text,provider_cleaned_candidate,cleanup_rejected_candidate,cleanup_guard_reason,delivery_error_code,delivery_user_reason,cleanup_attempt_kind,cleanup_transformations_json,cleanup_final_guard_reason,cleanup_failure_reason) VALUES (datetime('now'),?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", params![duration, raw, final_text, cleanup_status, engine.unwrap_or("unknown"), degraded as i32, degraded_reason, status, spool.map(|p| p.to_string_lossy().to_string()), delivery_method, fallback_reason, context_profile_id, context_policy_json, context_family, context_browser_host, context_native_bundle, asr_text, provider_cleaned_candidate, cleanup_rejected_candidate, cleanup_guard_reason, diagnostic.map(|item| item.code), diagnostic.map(|item| item.user_reason), cleanup_attempt_kind, cleanup_transformations_json, cleanup_final_guard_reason, cleanup_failure_reason])?;
     if count_asr || count_llm {
         c.execute("INSERT INTO usage(day,asr_requests,llm_requests,audio_seconds) VALUES (date('now'),?,?,?) ON CONFLICT(day) DO UPDATE SET asr_requests=asr_requests+excluded.asr_requests,llm_requests=llm_requests+excluded.llm_requests,audio_seconds=audio_seconds+excluded.audio_seconds", params![count_asr as i64, count_llm as i64, duration])?;
     }
@@ -3461,7 +7711,7 @@ pub fn get_history_page(
     let search_pattern = query
         .filter(|value| !value.is_empty())
         .map(|value| format!("%{}%", escape_history_search(value)));
-    let mut s = c.prepare("SELECT id,created_at,COALESCE(raw_text,''),COALESCE((SELECT final_text FROM dictation_revisions WHERE dictation_id=dictations.id ORDER BY revision_id DESC LIMIT 1),final_text,''),COALESCE(duration_secs,0),COALESCE(degraded,0),degraded_reason,COALESCE(status,'ok'),delivery_method,fallback_reason,context_profile_id,raw_audio_path,COALESCE(cleanup_status,'unknown'),(SELECT COUNT(*) FROM dictation_revisions WHERE dictation_id=dictations.id),verbatim_text,COALESCE(verbatim_reviewed,0),asr_text,engine,provider_cleaned_candidate,delivery_error_code,delivery_user_reason FROM dictations WHERE (?1 IS NULL OR id < ?1) AND (?2 IS NULL OR (COALESCE(raw_text,'') LIKE ?2 ESCAPE '\\' OR COALESCE(asr_text,'') LIKE ?2 ESCAPE '\\' OR COALESCE(provider_cleaned_candidate,'') LIKE ?2 ESCAPE '\\' OR COALESCE((SELECT final_text FROM dictation_revisions WHERE dictation_id=dictations.id ORDER BY revision_id DESC LIMIT 1),final_text,'') LIKE ?2 ESCAPE '\\')) ORDER BY id DESC LIMIT ?3")?;
+    let mut s = c.prepare("SELECT id,created_at,COALESCE(raw_text,''),COALESCE((SELECT final_text FROM dictation_revisions WHERE dictation_id=dictations.id ORDER BY revision_id DESC LIMIT 1),final_text,''),COALESCE(duration_secs,0),COALESCE(degraded,0),degraded_reason,COALESCE(status,'ok'),delivery_method,fallback_reason,context_profile_id,raw_audio_path,COALESCE(cleanup_status,'unknown'),(SELECT COUNT(*) FROM dictation_revisions WHERE dictation_id=dictations.id),verbatim_text,COALESCE(verbatim_reviewed,0),asr_text,engine,provider_cleaned_candidate,delivery_error_code,delivery_user_reason,cleanup_rejected_candidate,cleanup_guard_reason,cleanup_attempt_kind,cleanup_transformations_json,cleanup_final_guard_reason,cleanup_failure_reason FROM dictations WHERE (?1 IS NULL OR id < ?1) AND (?2 IS NULL OR (COALESCE(raw_text,'') LIKE ?2 ESCAPE '\\' OR COALESCE(asr_text,'') LIKE ?2 ESCAPE '\\' OR COALESCE(provider_cleaned_candidate,'') LIKE ?2 ESCAPE '\\' OR COALESCE(cleanup_rejected_candidate,'') LIKE ?2 ESCAPE '\\' OR COALESCE((SELECT final_text FROM dictation_revisions WHERE dictation_id=dictations.id ORDER BY revision_id DESC LIMIT 1),final_text,'') LIKE ?2 ESCAPE '\\')) ORDER BY id DESC LIMIT ?3")?;
     let mut items = s
         .query_map(
             params![before_id, search_pattern.as_deref(), fetch_limit],
@@ -3521,6 +7771,23 @@ fn history_row<'a>(
             provider_cleaned_candidate: r.get(18)?,
             delivery_error_code: r.get(19)?,
             delivery_user_reason: r.get(20)?,
+            cleanup_rejected_candidate: r.get(21)?,
+            cleanup_guard_reason: r.get(22)?,
+            cleanup_attempt_kind: r.get(23)?,
+            cleanup_transformations: r
+                .get::<_, Option<String>>(24)?
+                .map(|json| {
+                    serde_json::from_str(&json).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            24,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })
+                })
+                .transpose()?,
+            cleanup_final_guard_reason: r.get(25)?,
+            cleanup_failure_reason: r.get(26)?,
         })
     }
 }
@@ -3531,6 +7798,18 @@ pub fn get_history(dir: &Path, limit: i64) -> anyhow::Result<Vec<HistoryItem>> {
 }
 
 pub fn purge_history(dir: &Path, keep_history_days: u64) -> anyhow::Result<usize> {
+    purge_history_with_details(dir, keep_history_days).map(|(deleted, _)| deleted)
+}
+
+pub(crate) fn purge_history_with_details(
+    dir: &Path,
+    keep_history_days: u64,
+) -> anyhow::Result<(usize, bool)> {
+    let _mutation = begin_spool_root_mutation(dir)?;
+    // Retention may delete linked recovery or gold audio as well as History
+    // rows. Keep the compatibility root-wide guard for the full transitive
+    // operation instead of claiming a destination-only History scope.
+    let _commit = try_spool_io_commit(dir)?;
     let backup_days = if keep_history_days == 0 {
         HISTORY_MIGRATION_BACKUP_MAX_DAYS
     } else {
@@ -3539,7 +7818,7 @@ pub fn purge_history(dir: &Path, keep_history_days: u64) -> anyhow::Result<usize
     prune_history_migration_backups(dir, Some(backup_days), SystemTime::now())?;
     // Zero is the explicit "keep forever" setting for live history text.
     if keep_history_days == 0 {
-        return Ok(0);
+        return Ok((0, false));
     }
     let c = open_history(dir)?;
     let cutoff = format!("-{keep_history_days} days");
@@ -3552,22 +7831,91 @@ pub fn purge_history(dir: &Path, keep_history_days: u64) -> anyhow::Result<usize
         "DELETE FROM dictations WHERE created_at < datetime('now', ?)",
         [cutoff.as_str()],
     )?;
+    let deleted_drafts = c.execute(
+        "DELETE FROM style_drafts WHERE created_at < datetime('now', ?)",
+        [cutoff.as_str()],
+    )?;
+    c.execute(
+        "DELETE FROM usage WHERE day < date('now', ?)",
+        [cutoff.as_str()],
+    )?;
     drop(statement);
     drop(c);
     for path in paths.into_iter().flatten() {
-        remove_spool_artifact(dir, Path::new(&path));
+        remove_spool_artifact_inner(dir, Path::new(&path), true);
     }
-    Ok(deleted)
+    Ok((deleted, deleted_drafts > 0))
 }
 
-const LEARN_PAIR_COLUMNS: &str = "pair_key, before_surface, after_surface, hits, promoted, last_at, family, mapping_id, browser_host, native_bundle, last_used_at, pinned, tombstoned_at, ignored";
+const LEARN_PAIR_COLUMNS: &str = "pair_key, before_surface, after_surface, hits, promoted, last_at, family, mapping_id, browser_host, native_bundle, last_used_at, pinned, tombstoned_at, ignored, manual_scoped, auto_scoped";
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LearnPairScope {
     pub family: Option<String>,
     pub mapping_id: Option<String>,
     pub browser_host: Option<String>,
     pub native_bundle: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LearnPairScopeMatch {
+    Match,
+    Mismatch,
+    Unknown,
+}
+
+impl LearnPairScope {
+    pub fn from_snapshot(snapshot: &crate::context::ContextSnapshot) -> Self {
+        Self {
+            family: Some(crate::context::family_id(snapshot.profile.family).to_owned()),
+            mapping_id: snapshot.profile.id.strip_prefix("user.").map(str::to_owned),
+            browser_host: snapshot.target_guard.browser_host.clone(),
+            native_bundle: if snapshot.target_guard.browser_host.is_some() {
+                None
+            } else {
+                snapshot.target_guard.bundle_id.clone()
+            },
+        }
+    }
+
+    /// A scoped pair applies only when every declared dimension is known and
+    /// equal. An absent observed value is kept distinct from a mismatch.
+    pub fn assess_record(&self, row: &LearnPairRecord) -> LearnPairScopeMatch {
+        let dimensions = [
+            (row.family.as_deref(), self.family.as_deref()),
+            (row.mapping_id.as_deref(), self.mapping_id.as_deref()),
+            (row.browser_host.as_deref(), self.browser_host.as_deref()),
+            (row.native_bundle.as_deref(), self.native_bundle.as_deref()),
+        ];
+        let mut unknown = false;
+        for (required, observed) in dimensions {
+            match (required, observed) {
+                (None, _) => {}
+                (Some(_), None) => unknown = true,
+                (Some(required), Some(observed)) if required != observed => {
+                    return LearnPairScopeMatch::Mismatch;
+                }
+                (Some(_), Some(_)) => {}
+            }
+        }
+        if unknown {
+            LearnPairScopeMatch::Unknown
+        } else {
+            LearnPairScopeMatch::Match
+        }
+    }
+
+    /// Select the one set of promoted pairs authorized for this observed
+    /// context. Downstream replacement, hinting, usage, and final protection
+    /// must all consume this set rather than reinterpreting scope fields.
+    pub fn applicable_promoted_records(&self, rows: &[LearnPairRecord]) -> Vec<LearnPairRecord> {
+        rows.iter()
+            .filter(|row| {
+                row.is_live_promoted() && self.assess_record(row) == LearnPairScopeMatch::Match
+            })
+            .cloned()
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -3596,6 +7944,10 @@ pub struct LearnPairRecord {
     pub ignored: bool,
     #[serde(default)]
     pub promote_hits: u32,
+    #[serde(default)]
+    pub manual_scoped: bool,
+    #[serde(default)]
+    pub auto_scoped: bool,
 }
 
 impl LearnPairRecord {
@@ -3636,6 +7988,8 @@ fn learn_pair_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LearnPairRec
         tombstoned_at: row.get(12)?,
         ignored: row.get::<_, Option<i64>>(13)?.unwrap_or(0) != 0,
         promote_hits: 0,
+        manual_scoped: row.get::<_, Option<i64>>(14)?.unwrap_or(0) != 0,
+        auto_scoped: row.get::<_, Option<i64>>(15)?.unwrap_or(0) != 0,
     })
 }
 
@@ -3646,18 +8000,445 @@ pub fn upsert_learn_pair(
     before_surface: &str,
     after_surface: &str,
 ) -> anyhow::Result<Option<LearnPairRecord>> {
-    upsert_learn_pair_with_scope(dir, pair_key, before_surface, after_surface, None)
+    Ok(
+        match upsert_learn_pair_with_scope(dir, pair_key, before_surface, after_surface, None)? {
+            LearnPairUpsert::Stored(row) => Some(*row),
+            LearnPairUpsert::Skipped(_) => None,
+        },
+    )
 }
 
+/// The DB owner distinguishes intentional suppression from missing/failed data.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LearnPairSkipReason {
+    TombstoneOrIgnored,
+    PendingCapacity,
+    ScopeConflict,
+    DuplicateObservation,
+    UnknownDictationOrigin,
+}
+impl LearnPairSkipReason {
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::TombstoneOrIgnored => "tombstone_or_ignored",
+            Self::PendingCapacity => "cap",
+            Self::ScopeConflict => "scope_conflict",
+            Self::DuplicateObservation => "duplicate_observation",
+            Self::UnknownDictationOrigin => "dictation_origin_unknown",
+        }
+    }
+}
+pub enum LearnPairUpsert {
+    Stored(Box<LearnPairRecord>),
+    Skipped(LearnPairSkipReason),
+}
+
+/// Opaque identity for one user-originated learning event. The key hashes the
+/// source and pair identity; only History row/revision IDs are retained as
+/// metadata so deleting the row also deletes its receipts.
+#[derive(Clone, Debug)]
+pub(crate) struct LearnPairObservation {
+    observation_key: String,
+    source_kind: &'static str,
+    source_history_id: Option<i64>,
+    source_revision_id: Option<i64>,
+    rule_key: Option<String>,
+    dictation_origin: Option<String>,
+    channel: Option<&'static str>,
+    proof_eligible: bool,
+}
+
+impl LearnPairObservation {
+    pub(crate) fn history_edit(history_id: i64, revision_id: i64, pair_key: &str) -> Self {
+        Self {
+            observation_key: learn_observation_key(
+                "history_edit",
+                &history_id.to_string(),
+                pair_key,
+            ),
+            source_kind: "history_edit",
+            source_history_id: Some(history_id),
+            source_revision_id: Some(revision_id),
+            rule_key: None,
+            dictation_origin: None,
+            channel: None,
+            proof_eligible: false,
+        }
+    }
+
+    pub(crate) fn history_edit_from_store(
+        dir: &Path,
+        history_id: i64,
+        revision_id: i64,
+        pair_key: &str,
+    ) -> anyhow::Result<Option<Self>> {
+        let connection = open_history(dir)?;
+        let origin = connection
+            .query_row(
+                "SELECT d.transaction_id
+                 FROM dictations d
+                 JOIN dictation_revisions r ON r.dictation_id = d.id
+                 WHERE d.id = ?1 AND r.revision_id = ?2",
+                params![history_id, revision_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?;
+        let Some(origin) = origin else {
+            return Ok(None);
+        };
+        let Some(origin) = origin.filter(|value| !value.is_empty()) else {
+            return Ok(Some(Self::history_edit(history_id, revision_id, pair_key)));
+        };
+        Ok(Some(Self {
+            observation_key: learn_observation_key(
+                "history_edit",
+                &format!("{origin}:{revision_id}"),
+                pair_key,
+            ),
+            source_kind: "history_edit",
+            source_history_id: Some(history_id),
+            source_revision_id: Some(revision_id),
+            rule_key: Some(pair_key.to_owned()),
+            dictation_origin: Some(origin),
+            channel: Some("history_edit"),
+            proof_eligible: true,
+        }))
+    }
+
+    pub(crate) fn paste_session(session_id: &str, pair_key: &str) -> Self {
+        Self {
+            observation_key: learn_observation_key("paste_session", session_id, pair_key),
+            source_kind: "paste_session",
+            source_history_id: None,
+            source_revision_id: None,
+            rule_key: None,
+            dictation_origin: None,
+            channel: None,
+            proof_eligible: false,
+        }
+    }
+
+    pub(crate) fn paste_session_with_dictation_origin(
+        session_id: &str,
+        pair_key: &str,
+        dictation_origin: &str,
+    ) -> Self {
+        Self {
+            observation_key: learn_observation_key("paste_session", session_id, pair_key),
+            source_kind: "paste_session",
+            source_history_id: None,
+            source_revision_id: None,
+            rule_key: Some(pair_key.to_owned()),
+            dictation_origin: Some(dictation_origin.to_owned()),
+            channel: Some("paste"),
+            proof_eligible: true,
+        }
+    }
+
+    #[cfg(any(test, feature = "research-harness"))]
+    pub(crate) fn research_fixture_origin(source_origin_id: &str, pair_key: &str) -> Self {
+        Self::research_fixture_origin_with_observation_id(
+            source_origin_id,
+            source_origin_id,
+            pair_key,
+        )
+    }
+
+    #[cfg(any(test, feature = "research-harness"))]
+    pub(crate) fn research_fixture_origin_with_observation_id(
+        observation_id: &str,
+        source_origin_id: &str,
+        pair_key: &str,
+    ) -> Self {
+        let dictation_origin = format!("research_fixture:{source_origin_id}");
+        Self {
+            observation_key: learn_observation_key(
+                "research_fixture_edit",
+                observation_id,
+                pair_key,
+            ),
+            source_kind: "research_fixture_edit",
+            source_history_id: None,
+            source_revision_id: None,
+            rule_key: Some(pair_key.to_owned()),
+            dictation_origin: Some(dictation_origin),
+            channel: Some("research_fixture"),
+            proof_eligible: true,
+        }
+    }
+
+    pub(crate) fn proof_eligible(&self) -> bool {
+        self.proof_eligible
+    }
+
+    #[cfg(any(test, feature = "research-harness"))]
+    pub(crate) fn research_fixture_edit(operation_id: &str, pair_key: &str) -> Self {
+        Self {
+            observation_key: learn_observation_key("research_fixture_edit", operation_id, pair_key),
+            source_kind: "research_fixture_edit",
+            source_history_id: None,
+            source_revision_id: None,
+            rule_key: None,
+            dictation_origin: None,
+            channel: None,
+            proof_eligible: false,
+        }
+    }
+
+    #[cfg(any(test, feature = "research-harness"))]
+    pub(crate) fn research_fixture_apply(operation_id: &str, pair_key: &str) -> Self {
+        Self {
+            observation_key: learn_observation_key(
+                "research_fixture_apply",
+                operation_id,
+                pair_key,
+            ),
+            source_kind: "research_fixture_apply",
+            source_history_id: None,
+            source_revision_id: None,
+            rule_key: None,
+            dictation_origin: None,
+            channel: None,
+            proof_eligible: false,
+        }
+    }
+
+    #[cfg(any(test, feature = "research-harness"))]
+    pub(crate) fn research_fixture_noop(operation_id: &str, pair_key: &str) -> Self {
+        Self {
+            observation_key: learn_observation_key("research_fixture_noop", operation_id, pair_key),
+            source_kind: "research_fixture_noop",
+            source_history_id: None,
+            source_revision_id: None,
+            rule_key: None,
+            dictation_origin: None,
+            channel: None,
+            proof_eligible: false,
+        }
+    }
+
+    #[cfg(any(test, feature = "research-harness"))]
+    pub(crate) fn research_fixture_undo(operation_id: &str, pair_key: &str) -> Self {
+        Self {
+            observation_key: learn_observation_key("research_fixture_undo", operation_id, pair_key),
+            source_kind: "research_fixture_undo",
+            source_history_id: None,
+            source_revision_id: None,
+            rule_key: None,
+            dictation_origin: None,
+            channel: None,
+            proof_eligible: false,
+        }
+    }
+}
+
+fn learn_observation_key(source_kind: &str, origin: &str, pair_key: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut digest = Sha256::new();
+    for value in [
+        source_kind.as_bytes(),
+        origin.as_bytes(),
+        pair_key.as_bytes(),
+    ] {
+        digest.update((value.len() as u64).to_be_bytes());
+        digest.update(value);
+    }
+    hex::encode(digest.finalize())
+}
+
+enum VerifiedDictationOrigin {
+    Committed(i64),
+    Pending(SpoolIoCommitPermit),
+    Fixture,
+}
+
+fn verify_dictation_origin(
+    dir: &Path,
+    connection: &Connection,
+    observation: &LearnPairObservation,
+) -> anyhow::Result<Option<VerifiedDictationOrigin>> {
+    let (Some(rule_key), Some(dictation_origin), Some(channel)) = (
+        observation.rule_key.as_deref(),
+        observation.dictation_origin.as_deref(),
+        observation.channel,
+    ) else {
+        return Ok(None);
+    };
+    let expected_source_kind = match channel {
+        "paste" => "paste_session",
+        "history_edit" => "history_edit",
+        "research_fixture" => "research_fixture_edit",
+        _ => return Ok(None),
+    };
+    if rule_key.is_empty()
+        || rule_key.len() > 256
+        || dictation_origin.is_empty()
+        || dictation_origin.len() > 256
+        || observation.source_kind != expected_source_kind
+    {
+        return Ok(None);
+    }
+    if channel == "research_fixture" {
+        return Ok(dictation_origin
+            .strip_prefix("research_fixture:")
+            .filter(|source_id| !source_id.is_empty() && source_id.len() <= 240)
+            .map(|_| VerifiedDictationOrigin::Fixture));
+    }
+    if let Some(history_id) = connection
+        .query_row(
+            "SELECT id FROM dictations WHERE transaction_id = ?1",
+            [dictation_origin],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+    {
+        return Ok(Some(VerifiedDictationOrigin::Committed(history_id)));
+    }
+    if channel == "history_edit" {
+        return Ok(None);
+    }
+    let pending_commit = try_spool_io_commit_pending_history(dir, dictation_origin)?;
+    if !active_pending_history_origin(dir, dictation_origin)? {
+        return Ok(None);
+    }
+    Ok(Some(VerifiedDictationOrigin::Pending(pending_commit)))
+}
+
+pub(crate) fn count_independent_learn_pair_hits(dir: &Path, pair_key: &str) -> anyhow::Result<u32> {
+    let connection = open_history(dir)?;
+    let count = connection.query_row(
+        "SELECT COUNT(DISTINCT dictation_origin)
+         FROM learn_observations
+         WHERE rule_key = ?1
+           AND proof_eligible = 1
+           AND dictation_origin IS NOT NULL",
+        [pair_key],
+        |row| row.get::<_, i64>(0),
+    )?;
+    Ok(count as u32)
+}
+
+#[cfg(test)]
 pub fn upsert_learn_pair_with_scope(
     dir: &Path,
     pair_key: &str,
     before_surface: &str,
     after_surface: &str,
     scope: Option<&LearnPairScope>,
-) -> anyhow::Result<Option<LearnPairRecord>> {
-    let c = open_history(dir)?;
-    if let Some(existing) = c
+) -> anyhow::Result<LearnPairUpsert> {
+    upsert_learn_pair_with_observation(dir, pair_key, before_surface, after_surface, scope, None)
+}
+
+pub(crate) fn upsert_learn_pair_with_observation(
+    dir: &Path,
+    pair_key: &str,
+    before_surface: &str,
+    after_surface: &str,
+    scope: Option<&LearnPairScope>,
+    observation: Option<&LearnPairObservation>,
+) -> anyhow::Result<LearnPairUpsert> {
+    upsert_learn_pair_with_observation_policy(
+        dir,
+        pair_key,
+        before_surface,
+        after_surface,
+        scope,
+        observation,
+        false,
+    )
+}
+
+pub(crate) fn upsert_style_learning_pair_with_observation(
+    dir: &Path,
+    pair_key: &str,
+    before_surface: &str,
+    after_surface: &str,
+    scope: Option<&LearnPairScope>,
+    observation: Option<&LearnPairObservation>,
+) -> anyhow::Result<LearnPairUpsert> {
+    if !(pair_key.starts_with("learn:style:") || pair_key.starts_with("learn:intensity:")) {
+        anyhow::bail!("text-refresh upsert is limited to internal style learning keys");
+    }
+    upsert_learn_pair_with_observation_policy(
+        dir,
+        pair_key,
+        before_surface,
+        after_surface,
+        scope,
+        observation,
+        true,
+    )
+}
+
+#[cfg(any(test, feature = "research-harness"))]
+pub(crate) fn has_learn_pair_observation(
+    dir: &Path,
+    observation: &LearnPairObservation,
+) -> anyhow::Result<bool> {
+    let connection = open_history(dir)?;
+    Ok(connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM learn_observations WHERE observation_key = ?1)",
+        [&observation.observation_key],
+        |row| row.get(0),
+    )?)
+}
+
+#[cfg(any(test, feature = "research-harness"))]
+pub(crate) fn record_research_fixture_application(
+    dir: &Path,
+    pair_key: &str,
+    after_surface: &str,
+    observation: &LearnPairObservation,
+    applied: bool,
+) -> anyhow::Result<bool> {
+    let mut connection = open_history(dir)?;
+    let transaction =
+        connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    transaction.execute(
+        "INSERT OR IGNORE INTO learn_observations (observation_key, source_kind, source_history_id, source_revision_id, created_at) VALUES (?1, ?2, ?3, ?4, datetime('now'))",
+        params![
+            observation.observation_key,
+            observation.source_kind,
+            observation.source_history_id,
+            observation.source_revision_id
+        ],
+    )?;
+    if transaction.changes() == 0 {
+        return Ok(false);
+    }
+    if applied {
+        transaction.execute(
+            "UPDATE learn_pairs SET last_used_at = datetime('now') WHERE pair_key = ?1 AND after_surface = ?2 AND promoted = 1 AND ignored = 0 AND tombstoned_at IS NULL",
+            params![pair_key, after_surface],
+        )?;
+        if transaction.changes() != 1 {
+            anyhow::bail!("research application pair is no longer live");
+        }
+        transaction.execute(
+            "INSERT INTO learned_term_usage (word, replacement_runs, last_replaced_at) VALUES (?1, 1, datetime('now')) ON CONFLICT(word) DO UPDATE SET replacement_runs = replacement_runs + 1, last_replaced_at = datetime('now')",
+            [after_surface],
+        )?;
+    }
+    transaction.execute(
+        "DELETE FROM learn_observations WHERE source_history_id IS NULL AND observation_key IN (SELECT observation_key FROM learn_observations WHERE source_history_id IS NULL ORDER BY rowid DESC LIMIT -1 OFFSET 4096)",
+        [],
+    )?;
+    transaction.commit()?;
+    Ok(true)
+}
+
+fn upsert_learn_pair_with_observation_policy(
+    dir: &Path,
+    pair_key: &str,
+    before_surface: &str,
+    after_surface: &str,
+    scope: Option<&LearnPairScope>,
+    observation: Option<&LearnPairObservation>,
+    refresh_conflicting_text: bool,
+) -> anyhow::Result<LearnPairUpsert> {
+    let mut c = open_history(dir)?;
+    let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    if let Some(existing) = tx
         .query_row(
             &format!("SELECT {LEARN_PAIR_COLUMNS} FROM learn_pairs WHERE pair_key = ?1"),
             [pair_key],
@@ -3666,24 +8447,122 @@ pub fn upsert_learn_pair_with_scope(
         .optional()?
     {
         if existing.ignored || existing.tombstoned_at.is_some() {
-            return Ok(None);
+            return Ok(LearnPairUpsert::Skipped(
+                LearnPairSkipReason::TombstoneOrIgnored,
+            ));
+        }
+        let existing_scope = LearnPairScope {
+            family: existing.family.clone(),
+            mapping_id: existing.mapping_id.clone(),
+            browser_host: existing.browser_host.clone(),
+            native_bundle: existing.native_bundle.clone(),
+        };
+        if existing_scope != scope.cloned().unwrap_or_default()
+            || (!refresh_conflicting_text
+                && (existing.before_surface != before_surface
+                    || existing.after_surface != after_surface))
+        {
+            return Ok(LearnPairUpsert::Skipped(LearnPairSkipReason::ScopeConflict));
         }
     } else {
-        let pending: i64 = c.query_row(
+        let pending: i64 = tx.query_row(
             "SELECT COUNT(*) FROM learn_pairs WHERE promoted = 0 AND ignored = 0 AND tombstoned_at IS NULL",
             [],
             |row| row.get(0),
         )?;
         if pending >= LEARN_PAIRS_PENDING_CAP {
-            return Ok(None);
+            return Ok(LearnPairUpsert::Skipped(
+                LearnPairSkipReason::PendingCapacity,
+            ));
         }
     }
+    let mut pending_origin_commit = None;
+    if let Some(observation) = observation {
+        let source_history_id = if observation.proof_eligible {
+            if observation.rule_key.as_deref() != Some(pair_key) {
+                return Ok(LearnPairUpsert::Skipped(
+                    LearnPairSkipReason::UnknownDictationOrigin,
+                ));
+            }
+            match verify_dictation_origin(dir, &tx, observation)? {
+                Some(VerifiedDictationOrigin::Committed(history_id)) => Some(history_id),
+                Some(VerifiedDictationOrigin::Pending(commit)) => {
+                    pending_origin_commit = Some(commit);
+                    None
+                }
+                Some(VerifiedDictationOrigin::Fixture) => None,
+                None => {
+                    return Ok(LearnPairUpsert::Skipped(
+                        LearnPairSkipReason::UnknownDictationOrigin,
+                    ));
+                }
+            }
+        } else {
+            observation.source_history_id
+        };
+        tx.execute(
+            "INSERT OR IGNORE INTO learn_observations (
+                observation_key, source_kind, source_history_id, source_revision_id,
+                created_at, rule_key, dictation_origin, channel, proof_eligible
+             ) VALUES (?1, ?2, ?3, ?4, datetime('now'), ?5, ?6, ?7, ?8)",
+            params![
+                observation.observation_key,
+                observation.source_kind,
+                source_history_id,
+                observation.source_revision_id,
+                observation.rule_key,
+                observation.dictation_origin,
+                observation.channel,
+                observation.proof_eligible
+            ],
+        )?;
+        if tx.changes() == 0 {
+            if observation.proof_eligible {
+                tx.execute(
+                    "UPDATE learn_observations
+                     SET source_history_id = COALESCE(source_history_id, ?3),
+                         source_revision_id = COALESCE(source_revision_id, ?4),
+                         channel = CASE WHEN ?5 = 'history_edit' THEN ?5 ELSE channel END
+                     WHERE rule_key = ?1 AND dictation_origin = ?2 AND proof_eligible = 1",
+                    params![
+                        observation.rule_key,
+                        observation.dictation_origin,
+                        source_history_id,
+                        observation.source_revision_id,
+                        observation.channel
+                    ],
+                )?;
+            }
+            tx.commit()?;
+            return Ok(LearnPairUpsert::Skipped(
+                LearnPairSkipReason::DuplicateObservation,
+            ));
+        }
+        // Paste receipts only need to cover recently completed process/session
+        // retries. History receipts live with their parent History row.
+        tx.execute(
+            "DELETE FROM learn_observations WHERE source_history_id IS NULL AND observation_key IN (SELECT observation_key FROM learn_observations WHERE source_history_id IS NULL ORDER BY rowid DESC LIMIT -1 OFFSET 4096)",
+            [],
+        )?;
+    }
     let scope = scope.cloned().unwrap_or_default();
-    let record = c.query_row(
+    let before_update = if refresh_conflicting_text {
+        "excluded.before_surface"
+    } else {
+        "learn_pairs.before_surface"
+    };
+    let after_update = if refresh_conflicting_text {
+        "excluded.after_surface"
+    } else {
+        "learn_pairs.after_surface"
+    };
+    let record = tx.query_row(
         &format!(
-            "INSERT INTO learn_pairs (pair_key, before_surface, after_surface, hits, promoted, last_at, family, mapping_id, browser_host, native_bundle, last_used_at, pinned, tombstoned_at, ignored)
+        "INSERT INTO learn_pairs (pair_key, before_surface, after_surface, hits, promoted, last_at, family, mapping_id, browser_host, native_bundle, last_used_at, pinned, tombstoned_at, ignored)
              VALUES (?1, ?2, ?3, 1, 0, datetime('now'), ?4, ?5, ?6, ?7, NULL, 0, NULL, 0)
              ON CONFLICT(pair_key) DO UPDATE SET
+               before_surface = {before_update},
+               after_surface = {after_update},
                hits = hits + 1,
                last_at = datetime('now'),
                family = excluded.family,
@@ -3703,7 +8582,9 @@ pub fn upsert_learn_pair_with_scope(
         ],
         learn_pair_from_row,
     )?;
-    Ok(Some(record))
+    tx.commit()?;
+    drop(pending_origin_commit);
+    Ok(LearnPairUpsert::Stored(Box::new(record)))
 }
 
 pub fn get_learn_pair(dir: &Path, pair_key: &str) -> anyhow::Result<Option<LearnPairRecord>> {
@@ -3716,13 +8597,306 @@ pub fn get_learn_pair(dir: &Path, pair_key: &str) -> anyhow::Result<Option<Learn
     .optional()?)
 }
 
-pub fn mark_learn_pair_promoted(dir: &Path, pair_key: &str) -> anyhow::Result<bool> {
-    let c = open_history(dir)?;
-    c.execute(
-        "UPDATE learn_pairs SET promoted = 1, ignored = 0, tombstoned_at = NULL, last_at = datetime('now') WHERE pair_key = ?1",
-        [pair_key],
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DictionaryEffectAction {
+    Add,
+    Remove,
+}
+
+impl DictionaryEffectAction {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Add => "add",
+            Self::Remove => "remove",
+        }
+    }
+
+    fn from_str(value: &str) -> anyhow::Result<Self> {
+        match value {
+            "add" => Ok(Self::Add),
+            "remove" => Ok(Self::Remove),
+            _ => anyhow::bail!("invalid pending dictionary effect"),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PendingDictionaryEffect {
+    pub pair_key: String,
+    pub word: String,
+    pub action: DictionaryEffectAction,
+    pub version: i64,
+}
+
+fn is_global_dictionary_word_rule(
+    pair_key: &str,
+    before_surface: &str,
+    after_surface: &str,
+    manual_scoped: bool,
+    auto_scoped: bool,
+) -> bool {
+    !before_surface.trim().is_empty()
+        && !after_surface.trim().is_empty()
+        && !manual_scoped
+        && !auto_scoped
+        && !pair_key.starts_with("learn:style:")
+        && !pair_key.starts_with("learn:intensity:")
+}
+
+fn stage_dictionary_effect(
+    transaction: &rusqlite::Transaction<'_>,
+    pair_key: &str,
+    action: DictionaryEffectAction,
+) -> anyhow::Result<()> {
+    transaction.execute(
+        "UPDATE learn_pairs
+         SET dictionary_pending_action = ?2,
+             dictionary_effect_version = dictionary_effect_version + 1
+         WHERE pair_key = ?1",
+        params![pair_key, action.as_str()],
     )?;
-    Ok(c.changes() > 0)
+    Ok(())
+}
+
+pub(crate) fn list_pending_dictionary_effects(
+    dir: &Path,
+) -> anyhow::Result<Vec<PendingDictionaryEffect>> {
+    let connection = open_history(dir)?;
+    let mut statement = connection.prepare(
+        "SELECT pair_key, after_surface, dictionary_pending_action, dictionary_effect_version
+         FROM learn_pairs
+         WHERE dictionary_pending_action != 'none'
+         ORDER BY dictionary_effect_version, pair_key",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, i64>(3)?,
+        ))
+    })?;
+    rows.map(|row| {
+        let (pair_key, word, action, version) = row?;
+        Ok(PendingDictionaryEffect {
+            pair_key,
+            word,
+            action: DictionaryEffectAction::from_str(&action)?,
+            version,
+        })
+    })
+    .collect()
+}
+
+pub(crate) fn acknowledge_dictionary_effect(
+    dir: &Path,
+    pair_key: &str,
+    version: i64,
+) -> anyhow::Result<bool> {
+    let connection = open_history(dir)?;
+    connection.execute(
+        "UPDATE learn_pairs
+         SET dictionary_pending_action = 'none'
+         WHERE pair_key = ?1
+           AND dictionary_effect_version = ?2
+           AND dictionary_pending_action != 'none'",
+        params![pair_key, version],
+    )?;
+    Ok(connection.changes() == 1)
+}
+
+pub(crate) fn cancel_pending_dictionary_effects_for_word(
+    dir: &Path,
+    word: &str,
+) -> anyhow::Result<bool> {
+    let mut connection = open_history(dir)?;
+    let transaction =
+        connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    transaction.execute(
+        "UPDATE learn_pairs
+         SET dictionary_pending_action = 'none',
+             dictionary_effect_version = dictionary_effect_version + 1
+         WHERE after_surface = ?1 COLLATE NOCASE
+           AND dictionary_pending_action = 'add'",
+        [word],
+    )?;
+    let cancelled = transaction.changes() > 0;
+    transaction.commit()?;
+    Ok(cancelled)
+}
+
+#[cfg(test)]
+pub fn mark_learn_pair_promoted(dir: &Path, pair_key: &str) -> anyhow::Result<bool> {
+    mark_learn_pair_promoted_with_scope_kind(dir, pair_key, false)
+}
+
+#[cfg(test)]
+pub(crate) fn mark_learn_pair_promoted_with_scope_kind(
+    dir: &Path,
+    pair_key: &str,
+    auto_scoped: bool,
+) -> anyhow::Result<bool> {
+    let mut connection = open_history(dir)?;
+    let transaction =
+        connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let prior = transaction
+        .query_row(
+            "SELECT before_surface, after_surface, promoted, ignored, tombstoned_at,
+                    manual_scoped, auto_scoped, dictionary_pending_action
+             FROM learn_pairs WHERE pair_key = ?1",
+            [pair_key],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, bool>(2)?,
+                    row.get::<_, bool>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<i64>>(5)?.unwrap_or(0) != 0,
+                    row.get::<_, Option<i64>>(6)?.unwrap_or(0) != 0,
+                    row.get::<_, String>(7)?,
+                ))
+            },
+        )
+        .optional()?;
+    let prior_global = prior.as_ref().is_some_and(
+        |(before, after, promoted, ignored, tombstoned_at, manual_scoped, prior_auto, _)| {
+            *promoted
+                && !*ignored
+                && tombstoned_at.is_none()
+                && is_global_dictionary_word_rule(
+                    pair_key,
+                    before,
+                    after,
+                    *manual_scoped,
+                    *prior_auto,
+                )
+        },
+    );
+    let had_pending_global_add = prior.as_ref().is_some_and(
+        |(before, after, _, _, _, manual_scoped, prior_auto, action)| {
+            action == "add"
+                && is_global_dictionary_word_rule(
+                    pair_key,
+                    before,
+                    after,
+                    *manual_scoped,
+                    *prior_auto,
+                )
+        },
+    );
+    transaction.execute(
+        "UPDATE learn_pairs SET promoted = 1, ignored = 0, tombstoned_at = NULL, auto_scoped = CASE WHEN ?2 THEN 1 ELSE auto_scoped END, last_at = datetime('now') WHERE pair_key = ?1",
+        params![pair_key, auto_scoped],
+    )?;
+    let changed = transaction.changes() > 0;
+    if changed {
+        let (before, after, manual_scoped, stored_auto_scoped) = transaction.query_row(
+            "SELECT before_surface, after_surface, manual_scoped, auto_scoped
+             FROM learn_pairs WHERE pair_key = ?1",
+            [pair_key],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<i64>>(2)?.unwrap_or(0) != 0,
+                    row.get::<_, Option<i64>>(3)?.unwrap_or(0) != 0,
+                ))
+            },
+        )?;
+        let is_global = is_global_dictionary_word_rule(
+            pair_key,
+            &before,
+            &after,
+            manual_scoped,
+            stored_auto_scoped,
+        );
+        if is_global {
+            stage_dictionary_effect(&transaction, pair_key, DictionaryEffectAction::Add)?;
+        } else if prior_global || had_pending_global_add {
+            stage_dictionary_effect(&transaction, pair_key, DictionaryEffectAction::Remove)?;
+        }
+    }
+    transaction.commit()?;
+    Ok(changed)
+}
+
+/// Promote an automatically learned pair only while its exact candidate is
+/// still live, in the same scope, and at its required hit threshold. This
+/// conditional update never clears a tombstone or ignored marker.
+pub(crate) fn promote_learn_pair_if_eligible(
+    dir: &Path,
+    pair_key: &str,
+    before_surface: &str,
+    after_surface: &str,
+    scope: Option<&LearnPairScope>,
+    threshold: u32,
+    auto_scoped: bool,
+) -> anyhow::Result<bool> {
+    let scope = scope.cloned().unwrap_or_default();
+    let mut connection = open_history(dir)?;
+    let transaction =
+        connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let changed = transaction.execute(
+        "UPDATE learn_pairs
+         SET promoted = 1,
+             auto_scoped = CASE WHEN ?9 THEN 1 ELSE auto_scoped END,
+             last_at = datetime('now')
+         WHERE pair_key = ?1
+           AND before_surface = ?2
+           AND after_surface = ?3
+           AND family IS ?4
+           AND mapping_id IS ?5
+           AND browser_host IS ?6
+           AND native_bundle IS ?7
+           AND (?2 = '' AND hits >= ?8 OR ?2 != '' AND (
+               SELECT COUNT(DISTINCT dictation_origin)
+               FROM learn_observations
+               WHERE rule_key = ?1
+                 AND proof_eligible = 1
+                 AND dictation_origin IS NOT NULL
+           ) >= ?8)
+           AND promoted = 0
+           AND ignored = 0
+           AND tombstoned_at IS NULL",
+        params![
+            pair_key,
+            before_surface,
+            after_surface,
+            scope.family,
+            scope.mapping_id,
+            scope.browser_host,
+            scope.native_bundle,
+            threshold as i64,
+            auto_scoped
+        ],
+    )?;
+    if changed > 0 {
+        let (before, after, manual_scoped, stored_auto_scoped) = transaction.query_row(
+            "SELECT before_surface, after_surface, manual_scoped, auto_scoped
+             FROM learn_pairs WHERE pair_key = ?1",
+            [pair_key],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<i64>>(2)?.unwrap_or(0) != 0,
+                    row.get::<_, Option<i64>>(3)?.unwrap_or(0) != 0,
+                ))
+            },
+        )?;
+        if is_global_dictionary_word_rule(
+            pair_key,
+            &before,
+            &after,
+            manual_scoped,
+            stored_auto_scoped,
+        ) {
+            stage_dictionary_effect(&transaction, pair_key, DictionaryEffectAction::Add)?;
+        }
+    }
+    transaction.commit()?;
+    Ok(changed > 0)
 }
 
 pub fn ensure_learn_pair_promoted(
@@ -3732,20 +8906,42 @@ pub fn ensure_learn_pair_promoted(
     after_surface: &str,
     scope: Option<&LearnPairScope>,
 ) -> anyhow::Result<()> {
-    let scope = scope.cloned().unwrap_or_default();
-    let c = open_history(dir)?;
-    c.execute(
-        "INSERT INTO learn_pairs (pair_key, before_surface, after_surface, hits, promoted, last_at, family, mapping_id, browser_host, native_bundle, pinned, ignored)
-         VALUES (?1, ?2, ?3, 3, 1, datetime('now'), ?4, ?5, ?6, ?7, 0, 0)
+    let scope = scope.ok_or_else(|| anyhow::anyhow!("learn pair scope is required"))?;
+    let mut c = open_history(dir)?;
+    let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let existing = tx
+        .query_row(
+            &format!("SELECT {LEARN_PAIR_COLUMNS} FROM learn_pairs WHERE pair_key = ?1"),
+            [pair_key],
+            learn_pair_from_row,
+        )
+        .optional()?;
+    if let Some(existing) = existing {
+        let existing_scope = LearnPairScope {
+            family: existing.family,
+            mapping_id: existing.mapping_id,
+            browser_host: existing.browser_host,
+            native_bundle: existing.native_bundle,
+        };
+        if existing_scope != *scope {
+            anyhow::bail!("learn pair scope conflicts with the recorded scope");
+        }
+        if existing.before_surface != before_surface || existing.after_surface != after_surface {
+            anyhow::bail!("learn pair surface conflicts with the recorded pair key");
+        }
+    }
+    tx.execute(
+        "INSERT INTO learn_pairs (pair_key, before_surface, after_surface, hits, promoted, last_at, family, mapping_id, browser_host, native_bundle, pinned, ignored, manual_scoped)
+         VALUES (?1, ?2, ?3, 3, 1, datetime('now'), ?4, ?5, ?6, ?7, 0, 0, 0)
          ON CONFLICT(pair_key) DO UPDATE SET
            promoted = 1,
            ignored = 0,
            tombstoned_at = NULL,
            last_at = datetime('now'),
-           family = COALESCE(learn_pairs.family, excluded.family),
-           mapping_id = COALESCE(learn_pairs.mapping_id, excluded.mapping_id),
-           browser_host = COALESCE(learn_pairs.browser_host, excluded.browser_host),
-           native_bundle = COALESCE(learn_pairs.native_bundle, excluded.native_bundle)",
+           family = excluded.family,
+           mapping_id = excluded.mapping_id,
+           browser_host = excluded.browser_host,
+           native_bundle = excluded.native_bundle",
         params![
             pair_key,
             before_surface,
@@ -3756,7 +8952,141 @@ pub fn ensure_learn_pair_promoted(
             scope.native_bundle
         ],
     )?;
+    let (before, after, manual_scoped, auto_scoped) = tx.query_row(
+        "SELECT before_surface, after_surface, manual_scoped, auto_scoped
+         FROM learn_pairs WHERE pair_key = ?1",
+        [pair_key],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<i64>>(2)?.unwrap_or(0) != 0,
+                row.get::<_, Option<i64>>(3)?.unwrap_or(0) != 0,
+            ))
+        },
+    )?;
+    if is_global_dictionary_word_rule(pair_key, &before, &after, manual_scoped, auto_scoped) {
+        // Explicit confirmation also repairs a missing Settings projection for
+        // an already-promoted global rule. The Settings owner applies this
+        // source idempotently before conditionally acknowledging this version.
+        stage_dictionary_effect(&tx, pair_key, DictionaryEffectAction::Add)?;
+    }
+    tx.commit()?;
     Ok(())
+}
+
+#[derive(Debug)]
+pub enum ManualScopedPairStoreError {
+    InvalidScope,
+    ScopeConflict,
+    #[expect(
+        dead_code,
+        reason = "retain the private storage cause for internal diagnostics while code() exposes only a stable category"
+    )]
+    Storage(anyhow::Error),
+}
+
+impl ManualScopedPairStoreError {
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::InvalidScope => "manual_pair_scope_unknown",
+            Self::ScopeConflict => "manual_pair_scope_conflict",
+            Self::Storage(_) => "manual_pair_save_failed",
+        }
+    }
+}
+
+pub fn ensure_manual_scoped_learn_pair(
+    dir: &Path,
+    pair_key: &str,
+    before_surface: &str,
+    after_surface: &str,
+    scope: &LearnPairScope,
+) -> Result<LearnPairRecord, ManualScopedPairStoreError> {
+    if scope.native_bundle.as_deref().is_none_or(str::is_empty) || scope.browser_host.is_some() {
+        return Err(ManualScopedPairStoreError::InvalidScope);
+    }
+    let mut c = open_history(dir).map_err(ManualScopedPairStoreError::Storage)?;
+    let tx = c
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|error| ManualScopedPairStoreError::Storage(error.into()))?;
+    let existing = tx
+        .query_row(
+            &format!("SELECT {LEARN_PAIR_COLUMNS} FROM learn_pairs WHERE pair_key = ?1"),
+            [pair_key],
+            learn_pair_from_row,
+        )
+        .optional()
+        .map_err(|error| ManualScopedPairStoreError::Storage(error.into()))?;
+    let was_global_promoted = existing.as_ref().is_some_and(|existing| {
+        existing.is_live_promoted()
+            && is_global_dictionary_word_rule(
+                pair_key,
+                &existing.before_surface,
+                &existing.after_surface,
+                existing.manual_scoped,
+                existing.auto_scoped,
+            )
+    });
+    let had_pending_global_add = tx
+        .query_row(
+            "SELECT dictionary_pending_action = 'add' FROM learn_pairs WHERE pair_key = ?1",
+            [pair_key],
+            |row| row.get::<_, bool>(0),
+        )
+        .optional()
+        .map_err(|error| ManualScopedPairStoreError::Storage(error.into()))?
+        .unwrap_or(false);
+    if let Some(existing) = existing {
+        let existing_scope = LearnPairScope {
+            family: existing.family,
+            mapping_id: existing.mapping_id,
+            browser_host: existing.browser_host,
+            native_bundle: existing.native_bundle,
+        };
+        if existing.before_surface != before_surface || existing.after_surface != after_surface {
+            return Err(ManualScopedPairStoreError::ScopeConflict);
+        }
+        // A user may explicitly rebind an existing exact pair only after its
+        // previous rule has been disarmed. Active rules remain scope-bound.
+        if existing_scope != *scope && !existing.ignored && existing.tombstoned_at.is_none() {
+            return Err(ManualScopedPairStoreError::ScopeConflict);
+        }
+    }
+    let row = tx.query_row(
+        &format!(
+            "INSERT INTO learn_pairs (pair_key, before_surface, after_surface, hits, promoted, last_at, family, mapping_id, browser_host, native_bundle, pinned, ignored, manual_scoped)
+         VALUES (?1, ?2, ?3, 0, 1, datetime('now'), ?4, ?5, NULL, ?6, 0, 0, 1)
+         ON CONFLICT(pair_key) DO UPDATE SET
+           promoted = 1,
+           ignored = 0,
+           tombstoned_at = NULL,
+           last_at = datetime('now'),
+           family = excluded.family,
+           mapping_id = excluded.mapping_id,
+           browser_host = NULL,
+           native_bundle = excluded.native_bundle,
+           manual_scoped = 1,
+           auto_scoped = 0
+         RETURNING {LEARN_PAIR_COLUMNS}"
+        ),
+        params![
+            pair_key,
+            before_surface,
+            after_surface,
+            scope.family,
+            scope.mapping_id,
+            scope.native_bundle
+        ],
+        learn_pair_from_row,
+    ).map_err(|error| ManualScopedPairStoreError::Storage(error.into()))?;
+    if was_global_promoted || had_pending_global_add {
+        stage_dictionary_effect(&tx, pair_key, DictionaryEffectAction::Remove)
+            .map_err(ManualScopedPairStoreError::Storage)?;
+    }
+    tx.commit()
+        .map_err(|error| ManualScopedPairStoreError::Storage(error.into()))?;
+    Ok(row)
 }
 
 pub fn set_learn_pair_hits(dir: &Path, pair_key: &str, hits: u32) -> anyhow::Result<bool> {
@@ -3768,13 +9098,91 @@ pub fn set_learn_pair_hits(dir: &Path, pair_key: &str, hits: u32) -> anyhow::Res
     Ok(c.changes() > 0)
 }
 
+fn tombstone_learn_pair_with_observation(
+    dir: &Path,
+    pair_key: &str,
+    observation: Option<&LearnPairObservation>,
+) -> anyhow::Result<(bool, bool)> {
+    let mut connection = open_history(dir)?;
+    let transaction =
+        connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let prior = transaction
+        .query_row(
+            "SELECT before_surface, after_surface, promoted, ignored, tombstoned_at,
+                    manual_scoped, auto_scoped, dictionary_pending_action
+             FROM learn_pairs WHERE pair_key = ?1",
+            [pair_key],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)? != 0,
+                    row.get::<_, i64>(3)? != 0,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<i64>>(5)?.unwrap_or(0) != 0,
+                    row.get::<_, Option<i64>>(6)?.unwrap_or(0) != 0,
+                    row.get::<_, String>(7)?,
+                ))
+            },
+        )
+        .optional()?;
+    let should_remove_dictionary_effect = prior.as_ref().is_some_and(
+        |(before, after, promoted, ignored, tombstoned_at, manual_scoped, auto_scoped, action)| {
+            is_global_dictionary_word_rule(pair_key, before, after, *manual_scoped, *auto_scoped)
+                && ((*promoted && !*ignored && tombstoned_at.is_none()) || action == "add")
+        },
+    );
+    if let Some(observation) = observation {
+        transaction.execute(
+            "INSERT OR IGNORE INTO learn_observations (observation_key, source_kind, source_history_id, source_revision_id, created_at) VALUES (?1, ?2, ?3, ?4, datetime('now'))",
+            params![
+                observation.observation_key,
+                observation.source_kind,
+                observation.source_history_id,
+                observation.source_revision_id
+            ],
+        )?;
+        if transaction.changes() == 0 {
+            return Ok((false, true));
+        }
+        transaction.execute(
+            "DELETE FROM learn_observations WHERE source_history_id IS NULL AND observation_key IN (SELECT observation_key FROM learn_observations WHERE source_history_id IS NULL ORDER BY rowid DESC LIMIT -1 OFFSET 4096)",
+            [],
+        )?;
+    }
+    if observation.is_some() {
+        transaction.execute(
+            "UPDATE learn_pairs SET ignored = 1, tombstoned_at = datetime('now'), last_at = datetime('now') WHERE pair_key = ?1 AND tombstoned_at IS NULL",
+            [pair_key],
+        )?;
+    } else {
+        transaction.execute(
+            "UPDATE learn_pairs SET ignored = 1, tombstoned_at = datetime('now'), last_at = datetime('now') WHERE pair_key = ?1",
+            [pair_key],
+        )?;
+    }
+    let changed = transaction.changes() > 0;
+    if observation.is_some() && !changed {
+        anyhow::bail!("research undo pair is no longer live");
+    }
+    if changed && should_remove_dictionary_effect {
+        stage_dictionary_effect(&transaction, pair_key, DictionaryEffectAction::Remove)?;
+    }
+    transaction.commit()?;
+    Ok((changed, false))
+}
+
 pub fn tombstone_learn_pair(dir: &Path, pair_key: &str) -> anyhow::Result<bool> {
-    let c = open_history(dir)?;
-    c.execute(
-        "UPDATE learn_pairs SET ignored = 1, tombstoned_at = datetime('now'), last_at = datetime('now') WHERE pair_key = ?1",
-        [pair_key],
-    )?;
-    Ok(c.changes() > 0)
+    Ok(tombstone_learn_pair_with_observation(dir, pair_key, None)?.0)
+}
+
+#[cfg(any(test, feature = "research-harness"))]
+pub(crate) fn tombstone_research_learn_pair(
+    dir: &Path,
+    pair_key: &str,
+    observation: &LearnPairObservation,
+) -> anyhow::Result<(bool, bool)> {
+    tombstone_learn_pair_with_observation(dir, pair_key, Some(observation))
 }
 
 #[allow(dead_code)]
@@ -3827,6 +9235,57 @@ pub fn list_learn_pairs(dir: &Path) -> anyhow::Result<Vec<LearnPairRecord>> {
     rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
 }
 
+/// Application allocation limits for the complete, non-paged Settings audit.
+pub(crate) const AUDIT_PAIR_MAX_ROWS: usize = 1024;
+pub(crate) const AUDIT_PAIR_MAX_UTF8_BYTES: usize = 2 * 1024 * 1024;
+#[derive(Debug)]
+pub(crate) enum AuditPairReadError {
+    Capacity {
+        resource: &'static str,
+        limit: usize,
+    },
+    Store,
+}
+pub(crate) fn list_learn_pairs_for_audit(
+    dir: &Path,
+) -> Result<Vec<LearnPairRecord>, AuditPairReadError> {
+    use rusqlite::types::ValueRef;
+    let c = open_history(dir).map_err(|_| AuditPairReadError::Store)?;
+    let mut query = c
+        .prepare(&format!(
+            "SELECT {LEARN_PAIR_COLUMNS} FROM learn_pairs ORDER BY last_at DESC, pair_key ASC"
+        ))
+        .map_err(|_| AuditPairReadError::Store)?;
+    let mut cursor = query.query([]).map_err(|_| AuditPairReadError::Store)?;
+    let mut rows = Vec::new();
+    let mut bytes = 0usize;
+    while let Some(row) = cursor.next().map_err(|_| AuditPairReadError::Store)? {
+        if rows.len() == AUDIT_PAIR_MAX_ROWS {
+            return Err(AuditPairReadError::Capacity {
+                resource: "rows",
+                limit: AUDIT_PAIR_MAX_ROWS,
+            });
+        }
+        // SQLite may materialize its current row. No owned String/row copy is made before admission.
+        for index in [0_usize, 1, 2, 5, 6, 7, 8, 9, 10, 12] {
+            let size = match row.get_ref(index).map_err(|_| AuditPairReadError::Store)? {
+                ValueRef::Text(text) => text.len(),
+                ValueRef::Null => 0,
+                _ => return Err(AuditPairReadError::Store),
+            };
+            bytes = bytes
+                .checked_add(size)
+                .filter(|n| *n <= AUDIT_PAIR_MAX_UTF8_BYTES)
+                .ok_or(AuditPairReadError::Capacity {
+                    resource: "utf8_bytes",
+                    limit: AUDIT_PAIR_MAX_UTF8_BYTES,
+                })?;
+        }
+        rows.push(learn_pair_from_row(row).map_err(|_| AuditPairReadError::Store)?);
+    }
+    Ok(rows)
+}
+
 #[derive(Clone, Serialize)]
 pub struct LearnedTermUsage {
     pub word: String,
@@ -3850,7 +9309,7 @@ pub fn record_learned_term_usage(dir: &Path, words: &[String]) -> anyhow::Result
 
 pub fn list_learned_term_usage(dir: &Path) -> anyhow::Result<Vec<LearnedTermUsage>> {
     let c = open_history(dir)?;
-    let mut statement = c.prepare("SELECT word, replacement_runs, last_replaced_at FROM learned_term_usage WHERE EXISTS (SELECT 1 FROM learn_pairs WHERE after_surface = word AND promoted = 1 AND ignored = 0 AND tombstoned_at IS NULL) ORDER BY last_replaced_at DESC, word ASC")?;
+    let mut statement = c.prepare("SELECT word, replacement_runs, last_replaced_at FROM learned_term_usage WHERE EXISTS (SELECT 1 FROM learn_pairs WHERE after_surface COLLATE NOCASE = word COLLATE NOCASE AND promoted = 1 AND ignored = 0 AND tombstoned_at IS NULL) ORDER BY last_replaced_at DESC, word ASC")?;
     let rows = statement.query_map([], |row| {
         Ok(LearnedTermUsage {
             word: row.get(0)?,
@@ -3939,9 +9398,26 @@ pub fn delete_style_draft(dir: &Path, draft_key: &str) -> anyhow::Result<bool> {
     Ok(c.changes() > 0)
 }
 
+#[cfg(test)]
 pub fn clear_all_data(dir: &Path) -> anyhow::Result<()> {
+    let guard = begin_clear_all_data(dir)?;
+    clear_all_data_under_guard(dir, &guard)
+}
+
+/// Clear data after admission has already been acquired. This runs on the
+/// retained spool I/O owner in production; no registry guard crosses the
+/// filesystem or database work.
+pub(crate) fn clear_all_data_under_guard(
+    dir: &Path,
+    guard: &SpoolClearGuard,
+) -> anyhow::Result<()> {
+    if guard.data_root != normalized_data_root(dir) {
+        anyhow::bail!("data clear lease does not own this directory");
+    }
+    let _commit = try_spool_io_commit(dir)?;
     let c = open_history(dir)?;
-    c.execute_batch("DELETE FROM dictations; DELETE FROM usage; DELETE FROM learn_pairs; DELETE FROM style_drafts; DELETE FROM learned_term_usage;")?;
+    c.execute_batch("DELETE FROM dictations; DELETE FROM learn_observations; DELETE FROM usage; DELETE FROM learn_pairs; DELETE FROM style_drafts; DELETE FROM learned_term_usage;")?;
+    let vacuum_result = c.execute_batch("VACUUM");
     drop(c);
     // Run after open_history: clearing a legacy database can itself create a
     // rollback copy, which must not retain the very text the user cleared.
@@ -3954,6 +9430,13 @@ pub fn clear_all_data(dir: &Path) -> anyhow::Result<()> {
     let gold = gold_root(dir);
     if gold.exists() {
         fs::remove_dir_all(&gold)?;
+    }
+    let pending = pending_history_root(dir);
+    if pending.exists() {
+        fs::remove_dir_all(&pending)?;
+    }
+    if let Err(error) = vacuum_result {
+        return Err(error.into());
     }
     Ok(())
 }
@@ -3979,7 +9462,7 @@ pub fn write_export_file(path: &Path, contents: &str) -> anyhow::Result<()> {
     if path.as_os_str().is_empty() || !path.is_absolute() {
         anyhow::bail!("invalid export path");
     }
-    write_atomic_bytes(path, contents.as_bytes())
+    write_atomic_bytes_with_parent_mode(path, contents.as_bytes(), false)
 }
 pub fn failed_spool(dir: &Path, id: i64) -> anyhow::Result<Option<String>> {
     let c = open_history(dir)?;
@@ -4004,6 +9487,31 @@ pub struct HistoryScene {
     pub family: Option<String>,
     pub browser_host: Option<String>,
     pub native_bundle: Option<String>,
+}
+
+pub(crate) struct ManualHistorySave {
+    pub revision_id: Option<i64>,
+    /// The adopted text immediately before this manual revision. For an
+    /// unchanged retry of the latest manual revision, this is reconstructed
+    /// from its predecessor so learning can reuse the same origin receipt.
+    pub learning_before_text: String,
+    pub scene: HistoryScene,
+    pub changed: bool,
+}
+
+pub(crate) struct RecleanHistorySave<'a> {
+    pub dictation_id: i64,
+    pub final_text: &'a str,
+    pub cleanup_status: &'a str,
+    pub intent: &'a crate::llm::CleanupIntent,
+    pub model: &'a str,
+    pub context_policy: &'a crate::context::ContextPolicy,
+    pub cleanup_rejected_candidate: Option<&'a str>,
+    pub cleanup_guard_reason: Option<&'a str>,
+    pub cleanup_attempt_kind: Option<&'a str>,
+    pub cleanup_transformations: Option<&'a [String]>,
+    pub cleanup_final_guard_reason: Option<&'a str>,
+    pub cleanup_failure_reason: Option<&'a str>,
 }
 
 impl HistoryScene {
@@ -4099,56 +9607,193 @@ pub fn save_history_revision(
     if c.changes() == 0 {
         anyhow::bail!("history record was not found");
     }
+    c.execute(
+        "UPDATE dictations SET cleanup_rejected_candidate=NULL, cleanup_guard_reason=NULL, cleanup_attempt_kind=NULL, cleanup_transformations_json=NULL, cleanup_final_guard_reason=NULL, cleanup_failure_reason=NULL WHERE id=?",
+        [dictation_id],
+    )?;
     Ok(c.last_insert_rowid())
 }
+
+/// Saves an explicit History edit while reading the prior adopted text and
+/// captured scene under the same SQLite write transaction. A repeated save of
+/// the current text is a no-op, so it cannot create a new learning event.
+pub(crate) fn save_manual_history_revision(
+    dir: &Path,
+    dictation_id: i64,
+    final_text: &str,
+) -> anyhow::Result<ManualHistorySave> {
+    if final_text.trim().is_empty() {
+        anyhow::bail!("history revision cannot be empty");
+    }
+    let mut c = open_history(dir)?;
+    let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let row = tx
+        .query_row(
+            "SELECT COALESCE(NULLIF((SELECT final_text FROM dictation_revisions WHERE dictation_id=d.id ORDER BY revision_id DESC LIMIT 1),''),NULLIF(d.final_text,''),COALESCE(d.raw_text,'')), (SELECT revision_id FROM dictation_revisions WHERE dictation_id=d.id ORDER BY revision_id DESC LIMIT 1), (SELECT revision_reason FROM dictation_revisions WHERE dictation_id=d.id ORDER BY revision_id DESC LIMIT 1), COALESCE(NULLIF((SELECT final_text FROM dictation_revisions previous WHERE previous.dictation_id=d.id AND previous.revision_id < (SELECT revision_id FROM dictation_revisions latest WHERE latest.dictation_id=d.id ORDER BY latest.revision_id DESC LIMIT 1) ORDER BY previous.revision_id DESC LIMIT 1),''),NULLIF(d.final_text,''),COALESCE(d.raw_text,'')), d.context_policy_json, d.context_profile_id, d.context_family, d.context_browser_host, d.context_native_bundle FROM dictations d WHERE d.id=?1",
+            [dictation_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or_else(|| anyhow::anyhow!("history record was not found"))?;
+    let (
+        previous_text,
+        previous_revision_id,
+        previous_reason,
+        retry_before_text,
+        policy_json,
+        profile_id,
+        family,
+        browser_host,
+        native_bundle,
+    ) = row;
+    let scene = HistoryScene {
+        policy: policy_json
+            .map(|value| serde_json::from_str(&value))
+            .transpose()?,
+        profile_id,
+        family,
+        browser_host,
+        native_bundle,
+    };
+    if previous_text == final_text {
+        tx.commit()?;
+        let revision_id =
+            previous_revision_id.filter(|_| previous_reason.as_deref() == Some("manual_edit"));
+        return Ok(ManualHistorySave {
+            revision_id,
+            learning_before_text: if revision_id.is_some() {
+                retry_before_text
+            } else {
+                previous_text
+            },
+            scene,
+            changed: false,
+        });
+    }
+    tx.execute(
+        "INSERT INTO dictation_revisions (dictation_id,created_at,final_text,cleanup_status,intent_json,model,context_policy_json,revision_reason) VALUES (?1,datetime('now'),?2,NULL,NULL,NULL,NULL,'manual_edit')",
+        params![dictation_id, final_text],
+    )?;
+    let revision_id = tx.last_insert_rowid();
+    tx.execute(
+        "UPDATE dictations SET cleanup_rejected_candidate=NULL, cleanup_guard_reason=NULL, cleanup_attempt_kind=NULL, cleanup_transformations_json=NULL, cleanup_final_guard_reason=NULL, cleanup_failure_reason=NULL WHERE id=?1",
+        [dictation_id],
+    )?;
+    tx.commit()?;
+    Ok(ManualHistorySave {
+        revision_id: Some(revision_id),
+        learning_before_text: previous_text,
+        scene,
+        changed: true,
+    })
+}
+
+fn history_revision_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<HistoryRevision> {
+    let intent_json: Option<String> = row.get(5)?;
+    let context_policy_json: Option<String> = row.get(7)?;
+    Ok(HistoryRevision {
+        revision_id: row.get(0)?,
+        dictation_id: row.get(1)?,
+        created_at: row.get(2)?,
+        final_text: row.get(3)?,
+        cleanup_status: row.get(4)?,
+        intent: intent_json.and_then(|value| serde_json::from_str(&value).ok()),
+        model: row.get(6)?,
+        context_policy: context_policy_json.and_then(|value| serde_json::from_str(&value).ok()),
+        revision_reason: row.get(8)?,
+    })
+}
+
+const HISTORY_REVISION_COLUMNS: &str =
+    "revision_id,dictation_id,created_at,final_text,cleanup_status,intent_json,model,context_policy_json,revision_reason";
 
 pub fn get_history_revisions(
     dir: &Path,
     dictation_id: i64,
 ) -> anyhow::Result<Vec<HistoryRevision>> {
     let c = open_history(dir)?;
-    let mut statement = c.prepare("SELECT revision_id,dictation_id,created_at,final_text,cleanup_status,intent_json,model,context_policy_json,revision_reason FROM dictation_revisions WHERE dictation_id=? ORDER BY revision_id ASC")?;
-    let rows = statement.query_map([dictation_id], |row| {
-        let intent_json: Option<String> = row.get(5)?;
-        let context_policy_json: Option<String> = row.get(7)?;
-        Ok(HistoryRevision {
-            revision_id: row.get(0)?,
-            dictation_id: row.get(1)?,
-            created_at: row.get(2)?,
-            final_text: row.get(3)?,
-            cleanup_status: row.get(4)?,
-            intent: intent_json.and_then(|value| serde_json::from_str(&value).ok()),
-            model: row.get(6)?,
-            context_policy: context_policy_json.and_then(|value| serde_json::from_str(&value).ok()),
-            revision_reason: row.get(8)?,
-        })
-    })?;
+    let mut statement = c.prepare(&format!(
+        "SELECT {HISTORY_REVISION_COLUMNS} FROM dictation_revisions WHERE dictation_id=? ORDER BY revision_id ASC"
+    ))?;
+    let rows = statement.query_map([dictation_id], history_revision_from_row)?;
     rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
 }
-#[allow(dead_code)]
-pub fn mark_retried(
+
+pub fn get_history_revision(
     dir: &Path,
-    id: i64,
-    final_text: &str,
-    degraded: bool,
-    degraded_reason: Option<&str>,
-) -> anyhow::Result<()> {
-    mark_retried_with_texts(
-        dir,
-        id,
-        None,
-        None,
-        None,
-        final_text,
-        degraded,
-        degraded_reason,
-        None,
-    )
+    dictation_id: i64,
+    revision_id: i64,
+) -> anyhow::Result<Option<HistoryRevision>> {
+    let c = open_history(dir)?;
+    let mut statement = c.prepare(&format!(
+        "SELECT {HISTORY_REVISION_COLUMNS} FROM dictation_revisions WHERE dictation_id=? AND revision_id=?"
+    ))?;
+    statement
+        .query_row(
+            params![dictation_id, revision_id],
+            history_revision_from_row,
+        )
+        .optional()
+        .map_err(Into::into)
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RetryDelivery {
+    Copied,
+    ClipboardChanged,
+    ClipboardOwnershipUnverified,
+    ClipboardWriteFailed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RecleanDelivery {
+    Copied,
+    ClipboardChanged,
+    ClipboardOwnershipUnverified,
+    ClipboardWriteFailed,
+}
+
+impl RecleanDelivery {
+    fn persistence(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Copied => ("clipboard", "reclean_clipboard_only"),
+            Self::ClipboardChanged => ("history", "reclean_clipboard_changed"),
+            Self::ClipboardOwnershipUnverified => {
+                ("history", "reclean_clipboard_ownership_unverified")
+            }
+            Self::ClipboardWriteFailed => ("history", "reclean_clipboard_write_failed"),
+        }
+    }
+}
+
+impl RetryDelivery {
+    fn persistence(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Copied => ("clipboard", "retry_clipboard_only"),
+            Self::ClipboardChanged => ("history", "retry_clipboard_changed"),
+            Self::ClipboardOwnershipUnverified => {
+                ("history", "retry_clipboard_ownership_unverified")
+            }
+            Self::ClipboardWriteFailed => ("history", "retry_clipboard_write_failed"),
+        }
+    }
 }
 
 // Keep the persisted transcript, provider-original transcript, and delivery
 // status explicit at this history boundary.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub fn mark_retried_with_texts(
     dir: &Path,
     id: i64,
@@ -4159,63 +9804,282 @@ pub fn mark_retried_with_texts(
     degraded: bool,
     degraded_reason: Option<&str>,
     cleanup_status: Option<&str>,
+    delivery: RetryDelivery,
 ) -> anyhow::Result<()> {
-    let c = open_history(dir)?;
-    c.execute(
+    mark_retried_with_texts_and_cleanup_rejection(
+        dir,
+        id,
+        raw_text,
+        asr_text,
+        engine,
+        final_text,
+        degraded,
+        degraded_reason,
+        cleanup_status,
+        delivery,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+}
+
+pub fn save_reclean_revision_with_facts(
+    dir: &Path,
+    request: RecleanHistorySave<'_>,
+) -> anyhow::Result<i64> {
+    let RecleanHistorySave {
+        dictation_id,
+        final_text,
+        cleanup_status,
+        intent,
+        model,
+        context_policy,
+        cleanup_rejected_candidate,
+        cleanup_guard_reason,
+        cleanup_attempt_kind,
+        cleanup_transformations,
+        cleanup_final_guard_reason,
+        cleanup_failure_reason,
+    } = request;
+    if final_text.trim().is_empty() {
+        anyhow::bail!("history revision cannot be empty");
+    }
+    let mut c = open_history(dir)?;
+    let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let intent_json = serde_json::to_string(intent)?;
+    let context_policy_json = serde_json::to_string(&context_policy.history_metadata())?;
+    tx.execute(
+        "INSERT INTO dictation_revisions (dictation_id,created_at,final_text,cleanup_status,intent_json,model,context_policy_json,revision_reason) SELECT ?,datetime('now'),?,?,?,?,?,? WHERE EXISTS (SELECT 1 FROM dictations WHERE id=?)",
+        params![dictation_id, final_text, cleanup_status, intent_json, model, context_policy_json, "ai_reclean", dictation_id],
+    )?;
+    if tx.changes() == 0 {
+        anyhow::bail!("history record was not found");
+    }
+    let revision_id = tx.last_insert_rowid();
+    let transformations_json = cleanup_transformations
+        .map(serde_json::to_string)
+        .transpose()?;
+    tx.execute(
+        "UPDATE dictations SET cleanup_rejected_candidate=?,cleanup_guard_reason=?,cleanup_attempt_kind=?,cleanup_transformations_json=?,cleanup_final_guard_reason=?,cleanup_failure_reason=? WHERE id=?",
+        params![cleanup_rejected_candidate, cleanup_guard_reason, cleanup_attempt_kind, transformations_json, cleanup_final_guard_reason, cleanup_failure_reason, dictation_id],
+    )?;
+    tx.commit()?;
+    Ok(revision_id)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn mark_retried_with_texts_and_cleanup_rejection(
+    dir: &Path,
+    id: i64,
+    raw_text: Option<&str>,
+    asr_text: Option<&str>,
+    engine: Option<&str>,
+    final_text: &str,
+    degraded: bool,
+    degraded_reason: Option<&str>,
+    cleanup_status: Option<&str>,
+    delivery: RetryDelivery,
+    cleanup_rejected_candidate: Option<&str>,
+    cleanup_guard_reason: Option<&str>,
+    cleanup_attempt_kind: Option<&str>,
+    cleanup_transformations: Option<&[String]>,
+    cleanup_final_guard_reason: Option<&str>,
+    cleanup_failure_reason: Option<&str>,
+) -> anyhow::Result<()> {
+    let mut c = open_history(dir)?;
+    let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let (delivery_method, fallback_reason) = delivery.persistence();
+    let status = if degraded {
+        "degraded"
+    } else if delivery == RetryDelivery::Copied {
+        "copied"
+    } else {
+        "history"
+    };
+    tx.execute(
         "INSERT INTO dictation_revisions (dictation_id,created_at,final_text,cleanup_status,revision_reason) SELECT ?,datetime('now'),?,?,? WHERE EXISTS (SELECT 1 FROM dictations WHERE id=?)",
         params![id, final_text, cleanup_status, "retry", id],
     )?;
-    c.execute(
-        "UPDATE dictations SET status=?, degraded=?, degraded_reason=?, raw_text=COALESCE(?,raw_text), asr_text=COALESCE(?,asr_text), engine=COALESCE(?,engine), cleanup_status=COALESCE(?,cleanup_status), raw_audio_path=NULL, delivery_method='clipboard', fallback_reason='retry_clipboard_only', delivery_error_code=NULL, delivery_user_reason=NULL WHERE id=?",
+    if tx.changes() == 0 {
+        anyhow::bail!("history record was not found");
+    }
+    let transformations_json = cleanup_transformations
+        .map(serde_json::to_string)
+        .transpose()?;
+    tx.execute(
+        "UPDATE dictations SET status=?, degraded=?, degraded_reason=?, raw_text=COALESCE(?,raw_text), asr_text=COALESCE(?,asr_text), engine=COALESCE(?,engine), cleanup_status=COALESCE(?,cleanup_status), provider_cleaned_candidate=NULL, cleanup_rejected_candidate=?, cleanup_guard_reason=?, cleanup_attempt_kind=?, cleanup_transformations_json=?, cleanup_final_guard_reason=?, cleanup_failure_reason=?, raw_audio_path=NULL, delivery_method=?, fallback_reason=?, delivery_error_code=NULL, delivery_user_reason=NULL WHERE id=?",
         params![
-            if degraded { "degraded" } else { "copied" },
+            status,
             degraded as i32,
             degraded_reason,
             raw_text,
             asr_text,
             engine,
             cleanup_status,
+            cleanup_rejected_candidate,
+            cleanup_guard_reason,
+            cleanup_attempt_kind,
+            transformations_json,
+            cleanup_final_guard_reason,
+            cleanup_failure_reason,
+            delivery_method,
+            fallback_reason,
             id
         ],
     )?;
+    tx.commit()?;
     Ok(())
 }
 
 pub fn record_recovered_history(dir: &Path, recovery: &RecoveredSpool) -> anyhow::Result<()> {
-    let c = open_history(dir)?;
-    let already_recorded: i64 = c.query_row(
+    let _mutation = begin_spool_root_mutation(dir)?;
+    let spool_root = dir.join("spool");
+    let gold_root = gold_root(dir);
+    let (owner_path, expected_kind) = if is_safe_spool_path(&spool_root, &recovery.audio_path) {
+        let owner_path = spool_session_key_for_artifact(&recovery.audio_path)
+            .ok_or_else(|| anyhow::anyhow!("invalid recovered spool path"))?;
+        let kind = spool_lease_kind_for_artifact(&recovery.audio_path, &owner_path);
+        (owner_path, kind)
+    } else if is_safe_spool_path(&gold_root, &recovery.audio_path) {
+        let owner_path = spool_session_key_for_artifact(&recovery.audio_path)
+            .ok_or_else(|| anyhow::anyhow!("invalid recovered artifact path"))?;
+        (owner_path, SpoolLeaseKind::Artifact)
+    } else {
+        anyhow::bail!("recovered audio is outside the owned storage roots");
+    };
+    let lease = wait_for_history_delete_spool_lease(dir, &recovery.audio_path)?;
+    if lease.inner.kind != expected_kind {
+        anyhow::bail!("recovered audio owner kind changed during admission");
+    }
+    let _owner_commit = try_spool_io_commit_audio_session(&lease)?;
+    match expected_kind {
+        SpoolLeaseKind::Session => {
+            let root_metadata = fs::symlink_metadata(&spool_root)?;
+            if !root_metadata.is_dir() || root_metadata.file_type().is_symlink() {
+                anyhow::bail!("recovered spool root has an unsafe file type");
+            }
+            let metadata = fs::symlink_metadata(&owner_path)?;
+            if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                anyhow::bail!("recovered session has an unsafe owner directory");
+            }
+            let session_id = owner_path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .ok_or_else(|| anyhow::anyhow!("recovered session id is invalid"))?;
+            if !valid_spool_session_id(session_id)
+                || recovery.audio_path != owner_path.join("recovery.wav")
+            {
+                anyhow::bail!("recovered session path is invalid");
+            }
+            let manifest = load_manifest(&owner_path)?;
+            if manifest.schema_version != SPOOL_MANIFEST_VERSION
+                || manifest.session_id != session_id
+                || !matches!(
+                    manifest.status.as_str(),
+                    "active" | "recoverable" | "degraded"
+                )
+            {
+                anyhow::bail!("recovered session is no longer eligible for History");
+            }
+        }
+        SpoolLeaseKind::Artifact => {
+            let managed_root = if recovery.audio_path.starts_with(&spool_root) {
+                &spool_root
+            } else {
+                &gold_root
+            };
+            let root_metadata = fs::symlink_metadata(managed_root)?;
+            if !root_metadata.is_dir() || root_metadata.file_type().is_symlink() {
+                anyhow::bail!("recovered artifact root has an unsafe file type");
+            }
+            let metadata = fs::symlink_metadata(&recovery.audio_path)?;
+            if !metadata.is_file() || metadata.file_type().is_symlink() {
+                anyhow::bail!("recovered artifact has an unsafe file type");
+            }
+        }
+    }
+    let artifact_metadata = fs::symlink_metadata(&recovery.audio_path)?;
+    if !artifact_metadata.is_file() || artifact_metadata.file_type().is_symlink() {
+        anyhow::bail!("recovered audio has an unsafe file type");
+    }
+    let _history_commit = try_history_database_commit_with_wait(dir)?;
+    let mut c = open_history(dir)?;
+    let transaction = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let already_recorded: i64 = transaction.query_row(
         "SELECT COUNT(*) FROM dictations WHERE raw_audio_path=?",
         [recovery.audio_path.to_string_lossy().as_ref()],
         |row| row.get(0),
     )?;
     if already_recorded > 0 {
+        transaction.commit()?;
         return Ok(());
     }
-    drop(c);
     let context = crate::context::ContextSnapshot::general();
-    insert_history_with_status(InsertHistory {
-        dir,
-        raw: "",
-        asr_text: None,
-        engine: None,
-        final_text: "",
-        cleanup_status: None,
-        duration: recovery.duration_secs,
-        degraded: true,
-        degraded_reason: Some("interrupted_recording"),
-        status: "failed".into(),
-        delivery_method: Some("none"),
-        fallback_reason: Some("crash_recovery"),
-        spool: Some(&recovery.audio_path),
-        count_asr: false,
-        count_llm: false,
-        context: Some(&context),
-    })
+    insert_history_with_status_and_candidate_on_connection(
+        &transaction,
+        InsertHistory {
+            dir,
+            raw: "",
+            asr_text: None,
+            engine: None,
+            final_text: "",
+            cleanup_status: None,
+            duration: recovery.duration_secs,
+            degraded: true,
+            degraded_reason: Some("interrupted_recording"),
+            status: "failed".into(),
+            delivery_method: Some("none"),
+            fallback_reason: Some("crash_recovery"),
+            spool: Some(&recovery.audio_path),
+            count_asr: false,
+            count_llm: false,
+            context: Some(&context),
+            cleanup_attempt_kind: None,
+            cleanup_transformations_json: None,
+            cleanup_final_guard_reason: None,
+            cleanup_failure_reason: None,
+        },
+        None,
+        None,
+        None,
+        None,
+    )?;
+    transaction.commit()?;
+    Ok(())
 }
 
 pub fn remove_spool_artifact(dir: &Path, path: &Path) {
+    remove_spool_artifact_inner(dir, path, false);
+}
+
+fn remove_spool_artifact_inner(dir: &Path, path: &Path, root_commit_held: bool) {
     let spool_root = dir.join("spool");
     if is_safe_spool_path(&spool_root, path) {
+        let Some(key) = spool_session_key_for_artifact(path) else {
+            return;
+        };
+        let lease_kind = spool_lease_kind_for_artifact(path, &key);
+        let lease = match reserve_spool_session_path(&key, false, lease_kind) {
+            Ok(lease) => lease,
+            Err(_) => {
+                defer_spool_artifact_removal_until_release(path);
+                return;
+            }
+        };
+        let _commit = if root_commit_held {
+            None
+        } else {
+            match try_spool_io_commit_audio_session(&lease) {
+                Ok(commit) => Some(commit),
+                Err(_) => return,
+            }
+        };
+        if !spool_lease_can_write(&lease) {
+            return;
+        }
         if path.is_dir() {
             let _ = fs::remove_dir_all(path);
             return;
@@ -4229,7 +10093,24 @@ pub fn remove_spool_artifact(dir: &Path, path: &Path) {
         return;
     }
     if is_safe_spool_path(&gold_root(dir), path) && path.is_file() {
-        let _ = fs::remove_file(path);
+        let Some(key) = spool_session_key_for_artifact(path) else {
+            return;
+        };
+        let lease = match reserve_spool_session_path(&key, false, SpoolLeaseKind::Artifact) {
+            Ok(lease) => lease,
+            Err(_) => return,
+        };
+        let _commit = if root_commit_held {
+            None
+        } else {
+            match try_spool_io_commit_audio_session(&lease) {
+                Ok(commit) => Some(commit),
+                Err(_) => return,
+            }
+        };
+        if spool_lease_can_write(&lease) {
+            let _ = fs::remove_file(path);
+        }
     }
 }
 
@@ -4363,6 +10244,11 @@ pub fn export_gold_corpus(
 }
 
 pub fn purge_gold_audio(dir: &Path, keep_audio_days: u64) -> anyhow::Result<usize> {
+    let _mutation = begin_spool_root_mutation(dir)?;
+    // The operation reads the gold tree and updates History rows whose audio
+    // references expired, so both typed regions are part of its ownership.
+    let _history_commit = try_spool_io_commit_scope(dir, SpoolIoScope::HistoryDatabase)?;
+    let _commit = try_spool_io_commit_scope(dir, SpoolIoScope::GoldAudio)?;
     let root = gold_root(dir);
     if !root.exists() {
         return Ok(0);
@@ -4415,15 +10301,18 @@ pub fn history_text(dir: &Path, id: i64) -> anyhow::Result<String> {
     )?)
 }
 
-pub fn history_raw_text(dir: &Path, id: i64) -> anyhow::Result<String> {
+/// Return the provider's original ASR transcript for History re-cleanup.
+/// Older rows intentionally remain unavailable when this nullable field is absent.
+pub fn history_asr_text(dir: &Path, id: i64) -> anyhow::Result<Option<String>> {
     let c = open_history(dir)?;
-    Ok(c.query_row(
-        "SELECT COALESCE(raw_text,'') FROM dictations WHERE id=?",
-        [id],
-        |r| r.get(0),
-    )?)
+    Ok(
+        c.query_row("SELECT asr_text FROM dictations WHERE id=?", [id], |r| {
+            r.get(0)
+        })?,
+    )
 }
 
+#[cfg(test)]
 pub fn update_history_revision_state(
     dir: &Path,
     id: i64,
@@ -4434,8 +10323,53 @@ pub fn update_history_revision_state(
 ) -> anyhow::Result<()> {
     let c = open_history(dir)?;
     c.execute(
-        "UPDATE dictations SET status=?,degraded=?,degraded_reason=?,cleanup_status=COALESCE(?,cleanup_status),delivery_method='clipboard',fallback_reason=NULL,delivery_error_code=NULL,delivery_user_reason=NULL WHERE id=?",
-        params![status, degraded as i32, degraded_reason, cleanup_status, id],
+        "UPDATE dictations SET status=?,degraded=?,degraded_reason=?,cleanup_status=COALESCE(?,cleanup_status),cleanup_rejected_candidate=?,cleanup_guard_reason=?,delivery_method='clipboard',fallback_reason=NULL,delivery_error_code=NULL,delivery_user_reason=NULL WHERE id=?",
+        params![status, degraded as i32, degraded_reason, cleanup_status, Option::<&str>::None, Option::<&str>::None, id],
+    )?;
+    if c.changes() == 0 {
+        anyhow::bail!("history record was not found");
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn update_history_revision_state_with_reclean_delivery(
+    dir: &Path,
+    id: i64,
+    degraded: bool,
+    degraded_reason: Option<&str>,
+    cleanup_status: Option<&str>,
+    cleanup_rejected_candidate: Option<&str>,
+    cleanup_guard_reason: Option<&str>,
+    delivery: Option<RecleanDelivery>,
+    cleanup_attempt_kind: Option<&str>,
+    cleanup_transformations: Option<&[String]>,
+    cleanup_final_guard_reason: Option<&str>,
+    cleanup_failure_reason: Option<&str>,
+) -> anyhow::Result<()> {
+    let (status, delivery_method, fallback_reason) = if degraded {
+        ("degraded", "history", None)
+    } else if let Some(delivery) = delivery {
+        let (method, reason) = delivery.persistence();
+        (
+            if delivery == RecleanDelivery::Copied {
+                "copied"
+            } else {
+                "history"
+            },
+            method,
+            Some(reason),
+        )
+    } else {
+        ("history", "history", Some("reclean_copy_not_attempted"))
+    };
+    let c = open_history(dir)?;
+    let transformations_json = cleanup_transformations
+        .map(serde_json::to_string)
+        .transpose()?;
+    c.execute(
+        "UPDATE dictations SET status=?,degraded=?,degraded_reason=?,cleanup_status=COALESCE(?,cleanup_status),cleanup_rejected_candidate=?,cleanup_guard_reason=?,cleanup_attempt_kind=?,cleanup_transformations_json=?,cleanup_final_guard_reason=?,cleanup_failure_reason=?,delivery_method=?,fallback_reason=?,delivery_error_code=NULL,delivery_user_reason=NULL WHERE id=?",
+        params![status, degraded as i32, degraded_reason, cleanup_status, cleanup_rejected_candidate, cleanup_guard_reason, cleanup_attempt_kind, transformations_json, cleanup_final_guard_reason, cleanup_failure_reason, delivery_method, fallback_reason, id],
     )?;
     if c.changes() == 0 {
         anyhow::bail!("history record was not found");
@@ -4443,18 +10377,170 @@ pub fn update_history_revision_state(
     Ok(())
 }
 pub fn delete_history(dir: &Path, id: i64) -> anyhow::Result<()> {
+    // Keep the same admission order as recovery: claim the data-root mutation,
+    // wait for the exact spool owner to release its path, then claim History.
+    // Waiting for a spool lease while holding History could deadlock a worker
+    // that still needs to finish its History commit before releasing the lease.
+    let _mutation = begin_spool_root_mutation(dir)?;
     let c = open_history(dir)?;
-    let spool: Option<String> = c
+    let (spool, transaction_id) = c
         .query_row(
-            "SELECT raw_audio_path FROM dictations WHERE id=?",
+            "SELECT raw_audio_path, transaction_id FROM dictations WHERE id=?",
             [id],
-            |row| row.get::<_, Option<String>>(0),
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                ))
+            },
         )
         .optional()?
-        .flatten();
-    c.execute("DELETE FROM dictations WHERE id=?", [id])?;
-    if let Some(spool) = spool {
-        remove_spool_artifact(dir, Path::new(&spool));
+        .unwrap_or((None, None));
+    let spool_path = spool.as_deref().map(Path::new);
+    let _spool_lease = if let Some(path) = spool_path {
+        Some(wait_for_history_delete_spool_lease(dir, path)?)
+    } else {
+        None
+    };
+    if let Some(transaction_id) = transaction_id.as_deref() {
+        // A committed History row may still have its recovery intent if the
+        // process stopped after the SQLite ACK. Remove that intent before
+        // deleting the row so a later recovery pass cannot recreate the proof.
+        remove_pending_history_intent(dir, transaction_id)?;
+    }
+    let _history_commit = try_history_database_commit_with_wait(dir)?;
+    let mut connection = c;
+    let transaction =
+        connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    if let Some(path) = spool_path {
+        if is_safe_spool_path(&dir.join("spool"), path) {
+            if let Some(lease) = _spool_lease.as_ref() {
+                mark_spool_artifact_complete(dir, path, lease.inner.kind)?;
+            }
+        }
+    }
+    transaction.execute("DELETE FROM dictations WHERE id=?", [id])?;
+    transaction.commit()?;
+    if let Some(path) = spool_path {
+        remove_spool_artifact_for_history_delete(dir, path)?;
+    }
+    Ok(())
+}
+
+fn wait_for_history_delete_spool_lease(
+    dir: &Path,
+    path: &Path,
+) -> anyhow::Result<AudioSpoolSessionLease> {
+    if is_safe_spool_path(&dir.join("spool"), path) {
+        let key = spool_session_key_for_artifact(path)
+            .ok_or_else(|| anyhow::anyhow!("invalid History spool artifact path"))?;
+        let kind = spool_lease_kind_for_artifact(path, &key);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match reserve_spool_session_path(&key, false, kind) {
+                Ok(lease) => return Ok(lease),
+                Err(error) if Instant::now() < deadline => {
+                    #[cfg(test)]
+                    wait_for_history_delete_spool_test_gate(&key);
+                    std::thread::sleep(Duration::from_millis(2));
+                    drop(error);
+                }
+                Err(error) => return Err(error.context("History spool deletion timed out")),
+            }
+        }
+    }
+    if is_safe_spool_path(&gold_root(dir), path) {
+        let key = spool_session_key_for_artifact(path)
+            .ok_or_else(|| anyhow::anyhow!("invalid History gold artifact path"))?;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match reserve_spool_session_path(&key, false, SpoolLeaseKind::Artifact) {
+                Ok(lease) => return Ok(lease),
+                Err(error) if Instant::now() < deadline => {
+                    #[cfg(test)]
+                    wait_for_history_delete_spool_test_gate(&key);
+                    std::thread::sleep(Duration::from_millis(2));
+                    drop(error);
+                }
+                Err(error) => return Err(error.context("History artifact deletion timed out")),
+            }
+        }
+    }
+    anyhow::bail!("History references a spool artifact outside the owned storage roots")
+}
+
+fn mark_spool_artifact_complete(
+    dir: &Path,
+    path: &Path,
+    lease_kind: SpoolLeaseKind,
+) -> anyhow::Result<()> {
+    if is_safe_spool_path(&dir.join("spool"), path) {
+        let Some(session_dir) = spool_session_key_for_artifact(path) else {
+            anyhow::bail!("invalid History spool session path");
+        };
+        if lease_kind == SpoolLeaseKind::Session {
+            match fs::symlink_metadata(&session_dir) {
+                Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+                Ok(_) => anyhow::bail!("History spool session has an unsafe file type"),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(error) => return Err(error.into()),
+            }
+        }
+        let artifact_metadata = match fs::symlink_metadata(path) {
+            Ok(metadata) => Some(metadata),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+                    && lease_kind == SpoolLeaseKind::Artifact =>
+            {
+                return Ok(())
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+        if artifact_metadata.as_ref().is_some_and(|metadata| {
+            metadata.file_type().is_symlink()
+                || (lease_kind == SpoolLeaseKind::Artifact && !metadata.is_file())
+                || (lease_kind == SpoolLeaseKind::Session
+                    && !metadata.is_file()
+                    && !(path == session_dir && metadata.is_dir()))
+        }) {
+            anyhow::bail!("History spool artifact has an unsafe file type");
+        }
+        if lease_kind == SpoolLeaseKind::Artifact {
+            return Ok(());
+        }
+        let manifest_metadata = fs::symlink_metadata(manifest_path(&session_dir))?;
+        if !manifest_metadata.is_file() || manifest_metadata.file_type().is_symlink() {
+            anyhow::bail!("History spool manifest has an unsafe file type");
+        }
+        let mut manifest = load_manifest(&session_dir)?;
+        manifest.status = "complete".to_owned();
+        save_manifest(&session_dir, &manifest)?;
+    }
+    Ok(())
+}
+
+fn remove_spool_artifact_for_history_delete(dir: &Path, path: &Path) -> anyhow::Result<()> {
+    if is_safe_spool_path(&dir.join("spool"), path) || is_safe_spool_path(&gold_root(dir), path) {
+        let owner_path = spool_session_key_for_artifact(path)
+            .ok_or_else(|| anyhow::anyhow!("invalid History artifact owner path"))?;
+        let manifest_path = owner_path.join("manifest.json");
+        let remove_path = if fs::symlink_metadata(&manifest_path)
+            .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
+        {
+            owner_path
+        } else {
+            path.to_path_buf()
+        };
+        match fs::symlink_metadata(&remove_path) {
+            Ok(metadata) if metadata.file_type().is_dir() => fs::remove_dir_all(&remove_path)?,
+            Ok(metadata) if metadata.file_type().is_file() => fs::remove_file(&remove_path)?,
+            Ok(_) => anyhow::bail!("History spool artifact has an unsafe file type"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        }
+    } else {
+        anyhow::bail!("History spool artifact path changed during deletion")
     }
     Ok(())
 }
@@ -4511,12 +10597,25 @@ mod tests {
             {
                 return state;
             }
-            self.values
-                .borrow()
-                .get(slot)
-                .cloned()
-                .map(crate::keychain::ApiKeyState::Configured)
-                .unwrap_or(crate::keychain::ApiKeyState::Missing)
+            let values = self.values.borrow();
+            let configured = |slot: &str| {
+                values
+                    .get(slot)
+                    .filter(|key| !key.trim().is_empty())
+                    .cloned()
+                    .map(crate::keychain::ApiKeyState::Configured)
+            };
+            if let Some(state) = configured(slot) {
+                return state;
+            }
+            if slot == "provider_custom" {
+                if let Some(state) =
+                    configured("asr_api_key").or_else(|| configured("cleanup_api_key"))
+                {
+                    return state;
+                }
+            }
+            crate::keychain::ApiKeyState::Missing
         }
 
         fn write(&self, slot: &str, key: &str) -> Result<(), String> {
@@ -4526,9 +10625,13 @@ mod tests {
             if let Some(error) = self.write_errors.borrow().get(slot) {
                 return Err(error.clone());
             }
-            self.values
-                .borrow_mut()
-                .insert(slot.to_owned(), key.to_owned());
+            if key.is_empty() {
+                self.values.borrow_mut().remove(slot);
+            } else {
+                self.values
+                    .borrow_mut()
+                    .insert(slot.to_owned(), key.to_owned());
+            }
             Ok(())
         }
     }
@@ -4546,6 +10649,680 @@ mod tests {
         dir
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn export_preserves_selected_directory_permissions_and_restricts_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = temp_dir("export-mode");
+        fs::create_dir_all(&root).unwrap();
+        for mode in [0o755, 0o750] {
+            fs::set_permissions(&root, fs::Permissions::from_mode(mode)).unwrap();
+            let output = root.join(format!("export-{mode:o}.json"));
+            write_export_file(&output, "private export").unwrap();
+            assert_eq!(
+                fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+                mode
+            );
+            assert_eq!(
+                fs::metadata(&output).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            assert_eq!(fs::read_to_string(&output).unwrap(), "private export");
+            fs::set_permissions(&output, fs::Permissions::from_mode(0o644)).unwrap();
+            write_export_file(&output, "replacement").unwrap();
+            assert_eq!(
+                fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+                mode
+            );
+            assert_eq!(
+                fs::metadata(&output).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            assert_eq!(fs::read_to_string(&output).unwrap(), "replacement");
+            assert!(write_export_file(Path::new("relative-export.json"), "no").is_err());
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn malformed_settings_are_backed_up_before_first_persist_and_backup_is_stable() {
+        let dir = temp_dir("malformed-settings");
+        fs::create_dir_all(&dir).unwrap();
+        let original = b"{ definitely not settings";
+        fs::write(dir.join("settings.json"), original).unwrap();
+        let (_loaded, needs_persist) =
+            load_settings_with_backend(&dir, &FakeCredentialBackend::default());
+        assert!(!needs_persist);
+        let settings = Settings::default();
+        persist_settings_without_credential_changes(&dir, &settings).unwrap();
+        let backup = dir.join("settings.json.malformed.bak");
+        assert_eq!(fs::read(&backup).unwrap(), original);
+        #[cfg(unix)]
+        assert_eq!(
+            fs::metadata(&backup).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        persist_settings_without_credential_changes(&dir, &settings).unwrap();
+        assert_eq!(fs::read(&backup).unwrap(), original);
+        fs::remove_dir_all(dir).unwrap();
+
+        let reuse_dir = temp_dir("malformed-settings-backup-reuse");
+        fs::create_dir_all(&reuse_dir).unwrap();
+        let original = b"{ still malformed settings";
+        fs::write(reuse_dir.join("settings.json"), original).unwrap();
+        let backup = reuse_dir.join("settings.json.malformed.bak");
+        fs::write(&backup, original).unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(&backup, fs::Permissions::from_mode(0o600)).unwrap();
+        let backend = FakeCredentialBackend::default();
+        let (_loaded, needs_persist) = load_settings_with_backend(&reuse_dir, &backend);
+        assert!(!needs_persist);
+        persist_settings_with_backend(&reuse_dir, &settings, &backend).unwrap();
+        assert_eq!(fs::read(&backup).unwrap(), original);
+        #[cfg(unix)]
+        assert_eq!(
+            fs::metadata(&backup).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(backend.writes.borrow().is_empty());
+        fs::remove_dir_all(reuse_dir).unwrap();
+
+        let conflict_dir = temp_dir("malformed-settings-conflict");
+        fs::create_dir_all(&conflict_dir).unwrap();
+        let original = b"{ bad settings }";
+        fs::write(conflict_dir.join("settings.json"), original).unwrap();
+        fs::write(
+            conflict_dir.join("settings.json.malformed.bak"),
+            b"different existing backup",
+        )
+        .unwrap();
+        assert!(persist_settings_without_credential_changes(&conflict_dir, &settings).is_err());
+        assert_eq!(
+            fs::read(conflict_dir.join("settings.json")).unwrap(),
+            original
+        );
+        fs::remove_dir_all(conflict_dir).unwrap();
+    }
+
+    #[test]
+    fn pending_history_scope_covers_quota_tree_but_is_disjoint_from_capture_and_history() {
+        let root = temp_dir("pending-scope");
+        let pending = try_spool_io_commit_scope(&root, SpoolIoScope::PendingHistoryIntent)
+            .expect("the pending directory tree is admitted");
+        assert!(
+            try_spool_io_commit_scope(&root, SpoolIoScope::PendingHistoryIntent).is_err(),
+            "distinct transaction identities still share the quota/enumeration scope"
+        );
+        let history = try_spool_io_commit_scope(&root, SpoolIoScope::HistoryDatabase)
+            .expect("pending metadata does not lock the History database");
+        let capture = try_spool_io_commit_scope(&root, SpoolIoScope::RecoverySpool)
+            .expect("pending metadata does not lock active audio capture");
+        assert!(
+            try_spool_io_commit(&root).is_err(),
+            "the compatibility root-wide permit still conflicts with every typed scope"
+        );
+        drop(capture);
+        drop(history);
+        drop(pending);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn live_spool_session_scopes_are_disjoint_and_still_conflict_with_root_maintenance() {
+        let root = temp_dir("live-session-scopes");
+        let (first_dir, first_lease) = begin_audio_spool_session(&root, "scope-first")
+            .expect("first live session reserves its derived path");
+        let (second_dir, second_lease) = begin_audio_spool_session(&root, "scope-second")
+            .expect("second live session reserves a disjoint derived path");
+        initialize_audio_spool_session(&first_lease).unwrap();
+        initialize_audio_spool_session(&second_lease).unwrap();
+
+        let first = try_spool_io_commit_audio_session(&first_lease)
+            .expect("first live session owns its own path scope");
+        let second = try_spool_io_commit_audio_session(&second_lease)
+            .expect("another live session may use a disjoint path scope");
+        assert!(try_spool_io_commit_audio_session(&first_lease).is_err());
+        assert!(try_spool_io_commit_scope(&root, SpoolIoScope::RecoverySpool).is_err());
+        assert!(try_spool_io_commit(&root).is_err());
+
+        drop(second);
+        drop(first);
+        drop(second_lease);
+        drop(first_lease);
+        let _ = fs::remove_dir_all(root);
+        assert!(!first_dir.join("manifest.json").exists());
+        assert!(!second_dir.join("manifest.json").exists());
+    }
+
+    #[test]
+    fn deferred_session_cleanup_keeps_exact_owner_without_restoring_write_access() {
+        let root = temp_dir("deferred-session-cleanup-scope");
+        let (session_dir, lease) = begin_audio_spool_session(&root, "cleanup-owned-session")
+            .expect("reserve the live session");
+        initialize_audio_spool_session(&lease).unwrap();
+
+        assert!(defer_spool_artifact_removal_until_release(&session_dir));
+        assert!(lease.deletion_requested());
+        assert!(try_spool_io_commit_audio_session(&lease).is_err());
+        let cleanup = try_spool_io_commit_audio_session_cleanup(&lease)
+            .expect("the exact current lease keeps cleanup permission");
+        drop(cleanup);
+        delete_audio_spool_session(&lease).expect("cleanup deletes its exact session tree");
+        assert!(!session_dir.exists());
+        assert!(try_spool_io_commit_audio_session(&lease).is_err());
+        assert!(reserve_spool_session_path(&session_dir, true, SpoolLeaseKind::Session).is_err());
+
+        drop(lease);
+        let (reused_dir, reused_lease) = begin_audio_spool_session(&root, "cleanup-owned-session")
+            .expect("reuse waits for the cleanup owner to release its lease");
+        assert_eq!(reused_dir, session_dir);
+        initialize_audio_spool_session(&reused_lease).unwrap();
+        drop(reused_lease);
+        clear_all_data(&root).unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn spool_quota_scan_tolerates_sibling_temp_rename_and_session_cleanup() {
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        let root = temp_dir("spool-quota-disappearing-entry");
+        let (first_dir, first_lease) =
+            begin_audio_spool_session(&root, "quota-first").expect("first session reserves a path");
+        let (_second_dir, second_lease) = begin_audio_spool_session(&root, "quota-second")
+            .expect("second session reserves a disjoint path");
+        initialize_audio_spool_session(&first_lease).unwrap();
+        initialize_audio_spool_session(&second_lease).unwrap();
+        drop(first_lease);
+        drop(second_lease);
+        let quota_anchor = root.join("spool/quota-anchor.bin");
+        File::create(&quota_anchor)
+            .unwrap()
+            .set_len(MAX_SPOOL_BYTES - 24 * 1024)
+            .unwrap();
+
+        let first_relative = Path::new("quota-first/rename-race.wav");
+        let first_target = root.join("spool").join(first_relative);
+        let first_temp = first_target.parent().unwrap().join(format!(
+            ".{}.tmp-{}",
+            first_target.file_name().unwrap().to_string_lossy(),
+            std::process::id()
+        ));
+        let (rename_entered_tx, rename_entered_rx) = mpsc::channel();
+        let (rename_release_tx, rename_release_rx) = mpsc::channel();
+        pause_next_atomic_rename_for_test(&first_temp, rename_entered_tx, rename_release_rx);
+        let first_root = root.clone();
+        let first_writer = std::thread::spawn(move || {
+            write_spool_file(&first_root, first_relative, &vec![0x25; 16 * 1024])
+        });
+        rename_entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("A owns its session scope and has a synced temporary file");
+
+        let (scan_entered_tx, scan_entered_rx) = mpsc::channel();
+        let (scan_release_tx, scan_release_rx) = mpsc::channel();
+        pause_next_spool_size_walk_for_test(&first_temp, scan_entered_tx, scan_release_rx);
+        let second_root = root.clone();
+        let second_writer = std::thread::spawn(move || {
+            write_spool_file(
+                &second_root,
+                Path::new("quota-second/parallel.wav"),
+                &vec![0x50; 16 * 1024],
+            )
+        });
+        scan_entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("B's real quota walk reaches A's temporary directory entry");
+
+        rename_release_tx
+            .send(())
+            .expect("allow A's actual atomic rename");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !first_target.exists() {
+            assert!(Instant::now() < deadline, "A's final file rename completes");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        first_writer
+            .join()
+            .unwrap()
+            .expect("A releases its reservation after the actual write returns");
+        assert_eq!(
+            recovery_spool_reserved_bytes_for_test(&root),
+            0,
+            "A's reservation can drop while B still owns the recursive scan"
+        );
+        scan_release_tx
+            .send(())
+            .expect("resume B's quota metadata lookup after A's temp entry vanished");
+        let second_error = second_writer
+            .join()
+            .unwrap()
+            .expect_err("B retains A's start-of-scan charge and does not over-admit quota");
+        assert!(second_error
+            .to_string()
+            .contains("audio spool quota exceeded"));
+        assert_eq!(fs::read(&first_target).unwrap().len(), 16 * 1024);
+        let second_target = root.join("spool/quota-second/parallel.wav");
+        assert!(!second_target.exists());
+        fs::remove_file(&quota_anchor).unwrap();
+
+        let (delete_scan_entered_tx, delete_scan_entered_rx) = mpsc::channel();
+        let (delete_scan_release_tx, delete_scan_release_rx) = mpsc::channel();
+        pause_next_spool_size_walk_for_test(
+            &first_target,
+            delete_scan_entered_tx,
+            delete_scan_release_rx,
+        );
+        let second_root = root.clone();
+        let second_writer = std::thread::spawn(move || {
+            write_spool_file(
+                &second_root,
+                Path::new("quota-second/after-delete.wav"),
+                &vec![0x75; 16 * 1024],
+            )
+        });
+        delete_scan_entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("B's next actual quota walk pauses on A's existing file");
+        let first_root = root.clone();
+        let first_dir_for_delete = first_dir.clone();
+        let deleter = std::thread::spawn(move || {
+            remove_spool_artifact(&first_root, &first_dir_for_delete);
+        });
+        deleter.join().unwrap();
+        assert!(!first_dir.exists(), "A's sibling session cleanup completes");
+        delete_scan_release_tx
+            .send(())
+            .expect("resume B's quota scan after A's session disappeared");
+        second_writer
+            .join()
+            .unwrap()
+            .expect("B's capture artifact is not lost to A's scoped cleanup");
+        assert_eq!(
+            fs::read(root.join("spool/quota-second/after-delete.wav"))
+                .unwrap()
+                .len(),
+            16 * 1024
+        );
+
+        clear_all_data(&root).unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn quota_ledger_fences_same_root_scans_and_clears_markers_after_faults() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let root = temp_dir("spool-quota-ledger-fence");
+        let spool_root = root.join("spool");
+        fs::create_dir_all(&spool_root).unwrap();
+        let scan_target = spool_root.join("scan-target.bin");
+        fs::write(&scan_target, b"counted before reservation").unwrap();
+
+        let (scan_entered_tx, scan_entered_rx) = mpsc::channel();
+        let (scan_release_tx, scan_release_rx) = mpsc::channel();
+        pause_next_spool_size_walk_for_test(&scan_target, scan_entered_tx, scan_release_rx);
+        let first_root = spool_root.clone();
+        let (first_result_tx, first_result_rx) = mpsc::channel();
+        let first = std::thread::spawn(move || {
+            first_result_tx
+                .send(reserve_recovery_spool_bytes(&first_root, 1).map_err(|e| e.to_string()))
+                .unwrap();
+        });
+        scan_entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("the first reservation pauses in a real recursive scan");
+
+        let (same_root_started_tx, same_root_started_rx) = mpsc::channel();
+        let (same_root_result_tx, same_root_result_rx) = mpsc::channel();
+        let same_root_spool = spool_root.clone();
+        let same_root = std::thread::spawn(move || {
+            same_root_started_tx.send(()).unwrap();
+            same_root_result_tx
+                .send(reserve_recovery_spool_bytes(&same_root_spool, 1).map_err(|e| e.to_string()))
+                .unwrap();
+        });
+        same_root_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("a same-root waiter starts");
+        let same_root_waited = matches!(
+            same_root_result_rx.recv_timeout(Duration::from_millis(50)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        );
+
+        let other_spool_root = temp_dir("spool-quota-other-root").join("spool");
+        let (other_result_tx, other_result_rx) = mpsc::channel();
+        let other_root = std::thread::spawn(move || {
+            let result = reserve_recovery_spool_bytes(&other_spool_root, 1)
+                .map(drop)
+                .map_err(|error| error.to_string());
+            other_result_tx.send(result).unwrap();
+        });
+        let other_progressed = other_result_rx.recv_timeout(Duration::from_secs(2));
+        scan_release_tx.send(()).unwrap();
+        let first_reservation = first_result_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .expect("first same-root reservation is admitted after its scan");
+        let second_reservation = same_root_result_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .expect("the waiting same-root reservation follows the first admission");
+        first.join().unwrap();
+        same_root.join().unwrap();
+        other_root.join().unwrap();
+        other_progressed
+            .expect("an unrelated root's quota scan is not serialized behind the paused scan")
+            .expect("unrelated root reservation succeeds");
+        assert!(
+            same_root_waited,
+            "no same-root reservation enters between scan start and admission"
+        );
+        assert_eq!(
+            recovery_spool_reserved_bytes_for_test(&root),
+            2,
+            "the ledger includes both serialized same-root reservations"
+        );
+        drop(second_reservation);
+        drop(first_reservation);
+
+        inject_spool_quota_scan_fault_for_test(&spool_root, SpoolQuotaScanFault::Error);
+        let error = reserve_recovery_spool_bytes(&spool_root, 1)
+            .err()
+            .expect("the injected scanner error is returned");
+        assert!(error
+            .to_string()
+            .contains("injected spool quota scan failure"));
+        drop(
+            reserve_recovery_spool_bytes(&spool_root, 1)
+                .expect("the scan marker clears after an I/O error"),
+        );
+
+        inject_spool_quota_scan_fault_for_test(&spool_root, SpoolQuotaScanFault::Panic);
+        let panic_result = std::panic::catch_unwind(|| {
+            let _ = reserve_recovery_spool_bytes(&spool_root, 1);
+        });
+        assert!(panic_result.is_err(), "the panic fault reaches the scanner");
+        drop(
+            reserve_recovery_spool_bytes(&spool_root, 1)
+                .expect("the scan marker clears during unwinding"),
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn atomic_file_ack_requires_parent_directory_sync_after_rename() {
+        let root = temp_dir("atomic-parent-sync");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("committed-but-unacked.bin");
+        fail_next_atomic_parent_sync_for_test(&root);
+
+        let error = write_atomic_bytes(&path, b"durable receipt requires directory sync")
+            .expect_err("directory sync failure cannot produce a successful ACK");
+        assert!(error
+            .to_string()
+            .contains("injected atomic parent directory sync failure"));
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            b"durable receipt requires directory sync",
+            "rename may have happened, so the outcome is retained as unacknowledged"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pending_history_cancel_waits_for_paused_journal_and_blocks_late_promotion() {
+        let root = temp_dir("pending-cancel-race");
+        let intent = pending_history_intent_for_test(
+            "dictation-test-cancel-race",
+            "delivery_pending",
+            "unknown",
+            "cancelled before external delivery",
+        );
+        let transaction_id = intent.transaction_id.clone();
+        let active_owner = register_pending_history_owner(&root, &transaction_id)
+            .expect("reserve the live cancellation identity");
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        pause_next_pending_history_write_for_test(&root, entered_tx, release_rx);
+
+        let writer_root = root.clone();
+        let writer_owner = active_owner.clone();
+        let writer = std::thread::spawn(move || {
+            write_pending_history_intent(&writer_root, &intent, &writer_owner)
+        });
+        entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("the intent writer pauses after staging fsync while it owns quota admission");
+
+        let (cancel_tx, cancel_rx) = std::sync::mpsc::channel();
+        let cancel_root = root.clone();
+        let cancel_id = transaction_id.clone();
+        let cancel_owner = active_owner.clone();
+        let cancel = std::thread::spawn(move || {
+            let result = cancel_pending_history_intent(&cancel_root, &cancel_id, &cancel_owner)
+                .map_err(|error| error.to_string());
+            let _ = cancel_tx.send(result);
+        });
+        assert!(matches!(
+            cancel_rx.recv_timeout(Duration::from_millis(50)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+
+        release_tx
+            .send(())
+            .expect("release staged journal installation");
+        writer
+            .join()
+            .expect("journal writer thread exits")
+            .expect("the paused atomic journal write completes");
+        cancel.join().expect("cancellation owner exits");
+        cancel_rx
+            .try_recv()
+            .expect("cancellation reports its durable tombstone and cleanup")
+            .expect("known no-side-effect cancellation is durably recorded");
+
+        assert_eq!(promote_all_pending_history_intents(&root).unwrap(), 0);
+        assert!(get_history(&root, 10).unwrap().is_empty());
+        assert!(!pending_history_path(&root, &transaction_id)
+            .unwrap()
+            .exists());
+        assert!(!pending_history_root(&root).join(&transaction_id).exists());
+        assert!(
+            write_pending_history_intent(
+                &root,
+                &pending_history_intent_for_test(
+                    &transaction_id,
+                    "delivery_pending",
+                    "unknown",
+                    "must not return after cancellation",
+                ),
+                &active_owner,
+            )
+            .is_err(),
+            "a late writer carrying the cancelled owner token cannot resurrect the intent"
+        );
+        clear_all_data(&root).unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn history_recovery_text_uses_only_its_pending_intent_or_history_transaction() {
+        let root = temp_dir("history-recovery-text");
+        let transaction_id = "dictation-recovery-copy";
+        let text = "Exact recovery text, with punctuation.";
+        let intent =
+            pending_history_intent_for_test(transaction_id, "delivery_pending", "unknown", text);
+        let owner = register_pending_history_owner(&root, transaction_id)
+            .expect("reserve the exact recovery transaction identity");
+        write_pending_history_intent(&root, &intent, &owner)
+            .expect("the transaction's original text is durably retained");
+
+        assert_eq!(
+            history_recovery_text_for_transaction(&root, transaction_id)
+                .expect("read the exact retained pending text"),
+            text
+        );
+        assert!(
+            history_recovery_text_for_transaction(&root, "some-other-transaction").is_err(),
+            "a recovery ticket cannot read another transaction's text"
+        );
+
+        promote_pending_history_intent(&root, transaction_id, &owner)
+            .expect("promote the uncertain transaction exactly once");
+        let rows = get_history(&root, 10).expect("the text has a durable History row");
+        let row = rows.first().expect("the exact transaction promotes once");
+        assert_eq!(row.status, "delivery_unconfirmed");
+        assert_eq!(row.delivery_method.as_deref(), Some("unknown"));
+        assert_eq!(row.final_text, text);
+        assert_eq!(
+            history_recovery_text_for_transaction(&root, transaction_id)
+                .expect("read the exact acknowledged History text"),
+            text
+        );
+        clear_all_data(&root).unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pending_history_startup_promotion_is_unknown_idempotent_and_cancel_safe() {
+        let root = temp_dir("pending-promotion");
+        let mut interrupted = pending_history_intent_for_test(
+            "dictation-test-interrupted",
+            "delivery_pending",
+            "unknown",
+            "the text from an interrupted delivery",
+        );
+        let interrupted_owner = register_pending_history_owner(&root, &interrupted.transaction_id)
+            .expect("reserve the interrupted delivery identity");
+        write_pending_history_intent(&root, &interrupted, &interrupted_owner)
+            .expect("durable pre-delivery intent");
+        drop(interrupted_owner);
+        let path = pending_history_path(&root, &interrupted.transaction_id).unwrap();
+        let stage = path.parent().unwrap().join(".intent.pending");
+        fs::rename(&path, &stage).expect("simulate crash after stage fsync but before rename");
+        assert_eq!(promote_all_pending_history_intents(&root).unwrap(), 1);
+        let rows = get_history(&root, 10).expect("interrupted intent becomes visible in History");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].raw_text, "the text from an interrupted delivery");
+        assert_eq!(rows[0].status, "delivery_unconfirmed");
+        assert_eq!(rows[0].delivery_method.as_deref(), Some("unknown"));
+        assert_eq!(
+            rows[0].fallback_reason.as_deref(),
+            Some("delivery_state_unknown_after_restart")
+        );
+
+        // Replaying the stable transaction key cannot create a second row.
+        interrupted.status = "ok".into();
+        interrupted.delivery_method = "paste".into();
+        let stale_owner = register_pending_history_owner(&root, &interrupted.transaction_id)
+            .expect("reacquire the stable acknowledgement identity");
+        write_pending_history_intent(&root, &interrupted, &stale_owner)
+            .expect("stale acknowledgement sidecar");
+        drop(stale_owner);
+        assert_eq!(promote_all_pending_history_intents(&root).unwrap(), 1);
+        assert_eq!(get_history(&root, 10).unwrap().len(), 1);
+
+        let cancelled = pending_history_intent_for_test(
+            "dictation-test-cancelled",
+            "delivery_pending",
+            "unknown",
+            "do not resurrect this canceled text",
+        );
+        let cancelled_owner = register_pending_history_owner(&root, &cancelled.transaction_id)
+            .expect("reserve the cancellation candidate identity");
+        write_pending_history_intent(&root, &cancelled, &cancelled_owner)
+            .expect("durable cancellation candidate");
+        drop(cancelled_owner);
+        let cancelled_path = pending_history_path(&root, &cancelled.transaction_id).unwrap();
+        let cancelled_dir = cancelled_path.parent().unwrap();
+        let mut marker = File::create(cancelled_dir.join(".delivery.cancelled")).unwrap();
+        marker
+            .write_all(cancelled.transaction_id.as_bytes())
+            .unwrap();
+        marker.sync_all().unwrap();
+        File::open(cancelled_dir).unwrap().sync_all().unwrap();
+        assert_eq!(promote_all_pending_history_intents(&root).unwrap(), 0);
+        let rows = get_history(&root, 10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(!cancelled_dir.exists());
+        clear_all_data(&root).unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pending_history_promotion_persists_observed_cleanup_provenance() {
+        let root = temp_dir("pending-cleanup-provenance");
+        let mut intent = pending_history_intent_for_test(
+            "dictation-cleanup-provenance",
+            "ok",
+            "paste",
+            "accepted transformed text",
+        );
+        intent.cleanup_attempt_kind = Some("success".into());
+        intent.cleanup_transformations = Some(vec![
+            "strip_internal_cleanup_metadata".into(),
+            "restore_spoken_layout".into(),
+            "restore_prepared_preamble".into(),
+        ]);
+        intent.cleanup_final_guard_reason = Some("final_protected_token_changed".into());
+        let owner = register_pending_history_owner(&root, &intent.transaction_id)
+            .expect("reserve the actual transaction identity");
+        write_pending_history_intent(&root, &intent, &owner)
+            .expect("persist the serialized History intent");
+
+        promote_pending_history_intent(&root, &intent.transaction_id, &owner)
+            .expect("promote the owned intent through the public store entry point");
+        let page = get_history_page(&root, 10, None, None).expect("read the promoted row");
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(
+            page.items[0].cleanup_attempt_kind.as_deref(),
+            Some("success")
+        );
+        assert_eq!(
+            page.items[0].cleanup_transformations.as_deref(),
+            Some(
+                [
+                    "strip_internal_cleanup_metadata".to_owned(),
+                    "restore_spoken_layout".to_owned(),
+                    "restore_prepared_preamble".to_owned(),
+                ]
+                .as_slice()
+            )
+        );
+        assert_eq!(
+            page.items[0].cleanup_final_guard_reason.as_deref(),
+            Some("final_protected_token_changed")
+        );
+        let exported: serde_json::Value =
+            serde_json::from_str(&export_history_json(&root).unwrap()).unwrap();
+        assert_eq!(exported[0]["cleanup_attempt_kind"], "success");
+        assert_eq!(
+            exported[0]["cleanup_transformations"],
+            serde_json::json!([
+                "strip_internal_cleanup_metadata",
+                "restore_spoken_layout",
+                "restore_prepared_preamble"
+            ])
+        );
+
+        drop(owner);
+        assert_eq!(
+            promote_all_pending_history_intents(&root).unwrap(),
+            0,
+            "the promoted intent is removed and cannot create a duplicate after reopening"
+        );
+        assert_eq!(
+            get_history_page(&root, 10, None, None).unwrap().items.len(),
+            1
+        );
+        clear_all_data(&root).unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+
     fn write_spool_f32_chunk(root: &Path, session_id: &str, index: usize, samples: &[f32]) {
         let mut bytes = Vec::with_capacity(std::mem::size_of_val(samples));
         for sample in samples {
@@ -4555,6 +11332,125 @@ mod tests {
             .join("chunks")
             .join(format!("{index:08}.f32"));
         write_spool_file(root, &relative, &bytes).unwrap();
+    }
+
+    #[test]
+    fn failed_short_history_retry_insert_is_idempotent_for_acknowledged_audio() {
+        let dir = temp_dir("failed-short-idempotent");
+        let path = write_spool_file(&dir, Path::new("failed-job.wav"), b"complete wav")
+            .expect("audio artifact is durably installed");
+        let context = crate::context::ContextSnapshot::general();
+
+        insert_failed_history_with_context_once(
+            &dir,
+            1.25,
+            &path,
+            &context,
+            "on_device:qwen3-asr-0.6b",
+        )
+        .expect("History row is inserted and acknowledged");
+        insert_failed_history_with_context_once(
+            &dir,
+            1.25,
+            &path,
+            &context,
+            "on_device:qwen3-asr-0.6b",
+        )
+        .expect("a replay after a lost acknowledgement reuses the same row");
+
+        let rows = get_history(&dir, 10).expect("History reads after insert");
+        assert_eq!(rows.len(), 1);
+        let connection = open_history(&dir).expect("History database is available");
+        let stored_audio: String = connection
+            .query_row(
+                "SELECT raw_audio_path FROM dictations WHERE id=?",
+                [rows[0].id],
+                |row| row.get(0),
+            )
+            .expect("the History row references its acknowledged recovery WAV");
+        assert_eq!(PathBuf::from(stored_audio), path);
+        assert!(path.is_file());
+
+        remove_spool_artifact(&dir, &path);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn deleting_failed_short_history_removes_flat_artifact_without_resurrection() {
+        let dir = temp_dir("delete-failed-short-flat");
+        let path = write_spool_file(&dir, Path::new("failed-job.wav"), b"short recording")
+            .expect("persist the flat failed-short artifact");
+        insert_failed_history_with_context_once(
+            &dir,
+            0.2,
+            &path,
+            &crate::context::ContextSnapshot::general(),
+            "on_device:test",
+        )
+        .unwrap();
+
+        let id = get_history(&dir, 10).unwrap()[0].id;
+        delete_history(&dir, id).unwrap();
+
+        assert!(get_history(&dir, 10).unwrap().is_empty());
+        assert!(!path.exists());
+        assert!(recover_spool(&dir, 7).unwrap().is_empty());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn deleting_history_with_retention_removed_artifact_does_not_resurrect() {
+        let dir = temp_dir("delete-expired-flat-artifact");
+        let path = write_spool_file(&dir, Path::new("expired-job.wav"), b"retained audio")
+            .expect("persist a flat managed artifact");
+        insert_failed_history_with_context_once(
+            &dir,
+            0.3,
+            &path,
+            &crate::context::ContextSnapshot::general(),
+            "on_device:test",
+        )
+        .unwrap();
+        fs::remove_file(&path).unwrap();
+
+        let id = get_history(&dir, 10).unwrap()[0].id;
+        delete_history(&dir, id).unwrap();
+
+        assert!(get_history(&dir, 10).unwrap().is_empty());
+        assert!(!path.exists());
+        assert!(recover_spool(&dir, 7).unwrap().is_empty());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn spool_io_commit_is_root_scoped_and_rejects_alias_and_prefix_roots() {
+        let root = temp_dir("root-scoped-commit");
+        let alias = root.join("unused-child").join("..");
+        let child = root.join("child-root");
+        let sibling = root.with_file_name(format!(
+            "{}-sibling",
+            root.file_name().unwrap().to_string_lossy()
+        ));
+
+        let owner = try_spool_io_commit(&root).expect("first data root is admitted");
+        assert!(
+            try_spool_io_commit(&alias).is_err(),
+            "lexical aliases cannot bypass the root-scoped quota/clear permit"
+        );
+        assert!(
+            try_spool_io_commit(&child).is_err(),
+            "a nested path cannot mutate while its parent data root is committing"
+        );
+        let sibling_owner = try_spool_io_commit(&sibling)
+            .expect("independent sibling data roots can make progress concurrently");
+        drop(sibling_owner);
+        drop(owner);
+
+        let child_owner = try_spool_io_commit(&child)
+            .expect("the nested root is admitted after the parent commit closes");
+        drop(child_owner);
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(sibling);
     }
 
     fn decode_wav_samples(path: &Path) -> Vec<i16> {
@@ -4972,7 +11868,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_25_migrates_retired_gestures_to_tap_idempotently_without_rebinding() {
+    fn settings_schema_migrates_retired_gestures_to_tap_idempotently_without_rebinding() {
         for mode in ["double_tap", "hybrid", "hold", "tap"] {
             for hotkey in ["Fn", "CmdOrControl+Alt+K", "Shift"] {
                 let mut settings = Settings {
@@ -4982,7 +11878,7 @@ mod tests {
                     ..Settings::default()
                 };
                 settings.normalize();
-                assert_eq!(settings.schema_version, 25);
+                assert_eq!(settings.schema_version, SETTINGS_SCHEMA_VERSION);
                 assert_eq!(settings.activation_mode, "tap");
                 assert_eq!(settings.hotkey, hotkey);
                 settings.normalize();
@@ -5084,6 +11980,120 @@ mod tests {
             serde_json::from_slice(&std::fs::read(dir.join("settings.json")).unwrap()).unwrap();
         assert_eq!(saved["activation_mode"], "hold_to_talk");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn non_service_configuration_save_preserves_deferred_credentials_without_store_access() {
+        let dir = temp_dir("non-service-save-deferred-credentials");
+        let sidecar_value = "deferred-sidecar-fixture";
+        write_secret_sidecar(&dir, "asr_api_key", sidecar_value).unwrap();
+        let sidecar_path = secret_sidecar_path(&dir, "asr_api_key");
+        let sidecar_before = std::fs::read(&sidecar_path).unwrap();
+        let settings_credential = "deferred-settings-fixture";
+        let settings = Settings {
+            onboarded: true,
+            asr_provider: crate::engine::EngineProvider::Custom,
+            asr_model: "whisper-1".into(),
+            asr_api_key: sidecar_value.into(),
+            cleanup_provider: crate::engine::EngineProvider::Custom,
+            cleanup_model: "router-cleanup-model".into(),
+            cleanup_api_key: settings_credential.into(),
+            custom_base_url: "https://router.example.test/v1".into(),
+            input_device: "MacBook Pro Microphone".into(),
+            ..Settings::default()
+        };
+        let mut settings = settings;
+        settings
+            .unverified_credential_sources
+            .insert("sidecar:asr_api_key".into(), sidecar_value.into());
+        settings.unverified_credential_sources.insert(
+            "settings:cleanup_api_key".into(),
+            settings_credential.into(),
+        );
+        settings
+            .credential_baselines
+            .insert("provider_custom".into(), "existing-baseline-fixture".into());
+
+        save_configuration(&dir, &settings)
+            .expect("a structurally valid device preference does not require provider readiness");
+
+        let on_disk: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join("settings.json")).unwrap()).unwrap();
+        assert_eq!(on_disk["input_device"], "MacBook Pro Microphone");
+        assert_eq!(on_disk["custom_base_url"], "https://router.example.test/v1");
+        assert_eq!(on_disk["asr_api_key"], "");
+        assert_eq!(on_disk["cleanup_api_key"], settings_credential);
+        assert_eq!(on_disk["provider_api_keys"], serde_json::json!({}));
+        assert_eq!(std::fs::read(&sidecar_path).unwrap(), sidecar_before);
+        assert_eq!(
+            settings.credential_baselines.get("provider_custom"),
+            Some(&"existing-baseline-fixture".to_owned())
+        );
+        assert!(settings.validate_configuration().is_ok());
+        let missing_credentials = Settings {
+            onboarded: true,
+            asr_provider: crate::engine::EngineProvider::Custom,
+            asr_model: "whisper-1".into(),
+            cleanup_provider: crate::engine::EngineProvider::Custom,
+            cleanup_model: "router-cleanup-model".into(),
+            custom_base_url: "https://router.example.test/v1".into(),
+            ..Settings::default()
+        };
+        assert!(missing_credentials.validate_configuration().is_ok());
+        assert!(missing_credentials.validate_with_models_root(None).is_err());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn missing_local_model_does_not_block_structural_preferences_but_readiness_still_fails() {
+        let dir = temp_dir("non-service-save-missing-local-model");
+        let settings = Settings {
+            onboarded: true,
+            asr_provider: crate::engine::EngineProvider::OnDevice,
+            cleanup_enabled: false,
+            input_device: "MacBook Pro Microphone".into(),
+            ..Settings::default()
+        };
+
+        save_configuration(&dir, &settings)
+            .expect("local model availability is not a prerequisite for saving preferences");
+        assert!(settings
+            .validate_with_models_root(Some(&dir.join("models")))
+            .is_err());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn remote_keyless_local_route_stays_readiness_gated_during_preference_saves() {
+        let dir = temp_dir("non-service-save-remote-keyless-local-route");
+        let settings = Settings {
+            onboarded: true,
+            asr_provider: crate::engine::EngineProvider::LocalWhisper,
+            local_whisper_base_url: "https://remote.example.test/v1".into(),
+            cleanup_enabled: false,
+            input_device: "MacBook Pro Microphone".into(),
+            ..Settings::default()
+        };
+
+        save_configuration(&dir, &settings)
+            .expect("structurally valid preferences may be saved without route readiness");
+        assert!(settings
+            .validate_with_models_root(Some(&dir.join("models")))
+            .is_err());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn structurally_invalid_audio_preferences_are_still_rejected() {
+        let mut settings = Settings {
+            input_device: "x".repeat(513),
+            ..Settings::default()
+        };
+        assert!(settings.validate_configuration().is_err());
+
+        settings.input_device = "MacBook Pro Microphone".into();
+        settings.input_gain = 4.1;
+        assert!(settings.validate_configuration().is_err());
     }
 
     #[test]
@@ -5271,28 +12281,6 @@ mod tests {
     }
 
     #[test]
-    fn repair_incomplete_custom_asr_so_a_groq_key_can_be_saved() {
-        let mut settings = Settings {
-            asr_provider: crate::engine::EngineProvider::Custom,
-            asr_base_url: "https://relay.example.com/v1".into(),
-            custom_base_url: "https://relay.example.com/v1".into(),
-            asr_api_key: String::new(),
-            asr_model: "whisper-1".into(),
-            api_key: "gsk_test".into(),
-            onboarded: true,
-            ..Settings::default()
-        };
-        settings.normalize();
-        assert_eq!(settings.asr_provider, crate::engine::EngineProvider::Custom);
-        assert!(settings.validate().is_err());
-        assert!(settings.repair_incomplete_engine_sides());
-        assert_eq!(settings.asr_provider, crate::engine::EngineProvider::Groq);
-        assert!(settings.asr_base_url.is_empty());
-        assert_eq!(settings.asr_model, crate::asr::MODEL);
-        assert!(settings.validate().is_ok());
-    }
-
-    #[test]
     fn load_settings_repairs_incomplete_custom_asr_left_on_disk() {
         let dir = temp_dir("incomplete-custom-asr");
         std::fs::create_dir_all(&dir).unwrap();
@@ -5387,6 +12375,732 @@ mod tests {
     }
 
     #[test]
+    fn load_and_public_view_keep_keychain_unavailable_distinct_from_missing() {
+        let dir = temp_dir("credential-read-state");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("settings.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": SETTINGS_SCHEMA_VERSION,
+                "asr_provider": "custom",
+                "custom_base_url": "https://relay.example.test/v1",
+                "cleanup_enabled": true,
+                "cleanup_provider": "custom",
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let backend = FakeCredentialBackend::default();
+        backend.script_reads(
+            "provider_custom",
+            [crate::keychain::ApiKeyState::Unavailable(
+                "synthetic keychain failure".into(),
+            )],
+        );
+        backend.script_reads("asr_api_key", [crate::keychain::ApiKeyState::Missing]);
+        backend.script_reads("cleanup_api_key", [crate::keychain::ApiKeyState::Missing]);
+        backend.script_reads("groq_api_key", [crate::keychain::ApiKeyState::Missing]);
+
+        let (settings, _) = load_settings_with_backend(&dir, &backend);
+        let view = SettingsView::from(&settings);
+
+        assert_eq!(
+            settings.credential_read_states.get("provider_custom"),
+            Some(&CredentialReadState::Unavailable)
+        );
+        assert_eq!(
+            settings.credential_read_states.get("asr_api_key"),
+            Some(&CredentialReadState::Missing)
+        );
+        assert_eq!(
+            view.provider_keys["custom"].keychain_state,
+            CredentialReadState::Unavailable
+        );
+        assert_eq!(
+            view.asr_api_key_keychain_state,
+            CredentialReadState::Missing
+        );
+        assert_eq!(
+            view.cleanup_api_key_keychain_state,
+            CredentialReadState::Missing
+        );
+        assert_eq!(view.custom_base_url, "https://relay.example.test/v1");
+        assert!(settings.asr_api_key.is_empty());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn unavailable_keychain_keeps_an_unverified_session_value_without_claiming_it_is_durable() {
+        let dir = temp_dir("unavailable-custom-session-value");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("settings.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": SETTINGS_SCHEMA_VERSION,
+                "asr_provider": "custom",
+                "asr_base_url": "https://relay.example.test/v1",
+                "custom_base_url": "https://relay.example.test/v1",
+                "asr_api_key": "synthetic-deferred-key",
+                "cleanup_enabled": false,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let backend = FakeCredentialBackend::default();
+        backend.script_reads("provider_custom", [crate::keychain::ApiKeyState::Missing]);
+        backend.script_reads(
+            "asr_api_key",
+            [crate::keychain::ApiKeyState::Unavailable(
+                "synthetic keychain failure".into(),
+            )],
+        );
+        backend.script_reads("cleanup_api_key", [crate::keychain::ApiKeyState::Missing]);
+        backend.script_reads("groq_api_key", [crate::keychain::ApiKeyState::Missing]);
+
+        let (settings, _) = load_settings_with_backend(&dir, &backend);
+        let view = SettingsView::from(&settings);
+
+        assert_eq!(settings.asr_api_key, "synthetic-deferred-key");
+        assert!(settings
+            .unverified_credential_sources
+            .contains_key("settings:asr_api_key"));
+        assert!(view.provider_keys["custom"].configured);
+        assert_eq!(
+            view.provider_keys["custom"].keychain_state,
+            CredentialReadState::Unavailable
+        );
+        assert_eq!(
+            view.asr_api_key_keychain_state,
+            CredentialReadState::Unavailable
+        );
+        assert!(backend.writes.borrow().is_empty());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn unknown_asr_origin_keeps_legacy_slot_unavailable_outside_custom_recovery_scope() {
+        let dir = temp_dir("unknown-origin-custom-session-value");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("settings.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": SETTINGS_SCHEMA_VERSION,
+                "asr_provider": "custom",
+                "custom_base_url": "https://relay.example.test/v1",
+                "asr_api_key": "synthetic-deferred-key",
+                "cleanup_enabled": false,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let backend = FakeCredentialBackend::default();
+        backend.script_reads("provider_custom", [crate::keychain::ApiKeyState::Missing]);
+        backend.script_reads(
+            "asr_api_key",
+            [crate::keychain::ApiKeyState::Unavailable(
+                "synthetic keychain failure".into(),
+            )],
+        );
+        backend.script_reads("cleanup_api_key", [crate::keychain::ApiKeyState::Missing]);
+        backend.script_reads("groq_api_key", [crate::keychain::ApiKeyState::Missing]);
+
+        let (settings, _) = load_settings_with_backend(&dir, &backend);
+        let view = SettingsView::from(&settings);
+
+        let asr_scope =
+            custom_credential_recovery_scope(&settings, CustomCredentialPurpose::Asr).unwrap();
+        assert!(!asr_scope.include_asr_legacy);
+        assert_eq!(settings.asr_api_key, "synthetic-deferred-key");
+        assert!(settings
+            .unverified_credential_sources
+            .contains_key("settings:asr_api_key"));
+        assert!(view.provider_keys["custom"].configured);
+        assert_eq!(
+            view.provider_keys["custom"].keychain_state,
+            CredentialReadState::Missing
+        );
+        assert_eq!(
+            view.asr_api_key_keychain_state,
+            CredentialReadState::Unavailable
+        );
+        assert!(backend.writes.borrow().is_empty());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn custom_recovery_scope_excludes_non_custom_purpose_aliases() {
+        let mut settings = Settings {
+            asr_provider: crate::engine::EngineProvider::Groq,
+            cleanup_enabled: true,
+            cleanup_provider: crate::engine::EngineProvider::Custom,
+            custom_base_url: "https://router.example.test/v1/chat/completions".into(),
+            cleanup_base_url: "https://router.example.test/v1/cleanup".into(),
+            ..Settings::default()
+        };
+        settings.asr_base_url = "https://router.example.test/v1/asr".into();
+        let cleanup_scope =
+            custom_credential_recovery_scope(&settings, CustomCredentialPurpose::Cleanup).unwrap();
+        assert_eq!(cleanup_scope.origin, "https://router.example.test");
+        assert_eq!(cleanup_scope.purpose, CustomCredentialPurpose::Cleanup);
+        assert!(!cleanup_scope.include_asr_legacy);
+        assert!(cleanup_scope.include_cleanup_legacy);
+        assert!(
+            custom_credential_recovery_scope(&settings, CustomCredentialPurpose::Asr).is_none()
+        );
+
+        settings.asr_provider = crate::engine::EngineProvider::Custom;
+        let both_custom =
+            custom_credential_recovery_scope(&settings, CustomCredentialPurpose::Asr).unwrap();
+        assert!(both_custom.include_asr_legacy);
+        assert!(both_custom.include_cleanup_legacy);
+
+        settings.cleanup_enabled = false;
+        let asr_only =
+            custom_credential_recovery_scope(&settings, CustomCredentialPurpose::Asr).unwrap();
+        assert!(asr_only.include_asr_legacy);
+        assert!(!asr_only.include_cleanup_legacy);
+
+        settings.custom_base_url = "file:///tmp/invalid".into();
+        assert!(
+            custom_credential_recovery_scope(&settings, CustomCredentialPurpose::Asr).is_none()
+        );
+    }
+
+    #[test]
+    fn foreground_recovery_omits_a_legacy_alias_from_a_different_origin() {
+        let settings = Settings {
+            asr_provider: crate::engine::EngineProvider::Custom,
+            asr_base_url: "https://router-a.example.test/v1".into(),
+            cleanup_enabled: true,
+            cleanup_provider: crate::engine::EngineProvider::Custom,
+            cleanup_base_url: "https://router-b.example.test/v1".into(),
+            custom_base_url: "https://router-a.example.test/v1".into(),
+            ..Settings::default()
+        };
+        let scope =
+            custom_credential_recovery_scope(&settings, CustomCredentialPurpose::Asr).unwrap();
+        assert_eq!(scope.origin, "https://router-a.example.test");
+        assert!(scope.include_asr_legacy);
+        assert!(!scope.include_cleanup_legacy);
+        let cleanup_scope =
+            custom_credential_recovery_scope(&settings, CustomCredentialPurpose::Cleanup).unwrap();
+        assert!(!cleanup_scope.include_cleanup_legacy);
+    }
+
+    #[test]
+    fn unavailable_custom_readiness_does_not_claim_the_key_is_missing() {
+        let mut settings = Settings {
+            onboarded: true,
+            asr_provider: crate::engine::EngineProvider::Custom,
+            custom_base_url: "https://router.example.test/v1".into(),
+            ..Settings::default()
+        };
+        settings
+            .credential_read_states
+            .insert("provider_custom".into(), CredentialReadState::Unavailable);
+        assert_eq!(
+            settings.validate().unwrap_err().to_string(),
+            "钥匙串暂时不可读取；当前设置未更改，请在前台设置中重试读取。"
+        );
+    }
+
+    #[test]
+    fn custom_recovery_adoption_is_session_only_and_does_not_fan_out_on_save() {
+        let dir = temp_dir("session-only-custom-recovery");
+        let backend = FakeCredentialBackend::default();
+        let mut settings = Settings {
+            asr_provider: crate::engine::EngineProvider::Custom,
+            asr_base_url: "https://router.example.test/v1".into(),
+            ..Settings::default()
+        };
+        let scope =
+            custom_credential_recovery_scope(&settings, CustomCredentialPurpose::Asr).unwrap();
+        adopt_interactive_custom_credential(
+            &mut settings,
+            "synthetic-session-only-key".into(),
+            scope,
+        );
+
+        assert!(settings.session_only_custom_credential);
+        assert_eq!(
+            settings.provider_api_keys.get("custom").map(String::as_str),
+            Some("synthetic-session-only-key")
+        );
+        assert_eq!(
+            settings.provider_secret(crate::engine::EngineProvider::Custom),
+            ""
+        );
+        settings.vision_provider = "custom".into();
+        assert_eq!(settings.vision_credential(), "");
+        let public = SettingsView::from(&settings);
+        assert!(public.provider_keys["custom"].configured);
+        assert_eq!(
+            public.provider_keys["custom"].hint.as_deref(),
+            Some("••••y-key")
+        );
+        assert!(backend.writes.borrow().is_empty());
+        save_settings_with_backend(&dir, &settings, &backend).unwrap();
+        assert!(backend.writes.borrow().is_empty());
+        let on_disk = fs::read_to_string(dir.join("settings.json")).unwrap();
+        assert!(!on_disk.contains("synthetic-session-only-key"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn parsed_preference_patch_can_preserve_nonsecret_credential_state() {
+        let mut previous = Settings::default();
+        previous
+            .credential_read_states
+            .insert("provider_custom".into(), CredentialReadState::Unavailable);
+        previous.session_only_custom_credential = true;
+        previous.session_custom_credential_scope = Some(CustomCredentialRecoveryScope {
+            origin: "https://router.example.test".into(),
+            purpose: CustomCredentialPurpose::Asr,
+            asr_active: true,
+            cleanup_active: false,
+            include_asr_legacy: true,
+            include_cleanup_legacy: false,
+        });
+        previous.unverified_credential_sources.insert(
+            "settings:cleanup_api_key".into(),
+            "synthetic-deferred".into(),
+        );
+        let parsed: Settings =
+            serde_json::from_value(serde_json::to_value(&previous).unwrap()).unwrap();
+        let mut next = parsed;
+
+        next.preserve_credential_runtime_metadata_from(&previous);
+
+        assert_eq!(
+            next.credential_read_states.get("provider_custom"),
+            Some(&CredentialReadState::Unavailable)
+        );
+        assert!(next.session_only_custom_credential);
+        assert_eq!(
+            next.session_custom_credential_scope,
+            previous.session_custom_credential_scope
+        );
+        assert_eq!(
+            next.unverified_credential_sources
+                .get("settings:cleanup_api_key"),
+            Some(&"synthetic-deferred".to_owned())
+        );
+    }
+
+    #[test]
+    fn public_settings_view_never_contains_the_full_runtime_credential() {
+        let secret = "synthetic-full-secret-12345";
+        let settings = Settings {
+            asr_provider: crate::engine::EngineProvider::Custom,
+            custom_base_url: "https://router.example.test/v1".into(),
+            provider_api_keys: [("custom".to_owned(), secret.to_owned())]
+                .into_iter()
+                .collect(),
+            ..Settings::default()
+        };
+        let serialized = serde_json::to_string(&SettingsView::from(&settings)).unwrap();
+        assert!(!serialized.contains(secret));
+        assert!(serialized.contains("configured"));
+        assert!(serialized.contains("keychain_state"));
+    }
+
+    #[test]
+    fn settings_view_masks_every_short_ascii_and_unicode_credential() {
+        for secret in ["x", "ab", "abc", "abcd", "abcde", "🔑秘密"] {
+            let settings = Settings {
+                api_key: secret.into(),
+                provider_api_keys: [("custom".to_owned(), secret.into())].into_iter().collect(),
+                ..Settings::default()
+            };
+            let view = SettingsView::from(&settings);
+            let serialized = serde_json::to_string(&view).unwrap();
+            assert_eq!(view.api_key_hint.as_deref(), Some("••••"));
+            assert_eq!(view.provider_keys["custom"].hint.as_deref(), Some("••••"));
+            let public: serde_json::Value = serde_json::from_str(&serialized).unwrap();
+            assert_eq!(public["api_key_hint"], "••••");
+            assert_eq!(public["provider_keys"]["custom"]["hint"], "••••");
+        }
+    }
+
+    #[test]
+    fn session_custom_credential_is_bound_to_origin_across_a_settings_patch_round_trip() {
+        let dir = temp_dir("session-custom-origin-patch");
+        let backend = FakeCredentialBackend::default();
+        let mut current = Settings {
+            asr_provider: crate::engine::EngineProvider::Custom,
+            asr_base_url: "https://router-a.example.test/v1".into(),
+            cleanup_enabled: false,
+            ..Settings::default()
+        };
+        let scope =
+            custom_credential_recovery_scope(&current, CustomCredentialPurpose::Asr).unwrap();
+        adopt_interactive_custom_credential(
+            &mut current,
+            "synthetic-session-origin-key".into(),
+            scope,
+        );
+        assert_eq!(current.asr_credential(), "synthetic-session-origin-key");
+
+        // Match update_settings_patch's serde merge plus runtime-metadata
+        // restoration; the recovered value is not sent by the frontend.
+        let mut merged = serde_json::to_value(&current).unwrap();
+        merged.as_object_mut().unwrap().insert(
+            "asr_base_url".into(),
+            serde_json::Value::String("https://router-b.example.test/v1".into()),
+        );
+        let mut next: Settings = serde_json::from_value(merged).unwrap();
+        next.preserve_credential_runtime_metadata_from(&current);
+        next.session_only_custom_credential = current.session_only_custom_credential;
+        assert!(next.clear_stale_session_custom_credential());
+        assert!(!next.session_only_custom_credential);
+        assert!(next.session_custom_credential_scope.is_none());
+        assert!(next.session_custom_credential_rejected);
+        assert_eq!(
+            next.credential_read_states.get("provider_custom"),
+            Some(&CredentialReadState::Configured),
+            "revoking a process-only route lease must not rewrite the last Keychain read result"
+        );
+        assert!(!next.provider_api_keys.contains_key("custom"));
+        assert_eq!(next.asr_credential(), "");
+
+        save_settings_with_backend(&dir, &next, &backend).unwrap();
+        assert!(backend.writes.borrow().is_empty());
+        let on_disk = fs::read_to_string(dir.join("settings.json")).unwrap();
+        assert!(!on_disk.contains("synthetic-session-origin-key"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn revoked_custom_value_stays_rejected_through_full_and_patch_round_trips() {
+        let dir = temp_dir("revoked-custom-full-patch-round-trip");
+        let backend = FakeCredentialBackend::default();
+        let mut previous = Settings {
+            asr_provider: crate::engine::EngineProvider::Custom,
+            asr_base_url: "https://router-a.example.test/v1".into(),
+            custom_base_url: "https://router-a.example.test/v1".into(),
+            asr_api_key: "synthetic-deferred-asr-alias".into(),
+            cleanup_enabled: false,
+            ..Settings::default()
+        };
+        previous.unverified_credential_sources.insert(
+            "settings:asr_api_key".into(),
+            "synthetic-deferred-asr-alias".into(),
+        );
+        previous
+            .credential_baselines
+            .insert("asr_api_key".into(), "synthetic-older-asr-value".into());
+        previous
+            .credential_read_states
+            .insert("asr_api_key".into(), CredentialReadState::Unavailable);
+
+        let scope =
+            custom_credential_recovery_scope(&previous, CustomCredentialPurpose::Asr).unwrap();
+        adopt_interactive_custom_credential(
+            &mut previous,
+            "synthetic-session-custom-value".into(),
+            scope,
+        );
+        previous.cleanup_enabled = true;
+        previous.cleanup_provider = crate::engine::EngineProvider::Custom;
+        previous.cleanup_base_url = "https://router-b.example.test/v1".into();
+        assert!(previous.clear_stale_session_custom_credential());
+        assert!(previous.session_custom_credential_rejected);
+        assert!(!previous.provider_api_keys.contains_key("custom"));
+
+        // Full settings payloads do not serialize the rejection/read-state
+        // metadata and may omit aliases. The production compatibility helper
+        // must restore provenance before bind_* restores unchanged-route values.
+        let mut full: Settings =
+            serde_json::from_value(serde_json::to_value(&previous).unwrap()).unwrap();
+        full.asr_api_key.clear();
+        crate::preserve_session_custom_credential_for_full_settings_roundtrip(&previous, &mut full);
+        full.asr_api_key = bind_asr_key_to_host(
+            full.asr_provider,
+            &previous.asr_base_url,
+            &full.asr_base_url,
+            &full.asr_api_key,
+            &previous.asr_api_key,
+        );
+        assert_eq!(full.asr_api_key, "synthetic-deferred-asr-alias");
+        assert!(full.session_custom_credential_rejected);
+        assert_eq!(full.asr_credential(), "");
+        assert_eq!(
+            full.credential_read_states.get("asr_api_key"),
+            Some(&CredentialReadState::Unavailable)
+        );
+        assert_eq!(
+            full.unverified_credential_sources
+                .get("settings:asr_api_key")
+                .map(String::as_str),
+            Some("synthetic-deferred-asr-alias")
+        );
+        assert_eq!(
+            full.credential_baselines
+                .get("asr_api_key")
+                .map(String::as_str),
+            Some("synthetic-older-asr-value")
+        );
+
+        let mut patch = serde_json::to_value(&full).unwrap();
+        patch
+            .as_object_mut()
+            .unwrap()
+            .insert("ui_language".into(), serde_json::Value::String("en".into()));
+        let mut after_patch: Settings = serde_json::from_value(patch).unwrap();
+        crate::restore_session_custom_credential_after_patch(&full, &mut after_patch, false);
+        assert_eq!(after_patch.ui_language, "en");
+        assert!(after_patch.session_custom_credential_rejected);
+        assert_eq!(after_patch.asr_credential(), "");
+        assert_eq!(
+            after_patch.credential_read_states.get("asr_api_key"),
+            Some(&CredentialReadState::Unavailable)
+        );
+        save_configuration(&dir, &after_patch).unwrap();
+        assert!(backend.writes.borrow().is_empty());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn omitted_full_settings_secret_preserves_unavailable_deferred_source_without_keychain_write() {
+        let dir = temp_dir("full-settings-deferred-unavailable");
+        let backend = FakeCredentialBackend::default();
+        let mut previous = Settings {
+            asr_provider: crate::engine::EngineProvider::Custom,
+            asr_base_url: "https://router.example.test/v1".into(),
+            custom_base_url: "https://router.example.test/v1".into(),
+            asr_api_key: "synthetic-deferred-key".into(),
+            cleanup_enabled: false,
+            ..Settings::default()
+        };
+        previous.unverified_credential_sources.insert(
+            "settings:asr_api_key".into(),
+            "synthetic-deferred-key".into(),
+        );
+        previous
+            .credential_baselines
+            .insert("asr_api_key".into(), "synthetic-prior-baseline".into());
+        previous
+            .credential_read_states
+            .insert("provider_custom".into(), CredentialReadState::Unavailable);
+        previous
+            .credential_read_states
+            .insert("asr_api_key".into(), CredentialReadState::Unavailable);
+
+        let mut full: Settings =
+            serde_json::from_value(serde_json::to_value(&previous).unwrap()).unwrap();
+        full.asr_api_key.clear();
+        crate::preserve_session_custom_credential_for_full_settings_roundtrip(&previous, &mut full);
+        full.asr_api_key = bind_asr_key_to_host(
+            full.asr_provider,
+            &previous.asr_base_url,
+            &full.asr_base_url,
+            &full.asr_api_key,
+            &previous.asr_api_key,
+        );
+        assert_eq!(full.asr_api_key, "synthetic-deferred-key");
+        assert_eq!(
+            full.credential_read_states.get("provider_custom"),
+            Some(&CredentialReadState::Unavailable)
+        );
+        assert_eq!(
+            full.credential_read_states.get("asr_api_key"),
+            Some(&CredentialReadState::Unavailable)
+        );
+        assert_eq!(
+            full.unverified_credential_sources
+                .get("settings:asr_api_key")
+                .map(String::as_str),
+            Some("synthetic-deferred-key")
+        );
+
+        // Ordinary preference persistence must not touch secure storage.
+        save_configuration(&dir, &full).unwrap();
+        let persisted_before = fs::read(dir.join("settings.json")).unwrap();
+        assert!(backend.writes.borrow().is_empty());
+
+        // The compatibility service-save path sees the original unavailable
+        // read state and refuses migration without writing or relabeling it.
+        backend.script_reads(
+            "asr_api_key",
+            [crate::keychain::ApiKeyState::Unavailable(
+                "synthetic Keychain unavailable".into(),
+            )],
+        );
+        assert!(save_settings_with_backend(&dir, &full, &backend).is_err());
+        assert!(backend.writes.borrow().is_empty());
+        assert_eq!(
+            fs::read(dir.join("settings.json")).unwrap(),
+            persisted_before
+        );
+        assert_eq!(
+            full.credential_read_states.get("asr_api_key"),
+            Some(&CredentialReadState::Unavailable)
+        );
+        assert_eq!(
+            full.unverified_credential_sources
+                .get("settings:asr_api_key")
+                .map(String::as_str),
+            Some("synthetic-deferred-key")
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn explicit_full_settings_custom_key_clears_revocation_and_persists() {
+        let dir = temp_dir("explicit-custom-after-revocation");
+        let backend = FakeCredentialBackend::default();
+        let previous = Settings {
+            asr_provider: crate::engine::EngineProvider::Custom,
+            asr_base_url: "https://router.example.test/v1".into(),
+            custom_base_url: "https://router.example.test/v1".into(),
+            session_custom_credential_rejected: true,
+            ..Settings::default()
+        };
+        let mut incoming: Settings =
+            serde_json::from_value(serde_json::to_value(&previous).unwrap()).unwrap();
+        incoming
+            .provider_api_keys
+            .insert("custom".into(), "synthetic-explicit-new-key".into());
+        crate::preserve_session_custom_credential_for_full_settings_roundtrip(
+            &previous,
+            &mut incoming,
+        );
+        assert!(!incoming.session_custom_credential_rejected);
+        assert!(!incoming.session_only_custom_credential);
+        assert_eq!(
+            incoming.provider_secret(crate::engine::EngineProvider::Custom),
+            "synthetic-explicit-new-key"
+        );
+
+        save_settings_with_backend(&dir, &incoming, &backend).unwrap();
+        assert_eq!(
+            backend.writes.borrow().as_slice(),
+            &[(
+                "provider_custom".into(),
+                "synthetic-explicit-new-key".into()
+            )]
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn revoked_session_custom_credential_cannot_fall_back_to_a_legacy_alias() {
+        let mut settings = Settings {
+            asr_provider: crate::engine::EngineProvider::Custom,
+            asr_base_url: "https://router-a.example.test/v1".into(),
+            asr_api_key: "synthetic-legacy-a-key".into(),
+            cleanup_api_key: "synthetic-legacy-cleanup-key".into(),
+            cleanup_enabled: false,
+            ..Settings::default()
+        };
+        let scope =
+            custom_credential_recovery_scope(&settings, CustomCredentialPurpose::Asr).unwrap();
+        adopt_interactive_custom_credential(
+            &mut settings,
+            "synthetic-session-origin-key".into(),
+            scope,
+        );
+        assert_eq!(settings.asr_credential(), "synthetic-session-origin-key");
+
+        settings.asr_base_url = "https://router-b.example.test/v1".into();
+        assert!(settings.clear_stale_session_custom_credential());
+        assert!(settings.session_custom_credential_rejected);
+        assert_eq!(settings.asr_credential(), "");
+        assert_eq!(
+            settings.provider_secret(crate::engine::EngineProvider::Custom),
+            ""
+        );
+    }
+
+    #[test]
+    fn session_custom_value_is_limited_to_the_captured_active_purpose_set() {
+        let mut settings = Settings {
+            asr_provider: crate::engine::EngineProvider::Custom,
+            asr_base_url: "https://router.example.test/v1/asr".into(),
+            cleanup_enabled: true,
+            cleanup_provider: crate::engine::EngineProvider::Custom,
+            cleanup_base_url: "https://router.example.test/v1/cleanup".into(),
+            custom_base_url: "https://router.example.test/v1".into(),
+            ..Settings::default()
+        };
+        let scope =
+            custom_credential_recovery_scope(&settings, CustomCredentialPurpose::Asr).unwrap();
+        adopt_interactive_custom_credential(
+            &mut settings,
+            "synthetic-shared-custom-key".into(),
+            scope,
+        );
+        assert_eq!(settings.asr_credential(), "synthetic-shared-custom-key");
+        assert_eq!(settings.cleanup_credential(), "synthetic-shared-custom-key");
+
+        settings.cleanup_provider = crate::engine::EngineProvider::Groq;
+        assert!(settings.clear_stale_session_custom_credential());
+        assert_eq!(settings.asr_credential(), "");
+        assert_eq!(settings.cleanup_credential(), "");
+    }
+
+    #[test]
+    fn recovered_custom_credential_does_not_cross_to_a_different_accurate_asr_origin() {
+        let mut settings = Settings {
+            asr_provider: crate::engine::EngineProvider::Custom,
+            asr_base_url: "https://router-a.example.test/v1".into(),
+            accurate_asr_provider: crate::engine::EngineProvider::Custom,
+            accurate_asr_base_url: "https://router-b.example.test/v1".into(),
+            ..Settings::default()
+        };
+        let scope =
+            custom_credential_recovery_scope(&settings, CustomCredentialPurpose::Asr).unwrap();
+        adopt_interactive_custom_credential(&mut settings, "synthetic-router-a-key".into(), scope);
+        assert_eq!(settings.asr_credential(), "synthetic-router-a-key");
+        assert_eq!(settings.accurate_asr_credential(), "");
+
+        settings.accurate_asr_base_url = "https://router-a.example.test/alternate".into();
+        assert_eq!(settings.accurate_asr_credential(), "synthetic-router-a-key");
+    }
+
+    #[test]
+    fn on_device_mlx_cleanup_is_ready_without_url_or_api_key() {
+        let settings = Settings {
+            cleanup_provider: crate::engine::EngineProvider::OnDeviceMlx,
+            cleanup_model: crate::engine::EngineProvider::OnDeviceMlx
+                .default_llm_model()
+                .into(),
+            cleanup_base_url: String::new(),
+            cleanup_api_key: String::new(),
+            ..Settings::default()
+        };
+        settings
+            .validate_provider_side(
+                crate::engine::EngineProvider::OnDeviceMlx,
+                false,
+                None,
+                true,
+            )
+            .expect("the bundled native provider has no URL or API key");
+        assert_eq!(settings.cleanup_endpoint(), "");
+        assert_eq!(settings.cleanup_credential(), "");
+    }
+
+    #[test]
+    fn on_device_mlx_normalizes_only_its_legacy_lmstudio_model_id() {
+        let mut native = Settings {
+            cleanup_provider: crate::engine::EngineProvider::OnDeviceMlx,
+            cleanup_model: crate::lmstudio_local::MODEL_VARIANT.into(),
+            ..Settings::default()
+        };
+        native.normalize();
+        assert_eq!(native.cleanup_model, crate::modelstore::MODEL_ID);
+
+        let mut lmstudio = Settings {
+            cleanup_provider: crate::engine::EngineProvider::LmStudio,
+            cleanup_model: crate::lmstudio_local::MODEL_VARIANT.into(),
+            ..Settings::default()
+        };
+        lmstudio.normalize();
+        assert_eq!(lmstudio.cleanup_model, crate::lmstudio_local::MODEL_VARIANT);
+    }
+
+    #[test]
     fn history_schema_migration_keeps_a_versioned_backup() {
         let dir = temp_dir("history-migration");
         std::fs::create_dir_all(&dir).unwrap();
@@ -5401,7 +13115,26 @@ mod tests {
 
         let history = get_history(&dir, 10).unwrap();
 
-        assert!(dir.join("history.sqlite.v2.bak").is_file());
+        let backup = dir.join("history.sqlite.v2.bak");
+        assert!(backup.is_file());
+        #[cfg(unix)]
+        assert_eq!(
+            fs::metadata(&backup).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let backup_db =
+            Connection::open_with_flags(&backup, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .unwrap();
+        let integrity: String = backup_db
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok");
+        assert_eq!(
+            backup_db
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i32>(0))
+                .unwrap(),
+            2
+        );
         assert_eq!(history[0].asr_text, None);
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -5427,6 +13160,143 @@ mod tests {
             fs::read_to_string(dir.join("settings.json")).unwrap(),
             "user settings"
         );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn schema_17_adds_nullable_cleanup_attribution_and_keeps_existing_rows() {
+        let dir = temp_dir("schema-17-cleanup-attribution");
+        fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("history.sqlite");
+        let connection = Connection::open(&db_path).unwrap();
+        connection.execute_batch("CREATE TABLE dictations (id INTEGER PRIMARY KEY, created_at TEXT NOT NULL, duration_secs REAL, raw_text TEXT, final_text TEXT, cleanup_status TEXT, engine TEXT, degraded INTEGER, degraded_reason TEXT, status TEXT, raw_audio_path TEXT, delivery_method TEXT, fallback_reason TEXT, context_profile_id TEXT, context_policy_json TEXT, asr_text TEXT, provider_cleaned_candidate TEXT, cleanup_rejected_candidate TEXT, cleanup_guard_reason TEXT); CREATE TABLE dictation_revisions (revision_id INTEGER PRIMARY KEY, dictation_id INTEGER NOT NULL, created_at TEXT NOT NULL, final_text TEXT NOT NULL, cleanup_status TEXT, intent_json TEXT, model TEXT, context_policy_json TEXT, revision_reason TEXT NOT NULL); INSERT INTO dictations(id,created_at,duration_secs,raw_text,final_text,cleanup_status,engine,degraded,degraded_reason,status,raw_audio_path,delivery_method,fallback_reason,context_profile_id,context_policy_json,asr_text,provider_cleaned_candidate,cleanup_rejected_candidate,cleanup_guard_reason) VALUES(41,'2026-11-01',3.5,'old raw','old final','local_only','whisper',1,'provider_failure','degraded','spool/session.wav','clipboard','delivery_fallback','profile-7','{\"family\":\"document\"}','old asr','provider candidate','rejected candidate','protected_token_changed'); INSERT INTO dictation_revisions(revision_id,dictation_id,created_at,final_text,cleanup_status,intent_json,model,context_policy_json,revision_reason) VALUES(9,41,'2026-11-02','old revision','local_only','{}','model-7','{\"family\":\"document\"}','manual'); PRAGMA user_version=17;").unwrap();
+        let old_columns: Vec<String> = {
+            let mut columns_statement =
+                connection.prepare("PRAGMA table_info(dictations)").unwrap();
+            columns_statement
+                .query_map([], |row| row.get(1))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        assert!(!old_columns
+            .iter()
+            .any(|column| column == "cleanup_attempt_kind"));
+        assert!(!old_columns
+            .iter()
+            .any(|column| column == "cleanup_transformations_json"));
+        assert!(!old_columns
+            .iter()
+            .any(|column| column == "cleanup_final_guard_reason"));
+        assert!(!old_columns
+            .iter()
+            .any(|column| column == "cleanup_failure_reason"));
+        drop(connection);
+        let item = get_history_page(&dir, 10, None, None)
+            .unwrap()
+            .items
+            .remove(0);
+        assert_eq!(item.raw_text, "old raw");
+        assert_eq!(item.asr_text.as_deref(), Some("old asr"));
+        assert_eq!(
+            item.provider_cleaned_candidate.as_deref(),
+            Some("provider candidate")
+        );
+        assert_eq!(
+            item.cleanup_rejected_candidate.as_deref(),
+            Some("rejected candidate")
+        );
+        assert_eq!(
+            item.cleanup_guard_reason.as_deref(),
+            Some("protected_token_changed")
+        );
+        assert_eq!(item.context_profile_id.as_deref(), Some("profile-7"));
+        let persisted_audio_path: Option<String> = Connection::open(&db_path)
+            .unwrap()
+            .query_row(
+                "SELECT raw_audio_path FROM dictations WHERE id=41",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(persisted_audio_path.as_deref(), Some("spool/session.wav"));
+        assert_eq!(item.delivery_method.as_deref(), Some("clipboard"));
+        assert_eq!(item.cleanup_attempt_kind, None);
+        assert_eq!(item.cleanup_transformations, None);
+        assert_eq!(item.revision_count, 1);
+        let migrated: Connection = open_history(&dir).unwrap();
+        assert_eq!(
+            migrated
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i32>(0))
+                .unwrap(),
+            HISTORY_SCHEMA_VERSION
+        );
+        migrated.execute("INSERT INTO dictations(id,created_at,raw_text,final_text,cleanup_status,status,cleanup_attempt_kind,cleanup_transformations_json,cleanup_final_guard_reason,cleanup_failure_reason) VALUES(42,'2026-11-03','new raw','new final','cleanup_not_requested','ok','not_called','[]',NULL,NULL)", []).unwrap();
+        drop(migrated);
+        let reopened = get_history_page(&dir, 10, None, None).unwrap();
+        assert_eq!(
+            reopened.items[0].cleanup_attempt_kind.as_deref(),
+            Some("not_called")
+        );
+        assert_eq!(
+            reopened.items[0].cleanup_transformations.as_deref(),
+            Some([].as_slice())
+        );
+        assert_eq!(reopened.items[0].cleanup_final_guard_reason, None);
+        assert_eq!(reopened.items[0].cleanup_failure_reason, None);
+        let export: serde_json::Value =
+            serde_json::from_str(&export_history_json(&dir).unwrap()).unwrap();
+        assert_eq!(export[0]["cleanup_attempt_kind"], "not_called");
+        assert_eq!(export[0]["cleanup_transformations"], serde_json::json!([]));
+        assert!(export[0]["cleanup_final_guard_reason"].is_null());
+        assert!(export[0]["cleanup_failure_reason"].is_null());
+        assert!(export[1]["cleanup_attempt_kind"].is_null());
+        let backup = dir.join("history.sqlite.v17.bak");
+        assert!(backup.is_file());
+        #[cfg(unix)]
+        assert_eq!(
+            fs::metadata(&backup).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let backup_db =
+            Connection::open_with_flags(&backup, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .unwrap();
+        assert_eq!(
+            backup_db
+                .query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
+                .unwrap(),
+            "ok"
+        );
+        assert_eq!(
+            backup_db
+                .query_row(
+                    "SELECT final_text FROM dictation_revisions WHERE revision_id=9",
+                    [],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            "old revision"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn newer_history_schema_is_rejected_without_changing_database_bytes() {
+        let dir = temp_dir("future-history-schema");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("history.sqlite");
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch("CREATE TABLE future_only(id INTEGER PRIMARY KEY, sentinel TEXT); INSERT INTO future_only VALUES(1,'keep'); CREATE TABLE dictations(id INTEGER PRIMARY KEY, created_at TEXT NOT NULL, raw_text TEXT, final_text TEXT); INSERT INTO dictations VALUES(2,'2026-11-01','keep raw','keep final');").unwrap();
+        connection
+            .pragma_update(None, "user_version", HISTORY_SCHEMA_VERSION + 1)
+            .unwrap();
+        drop(connection);
+        let before = fs::read(&path).unwrap();
+        assert!(open_history(&dir).is_err());
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert!(!dir
+            .join(format!("history.sqlite.v{}.bak", HISTORY_SCHEMA_VERSION))
+            .exists());
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -5512,6 +13382,88 @@ mod tests {
     }
 
     #[test]
+    fn migration_backup_does_not_overwrite_existing_regular_file() {
+        let dir = temp_dir("migration-backup-existing-file");
+        fs::create_dir_all(&dir).unwrap();
+        let database = Connection::open(dir.join("history.sqlite")).unwrap();
+        database.execute_batch("PRAGMA user_version=2;").unwrap();
+        drop(database);
+        let backup = dir.join("history.sqlite.v2.bak");
+        fs::write(&backup, b"preexisting owner data").unwrap();
+
+        open_history(&dir).unwrap();
+
+        assert_eq!(fs::read(&backup).unwrap(), b"preexisting owner data");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn migration_backup_temp_collision_preserves_existing_directory_contents() {
+        let dir = temp_dir("migration-temp-collision");
+        fs::create_dir_all(&dir).unwrap();
+        let occupied = dir.join("occupied-stage");
+        fs::create_dir(&occupied).unwrap();
+        let sentinel = occupied.join("owner-data.txt");
+        fs::write(&sentinel, b"preexisting owner data").unwrap();
+
+        assert!(create_history_backup_temp_dir(&occupied).is_err());
+
+        assert_eq!(fs::read(&sentinel).unwrap(), b"preexisting owner data");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn migration_backup_is_integral_during_concurrent_wal_writes() {
+        let dir = temp_dir("migration-backup-wal-writer");
+        fs::create_dir_all(&dir).unwrap();
+        let database_path = dir.join("history.sqlite");
+        let database = Connection::open(&database_path).unwrap();
+        database
+            .execute_batch(
+                "PRAGMA journal_mode=WAL; CREATE TABLE dictations (id INTEGER PRIMARY KEY, value TEXT NOT NULL); INSERT INTO dictations VALUES (1, 'initial'); PRAGMA user_version=2;",
+            )
+            .unwrap();
+        let writer_path = database_path.clone();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            let writer_db = Connection::open(writer_path).unwrap();
+            writer_db.busy_timeout(Duration::from_secs(2)).unwrap();
+            started_tx.send(()).unwrap();
+            let mut revision = 0_u64;
+            while stop_rx.try_recv().is_err() {
+                revision += 1;
+                let _ = writer_db.execute(
+                    "UPDATE dictations SET value=?1 WHERE id=1",
+                    [revision.to_string()],
+                );
+                std::thread::yield_now();
+            }
+        });
+        started_rx.recv().unwrap();
+
+        let backup = dir.join("history.sqlite.v2.bak");
+        create_history_migration_backup(&database, &dir, &backup).unwrap();
+
+        stop_tx.send(()).unwrap();
+        writer.join().unwrap();
+        let backup_db =
+            Connection::open_with_flags(&backup, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .unwrap();
+        let integrity: String = backup_db
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok");
+        let value: String = backup_db
+            .query_row("SELECT value FROM dictations WHERE id=1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert!(!value.is_empty());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn save_settings_never_writes_plaintext_key() {
         let dir = temp_dir("keyblank");
         let backend = FakeCredentialBackend::default();
@@ -5584,6 +13536,53 @@ mod tests {
                 .contains("new-synthetic-key")
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn same_baseline_key_is_not_rewritten_when_keychain_is_unavailable() {
+        let dir = temp_dir("same-baseline-unavailable");
+        let backend = FakeCredentialBackend::default();
+        backend.script_reads(
+            "groq_api_key",
+            [crate::keychain::ApiKeyState::Unavailable(
+                "synthetic unavailable".into(),
+            )],
+        );
+        let mut settings = Settings::default();
+        adopt_interactive_groq_credential(&mut settings, "same-baseline-key".into());
+
+        let result = save_settings_with_backend(&dir, &settings, &backend);
+
+        assert!(result.is_err());
+        assert!(backend.writes.borrow().is_empty());
+        assert!(!dir.join("settings.json").exists());
+        assert!(!secret_sidecar_path(&dir, "api_key").exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn interactive_groq_read_adoption_updates_only_ram_baseline() {
+        let mut settings = Settings::default();
+        settings
+            .unverified_credential_sources
+            .insert("settings:api_key".into(), "legacy-key".into());
+
+        adopt_interactive_groq_credential(&mut settings, "session-key".into());
+
+        assert_eq!(settings.api_key, "session-key");
+        assert_eq!(
+            settings.provider_api_keys.get("groq").unwrap(),
+            "session-key"
+        );
+        assert_eq!(
+            settings.credential_baselines.get("groq_api_key").unwrap(),
+            "session-key"
+        );
+        assert!(!settings
+            .unverified_credential_sources
+            .contains_key("settings:api_key"));
+        let serialized = serde_json::to_string(&SettingsView::from(&settings)).unwrap();
+        assert!(!serialized.contains("session-key"));
     }
 
     #[test]
@@ -5835,6 +13834,113 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    fn write_custom_host_settings_fixture(dir: &Path) -> Vec<u8> {
+        let original = br#"{"custom_base_url":"https://old.example/v1"}"#.to_vec();
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join("settings.json"), &original).unwrap();
+        original
+    }
+
+    fn seed_custom_host_credentials(backend: &FakeCredentialBackend) {
+        backend.seed("provider_custom", "old-custom-key");
+        backend.seed("asr_api_key", "old-asr-alias");
+        backend.seed("cleanup_api_key", "old-cleanup-alias");
+        backend.seed("api_key", "keep-groq-key");
+        backend.seed("provider_openai", "keep-openai-key");
+    }
+
+    fn assert_custom_host_settings_unchanged(dir: &Path, original: &[u8]) {
+        assert_eq!(std::fs::read(dir.join("settings.json")).unwrap(), original);
+    }
+
+    #[test]
+    fn custom_host_change_clear_failure_keeps_settings_and_unrelated_keys() {
+        for failing_slot in CUSTOM_HOST_CHANGE_CREDENTIAL_SLOTS {
+            let dir = temp_dir(&format!("custom-host-clear-{failing_slot}"));
+            let original = write_custom_host_settings_fixture(&dir);
+            let backend = FakeCredentialBackend::default();
+            seed_custom_host_credentials(&backend);
+            backend.fail_write(failing_slot, "injected delete failure");
+
+            assert!(
+                clear_custom_credentials_before_host_change_with_backend(&dir, &backend).is_err()
+            );
+            assert_custom_host_settings_unchanged(&dir, &original);
+            assert_eq!(
+                backend.read("api_key"),
+                crate::keychain::ApiKeyState::Configured("keep-groq-key".into())
+            );
+            assert_eq!(
+                backend.read("provider_openai"),
+                crate::keychain::ApiKeyState::Configured("keep-openai-key".into())
+            );
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    #[test]
+    fn custom_host_change_clear_unavailable_readback_keeps_settings() {
+        let dir = temp_dir("custom-host-clear-unavailable-readback");
+        let original = write_custom_host_settings_fixture(&dir);
+        let backend = FakeCredentialBackend::default();
+        seed_custom_host_credentials(&backend);
+        backend.script_reads(
+            "provider_custom",
+            [crate::keychain::ApiKeyState::Unavailable(
+                "injected readback failure".into(),
+            )],
+        );
+
+        assert!(clear_custom_credentials_before_host_change_with_backend(&dir, &backend).is_err());
+        assert_custom_host_settings_unchanged(&dir, &original);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn custom_host_change_clear_sidecar_failure_keeps_settings() {
+        let dir = temp_dir("custom-host-clear-sidecar-failure");
+        let original = write_custom_host_settings_fixture(&dir);
+        let backend = FakeCredentialBackend::default();
+        seed_custom_host_credentials(&backend);
+        write_secret_sidecar(&dir, "provider_custom", "old-custom-sidecar").unwrap();
+        write_secret_sidecar(&dir, "cleanup_api_key", "old-cleanup-sidecar").unwrap();
+        let blocked_sidecar = secret_sidecar_path(&dir, "asr_api_key");
+        std::fs::create_dir(&blocked_sidecar).unwrap();
+
+        assert!(clear_custom_credentials_before_host_change_with_backend(&dir, &backend).is_err());
+        assert_custom_host_settings_unchanged(&dir, &original);
+        assert!(blocked_sidecar.is_dir());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn custom_host_change_clear_removes_all_custom_slots_before_verifying_fallback() {
+        let dir = temp_dir("custom-host-clear-success");
+        let original = write_custom_host_settings_fixture(&dir);
+        let backend = FakeCredentialBackend::default();
+        seed_custom_host_credentials(&backend);
+        for slot in ["provider_custom", "asr_api_key", "cleanup_api_key"] {
+            write_secret_sidecar(&dir, slot, &format!("old-{slot}-sidecar")).unwrap();
+        }
+
+        clear_custom_credentials_before_host_change_with_backend(&dir, &backend).unwrap();
+
+        for slot in CUSTOM_HOST_CHANGE_CREDENTIAL_SLOTS {
+            assert_eq!(backend.read(slot), crate::keychain::ApiKeyState::Missing);
+            assert!(!secret_sidecar_path(&dir, slot).exists());
+        }
+        assert_eq!(
+            backend.read("api_key"),
+            crate::keychain::ApiKeyState::Configured("keep-groq-key".into())
+        );
+        assert_eq!(
+            backend.read("provider_openai"),
+            crate::keychain::ApiKeyState::Configured("keep-openai-key".into())
+        );
+        assert_custom_host_settings_unchanged(&dir, &original);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn load_settings_reads_api_key_from_sidecar_when_keychain_is_empty() {
         let dir = temp_dir("sidecar-load");
@@ -5857,7 +13963,8 @@ mod tests {
             credential_hint("gsk_abcdefghij").as_deref(),
             Some("••••fghij")
         );
-        assert_eq!(credential_hint("only").as_deref(), Some("••••only"));
+        assert_eq!(credential_hint("only").as_deref(), Some("••••"));
+        assert_eq!(credential_hint("🔑秘密").as_deref(), Some("••••"));
         assert_eq!(credential_hint("asr_only").as_deref(), Some("••••_only"));
     }
 
@@ -5875,6 +13982,31 @@ mod tests {
         assert_eq!(view.cleanup_model, crate::llm::MODEL);
         assert!(!json.contains("test_key_1234"));
         assert!(!json.contains("secret"));
+    }
+
+    #[test]
+    fn custom_cleanup_parameters_round_trip_through_settings_view_and_validate() {
+        let mut settings = Settings {
+            custom_cleanup_parameters: serde_json::from_value(serde_json::json!({
+                "temperature": 0,
+                "vendor_extension": {"enabled": false, "bias": 0},
+            }))
+            .expect("parameter object"),
+            ..Settings::default()
+        };
+        settings
+            .validate_configuration()
+            .expect("bounded parameters validate");
+        let view = SettingsView::from(&settings);
+        assert_eq!(
+            view.custom_cleanup_parameters,
+            settings.custom_cleanup_parameters
+        );
+
+        settings
+            .custom_cleanup_parameters
+            .insert("messages".into(), serde_json::Value::Array(Vec::new()));
+        assert!(settings.validate_configuration().is_err());
     }
 
     #[test]
@@ -6015,6 +14147,191 @@ mod tests {
     }
 
     #[test]
+    fn live_audio_spool_lease_blocks_reuse_reads_and_defers_all_data_deletion() {
+        let dir = temp_dir("audio-spool-lease");
+        let (session, lease) = begin_audio_spool_session(&dir, "live-session").unwrap();
+        assert!(
+            !dir.join("spool").exists(),
+            "audio reservation performs no filesystem initialization"
+        );
+        assert!(begin_audio_spool_session(&dir, "nested/session").is_err());
+        let alias_root = dir.join("unused-child").join("..");
+        assert!(begin_audio_spool_session(&alias_root, "live-session").is_err());
+        let chunk = session.join("chunks/00000000.f32");
+
+        assert!(begin_audio_spool_session(&dir, "live-session").is_err());
+        assert!(read_spool_file(&chunk)
+            .unwrap_err()
+            .to_string()
+            .contains("already owned by an audio worker"));
+        assert!(recover_spool_session(&dir, "live-session", 7)
+            .unwrap_err()
+            .to_string()
+            .contains("still owned"));
+        assert!(
+            write_spool_file(&dir, Path::new("live-session/chunks/late.f32"), b"late")
+                .unwrap_err()
+                .to_string()
+                .contains("already owned by an audio worker")
+        );
+
+        assert!(clear_all_data(&dir)
+            .unwrap_err()
+            .to_string()
+            .contains("cleanup is still pending"));
+        assert!(
+            !lease.deletion_requested(),
+            "a rejected data clear must not schedule the live recording for deletion"
+        );
+        assert!(
+            !dir.join("spool").exists(),
+            "clear does not create or mutate a path while initialization is reserved"
+        );
+        assert!(begin_audio_spool_session(&dir, "live-session").is_err());
+
+        let release_started = std::time::Instant::now();
+        drop(lease);
+        assert!(release_started.elapsed() < Duration::from_millis(100));
+        assert!(
+            !session.exists(),
+            "a memory-only lease drop does not create or delete files"
+        );
+        clear_all_data(&dir).unwrap();
+        let (reused, lease) = begin_audio_spool_session(&dir, "live-session").unwrap();
+        assert!(!reused.exists());
+        initialize_audio_spool_session(&lease).unwrap();
+        drop(lease);
+        assert!(reused.join("manifest.json").exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn stale_spool_session_drop_cannot_release_a_successor_generation() {
+        let dir = temp_dir("audio-spool-lease-aba");
+        let session_dir = dir.join("spool").join("aba-session");
+        let stale =
+            reserve_spool_session_path(&session_dir, true, SpoolLeaseKind::Session).unwrap();
+        let stale_generation = stale.generation();
+
+        // Model a predecessor whose owner slot was revoked while an old clone
+        // is still retained. A new generation is allowed to claim the exact
+        // same logical session path.
+        {
+            let mut active = ACTIVE_AUDIO_SPOOL_SESSIONS
+                .get_or_init(Default::default)
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            assert_eq!(
+                active
+                    .sessions
+                    .get(&session_dir)
+                    .map(|value| value.generation),
+                Some(stale_generation)
+            );
+            active.sessions.remove(&session_dir);
+        }
+        let successor =
+            reserve_spool_session_path(&session_dir, true, SpoolLeaseKind::Session).unwrap();
+        assert_ne!(stale.generation(), successor.generation());
+        drop(stale);
+
+        assert!(spool_lease_is_current(&successor));
+        assert!(reserve_spool_session_path(&session_dir, true, SpoolLeaseKind::Session).is_err());
+        drop(successor);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn root_mutation_and_clear_admissions_are_prefix_scoped_and_memory_only() {
+        let dir = temp_dir("audio-spool-root-admission");
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("preserve.bin");
+        std::fs::write(&marker, b"clear busy must preserve this file").unwrap();
+        let before = std::fs::read(&marker).unwrap();
+        let nested_root = dir.join("nested").join("profile");
+
+        let mutation = begin_spool_root_mutation(&nested_root).unwrap();
+        let alias_root = nested_root.join("unused-child").join("..");
+        assert!(begin_clear_all_data(&alias_root).is_err());
+        assert!(clear_all_data(&dir)
+            .unwrap_err()
+            .to_string()
+            .contains("cleanup is still pending"));
+        assert_eq!(std::fs::read(&marker).unwrap(), before);
+        assert!(
+            !nested_root.exists(),
+            "admission must not create directories"
+        );
+        drop(mutation);
+
+        let clear = begin_clear_all_data(&dir).unwrap();
+        assert!(begin_spool_root_mutation(&nested_root).is_err());
+        assert!(begin_audio_spool_session(&nested_root, "nested-session").is_err());
+        assert_eq!(std::fs::read(&marker).unwrap(), before);
+        drop(clear);
+
+        let mutation_after_release = begin_spool_root_mutation(&nested_root).unwrap();
+        drop(mutation_after_release);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn recovery_readers_and_retention_reject_an_active_clear_before_side_effects() {
+        let dir = temp_dir("audio-spool-clear-fences-recovery");
+        std::fs::create_dir_all(dir.join("spool").join("legacy")).unwrap();
+        let audio = dir.join("spool").join("legacy").join("recovery.wav");
+        std::fs::write(&audio, b"preserve until clear completes").unwrap();
+        let before = std::fs::read(&audio).unwrap();
+        let recovery = RecoveredSpool {
+            audio_path: audio.clone(),
+            duration_secs: 1.0,
+        };
+
+        let clear = begin_clear_all_data(&dir).unwrap();
+        assert!(read_spool_file(&audio).is_err());
+        assert!(recover_spool(&dir, 7).is_err());
+        assert!(recover_spool_session(&dir, "legacy", 7).is_err());
+        assert!(record_recovered_history(&dir, &recovery).is_err());
+        assert!(purge_history(&dir, 0).is_err());
+        assert!(purge_gold_audio(&dir, 0).is_err());
+        assert_eq!(std::fs::read(&audio).unwrap(), before);
+        drop(clear);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn failed_audio_spool_initialization_and_cancel_preserve_preexisting_artifacts() {
+        use sha2::Digest;
+
+        let dir = temp_dir("audio-spool-init-existing");
+        let session = begin_spool_session(&dir, "preexisting-session").unwrap();
+        let marker = session.join("marker.bin");
+        std::fs::write(&marker, b"recovery artifact must remain untouched").unwrap();
+        let before = sha2::Sha256::digest(std::fs::read(&marker).unwrap());
+
+        let (reserved, lease) = begin_audio_spool_session(&dir, "preexisting-session").unwrap();
+        assert_eq!(reserved, session);
+        assert!(initialize_audio_spool_session(&lease).is_err());
+        assert!(clear_all_data(&dir)
+            .unwrap_err()
+            .to_string()
+            .contains("cleanup is still pending"));
+        let release_started = std::time::Instant::now();
+        drop(lease);
+        assert!(release_started.elapsed() < Duration::from_millis(100));
+
+        let after = sha2::Sha256::digest(std::fs::read(&marker).unwrap());
+        assert_eq!(
+            before, after,
+            "failed initialization cannot erase recovery data"
+        );
+        assert!(session.join("manifest.json").exists());
+        clear_all_data(&dir).unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn encrypted_spool_round_trip_and_plaintext_compatibility() {
         let key = [7_u8; 32];
         let plaintext = b"audio bytes";
@@ -6039,6 +14356,7 @@ mod tests {
             b"secret audio",
             true,
             None,
+            None,
         );
         assert!(result.is_err());
         assert!(!dir.join("spool/missing-key.wav").exists());
@@ -6061,6 +14379,7 @@ mod tests {
             wav,
             true,
             Some(&[3_u8; 32]),
+            None,
         )
         .unwrap();
         let on_disk = std::fs::read(dir.join("spool/session/recovery.wav")).unwrap();
@@ -6093,6 +14412,67 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    #[test]
+    fn live_error_recovery_touches_only_the_matching_spool_session() {
+        let dir = temp_dir("scoped-live-recovery");
+        let matching = begin_spool_session(&dir, "current-session").unwrap();
+        write_spool_f32_chunk(&dir, "current-session", 0, &[0.1, 0.2, 0.3]);
+        record_spool_chunk(&matching, 0, 0.0, 0.0001875, "written").unwrap();
+        let unrelated = begin_spool_session(&dir, "other-session").unwrap();
+        write_spool_f32_chunk(&dir, "other-session", 0, &[0.4, 0.5]);
+        record_spool_chunk(&unrelated, 0, 0.0, 0.000125, "written").unwrap();
+
+        let recovered = recover_spool_session(&dir, "current-session", 7)
+            .unwrap()
+            .expect("matching live audio should remain recoverable");
+
+        assert!(recovered.audio_path.is_file());
+        assert_eq!(load_manifest(&matching).unwrap().status, "recoverable");
+        assert_eq!(load_manifest(&unrelated).unwrap().status, "active");
+        assert!(!unrelated.join("recovery.wav").exists());
+        assert!(recover_spool_session(&dir, "../other-session", 7).is_err());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_flat_symlink_does_not_interrupt_startup_spool_recovery() {
+        use std::os::unix::fs::symlink;
+
+        let dir = temp_dir("dangling-flat-link-recovery");
+        let session = begin_spool_session(&dir, "valid-session-after-link").unwrap();
+        write_spool_f32_chunk(&dir, "valid-session-after-link", 0, &[0.1, 0.2, 0.3]);
+        record_spool_chunk(&session, 0, 0.0, 0.0001875, "written").unwrap();
+        symlink(
+            dir.join("missing-target.wav"),
+            dir.join("spool/dangling.wav"),
+        )
+        .unwrap();
+
+        let recovered = recover_spool(&dir, 7).unwrap();
+
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].audio_path, session.join("recovery.wav"));
+        assert!(recovered[0].audio_path.is_file());
+        assert!(dir.join("spool/dangling.wav").symlink_metadata().is_ok());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn zero_day_retention_never_recovers_a_same_second_live_spool() {
+        let dir = temp_dir("zero-day-live-recovery");
+        let session = begin_spool_session(&dir, "zero-day-session").unwrap();
+        write_spool_f32_chunk(&dir, "zero-day-session", 0, &[0.1, 0.2, 0.3]);
+        record_spool_chunk(&session, 0, 0.0, 0.0001875, "written").unwrap();
+
+        assert!(recover_spool_session(&dir, "zero-day-session", 0)
+            .unwrap()
+            .is_none());
+        assert!(!session.join("recovery.wav").exists());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     fn set_spool_created_at_for_test(session: &Path, created_at_ms: u64) {
         let mut manifest = load_manifest(session).unwrap();
         manifest.created_at_ms = created_at_ms;
@@ -6110,6 +14490,48 @@ mod tests {
             elapsed.as_secs() < 60,
             "test must model a recent directory mtime"
         );
+    }
+
+    #[test]
+    fn retention_tick_removes_expired_spool() {
+        let dir = temp_dir("spool-daily-retention");
+        let old = begin_spool_session(&dir, "expired-session").unwrap();
+        let fresh = begin_spool_session(&dir, "fresh-session").unwrap();
+        let completed = begin_spool_session(&dir, "leased-complete-session").unwrap();
+        set_spool_created_at_for_test(&old, now_ms().saturating_sub(8 * 86_400_000));
+        let mut completed_manifest = load_manifest(&completed).unwrap();
+        completed_manifest.status = "complete".into();
+        completed_manifest.created_at_ms = now_ms().saturating_sub(8 * 86_400_000);
+        save_manifest(&completed, &completed_manifest).unwrap();
+        let _completed_lease = lease_spool_session(&completed).unwrap();
+        let flat_old = dir.join("spool/expired.wav");
+        let flat_fresh = dir.join("spool/fresh.wav");
+        std::fs::write(&flat_old, b"old").unwrap();
+        std::fs::write(&flat_fresh, b"fresh").unwrap();
+        let old_time = SystemTime::now() - Duration::from_secs(8 * 86_400);
+        std::fs::File::options()
+            .write(true)
+            .open(&flat_old)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(old_time))
+            .unwrap();
+        let injected_now = now_ms();
+        set_spool_created_at_for_test(&fresh, injected_now.saturating_sub(3_000));
+        let fresh_created_at = load_manifest(&fresh).unwrap().created_at_ms;
+
+        expire_spool(&dir, 7, || injected_now).unwrap();
+
+        assert!(!old.exists());
+        assert!(fresh.exists());
+        assert!(completed.exists());
+        assert!(!flat_old.exists());
+        assert!(flat_fresh.exists());
+        assert_eq!(
+            load_manifest(&fresh).unwrap().created_at_ms,
+            fresh_created_at
+        );
+        drop(_completed_lease);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -6156,6 +14578,27 @@ mod tests {
             "expired unreconstructable chunks are purged"
         );
 
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn zero_day_startup_retention_removes_fresh_sessions_and_legacy_files() {
+        let dir = temp_dir("zero-day-spool-retention");
+        let session = begin_spool_session(&dir, "fresh-zero-day-session").unwrap();
+        write_spool_f32_chunk(&dir, "fresh-zero-day-session", 0, &[0.1, 0.2, 0.3]);
+        record_spool_chunk(&session, 0, 0.0, 0.0001875, "written").unwrap();
+        let flat = write_spool_file(&dir, Path::new("fresh-failed-job.wav"), b"legacy audio")
+            .expect("flat legacy recovery artifact uses its exact file scope");
+
+        assert!(recover_spool(&dir, 0).unwrap().is_empty());
+        assert!(
+            !session.exists(),
+            "zero days removes even a same-second session"
+        );
+        assert!(
+            !flat.exists(),
+            "zero days removes fresh flat legacy artifacts too"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -6461,6 +14904,97 @@ mod tests {
     }
 
     #[test]
+    fn deleting_history_with_missing_recovery_wav_completes_manifest_before_commit() {
+        let dir = temp_dir("delete-history-missing-session-wav");
+        let session = begin_spool_session(&dir, "session-missing-wav").unwrap();
+        std::fs::create_dir_all(session.join("chunks")).unwrap();
+        std::fs::write(session.join("chunks/00000000.f32"), 0.25_f32.to_le_bytes()).unwrap();
+        let recovery = recover_spool(&dir, 7).unwrap().remove(0);
+        assert_eq!(load_manifest(&session).unwrap().status, "recoverable");
+        record_recovered_history(&dir, &recovery).unwrap();
+        std::fs::remove_file(&recovery.audio_path).unwrap();
+        let id = get_history(&dir, 10).unwrap()[0].id;
+
+        let lease = wait_for_history_delete_spool_lease(&dir, &recovery.audio_path).unwrap();
+        let connection = open_history(&dir).unwrap();
+        let transaction = connection
+            .unchecked_transaction()
+            .expect("start History delete transaction");
+        mark_spool_artifact_complete(&dir, &recovery.audio_path, lease.inner.kind).unwrap();
+        assert_eq!(load_manifest(&session).unwrap().status, "complete");
+        transaction
+            .execute("DELETE FROM dictations WHERE id=?", [id])
+            .unwrap();
+        transaction.commit().unwrap();
+        drop(lease);
+
+        assert!(get_history(&dir, 10).unwrap().is_empty());
+        assert!(session.exists());
+        assert!(recover_spool(&dir, 7).unwrap().is_empty());
+        assert!(session.exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn cached_recovery_cannot_resurrect_history_after_delete() {
+        let dir = temp_dir("cached-recovery-after-delete");
+        let session = begin_spool_session(&dir, "cached-delete-session").unwrap();
+        std::fs::create_dir_all(session.join("chunks")).unwrap();
+        std::fs::write(session.join("chunks/00000000.f32"), 0.25_f32.to_le_bytes()).unwrap();
+        let recovery = recover_spool(&dir, 7).unwrap().remove(0);
+        record_recovered_history(&dir, &recovery).unwrap();
+        let id = get_history(&dir, 10).unwrap()[0].id;
+
+        delete_history(&dir, id).unwrap();
+        assert!(get_history(&dir, 10).unwrap().is_empty());
+        assert!(!session.exists());
+        assert!(record_recovered_history(&dir, &recovery).is_err());
+        assert!(get_history(&dir, 10).unwrap().is_empty());
+        assert!(!session.exists());
+        assert!(!recovery.audio_path.exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn completed_session_with_retained_recovery_wav_cannot_be_promoted() {
+        let dir = temp_dir("completed-recovery-not-promoted");
+        let session = begin_spool_session(&dir, "completed-recovery-session").unwrap();
+        std::fs::create_dir_all(session.join("chunks")).unwrap();
+        std::fs::write(session.join("chunks/00000000.f32"), 0.25_f32.to_le_bytes()).unwrap();
+        let recovery = recover_spool(&dir, 7).unwrap().remove(0);
+        let mut manifest = load_manifest(&session).unwrap();
+        manifest.status = "complete".into();
+        save_manifest(&session, &manifest).unwrap();
+
+        assert!(recovery.audio_path.exists());
+        assert!(record_recovered_history(&dir, &recovery).is_err());
+        assert!(get_history(&dir, 10).unwrap().is_empty());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn flat_managed_recovery_promotes_idempotently_and_cannot_resurrect_after_delete() {
+        let dir = temp_dir("flat-recovery-promotion");
+        let audio_path =
+            write_spool_file(&dir, Path::new("legacy-recovery.wav"), b"legacy audio").unwrap();
+        let recovery = RecoveredSpool {
+            audio_path: audio_path.clone(),
+            duration_secs: 1.0,
+        };
+        record_recovered_history(&dir, &recovery).unwrap();
+        record_recovered_history(&dir, &recovery).unwrap();
+        let rows = get_history(&dir, 10).unwrap();
+        assert_eq!(rows.len(), 1);
+
+        delete_history(&dir, rows[0].id).unwrap();
+        assert!(get_history(&dir, 10).unwrap().is_empty());
+        assert!(!audio_path.exists());
+        assert!(record_recovered_history(&dir, &recovery).is_err());
+        assert!(get_history(&dir, 10).unwrap().is_empty());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn recovered_history_is_idempotent_and_deletes_session_artifacts() {
         let dir = temp_dir("recovered-history");
         let session = begin_spool_session(&dir, "session-recovered").unwrap();
@@ -6473,6 +15007,34 @@ mod tests {
         let id = get_history(&dir, 10).unwrap()[0].id;
         delete_history(&dir, id).unwrap();
         assert!(!session.exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn concurrent_recovered_history_insert_is_idempotent_for_one_audio_path() {
+        let dir = temp_dir("concurrent-recovered-history");
+        let session = begin_spool_session(&dir, "session-concurrent-recovered").unwrap();
+        std::fs::create_dir_all(session.join("chunks")).unwrap();
+        std::fs::write(session.join("chunks/00000000.f32"), 0.25_f32.to_le_bytes()).unwrap();
+        let recovery = recover_spool(&dir, 7).unwrap().remove(0);
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let dir = dir.clone();
+                let recovery = recovery.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    record_recovered_history(&dir, &recovery)
+                })
+            })
+            .collect();
+        barrier.wait();
+        for handle in handles {
+            handle.join().unwrap().unwrap();
+        }
+
+        assert_eq!(get_history(&dir, 10).unwrap().len(), 1);
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -6543,6 +15105,92 @@ mod tests {
         delete_history(&dir, id).unwrap();
         assert!(get_history(&dir, 10).unwrap().is_empty());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn deleting_history_waits_for_spool_owner_and_leaves_record_on_timeout() {
+        let dir = temp_dir("delete-history-busy-spool");
+        let session = begin_spool_session(&dir, "delete-busy").unwrap();
+        let context = crate::context::ContextSnapshot::general();
+        insert_history_with_delivery_and_spool(
+            &dir,
+            "raw",
+            "final",
+            1.0,
+            true,
+            Some("partial_asr_failure"),
+            "degraded",
+            "history",
+            None,
+            &context,
+            Some(&session),
+        )
+        .unwrap();
+        let id = get_history(&dir, 10).unwrap()[0].id;
+        let owner = lease_spool_session(&session).unwrap();
+
+        let error = delete_history(&dir, id).unwrap_err();
+
+        assert!(error.to_string().contains("timed out"));
+        assert_eq!(get_history(&dir, 10).unwrap().len(), 1);
+        assert_eq!(load_manifest(&session).unwrap().status, "active");
+        drop(owner);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn deleting_history_after_spool_release_does_not_resurrect_on_recovery() {
+        let dir = temp_dir("delete-history-spool-release");
+        let session = begin_spool_session(&dir, "delete-release").unwrap();
+        let context = crate::context::ContextSnapshot::general();
+        insert_history_with_delivery_and_spool(
+            &dir,
+            "raw",
+            "final",
+            1.0,
+            true,
+            Some("partial_asr_failure"),
+            "degraded",
+            "history",
+            None,
+            &context,
+            Some(&session),
+        )
+        .unwrap();
+        let id = get_history(&dir, 10).unwrap()[0].id;
+        let owner = lease_spool_session(&session).unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        pause_history_delete_spool_wait_for_test(&session, entered_tx, release_rx);
+
+        let delete_root = dir.clone();
+        let deleting = std::thread::spawn(move || delete_history(&delete_root, id));
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        drop(owner);
+        release_tx.send(()).unwrap();
+        deleting.join().unwrap().unwrap();
+
+        assert!(get_history(&dir, 10).unwrap().is_empty());
+        assert!(recover_spool(&dir, 7).unwrap().is_empty());
+        assert!(!session.exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn clear_all_data_scrubs_text_and_keeps_database_usable() {
+        let dir = temp_dir("clear-history-scrub-text");
+        let secret = "unique_clear_history_secret_7f0d8a2c";
+        insert_history(&dir, secret, secret, 1.0, false).unwrap();
+        let database = dir.join("history.sqlite");
+
+        clear_all_data(&dir).unwrap();
+
+        assert!(!fs::read(database)
+            .unwrap()
+            .windows(secret.len())
+            .any(|w| w == secret.as_bytes()));
+        assert!(get_history(&dir, 10).unwrap().is_empty());
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -6662,6 +15310,351 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_rejection_candidate_is_separate_exportable_and_generation_scoped() {
+        let dir = temp_dir("cleanup-rejection-history");
+        let context = crate::context::ContextSnapshot::general();
+        insert_history_with_asr_candidate_and_delivery_and_spool_and_cleanup_rejection(
+            &dir,
+            "prepared transcript",
+            Some("provider ASR text"),
+            Some("ASR-side cleanup candidate"),
+            "safe final text",
+            1.0,
+            true,
+            Some("preservation_guard"),
+            "degraded",
+            "history",
+            Some("paste_unverified"),
+            &context,
+            None,
+            "test-asr",
+            "preservation_guard",
+            None,
+            Some("complete cleanup candidate"),
+            Some("provider_protected_token_changed"),
+        )
+        .unwrap();
+        let id = get_history(&dir, 1).unwrap()[0].id;
+        let old_transforms = [
+            "strip_internal_cleanup_metadata".to_owned(),
+            "restore_spoken_layout".to_owned(),
+        ];
+        update_history_revision_state_with_reclean_delivery(
+            &dir,
+            id,
+            true,
+            Some("preservation_guard"),
+            Some("preservation_guard"),
+            Some("prior rejected candidate"),
+            Some("provider_protected_token_changed"),
+            None,
+            Some("network"),
+            Some(&old_transforms),
+            Some("prior_final_reason"),
+            Some("network_failure"),
+        )
+        .unwrap();
+        let item = get_history(&dir, 1).unwrap().remove(0);
+        assert_eq!(
+            item.provider_cleaned_candidate.as_deref(),
+            Some("ASR-side cleanup candidate")
+        );
+        assert_eq!(
+            item.cleanup_rejected_candidate.as_deref(),
+            Some("prior rejected candidate")
+        );
+        assert_eq!(
+            item.cleanup_guard_reason.as_deref(),
+            Some("provider_protected_token_changed")
+        );
+        assert_eq!(item.cleanup_attempt_kind.as_deref(), Some("network"));
+        assert_eq!(
+            item.cleanup_transformations.as_deref(),
+            Some(old_transforms.as_slice())
+        );
+        assert_eq!(
+            item.cleanup_final_guard_reason.as_deref(),
+            Some("prior_final_reason")
+        );
+        assert_eq!(
+            item.cleanup_failure_reason.as_deref(),
+            Some("network_failure")
+        );
+        assert_eq!(
+            get_history_page(&dir, 10, None, Some("prior rejected candidate"))
+                .unwrap()
+                .items[0]
+                .id,
+            id
+        );
+
+        let export: serde_json::Value =
+            serde_json::from_str(&export_history_json(&dir).unwrap()).unwrap();
+        assert_eq!(
+            export[0]["provider_cleaned_candidate"],
+            "ASR-side cleanup candidate"
+        );
+        assert_eq!(
+            export[0]["cleanup_rejected_candidate"],
+            "prior rejected candidate"
+        );
+        assert_eq!(
+            export[0]["cleanup_guard_reason"],
+            "provider_protected_token_changed"
+        );
+
+        mark_retried_with_texts_and_cleanup_rejection(
+            &dir,
+            id,
+            Some("new prepared transcript"),
+            Some("new ASR text"),
+            Some("on_device:qwen3-asr-0.6b"),
+            "new final text",
+            true,
+            Some("preservation_guard"),
+            Some("preservation_guard"),
+            RetryDelivery::ClipboardChanged,
+            Some("new cleanup candidate"),
+            Some("final_source_script_changed"),
+            Some("final_guard"),
+            Some(&[]),
+            Some("final_explicit_layout_changed"),
+            Some("final_guard_explicit_layout_changed"),
+        )
+        .unwrap();
+        let item = get_history(&dir, 1).unwrap().remove(0);
+        assert_eq!(item.provider_cleaned_candidate, None);
+        assert_eq!(item.asr_text.as_deref(), Some("new ASR text"));
+        assert_eq!(
+            item.cleanup_rejected_candidate.as_deref(),
+            Some("new cleanup candidate")
+        );
+        assert_eq!(
+            item.cleanup_guard_reason.as_deref(),
+            Some("final_source_script_changed")
+        );
+        assert_eq!(item.cleanup_attempt_kind.as_deref(), Some("final_guard"));
+        assert_eq!(item.cleanup_transformations.as_deref(), Some([].as_slice()));
+        assert_eq!(
+            item.cleanup_final_guard_reason.as_deref(),
+            Some("final_explicit_layout_changed")
+        );
+        assert_eq!(
+            item.cleanup_failure_reason.as_deref(),
+            Some("final_guard_explicit_layout_changed")
+        );
+        assert_eq!(item.raw_text, "new prepared transcript");
+        assert_eq!(item.final_text, "new final text");
+
+        let manual = save_manual_history_revision(&dir, id, "manually edited final").unwrap();
+        assert!(manual.changed);
+        assert_eq!(manual.learning_before_text, "new final text");
+        let item = get_history(&dir, 1).unwrap().remove(0);
+        assert_eq!(item.cleanup_rejected_candidate, None);
+        assert_eq!(item.cleanup_guard_reason, None);
+        assert_eq!(item.cleanup_attempt_kind, None);
+        assert_eq!(item.cleanup_transformations, None);
+        assert_eq!(item.cleanup_final_guard_reason, None);
+        assert_eq!(item.cleanup_failure_reason, None);
+        assert_eq!(item.raw_text, "new prepared transcript");
+        assert_eq!(item.asr_text.as_deref(), Some("new ASR text"));
+        assert_eq!(item.final_text, "manually edited final");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn learn_pair_scope_keeps_unknown_distinct_from_a_foreign_scope() {
+        let row = LearnPairRecord {
+            pair_key: "pair".into(),
+            before_surface: "LOM".into(),
+            after_surface: "LLM".into(),
+            hits: 3,
+            promoted: true,
+            last_at: "2026-01-01".into(),
+            family: Some("work_chat".into()),
+            mapping_id: Some("codex".into()),
+            browser_host: None,
+            native_bundle: Some("com.example.codex".into()),
+            last_used_at: None,
+            pinned: false,
+            tombstoned_at: None,
+            ignored: false,
+            promote_hits: 0,
+            manual_scoped: false,
+            auto_scoped: false,
+        };
+        let matching = LearnPairScope {
+            family: Some("work_chat".into()),
+            mapping_id: Some("codex".into()),
+            browser_host: None,
+            native_bundle: Some("com.example.codex".into()),
+        };
+        assert_eq!(matching.assess_record(&row), LearnPairScopeMatch::Match);
+        assert_eq!(
+            LearnPairScope {
+                native_bundle: Some("com.example.other".into()),
+                ..matching.clone()
+            }
+            .assess_record(&row),
+            LearnPairScopeMatch::Mismatch
+        );
+        assert_eq!(
+            LearnPairScope {
+                mapping_id: None,
+                ..matching.clone()
+            }
+            .assess_record(&row),
+            LearnPairScopeMatch::Unknown
+        );
+        let selected = LearnPairScope {
+            mapping_id: None,
+            native_bundle: None,
+            ..matching
+        }
+        .applicable_promoted_records(std::slice::from_ref(&row));
+        assert!(selected.is_empty());
+    }
+
+    #[test]
+    fn existing_family_only_promoted_rows_no_longer_apply_globally() {
+        let dir = temp_dir("family-only-learn-pair-migration");
+        let connection = open_history(&dir).unwrap();
+        let family_key = crate::dictionary_learn::pair_key("知呼", "知乎");
+        let mapping_key = crate::dictionary_learn::pair_key("派森", "Python");
+        let global_key = crate::dictionary_learn::pair_key("大模型", "LLM");
+        let empty_family_key = crate::dictionary_learn::pair_key("空族", "EmptyFamily");
+        connection
+            .execute(
+                "INSERT INTO learn_pairs (pair_key, before_surface, after_surface, hits, promoted, last_at, family)
+                 VALUES (?1, '知呼', '知乎', 3, 1, datetime('now'), 'work_chat')",
+                [&family_key],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO learn_pairs (pair_key, before_surface, after_surface, hits, promoted, last_at)
+                 VALUES (?1, '大模型', 'LLM', 3, 1, datetime('now'))",
+                [&global_key],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO learn_pairs (pair_key, before_surface, after_surface, hits, promoted, last_at, family)
+                 VALUES (?1, '空族', 'EmptyFamily', 4, 1, datetime('now'), '')",
+                [&empty_family_key],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO learn_pairs (pair_key, before_surface, after_surface, hits, promoted, last_at, family, mapping_id, last_used_at, pinned)
+                 VALUES (?1, '派森', 'Python', 3, 1, datetime('now'), 'work_chat', 'codex', '2026-11-03', 1)",
+                [&mapping_key],
+            )
+            .unwrap();
+        drop(connection);
+
+        let reopened = open_history(&dir).unwrap();
+        let version: i32 = reopened
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, HISTORY_SCHEMA_VERSION);
+        let family_only = get_learn_pair(&dir, &family_key).unwrap().unwrap();
+        let mapping_scoped = get_learn_pair(&dir, &mapping_key).unwrap().unwrap();
+        let global = get_learn_pair(&dir, &global_key).unwrap().unwrap();
+        let empty_family = get_learn_pair(&dir, &empty_family_key).unwrap().unwrap();
+        assert!(!family_only.is_live_promoted());
+        assert_eq!(family_only.before_surface, "知呼");
+        assert_eq!(family_only.after_surface, "知乎");
+        assert_eq!(family_only.hits, 3);
+        assert!(mapping_scoped.is_live_promoted());
+        assert_eq!(mapping_scoped.before_surface, "派森");
+        assert_eq!(mapping_scoped.after_surface, "Python");
+        assert_eq!(mapping_scoped.hits, 3);
+        assert_eq!(mapping_scoped.mapping_id.as_deref(), Some("codex"));
+        assert_eq!(mapping_scoped.last_used_at.as_deref(), Some("2026-11-03"));
+        assert!(mapping_scoped.pinned);
+        assert!(global.is_live_promoted());
+        assert!(empty_family.is_live_promoted());
+        assert_eq!(empty_family.family.as_deref(), Some(""));
+        assert_eq!(empty_family.before_surface, "空族");
+        assert_eq!(empty_family.after_surface, "EmptyFamily");
+        assert_eq!(empty_family.hits, 4);
+
+        let same_family_other_app = LearnPairScope {
+            family: Some("work_chat".into()),
+            mapping_id: Some("slack".into()),
+            ..LearnPairScope::default()
+        };
+        assert!(same_family_other_app
+            .applicable_promoted_records(&[family_only.clone(), mapping_scoped.clone()])
+            .is_empty());
+        assert_eq!(
+            LearnPairScope {
+                family: Some("work_chat".into()),
+                mapping_id: Some("codex".into()),
+                ..LearnPairScope::default()
+            }
+            .applicable_promoted_records(&[mapping_scoped])
+            .len(),
+            1
+        );
+        drop(reopened);
+
+        let reopened_again = open_history(&dir).unwrap();
+        assert!(!get_learn_pair(&dir, &family_key)
+            .unwrap()
+            .unwrap()
+            .is_live_promoted());
+        assert!(get_learn_pair(&dir, &empty_family_key)
+            .unwrap()
+            .unwrap()
+            .is_live_promoted());
+        drop(reopened_again);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn reclean_revision_and_attribution_roll_back_together_on_sql_failure() {
+        let dir = temp_dir("reclean-atomic-adoption");
+        insert_history(&dir, "raw source", "old adopted text", 1.0, false).unwrap();
+        let c = open_history(&dir).unwrap();
+        c.execute("UPDATE dictations SET cleanup_attempt_kind='network',cleanup_failure_reason='network_failure' WHERE id=1", []).unwrap();
+        c.execute_batch("CREATE TRIGGER reject_reclean_facts BEFORE UPDATE OF cleanup_attempt_kind ON dictations BEGIN SELECT RAISE(ABORT, 'injected attribution failure'); END;").unwrap();
+        drop(c);
+        let intent = crate::llm::CleanupIntent::selected_text(
+            crate::llm::CleanupOperation::Cleanup,
+            "raw source",
+        );
+        let result = save_reclean_revision_with_facts(
+            &dir,
+            RecleanHistorySave {
+                dictation_id: 1,
+                final_text: "new adopted text",
+                cleanup_status: "ai_success",
+                intent: &intent,
+                model: "model",
+                context_policy: &crate::context::ContextPolicy::default(),
+                cleanup_rejected_candidate: None,
+                cleanup_guard_reason: None,
+                cleanup_attempt_kind: Some("success"),
+                cleanup_transformations: Some(&[]),
+                cleanup_final_guard_reason: None,
+                cleanup_failure_reason: None,
+            },
+        );
+        assert!(result.is_err());
+        let item = get_history(&dir, 1).unwrap().remove(0);
+        assert_eq!(item.final_text, "old adopted text");
+        assert_eq!(item.cleanup_attempt_kind.as_deref(), Some("network"));
+        assert_eq!(
+            item.cleanup_failure_reason.as_deref(),
+            Some("network_failure")
+        );
+        assert_eq!(item.revision_count, 0);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn retry_updates_history_text() {
         let dir = temp_dir("retry");
         insert_failed_history(&dir, "raw", 1.0, None).unwrap();
@@ -6676,6 +15669,7 @@ mod tests {
             false,
             None,
             Some("ai_success"),
+            RetryDelivery::Copied,
         )
         .unwrap();
         let item = get_history(&dir, 10).unwrap().remove(0);
@@ -6688,6 +15682,194 @@ mod tests {
         assert_eq!(item.final_text, "final");
         assert_eq!(item.cleanup_status, "ai_success");
         assert_eq!(item.engine.as_deref(), Some("deepgram:nova-3"));
+        assert_eq!(item.delivery_method.as_deref(), Some("clipboard"));
+        assert_eq!(
+            item.fallback_reason.as_deref(),
+            Some("retry_clipboard_only")
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn retry_clipboard_abstention_saves_transcript_as_history() {
+        let dir = temp_dir("retry-clipboard-changed");
+        insert_failed_history(&dir, "raw", 1.0, None).unwrap();
+        let id = get_history(&dir, 10).unwrap()[0].id;
+        mark_retried_with_texts(
+            &dir,
+            id,
+            Some("retried raw"),
+            Some("retry ASR"),
+            Some("on_device:qwen3-asr-0.6b"),
+            "final",
+            false,
+            None,
+            Some("local_only"),
+            RetryDelivery::ClipboardChanged,
+        )
+        .unwrap();
+
+        let item = get_history(&dir, 10).unwrap().remove(0);
+        assert_eq!(item.status, "history");
+        assert_eq!(item.final_text, "final");
+        assert_eq!(item.delivery_method.as_deref(), Some("history"));
+        assert_eq!(
+            item.fallback_reason.as_deref(),
+            Some("retry_clipboard_changed")
+        );
+        assert!(failed_spool(&dir, id).unwrap().is_none());
+        assert_eq!(history_text(&dir, id).unwrap(), "final");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn retry_clipboard_ownership_unknown_and_write_failure_keep_history_status() {
+        for delivery in [
+            RetryDelivery::ClipboardOwnershipUnverified,
+            RetryDelivery::ClipboardWriteFailed,
+        ] {
+            let dir = temp_dir("retry-clipboard-unverified");
+            insert_failed_history(&dir, "raw", 1.0, None).unwrap();
+            let id = get_history(&dir, 10).unwrap()[0].id;
+            mark_retried_with_texts(
+                &dir,
+                id,
+                Some("retried raw"),
+                Some("retry ASR"),
+                Some("on_device:qwen3-asr-0.6b"),
+                "final",
+                false,
+                None,
+                Some("local_only"),
+                delivery,
+            )
+            .unwrap();
+
+            let item = get_history(&dir, 10).unwrap().remove(0);
+            assert_eq!(item.status, "history");
+            assert_eq!(item.delivery_method.as_deref(), Some("history"));
+            assert_eq!(
+                item.fallback_reason.as_deref(),
+                Some(match delivery {
+                    RetryDelivery::ClipboardOwnershipUnverified => {
+                        "retry_clipboard_ownership_unverified"
+                    }
+                    RetryDelivery::ClipboardWriteFailed => "retry_clipboard_write_failed",
+                    _ => unreachable!(),
+                })
+            );
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    #[test]
+    fn reclean_delivery_records_only_a_current_owned_copy_as_copied() {
+        let cases = [
+            (
+                Some(RecleanDelivery::Copied),
+                "copied",
+                "clipboard",
+                Some("reclean_clipboard_only"),
+            ),
+            (
+                Some(RecleanDelivery::ClipboardChanged),
+                "history",
+                "history",
+                Some("reclean_clipboard_changed"),
+            ),
+            (
+                Some(RecleanDelivery::ClipboardOwnershipUnverified),
+                "history",
+                "history",
+                Some("reclean_clipboard_ownership_unverified"),
+            ),
+            (
+                Some(RecleanDelivery::ClipboardWriteFailed),
+                "history",
+                "history",
+                Some("reclean_clipboard_write_failed"),
+            ),
+        ];
+        for (delivery, status, delivery_method, fallback_reason) in cases {
+            let dir = temp_dir("reclean-delivery");
+            insert_failed_history(&dir, "raw source", 1.0, None).unwrap();
+            let id = get_history(&dir, 10).unwrap()[0].id;
+            save_history_revision(
+                &dir,
+                id,
+                "prepared result",
+                Some("ai_success"),
+                None,
+                None,
+                None,
+                "ai_reclean",
+            )
+            .unwrap();
+            update_history_revision_state_with_reclean_delivery(
+                &dir,
+                id,
+                false,
+                None,
+                Some("ai_success"),
+                None,
+                None,
+                delivery,
+                Some("success"),
+                Some(&[]),
+                None,
+                None,
+            )
+            .unwrap();
+
+            let item = get_history(&dir, 10).unwrap().remove(0);
+            assert_eq!(item.status, status);
+            assert_eq!(item.final_text, "prepared result");
+            assert_eq!(item.delivery_method.as_deref(), Some(delivery_method));
+            assert_eq!(item.fallback_reason.as_deref(), fallback_reason);
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    #[test]
+    fn reclean_degraded_result_stays_in_history_without_a_clipboard_claim() {
+        let dir = temp_dir("reclean-degraded-no-copy");
+        insert_failed_history(&dir, "raw source", 1.0, None).unwrap();
+        let id = get_history(&dir, 10).unwrap()[0].id;
+        save_history_revision(
+            &dir,
+            id,
+            "raw source",
+            Some("ai_failed_raw"),
+            None,
+            None,
+            None,
+            "ai_reclean",
+        )
+        .unwrap();
+        update_history_revision_state_with_reclean_delivery(
+            &dir,
+            id,
+            true,
+            Some("native_input_too_large"),
+            Some("ai_failed_raw"),
+            None,
+            None,
+            None,
+            Some("success"),
+            Some(&[]),
+            None,
+            None,
+        )
+        .unwrap();
+
+        let item = get_history(&dir, 10).unwrap().remove(0);
+        assert_eq!(item.status, "degraded");
+        assert_eq!(
+            item.degraded_reason.as_deref(),
+            Some("native_input_too_large")
+        );
+        assert_eq!(item.delivery_method.as_deref(), Some("history"));
+        assert_eq!(item.fallback_reason, None);
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -6696,12 +15878,28 @@ mod tests {
         let dir = temp_dir("retry-degraded");
         insert_failed_history(&dir, "raw", 1.0, None).unwrap();
         let id = get_history(&dir, 10).unwrap()[0].id;
-        mark_retried(&dir, id, "raw", true, Some("llm_cleanup_failed")).unwrap();
+        mark_retried_with_texts(
+            &dir,
+            id,
+            Some("raw"),
+            Some("raw"),
+            None,
+            "raw",
+            true,
+            Some("llm_cleanup_failed"),
+            None,
+            RetryDelivery::ClipboardChanged,
+        )
+        .unwrap();
         let item = get_history(&dir, 10).unwrap().remove(0);
         assert_eq!(item.status, "degraded");
         assert!(item.degraded);
         assert_eq!(item.degraded_reason.as_deref(), Some("llm_cleanup_failed"));
-        assert_eq!(item.delivery_method.as_deref(), Some("clipboard"));
+        assert_eq!(item.delivery_method.as_deref(), Some("history"));
+        assert_eq!(
+            item.fallback_reason.as_deref(),
+            Some("retry_clipboard_changed")
+        );
         assert!(failed_spool(&dir, id).unwrap().is_none());
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -6731,6 +15929,134 @@ mod tests {
         assert_eq!(get_history_revisions(&dir, id).unwrap().len(), 1);
         delete_history(&dir, id).unwrap();
         assert!(get_history_revisions(&dir, id).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn retrying_manual_history_save_reuses_original_revision_evidence() {
+        let dir = temp_dir("manual-history-learning-retry");
+        insert_history(&dir, "raw", "adopted before", 1.0, false).unwrap();
+        let id = get_history(&dir, 10).unwrap()[0].id;
+        let first = save_manual_history_revision(&dir, id, "adopted after").unwrap();
+        assert!(first.changed);
+        assert_eq!(first.learning_before_text, "adopted before");
+        let first_revision_id = first.revision_id.unwrap();
+
+        let retry = save_manual_history_revision(&dir, id, "adopted after").unwrap();
+        assert!(!retry.changed);
+        assert_eq!(retry.revision_id, Some(first_revision_id));
+        assert_eq!(retry.learning_before_text, "adopted before");
+        assert_eq!(get_history_revisions(&dir, id).unwrap().len(), 1);
+
+        let next = save_manual_history_revision(&dir, id, "third adopted text").unwrap();
+        assert!(next.changed);
+        assert_eq!(next.learning_before_text, "adopted after");
+        assert_eq!(get_history_revisions(&dir, id).unwrap().len(), 2);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn external_revision_lookup_requires_the_exact_dictation_and_revision_pair() {
+        let dir = temp_dir("external-revision-pair");
+        insert_history(&dir, "raw one", "parent final one", 1.0, false).unwrap();
+        insert_history(&dir, "raw two", "parent final two", 1.0, false).unwrap();
+        let rows = get_history(&dir, 10).unwrap();
+        let first_parent = rows
+            .iter()
+            .find(|row| row.raw_text == "raw one")
+            .unwrap()
+            .id;
+        let second_parent = rows
+            .iter()
+            .find(|row| row.raw_text == "raw two")
+            .unwrap()
+            .id;
+        let intent = crate::llm::CleanupIntent::selected_text(
+            crate::llm::CleanupOperation::Cleanup,
+            "cleanup",
+        );
+        let first_revision = save_history_revision(
+            &dir,
+            first_parent,
+            "first successful cleanup",
+            Some("ai_success"),
+            Some(&intent),
+            None,
+            None,
+            "ai_reclean",
+        )
+        .unwrap();
+        let second_revision = save_history_revision(
+            &dir,
+            first_parent,
+            "second successful cleanup",
+            Some("ai_success"),
+            Some(&intent),
+            None,
+            None,
+            "ai_reclean",
+        )
+        .unwrap();
+        let degraded_revision = save_history_revision(
+            &dir,
+            first_parent,
+            "degraded raw result",
+            Some("ai_failed_raw"),
+            Some(&intent),
+            None,
+            None,
+            "ai_reclean",
+        )
+        .unwrap();
+        let other_parent_revision = save_history_revision(
+            &dir,
+            second_parent,
+            "another history result",
+            Some("ai_success"),
+            Some(&intent),
+            None,
+            None,
+            "ai_reclean",
+        )
+        .unwrap();
+
+        assert_eq!(
+            get_history_revision(&dir, first_parent, first_revision)
+                .unwrap()
+                .unwrap()
+                .final_text,
+            "first successful cleanup"
+        );
+        assert_eq!(
+            get_history_revision(&dir, first_parent, second_revision)
+                .unwrap()
+                .unwrap()
+                .final_text,
+            "second successful cleanup"
+        );
+        assert_eq!(
+            get_history_revision(&dir, first_parent, degraded_revision)
+                .unwrap()
+                .unwrap()
+                .cleanup_status
+                .as_deref(),
+            Some("ai_failed_raw")
+        );
+        assert!(
+            get_history_revision(&dir, first_parent, other_parent_revision)
+                .unwrap()
+                .is_none()
+        );
+        assert!(get_history_revision(&dir, second_parent, first_revision)
+            .unwrap()
+            .is_none());
+        assert!(get_history_revision(&dir, first_parent, i64::MAX)
+            .unwrap()
+            .is_none());
+        delete_history(&dir, first_parent).unwrap();
+        assert!(get_history_revision(&dir, first_parent, first_revision)
+            .unwrap()
+            .is_none());
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -6792,10 +16118,16 @@ mod tests {
     #[test]
     fn dictionary_learn_enabled_defaults_true() {
         assert!(Settings::default().dictionary_learn_enabled);
+        assert!(!Settings::default().local_edit_learning_enabled);
         let parsed: Settings = serde_json::from_str(r#"{"api_key":"x"}"#).unwrap();
         assert!(parsed.dictionary_learn_enabled);
+        assert!(!parsed.local_edit_learning_enabled);
         let view = SettingsView::from(&parsed);
         assert!(view.dictionary_learn_enabled);
+        assert!(!view.local_edit_learning_enabled);
+        let opted_in: Settings =
+            serde_json::from_str(r#"{"api_key":"x","local_edit_learning_enabled":true}"#).unwrap();
+        assert!(opted_in.local_edit_learning_enabled);
     }
 
     #[test]
@@ -6941,6 +16273,7 @@ mod tests {
     fn bind_cleanup_key_clears_on_host_change_unless_a_new_key_is_supplied() {
         assert_eq!(
             bind_cleanup_key_to_host(
+                crate::engine::EngineProvider::OpenAi,
                 "https://api.groq.com/openai/v1",
                 "https://api.openai.com/v1",
                 "",
@@ -6950,8 +16283,50 @@ mod tests {
         );
         assert_eq!(
             bind_cleanup_key_to_host(
+                crate::engine::EngineProvider::OpenAi,
                 "https://api.openai.com/v1",
                 "https://api.openai.com/v1",
+                "",
+                "old-key"
+            ),
+            "old-key"
+        );
+    }
+
+    #[test]
+    fn custom_cleanup_key_binding_detects_scheme_and_port_changes() {
+        use crate::engine::EngineProvider;
+
+        assert_eq!(
+            bind_cleanup_key_to_host(EngineProvider::Custom, "", "", "", "old-key"),
+            "old-key",
+            "an untouched empty Custom endpoint must not clear credentials"
+        );
+        assert_eq!(
+            bind_cleanup_key_to_host(
+                EngineProvider::Custom,
+                "https://router.example/v1",
+                "https://router.example:8443/v1",
+                "",
+                "old-key"
+            ),
+            ""
+        );
+        assert_eq!(
+            bind_cleanup_key_to_host(
+                EngineProvider::Custom,
+                "http://router.example/v1",
+                "https://router.example/v1",
+                "",
+                "old-key"
+            ),
+            ""
+        );
+        assert_eq!(
+            bind_cleanup_key_to_host(
+                EngineProvider::Custom,
+                "https://router.example/v1",
+                "https://router.example:443/chat/completions",
                 "",
                 "old-key"
             ),
@@ -6963,6 +16338,7 @@ mod tests {
     fn bind_asr_key_clears_on_host_change_unless_a_new_key_is_supplied() {
         assert_eq!(
             bind_asr_key_to_host(
+                crate::engine::EngineProvider::OpenAi,
                 "https://api.groq.com/openai/v1",
                 "https://asr.example.com/v1",
                 "",
@@ -6972,6 +16348,7 @@ mod tests {
         );
         assert_eq!(
             bind_asr_key_to_host(
+                crate::engine::EngineProvider::OpenAi,
                 "https://api.groq.com/openai/v1",
                 "https://asr.example.com/v1",
                 "new-key",
@@ -6980,13 +16357,56 @@ mod tests {
             "new-key"
         );
         assert_eq!(
-            bind_asr_key_to_host("", "https://api.groq.com/openai/v1", "", "old-key"),
+            bind_asr_key_to_host(
+                crate::engine::EngineProvider::Groq,
+                "",
+                "https://api.groq.com/openai/v1",
+                "",
+                "old-key"
+            ),
             "old-key"
         );
         assert_eq!(
             bind_asr_key_to_host(
+                crate::engine::EngineProvider::OpenAi,
                 "https://asr.example.com/v1",
                 "https://asr.example.com/v1",
+                "",
+                "old-key"
+            ),
+            "old-key"
+        );
+    }
+
+    #[test]
+    fn custom_asr_key_binding_detects_scheme_and_port_changes() {
+        use crate::engine::EngineProvider;
+
+        assert_eq!(
+            bind_asr_key_to_host(
+                EngineProvider::Custom,
+                "https://router.example/v1",
+                "https://router.example:8443/v1",
+                "",
+                "old-key"
+            ),
+            ""
+        );
+        assert_eq!(
+            bind_asr_key_to_host(
+                EngineProvider::Custom,
+                "http://router.example/v1",
+                "https://router.example/v1",
+                "",
+                "old-key"
+            ),
+            ""
+        );
+        assert_eq!(
+            bind_asr_key_to_host(
+                EngineProvider::Custom,
+                "https://router.example/v1",
+                "https://router.example:443/audio/transcriptions",
                 "",
                 "old-key"
             ),
@@ -7122,6 +16542,105 @@ mod tests {
     }
 
     #[test]
+    fn purge_history_prunes_style_drafts_and_usage() {
+        let dir = temp_dir("history-retention-related-tables");
+        insert_history(&dir, "old", "old", 1.0, false).unwrap();
+        insert_history(&dir, "new", "new", 1.0, false).unwrap();
+        upsert_style_draft(&dir, "mapping", "style", "excerpt", "before", "after").unwrap();
+        upsert_style_draft(&dir, "mapping-new", "style", "excerpt", "before", "after").unwrap();
+        upsert_style_draft(
+            &dir,
+            "mapping-boundary",
+            "style",
+            "excerpt",
+            "before",
+            "after",
+        )
+        .unwrap();
+        let connection = open_history(&dir).unwrap();
+        connection.execute_batch(
+            "UPDATE dictations SET created_at = CASE raw_text WHEN 'old' THEN datetime('now','-400 days') ELSE datetime('now') END;
+             UPDATE style_drafts SET created_at = CASE mapping_id WHEN 'mapping' THEN datetime('now','-400 days') WHEN 'mapping-boundary' THEN datetime('now','-365 days','+1 minute') ELSE datetime('now') END;
+             INSERT INTO usage(day,asr_requests,llm_requests,audio_seconds) VALUES(date('now','-400 days'),4,2,8),(date('now','-365 days'),2,1,4);",
+        ).unwrap();
+        drop(connection);
+
+        assert_eq!(purge_history(&dir, 365).unwrap(), 1);
+        let connection = open_history(&dir).unwrap();
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM dictations", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM style_drafts", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM usage", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM usage WHERE day=date('now','-400 days')",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM usage WHERE day IN (date('now','-365 days'), date('now'))", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        drop(connection);
+
+        insert_history(&dir, "forever", "forever", 1.0, false).unwrap();
+        upsert_style_draft(&dir, "mapping-old", "style", "excerpt", "before", "after").unwrap();
+        let connection = open_history(&dir).unwrap();
+        connection.execute_batch(
+            "UPDATE dictations SET created_at = datetime('now','-4000 days');
+             UPDATE style_drafts SET created_at = datetime('now','-4000 days');
+             INSERT INTO usage(day,asr_requests,llm_requests,audio_seconds) VALUES(date('now','-4000 days'),4,2,8);",
+        ).unwrap();
+        drop(connection);
+        assert_eq!(purge_history(&dir, 0).unwrap(), 0);
+        let connection = open_history(&dir).unwrap();
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM dictations", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM style_drafts", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            3
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM usage", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            3
+        );
+        drop(connection);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn history_retention_zero_keeps_history_forever() {
         let dir = temp_dir("history-retention-forever");
         insert_history(&dir, "old", "old", 1.0, false).unwrap();
@@ -7205,6 +16724,58 @@ mod tests {
     }
 
     #[test]
+    fn malformed_utf8_backup_precedes_credential_writes_and_backup_failures() {
+        let dir = temp_dir("malformed-utf8-credential");
+        std::fs::create_dir_all(&dir).unwrap();
+        let settings_path = dir.join("settings.json");
+        let raw = [0xff, 0xfe, b'{'];
+        std::fs::write(&settings_path, raw).unwrap();
+        let backend = FakeCredentialBackend::default();
+        let (loaded, needs_persist) = load_settings_with_backend(&dir, &backend);
+        assert!(!needs_persist);
+        assert!(!loaded.onboarded);
+        assert_eq!(std::fs::read(&settings_path).unwrap(), raw);
+        let settings = Settings {
+            api_key: "synthetic-key".into(),
+            ..Settings::default()
+        };
+        persist_settings_with_backend(&dir, &settings, &backend).unwrap();
+        assert_eq!(
+            std::fs::read(dir.join("settings.json.malformed.bak")).unwrap(),
+            raw
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            std::fs::metadata(dir.join("settings.json.malformed.bak"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert!(
+            serde_json::from_slice::<Settings>(&std::fs::read(&settings_path).unwrap()).is_ok()
+        );
+        assert!(!backend.writes.borrow().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let dir = temp_dir("malformed-backup-directory");
+        std::fs::create_dir_all(&dir).unwrap();
+        let raw = b"{ malformed";
+        std::fs::write(dir.join("settings.json"), raw).unwrap();
+        std::fs::create_dir(dir.join("settings.json.malformed.bak")).unwrap();
+        let backend = FakeCredentialBackend::default();
+        let settings = Settings {
+            api_key: "must-not-write".into(),
+            ..Settings::default()
+        };
+        assert!(persist_settings_with_backend(&dir, &settings, &backend).is_err());
+        assert!(backend.writes.borrow().is_empty());
+        assert_eq!(std::fs::read(dir.join("settings.json")).unwrap(), raw);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn malformed_settings_are_kept_untouched() {
         let dir = temp_dir("malformed-settings");
         std::fs::create_dir_all(&dir).unwrap();
@@ -7212,7 +16783,8 @@ mod tests {
         let raw = b"{not valid json";
         std::fs::write(&path, raw).unwrap();
 
-        let (settings, needs_persist) = load_settings(&dir);
+        let (settings, needs_persist) =
+            load_settings_with_backend(&dir, &FakeCredentialBackend::default());
 
         assert_eq!(std::fs::read(&path).unwrap(), raw);
         assert!(!needs_persist);
@@ -7251,6 +16823,687 @@ mod tests {
     }
 
     #[test]
+    fn dictionary_sources_preserve_owners_and_reconcile_case_insensitively() {
+        let mut value = serde_json::to_value(Settings::default()).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.insert(
+            "dictionary".into(),
+            serde_json::json!(["VoiceFlow", "OldTerm"]),
+        );
+        object.remove("dictionary_sources");
+        let mut settings: Settings = serde_json::from_value(value).unwrap();
+        settings.normalize_dictionary_sources();
+
+        assert!(settings.has_dictionary_source("voiceflow", &DictionarySource::LegacyUnknown));
+        assert!(settings.has_dictionary_source("oldterm", &DictionarySource::LegacyUnknown));
+        assert!(settings
+            .add_dictionary_source("voiceflow", DictionarySource::Rule("rule:voiceflo".into())));
+        assert!(settings.add_dictionary_source(
+            "ScreenTerm",
+            DictionarySource::Screen("screen-origin".into())
+        ));
+        assert!(!settings.has_dictionary_source("screenterm", &DictionarySource::LegacyUnknown));
+        assert_eq!(
+            add_manual_dictionary_words(
+                &mut settings,
+                &["voiceflow".into(), "NewTerm".into(), "NEWTERM".into()]
+            ),
+            2
+        );
+        assert!(settings.has_dictionary_source("VOICEFLOW", &DictionarySource::Manual));
+        assert!(settings
+            .has_dictionary_source("VoiceFlow", &DictionarySource::Rule("rule:voiceflo".into())));
+        assert_eq!(
+            settings
+                .dictionary
+                .iter()
+                .filter(|word| word.eq_ignore_ascii_case("voiceflow"))
+                .count(),
+            1
+        );
+
+        let requested = vec!["voiceflow".into(), "FreshTerm".into(), "FRESHTERM".into()];
+        settings.dictionary = requested.clone();
+        let removed = reconcile_dictionary_patch(&mut settings, requested);
+        assert!(removed.iter().any(|word| word == "OldTerm"));
+        assert!(removed.iter().any(|word| word == "ScreenTerm"));
+        assert!(removed.iter().any(|word| word == "NewTerm"));
+        assert!(settings.has_dictionary_source("VoiceFlow", &DictionarySource::Manual));
+        assert!(settings
+            .has_dictionary_source("voiceflow", &DictionarySource::Rule("rule:voiceflo".into())));
+        assert!(settings.has_dictionary_source("freshterm", &DictionarySource::Manual));
+        assert!(!settings.has_dictionary_source("freshterm", &DictionarySource::LegacyUnknown));
+        assert!(!settings.has_dictionary_source(
+            "screenterm",
+            &DictionarySource::Screen("screen-origin".into())
+        ));
+    }
+
+    #[test]
+    fn dictionary_source_migration_merges_ascii_case_variants_and_owners() {
+        let mut settings = Settings {
+            dictionary: vec!["VoiceFlow".into(), "voiceflow".into(), "OtherTerm".into()],
+            dictionary_sources: legacy_dictionary_sources(),
+            ..Settings::default()
+        };
+        settings.dictionary_sources.owners.insert(
+            "VOICEFLOW".into(),
+            [DictionarySource::Rule("rule:voiceflo".into())]
+                .into_iter()
+                .collect(),
+        );
+
+        settings.normalize_dictionary_sources();
+
+        assert_eq!(settings.dictionary, vec!["VoiceFlow", "OtherTerm"]);
+        assert!(settings.has_dictionary_source("voiceflow", &DictionarySource::LegacyUnknown));
+        assert!(settings
+            .has_dictionary_source("VOICEFLOW", &DictionarySource::Rule("rule:voiceflo".into())));
+        assert_eq!(settings.dictionary_sources.owners.len(), 2);
+    }
+
+    #[test]
+    fn dictionary_projection_and_persistence_are_capped_without_resurrecting_dropped_words() {
+        let dir = temp_dir("dictionary-owner-cap");
+        let mut settings = Settings::default();
+        settings.dictionary = (0..257).map(|index| format!("term-{index:03}")).collect();
+        settings.dictionary_sources.owners.insert(
+            "term-256".into(),
+            [DictionarySource::Screen("late-screen-origin".into())]
+                .into_iter()
+                .collect(),
+        );
+
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("settings.json"),
+            serde_json::to_vec_pretty(&settings).unwrap(),
+        )
+        .unwrap();
+        let (mut loaded, needs_persist) =
+            load_settings_with_backend(&dir, &FakeCredentialBackend::default());
+        assert!(needs_persist);
+        assert_eq!(loaded.dictionary.len(), 256);
+        assert_eq!(loaded.dictionary_sources.owners.len(), 256);
+        assert!(!loaded.has_dictionary_source(
+            "term-256",
+            &DictionarySource::Screen("late-screen-origin".into())
+        ));
+        assert!(loaded.can_add_dictionary_source("TERM-000"));
+        assert!(!loaded.can_add_dictionary_source("term-256"));
+
+        let requested = (0..257).map(|index| format!("term-{index:03}")).collect();
+        reconcile_dictionary_patch(&mut loaded, requested);
+        assert_eq!(loaded.dictionary.len(), 256);
+        assert_eq!(loaded.dictionary_sources.owners.len(), 256);
+        assert!(!dictionary_contains_word(&loaded.dictionary, "term-256"));
+        assert!(!loaded.dictionary_sources.owners.contains_key("term-256"));
+
+        persist_settings_without_credential_changes(&dir, &loaded).unwrap();
+        let (reloaded, _) = load_settings_with_backend(&dir, &FakeCredentialBackend::default());
+        assert_eq!(reloaded.dictionary.len(), 256);
+        assert_eq!(reloaded.dictionary_sources.owners.len(), 256);
+        assert!(!dictionary_contains_word(&reloaded.dictionary, "term-256"));
+        assert!(!reloaded.dictionary_sources.owners.contains_key("term-256"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn history_v18_migration_preserves_legacy_receipts_without_counting_them_as_proof() {
+        let dir = temp_dir("history-v18-learning-proof-migration");
+        fs::create_dir_all(&dir).unwrap();
+        let database = dir.join("history.sqlite");
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE dictations (id INTEGER PRIMARY KEY, created_at TEXT NOT NULL);
+                 CREATE TABLE learn_observations (
+                     observation_key TEXT PRIMARY KEY,
+                     source_kind TEXT NOT NULL,
+                     source_history_id INTEGER,
+                     source_revision_id INTEGER,
+                     created_at TEXT NOT NULL
+                 );
+                 INSERT INTO learn_observations VALUES ('legacy-key', 'paste_session', NULL, NULL, '2026-11-06');
+                 PRAGMA user_version = 18;",
+            )
+            .unwrap();
+        drop(connection);
+
+        let migrated = open_history(&dir).unwrap();
+        let version: i32 = migrated
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, HISTORY_SCHEMA_VERSION);
+        let legacy = migrated
+            .query_row(
+                "SELECT source_kind, rule_key, dictation_origin, channel, proof_eligible
+                 FROM learn_observations WHERE observation_key = 'legacy-key'",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, i64>(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(legacy, ("paste_session".into(), None, None, None, 0));
+        let proof_index: bool = migrated
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name='idx_learn_observations_independent_proof')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(proof_index);
+        assert_eq!(
+            count_independent_learn_pair_hits(&dir, "legacy-key").unwrap(),
+            0
+        );
+        drop(migrated);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn legacy_research_fixture_receipt_replay_keeps_key_without_adding_hit_or_proof() {
+        let dir = temp_dir("legacy-research-receipt-replay");
+        let pair_key = crate::dictionary_learn::pair_key("VoiceFlo", "VoiceFlow");
+        let source_origin = "voiceflow-origin-legacy";
+        let observation_id = format!("stable_source:{source_origin}");
+        let legacy_receipt =
+            LearnPairObservation::research_fixture_edit(&observation_id, &pair_key);
+        assert!(matches!(
+            upsert_learn_pair_with_observation(
+                &dir,
+                &pair_key,
+                "VoiceFlo",
+                "VoiceFlow",
+                None,
+                Some(&legacy_receipt),
+            )
+            .unwrap(),
+            LearnPairUpsert::Stored(_)
+        ));
+        assert_eq!(get_learn_pair(&dir, &pair_key).unwrap().unwrap().hits, 1);
+        assert_eq!(
+            count_independent_learn_pair_hits(&dir, &pair_key).unwrap(),
+            0
+        );
+
+        let replay = LearnPairObservation::research_fixture_origin_with_observation_id(
+            &observation_id,
+            source_origin,
+            &pair_key,
+        );
+        assert!(has_learn_pair_observation(&dir, &replay).unwrap());
+        assert!(matches!(
+            upsert_learn_pair_with_observation(
+                &dir,
+                &pair_key,
+                "VoiceFlo",
+                "VoiceFlow",
+                None,
+                Some(&replay),
+            )
+            .unwrap(),
+            LearnPairUpsert::Skipped(LearnPairSkipReason::DuplicateObservation)
+        ));
+        assert_eq!(get_learn_pair(&dir, &pair_key).unwrap().unwrap().hits, 1);
+        assert_eq!(
+            count_independent_learn_pair_hits(&dir, &pair_key).unwrap(),
+            0
+        );
+        let connection = open_history(&dir).unwrap();
+        let receipt: (String, Option<String>, Option<String>, i64) = connection
+            .query_row(
+                "SELECT source_kind, rule_key, dictation_origin, proof_eligible
+                 FROM learn_observations WHERE observation_key = ?1",
+                [&replay.observation_key],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(receipt, ("research_fixture_edit".into(), None, None, 0));
+        drop(connection);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn insert_test_history_origin(dir: &Path, text: &str, transaction_id: &str) -> i64 {
+        insert_history(dir, text, text, 1.0, false).unwrap();
+        let connection = open_history(dir).unwrap();
+        let id = connection
+            .query_row(
+                "SELECT id FROM dictations WHERE raw_text = ?1 ORDER BY id DESC LIMIT 1",
+                [text],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE dictations SET transaction_id = ?1 WHERE id = ?2",
+                params![transaction_id, id],
+            )
+            .unwrap();
+        id
+    }
+
+    #[test]
+    fn paste_proof_links_to_pending_history_and_deletes_with_its_origin() {
+        let dir = temp_dir("learning-proof-pending-history-link");
+        let transaction_id = "fixture-transaction-001";
+        let pair_key = crate::dictionary_learn::pair_key("VoiceFlo", "VoiceFlow");
+        let owner = register_pending_history_owner(&dir, transaction_id).unwrap();
+        let intent =
+            pending_history_intent_for_test(transaction_id, "ok", "history", "I prefer VoiceFlow");
+        write_pending_history_intent(&dir, &intent, &owner).unwrap();
+
+        let observation = LearnPairObservation::paste_session_with_dictation_origin(
+            "session-001",
+            &pair_key,
+            transaction_id,
+        );
+        assert!(matches!(
+            upsert_learn_pair_with_observation(
+                &dir,
+                &pair_key,
+                "VoiceFlo",
+                "VoiceFlow",
+                None,
+                Some(&observation),
+            )
+            .unwrap(),
+            LearnPairUpsert::Stored(_)
+        ));
+        assert_eq!(
+            count_independent_learn_pair_hits(&dir, &pair_key).unwrap(),
+            1
+        );
+        let connection = open_history(&dir).unwrap();
+        let pending_link: Option<i64> = connection
+            .query_row(
+                "SELECT source_history_id FROM learn_observations WHERE dictation_origin = ?1",
+                [transaction_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pending_link, None);
+        drop(connection);
+
+        promote_pending_history_intent(&dir, transaction_id, &owner).unwrap();
+        drop(owner);
+        let connection = open_history(&dir).unwrap();
+        let history_id: i64 = connection
+            .query_row(
+                "SELECT id FROM dictations WHERE transaction_id = ?1",
+                [transaction_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let linked_id: Option<i64> = connection
+            .query_row(
+                "SELECT source_history_id FROM learn_observations WHERE dictation_origin = ?1",
+                [transaction_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(linked_id, Some(history_id));
+        connection
+            .execute(
+                "INSERT INTO dictation_revisions (dictation_id, created_at, final_text, revision_reason)
+                 VALUES (?1, datetime('now'), 'I prefer VoiceFlo', 'manual')",
+                [history_id],
+            )
+            .unwrap();
+        let revision_id = connection.last_insert_rowid();
+        drop(connection);
+
+        let history_edit =
+            LearnPairObservation::history_edit_from_store(&dir, history_id, revision_id, &pair_key)
+                .unwrap()
+                .unwrap();
+        assert!(history_edit.proof_eligible());
+        assert!(matches!(
+            upsert_learn_pair_with_observation(
+                &dir,
+                &pair_key,
+                "VoiceFlo",
+                "VoiceFlow",
+                None,
+                Some(&history_edit),
+            )
+            .unwrap(),
+            LearnPairUpsert::Skipped(LearnPairSkipReason::DuplicateObservation)
+        ));
+        assert_eq!(
+            count_independent_learn_pair_hits(&dir, &pair_key).unwrap(),
+            1
+        );
+        assert_eq!(get_learn_pair(&dir, &pair_key).unwrap().unwrap().hits, 1);
+        let connection = open_history(&dir).unwrap();
+        let enrichment: (Option<i64>, Option<String>) = connection
+            .query_row(
+                "SELECT source_revision_id, channel FROM learn_observations WHERE dictation_origin = ?1",
+                [transaction_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(enrichment, (Some(revision_id), Some("history_edit".into())));
+        drop(connection);
+
+        delete_history(&dir, history_id).unwrap();
+        assert_eq!(
+            count_independent_learn_pair_hits(&dir, &pair_key).unwrap(),
+            0
+        );
+        let connection = open_history(&dir).unwrap();
+        let remaining: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM learn_observations WHERE dictation_origin = ?1",
+                [transaction_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(remaining, 0);
+        drop(connection);
+        let late_paste = LearnPairObservation::paste_session_with_dictation_origin(
+            "late-session",
+            &pair_key,
+            transaction_id,
+        );
+        assert!(matches!(
+            upsert_learn_pair_with_observation(
+                &dir,
+                &pair_key,
+                "VoiceFlo",
+                "VoiceFlow",
+                None,
+                Some(&late_paste),
+            )
+            .unwrap(),
+            LearnPairUpsert::Skipped(LearnPairSkipReason::UnknownDictationOrigin)
+        ));
+        assert_eq!(
+            count_independent_learn_pair_hits(&dir, &pair_key).unwrap(),
+            0
+        );
+
+        let history_first_origin = "history-first-origin-002";
+        let history_first_id =
+            insert_test_history_origin(&dir, "history-first proof origin", history_first_origin);
+        let connection = open_history(&dir).unwrap();
+        connection
+            .execute(
+                "INSERT INTO dictation_revisions (dictation_id, created_at, final_text, revision_reason)
+                 VALUES (?1, datetime('now'), 'I prefer VoiceFlo', 'manual')",
+                [history_first_id],
+            )
+            .unwrap();
+        let history_first_revision = connection.last_insert_rowid();
+        drop(connection);
+
+        let history_first = LearnPairObservation::history_edit_from_store(
+            &dir,
+            history_first_id,
+            history_first_revision,
+            &pair_key,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(matches!(
+            upsert_learn_pair_with_observation(
+                &dir,
+                &pair_key,
+                "VoiceFlo",
+                "VoiceFlow",
+                None,
+                Some(&history_first),
+            )
+            .unwrap(),
+            LearnPairUpsert::Stored(_)
+        ));
+        let paste_replay = LearnPairObservation::paste_session_with_dictation_origin(
+            "history-first-session",
+            &pair_key,
+            history_first_origin,
+        );
+        assert!(matches!(
+            upsert_learn_pair_with_observation(
+                &dir,
+                &pair_key,
+                "VoiceFlo",
+                "VoiceFlow",
+                None,
+                Some(&paste_replay),
+            )
+            .unwrap(),
+            LearnPairUpsert::Skipped(LearnPairSkipReason::DuplicateObservation)
+        ));
+        assert_eq!(
+            count_independent_learn_pair_hits(&dir, &pair_key).unwrap(),
+            1
+        );
+        let connection = open_history(&dir).unwrap();
+        let history_first_readback: (Option<i64>, Option<i64>, Option<String>) = connection
+            .query_row(
+                "SELECT source_history_id, source_revision_id, channel
+                 FROM learn_observations WHERE dictation_origin = ?1",
+                [history_first_origin],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            history_first_readback,
+            (
+                Some(history_first_id),
+                Some(history_first_revision),
+                Some("history_edit".into())
+            )
+        );
+        drop(connection);
+
+        delete_history(&dir, history_first_id).unwrap();
+        assert_eq!(
+            count_independent_learn_pair_hits(&dir, &pair_key).unwrap(),
+            0
+        );
+        let connection = open_history(&dir).unwrap();
+        let deleted_origin_receipts: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM learn_observations WHERE dictation_origin = ?1",
+                [history_first_origin],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(deleted_origin_receipts, 0);
+        drop(connection);
+        let late_paste = LearnPairObservation::paste_session_with_dictation_origin(
+            "history-first-late-session",
+            &pair_key,
+            history_first_origin,
+        );
+        assert!(matches!(
+            upsert_learn_pair_with_observation(
+                &dir,
+                &pair_key,
+                "VoiceFlo",
+                "VoiceFlow",
+                None,
+                Some(&late_paste),
+            )
+            .unwrap(),
+            LearnPairUpsert::Skipped(LearnPairSkipReason::UnknownDictationOrigin)
+        ));
+        assert_eq!(
+            count_independent_learn_pair_hits(&dir, &pair_key).unwrap(),
+            0
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn independent_proof_threshold_ignores_receipt_hits_and_replays() {
+        let dir = temp_dir("learn-pair-independent-proof-threshold");
+        let pair_key = crate::dictionary_learn::pair_key("VoiceFlo", "VoiceFlow");
+        for _ in 0..3 {
+            upsert_learn_pair(&dir, &pair_key, "VoiceFlo", "VoiceFlow").unwrap();
+        }
+        assert!(!promote_learn_pair_if_eligible(
+            &dir,
+            &pair_key,
+            "VoiceFlo",
+            "VoiceFlow",
+            None,
+            2,
+            false,
+        )
+        .unwrap());
+
+        let first_id = insert_test_history_origin(&dir, "first proof origin", "origin-first");
+        let second_id = insert_test_history_origin(&dir, "second proof origin", "origin-second");
+        for (session, origin) in [
+            ("session-first", "origin-first"),
+            ("session-second", "origin-second"),
+        ] {
+            let observation = LearnPairObservation::paste_session_with_dictation_origin(
+                session, &pair_key, origin,
+            );
+            upsert_learn_pair_with_observation(
+                &dir,
+                &pair_key,
+                "VoiceFlo",
+                "VoiceFlow",
+                None,
+                Some(&observation),
+            )
+            .unwrap();
+            if origin == "origin-first" {
+                assert!(!promote_learn_pair_if_eligible(
+                    &dir,
+                    &pair_key,
+                    "VoiceFlo",
+                    "VoiceFlow",
+                    None,
+                    2,
+                    false,
+                )
+                .unwrap());
+            }
+        }
+        assert_eq!(
+            count_independent_learn_pair_hits(&dir, &pair_key).unwrap(),
+            2
+        );
+        assert!(promote_learn_pair_if_eligible(
+            &dir,
+            &pair_key,
+            "VoiceFlo",
+            "VoiceFlow",
+            None,
+            2,
+            false,
+        )
+        .unwrap());
+        let hits_before_replay = get_learn_pair(&dir, &pair_key).unwrap().unwrap().hits;
+        let replay = LearnPairObservation::paste_session_with_dictation_origin(
+            "session-first-replayed",
+            &pair_key,
+            "origin-first",
+        );
+        assert!(matches!(
+            upsert_learn_pair_with_observation(
+                &dir,
+                &pair_key,
+                "VoiceFlo",
+                "VoiceFlow",
+                None,
+                Some(&replay),
+            )
+            .unwrap(),
+            LearnPairUpsert::Skipped(LearnPairSkipReason::DuplicateObservation)
+        ));
+        assert_eq!(
+            get_learn_pair(&dir, &pair_key).unwrap().unwrap().hits,
+            hits_before_replay
+        );
+        assert_eq!(
+            count_independent_learn_pair_hits(&dir, &pair_key).unwrap(),
+            2
+        );
+        let connection = open_history(&dir).unwrap();
+        connection
+            .execute(
+                "DELETE FROM dictations WHERE id IN (?1, ?2)",
+                params![first_id, second_id],
+            )
+            .unwrap();
+        drop(connection);
+        assert_eq!(
+            count_independent_learn_pair_hits(&dir, &pair_key).unwrap(),
+            0
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn dictionary_effect_versions_reject_stale_ack_and_cancel_pending_work() {
+        let dir = temp_dir("dictionary-effect-versions");
+        let pair_key = crate::dictionary_learn::pair_key("VoiceFlo", "VoiceFlow");
+        ensure_learn_pair_promoted(
+            &dir,
+            &pair_key,
+            "VoiceFlo",
+            "VoiceFlow",
+            Some(&LearnPairScope::default()),
+        )
+        .unwrap();
+        let add = list_pending_dictionary_effects(&dir).unwrap().remove(0);
+        assert_eq!(add.action, DictionaryEffectAction::Add);
+        assert!(!acknowledge_dictionary_effect(&dir, &pair_key, add.version - 1).unwrap());
+        assert!(acknowledge_dictionary_effect(&dir, &pair_key, add.version).unwrap());
+
+        ensure_learn_pair_promoted(
+            &dir,
+            &pair_key,
+            "VoiceFlo",
+            "VoiceFlow",
+            Some(&LearnPairScope::default()),
+        )
+        .unwrap();
+        let reconfirmed_add = list_pending_dictionary_effects(&dir).unwrap().remove(0);
+        assert_eq!(reconfirmed_add.action, DictionaryEffectAction::Add);
+        assert!(reconfirmed_add.version > add.version);
+        assert!(cancel_pending_dictionary_effects_for_word(&dir, "voiceflow").unwrap());
+        assert!(list_pending_dictionary_effects(&dir).unwrap().is_empty());
+        assert!(!acknowledge_dictionary_effect(&dir, &pair_key, reconfirmed_add.version).unwrap());
+
+        ensure_learn_pair_promoted(
+            &dir,
+            &pair_key,
+            "VoiceFlo",
+            "VoiceFlow",
+            Some(&LearnPairScope::default()),
+        )
+        .unwrap();
+        let next_add = list_pending_dictionary_effects(&dir).unwrap().remove(0);
+        assert!(acknowledge_dictionary_effect(&dir, &pair_key, next_add.version).unwrap());
+        assert!(tombstone_learn_pair(&dir, &pair_key).unwrap());
+        let remove = list_pending_dictionary_effects(&dir).unwrap().remove(0);
+        assert_eq!(remove.action, DictionaryEffectAction::Remove);
+        assert!(!acknowledge_dictionary_effect(&dir, &pair_key, next_add.version).unwrap());
+        assert!(!cancel_pending_dictionary_effects_for_word(&dir, "voiceflow").unwrap());
+        assert_eq!(
+            list_pending_dictionary_effects(&dir).unwrap(),
+            vec![remove.clone()]
+        );
+        assert!(!acknowledge_dictionary_effect(&dir, &pair_key, remove.version - 1).unwrap());
+        assert!(acknowledge_dictionary_effect(&dir, &pair_key, remove.version).unwrap());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn clear_all_data_deletes_learn_pairs() {
         let dir = temp_dir("learn-pairs-clear");
         let key = crate::dictionary_learn::pair_key("知呼", "知乎");
@@ -7264,7 +17517,8 @@ mod tests {
     fn learned_usage_deduplicates_processing_passes_hides_forgotten_terms_and_clears() {
         let dir = temp_dir("learned-usage");
         let key = crate::dictionary_learn::pair_key("知呼", "知乎");
-        ensure_learn_pair_promoted(&dir, &key, "知呼", "知乎", None).unwrap();
+        ensure_learn_pair_promoted(&dir, &key, "知呼", "知乎", Some(&LearnPairScope::default()))
+            .unwrap();
         assert!(list_learned_term_usage(&dir).unwrap().is_empty());
         record_learned_term_usage(&dir, &["知乎".into(), "知乎".into()]).unwrap();
         record_learned_term_usage(&dir, &["知乎".into()]).unwrap();
@@ -7287,10 +17541,116 @@ mod tests {
     }
 
     #[test]
+    fn learned_usage_membership_matches_ascii_case_of_promoted_rule_surface() {
+        let dir = temp_dir("learned-usage-ascii-case");
+        let key = crate::dictionary_learn::pair_key("VoiceFlo", "VoiceFlow");
+        ensure_learn_pair_promoted(
+            &dir,
+            &key,
+            "VoiceFlo",
+            "VoiceFlow",
+            Some(&LearnPairScope::default()),
+        )
+        .unwrap();
+        record_learned_term_usage(&dir, &["voiceflow".into()]).unwrap();
+
+        let usage = list_learned_term_usage(&dir).unwrap();
+        assert_eq!(usage.len(), 1);
+        assert_eq!(usage[0].word, "voiceflow");
+        assert_eq!(usage[0].replacement_runs, 1);
+
+        tombstone_learn_pair(&dir, &key).unwrap();
+        assert!(list_learned_term_usage(&dir).unwrap().is_empty());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn automatic_scene_pair_marker_is_opt_in_and_tombstones_still_disarm_it() {
+        let dir = temp_dir("auto-scoped-pair");
+        let key = crate::dictionary_learn::pair_key("知呼", "知乎");
+        let scope = LearnPairScope {
+            family: Some("prompt_or_code".into()),
+            mapping_id: Some("codex".into()),
+            native_bundle: Some("com.openai.codex".into()),
+            ..LearnPairScope::default()
+        };
+        ensure_learn_pair_promoted(&dir, &key, "知呼", "知乎", Some(&scope)).unwrap();
+        let legacy = get_learn_pair(&dir, &key).unwrap().unwrap();
+        assert!(!legacy.auto_scoped);
+        assert!(!legacy.manual_scoped);
+
+        mark_learn_pair_promoted_with_scope_kind(&dir, &key, true).unwrap();
+        let learned = get_learn_pair(&dir, &key).unwrap().unwrap();
+        assert!(learned.auto_scoped);
+        assert!(!learned.manual_scoped);
+        tombstone_learn_pair(&dir, &key).unwrap();
+        let forgotten = get_learn_pair(&dir, &key).unwrap().unwrap();
+        assert!(forgotten.auto_scoped);
+        assert!(!forgotten.is_live_promoted());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn guarded_automatic_pair_promotion_requires_exact_live_candidate() {
+        let dir = temp_dir("guarded-auto-promotion");
+        let key = crate::dictionary_learn::pair_key("知呼", "知乎");
+        let scope = LearnPairScope {
+            family: Some("prompt_or_code".into()),
+            mapping_id: Some("codex".into()),
+            native_bundle: Some("com.openai.codex".into()),
+            ..LearnPairScope::default()
+        };
+        upsert_learn_pair_with_observation(&dir, &key, "知呼", "知乎", Some(&scope), None).unwrap();
+
+        assert!(
+            !promote_learn_pair_if_eligible(&dir, &key, "知呼", "知乎", Some(&scope), 2, true,)
+                .unwrap()
+        );
+        assert!(!promote_learn_pair_if_eligible(
+            &dir,
+            &key,
+            "wrong",
+            "知乎",
+            Some(&scope),
+            1,
+            true,
+        )
+        .unwrap());
+        assert!(!promote_learn_pair_if_eligible(
+            &dir,
+            &key,
+            "知呼",
+            "wrong",
+            Some(&scope),
+            1,
+            true,
+        )
+        .unwrap());
+        assert!(
+            !promote_learn_pair_if_eligible(&dir, &key, "知呼", "知乎", None, 1, true,).unwrap()
+        );
+
+        upsert_learn_pair_with_observation(&dir, &key, "知呼", "知乎", Some(&scope), None).unwrap();
+        assert!(tombstone_learn_pair(&dir, &key).unwrap());
+        assert!(
+            !promote_learn_pair_if_eligible(&dir, &key, "知呼", "知乎", Some(&scope), 2, true,)
+                .unwrap()
+        );
+        let row = get_learn_pair(&dir, &key).unwrap().unwrap();
+        assert_eq!(row.hits, 2);
+        assert!(!row.promoted);
+        assert!(!row.auto_scoped);
+        assert!(row.ignored);
+        assert!(row.tombstoned_at.is_some());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn history_v12_migration_preserves_learning_without_inventing_usage() {
         let dir = temp_dir("learned-usage-migration");
         let key = crate::dictionary_learn::pair_key("知呼", "知乎");
-        ensure_learn_pair_promoted(&dir, &key, "知呼", "知乎", None).unwrap();
+        ensure_learn_pair_promoted(&dir, &key, "知呼", "知乎", Some(&LearnPairScope::default()))
+            .unwrap();
         let connection = open_history(&dir).unwrap();
         connection
             .execute_batch("DROP TABLE learned_term_usage; PRAGMA user_version = 12;")
@@ -7333,9 +17693,10 @@ mod tests {
                 .is_some());
         }
         let extra = crate::dictionary_learn::pair_key("知呼", "知乎");
-        assert!(upsert_learn_pair(&dir, &extra, "知呼", "知乎")
-            .unwrap()
-            .is_none());
+        assert!(matches!(
+            upsert_learn_pair_with_scope(&dir, &extra, "知呼", "知乎", None).unwrap(),
+            LearnPairUpsert::Skipped(LearnPairSkipReason::PendingCapacity)
+        ));
         let first = crate::dictionary_learn::pair_key("b0", "a0");
         assert_eq!(
             upsert_learn_pair(&dir, &first, "b0", "a0")
@@ -7357,9 +17718,134 @@ mod tests {
         assert!(row.ignored);
         assert!(row.tombstoned_at.is_some());
         assert!(!row.is_pending());
-        assert!(upsert_learn_pair(&dir, &key, "知呼", "知乎")
-            .unwrap()
-            .is_none());
+        assert!(matches!(
+            upsert_learn_pair_with_scope(&dir, &key, "知呼", "知乎", None).unwrap(),
+            LearnPairUpsert::Skipped(LearnPairSkipReason::TombstoneOrIgnored)
+        ));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn learning_receipts_count_distinct_history_rows_once_and_follow_tombstones() {
+        let dir = temp_dir("learning-observation-receipts");
+        for index in 0..4 {
+            insert_history(
+                &dir,
+                &format!("raw {index}"),
+                &format!("final {index}"),
+                1.0,
+                false,
+            )
+            .unwrap();
+        }
+        let key = crate::dictionary_learn::pair_key("知呼", "知乎");
+        let scope = LearnPairScope {
+            family: Some("work_chat".into()),
+            mapping_id: Some("codex".into()),
+            native_bundle: Some("com.openai.codex".into()),
+            ..LearnPairScope::default()
+        };
+        let first_revision = LearnPairObservation::history_edit(1, 11, &key);
+        assert!(matches!(
+            upsert_learn_pair_with_observation(
+                &dir,
+                &key,
+                "知呼",
+                "知乎",
+                Some(&scope),
+                Some(&first_revision),
+            )
+            .unwrap(),
+            LearnPairUpsert::Stored(row) if row.hits == 1
+        ));
+
+        // A later revision of the same History row is still only one edit
+        // source for this exact pair.
+        let same_history = LearnPairObservation::history_edit(1, 12, &key);
+        assert!(matches!(
+            upsert_learn_pair_with_observation(
+                &dir,
+                &key,
+                "知呼",
+                "知乎",
+                Some(&scope),
+                Some(&same_history),
+            )
+            .unwrap(),
+            LearnPairUpsert::Skipped(LearnPairSkipReason::DuplicateObservation)
+        ));
+        assert_eq!(get_learn_pair(&dir, &key).unwrap().unwrap().hits, 1);
+
+        let second_history = LearnPairObservation::history_edit(2, 21, &key);
+        assert!(matches!(
+            upsert_learn_pair_with_observation(
+                &dir,
+                &key,
+                "知呼",
+                "知乎",
+                Some(&scope),
+                Some(&second_history),
+            )
+            .unwrap(),
+            LearnPairUpsert::Stored(row) if row.hits == 2
+        ));
+        let conflict = LearnPairScope {
+            native_bundle: Some("com.apple.TextEdit".into()),
+            ..scope.clone()
+        };
+        let conflicting_history = LearnPairObservation::history_edit(3, 31, &key);
+        assert!(matches!(
+            upsert_learn_pair_with_observation(
+                &dir,
+                &key,
+                "知呼",
+                "知乎",
+                Some(&conflict),
+                Some(&conflicting_history),
+            )
+            .unwrap(),
+            LearnPairUpsert::Skipped(LearnPairSkipReason::ScopeConflict)
+        ));
+        assert!(matches!(
+            upsert_learn_pair_with_observation(
+                &dir,
+                &key,
+                "知呼",
+                "知乎",
+                Some(&conflict),
+                Some(&conflicting_history),
+            )
+            .unwrap(),
+            LearnPairUpsert::Skipped(LearnPairSkipReason::ScopeConflict)
+        ));
+        assert!(tombstone_learn_pair(&dir, &key).unwrap());
+        let after_tombstone = LearnPairObservation::history_edit(4, 41, &key);
+        assert!(matches!(
+            upsert_learn_pair_with_observation(
+                &dir,
+                &key,
+                "知呼",
+                "知乎",
+                Some(&scope),
+                Some(&after_tombstone),
+            )
+            .unwrap(),
+            LearnPairUpsert::Skipped(LearnPairSkipReason::TombstoneOrIgnored)
+        ));
+        let row = get_learn_pair(&dir, &key).unwrap().unwrap();
+        assert_eq!(row.hits, 2);
+        assert!(row.ignored && row.tombstoned_at.is_some());
+
+        delete_history(&dir, 1).unwrap();
+        let connection = open_history(&dir).unwrap();
+        let remaining_receipts: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM learn_observations WHERE source_history_id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(remaining_receipts, 0);
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -7405,8 +17891,10 @@ mod tests {
                 native_bundle: Some("com.tencent.xinWeChat".into()),
             }),
         )
-        .unwrap()
         .unwrap();
+        let LearnPairUpsert::Stored(row) = row else {
+            panic!("fresh migration fixture was unexpectedly suppressed")
+        };
         assert_eq!(row.family.as_deref(), Some("personal_chat"));
         assert_eq!(row.mapping_id.as_deref(), Some("wechat"));
         assert!(!row.pinned);
@@ -7439,6 +17927,66 @@ mod tests {
         assert!(row.is_live_promoted());
         assert_eq!(row.family.as_deref(), Some("personal_chat"));
         assert_eq!(row.native_bundle.as_deref(), Some("com.tencent.xinWeChat"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn manual_scoped_pair_is_app_bound_and_refuses_scope_collisions() {
+        let dir = temp_dir("manual-scoped-pair");
+        let key = crate::dictionary_learn::pair_key("L O M", "LLM");
+        let scope = LearnPairScope {
+            native_bundle: Some("com.openai.codex".into()),
+            ..LearnPairScope::default()
+        };
+        ensure_manual_scoped_learn_pair(&dir, &key, "L O M", "LLM", &scope).unwrap();
+        let row = get_learn_pair(&dir, &key).unwrap().unwrap();
+        assert!(row.is_live_promoted());
+        assert!(row.manual_scoped);
+        assert_eq!(row.native_bundle.as_deref(), Some("com.openai.codex"));
+        assert_eq!(row.family, None);
+        assert_eq!(row.mapping_id, None);
+        assert_eq!(row.browser_host, None);
+
+        let observed = LearnPairScope {
+            native_bundle: Some("com.openai.codex".into()),
+            ..LearnPairScope::default()
+        };
+        assert_eq!(observed.assess_record(&row), LearnPairScopeMatch::Match);
+        let foreign = LearnPairScope {
+            native_bundle: Some("com.apple.TextEdit".into()),
+            ..LearnPairScope::default()
+        };
+        assert_eq!(foreign.assess_record(&row), LearnPairScopeMatch::Mismatch);
+        let unknown = LearnPairScope::default();
+        assert_eq!(unknown.assess_record(&row), LearnPairScopeMatch::Unknown);
+
+        let conflicting_scope = LearnPairScope {
+            native_bundle: Some("com.apple.TextEdit".into()),
+            ..LearnPairScope::default()
+        };
+        assert!(
+            ensure_manual_scoped_learn_pair(&dir, &key, "L O M", "LLM", &conflicting_scope)
+                .is_err()
+        );
+        assert!(ensure_manual_scoped_learn_pair(
+            &dir,
+            &key,
+            "L O M",
+            "LLM",
+            &LearnPairScope::default()
+        )
+        .is_err());
+        assert_eq!(
+            get_learn_pair(&dir, &key).unwrap().unwrap().native_bundle,
+            scope.native_bundle
+        );
+        assert!(tombstone_learn_pair(&dir, &key).unwrap());
+        let rebound =
+            ensure_manual_scoped_learn_pair(&dir, &key, "L O M", "LLM", &conflicting_scope)
+                .unwrap();
+        assert!(rebound.is_live_promoted());
+        assert_eq!(rebound.native_bundle.as_deref(), Some("com.apple.TextEdit"));
+        assert_eq!(rebound.hits, 0);
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -7632,10 +18180,48 @@ mod tests {
         )
         .unwrap();
 
+        #[cfg(unix)]
+        let downloads_mode = {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::metadata(&downloads).unwrap().permissions().mode() & 0o777
+        };
         let exported = export_gold_corpus(&dir, &downloads, "zh").unwrap();
         assert_eq!(exported.count, 1);
-        let wav = std::fs::read(Path::new(&exported.directory).join("utt0001.wav")).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&downloads).unwrap().permissions().mode() & 0o777,
+                downloads_mode
+            );
+            assert_eq!(
+                std::fs::metadata(&exported.directory)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+        }
+        let wav_path = Path::new(&exported.directory).join("utt0001.wav");
+        let wav = std::fs::read(&wav_path).unwrap();
         assert_eq!(wav, b"RIFFGOLD");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&wav_path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            assert_eq!(
+                std::fs::metadata(&exported.jsonl_path)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
         let jsonl = std::fs::read_to_string(&exported.jsonl_path).unwrap();
         assert!(jsonl.contains("language Chinese<asr_text>spoken words"));
         assert!(!jsonl.contains("Cleaned words"));
@@ -7733,5 +18319,57 @@ mod handy_settings_tests {
         ] {
             assert!(view.get(key).is_some(), "{key}");
         }
+    }
+}
+
+#[cfg(test)]
+mod guide_acknowledgement_fixtures {
+    use super::*;
+    #[test]
+    fn old_settings_and_independent_explicit_ack_round_trip() {
+        let mut settings: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            settings.guide_acknowledgements,
+            GuideAcknowledgements::default()
+        );
+        assert!(settings
+            .guide_acknowledgements
+            .acknowledge(OnDemandGuideId::ContextScreen, 1)
+            .unwrap());
+        assert!(!settings
+            .guide_acknowledgements
+            .acknowledge(OnDemandGuideId::ContextScreen, 1)
+            .unwrap());
+        assert_eq!(settings.guide_acknowledgements.dictionary_learning, None);
+        assert_eq!(settings.guide_acknowledgements.context_screen, Some(1));
+        let saved: Settings =
+            serde_json::from_value(serde_json::to_value(&settings).unwrap()).unwrap();
+        assert_eq!(
+            saved.guide_acknowledgements,
+            settings.guide_acknowledgements
+        );
+        assert!(saved
+            .guide_acknowledgements
+            .clone()
+            .acknowledge(OnDemandGuideId::ContextScreen, 2)
+            .is_err());
+        assert!(serde_json::from_str::<OnDemandGuideId>(r#""unknown_guide""#).is_err());
+    }
+    #[test]
+    fn teaching_ack_does_not_become_recording_configuration_or_feature_success() {
+        let before = Settings::default();
+        let mut after = before.clone();
+        after
+            .guide_acknowledgements
+            .acknowledge(OnDemandGuideId::SelectedTranslation, 1)
+            .unwrap();
+        assert!(!crate::dictation_configuration_changed(&before, &after));
+        assert_eq!(before.onboarded, after.onboarded);
+        assert_eq!(
+            before.dictionary_learn_enabled,
+            after.dictionary_learn_enabled
+        );
+        after.asr_model.push_str("-changed");
+        assert!(crate::dictation_configuration_changed(&before, &after));
     }
 }

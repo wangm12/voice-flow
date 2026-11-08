@@ -163,6 +163,7 @@ describe("ConfirmDialog", () => {
     const layout = document.querySelector("main")?.firstElementChild;
     expect(layout).toBeInstanceOf(HTMLElement);
     expect((layout as HTMLElement).inert).toBe(true);
-    expect(screen.getByRole("button", { name: "背景按钮" })).not.toHaveFocus();
+    expect(screen.queryByRole("button", { name: "背景按钮" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "背景按钮", hidden: true })).not.toHaveFocus();
   });
 });

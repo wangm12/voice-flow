@@ -4,8 +4,9 @@
 //! outcome codes, and monotonic durations. Transcript text, audio, context,
 //! endpoints, credentials, screenshots, and target identities are never kept.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
@@ -27,7 +28,263 @@ pub enum MetricKind {
     Paste,
     PasteSubmission,
     ReadbackConfirmation,
+    HistoryJournal,
+    CaptureSpoolFlush,
+    RetainedHistory,
     StopToInsert,
+}
+
+/// Coarse, content-free stage boundaries used by the shared dictation trace.
+#[allow(
+    dead_code,
+    reason = "Consumed by the follow-on ASR and cleanup trace instrumentation."
+)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Stage {
+    AsrInference,
+    FileValidation,
+    RuntimeStartup,
+    ModelLoad,
+    PromptPreparation,
+    QueueWait,
+    MlxGateWait,
+    Prefill,
+    Decode,
+    FinalGuard,
+    Paste,
+    TargetConfirmation,
+    LmStudioStatusProbe,
+}
+
+/// The single coarse class assigned from observed session facts by trace owners.
+#[allow(
+    dead_code,
+    reason = "Consumed by the follow-on trace classification owners."
+)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DictationClass {
+    Unclassified,
+    Cold,
+    FirstAfterLaunch,
+    Warm,
+    Long,
+    Contention,
+    FirstAfterIdleUnload,
+}
+
+/// Process-local trace payload. Stage offsets and durations are milliseconds
+/// from the owning host monotonic clock; child-process clocks are not mixed in.
+#[allow(
+    dead_code,
+    reason = "Consumed by the follow-on ASR and cleanup trace instrumentation."
+)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DictationTrace {
+    pub session_generation: u64,
+    pub stages: Vec<(Stage, u64, u64)>,
+    pub reported_stages: Vec<ReportedStageDuration>,
+    pub cache_status: Option<CacheStatus>,
+    pub class: DictationClass,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CacheStatus {
+    MemoryHit,
+    SnapshotHit,
+    Bypassed,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReportedScope {
+    FullPrompt,
+    SuffixAfterPrefixBuild,
+    ComputedSuffix,
+    Generation,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[serde(deny_unknown_fields)]
+pub struct ReportedStageDuration {
+    pub stage: Stage,
+    pub duration_ms: u64,
+    pub scope: ReportedScope,
+}
+
+const MAX_TRACE_SPANS: usize = 256;
+
+#[derive(Debug, Clone)]
+pub struct TraceHandle {
+    state: Arc<Mutex<TraceState>>,
+    terminal: Arc<AtomicBool>,
+}
+
+#[derive(Debug)]
+struct TraceState {
+    origin: Instant,
+    payload: DictationTrace,
+    sealed_at: Option<Instant>,
+    next_span_id: u64,
+    open_spans: BTreeMap<u64, (Stage, Instant)>,
+}
+
+#[derive(Debug)]
+pub struct TraceSpan {
+    handle: TraceHandle,
+    span_id: Option<u64>,
+}
+
+impl TraceHandle {
+    fn try_seal_snapshot_at(&self, now: Instant) -> Option<DictationTrace> {
+        // The terminal fence is independent from the payload mutex so a busy
+        // trace can never leave late child callbacks authorized to mutate it.
+        self.terminal.store(true, Ordering::Release);
+        let mut state = match self.state.try_lock() {
+            Ok(state) => state,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+        };
+        if state.sealed_at.is_none() {
+            state.sealed_at = Some(now);
+            let origin = state.origin;
+            let open = std::mem::take(&mut state.open_spans);
+            for (_, (stage, started)) in open {
+                push_trace_span(&mut state, stage, started, now, origin);
+            }
+        }
+        Some(state.payload.clone())
+    }
+
+    pub fn session_generation(&self) -> u64 {
+        self.state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .payload
+            .session_generation
+    }
+
+    pub fn begin(&self, stage: Stage) -> TraceSpan {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let span_id = if !self.terminal.load(Ordering::Acquire)
+            && state.sealed_at.is_none()
+            && state.payload.stages.len()
+                + state.payload.reported_stages.len()
+                + state.open_spans.len()
+                < MAX_TRACE_SPANS
+        {
+            let id = state.next_span_id;
+            state.next_span_id = state.next_span_id.saturating_add(1);
+            state.open_spans.insert(id, (stage, Instant::now()));
+            Some(id)
+        } else {
+            None
+        };
+        TraceSpan {
+            handle: self.clone(),
+            span_id,
+        }
+    }
+
+    pub fn snapshot(&self) -> DictationTrace {
+        self.state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .payload
+            .clone()
+    }
+
+    /// Store a validated child-reported duration without placing it on the host clock.
+    pub fn record_reported_seconds(&self, stage: Stage, seconds: f64, scope: ReportedScope) {
+        if !seconds.is_finite() || seconds < 0.0 {
+            return;
+        }
+        let millis = (seconds * 1_000.0).round();
+        if !millis.is_finite() || millis < 0.0 || millis > u64::MAX as f64 {
+            return;
+        }
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if self.terminal.load(Ordering::Acquire)
+            || state.sealed_at.is_some()
+            || state.payload.stages.len()
+                + state.payload.reported_stages.len()
+                + state.open_spans.len()
+                >= MAX_TRACE_SPANS
+        {
+            return;
+        }
+        state.payload.reported_stages.push(ReportedStageDuration {
+            stage,
+            duration_ms: millis as u64,
+            scope,
+        });
+    }
+
+    pub fn record_cache_status(&self, status: Option<&str>) {
+        let value = match status {
+            Some("memory_hit") => CacheStatus::MemoryHit,
+            Some("snapshot_hit") => CacheStatus::SnapshotHit,
+            Some("bypassed") => CacheStatus::Bypassed,
+            _ => CacheStatus::Unknown,
+        };
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if !self.terminal.load(Ordering::Acquire) && state.sealed_at.is_none() {
+            state.payload.cache_status = Some(value);
+        }
+    }
+}
+
+fn push_trace_span(
+    state: &mut TraceState,
+    stage: Stage,
+    start: Instant,
+    end: Instant,
+    origin: Instant,
+) {
+    if state.payload.stages.len() >= MAX_TRACE_SPANS {
+        return;
+    }
+    let start_ms = start
+        .saturating_duration_since(origin)
+        .as_millis()
+        .min(u64::MAX as u128) as u64;
+    let duration_ms = end
+        .saturating_duration_since(start)
+        .as_millis()
+        .min(u64::MAX as u128) as u64;
+    let item = (stage, start_ms, duration_ms);
+    let index = state
+        .payload
+        .stages
+        .partition_point(|existing| existing.1 <= start_ms);
+    state.payload.stages.insert(index, item);
+}
+
+impl TraceSpan {
+    pub fn finish(&mut self) {
+        let Some(id) = self.span_id.take() else {
+            return;
+        };
+        let mut state = self.handle.state.lock().unwrap_or_else(|p| p.into_inner());
+        if self.handle.terminal.load(Ordering::Acquire) || state.sealed_at.is_some() {
+            return;
+        }
+        if let Some((stage, started)) = state.open_spans.remove(&id) {
+            let now = Instant::now();
+            let origin = state.origin;
+            push_trace_span(&mut state, stage, started, now, origin);
+        }
+    }
+}
+impl Drop for TraceSpan {
+    fn drop(&mut self) {
+        self.finish();
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -77,7 +334,8 @@ fn safe_label(value: &str) -> String {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum DeliveryOutcome {
     PasteConfirmed,
     PasteUnconfirmed,
@@ -86,6 +344,18 @@ pub enum DeliveryOutcome {
     PreviewOnly,
     Failed,
     Cancelled,
+}
+
+impl DeliveryOutcome {
+    const ALL: [Self; 7] = [
+        Self::PasteConfirmed,
+        Self::PasteUnconfirmed,
+        Self::Copied,
+        Self::HistoryOnly,
+        Self::PreviewOnly,
+        Self::Failed,
+        Self::Cancelled,
+    ];
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -126,11 +396,21 @@ pub struct DiagnosticGroupSummary {
     pub validation: LatencySummary,
     pub paste_submission: LatencySummary,
     pub readback_confirmation: LatencySummary,
+    pub history_journal: LatencySummary,
+    pub capture_spool_flush: LatencySummary,
+    pub retained_history: LatencySummary,
     pub stop_to_insert: LatencySummary,
+    pub stop_to_insert_by_outcome: Vec<OutcomeLatencySummary>,
     pub delivery: DeliveryCounts,
     pub asr_usage: AsrUsageSummary,
     pub fallback_reasons: Vec<NamedCount>,
     pub error_reasons: Vec<NamedCount>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct OutcomeLatencySummary {
+    pub outcome: DeliveryOutcome,
+    pub latency: LatencySummary,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -203,6 +483,9 @@ pub struct LatencyMetrics {
     pub asr: LatencySummary,
     pub cleanup: LatencySummary,
     pub paste: LatencySummary,
+    pub history_journal: LatencySummary,
+    pub capture_spool_flush: LatencySummary,
+    pub retained_history: LatencySummary,
     pub stop_to_insert: LatencySummary,
     pub cleanup_guard_fallbacks: usize,
     pub groups: Vec<DiagnosticGroupSummary>,
@@ -220,6 +503,9 @@ struct MetricSamples {
     asr: VecDeque<u64>,
     cleanup: VecDeque<u64>,
     paste: VecDeque<u64>,
+    history_journal: VecDeque<u64>,
+    capture_spool_flush: VecDeque<u64>,
+    retained_history: VecDeque<u64>,
     stop_to_insert: VecDeque<u64>,
     cleanup_guard_fallbacks: usize,
     groups: BTreeMap<MetricGroup, GroupSamples>,
@@ -228,6 +514,7 @@ struct MetricSamples {
 #[derive(Default)]
 struct GroupSamples {
     latencies: BTreeMap<MetricKind, VecDeque<u64>>,
+    stop_to_insert_by_outcome: BTreeMap<DeliveryOutcome, VecDeque<u64>>,
     delivery: DeliveryCounts,
     asr_usage: AsrUsageSamples,
     fallback_reasons: BTreeMap<String, usize>,
@@ -274,6 +561,8 @@ impl Metrics {
             cancellation,
             started: Instant::now(),
             finished: false,
+            trace: None,
+            terminal_handoff: None,
         }
     }
 
@@ -399,6 +688,9 @@ impl Metrics {
             MetricKind::Asr => push_sample(&mut samples.asr, millis),
             MetricKind::Cleanup => push_sample(&mut samples.cleanup, millis),
             MetricKind::Paste => push_sample(&mut samples.paste, millis),
+            MetricKind::HistoryJournal => push_sample(&mut samples.history_journal, millis),
+            MetricKind::CaptureSpoolFlush => push_sample(&mut samples.capture_spool_flush, millis),
+            MetricKind::RetainedHistory => push_sample(&mut samples.retained_history, millis),
             MetricKind::PasteSubmission
             | MetricKind::Validation
             | MetricKind::ReadbackConfirmation => {}
@@ -421,6 +713,13 @@ impl Metrics {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let millis = elapsed.as_millis().min(u64::MAX as u128) as u64;
+        push_sample(
+            group_samples_mut(&mut samples, group)
+                .stop_to_insert_by_outcome
+                .entry(outcome)
+                .or_default(),
+            millis,
+        );
         if outcome == DeliveryOutcome::PasteConfirmed {
             push_sample(&mut samples.stop_to_insert, millis);
         }
@@ -502,6 +801,9 @@ impl Metrics {
             asr: summarize(&samples.asr),
             cleanup: summarize(&samples.cleanup),
             paste: summarize(&samples.paste),
+            history_journal: summarize(&samples.history_journal),
+            capture_spool_flush: summarize(&samples.capture_spool_flush),
+            retained_history: summarize(&samples.retained_history),
             stop_to_insert: summarize(&samples.stop_to_insert),
             cleanup_guard_fallbacks: samples.cleanup_guard_fallbacks,
             groups,
@@ -547,6 +849,7 @@ fn bounded_sum(total: f64, amount: f64) -> f64 {
 
 #[derive(Clone)]
 pub struct AsrRequestDiagnostics {
+    trace: Option<crate::research_trace::Trace>,
     metrics: Metrics,
     group: MetricGroup,
 }
@@ -562,10 +865,20 @@ impl std::fmt::Debug for AsrRequestDiagnostics {
 
 impl AsrRequestDiagnostics {
     pub fn new(metrics: Metrics, group: MetricGroup) -> Self {
-        Self { metrics, group }
+        Self {
+            metrics,
+            group,
+            trace: crate::research_trace::current(),
+        }
     }
 
     pub fn record_request(&self, duration_secs: Option<f64>) {
+        crate::research_trace::asr_attempt(
+            self.trace.as_ref(),
+            &self.group.provider,
+            &self.group.model,
+            &self.group.path,
+        );
         self.metrics.record_asr_request(&self.group, duration_secs);
     }
 
@@ -590,6 +903,12 @@ impl AsrRequestDiagnostics {
     }
 
     pub fn begin_stream(&self) -> AsrStreamAttemptGuard {
+        crate::research_trace::asr_attempt(
+            self.trace.as_ref(),
+            &self.group.provider,
+            &self.group.model,
+            &self.group.path,
+        );
         self.metrics.record_asr_stream_attempt(&self.group);
         AsrStreamAttemptGuard {
             diagnostics: self.clone(),
@@ -678,7 +997,21 @@ fn summarize_group(key: &MetricGroup, group: &GroupSamples) -> DiagnosticGroupSu
         validation: summary(MetricKind::Validation),
         paste_submission: summary(MetricKind::PasteSubmission),
         readback_confirmation: summary(MetricKind::ReadbackConfirmation),
+        history_journal: summary(MetricKind::HistoryJournal),
+        capture_spool_flush: summary(MetricKind::CaptureSpoolFlush),
+        retained_history: summary(MetricKind::RetainedHistory),
         stop_to_insert: summary(MetricKind::StopToInsert),
+        stop_to_insert_by_outcome: DeliveryOutcome::ALL
+            .into_iter()
+            .map(|outcome| OutcomeLatencySummary {
+                outcome,
+                latency: group
+                    .stop_to_insert_by_outcome
+                    .get(&outcome)
+                    .map(summarize)
+                    .unwrap_or_default(),
+            })
+            .collect(),
         delivery: group.delivery.clone(),
         asr_usage: AsrUsageSummary {
             request_count: group.asr_usage.request_count,
@@ -759,9 +1092,67 @@ pub struct StopToInsertTimer {
     cancellation: CancellationToken,
     started: Instant,
     finished: bool,
+    trace: Option<TraceHandle>,
+    terminal_handoff: Option<TerminalHandoff>,
 }
 
+type TerminalHandoff = Box<dyn FnOnce(DictationTrace, DeliveryOutcome, u64) + Send>;
+
 impl StopToInsertTimer {
+    pub(crate) fn bind_terminal_handoff(
+        &mut self,
+        handoff: impl FnOnce(DictationTrace, DeliveryOutcome, u64) + Send + 'static,
+    ) {
+        self.terminal_handoff = Some(Box::new(handoff));
+    }
+
+    fn terminal_snapshot(
+        &mut self,
+        outcome: DeliveryOutcome,
+        terminal_at: Instant,
+        elapsed_ms: u64,
+    ) {
+        if let Some(trace) = self.trace.take() {
+            let snapshot = trace.try_seal_snapshot_at(terminal_at);
+            if let (Some(handoff), Some(snapshot)) = (self.terminal_handoff.take(), snapshot) {
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    handoff(snapshot, outcome, elapsed_ms)
+                }));
+            }
+        } else {
+            self.terminal_handoff.take();
+        }
+    }
+
+    #[cfg(test)]
+    pub fn elapsed(&self) -> Duration {
+        self.started.elapsed()
+    }
+
+    pub fn bind_trace(&mut self, generation: u64) -> TraceHandle {
+        let trace = TraceHandle {
+            state: Arc::new(Mutex::new(TraceState {
+                origin: self.started,
+                payload: DictationTrace {
+                    session_generation: generation,
+                    stages: Vec::new(),
+                    reported_stages: Vec::new(),
+                    cache_status: None,
+                    class: DictationClass::Unclassified,
+                },
+                sealed_at: None,
+                next_span_id: 0,
+                open_spans: BTreeMap::new(),
+            })),
+            terminal: Arc::new(AtomicBool::new(false)),
+        };
+        self.trace = Some(trace.clone());
+        trace
+    }
+    pub fn trace_handle(&self) -> Option<TraceHandle> {
+        self.trace.clone()
+    }
+
     pub fn set_group(&mut self, group: MetricGroup) {
         self.group = group;
     }
@@ -771,8 +1162,12 @@ impl StopToInsertTimer {
             return;
         }
         self.finished = true;
+        let terminal_at = Instant::now();
+        let elapsed = terminal_at.saturating_duration_since(self.started);
+        let elapsed_ms = elapsed.as_millis().min(u64::MAX as u128) as u64;
+        self.terminal_snapshot(outcome, terminal_at, elapsed_ms);
         self.metrics
-            .record_delivery(&self.group, outcome, reason, self.started.elapsed());
+            .record_delivery(&self.group, outcome, reason, elapsed);
     }
 }
 
@@ -786,6 +1181,10 @@ impl Drop for StopToInsertTimer {
         } else {
             DeliveryOutcome::Failed
         };
+        let terminal_at = Instant::now();
+        let elapsed = terminal_at.saturating_duration_since(self.started);
+        let elapsed_ms = elapsed.as_millis().min(u64::MAX as u128) as u64;
+        self.terminal_snapshot(outcome, terminal_at, elapsed_ms);
         self.metrics.record_delivery(
             &self.group,
             outcome,
@@ -794,7 +1193,7 @@ impl Drop for StopToInsertTimer {
             } else {
                 "processing_failed"
             }),
-            self.started.elapsed(),
+            elapsed,
         );
     }
 }
@@ -820,6 +1219,17 @@ fn percentile(sorted: &[u64], percent: usize) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lmstudio_status_probe_stage_has_strict_snake_case_wire_name() {
+        let encoded = serde_json::to_string(&Stage::LmStudioStatusProbe).unwrap();
+        assert_eq!(encoded, "\"lm_studio_status_probe\"");
+        assert_eq!(
+            serde_json::from_str::<Stage>(&encoded).unwrap(),
+            Stage::LmStudioStatusProbe
+        );
+        assert!(serde_json::from_str::<Stage>("\"lmstudio_status_probe\"").is_err());
+    }
 
     #[test]
     fn reports_percentiles_and_keeps_samples_bounded() {
@@ -854,6 +1264,219 @@ mod tests {
     }
 
     #[test]
+    fn slow_unconfirmed_delivery_counts_in_per_outcome_stop_to_insert() {
+        let metrics = Metrics::default();
+        let group = MetricGroup::unknown("dictation");
+        metrics.record_delivery(
+            &group,
+            DeliveryOutcome::PasteUnconfirmed,
+            Some("readback_mismatch"),
+            Duration::from_millis(840),
+        );
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.stop_to_insert.sample_count, 0);
+        let serialized = serde_json::to_value(snapshot).expect("metrics serialize");
+        let unconfirmed = serialized["groups"][0]["stop_to_insert_by_outcome"]
+            .as_array()
+            .and_then(|outcomes| {
+                outcomes
+                    .iter()
+                    .find(|entry| entry["outcome"] == "paste_unconfirmed")
+            })
+            .expect("unconfirmed outcome has its own latency series");
+        assert_eq!(unconfirmed["latency"]["p50_ms"], 840);
+    }
+
+    #[test]
+    fn confirmed_only_stop_to_insert_unchanged() {
+        let metrics = Metrics::default();
+        let group = MetricGroup::unknown("dictation");
+        for (outcome, millis) in [
+            (DeliveryOutcome::PasteConfirmed, 10),
+            (DeliveryOutcome::PasteUnconfirmed, 20),
+            (DeliveryOutcome::Failed, 30),
+            (DeliveryOutcome::Cancelled, 40),
+            (DeliveryOutcome::PasteConfirmed, 50),
+        ] {
+            metrics.record_delivery(&group, outcome, None, Duration::from_millis(millis));
+        }
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.stop_to_insert.sample_count, 2);
+        assert_eq!(snapshot.stop_to_insert.p50_ms, Some(10));
+        assert_eq!(snapshot.stop_to_insert.p95_ms, Some(50));
+        assert_eq!(snapshot.groups[0].stop_to_insert.sample_count, 2);
+        assert_eq!(snapshot.groups[0].stop_to_insert_by_outcome.len(), 7);
+        assert_eq!(
+            snapshot.groups[0]
+                .stop_to_insert_by_outcome
+                .iter()
+                .map(|summary| summary.latency.sample_count)
+                .sum::<usize>(),
+            5
+        );
+    }
+
+    #[test]
+    fn stop_to_insert_outcome_timer_records_explicit_and_drop_once() {
+        let metrics = Metrics::default();
+        let group = MetricGroup::unknown("dictation");
+        metrics
+            .stop_to_insert(group.clone(), CancellationToken::new())
+            .finish(DeliveryOutcome::Copied, None);
+        drop(metrics.stop_to_insert(group, CancellationToken::new()));
+
+        let summaries = &metrics.snapshot().groups[0].stop_to_insert_by_outcome;
+        assert_eq!(
+            summaries
+                .iter()
+                .find(|summary| summary.outcome == DeliveryOutcome::Copied)
+                .unwrap()
+                .latency
+                .sample_count,
+            1
+        );
+        assert_eq!(
+            summaries
+                .iter()
+                .find(|summary| summary.outcome == DeliveryOutcome::Failed)
+                .unwrap()
+                .latency
+                .sample_count,
+            1
+        );
+    }
+
+    #[test]
+    fn cancelled_stop_to_insert_drop_is_counted_once_and_bounded() {
+        let metrics = Metrics::default();
+        let group = MetricGroup::unknown("dictation");
+        let cancellation = CancellationToken::new();
+        let timer = metrics.stop_to_insert(group.clone(), cancellation.clone());
+        cancellation.cancel();
+        drop(timer);
+        for sample in 0..(MAX_SAMPLES_PER_STAGE + 2) {
+            metrics.record_delivery(
+                &group,
+                DeliveryOutcome::PasteUnconfirmed,
+                None,
+                Duration::from_millis(sample as u64),
+            );
+        }
+
+        let summaries = &metrics.snapshot().groups[0].stop_to_insert_by_outcome;
+        assert_eq!(
+            summaries
+                .iter()
+                .find(|summary| summary.outcome == DeliveryOutcome::Cancelled)
+                .unwrap()
+                .latency
+                .sample_count,
+            1
+        );
+        assert_eq!(
+            summaries
+                .iter()
+                .find(|summary| summary.outcome == DeliveryOutcome::PasteUnconfirmed)
+                .unwrap()
+                .latency
+                .sample_count,
+            MAX_SAMPLES_PER_STAGE
+        );
+    }
+
+    #[test]
+    fn dictation_trace_uses_typed_content_free_stages_and_class() {
+        let trace = DictationTrace {
+            session_generation: 17,
+            stages: vec![(Stage::QueueWait, 20, 4), (Stage::Paste, 30, 5)],
+            reported_stages: Vec::new(),
+            cache_status: Some(CacheStatus::SnapshotHit),
+            class: DictationClass::FirstAfterLaunch,
+        };
+        let serialized = serde_json::to_value(trace).expect("trace serializes");
+        assert_eq!(serialized["session_generation"], 17);
+        assert_eq!(serialized["class"], "first_after_launch");
+        assert_eq!(serialized["cache_status"], "snapshot_hit");
+        assert_eq!(
+            serialized["stages"][0],
+            serde_json::json!(["queue_wait", 20, 4])
+        );
+    }
+
+    #[test]
+    fn trace_span_third_value_is_duration_not_end_offset() {
+        let origin = Instant::now();
+        let start = origin + Duration::from_millis(5);
+        let end = origin + Duration::from_millis(15);
+        let mut state = TraceState {
+            origin,
+            payload: DictationTrace {
+                session_generation: 1,
+                stages: Vec::new(),
+                reported_stages: Vec::new(),
+                cache_status: None,
+                class: DictationClass::Unclassified,
+            },
+            sealed_at: None,
+            next_span_id: 0,
+            open_spans: BTreeMap::new(),
+        };
+
+        push_trace_span(&mut state, Stage::QueueWait, start, end, origin);
+
+        assert_eq!(state.payload.stages, vec![(Stage::QueueWait, 5, 10)]);
+    }
+
+    #[test]
+    fn reported_timing_is_bounded_validated_and_sealed_without_host_offsets() {
+        let mut timer = Metrics::default()
+            .stop_to_insert(MetricGroup::unknown("trace_test"), CancellationToken::new());
+        let trace = timer.bind_trace(23);
+        trace.record_reported_seconds(Stage::Prefill, 0.125, ReportedScope::Unknown);
+        trace.record_reported_seconds(Stage::Decode, f64::NAN, ReportedScope::Generation);
+        trace.record_reported_seconds(Stage::Decode, -1.0, ReportedScope::Generation);
+        assert!(trace.snapshot().stages.is_empty());
+        let snapshot = trace.snapshot();
+        assert_eq!(snapshot.session_generation, 23);
+        assert_eq!(snapshot.reported_stages.len(), 1);
+        assert_eq!(snapshot.reported_stages[0].stage, Stage::Prefill);
+        assert_eq!(snapshot.reported_stages[0].duration_ms, 125);
+        assert_eq!(snapshot.reported_stages[0].scope, ReportedScope::Unknown);
+        trace.record_cache_status(Some("unrecognized-status"));
+        assert_eq!(trace.snapshot().cache_status, Some(CacheStatus::Unknown));
+        for _ in 0..MAX_TRACE_SPANS {
+            trace.record_reported_seconds(Stage::Decode, 0.001, ReportedScope::Generation);
+        }
+        let mut late = trace.begin(Stage::Paste);
+        late.finish();
+        let bounded = trace.snapshot();
+        assert_eq!(bounded.reported_stages.len(), MAX_TRACE_SPANS);
+        assert!(bounded.stages.is_empty());
+        timer.finish(DeliveryOutcome::PasteUnconfirmed, None);
+        trace.record_reported_seconds(Stage::Decode, 1.0, ReportedScope::Generation);
+        assert_eq!(trace.snapshot().reported_stages.len(), MAX_TRACE_SPANS);
+
+        let mut combined_timer = Metrics::default().stop_to_insert(
+            MetricGroup::unknown("combined_trace_test"),
+            CancellationToken::new(),
+        );
+        let combined = combined_timer.bind_trace(24);
+        let mut host = combined.begin(Stage::QueueWait);
+        host.finish();
+        for _ in 0..MAX_TRACE_SPANS {
+            combined.record_reported_seconds(Stage::Decode, 0.001, ReportedScope::Generation);
+        }
+        assert_eq!(combined.snapshot().stages.len(), 1);
+        assert_eq!(
+            combined.snapshot().reported_stages.len(),
+            MAX_TRACE_SPANS - 1
+        );
+        combined_timer.finish(DeliveryOutcome::PasteUnconfirmed, None);
+    }
+
+    #[test]
     fn prefetch_and_final_asr_are_reported_separately() {
         let metrics = Metrics::default();
         let group = MetricGroup::unknown("dictation");
@@ -871,5 +1494,75 @@ mod tests {
         metrics.record_cleanup_guard_fallback();
         metrics.record_cleanup_guard_fallback();
         assert_eq!(metrics.snapshot().cleanup_guard_fallbacks, 2);
+    }
+
+    #[test]
+    fn sealed_trace_rejects_late_generation_work() {
+        let metrics = Metrics::default();
+        let mut timer_n =
+            metrics.stop_to_insert(MetricGroup::unknown("test"), CancellationToken::new());
+        let trace_n = timer_n.bind_trace(10);
+        let mut old = trace_n.begin(Stage::QueueWait);
+        trace_n.try_seal_snapshot_at(Instant::now()).unwrap();
+        let frozen = trace_n.snapshot();
+        let mut timer_next =
+            metrics.stop_to_insert(MetricGroup::unknown("test"), CancellationToken::new());
+        let trace_next = timer_next.bind_trace(11);
+        let mut newer = trace_next.begin(Stage::FileValidation);
+        old.finish();
+        drop(old);
+        trace_n.record_reported_seconds(Stage::Decode, 0.25, ReportedScope::Generation);
+        trace_n.record_cache_status(Some("memory_hit"));
+        assert_eq!(trace_n.snapshot(), frozen);
+        newer.finish();
+        assert_eq!(trace_next.snapshot().session_generation, 11);
+        assert_ne!(trace_next.snapshot(), frozen);
+    }
+
+    #[test]
+    fn terminal_fence_seals_without_sink_and_when_payload_lock_is_busy() {
+        let metrics = Metrics::default();
+        let mut no_sink_timer =
+            metrics.stop_to_insert(MetricGroup::unknown("no_sink"), CancellationToken::new());
+        let no_sink_trace = no_sink_timer.bind_trace(31);
+        no_sink_timer.finish(DeliveryOutcome::PasteUnconfirmed, None);
+        no_sink_trace.record_reported_seconds(Stage::Decode, 0.25, ReportedScope::Generation);
+        no_sink_trace.record_cache_status(Some("memory_hit"));
+        assert!(no_sink_trace.begin(Stage::Paste).span_id.is_none());
+        assert!(no_sink_trace.snapshot().reported_stages.is_empty());
+        assert_eq!(no_sink_trace.snapshot().cache_status, None);
+
+        let mut busy_timer =
+            metrics.stop_to_insert(MetricGroup::unknown("busy_trace"), CancellationToken::new());
+        let busy_trace = busy_timer.bind_trace(32);
+        let payload_guard = busy_trace.state.lock().unwrap();
+        busy_timer.finish(DeliveryOutcome::PasteUnconfirmed, None);
+        drop(payload_guard);
+        busy_trace.record_reported_seconds(Stage::Decode, 0.25, ReportedScope::Generation);
+        busy_trace.record_cache_status(Some("snapshot_hit"));
+        assert!(busy_trace.begin(Stage::Paste).span_id.is_none());
+        assert!(busy_trace.snapshot().reported_stages.is_empty());
+        assert_eq!(busy_trace.snapshot().cache_status, None);
+    }
+
+    #[test]
+    fn terminal_handoff_uses_one_instant_for_open_span_and_elapsed() {
+        let metrics = Metrics::default();
+        let mut timer = metrics.stop_to_insert(
+            MetricGroup::unknown("terminal_instant"),
+            CancellationToken::new(),
+        );
+        let trace = timer.bind_trace(33);
+        let _open = trace.begin(Stage::AsrInference);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        timer.bind_terminal_handoff(move |snapshot, _, total_ms| {
+            sender.send((snapshot, total_ms)).unwrap();
+        });
+        timer.finish(DeliveryOutcome::PasteConfirmed, None);
+        let (snapshot, total_ms) = receiver.recv().unwrap();
+        assert_eq!(snapshot.stages.len(), 1);
+        let (_, offset_ms, duration_ms) = snapshot.stages[0];
+        assert!(offset_ms + duration_ms <= total_ms);
+        assert_eq!(metrics.snapshot().stop_to_insert.sample_count, 1);
     }
 }

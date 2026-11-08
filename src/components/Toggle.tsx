@@ -1,5 +1,6 @@
 import type { ButtonHTMLAttributes } from "react";
 import { focusRingClass, radius } from "../lib/theme";
+import { useControlDescription } from "../lib/controlDescription";
 
 type ToggleProps = Omit<ButtonHTMLAttributes<HTMLButtonElement>, "children" | "onChange" | "type"> & {
   checked: boolean;
@@ -9,12 +10,14 @@ type ToggleProps = Omit<ButtonHTMLAttributes<HTMLButtonElement>, "children" | "o
 
 /** A consistent binary setting control with native switch semantics. */
 export function Toggle({ checked, onChange, label, className = "", ...props }: ToggleProps) {
+  const description = useControlDescription(props["aria-describedby"]);
   return (
     <button
       {...props}
       type="button"
       role="switch"
       aria-label={label}
+      aria-describedby={description}
       aria-checked={checked}
       onClick={() => onChange(!checked)}
       className={`group relative inline-flex h-7 w-12 shrink-0 items-center ${radius.pill} outline-none transition-colors duration-150 motion-reduce:transition-none ${focusRingClass} disabled:cursor-not-allowed disabled:opacity-50 ${className}`}

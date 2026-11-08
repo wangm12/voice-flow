@@ -30,8 +30,8 @@
         "label": "island",
         "title": "VoiceFlow",
         "url": "island.html",
-        "width": 172,
-        "height": 68,
+        "width": 244,
+        "height": 64,
         "transparent": true,
         "shadow": false,
         "decorations": false,
@@ -39,6 +39,7 @@
         "visibleOnAllWorkspaces": true,
         "skipTaskbar": true,
         "focusable": false,
+        "acceptFirstMouse": true,
         "resizable": false,
         "visible": false
       }

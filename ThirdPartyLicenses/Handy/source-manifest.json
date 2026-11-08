@@ -1,0 +1,53 @@
+{
+  "artifact_type": "voiceflow-handy-component-attribution-manifest",
+  "components": [
+    {
+      "attribution_comment_lines": "1-3",
+      "bytes": 1668,
+      "project_path": "src/components/Onboarding/ModelCard.tsx",
+      "sha256": "d2091c93cf6934a63bf67d7b16e80ae6d83122da7f1a726db55364d2b1f78675",
+      "upstream_commit": "14f6f0d31cb22a4268acfbddba3052820fd0a06e"
+    },
+    {
+      "attribution_comment_lines": "1-3",
+      "bytes": 3377,
+      "project_path": "src/components/Onboarding/PermissionGuide.tsx",
+      "sha256": "d87181ac89e9bbf10b76228db82455f8943cf20333295fa841b93c192c7f6efc",
+      "upstream_commit": "14f6f0d31cb22a4268acfbddba3052820fd0a06e"
+    },
+    {
+      "attribution_comment_lines": "1-3",
+      "bytes": 3214,
+      "project_path": "src/components/Onboarding/MicrophoneSelector.tsx",
+      "sha256": "ca4098459c7ee325e0db030d83434dc728199dc5085a0ea9bfaf2c9f50878e0e",
+      "upstream_commit": "14f6f0d31cb22a4268acfbddba3052820fd0a06e"
+    }
+  ],
+  "license": {
+    "bytes": 1064,
+    "copyright_line": "Copyright (c) 2025 CJ Pais",
+    "expression": "MIT",
+    "output_path": "ThirdPartyLicenses/Handy/HANDY-LICENSE.txt",
+    "sha256": "3564e8ec14055ed54f896e8660a62627ea4fc3a1b64f72b798593df00e1f4edc",
+    "source_project_path": "src/components/Onboarding/HANDY-LICENSE.txt"
+  },
+  "outputs": [
+    {
+      "bytes": 527,
+      "path": "ThirdPartyLicenses/Handy/NOTICE.md",
+      "sha256": "cab5dae2ff0eeefda8cf7cbc89e419179868d5f6a7915a383975b4bd46eda2fc"
+    },
+    {
+      "bytes": 1064,
+      "path": "ThirdPartyLicenses/Handy/HANDY-LICENSE.txt",
+      "sha256": "3564e8ec14055ed54f896e8660a62627ea4fc3a1b64f72b798593df00e1f4edc"
+    }
+  ],
+  "schema_version": 1,
+  "upstream": {
+    "commit": "14f6f0d31cb22a4268acfbddba3052820fd0a06e",
+    "commit_url": "https://github.com/cjpais/Handy/commit/14f6f0d31cb22a4268acfbddba3052820fd0a06e",
+    "repository": "https://github.com/cjpais/Handy",
+    "scope": "Only the three adapted onboarding components below; no claim of wholesale source copying."
+  }
+}

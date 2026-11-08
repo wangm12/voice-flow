@@ -35,11 +35,3 @@
   font-weight: 650;
   letter-spacing: -0.04em;
 }
-
-.vf-particle-text--subtitle {
-  color: var(--color-secondary);
-  font-size: clamp(12px, 1.55vw, 15px);
-  font-weight: 400;
-  letter-spacing: -0.01em;
-  white-space: nowrap;
-}

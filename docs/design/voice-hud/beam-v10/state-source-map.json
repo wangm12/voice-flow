@@ -1,0 +1,132 @@
+{
+  "counts": {
+    "dictation": 12,
+    "phase": 8,
+    "capture": 7,
+    "recovery": 4,
+    "selected_action": 6,
+    "delivery_reason": 40,
+    "backend_reason": 7,
+    "cleanup_failure": 9
+  },
+  "visualCases": 60,
+  "coverage": {
+    "dictation": {
+      "idle": "idle",
+      "starting": "starting",
+      "recording": "recording-airpods",
+      "recording_limited": "recording-limit",
+      "processing": "processing",
+      "rate_limited": "retry-wait",
+      "done": "success",
+      "unverified": "input-unverified",
+      "copied": "copied",
+      "degraded": "partial-result",
+      "history": "history-only",
+      "error": "service-unavailable"
+    },
+    "phase": {
+      "finalizing_audio": "processing",
+      "asr": "processing",
+      "soniox_recovery": "processing",
+      "cascade_accurate": "processing",
+      "cleanup": "processing",
+      "delivery": "processing",
+      "idle": "processing",
+      "waiting_retry": "retry-wait"
+    },
+    "capture": {
+      "waiting_first_frame": "mic-waiting",
+      "receiving_audio": "recording-airpods",
+      "no_audio_yet": "mic-empty",
+      "no_recent_audio": "mic-stale",
+      "device_error": "mic-interrupted",
+      "unavailable": "mic-unavailable",
+      "no_speech": "no-speech"
+    },
+    "recovery": {
+      "history_saved": "audio-saved",
+      "audio_retained": "audio-retained",
+      "unknown_failure": "audio-unknown",
+      "no_audio": "mic-unavailable"
+    },
+    "selected_action": {
+      "waiting_for_selection": "wait-selection",
+      "listening": "selected-listening",
+      "preparing_rewrite": "selected-processing",
+      "accessibility_required": "accessibility",
+      "replaced": "selected-replaced",
+      "copied_instead": "selected-copied"
+    },
+    "delivery_reason": {
+      "delivery_failed": "paste-failed",
+      "delivery_cancelled": "cancelled",
+      "history_save_failed": "storage-full",
+      "history_save_failed_recovery_kept": "audio-retained",
+      "microphone_required": "mic-permission",
+      "audio_error": "mic-interrupted",
+      "no_speech": "no-speech",
+      "accessibility_required": "accessibility",
+      "browser_permission_required": "browser-permission",
+      "secure_input": "secure-input",
+      "input_unavailable": "no-input",
+      "input_changed": "input-changed",
+      "target_changed": "target-changed",
+      "target_unavailable": "target-unknown",
+      "paste_failed": "paste-failed",
+      "retry_clipboard_only": "copied",
+      "retry_clipboard_changed": "clipboard-changed",
+      "retry_clipboard_ownership_unverified": "clipboard-unknown",
+      "retry_clipboard_write_failed": "clipboard-unknown",
+      "reclean_clipboard_only": "copied",
+      "reclean_clipboard_changed": "clipboard-changed",
+      "reclean_clipboard_ownership_unverified": "clipboard-unknown",
+      "reclean_clipboard_write_failed": "clipboard-unknown",
+      "reclean_copy_not_attempted": "history-only",
+      "paste_unverified": "input-unverified",
+      "paste_shortcut_outcome_unknown": "input-unverified",
+      "paste_expected_splice_unavailable": "input-unverified",
+      "paste_target_unconfirmed_after_attempt": "input-unverified",
+      "paste_focus_unconfirmed_after_attempt": "input-unverified",
+      "paste_target_changed_after_attempt": "input-unverified",
+      "paste_focus_changed_after_attempt": "input-unverified",
+      "paste_readback_unavailable": "input-unverified",
+      "paste_readback_mismatch": "input-unverified",
+      "selected_action_clipboard_fallback": "selected-copied",
+      "clipboard_changed": "clipboard-changed",
+      "clipboard_ownership_unverified": "clipboard-unknown",
+      "clipboard_unavailable": "clipboard-failed",
+      "clipboard_write_failed": "clipboard-failed",
+      "keyboard_paste_failed": "paste-failed",
+      "paste_mutation_uncertain": "input-unverified"
+    },
+    "backend_reason": {
+      "api_key_required": "service-key",
+      "onboarding_required": "setup-required",
+      "processing_timeout": "asr-timeout",
+      "dictation_error": "service-unavailable",
+      "llm_cleanup_empty": "cleanup-fallback",
+      "preservation_guard": "cleanup-guard",
+      "local_processing_timeout": "asr-timeout"
+    },
+    "cleanup_failure": {
+      "network": "offline",
+      "timeout": "cleanup-fallback",
+      "context_authorization_changed": "cleanup-fallback",
+      "unauthorized": "service-key",
+      "rate_limited": "retry-wait",
+      "server": "service-unavailable",
+      "guard": "cleanup-guard",
+      "local_native": "model-missing",
+      "other": "service-unavailable"
+    }
+  },
+  "sources": [
+    "src/components/Island/hudOrb.ts",
+    "src/components/Island/IslandWindow.tsx",
+    "src/components/Island/voicePillTokens.ts",
+    "src/lib/deliveryCopy.ts",
+    "src-tauri/src/lib.rs",
+    "src-tauri/src/llm.rs"
+  ]
+}

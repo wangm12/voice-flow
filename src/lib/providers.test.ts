@@ -26,7 +26,7 @@ describe("provider catalog", () => {
       "on_device",
       "custom",
     ]);
-    expect(llm).toEqual(["groq", "openai", "siliconflow", "deepseek", "anthropic", "ollama", "custom"]);
+    expect(llm).toEqual(["groq", "openai", "siliconflow", "deepseek", "anthropic", "ollama", "lmstudio", "on_device_mlx", "custom"]);
     expect(asr).not.toContain("deepseek");
     expect(asr).not.toContain("anthropic");
     expect(llm).not.toContain("deepgram");
@@ -42,6 +42,7 @@ describe("provider catalog", () => {
     expect(inferProviderFromHost("https://api.openai.com/v1")).toBe("openai");
     expect(inferProviderFromHost("https://api.deepseek.com")).toBe("deepseek");
     expect(inferProviderFromHost("http://127.0.0.1:11434/v1")).toBe("ollama");
+    expect(inferProviderFromHost("http://127.0.0.1:1234")).toBeNull();
     expect(inferProviderFromHost("http://localhost:9000/v1")).toBe("local_whisper");
     expect(inferProviderFromHost("https://relay.example.com/v1")).toBeNull();
     expect(inferProviderFromHost("http://127.0.0.1:8080/v1")).not.toBe("on_device");
@@ -58,6 +59,27 @@ describe("provider catalog", () => {
     expect(defaultModel("on_device", "asr")).toBe("qwen3-asr-0.6b");
     expect(providersFor("asr").map((provider) => provider.id)).toContain("on_device");
     expect(providersFor("llm").map((provider) => provider.id)).not.toContain("on_device");
+  });
+
+  it("lists LM Studio as an explicit native cleanup provider without host inference", () => {
+    const provider = PROVIDERS.find((item) => item.id === "lmstudio");
+    expect(provider?.protocol).toBe("lmstudio_native");
+    expect(provider?.capabilities).toEqual(["llm"]);
+    expect(provider?.allowsEmptyKey).toBe(true);
+    expect(provider?.defaultLlmModel).toBe("qwen/qwen3.8-27b@6bit");
+    expect(provider?.llmModels[0]?.label).toBe("Qwen 3.8 27B · MLX 6-bit");
+    expect(inferProviderFromHost("http://localhost:1234")).toBeNull();
+  });
+
+  it("lists VoiceFlow MLX as a distinct local cleanup provider", () => {
+    const provider = PROVIDERS.find((item) => item.id === "on_device_mlx");
+    expect(provider?.protocol).toBe("on_device_mlx_local");
+    expect(provider?.capabilities).toEqual(["llm"]);
+    expect(provider?.allowsEmptyKey).toBe(true);
+    expect(provider?.defaultBaseUrl).toBe("");
+    expect(provider?.defaultLlmModel).toBe("qwen3_8_27b_mlx_6bit");
+    expect(provider?.llmModels[0]?.label).toBe("Qwen 3.8 27B · MLX 6-bit");
+    expect(providersFor("asr").map((item) => item.id)).not.toContain("on_device_mlx");
   });
 
   it("treats loopback hosts as empty-key eligible", () => {
@@ -109,5 +131,17 @@ describe("provider catalog", () => {
       expect(model?.note).toContain("2026-08-16");
     }
     expect(groq?.llmModels.find((item) => item.value === "openai/gpt-oss-20b")?.retiredForNewSelection).toBeUndefined();
+    const qwen = groq?.llmModels.find((item) => item.value === "qwen/qwen3.8-27b");
+    expect(qwen?.label).toBe("Qwen 3.8 27B");
+    expect(qwen?.note).toContain("不同构建");
+    expect(isKnownModel("groq", "llm", "qwen/qwen3.8-27b")).toBe(true);
+  });
+
+  it("retires Groq Distil-Whisper for new selections while keeping saved IDs valid", () => {
+    const distil = PROVIDERS.find((provider) => provider.id === "groq")?.asrModels.find(
+      (item) => item.value === "distil-whisper-large-v3-en",
+    );
+    expect(isKnownModel("groq", "asr", "distil-whisper-large-v3-en")).toBe(true);
+    expect(distil?.retiredForNewSelection).toBe(true);
   });
 });

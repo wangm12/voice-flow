@@ -1,0 +1,138 @@
+{
+  "artifact_type": "voiceflow_learning_episode_fixture",
+  "schema_version": 2,
+  "episode": {
+    "schema_version": 2,
+    "ttl_ms": 120000,
+    "episode_id": "60000000-0000-4000-8000-000000000001",
+    "arm_state_id": "60000000-0000-4000-8000-000000000002",
+    "selected_state_id": "60000000-0000-4000-8000-000000000003",
+    "baseline_run": null,
+    "edit_fixture_id": "60000000-0000-4000-8000-000000000004",
+    "purpose": "correction",
+    "source": {
+      "kind": "deterministic_text",
+      "fixture_id": "60000000-0000-4000-8000-000000000005",
+      "sha256": "3f0bcb4e1ff2a68c6521bffd2e85e1a286cfcd07c4006dded09cab54e9ac307a",
+      "byte_length": 21,
+      "rights": "synthetic"
+    },
+    "source_text_learning_authorized": true,
+    "learning_authorized": true,
+    "actor": "programmatic_fixture",
+    "authorized_text_layers": ["source", "post_insert", "settled"],
+    "edit_states": [
+      {
+        "sequence": 0,
+        "state_id": "60000000-0000-4000-8000-000000000006",
+        "layer": "post_insert",
+        "sha256": "3f0bcb4e1ff2a68c6521bffd2e85e1a286cfcd07c4006dded09cab54e9ac307a",
+        "byte_length": 21
+      },
+      {
+        "sequence": 1,
+        "state_id": "60000000-0000-4000-8000-000000000007",
+        "layer": "settled",
+        "sha256": "99f0448cfc84c2caf72365cc3f62cca67adfbebb6d3d62f877bd811c03233602",
+        "byte_length": 21
+      },
+      {
+        "sequence": 2,
+        "state_id": "60000000-0000-4000-8000-000000000008",
+        "layer": "settled",
+        "sha256": "a8a50d4c7cae7ab66f4d31dc3a217da63f96aa9a20059c3288558adad703de28",
+        "byte_length": 22
+      },
+      {
+        "sequence": 3,
+        "state_id": "60000000-0000-4000-8000-000000000009",
+        "layer": "settled",
+        "sha256": "1d0566abbd5aee36bf5be428dccf137ee07d09dba5c1c55bd0416917048b3505",
+        "byte_length": 23
+      },
+      {
+        "sequence": 4,
+        "state_id": "60000000-0000-4000-8000-000000000010",
+        "layer": "settled",
+        "sha256": "1c1c12a9274c3d147069390c9491fd1a11dd2760f3e5aed7842844b1f52daa06",
+        "byte_length": 23
+      },
+      {
+        "sequence": 5,
+        "state_id": "60000000-0000-4000-8000-000000000011",
+        "layer": "settled",
+        "sha256": "1f56c9370b2287f324c9b1d2e8bbb19f567b5d281b672c12d9b6878528da6d0d",
+        "byte_length": 22
+      }
+    ],
+    "scope": {
+      "mapping_id": "controlled-learning-trajectory",
+      "family": "general",
+      "native_bundle": "com.example.learning-trajectory-fixture"
+    },
+    "local_only_grant": true,
+    "target_oracle": "none",
+    "terms": [
+      {
+        "fixture_id": "60000000-0000-4000-8000-000000000012",
+        "before": "VoiceFlo",
+        "after": "VoiceFlow"
+      }
+    ],
+    "operations": [
+      {
+        "operation_id": "60000000-0000-4000-8000-000000000013",
+        "source_sha256": "3f0bcb4e1ff2a68c6521bffd2e85e1a286cfcd07c4006dded09cab54e9ac307a",
+        "settled_state_sha256": "1f56c9370b2287f324c9b1d2e8bbb19f567b5d281b672c12d9b6878528da6d0d",
+        "term_fixture_id": "60000000-0000-4000-8000-000000000012"
+      }
+    ]
+  },
+  "apply_text_template": {
+    "op": "apply_text",
+    "operation": {
+      "episode_id": "60000000-0000-4000-8000-000000000001",
+      "operation_id": "60000000-0000-4000-8000-000000000013",
+      "source_fixture_id": "60000000-0000-4000-8000-000000000005",
+      "states": [
+        {
+          "sequence": 0,
+          "state_id": "60000000-0000-4000-8000-000000000006",
+          "layer": "post_insert",
+          "text": "we saw VoiceFlo today"
+        },
+        {
+          "sequence": 1,
+          "state_id": "60000000-0000-4000-8000-000000000007",
+          "layer": "settled",
+          "text": "we saw VoiceFio today"
+        },
+        {
+          "sequence": 2,
+          "state_id": "60000000-0000-4000-8000-000000000008",
+          "layer": "settled",
+          "text": "we saw VoiceFlo! today"
+        },
+        {
+          "sequence": 3,
+          "state_id": "60000000-0000-4000-8000-000000000009",
+          "layer": "settled",
+          "text": "we saw VoiceFlow! today"
+        },
+        {
+          "sequence": 4,
+          "state_id": "60000000-0000-4000-8000-000000000010",
+          "layer": "settled",
+          "text": "we saw VoiceFlow? today"
+        },
+        {
+          "sequence": 5,
+          "state_id": "60000000-0000-4000-8000-000000000011",
+          "layer": "settled",
+          "text": "we saw VoiceFlow today"
+        }
+      ]
+    }
+  },
+  "scope": "synthetic predeclared six-state text trajectory through the bounded production observer; no human, IME, native target, insertion, AX, ASR, cleanup, or quality evidence"
+}

@@ -1,0 +1,3 @@
+# Generated dependency identity files
+
+`package.sh` copies the sidecar and Xcode `Package.resolved` files into this directory and writes `dependency-identities.txt` from those lockfile hashes, the local pinned `mlx-swift` checkout and its two nested MLX GitLinks, the selected Swift compatibility runtime file hash, and the pinned `mlx-audio-swift` cancellation overlay identity. `mlx-audio-swift-cancellation-overlay.json` records the exact upstream base, patch, and three post-patch file hashes used by the Xcode build. The package step fails if the overlay differs from its complete base or post-state, either lockfile changes during resolution/build, or either nested MLX source checkout does not match the parent GitLink.

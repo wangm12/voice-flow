@@ -4,10 +4,10 @@ use serde::Serialize;
 use tauri::{AppHandle, Monitor};
 
 /// Logical window size in points (pill animates inside, centered).
-const PILL_WIDTH: f64 = 172.0;
-pub const PILL_WIDTH_WITH_PARTIAL: f64 = 400.0;
-const PILL_HEIGHT: f64 = 68.0;
-const PILL_HEIGHT_WITH_WARNING: f64 = 96.0;
+const PILL_WIDTH: f64 = 244.0;
+pub const PILL_WIDTH_WITH_PARTIAL: f64 = 244.0;
+const PILL_HEIGHT: f64 = 64.0;
+const PILL_HEIGHT_WITH_WARNING: f64 = 64.0;
 /// Gap between pill bottom edge and top of dock / screen edge.
 const BOTTOM_GAP: f64 = 12.0;
 /// Used only when the reported work area is the full frame and does not
@@ -289,11 +289,6 @@ fn placement_for_monitor_rect_with_height(
     }
 }
 
-#[tauri::command]
-pub fn island_placement(app: AppHandle) -> IslandPlacement {
-    placement_for_cursor_screen(&app)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -301,14 +296,14 @@ mod tests {
     #[test]
     fn centers_pill_above_dock() {
         let p = placement_for_monitor_at_scale(100.0, 20.0, 1440.0, 900.0, 1.0, 56.0);
-        assert_eq!((p.x, p.y, p.width, p.height), (734.0, 784.0, 172.0, 68.0));
+        assert_eq!((p.x, p.y, p.width, p.height), (698.0, 788.0, 244.0, 64.0));
         assert_eq!(pill_window_width(false), PILL_WIDTH);
     }
 
     #[test]
     fn uses_partial_width_when_expected() {
         assert_eq!(pill_window_width(true), PILL_WIDTH_WITH_PARTIAL);
-        assert_eq!(PILL_WIDTH_WITH_PARTIAL, 400.0);
+        assert_eq!(PILL_WIDTH_WITH_PARTIAL, 244.0);
         let p = placement_for_monitor_at_scale_with_width(
             100.0,
             20.0,
@@ -318,7 +313,7 @@ mod tests {
             56.0,
             pill_window_width(true),
         );
-        assert_eq!((p.x, p.y, p.width, p.height), (620.0, 784.0, 400.0, 68.0));
+        assert_eq!((p.x, p.y, p.width, p.height), (698.0, 788.0, 244.0, 64.0));
     }
 
     #[test]
@@ -326,7 +321,7 @@ mod tests {
         let p = placement_for_monitor_at_scale(0.0, 0.0, 3024.0, 1964.0, 2.0, 56.0);
         assert_eq!(
             (p.x, p.y, p.width, p.height),
-            (1340.0, 1692.0, 344.0, 136.0)
+            (1268.0, 1700.0, 488.0, 128.0)
         );
     }
 

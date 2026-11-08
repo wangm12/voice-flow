@@ -84,8 +84,10 @@ pub struct DeliveryResult {
 }
 
 impl DeliveryResult {
-    /// Verified insert is a paste. Anything else keeps the clipboard and asks
-    /// the user to press ⌘V — including when VoiceFlow stole frontmost.
+    /// Verified insert is a paste. An unverified insert happens after the
+    /// paste shortcut was posted, so the outcome is `PasteUnverified`
+    /// (`verified: false`): the target may or may not contain the text, and the
+    /// caller must not claim success or ask the user to paste again.
     pub fn from_insert_verified(verified: bool) -> Self {
         if verified {
             Self {
@@ -95,8 +97,8 @@ impl DeliveryResult {
             }
         } else {
             Self {
-                method: DeliveryMethod::Clipboard,
-                verified: true,
+                method: DeliveryMethod::PasteUnverified,
+                verified: false,
                 fallback_reason: Some("paste_unverified"),
             }
         }
@@ -147,14 +149,16 @@ mod tests {
     }
 
     #[test]
-    fn insert_without_frontmost_target_is_a_copy_fallback() {
+    fn unverified_insert_is_paste_unverified_not_a_copy_fallback() {
         let verified = DeliveryResult::from_insert_verified(true);
         assert_eq!(verified.method, DeliveryMethod::Paste);
+        assert!(verified.verified);
         assert!(verified.fallback_reason.is_none());
 
-        let copied = DeliveryResult::from_insert_verified(false);
-        assert_eq!(copied.method, DeliveryMethod::Clipboard);
-        assert_eq!(copied.fallback_reason, Some("paste_unverified"));
+        let unverified = DeliveryResult::from_insert_verified(false);
+        assert_eq!(unverified.method, DeliveryMethod::PasteUnverified);
+        assert!(!unverified.verified);
+        assert_eq!(unverified.fallback_reason, Some("paste_unverified"));
     }
 
     #[test]

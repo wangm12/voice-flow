@@ -167,6 +167,34 @@ mod tests {
     }
 
     #[test]
+    fn trim_keeps_soft_tail_over_noise_floor() {
+        let noise_floor: Vec<f32> = (0..SAMPLE_RATE / 2)
+            .map(|i| if i % 2 == 0 { 0.001 } else { -0.001 })
+            .collect();
+        let mut samples = noise_floor;
+        samples.extend(tone(SAMPLE_RATE / 2));
+        samples.extend(vec![0.0; SAMPLE_RATE * 2]);
+        let soft_tail: Vec<f32> = tone(SAMPLE_RATE / 2)
+            .into_iter()
+            .map(|sample| sample * 0.02)
+            .collect();
+        samples.extend_from_slice(&soft_tail);
+
+        let out = trim_and_compress(&samples);
+        assert!(
+            out.len() < samples.len(),
+            "the long digital-silence gap is compressed"
+        );
+        assert!(
+            out.ends_with(&soft_tail),
+            "the quieter signal above the noise floor remains intact"
+        );
+        let retained_tail = &out[out.len() - soft_tail.len()..];
+        assert_eq!(retained_tail, soft_tail.as_slice());
+        assert!(rms(retained_tail) > rms(&[0.001, -0.001]));
+    }
+
+    #[test]
     fn retains_low_volume_speech_alone_and_after_a_loud_phrase() {
         let quiet: Vec<f32> = tone(SAMPLE_RATE)
             .into_iter()

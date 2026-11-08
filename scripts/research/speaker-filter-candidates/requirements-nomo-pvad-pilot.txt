@@ -1,0 +1,7 @@
+# Exact versions used for the private macOS Apple Silicon discovery pilot.
+# Use a dedicated venv and private caches; these are not product dependencies.
+numpy==2.2.6
+torch==2.11.0
+torchaudio==2.11.0
+modelscope==1.40.2
+addict==2.4.0

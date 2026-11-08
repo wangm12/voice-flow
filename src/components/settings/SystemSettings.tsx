@@ -15,12 +15,14 @@ export function SystemSettings({
   audioInputDevice,
   audioInputDevices,
   save,
+  uncommittedFields,
   onUiLanguageChange,
 }: {
   settings: Settings;
   audioInputDevice: string | null;
   audioInputDevices: AudioInputDevice[];
   save: SaveSettings;
+  uncommittedFields: string[];
   onUiLanguageChange: (uiLanguage: UiLanguagePreference) => void;
 }) {
   const { t } = useI18n();
@@ -45,10 +47,14 @@ export function SystemSettings({
   const selectedClamshellDevice = settings.clamshell_microphone?.trim() ?? "";
   const selectedClamshellDeviceAvailable = !selectedClamshellDevice
     || audioInputDevices.some((device) => device.name === selectedClamshellDevice);
+  const microphoneSettingsPending = uncommittedFields.includes("input_device")
+    || uncommittedFields.includes("input_gain")
+    || uncommittedFields.includes("clamshell_microphone");
+  const inputDevicePending = uncommittedFields.includes("input_device");
 
   return (
     <SettingsShell>
-      <SettingsPageHeader title={t("系统设置")} description={t("主题、语言、菜单栏图标和音频输入。")} />
+      <SettingsPageHeader title={t("系统设置")} description={t("主题、语言、菜单栏图标和音频输入。")} saveHint={t("更改自动保存")} />
       <SettingsGroup title={t("外观")}>
         <SettingsRow title={t("主题")} description={t("设置窗口使用浅色、深色，或跟随 macOS。")}>
           <Select aria-label={t("主题")} value={settings.theme} onValueChange={(value) => save({ theme: value as Settings["theme"] })} className={`${controlClass} w-40 max-w-full`}>
@@ -68,7 +74,8 @@ export function SystemSettings({
       <SettingsGroup title={t("音频输入")} description={t("选择录音使用的麦克风；默认跟随 macOS 系统设置。")}>
         <SettingsRow title={t("输入设备")} description={<>
           <span>{t("默认会跟随 macOS 当前输入设备；选择具体设备后，录音会固定使用它。")}</span>
-          {inputDeviceLabel && <span className="mt-2 block break-words text-xs leading-[18px] text-secondary">{t(selectedInputDevice ? "选定麦克风" : "当前麦克风")} · {inputDeviceLabel}</span>}
+          {inputDeviceLabel && <span className="mt-2 block break-words text-xs leading-[18px] text-secondary">{t(inputDevicePending ? "未保存的麦克风选择" : selectedInputDevice ? "选定麦克风" : "当前麦克风")} · {inputDeviceLabel}</span>}
+          {microphoneSettingsPending && <span role="status" className="mt-2 block text-xs leading-[18px] text-warning-ink">{t("麦克风设置尚未保存，自检暂不可用。")}</span>}
         </>}>
           <div className="flex max-w-full flex-wrap items-center justify-end gap-2">
             <Select data-size="wide" aria-label={t("输入设备")} value={selectedInputDevice} onValueChange={(value) => save({ input_device: value })} className={`${controlClass} w-[220px] max-w-full`}>
@@ -82,14 +89,14 @@ export function SystemSettings({
         <SettingsRow title={t("合盖麦克风")} description={t("笔记本合上盖时改用这只麦克风。")}>
           <div className="flex max-w-full flex-wrap items-center justify-end gap-2">
             <Select data-size="wide" aria-label={t("合盖麦克风")} value={selectedClamshellDevice} onValueChange={(value) => save({ clamshell_microphone: value })} className={`${controlClass} w-[220px] max-w-full`}>
-              <option value="">{t("关闭")}</option>
+              <option value="">{t("不使用合盖麦克风")}</option>
               {selectedClamshellDevice && !selectedClamshellDeviceAvailable && <option value={selectedClamshellDevice}>{`${selectedClamshellDevice} · ${t("设备不可用")}`}</option>}
               {audioInputDevices.map((device) => <option key={device.name} value={device.name}>{device.name}</option>)}
             </Select>
             {selectedClamshellDevice && !selectedClamshellDeviceAvailable && <SettingsStatus label={t("设备不可用")} tone="warning" />}
           </div>
         </SettingsRow>
-        <div className="px-5"><MicrophoneCheck configurationKey={`${selectedInputDevice || audioInputDevice || ""}|${selectedClamshellDevice}|${settings.input_gain ?? 1}`} /></div>
+        <div className="px-5"><MicrophoneCheck disabled={microphoneSettingsPending} configurationKey={`${selectedInputDevice || audioInputDevice || ""}|${selectedClamshellDevice}|${settings.input_gain ?? 1}`} /></div>
       </SettingsGroup>
       <SettingsGroup title={t("应用行为")}>
         <SettingsRow title={t("菜单栏图标")} description={t("关闭后隐藏 VoiceFlow 的菜单栏图标；你仍可以从应用窗口重新打开设置。")}>

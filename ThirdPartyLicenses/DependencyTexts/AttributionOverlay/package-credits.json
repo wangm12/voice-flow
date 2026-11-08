@@ -1,0 +1,260 @@
+{
+  "baseline_license_index": {
+    "note": "All six exact-release full-body statuses remain unresolved_no_full_text_candidate; the index is unchanged.",
+    "path": "ThirdPartyLicenses/DependencyTexts/license-index.json",
+    "sha256": "cd9a1bd9c42450749f151014a7dadf56860aafd56761ae6d0b1cc7b3c523463a"
+  },
+  "classification": "attribution_metadata_only",
+  "records": [
+    {
+      "archive_file_count": 27,
+      "archive_matches_lock": true,
+      "author_metadata": {
+        "archive_member_path": "package.json",
+        "archive_member_sha256": "e372f857ce05f266137c65293436b5380fec42ac311e6acb9378ed78b98d75d0",
+        "declared_value": "Anton Korzunov <thekashey@gmail.com>",
+        "field": "author",
+        "interpretation": "Package metadata credit only; not a copyright notice.",
+        "source_snapshot": "provenance/locked-package-metadata/npm/react-remove-scroll-bar@2.3.8/package.json",
+        "source_snapshot_sha256": "e372f857ce05f266137c65293436b5380fec42ac311e6acb9378ed78b98d75d0"
+      },
+      "declared_license_expression": "MIT",
+      "ecosystem": "npm",
+      "exact_archive_bytes": 4937,
+      "exact_archive_sha256": "ccc872d7a2dc007cbf9d755f30d56b8d80eabdbe22c44c95a709129bfdc46f01",
+      "exact_release_package_full_body_status": "unresolved_no_full_text_candidate",
+      "lock_identity": {
+        "integrity": "sha512-9r+yi9+mgU33AKcj6IbT9oRCO78WriSj6t/cF8DWBZJ9aOGPOTEDvdUDz1FwKim7QXWwmHqtdHnRJfhAxEG46Q==",
+        "lock_path": "node_modules/react-remove-scroll-bar",
+        "version": "2.3.8"
+      },
+      "locked_version": "2.3.8",
+      "name": "react-remove-scroll-bar",
+      "package_archive_copyright_notice_observed": false,
+      "package_archive_full_mit_grant_observed": false,
+      "provenance": {
+        "archive_receipt_identity": "react-remove-scroll-bar@2.3.8",
+        "license_index_path": "ThirdPartyLicenses/DependencyTexts/license-index.json",
+        "license_index_sha256": "cd9a1bd9c42450749f151014a7dadf56860aafd56761ae6d0b1cc7b3c523463a",
+        "local_content_receipt_path": "provenance/audit/local-content-receipt.json",
+        "local_content_receipt_sha256": "f5eaa98aea74e0363513b30b64a2e4c87318c106f44a41ad6dd68d5552d4d05d"
+      },
+      "source": "npm:registry.npmjs.org",
+      "source_revision": "b3b1287aad81def2e2ae707274b74531b61ddbaf",
+      "source_revision_followup_status": null,
+      "unresolved_reason": "The locked installed package has a license expression but no full license text candidate; no text from a similarly named package was borrowed.",
+      "upstream_repository": "https://github.com/theKashey/react-remove-scroll-bar"
+    },
+    {
+      "archive_file_count": 11,
+      "archive_matches_lock": true,
+      "author_metadata": {
+        "archive_member_path": "Cargo.toml",
+        "archive_member_sha256": "fe28135c8d4cb6456b797ff5143e6b65b4e35ded5db778ed962cfdbb8ac98581",
+        "declared_value": [
+          "HEnquist <henrik.enquist@gmail.com>"
+        ],
+        "field": "authors",
+        "interpretation": "Package metadata credit only; not a copyright notice.",
+        "source_snapshot": "provenance/locked-package-metadata/rust/realfft@3.5.0/Cargo.toml",
+        "source_snapshot_sha256": "fe28135c8d4cb6456b797ff5143e6b65b4e35ded5db778ed962cfdbb8ac98581"
+      },
+      "declared_license_expression": "MIT",
+      "ecosystem": "rust",
+      "exact_archive_bytes": 16916,
+      "exact_archive_sha256": "f821338fddb99d089116342c46e9f1fbf3828dba077674613e734e01d6ea8677",
+      "exact_release_package_full_body_status": "unresolved_no_full_text_candidate",
+      "lock_identity": {
+        "checksum": "f821338fddb99d089116342c46e9f1fbf3828dba077674613e734e01d6ea8677",
+        "name": "realfft",
+        "source": "registry:crates.io",
+        "version": "3.5.0"
+      },
+      "locked_version": "3.5.0",
+      "name": "realfft",
+      "package_archive_copyright_notice_observed": false,
+      "package_archive_full_mit_grant_observed": false,
+      "provenance": {
+        "archive_receipt_identity": "realfft@3.5.0",
+        "license_index_path": "ThirdPartyLicenses/DependencyTexts/license-index.json",
+        "license_index_sha256": "cd9a1bd9c42450749f151014a7dadf56860aafd56761ae6d0b1cc7b3c523463a",
+        "local_content_receipt_path": "provenance/audit/local-content-receipt.json",
+        "local_content_receipt_sha256": "f5eaa98aea74e0363513b30b64a2e4c87318c106f44a41ad6dd68d5552d4d05d"
+      },
+      "source": "registry:crates.io",
+      "source_revision": "d0d4eee0525fd27c96c8a046d6d107acd5ed84a6",
+      "source_revision_followup_status": null,
+      "unresolved_reason": "No full license text file was found inside the package distribution or declared project license file; the declared expression alone is not a text, and no sibling-package text was borrowed.",
+      "upstream_repository": "https://github.com/HEnquist/realfft"
+    },
+    {
+      "archive_file_count": 4,
+      "archive_matches_lock": true,
+      "author_metadata": {
+        "archive_member_path": "Cargo.toml",
+        "archive_member_sha256": "24df2f33b48c9e756a4f864f882c1ab07a159b6c2b790f45af2e8162499b6719",
+        "declared_value": [
+          "Steven Sheldon"
+        ],
+        "field": "authors",
+        "interpretation": "Package metadata credit only; not a copyright notice.",
+        "source_snapshot": "provenance/locked-package-metadata/rust/block@0.1.6/Cargo.toml",
+        "source_snapshot_sha256": "24df2f33b48c9e756a4f864f882c1ab07a159b6c2b790f45af2e8162499b6719"
+      },
+      "declared_license_expression": "MIT",
+      "ecosystem": "rust",
+      "exact_archive_bytes": 4077,
+      "exact_archive_sha256": "0d8c1fef690941d3e7788d328517591fecc684c084084702d6ff1641e993699a",
+      "exact_release_package_full_body_status": "unresolved_no_full_text_candidate",
+      "lock_identity": {
+        "checksum": "0d8c1fef690941d3e7788d328517591fecc684c084084702d6ff1641e993699a",
+        "name": "block",
+        "source": "registry:crates.io",
+        "version": "0.1.6"
+      },
+      "locked_version": "0.1.6",
+      "name": "block",
+      "package_archive_copyright_notice_observed": false,
+      "package_archive_full_mit_grant_observed": false,
+      "provenance": {
+        "archive_receipt_identity": "block@0.1.6",
+        "license_index_path": "ThirdPartyLicenses/DependencyTexts/license-index.json",
+        "license_index_sha256": "cd9a1bd9c42450749f151014a7dadf56860aafd56761ae6d0b1cc7b3c523463a",
+        "local_content_receipt_path": "provenance/audit/local-content-receipt.json",
+        "local_content_receipt_sha256": "f5eaa98aea74e0363513b30b64a2e4c87318c106f44a41ad6dd68d5552d4d05d"
+      },
+      "source": "registry:crates.io",
+      "source_revision": null,
+      "source_revision_followup_status": "unresolved_no_exact_cargo_vcs_info",
+      "unresolved_reason": "No full license text file was found inside the package distribution or declared project license file; the declared expression alone is not a text, and no sibling-package text was borrowed.",
+      "upstream_repository": "https://github.com/SSheldon/rust-block"
+    },
+    {
+      "archive_file_count": 2,
+      "archive_matches_lock": true,
+      "author_metadata": {
+        "archive_member_path": "Cargo.toml",
+        "archive_member_sha256": "d87624d9d117489bd49dbaeb70077a0721e00ac2a76eb371faec818a92da5661",
+        "declared_value": [
+          "Steven Sheldon"
+        ],
+        "field": "authors",
+        "interpretation": "Package metadata credit only; not a copyright notice.",
+        "source_snapshot": "provenance/locked-package-metadata/rust/malloc_buf@0.0.6/Cargo.toml",
+        "source_snapshot_sha256": "d87624d9d117489bd49dbaeb70077a0721e00ac2a76eb371faec818a92da5661"
+      },
+      "declared_license_expression": "MIT",
+      "ecosystem": "rust",
+      "exact_archive_bytes": 1239,
+      "exact_archive_sha256": "62bb907fe88d54d8d9ce32a3cceab4218ed2f6b7d35617cafe9adf84e43919cb",
+      "exact_release_package_full_body_status": "unresolved_no_full_text_candidate",
+      "lock_identity": {
+        "checksum": "62bb907fe88d54d8d9ce32a3cceab4218ed2f6b7d35617cafe9adf84e43919cb",
+        "name": "malloc_buf",
+        "source": "registry:crates.io",
+        "version": "0.0.6"
+      },
+      "locked_version": "0.0.6",
+      "name": "malloc_buf",
+      "package_archive_copyright_notice_observed": false,
+      "package_archive_full_mit_grant_observed": false,
+      "provenance": {
+        "archive_receipt_identity": "malloc_buf@0.0.6",
+        "license_index_path": "ThirdPartyLicenses/DependencyTexts/license-index.json",
+        "license_index_sha256": "cd9a1bd9c42450749f151014a7dadf56860aafd56761ae6d0b1cc7b3c523463a",
+        "local_content_receipt_path": "provenance/audit/local-content-receipt.json",
+        "local_content_receipt_sha256": "f5eaa98aea74e0363513b30b64a2e4c87318c106f44a41ad6dd68d5552d4d05d"
+      },
+      "source": "registry:crates.io",
+      "source_revision": null,
+      "source_revision_followup_status": "unresolved_no_exact_cargo_vcs_info",
+      "unresolved_reason": "No full license text file was found inside the package distribution or declared project license file; the declared expression alone is not a text, and no sibling-package text was borrowed.",
+      "upstream_repository": "https://github.com/SSheldon/malloc_buf"
+    },
+    {
+      "archive_file_count": 12,
+      "archive_matches_lock": true,
+      "author_metadata": {
+        "archive_member_path": "Cargo.toml",
+        "archive_member_sha256": "27c851b122617cfbf263603bcf05d637aaddbc87c12c2e78f8f91675739928a8",
+        "declared_value": [
+          "Steven Sheldon"
+        ],
+        "field": "authors",
+        "interpretation": "Package metadata credit only; not a copyright notice.",
+        "source_snapshot": "provenance/locked-package-metadata/rust/objc-foundation@0.1.1/Cargo.toml",
+        "source_snapshot_sha256": "27c851b122617cfbf263603bcf05d637aaddbc87c12c2e78f8f91675739928a8"
+      },
+      "declared_license_expression": "MIT",
+      "ecosystem": "rust",
+      "exact_archive_bytes": 9063,
+      "exact_archive_sha256": "1add1b659e36c9607c7aab864a76c7a4c2760cd0cd2e120f3fb8b952c7e22bf9",
+      "exact_release_package_full_body_status": "unresolved_no_full_text_candidate",
+      "lock_identity": {
+        "checksum": "1add1b659e36c9607c7aab864a76c7a4c2760cd0cd2e120f3fb8b952c7e22bf9",
+        "name": "objc-foundation",
+        "source": "registry:crates.io",
+        "version": "0.1.1"
+      },
+      "locked_version": "0.1.1",
+      "name": "objc-foundation",
+      "package_archive_copyright_notice_observed": false,
+      "package_archive_full_mit_grant_observed": false,
+      "provenance": {
+        "archive_receipt_identity": "objc-foundation@0.1.1",
+        "license_index_path": "ThirdPartyLicenses/DependencyTexts/license-index.json",
+        "license_index_sha256": "cd9a1bd9c42450749f151014a7dadf56860aafd56761ae6d0b1cc7b3c523463a",
+        "local_content_receipt_path": "provenance/audit/local-content-receipt.json",
+        "local_content_receipt_sha256": "f5eaa98aea74e0363513b30b64a2e4c87318c106f44a41ad6dd68d5552d4d05d"
+      },
+      "source": "registry:crates.io",
+      "source_revision": null,
+      "source_revision_followup_status": "unresolved_no_exact_cargo_vcs_info",
+      "unresolved_reason": "No full license text file was found inside the package distribution or declared project license file; the declared expression alone is not a text, and no sibling-package text was borrowed.",
+      "upstream_repository": "https://github.com/SSheldon/rust-objc-foundation"
+    },
+    {
+      "archive_file_count": 5,
+      "archive_matches_lock": true,
+      "author_metadata": {
+        "archive_member_path": "Cargo.toml.orig",
+        "archive_member_sha256": "8a219f5fdd84d366e0298e543d5a0c537d68ff2aceb0459698c047c4ffc082dc",
+        "declared_value": [
+          "Steven Sheldon"
+        ],
+        "field": "authors",
+        "interpretation": "Package metadata credit only; not a copyright notice.",
+        "source_snapshot": "provenance/locked-package-metadata/rust/objc_id@0.1.1/Cargo.toml.orig",
+        "source_snapshot_sha256": "8a219f5fdd84d366e0298e543d5a0c537d68ff2aceb0459698c047c4ffc082dc"
+      },
+      "declared_license_expression": "MIT",
+      "ecosystem": "rust",
+      "exact_archive_bytes": 3258,
+      "exact_archive_sha256": "c92d4ddb4bd7b50d730c215ff871754d0da6b2178849f8a2a2ab69712d0c073b",
+      "exact_release_package_full_body_status": "unresolved_no_full_text_candidate",
+      "lock_identity": {
+        "checksum": "c92d4ddb4bd7b50d730c215ff871754d0da6b2178849f8a2a2ab69712d0c073b",
+        "name": "objc_id",
+        "source": "registry:crates.io",
+        "version": "0.1.1"
+      },
+      "locked_version": "0.1.1",
+      "name": "objc_id",
+      "package_archive_copyright_notice_observed": false,
+      "package_archive_full_mit_grant_observed": false,
+      "provenance": {
+        "archive_receipt_identity": "objc_id@0.1.1",
+        "license_index_path": "ThirdPartyLicenses/DependencyTexts/license-index.json",
+        "license_index_sha256": "cd9a1bd9c42450749f151014a7dadf56860aafd56761ae6d0b1cc7b3c523463a",
+        "local_content_receipt_path": "provenance/audit/local-content-receipt.json",
+        "local_content_receipt_sha256": "f5eaa98aea74e0363513b30b64a2e4c87318c106f44a41ad6dd68d5552d4d05d"
+      },
+      "source": "registry:crates.io",
+      "source_revision": null,
+      "source_revision_followup_status": "unresolved_no_exact_cargo_vcs_info",
+      "unresolved_reason": "No full license text file was found inside the package distribution or declared project license file; the declared expression alone is not a text, and no sibling-package text was borrowed.",
+      "upstream_repository": "https://github.com/SSheldon/rust-objc-id"
+    }
+  ],
+  "schema": "voiceflow-six-package-attribution-overlay-v1"
+}

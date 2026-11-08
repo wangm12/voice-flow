@@ -1,0 +1,934 @@
+--- a/Sources/MLXAudioCore/DSP.swift
++++ b/Sources/MLXAudioCore/DSP.swift
+@@ -242,6 +242,31 @@
+     melScale: MelScale = .htk,
+     hannPeriodic: Bool = false
+ ) -> MLXArray {
++    computeMelSpectrogram(
++        audio: audio,
++        sampleRate: sampleRate,
++        nFft: nFft,
++        hopLength: hopLength,
++        nMels: nMels,
++        melScale: melScale,
++        hannPeriodic: hannPeriodic,
++        checkCancellation: {}
++    )
++}
++
++/// Compute a mel spectrogram while allowing the caller to cooperatively
++/// cancel at the existing materialization boundaries.
++public func computeMelSpectrogram(
++    audio: MLXArray,
++    sampleRate: Int,
++    nFft: Int,
++    hopLength: Int,
++    nMels: Int,
++    melScale: MelScale = .htk,
++    hannPeriodic: Bool = false,
++    checkCancellation: () throws -> Void
++) rethrows -> MLXArray {
++    try checkCancellation()
+     // If audio is 1D, compute proper mel spectrogram
+     if audio.ndim == 1 {
+         // Create Hanning window
+@@ -252,7 +277,9 @@
+ 
+         // Compute magnitude squared (power spectrum)
+         let magnitudes = MLX.abs(freqs).square()
++        try checkCancellation()
+         eval(magnitudes)  // Allow MLX to free STFT complex output
++        try checkCancellation()
+ 
+         // Create mel filterbank [nFreqs, nMels]
+         let filters = melFilters(
+@@ -265,7 +292,9 @@
+ 
+         // Apply mel filterbank: [numFrames, nFreqs] @ [nFreqs, nMels] = [numFrames, nMels]
+         var melSpec = MLX.matmul(magnitudes, filters)
++        try checkCancellation()
+         eval(melSpec)  // Allow MLX to free magnitudes and filters
++        try checkCancellation()
+ 
+         // Apply log scaling with clamping (Whisper-style normalization)
+         melSpec = MLX.maximum(melSpec, MLXArray(Float(1e-10)))
+@@ -274,9 +303,11 @@
+         melSpec = MLX.maximum(melSpec, maxVal - MLXArray(Float(8.0)))
+         melSpec = (melSpec + MLXArray(Float(4.0))) / MLXArray(Float(4.0))
+ 
++        try checkCancellation()
+         return melSpec
+     }
+ 
+     // If already 2D, assume it's a spectrogram
++    try checkCancellation()
+     return audio
+ }
+--- a/Sources/MLXAudioSTT/Models/Qwen3ASR/Qwen3ASR.swift
++++ b/Sources/MLXAudioSTT/Models/Qwen3ASR/Qwen3ASR.swift
+@@ -161,6 +161,23 @@
+     searchExpandSec: Float = 5.0,
+     minWindowMs: Float = 100.0
+ ) -> [(MLXArray, Float)] {
++    return splitAudioIntoChunks(
++        audio, sampleRate: sampleRate, chunkDuration: chunkDuration,
++        minChunkDuration: minChunkDuration, searchExpandSec: searchExpandSec,
++        minWindowMs: minWindowMs, checkCancellation: {}
++    )
++}
++
++public func splitAudioIntoChunks(
++    _ audio: MLXArray,
++    sampleRate: Int,
++    chunkDuration: Float = 1200.0,
++    minChunkDuration: Float = 1.0,
++    searchExpandSec: Float = 5.0,
++    minWindowMs: Float = 100.0,
++    checkCancellation: () throws -> Void
++) rethrows -> [(MLXArray, Float)] {
++    try checkCancellation()
+     // Ensure 1D
+     let wav: MLXArray
+     if audio.ndim > 1 {
+@@ -192,6 +209,7 @@
+     let minSamples = Int(minChunkDuration * Float(sampleRate))
+ 
+     while startSample < totalSamples {
++        try checkCancellation()
+         let endSample = min(startSample + maxChunkSamples, totalSamples)
+ 
+         if endSample >= totalSamples {
+@@ -213,8 +231,10 @@
+         var cutSample: Int
+         let searchLen = searchEnd - searchStart
+         if searchLen > minWindowSamples {
++            try checkCancellation()
+             // Only pull the search region to CPU for energy calculation
+             let searchRegion = wav[searchStart..<searchEnd].asArray(Float.self)
++            try checkCancellation()
+ 
+             let energyLen = searchRegion.count - minWindowSamples + 1
+             var energy = [Float](repeating: 0, count: energyLen)
+@@ -471,6 +491,15 @@
+         _ inputFeatures: MLXArray,
+         featureAttentionMask: MLXArray? = nil
+     ) -> MLXArray {
++        return callAsFunction(inputFeatures, featureAttentionMask: featureAttentionMask, checkCancellation: {})
++    }
++
++    func callAsFunction(
++        _ inputFeatures: MLXArray,
++        featureAttentionMask: MLXArray? = nil,
++        checkCancellation: () throws -> Void
++    ) rethrows -> MLXArray {
++        try checkCancellation()
+         // inputFeatures shape: [batch, n_mels, n_frames]
+         let batchSize = inputFeatures.dim(0)
+         let nFrames = inputFeatures.dim(2)
+@@ -479,7 +508,12 @@
+         let featureLens: [Int]
+         if let mask = featureAttentionMask {
+             let lens = mask.sum(axis: -1).asType(.int32)
+-            featureLens = (0..<batchSize).map { Int(lens[$0].item(Int32.self)) }
++            featureLens = try (0..<batchSize).map {
++                try checkCancellation()
++                let value = Int(lens[$0].item(Int32.self))
++                try checkCancellation()
++                return value
++            }
+         } else {
+             featureLens = [Int](repeating: nFrames, count: batchSize)
+         }
+@@ -492,6 +526,7 @@
+         var chunkCountsPerInput: [Int] = []
+ 
+         for i in 0..<batchSize {
++            try checkCancellation()
+             let featLen = featureLens[i]
+             let numChunks = Int(ceil(Double(featLen) / Double(chunkSize)))
+             let feat = inputFeatures[i]  // [n_mels, n_frames]
+@@ -499,6 +534,7 @@
+ 
+             var pos = 0
+             for j in 0..<numChunks {
++                try checkCancellation()
+                 let clen: Int
+                 if j == numChunks - 1 {
+                     let remainder = featLen % chunkSize
+@@ -530,9 +566,14 @@
+ 
+         // Compute output lengths after CNN for each chunk
+         let chunkLensArray = MLXArray(chunkLengths.map { Int32($0) })
++        try checkCancellation()
+         let featureLensAfterCnn = getFeatExtractOutputLengths(chunkLensArray)
+-        let featureLensAfterCnnValues = (0..<chunkLengths.count).map {
+-            Int(featureLensAfterCnn[$0].item(Int32.self))
++        try checkCancellation()
++        let featureLensAfterCnnValues = try (0..<chunkLengths.count).map {
++            try checkCancellation()
++            let value = Int(featureLensAfterCnn[$0].item(Int32.self))
++            try checkCancellation()
++            return value
+         }
+ 
+         // Process Conv2d layers in batches
+@@ -541,14 +582,18 @@
+         var chunkIdx = 0
+ 
+         for batchStart in stride(from: 0, to: paddedChunks.count, by: convBatchSize) {
++            try checkCancellation()
+             let batchEnd = min(batchStart + convBatchSize, paddedChunks.count)
+             let batchSlice = Array(paddedChunks[batchStart..<batchEnd])
+             let batchLen = batchSlice.count
+ 
+             // Stack batch and apply Conv2d: [batchLen, n_mels, maxChunkLen, 1]
+             var x = MLX.stacked(batchSlice, axis: 0).expandedDimensions(axis: -1)
++            try checkCancellation()
+             x = gelu(conv2d1(x))
++            try checkCancellation()
+             x = gelu(conv2d2(x))
++            try checkCancellation()
+             x = gelu(conv2d3(x))
+ 
+             // Reshape: [batchLen, f, t, c] -> [batchLen, t, c*f]
+@@ -562,7 +607,9 @@
+             let posEmb = positionalEmbedding(x.dim(1))
+             x = x + posEmb.expandedDimensions(axis: 0)
+ 
+-            eval(x) 
++            try checkCancellation()
++            eval(x)
++            try checkCancellation()
+ 
+             // Extract valid-length hidden states
+             for i in 0..<batchLen {
+@@ -590,6 +637,7 @@
+         var windowOffset = 0
+         var windowIndex = 0
+         for winLen in windowLengths {
++            try checkCancellation()
+             let end = min(windowOffset + winLen, seqLen)
+             guard windowOffset < end else { continue }
+             let window = hiddenStates[windowOffset..<end]
+@@ -608,16 +656,21 @@
+         var processedWindows: [(index: Int, data: MLXArray)] = []
+ 
+         for (_, group) in windowsByLen {
++            try checkCancellation()
+             for bStart in stride(from: 0, to: group.count, by: encoderBatchSize) {
++                try checkCancellation()
+                 let bEnd = min(bStart + encoderBatchSize, group.count)
+                 let batchItems = Array(group[bStart..<bEnd])
+ 
+                 // [batchLen, windowLen, d_model] — full self-attention within each window
+                 var batch = MLX.stacked(batchItems.map { $0.data }, axis: 0)
+                 for layer in layers {
++                    try checkCancellation()
+                     batch = layer(batch, mask: nil)
+                 }
++                try checkCancellation()
+                 eval(batch)
++                try checkCancellation()
+ 
+                 for (j, item) in batchItems.enumerated() {
+                     processedWindows.append((index: item.index, data: batch[j]))
+@@ -633,6 +686,7 @@
+         hiddenStates = lnPost(hiddenStates)
+         hiddenStates = gelu(proj1(hiddenStates))
+         hiddenStates = proj2(hiddenStates)
++        try checkCancellation()
+ 
+         return hiddenStates  // [seqLen, outputDim]
+     }
+@@ -969,7 +1023,23 @@
+         _ inputFeatures: MLXArray,
+         featureAttentionMask: MLXArray? = nil
+     ) -> MLXArray {
+-        return audioTower(inputFeatures, featureAttentionMask: featureAttentionMask)
++        return getAudioFeatures(
++            inputFeatures,
++            featureAttentionMask: featureAttentionMask,
++            checkCancellation: {}
++        )
++    }
++
++    func getAudioFeatures(
++        _ inputFeatures: MLXArray,
++        featureAttentionMask: MLXArray? = nil,
++        checkCancellation: () throws -> Void
++    ) rethrows -> MLXArray {
++        return try audioTower(
++            inputFeatures,
++            featureAttentionMask: featureAttentionMask,
++            checkCancellation: checkCancellation
++        )
+     }
+ 
+     // MARK: - Forward Pass
+@@ -1017,13 +1087,31 @@
+         audioFeatures: MLXArray,
+         inputIds: MLXArray
+     ) -> MLXArray {
++        return mergeAudioFeatures(
++            inputsEmbeds: inputsEmbeds,
++            audioFeatures: audioFeatures,
++            inputIds: inputIds,
++            checkCancellation: {}
++        )
++    }
++
++    func mergeAudioFeatures(
++        inputsEmbeds: MLXArray,
++        audioFeatures: MLXArray,
++        inputIds: MLXArray,
++        checkCancellation: () throws -> Void
++    ) rethrows -> MLXArray {
++        try checkCancellation()
+         let flatMask = (inputIds .== MLXArray(Int32(config.audioTokenId))).reshaped(-1)
+         let batchSize = inputsEmbeds.dim(0)
+         let seqLen = inputsEmbeds.dim(1)
+         let hiddenDim = inputsEmbeds.dim(2)
+ 
++        try checkCancellation()
+         let numAudioTokens = Int(flatMask.asType(.int32).sum().item(Int32.self))
++        try checkCancellation()
+         guard numAudioTokens > 0 && audioFeatures.dim(0) > 0 else {
++            try checkCancellation()
+             return inputsEmbeds
+         }
+ 
+@@ -1032,12 +1120,14 @@
+         let totalLen = flatEmbeds.dim(0)
+ 
+         // Audio tokens are contiguous in the prompt — find start and splice directly
++        try checkCancellation()
+         let maskValues = flatMask.asType(.int32).asArray(Int32.self)
++        try checkCancellation()
+         var firstAudioPos = -1
+         for (i, v) in maskValues.enumerated() {
+             if v != 0 { firstAudioPos = i; break }
+         }
+-        guard firstAudioPos >= 0 else { return inputsEmbeds }
++        guard firstAudioPos >= 0 else { try checkCancellation(); return inputsEmbeds }
+ 
+         let endAudioPos = firstAudioPos + numToReplace
+         var parts: [MLXArray] = []
+@@ -1049,27 +1139,41 @@
+             parts.append(flatEmbeds[endAudioPos..<totalLen])
+         }
+ 
+-        return MLX.concatenated(parts, axis: 0).reshaped(batchSize, seqLen, hiddenDim)
++        try checkCancellation()
++        let merged = MLX.concatenated(parts, axis: 0).reshaped(batchSize, seqLen, hiddenDim)
++        try checkCancellation()
++        return merged
+     }
+ 
+     // MARK: - Audio Preprocessing
+ 
+     public func preprocessAudio(_ audio: MLXArray) -> (MLXArray, MLXArray, Int) {
++        return preprocessAudio(audio, checkCancellation: {})
++    }
++
++    func preprocessAudio(
++        _ audio: MLXArray,
++        checkCancellation: () throws -> Void
++    ) rethrows -> (MLXArray, MLXArray, Int) {
++        try checkCancellation()
+         // Compute mel spectrogram (must match transformers' WhisperFeatureExtractor:
+         // slaney mel scale + periodic hann window)
+-        let melSpec = MLXAudioCore.computeMelSpectrogram(
++        let melSpec = try MLXAudioCore.computeMelSpectrogram(
+             audio: audio,
+             sampleRate: 16000,
+             nFft: 400,
+             hopLength: 160,
+             nMels: config.audioConfig.numMelBins,
+             melScale: .slaney,
+-            hannPeriodic: true
+-        )
++            hannPeriodic: true,
++            checkCancellation: checkCancellation
++        )
++        try checkCancellation()
+ 
+         // melSpec shape: [numFrames, nMels] -> need [1, nMels, numFrames]
+         let transposed = melSpec.transposed(1, 0)
+         let inputFeatures = transposed.expandedDimensions(axis: 0)
++        try checkCancellation()
+ 
+         // Create attention mask (all ones for single audio)
+         let numFrames = melSpec.dim(0)
+@@ -1078,7 +1182,9 @@
+         // Compute number of audio tokens after CNN
+         let audioLengths = featureAttentionMask.sum(axis: -1).asType(.int32)
+         let aftercnnLens = getFeatExtractOutputLengths(audioLengths)
++        try checkCancellation()
+         let numAudioTokens = Int(aftercnnLens[0].item(Int32.self))
++        try checkCancellation()
+ 
+         return (inputFeatures, featureAttentionMask, numAudioTokens)
+     }
+@@ -1225,8 +1331,10 @@
+         context: String,
+         language: String?,
+         repetitionPenalty: Float = 1.0,
+-        repetitionContextSize: Int = 32
+-    ) -> (text: String, language: String?, promptTokens: Int, generationTokens: Int) {
++        repetitionContextSize: Int = 32,
++        checkCancellation: () throws -> Void
++    ) rethrows -> (text: String, language: String?, promptTokens: Int, generationTokens: Int) {
++        try checkCancellation()
+         guard let tokenizer = tokenizer else {
+             fatalError("Tokenizer not loaded")
+         }
+@@ -1234,66 +1342,94 @@
+         let eosTokenIds = [151645, 151643]
+         let prefillStepSize = 2048
+ 
+-        let (inputFeatures, featureAttentionMask, numAudioTokens) = preprocessAudio(audio)
++        let (inputFeatures, featureAttentionMask, numAudioTokens) = try preprocessAudio(
++            audio,
++            checkCancellation: checkCancellation
++        )
++        try checkCancellation()
++        try checkCancellation()
+         let inputIds = buildPrompt(
+             numAudioTokens: numAudioTokens,
+             context: context,
+             language: language
+         )
++        try checkCancellation()
+         let promptTokenCount = inputIds.dim(1)
+ 
+-        let audioFeatures = getAudioFeatures(inputFeatures, featureAttentionMask: featureAttentionMask)
++        try checkCancellation()
++        let audioFeatures = try getAudioFeatures(
++            inputFeatures,
++            featureAttentionMask: featureAttentionMask,
++            checkCancellation: checkCancellation
++        )
++        try checkCancellation()
+         eval(audioFeatures)
++        try checkCancellation()
+ 
+         let embeds = model.embedTokens(inputIds)
+-        let inputsEmbeds = mergeAudioFeatures(
++        let inputsEmbeds = try mergeAudioFeatures(
+             inputsEmbeds: embeds,
+             audioFeatures: audioFeatures.asType(embeds.dtype),
+-            inputIds: inputIds
+-        )
+-
++            inputIds: inputIds,
++            checkCancellation: checkCancellation
++        )
++        try checkCancellation()
++
++        try checkCancellation()
+         let cache = makeCache()
++        try checkCancellation()
+ 
+         // Chunked prefill (mlx-lm.generate_step pattern): keeps lazy graph small,
+         // materializes cache state between chunks, frees intermediate buffers.
+         let totalTokens = inputIds.dim(1)
+         var processedTokens = 0
+         while totalTokens - processedTokens > 1 {
++            try checkCancellation()
+             let remaining = (totalTokens - processedTokens) - 1
+             let n = min(prefillStepSize, remaining)
+             let chunkIds = inputIds[0..., processedTokens..<(processedTokens + n)]
+             let chunkEmbeds = inputsEmbeds[0..., processedTokens..<(processedTokens + n), 0...]
++            try checkCancellation()
+             let chunkLogits = callAsFunction(
+                 inputIds: chunkIds,
+                 inputEmbeddings: chunkEmbeds,
+                 cache: cache
+             )
++            try checkCancellation()
+             eval(chunkLogits)
++            try checkCancellation()
+             Memory.clearCache()
+             processedTokens += n
+         }
+ 
++        try checkCancellation()
+         let lastIds = inputIds[0..., processedTokens..<totalTokens]
+         let lastEmbeds = inputsEmbeds[0..., processedTokens..<totalTokens, 0...]
++        try checkCancellation()
+         let firstLogits = callAsFunction(
+             inputIds: lastIds,
+             inputEmbeddings: lastEmbeds,
+             cache: cache
+         )
++        try checkCancellation()
+ 
+         var firstLast = firstLogits[0..., -1, 0...]
+         if temperature > 0 {
+             firstLast = firstLast / temperature
+         }
+         var prevTokenArr = firstLast.argMax(axis: -1)
++        try checkCancellation()
+         asyncEval(prevTokenArr)
++        try checkCancellation()
+ 
+         var generatedTokens: [Int] = []
+ 
+         // AR loop with asyncEval pipelining: while CPU is consuming token N
+         // (item() blocks briefly), GPU computes token N+1 in the background.
+         for tokenIndex in 0..<maxTokens {
++            try checkCancellation()
+             let prevTokenInt = prevTokenArr.item(Int.self)
++            try checkCancellation()
+ 
+             if eosTokenIds.contains(prevTokenInt) {
+                 break
+@@ -1316,7 +1452,9 @@
+             }
+ 
+             let nextInArr = MLXArray([Int32(prevTokenInt)]).expandedDimensions(axis: 0)
++            try checkCancellation()
+             let nextLogits = callAsFunction(inputIds: nextInArr, cache: cache)
++            try checkCancellation()
+             var nextLast = nextLogits[0..., -1, 0...]
+             if temperature > 0 {
+                 nextLast = nextLast / temperature
+@@ -1337,7 +1475,9 @@
+                 nextLast[0..., recentArr] = penalized
+             }
+             let nextTokenArr = nextLast.argMax(axis: -1)
++            try checkCancellation()
+             asyncEval(nextTokenArr)
++            try checkCancellation()
+ 
+             prevTokenArr = nextTokenArr
+ 
+@@ -1346,9 +1486,12 @@
+             }
+         }
+ 
++        try checkCancellation()
+         let decodedText = tokenizer.decode(tokens: generatedTokens)
++        try checkCancellation()
+         let parsed = parseGeneratedChunk(decodedText, forcedLanguage: language)
+ 
++        try checkCancellation()
+         return (parsed.text, parsed.language, promptTokenCount, generatedTokens.count)
+     }
+ 
+@@ -1366,16 +1509,39 @@
+         repetitionPenalty: Float = 1.0,
+         repetitionContextSize: Int = 32
+     ) -> STTOutput {
++        return generateCancellable(
++            audio: audio, maxTokens: maxTokens, temperature: temperature, context: context,
++            language: language, chunkDuration: chunkDuration, minChunkDuration: minChunkDuration,
++            repetitionPenalty: repetitionPenalty, repetitionContextSize: repetitionContextSize,
++            checkCancellation: {}
++        )
++    }
++
++    public func generateCancellable(
++        audio: MLXArray,
++        maxTokens: Int = 8192,
++        temperature: Float = 0.0,
++        context: String = "",
++        language: String? = nil,
++        chunkDuration: Float = 1200.0,
++        minChunkDuration: Float = 1.0,
++        repetitionPenalty: Float = 1.0,
++        repetitionContextSize: Int = 32,
++        checkCancellation: () throws -> Void
++    ) rethrows -> STTOutput {
++        try checkCancellation()
+         let startTime = Date()
+         let forcedLanguage = normalizeLanguageName(language)
+ 
+         // Split audio into chunks
+-        let chunks = splitAudioIntoChunks(
++        let chunks = try splitAudioIntoChunks(
+             audio,
+             sampleRate: sampleRate,
+             chunkDuration: chunkDuration,
+-            minChunkDuration: minChunkDuration
+-        )
++            minChunkDuration: minChunkDuration,
++            checkCancellation: checkCancellation
++        )
++        try checkCancellation()
+ 
+         var allTexts: [String] = []
+         var segments: [[String: Any]] = []
+@@ -1385,19 +1551,23 @@
+         var chunkLanguages: [String?] = []
+ 
+         for (chunkAudio, offsetSec) in chunks {
++            try checkCancellation()
+             if remainingTokens <= 0 { break }
+ 
+             let actualChunkDuration = Float(chunkAudio.dim(0)) / Float(sampleRate)
+ 
+-            let result = generateSingleChunk(
++            try checkCancellation()
++            let result = try generateSingleChunk(
+                 audio: chunkAudio,
+                 maxTokens: remainingTokens,
+                 temperature: temperature,
+                 context: context,
+                 language: forcedLanguage,
+                 repetitionPenalty: repetitionPenalty,
+-                repetitionContextSize: repetitionContextSize
++                repetitionContextSize: repetitionContextSize,
++                checkCancellation: checkCancellation
+             )
++            try checkCancellation()
+ 
+             allTexts.append(result.text)
+             chunkLanguages.append(result.language)
+@@ -1418,11 +1588,13 @@
+             Memory.clearCache()
+         }
+ 
++        try checkCancellation()
+         let endTime = Date()
+         let totalTime = endTime.timeIntervalSince(startTime)
+         let fullText = allTexts.joined(separator: " ")
+         let mergedLanguage = Qwen3ASRModel.mergeLanguages(chunkLanguages)
+ 
++        try checkCancellation()
+         return STTOutput(
+             text: fullText.trimmingCharacters(in: .whitespacesAndNewlines),
+             segments: segments,
+--- a/Sources/MLXAudioSTT/Models/CohereTranscribe/CohereTranscribe.swift
++++ b/Sources/MLXAudioSTT/Models/CohereTranscribe/CohereTranscribe.swift
+@@ -320,9 +320,40 @@
+         generationParameters: STTGenerateParameters,
+         vad: (model: SileroVAD, config: SpeechSegmentConfig)?
+     ) -> STTOutput {
++        generateBatch(
++            audio: audio,
++            generationParameters: generationParameters,
++            vad: vad,
++            checkCancellation: {}
++        )
++    }
++
++    /// Synchronous batch generation with cooperative cancellation at existing
++    /// preprocessing, evaluation, and token sampling boundaries.
++    public func generate(
++        audio: MLXArray,
++        generationParameters: STTGenerateParameters,
++        checkCancellation: () throws -> Void
++    ) rethrows -> STTOutput {
++        try generateBatch(
++            audio: audio,
++            generationParameters: generationParameters,
++            vad: nil,
++            checkCancellation: checkCancellation
++        )
++    }
++
++    private func generateBatch(
++        audio: MLXArray,
++        generationParameters: STTGenerateParameters,
++        vad: (model: SileroVAD, config: SpeechSegmentConfig)?,
++        checkCancellation: () throws -> Void
++    ) rethrows -> STTOutput {
++        try checkCancellation()
+         let audio1D = audio.ndim > 1 ? audio.mean(axis: -1) : audio
+         let chunks: [(MLXArray, Float)]
+         if let vad {
++            try checkCancellation()
+             do {
+                 chunks = try segmentSpeech(
+                     audio: audio1D,
+@@ -331,30 +362,42 @@
+                     config: vad.config
+                 )
+             } catch {
++                try checkCancellation()
+                 if generationParameters.verbose {
+                     print("VAD pre-processing failed (\(error)); falling back to fixed chunking")
+                 }
+-                chunks = splitAudioIntoChunks(
++                chunks = try splitAudioIntoChunks(
+                     audio1D,
+                     sampleRate: config.sampleRate,
+                     chunkDuration: generationParameters.chunkDuration,
+-                    minChunkDuration: generationParameters.minChunkDuration
++                    minChunkDuration: generationParameters.minChunkDuration,
++                    checkCancellation: checkCancellation
+                 )
+             }
++            try checkCancellation()
+         } else {
+-            chunks = splitAudioIntoChunks(
++            chunks = try splitAudioIntoChunks(
+                 audio1D,
+                 sampleRate: config.sampleRate,
+                 chunkDuration: generationParameters.chunkDuration,
+-                minChunkDuration: generationParameters.minChunkDuration
+-            )
+-        }
++                minChunkDuration: generationParameters.minChunkDuration,
++                checkCancellation: checkCancellation
++            )
++        }
++        try checkCancellation()
+ 
+         guard chunks.count > 1 else {
+             // One chunk: transcribe it rather than the original buffer, so a single VAD
+             // speech region keeps its leading/trailing-silence trim. `chunks` is never
+             // empty, but fall back to `audio1D` defensively.
+-            return generateSingleChunk(audio: chunks.first?.0 ?? audio1D, generationParameters: generationParameters)
++            try checkCancellation()
++            let output = try generateSingleChunk(
++                audio: chunks.first?.0 ?? audio1D,
++                generationParameters: generationParameters,
++                checkCancellation: checkCancellation
++            )
++            try checkCancellation()
++            return output
+         }
+ 
+         var outputs: [STTOutput] = []
+@@ -362,6 +405,7 @@
+         var remainingTokens = generationParameters.maxTokens
+ 
+         for (chunkAudio, offsetSeconds) in chunks {
++            try checkCancellation()
+             if remainingTokens <= 0 {
+                 break
+             }
+@@ -374,11 +418,17 @@
+                 from: generationParameters,
+                 maxTokens: remainingTokens
+             )
+-            let output = generateSingleChunk(audio: chunkAudio, generationParameters: chunkParameters)
++            let output = try generateSingleChunk(
++                audio: chunkAudio,
++                generationParameters: chunkParameters,
++                checkCancellation: checkCancellation
++            )
++            try checkCancellation()
+             outputs.append(output)
+             remainingTokens = max(0, remainingTokens - output.generationTokens)
+         }
+ 
++        try checkCancellation()
+         let combinedText = outputs
+             .map(\.text)
+             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+@@ -391,6 +441,7 @@
+         let totalTime = outputs.reduce(0.0) { $0 + $1.totalTime }
+         let peakMemoryUsage = outputs.map(\.peakMemoryUsage).max() ?? 0
+ 
++        try checkCancellation()
+         return STTOutput(
+             text: combinedText,
+             language: generationParameters.language,
+@@ -408,14 +459,29 @@
+         audio: MLXArray,
+         generationParameters: STTGenerateParameters
+     ) -> STTOutput {
+-        var context = encodeAndPrefill(
++        generateSingleChunk(
+             audio: audio,
+-            generationParameters: generationParameters
+-        )
++            generationParameters: generationParameters,
++            checkCancellation: {}
++        )
++    }
++
++    private func generateSingleChunk(
++        audio: MLXArray,
++        generationParameters: STTGenerateParameters,
++        checkCancellation: () throws -> Void
++    ) rethrows -> STTOutput {
++        try checkCancellation()
++        var context = try encodeAndPrefill(
++            audio: audio,
++            generationParameters: generationParameters,
++            checkCancellation: checkCancellation
++        )
++        try checkCancellation()
+ 
+         var generated: [Int] = []
+         let decodeStart = Date()
+-        
++
+         let eosTokenId = tokenizer?.encode(text: "<|endoftext|>").first ?? 0
+ 
+         let maxGenerationTokens = effectiveMaxGenerationTokens(
+@@ -424,16 +490,23 @@
+         )
+ 
+         for pos in context.promptLength..<(context.promptLength + maxGenerationTokens) {
+-            let token = sample(logits: context.logits, temperature: generationParameters.temperature)
++            try checkCancellation()
++            let token = try sample(
++                logits: context.logits,
++                temperature: generationParameters.temperature,
++                checkCancellation: checkCancellation
++            )
++            try checkCancellation()
++            if token == eosTokenId {
++                generated.append(token)
++                break
++            }
+             generated.append(token)
+-
+-            if token == eosTokenId {
+-                break
+-            }
+ 
+             let inputIds = MLXArray([Int32(token)]).expandedDimensions(axis: 0)
+             let positions = MLXArray([Int32(pos)]).expandedDimensions(axis: 0)
+ 
++            try checkCancellation()
+             let next = decoder(
+                 inputIds: inputIds,
+                 positions: positions,
+@@ -442,20 +515,24 @@
+                 crossAttentionMask: nil,
+                 cache: context.cache
+             )
+-            
++
+             context.cache = next.1
+             context.logits = lmHead(next.0[0, -1])
+ 
++            try checkCancellation()
+             eval(context.logits)
++            try checkCancellation()
+             if generated.count % 256 == 0 {
+                 Memory.clearCache()
+             }
+         }
+ 
++        try checkCancellation()
+         if generated.last == eosTokenId {
+             _ = generated.popLast()
+         }
+ 
++        try checkCancellation()
+         let text = tokenizer?.decode(tokens: generated).trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+ 
+         let end = Date()
+@@ -463,6 +540,7 @@
+         let decodeTime = end.timeIntervalSince(decodeStart)
+ 
+         Memory.clearCache()
++        try checkCancellation()
+ 
+         return STTOutput(
+             text: text,
+@@ -637,17 +715,32 @@
+         audio: MLXArray,
+         generationParameters: STTGenerateParameters
+     ) -> CoherePrefillContext {
++        encodeAndPrefill(
++            audio: audio,
++            generationParameters: generationParameters,
++            checkCancellation: {}
++        )
++    }
++
++    func encodeAndPrefill(
++        audio: MLXArray,
++        generationParameters: STTGenerateParameters,
++        checkCancellation: () throws -> Void
++    ) rethrows -> CoherePrefillContext {
++        try checkCancellation()
+         let start = Date()
+         guard let tokenizer else {
+             fatalError("CohereTranscribeTokenizer must be loaded before generation")
+         }
+ 
++        try checkCancellation()
+         let melFilters = CohereTranscribeAudio.computeMelFilters(
+             sampleRate: config.sampleRate,
+             nFft: 512,
+             numMels: config.encoder.featIn
+         )
+         
++        try checkCancellation()
+         let features = CohereTranscribeAudio.computeFeatures(
+             audio: audio,
+             melFilters: melFilters,
+@@ -656,8 +749,11 @@
+             hopLength: 160
+         )
+ 
++        try checkCancellation()
+         let (encOut, _) = encoder(features)
++        try checkCancellation()
+         
++        try checkCancellation()
+         let adapterOut: MLXArray
+         if let bridgeProj = bridgeProj {
+             adapterOut = bridgeProj(encOut)
+@@ -676,6 +772,7 @@
+         let positions = MLXArray((0..<promptLength).map(Int32.init)).expandedDimensions(axis: 0)
+         let selfMask = MultiHeadAttention.createAdditiveCausalMask(promptLength).asType(adapterOut.dtype)
+ 
++        try checkCancellation()
+         let prefill = decoder(
+             inputIds: promptIdsMX,
+             positions: positions,
+@@ -701,7 +798,9 @@
+                 cacheArrays.append(crossValues)
+             }
+         }
++        try checkCancellation()
+         eval(cacheArrays)
++        try checkCancellation()
+ 
+         if generationParameters.verbose {
+             let seconds = Double(audio.shape[0]) / Double(config.sampleRate)
+@@ -709,6 +808,7 @@
+             print("Prompt: \(promptLength) tokens")
+         }
+ 
++        try checkCancellation()
+         return CoherePrefillContext(
+             adapterOut: adapterOut,
+             promptLength: promptLength,
+@@ -719,6 +819,15 @@
+     }
+ 
+     func sample(logits: MLXArray, temperature: Float) -> Int {
++        sample(logits: logits, temperature: temperature, checkCancellation: {})
++    }
++
++    func sample(
++        logits: MLXArray,
++        temperature: Float,
++        checkCancellation: () throws -> Void
++    ) rethrows -> Int {
++        try checkCancellation()
+         let logits1D: MLXArray
+         if logits.ndim > 1 {
+             logits1D = logits.squeezed()
+@@ -727,12 +836,18 @@
+         }
+ 
+         if temperature == 0 {
+-            return logits1D.argMax(axis: -1).item(Int.self)
++            try checkCancellation()
++            let token = logits1D.argMax(axis: -1).item(Int.self)
++            try checkCancellation()
++            return token
+         }
+ 
+         let scaled = (logits1D / temperature).expandedDimensions(axis: 0)
+         let sampled = categorical(scaled)
+-        return sampled.item(Int.self)
++        try checkCancellation()
++        let token = sampled.item(Int.self)
++        try checkCancellation()
++        return token
+     }
+ 
+     func effectiveMaxGenerationTokens(promptLength: Int, requestedMaxTokens: Int) -> Int {

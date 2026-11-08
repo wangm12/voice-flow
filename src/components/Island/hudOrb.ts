@@ -24,6 +24,48 @@ export type ProcessingPhase =
   | "waiting_retry"
   | "idle";
 
+export function activeHudStatusLabel(
+  state: DictationState,
+  _phase: ProcessingPhase,
+  _phaseConfirmed: boolean,
+  translate: (source: string) => string,
+): string | null {
+  if (state === "starting") return translate("准备录音");
+  if (state === "recording") return translate("录音中");
+  if (state === "recording_limited") return translate("录音已达上限");
+  if (state === "processing" || state === "rate_limited") return translate("处理中");
+  return null;
+}
+
+export function shouldHideOnConfirmedPaste(payload: {
+  state: DictationState;
+  delivery_method?: string;
+  fallback_reason?: string | null;
+}): boolean {
+  return payload.state === "done"
+    && payload.delivery_method === "paste"
+    && payload.fallback_reason == null;
+}
+
+export function hudStageTimerKey(
+  generation: number,
+  state: DictationState,
+  phase: ProcessingPhase,
+  phaseConfirmed: boolean,
+): string {
+  return `${generation}:${state}:${phase}:${phaseConfirmed ? "confirmed" : "unconfirmed"}`;
+}
+
+export function formatHudElapsed(elapsedMs: number): string {
+  const seconds = Math.max(0, Math.floor(elapsedMs / 1_000));
+  const hours = Math.floor(seconds / 3_600);
+  const minutes = Math.floor((seconds % 3_600) / 60);
+  const remaining = seconds % 60;
+  return hours > 0
+    ? `${hours}:${String(minutes).padStart(2, "0")}:${String(remaining).padStart(2, "0")}`
+    : `${String(minutes).padStart(2, "0")}:${String(remaining).padStart(2, "0")}`;
+}
+
 export type HudOrbConfig = {
   state: OrbState;
   paused: boolean;
@@ -31,19 +73,17 @@ export type HudOrbConfig = {
   dim: boolean;
 };
 
-export const HUD_ORB_SIZE = 64 as const;
-/** Thinking stays visible this long on Copied before the outgoing node unmounts. */
-export const HUD_LABEL_OUT_MS = 320;
-/** Copied stays at opacity 0 this long so Thinking can leave first. */
-export const HUD_LABEL_IN_DELAY_MS = 120;
-export const HUD_LABEL_IN_DURATION_MS = 400;
+export const HUD_ORB_SIZE = 20 as const;
+/** Shared capsule motion stays inside the product's 150–300ms transition window. */
+export const HUD_MOTION_MS = 220;
+/** Exits finish before the shared enter/fade duration. */
+export const HUD_LABEL_OUT_MS = 150;
+export const HUD_LABEL_IN_DELAY_MS = 0;
+export const HUD_LABEL_IN_DURATION_MS = HUD_MOTION_MS;
 /** Incoming `--in` class must last this long (delay + fade), not just while outgoing exists. */
 export const HUD_LABEL_FADE_MS = HUD_LABEL_IN_DELAY_MS + HUD_LABEL_IN_DURATION_MS;
-export const HUD_CAPTION_REVEAL_DELAY_MS = 160;
-export const HUD_CAPTION_REVEAL_MS = 420;
-export const HUD_ORB_FADE_MS = 480;
-export const HUD_THINK_BEAM_FADE_MS = 480;
-export const HUD_PILL_RADIUS_PX = 20;
+export const HUD_THINK_BEAM_FADE_MS = HUD_MOTION_MS;
+export const HUD_PILL_RADIUS_PX = 24;
 
 const HUD_FINAL_STATES = new Set<DictationState>([
   "done",
@@ -54,26 +94,30 @@ const HUD_FINAL_STATES = new Set<DictationState>([
   "degraded",
 ]);
 
-export type HudBorderBeamColor = "mono";
+export type HudBorderBeamColor = "colorful" | "mono";
 export type HudBorderBeamSize = "md" | "line";
 export type HudBorderBeamConfig = {
   size: HudBorderBeamSize;
   colorVariant: HudBorderBeamColor;
   strength: number;
   duration?: number;
+  brightness: number;
 };
 
 export const HUD_LISTENING_BEAM: HudBorderBeamConfig = {
   size: "md",
   colorVariant: "mono",
   strength: 1,
-  duration: 3.2,
+  duration: 1.96,
+  brightness: 1.3,
 };
 
 export const HUD_THINKING_BEAM: HudBorderBeamConfig = {
   size: "line",
   colorVariant: "mono",
-  strength: 0.7,
+  strength: 0.65,
+  duration: 3.1,
+  brightness: 1.3,
 };
 
 export function hudBorderBeamFor(state: DictationState): HudBorderBeamConfig | null {
@@ -89,16 +133,29 @@ export function hudBorderBeamFor(state: DictationState): HudBorderBeamConfig | n
 export function hudStatusLabel(
   state: DictationState,
   orb: HudOrbConfig | null,
-  options?: { doneCheck?: boolean },
+  options?: {
+    doneCheck?: boolean;
+    phase?: ProcessingPhase;
+    phaseConfirmed?: boolean;
+    translate?: (source: string) => string;
+  },
 ): string | null {
-  if (options?.doneCheck || state === "done" || state === "degraded") return "Done";
-  if (state === "starting" || state === "recording" || state === "recording_limited") {
-    return "Listening…";
+  const translate = options?.translate ?? ((source: string) => source);
+  if (state === "degraded") return translate("部分结果");
+  if (options?.doneCheck || state === "done") return translate("已完成");
+  if (["starting", "recording", "recording_limited", "processing", "rate_limited"].includes(state)) {
+    return activeHudStatusLabel(
+      state,
+      options?.phase ?? "idle",
+      options?.phaseConfirmed ?? false,
+      translate,
+    );
   }
-  if (state === "copied" || state === "unverified") return "Copied";
-  if (state === "history") return "Saved";
-  if (state === "error") return "Error";
-  if (orb) return "Thinking…";
+  if (state === "copied") return translate("已复制");
+  if (state === "unverified") return translate("结果未确认");
+  if (state === "history") return translate("已保存到历史");
+  if (state === "error") return translate("错误");
+  if (orb) return translate("处理中");
   return null;
 }
 
@@ -108,31 +165,43 @@ export function perceptualLevel(levels: number[]): number {
   return Math.min(1, Math.pow(clamped, 0.58));
 }
 
-export function shouldMountHudOrb(state: DictationState, hasCaption: boolean): boolean {
-  if (HUD_FINAL_STATES.has(state)) return false;
-  if (state === "idle") return hasCaption;
-  return true;
+export function hudAudioLevel(
+  levels: number[],
+  lastAudioLevelAtMs: number | null,
+  clockNowMs: number,
+): { fresh: boolean; level: number } {
+  const fresh = lastAudioLevelAtMs != null
+    && clockNowMs >= lastAudioLevelAtMs
+    && clockNowMs - lastAudioLevelAtMs <= 750;
+  return { fresh, level: fresh ? perceptualLevel(levels) : 0 };
 }
 
 export const HUD_LISTENING_ORB_SPEED = 1.35;
-export const HUD_THINKING_ORB_SPEED = 1.2;
+// Keep the approved 20px orb on the library's native speed curve.
+export const HUD_THINKING_ORB_SPEED = 1;
 
 export function hudOrbFor(
   state: DictationState,
   _phase: ProcessingPhase,
   options: {
     reduced: boolean;
+    pageVisible?: boolean;
     level: number;
+    levelFresh?: boolean;
     selectedActionState?: string | null;
   },
 ): HudOrbConfig | null {
-  void options.level;
   void options.selectedActionState;
   if (HUD_FINAL_STATES.has(state)) return null;
-  const pauseMotion = options.reduced || state === "idle";
+  const listening = ["starting", "recording", "recording_limited"].includes(state);
   const thinking = state === "processing" || state === "rate_limited";
+  if (!listening && !thinking && state !== "idle") return null;
+  const pauseMotion = options.reduced
+    || options.pageVisible === false
+    || state === "idle"
+    || (listening && !options.levelFresh);
   return {
-    state: thinking ? "shaping" : "breathing",
+    state: thinking ? "working" : "breathing",
     paused: pauseMotion,
     speed: thinking ? HUD_THINKING_ORB_SPEED : HUD_LISTENING_ORB_SPEED,
     dim: state === "recording_limited",

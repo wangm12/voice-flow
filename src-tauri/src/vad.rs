@@ -195,6 +195,30 @@ mod tests {
     }
 
     #[test]
+    fn long_gap_keeps_subthreshold_speech() {
+        let mut samples = tone(SAMPLE_RATE);
+        samples.extend(silence(SAMPLE_RATE * 2));
+        let quiet_tail: Vec<f32> = tone(SAMPLE_RATE)
+            .into_iter()
+            .map(|sample| sample * 0.006)
+            .collect();
+        samples.extend_from_slice(&quiet_tail);
+
+        let out = filter_speech(&samples, true);
+        assert!(
+            out.len() < samples.len(),
+            "the long digital-silence gap is compressed"
+        );
+        assert!(
+            out.ends_with(&quiet_tail),
+            "the lower-level speech after the gap is retained"
+        );
+        assert!(out[out.len() - quiet_tail.len()..]
+            .iter()
+            .any(|sample| *sample != 0.0));
+    }
+
+    #[test]
     fn filter_speech_removes_leading_and_trailing_silence() {
         let mut samples = silence(SAMPLE_RATE * 2);
         samples.extend(tone(SAMPLE_RATE));

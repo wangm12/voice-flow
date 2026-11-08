@@ -39,32 +39,28 @@ pub fn should_hop_tis_to_main_queue(on_main_thread: bool) -> bool {
 /// `select_latin` must return true only if the source actually changed.
 /// `restore` then runs on the way out, including when `paste` fails.
 #[cfg(test)]
-pub fn run_with_latin_layout_if_cjk<T>(
+fn test_layout_guard(
     current_id: &str,
     current_name: &str,
     select_latin: impl FnOnce() -> bool,
-    restore: impl FnOnce(),
-    paste: impl FnOnce() -> T,
-) -> T {
+    restore: impl FnOnce() + 'static,
+) -> AbcLayoutGuard {
     let switched = should_switch_input_source(current_id, current_name) && select_latin();
-    struct RestoreOnDrop<F: FnOnce()>(Option<F>);
-    impl<F: FnOnce()> Drop for RestoreOnDrop<F> {
-        fn drop(&mut self) {
-            if let Some(restore) = self.0.take() {
-                restore();
-            }
-        }
+    AbcLayoutGuard {
+        _private: (),
+        restore: if switched {
+            Some(Box::new(restore))
+        } else {
+            None
+        },
     }
-    let _guard = RestoreOnDrop(switched.then_some(restore));
-    paste()
 }
 
 /// RAII switch to ABC/US around Cmd+V. No-op when the current source is already
 /// Latin, when TIS cannot identify the source, or on non-macOS.
 pub struct AbcLayoutGuard {
     _private: (),
-    #[cfg(target_os = "macos")]
-    previous: Option<RetainedInputSource>,
+    restore: Option<Box<dyn FnOnce()>>,
 }
 
 impl AbcLayoutGuard {
@@ -75,7 +71,18 @@ impl AbcLayoutGuard {
         }
         #[cfg(not(target_os = "macos"))]
         {
-            Self { _private: () }
+            Self {
+                _private: (),
+                restore: None,
+            }
+        }
+    }
+}
+
+impl Drop for AbcLayoutGuard {
+    fn drop(&mut self) {
+        if let Some(restore) = self.restore.take() {
+            restore();
         }
     }
 }
@@ -91,15 +98,6 @@ impl Drop for RetainedInputSource {
                 core_foundation::base::CFRelease(self.0 as core_foundation::base::CFTypeRef);
             }
             self.0 = std::ptr::null();
-        }
-    }
-}
-
-#[cfg(target_os = "macos")]
-impl Drop for AbcLayoutGuard {
-    fn drop(&mut self) {
-        if let Some(previous) = self.previous.take() {
-            macos::select_source(previous.0);
         }
     }
 }
@@ -183,6 +181,11 @@ mod macos {
         job.result.expect("main-queue job did not complete")
     }
 
+    #[cfg(feature = "research-harness")]
+    pub(crate) fn research_main_queue_probe() -> bool {
+        on_main_queue(is_main_thread)
+    }
+
     pub(super) fn acquire_guard() -> AbcLayoutGuard {
         // TIS/IME queries must run on the main dispatch queue. The 30 ms
         // settle stays on the paste worker so we do not freeze AppKit.
@@ -190,9 +193,15 @@ mod macos {
         if previous.is_some() {
             thread::sleep(Duration::from_millis(30));
         }
+        let restore = previous.map(|previous| {
+            Box::new(move || {
+                select_source(previous.0);
+                drop(previous);
+            }) as Box<dyn FnOnce()>
+        });
         AbcLayoutGuard {
             _private: (),
-            previous,
+            restore,
         }
     }
 
@@ -291,9 +300,12 @@ mod macos {
     }
 }
 
+#[cfg(all(target_os = "macos", feature = "research-harness"))]
+pub(crate) use macos::research_main_queue_probe;
+
 #[cfg(test)]
 mod tests {
-    use super::{run_with_latin_layout_if_cjk, should_switch_input_source};
+    use super::{should_switch_input_source, test_layout_guard};
     use std::panic::AssertUnwindSafe;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -426,25 +438,40 @@ mod tests {
     }
 
     #[test]
-    fn latin_layout_guard_restores_after_paste_failure() {
+    fn latin_layout_guard_restores_and_releases_retained_source_after_paste_failure() {
+        struct RetainedSourceDrop(Arc<AtomicBool>);
+        impl Drop for RetainedSourceDrop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
         let restored = Arc::new(AtomicBool::new(false));
+        let released = Arc::new(AtomicBool::new(false));
         let restored_on_drop = restored.clone();
-        let result = run_with_latin_layout_if_cjk(
-            "com.apple.inputmethod.SCIM.ITABC",
-            "Pinyin - Simplified",
-            || true,
-            move || restored_on_drop.store(true, Ordering::SeqCst),
-            || Err::<(), &'static str>("paste failed"),
-        );
+        let retained = RetainedSourceDrop(released.clone());
+        let result = {
+            let _guard = test_layout_guard(
+                "com.apple.inputmethod.SCIM.ITABC",
+                "Pinyin - Simplified",
+                || true,
+                move || {
+                    restored_on_drop.store(true, Ordering::SeqCst);
+                    drop(retained);
+                },
+            );
+            Err::<(), &'static str>("paste failed")
+        };
         assert_eq!(result, Err("paste failed"));
         assert!(restored.load(Ordering::SeqCst));
+        assert!(released.load(Ordering::SeqCst));
     }
 
     #[test]
     fn latin_layout_guard_skips_switch_for_abc() {
         let selected = Arc::new(AtomicUsize::new(0));
         let selected_in_switch = selected.clone();
-        run_with_latin_layout_if_cjk(
+        let _guard = test_layout_guard(
             "com.apple.keylayout.ABC",
             "ABC",
             move || {
@@ -452,7 +479,6 @@ mod tests {
                 true
             },
             || panic!("ABC must not restore a layout that was never switched"),
-            || (),
         );
         assert_eq!(selected.load(Ordering::SeqCst), 0);
     }
@@ -461,12 +487,11 @@ mod tests {
     fn latin_layout_guard_does_not_restore_when_switch_fails() {
         let restored = Arc::new(AtomicBool::new(false));
         let restored_on_drop = restored.clone();
-        run_with_latin_layout_if_cjk(
+        let _guard = test_layout_guard(
             "com.apple.inputmethod.SCIM.ITABC",
             "Pinyin",
             || false,
             move || restored_on_drop.store(true, Ordering::SeqCst),
-            || (),
         );
         assert!(!restored.load(Ordering::SeqCst));
     }
@@ -476,13 +501,13 @@ mod tests {
         let restored = Arc::new(AtomicBool::new(false));
         let restored_on_drop = restored.clone();
         let panicked = std::panic::catch_unwind(AssertUnwindSafe(|| {
-            run_with_latin_layout_if_cjk(
+            let _guard = test_layout_guard(
                 "com.apple.inputmethod.SCIM.ITABC",
                 "Pinyin",
                 || true,
                 move || restored_on_drop.store(true, Ordering::SeqCst),
-                || panic!("paste panicked"),
-            )
+            );
+            panic!("paste panicked")
         }));
         assert!(panicked.is_err());
         assert!(restored.load(Ordering::SeqCst));

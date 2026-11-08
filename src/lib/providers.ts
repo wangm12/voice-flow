@@ -11,12 +11,14 @@ export type ProviderId =
   | "deepseek"
   | "anthropic"
   | "ollama"
+  | "lmstudio"
+  | "on_device_mlx"
   | "local_whisper"
   | "on_device"
   | "custom";
 
 export type ProviderCapability = "asr" | "llm";
-export type ProviderProtocol = "openai_compat" | "deepgram" | "anthropic" | "on_device_local" | "soniox_realtime" | "assemblyai_dictation_sync" | "dashscope_message";
+export type ProviderProtocol = "openai_compat" | "deepgram" | "anthropic" | "lmstudio_native" | "on_device_local" | "on_device_mlx_local" | "soniox_realtime" | "assemblyai_dictation_sync" | "dashscope_message";
 export type AsrTransport = "http_batch" | "websocket_stream" | "websocket_completed_audio" | "on_device";
 export type ModelField = "select" | "text";
 export type AsrLanguageSupport =
@@ -77,6 +79,8 @@ export const PROVIDER_IDS = [
   "deepseek",
   "anthropic",
   "ollama",
+  "lmstudio",
+  "on_device_mlx",
   "local_whisper",
   "on_device",
   "custom",
@@ -104,7 +108,12 @@ export const PROVIDERS: readonly ProviderDefinition[] = [
         label: "Whisper Large v3",
         asrProfile: { languageSupport: "optional_fixed_language" },
       },
-      { value: "distil-whisper-large-v3-en", label: "Distil-Whisper", note: "仅英语" },
+      {
+        value: "distil-whisper-large-v3-en",
+        label: "Distil-Whisper",
+        note: "旧配置保留；仅英语，不供新选择",
+        retiredForNewSelection: true,
+      },
     ],
     llmModels: [
       {
@@ -121,6 +130,11 @@ export const PROVIDERS: readonly ProviderDefinition[] = [
       },
       { value: "openai/gpt-oss-20b", label: "GPT-OSS 20B", note: "默认" },
       { value: "openai/gpt-oss-120b", label: "GPT-OSS 120B" },
+      {
+        value: "qwen/qwen3.8-27b",
+        label: "Qwen 3.8 27B",
+        note: "Groq 云端推理；与本机 MLX 6-bit 是不同构建",
+      },
     ],
     defaultAsrModel: "whisper-large-v3-turbo",
     defaultLlmModel: "openai/gpt-oss-20b",
@@ -439,6 +453,40 @@ export const PROVIDERS: readonly ProviderDefinition[] = [
     defaultLlmModel: "qwen3.5:4b",
   },
   {
+    id: "lmstudio",
+    label: "LM Studio",
+    capabilities: ["llm"],
+    protocol: "lmstudio_native",
+    defaultBaseUrl: "http://127.0.0.1:1234",
+    allowsEmptyKey: true,
+    editableBaseUrl: false,
+    asrModelField: "select",
+    llmModelField: "select",
+    asrModels: [],
+    llmModels: [
+      { value: "qwen/qwen3.8-27b@6bit", label: "Qwen 3.8 27B · MLX 6-bit", note: "需 LM Studio 已加载 voiceflow-cleanup 本机实例" },
+    ],
+    defaultAsrModel: "",
+    defaultLlmModel: "qwen/qwen3.8-27b@6bit",
+  },
+  {
+    id: "on_device_mlx",
+    label: "VoiceFlow MLX",
+    capabilities: ["llm"],
+    protocol: "on_device_mlx_local",
+    defaultBaseUrl: "",
+    allowsEmptyKey: true,
+    editableBaseUrl: false,
+    asrModelField: "select",
+    llmModelField: "select",
+    asrModels: [],
+    llmModels: [
+      { value: "qwen3_8_27b_mlx_6bit", label: "Qwen 3.8 27B · MLX 6-bit", note: "VoiceFlow 管理 · 本机推理" },
+    ],
+    defaultAsrModel: "",
+    defaultLlmModel: "qwen3_8_27b_mlx_6bit",
+  },
+  {
     id: "local_whisper",
     label: "Local Whisper",
     capabilities: ["asr"],
@@ -550,6 +598,13 @@ export function dashscopeRegionFromEndpoint(endpoint?: string | null): Dashscope
     return "beijing";
   }
 }
+
+/** Provider-facing labels and notes that are rendered through the i18n layer. */
+export const providerLabelSources = PROVIDERS.flatMap((provider) => [
+  provider.label,
+  ...provider.asrModels.flatMap((model) => [model.label, ...(model.note ? [model.note] : [])]),
+  ...provider.llmModels.flatMap((model) => [model.label, ...(model.note ? [model.note] : [])]),
+]);
 
 export function isProviderId(value: string | undefined | null): value is ProviderId {
   return PROVIDER_IDS.some((id) => id === value);

@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager};
 
 pub const MAX_SECONDS: u64 = 30;
+const FRAME_FRESHNESS: Duration = Duration::from_millis(750);
 
 #[derive(Clone, Default, Serialize)]
 pub struct Levels {
@@ -14,6 +15,7 @@ pub struct Levels {
     pub received_frames: bool,
     pub signal_detected: bool,
     pub clipping_detected: bool,
+    pub frame_fresh: bool,
 }
 
 impl Levels {
@@ -65,11 +67,27 @@ pub struct Status {
     pub session_id: String,
     pub device_name: String,
     pub state: String,
+    pub stream_released: bool,
     pub elapsed_secs: u64,
     pub input_gain: f32,
     #[serde(flatten)]
     pub levels: Levels,
     pub error: Option<String>,
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StopState {
+    Stopped,
+    InactiveCancelled,
+}
+
+/// Produced by the audio thread after drop, or after recording that a pending
+/// matching start is cancelled. IPC delivery alone never creates this fact.
+#[derive(Debug, PartialEq, Eq, Serialize)]
+pub struct StopReceipt {
+    pub session_id: String,
+    pub state: StopState,
 }
 
 pub struct Check {
@@ -81,6 +99,7 @@ pub struct Check {
     input_gain: f32,
     started: Instant,
     levels: Arc<Mutex<Levels>>,
+    last_frame_at: Arc<Mutex<Option<Instant>>>,
     error: Arc<Mutex<Option<String>>>,
 }
 
@@ -102,6 +121,8 @@ impl Check {
         let config = supported.config();
         let levels = Arc::new(Mutex::new(Levels::default()));
         let callback_levels = levels.clone();
+        let last_frame_at = Arc::new(Mutex::new(None));
+        let callback_last_frame_at = last_frame_at.clone();
         let error = Arc::new(Mutex::new(None));
         let callback_error = error.clone();
         let err_fn = move |failure: cpal::StreamError| {
@@ -112,6 +133,9 @@ impl Check {
                 device.build_input_stream(
                     &config,
                     move |samples: &[$ty], _| {
+                        if !samples.is_empty() {
+                            *crate::lock_recover(&callback_last_frame_at) = Some(Instant::now());
+                        }
                         crate::lock_recover(&callback_levels)
                             .observe(samples, channels, input_gain);
                     },
@@ -136,20 +160,39 @@ impl Check {
             input_gain,
             started: Instant::now(),
             levels,
+            last_frame_at,
             error,
         })
     }
 
     pub fn status(&self, state: &str) -> Status {
+        let last_frame_at = *crate::lock_recover(&self.last_frame_at);
+        let frame_fresh = last_frame_at.is_some_and(|at| at.elapsed() <= FRAME_FRESHNESS);
+        let mut levels = crate::lock_recover(&self.levels).clone();
+        levels.frame_fresh = frame_fresh;
+        if !frame_fresh {
+            levels.level = 0.0;
+        }
         Status {
             session_id: self.session_id.clone(),
             device_name: self.device_name.clone(),
             state: state.into(),
+            stream_released: false,
             elapsed_secs: self.started.elapsed().as_secs(),
             input_gain: self.input_gain,
-            levels: crate::lock_recover(&self.levels).clone(),
+            levels,
             error: crate::lock_recover(&self.error).clone(),
         }
+    }
+
+    /// A terminal fact is published only after the self-check stream owner drops.
+    /// Other audio-engine streams (recording/prewarm) have separate ownership.
+    pub fn finish(self, state: &str) {
+        let mut status = self.status(state);
+        let app = self.app.clone();
+        drop(self);
+        status.stream_released = true;
+        let _ = app.emit("microphone-check://state", status);
     }
 
     pub fn terminal_state(&self) -> Option<&'static str> {

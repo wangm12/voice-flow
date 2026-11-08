@@ -7,12 +7,32 @@
 | 文档 | 内容 |
 | --- | --- |
 | [README.md](../README.md) | 产品说明、设置页、本地开发、签名 |
+| [THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md) | MLX sidecar 的上游 LICENSE/NOTICE、Swift 参考文本、Handy 组件及固定本地模型的来源说明 |
 | [privacy.md](privacy.md) | 数据流、本地保留、Keychain、删除 |
-| [end-to-end-workflows.md](end-to-end-workflows.md) | 首次配置 / 本机麦克风自检 / 词典反馈 / batch 预取 / Soniox 实时流与恢复 / AssemblyAI Dictation + raw Sync / Qwen Audio Message / 口述 / 长录音与完整音频恢复 / 六类选中文本操作 / 手动看屏幕 / 后端交付撤销命令 |
-| [cleanup-evaluation.md](cleanup-evaluation.md) | 确定性本地整理评测、test-only 编辑归因裁判、显式 WAV → ASR → 整理评测入口与可选 live provider 协议（不是当前 runtime/E2E 验收结果） |
+| [end-to-end-workflows.md](end-to-end-workflows.md) | 首次配置 / 本机麦克风自检 / 词典反馈 / batch 预取 / Soniox 实时流与恢复 / AssemblyAI Dictation + raw Sync / Qwen Audio Message / 口述 / 长录音与完整音频恢复 / 六类选中文本操作 / 手动看屏幕 / PromptOrCode 与 Code 中的请求边界 / 后端交付撤销命令 |
+| [cleanup-evaluation.md](cleanup-evaluation.md) | 确定性本地整理评测、test-only 编辑归因裁判、feature-gated WAV evaluator、strict corpus/recipe/negative 契约、显式 SHA 候选重放、当前执行范围与可选 live provider 协议（不代表 runtime/E2E 验收） |
+| [public-corpus-preparation.md](public-corpus-preparation.md) | 显式有界公共语料下载、ASCEND 待审候选、独立人工标签导入和 YODAS 元数据准备 |
 | [asr-cleanup-later-and-wont.md](asr-cleanup-later-and-wont.md) | 以后再做 / 明确不做 |
 | [release-checklist.md](release-checklist.md) | 发布前检查 |
 | [context-e2e-checklist.md](context-e2e-checklist.md) | Context / 交付手工验收 |
+
+## 维护工具
+
+- [依赖归属与原文生成工具](../scripts/research/third-party-notices/tools/README.md)：按锁定依赖生成外部 staging，保留原文、引用类型、缺失和来源身份；测试使用离线 fixtures。
+
+## 进行中的计划（待实施，不代表当前行为）
+
+| 文档 | 内容 |
+| --- | --- |
+| [Chatterfly 改进计划](chatterfly-improvement-plan-2026-10-26.md) | 分阶段改动、验证协议、成功门槛与回退条件；工作落地或终止后删除计划及此链接 |
+| [Cleanup 与纠错学习 harness 改进计划](cleanup-learning-harness-plan-2026-11-05.md) | 编辑采集、归因、场景规则、晋升/召回、prompt 消融与完整学习 episode 验收；待实施，落地或终止后删除 |
+| [纠错 Harness 生产接入与规则晋升研究计划](learning-harness-production-research-plan.md) | 干净 main 上的依赖审计、受控 V2/V3 fixture 接入顺序、隔离 SQLite 验收与后续研究门槛；当前仍为提案 |
+
+## 设计参考（归档，不作为实现规范）
+
+| 文档 | 内容 |
+| --- | --- |
+| [Voice HUD 设计参考](design/voice-hud/README.md) | 已评审的 HUD 方案、状态样例与可重建预览；当前行为以本页活文档和源码为准 |
 
 ## 研究对照（结论可能仍有效，实现状态会过期）
 

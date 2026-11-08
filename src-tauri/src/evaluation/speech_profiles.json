@@ -1,0 +1,45 @@
+{
+  "artifact_type": "compiled_asr_speech_profiles",
+  "schema_version": 1,
+  "profiles": [
+    {
+      "id": "ascend-audited-three-metadata-v1",
+      "packet_sha256": "d173c66a5d6b8e57ac3978c2a5dc4d12476eb46cf34442e18386c557a11f5142",
+      "member_count": 3,
+      "evidence_pins": {
+        "candidates": "747c1ecc7f9c532318eea8bf1db0ce6614dfc8f7841a2b5ce191f4116b4a7783",
+        "audit": "25675eda8f9f7a59b118989d42845e4b35a8cfa25f9fcd0e49cc01b1ee516a93",
+        "observations": "686636b8d61c53f9f2883f566dd6f0b3305ef4710ec4f118990d3e32d59aa423",
+        "report": "19c21f0017fc87e6d559af4c8c01334a563c5d992e40442894d959409a704562",
+        "card": "132d44b626d1ec77704f35faa5fc5becd38f27403389b2ab6e95c796cf1430c4",
+        "license": "47c0a954c88d793bdefe92fb007ae3c038fb3807f1a27083433d01aa7542c0d8",
+        "acquisition": "30b6321a18ca1c865824468c81f04517ed1e985adebe03c6443f190232f96fc9"
+      },
+      "cohort_proof": null,
+      "packet_state": "metadata_projection_only_product_admission_not_implemented"
+    },
+    {
+      "id": "ascend-audited-pilot60-metadata-v1",
+      "packet_sha256": null,
+      "member_count": 60,
+      "evidence_pins": {
+        "candidates": "747c1ecc7f9c532318eea8bf1db0ce6614dfc8f7841a2b5ce191f4116b4a7783",
+        "audit": "25675eda8f9f7a59b118989d42845e4b35a8cfa25f9fcd0e49cc01b1ee516a93",
+        "observations": "686636b8d61c53f9f2883f566dd6f0b3305ef4710ec4f118990d3e32d59aa423",
+        "report": "19c21f0017fc87e6d559af4c8c01334a563c5d992e40442894d959409a704562",
+        "card": "132d44b626d1ec77704f35faa5fc5becd38f27403389b2ab6e95c796cf1430c4",
+        "license": "47c0a954c88d793bdefe92fb007ae3c038fb3807f1a27083433d01aa7542c0d8",
+        "acquisition": "30b6321a18ca1c865824468c81f04517ed1e985adebe03c6443f190232f96fc9",
+        "cohort_proposal": "b4909ed4b790bb43a9fefa6dde3246b511029d8750344665fe363f41589272bc",
+        "cohort_audit": "edbbc3a9f3b013bd07bc482d968cf457c305bf3173c4ad9b32c866703a41cdbc",
+        "cohort_verification": "676264956e74ee2407a0be2938964e47295f633e923da60da634c23942274211"
+      },
+      "cohort_proof": {
+        "proposal_role": "cohort_proposal",
+        "audit_role": "cohort_audit",
+        "verification_role": "cohort_verification"
+      },
+      "packet_state": "metadata_projection_only_native_admission_not_run"
+    }
+  ]
+}

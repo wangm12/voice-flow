@@ -1,24 +1,20 @@
-import { useLayoutEffect, useRef, useState, type CSSProperties } from "react";
+import { useState, type CSSProperties } from "react";
 import { BorderBeam } from "border-beam";
 import { VoiceHudOrb } from "../../src/components/Island/VoiceHudOrb";
 import {
-  HUD_LABEL_IN_DELAY_MS,
-  HUD_LABEL_IN_DURATION_MS,
+  HUD_LABEL_FADE_MS,
   HUD_LABEL_OUT_MS,
+  HUD_MOTION_MS,
   HUD_LISTENING_BEAM,
   HUD_PILL_RADIUS_PX,
   HUD_THINKING_BEAM,
+  formatHudElapsed,
   hudOrbFor,
   hudStatusLabel,
   type DictationState,
 } from "../../src/components/Island/hudOrb";
-import {
-  applyLineBeamProgress,
-  driveLineBeamWithJs,
-  releaseLineBeamDrive,
-  stepSmoothThinkingProgress,
-} from "../../src/components/Island/hudLineBeam";
-import type { Phase } from "./content";
+import { usePageVisible } from "../../src/components/Island/hudLineBeam";
+import type { Locale, Phase } from "./content";
 
 const overlayStyle: CSSProperties = {
   position: "absolute",
@@ -32,8 +28,6 @@ function useHudLabel(next: string | null, reduced: boolean) {
   const [outgoing, setOutgoing] = useState<string | null>(null);
   const [entering, setEntering] = useState(false);
 
-  // Match VoicePill's label crossfade. CSS animation-end cleanup also respects
-  // the website's pause control without running completion timers offscreen.
   if (next !== text) {
     setOutgoing(!reduced && text != null && next != null ? text : null);
     setEntering(!reduced && text != null && next != null);
@@ -43,180 +37,117 @@ function useHudLabel(next: string | null, reduced: boolean) {
     setEntering(false);
   }
 
-  return {
-    text,
-    outgoing,
-    entering,
-    finishEntering: () => setEntering(false),
-    finishOutgoing: () => setOutgoing(null),
-  };
+  return { text, outgoing, entering };
 }
 
-/** Present the actual product's UI using the browser demo's preset clock. */
+/** A preset visual only: it never presents the demo's timer as microphone evidence. */
 export default function DemoHud({
   phase,
-  progress,
   running,
   reducedMotion,
+  elapsedMs,
+  locale,
 }: {
   phase: Phase;
   progress: number;
   running: boolean;
   reducedMotion: boolean;
+  elapsedMs: number;
+  locale: Locale;
 }) {
-  const state: DictationState =
-    phase === "idle"
-      ? "idle"
-      : phase === "listening"
-        ? "recording"
-        : phase === "complete"
-          ? "done"
-          : "processing";
-  const orb =
-    state === "idle"
-      ? null
-      : hudOrbFor(state, phase === "writing" ? "delivery" : "cleanup", {
-          reduced: reducedMotion,
-          level: 0,
-        });
+  const pageVisible = usePageVisible();
+  const state: DictationState = phase === "idle"
+    ? "idle"
+    : phase === "listening"
+      ? "recording"
+      : phase === "complete"
+        ? "done"
+        : "processing";
   const listening = state === "recording";
   const thinking = state === "processing";
-  const label = useHudLabel(hudStatusLabel(state, orb), reducedMotion);
-  const lineRef = useRef<HTMLDivElement>(null);
-  const visualProgress = useRef(0);
-  const targetProgress = useRef(progress);
-  targetProgress.current = progress;
-
-  // Reuse the product's line geometry and easing. Its live hook intentionally
-  // creeps while waiting, so the website adds pause/resume without resetting it.
-  useLayoutEffect(() => {
-    const line = lineRef.current;
-    if (!line) return;
-    if (!thinking || reducedMotion) {
-      visualProgress.current = 0;
-      releaseLineBeamDrive(line);
-      applyLineBeamProgress(line, null);
-      line.style.removeProperty("animation-play-state");
-      return;
-    }
-    driveLineBeamWithJs(line);
-    line.style.setProperty(
-      "animation-play-state",
-      running ? "running" : "paused",
-      "important",
-    );
-    if (!running) return;
-    let frame: number;
-    let previous = performance.now();
-    function tick(now: number) {
-      const dt = Math.min(0.05, Math.max(0, (now - previous) / 1000));
-      previous = now;
-      visualProgress.current = stepSmoothThinkingProgress(
-        visualProgress.current,
-        targetProgress.current,
-        dt,
-      );
-      applyLineBeamProgress(line!, visualProgress.current);
-      frame = requestAnimationFrame(tick);
-    }
-    applyLineBeamProgress(line, visualProgress.current);
-    frame = requestAnimationFrame(tick);
-    return () => cancelAnimationFrame(frame);
-  }, [thinking, running, reducedMotion]);
-
+  const orb = hudOrbFor(state, "idle", {
+    reduced: reducedMotion,
+    pageVisible,
+    level: 0,
+    levelFresh: false,
+  });
+  const englishLabels: Record<string, string> = {
+    "录音中": "Listening",
+    "处理中": "Processing",
+    "预设演示 · 未使用麦克风": "Preset demo · no microphone input",
+    "停止录音并整理": "Stop and process",
+  };
+  const translate = (source: string) => locale === "zh" ? source : englishLabels[source] ?? source;
+  const label = useHudLabel(hudStatusLabel(state, orb, { translate }), reducedMotion);
+  const hidden = state === "idle" || state === "done";
   const stackClass = [
     "voice-pill-stack",
-    state === "idle" ? "voice-pill-stack--hidden" : "",
-    state === "done" ? "voice-pill-stack--exit" : "",
+    hidden ? "voice-pill-stack--hidden voice-pill-stack--hidden-now" : "",
     reducedMotion ? "voice-pill-stack--reduced" : "",
-  ]
-    .filter(Boolean)
-    .join(" ");
+  ].filter(Boolean).join(" ");
 
   return (
     <div
-      className="demo-hud"
+      className="demo-hud voice-pill-stage"
       data-hud-state={state}
       data-running={running}
       aria-hidden="true"
-      style={
-        {
-          "--hud-label-in-delay": `${HUD_LABEL_IN_DELAY_MS}ms`,
-          "--hud-label-in-duration": `${HUD_LABEL_IN_DURATION_MS}ms`,
-          "--hud-label-out-duration": `${HUD_LABEL_OUT_MS}ms`,
-        } as CSSProperties
-      }
+      style={{
+        width: 220,
+        height: 48,
+        ["--voice-pill-width" as string]: "220px",
+        ["--voice-pill-height" as string]: "48px",
+        ["--hud-motion-duration" as string]: `${HUD_MOTION_MS}ms`,
+        ["--hud-label-in-duration" as string]: `${HUD_LABEL_FADE_MS}ms`,
+        ["--hud-label-out-duration" as string]: `${HUD_LABEL_OUT_MS}ms`,
+      }}
     >
       <div className={stackClass}>
         <div className="voice-pill__beam-host">
-          <div
-            className={`voice-pill voice-pill--${state} voice-pill--labeled${orb ? " voice-pill--orb" : ""}`}
-          >
-            {thinking && reducedMotion && (
-              <span
-                className="voice-pill__progress voice-pill__progress--visible"
-                style={{ transform: `scaleX(${progress})` }}
-              />
-            )}
-            <div className="voice-pill__content">
-              <span className="voice-pill__indicator">
-                <span
-                  className={`voice-pill__center-state${orb ? " voice-pill__center-state--active" : ""}`}
-                >
-                  {orb && (
-                    <VoiceHudOrb
-                      state={orb.state}
-                      paused={orb.paused || !running}
-                      speed={orb.speed}
-                      dim={orb.dim}
-                    />
-                  )}
+          <div className={`voice-pill voice-pill--${state} voice-pill--expanded voice-pill--labeled${thinking ? " voice-pill--orb" : ""}`} style={{ width: 220, height: 48 }}>
+            <span className="voice-pill__indicator" aria-hidden="true">
+              {thinking && orb ? (
+                <span className="voice-pill__center-state voice-pill__center-state--active">
+                  <VoiceHudOrb state="working" paused={orb.paused || !running || !pageVisible} speed={orb.speed} dim={orb.dim} />
                 </span>
+              ) : (
+                <svg className="voice-pill__glyph" width="18" height="18" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.35" strokeLinecap="round" strokeLinejoin="round">
+                  <rect x="7" y="2.5" width="6" height="10" rx="3" />
+                  <path d="M4.5 9.5a5.5 5.5 0 0 0 11 0M10 15v2.5m-3 0h6" />
+                </svg>
+              )}
+            </span>
+            <span className="voice-pill__copy">
+              <span className="voice-pill__title-row">
+                <span className="voice-pill__label-stack" aria-hidden="true">
+                  {label.text && <span key={label.text} className={`voice-pill__label${label.entering ? " voice-pill__label--in" : ""}`}>{label.text}</span>}
+                  {label.outgoing && <span key={`out-${label.outgoing}`} className="voice-pill__label voice-pill__label--out">{label.outgoing}</span>}
+                </span>
+                {listening && <time className="voice-pill__elapsed">{formatHudElapsed(elapsedMs)}</time>}
               </span>
-              <span className="voice-pill__label-stack">
-                {label.text && (
-                  <span
-                    key={label.text}
-                    className={`voice-pill__label${label.entering ? " voice-pill__label--in" : ""}`}
-                    onAnimationEnd={label.finishEntering}
-                  >
-                    {label.text}
-                  </span>
-                )}
-                {label.outgoing && (
-                  <span
-                    key={`out-${label.outgoing}`}
-                    className="voice-pill__label voice-pill__label--out"
-                    onAnimationEnd={label.finishOutgoing}
-                  >
-                    {label.outgoing}
-                  </span>
-                )}
+              {listening && (
+                <span className="voice-pill__subtitle">
+                  <svg className="voice-pill__glyph" width="11" height="11" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                    <rect x="7" y="2.5" width="6" height="10" rx="3" />
+                    <path d="M4.5 9.5a5.5 5.5 0 0 0 11 0M10 15v2.5m-3 0h6" />
+                  </svg>
+                  <span>{translate("预设演示 · 未使用麦克风")}</span>
+                </span>
+              )}
+            </span>
+            {state !== "idle" && state !== "done" && (
+              <span className="voice-pill__action" aria-hidden="true" title={translate("停止录音并整理")}>
+                <svg className="voice-pill__glyph" width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.35" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                  <rect x="5" y="5" width="10" height="10" rx="1" fill="currentColor" strokeWidth="1.6" />
+                </svg>
               </span>
-            </div>
+            )}
           </div>
-          <BorderBeam
-            className="voice-pill__beam-fx"
-            {...HUD_LISTENING_BEAM}
-            theme="dark"
-            borderRadius={HUD_PILL_RADIUS_PX}
-            active={listening && !reducedMotion}
-            style={overlayStyle}
-          >
+          <BorderBeam className="voice-pill__beam-fx" {...HUD_LISTENING_BEAM} theme="dark" borderRadius={HUD_PILL_RADIUS_PX} active={false} style={overlayStyle}>
             <div className="voice-pill__beam-ghost" />
           </BorderBeam>
-          <div
-            className={`voice-pill__beam-layer${thinking ? "" : " voice-pill__beam-layer--exit"}`}
-          >
-            <BorderBeam
-              ref={lineRef}
-              className="voice-pill__beam-fx"
-              {...HUD_THINKING_BEAM}
-              theme="dark"
-              borderRadius={HUD_PILL_RADIUS_PX}
-              active={thinking && !reducedMotion}
-              style={overlayStyle}
-            >
+          <div className={`voice-pill__beam-layer${thinking ? "" : " voice-pill__beam-layer--exit"}`}>
+            <BorderBeam className="voice-pill__beam-fx" {...HUD_THINKING_BEAM} theme="dark" borderRadius={HUD_PILL_RADIUS_PX} active={thinking && !reducedMotion && running && pageVisible} style={overlayStyle}>
               <div className="voice-pill__beam-ghost" />
             </BorderBeam>
           </div>

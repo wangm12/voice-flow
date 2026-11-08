@@ -61,6 +61,7 @@ export function ParticleText({
     let gatherStart = 0;
     let building = 0;
     let gathering = false;
+    let hasGathered = false;
     let reducedMotion = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false;
 
     const stopAnimation = () => {
@@ -107,6 +108,7 @@ export function ParticleText({
 
       gathering = false;
       animationFrame = null;
+      hasGathered = true;
     };
 
     const scheduleGather = () => {
@@ -233,12 +235,32 @@ export function ParticleText({
         };
       });
 
-      scheduleGather();
+      if (!hasGathered) {
+        scheduleGather();
+      } else {
+        stopAnimation();
+        if (gatherTimer !== null) {
+          window.clearTimeout(gatherTimer);
+          gatherTimer = null;
+        }
+        gathering = false;
+        particles.forEach((particle) => {
+          particle.x = particle.targetX;
+          particle.y = particle.targetY;
+          particle.startX = particle.targetX;
+          particle.startY = particle.targetY;
+          particle.delay = 0;
+        });
+        render(performance.now());
+      }
     };
 
     const queueSample = () => {
       if (resizeFrame !== null) window.cancelAnimationFrame(resizeFrame);
-      resizeFrame = window.requestAnimationFrame(() => void sampleText());
+      resizeFrame = window.requestAnimationFrame(() => {
+        resizeFrame = null;
+        void sampleText();
+      });
     };
 
     const reduceMotionQuery = window.matchMedia?.("(prefers-reduced-motion: reduce)");
@@ -256,6 +278,20 @@ export function ParticleText({
 
     const resizeObserver = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(queueSample);
     resizeObserver?.observe(container);
+
+    let dprQuery: MediaQueryList | null = null;
+    const onDprChange = () => {
+      dprQuery?.removeEventListener("change", onDprChange);
+      dprQuery = null;
+      armDprQuery();
+      queueSample();
+    };
+    const armDprQuery = () => {
+      if (!window.matchMedia) return;
+      dprQuery = window.matchMedia(`(resolution: ${window.devicePixelRatio || 1}dppx)`);
+      dprQuery.addEventListener("change", onDprChange);
+    };
+    armDprQuery();
     void sampleText();
 
     return () => {
@@ -264,6 +300,7 @@ export function ParticleText({
       themeObserver?.disconnect();
       reduceMotionQuery?.removeEventListener("change", onReducedMotionChange);
       colorSchemeQuery?.removeEventListener("change", onColorSchemeChange);
+      dprQuery?.removeEventListener("change", onDprChange);
       stopAnimation();
       if (resizeFrame !== null) window.cancelAnimationFrame(resizeFrame);
       if (gatherTimer !== null) window.clearTimeout(gatherTimer);

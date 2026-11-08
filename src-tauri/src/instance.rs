@@ -14,6 +14,13 @@ mod platform {
         _file: File,
     }
 
+    #[cfg(test)]
+    pub fn new_for_test() -> InstanceLock {
+        InstanceLock {
+            _file: File::open("/dev/null").expect("test instance lock handle"),
+        }
+    }
+
     pub fn acquire() -> io::Result<InstanceLock> {
         let path = std::env::temp_dir().join("voiceflow-single-instance.lock");
         let file = OpenOptions::new()
@@ -38,11 +45,18 @@ mod platform {
 
     pub struct InstanceLock;
 
+    #[cfg(test)]
+    pub fn new_for_test() -> InstanceLock {
+        InstanceLock
+    }
+
     pub fn acquire() -> io::Result<InstanceLock> {
         Ok(InstanceLock)
     }
 }
 
+#[cfg(test)]
+pub use platform::new_for_test;
 pub use platform::{acquire, InstanceLock};
 
 pub fn acquire_or_exit() -> InstanceLock {

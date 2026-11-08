@@ -1,0 +1,42 @@
+{
+  "classification": "supplemental_upstream_not_locked_release_body",
+  "do_not_reassign": "The react-remove-scroll-bar@2.3.7 and malloc_buf later-upstream notices do not apply to realfft@3.5.0. The RealFFT notice below is an authentic later-upstream missing-license repair for unchanged 3.5.0 Rust source, but is not the 3.5.0 archive body. No supplemental notice is evidence for block@0.1.6, objc-foundation@0.1.1, or objc_id@0.1.1.",
+  "items": [
+    {
+      "classification_note": "Same-project upstream supplemental MIT notice; exact locked-release applicability unverified. Not the 2.3.8 archive body.",
+      "included_notice_path": "supplemental/react-remove-scroll-bar-2.3.7/LICENSE",
+      "locked_package": "react-remove-scroll-bar@2.3.8",
+      "locked_version": "2.3.8",
+      "notice_sha256": "a79aae0c0f21990d9d963bb3c5a79cdcea9a46f8523ba55c58d7fe776b6ebc84",
+      "same_project_upstream_revision": "8ca9ba5ea52de03308fe8ced94f7b159a44d28ff",
+      "same_revision_package_metadata_path": "provenance/supplemental/react-remove-scroll-bar-8ca9ba5/package.json",
+      "same_revision_package_metadata_sha256": "484ad46c8cc261e168d7e2602bbb70b80f8d10307b7de91d99485da28c350a03",
+      "same_revision_package_version": "2.3.7",
+      "source_url": "https://github.com/theKashey/react-remove-scroll-bar/blob/8ca9ba5ea52de03308fe8ced94f7b159a44d28ff/LICENSE"
+    },
+    {
+      "classification_note": "Same-project later upstream MIT notice. History describes a later license addition; the 0.0.6 release tree has no license file. Not a 0.0.6 distribution body.",
+      "history_evidence_path": "provenance/supplemental/malloc_buf-license-history.response",
+      "history_evidence_sha256": "a2808cadc114218edf9fa9d804e2819ea2a5fd3ec8f028d580cfca792cb63bce",
+      "included_notice_path": "supplemental/malloc_buf-later-upstream/LICENSE",
+      "locked_package": "malloc_buf@0.0.6",
+      "locked_release_tree_evidence_path": "provenance/supplemental/malloc_buf-0.0.6-release-tag-tree.response",
+      "locked_release_tree_evidence_sha256": "8356f2597ab05fde7560752eb9d8c356699967e803f8d7ae34f0eab97fb859b4",
+      "notice_sha256": "aced7b57e474a63edb5a724954222bf7659c01ceef0e648a03af799582991db7",
+      "same_project_upstream_revision": "d9a3e539642bd90e07df458d226b19cdfa606863",
+      "source_url": "https://github.com/SSheldon/malloc_buf/blob/d9a3e539642bd90e07df458d226b19cdfa606863/LICENSE"
+    },
+    {
+      "classification_note": "Authentic MIT notice added by the later upstream missing-license repair at 3.5.1. The commit changes Cargo.toml version, LICENSE, and README only; Rust source is unchanged from locked 3.5.0. This notice is not present in the exact 3.5.0 archive and does not change the locked exact-release full-text status.",
+      "included_notice_path": "supplemental/realfft-pinned-new-license.txt",
+      "locked_package": "realfft@3.5.0",
+      "locked_version": "3.5.0",
+      "notice_sha256": "080766c57f9e48f00218f4e43c7d671d4b6ffee85a39417b5ab3c916dfe29b0d",
+      "notice_provenance_path": "provenance/realfft-later-upstream.json",
+      "same_project_upstream_revision": "9fdcf59c60c7ecacbf75774d378a068811a2e6ea",
+      "upstream_package_version": "3.5.1",
+      "source_url": "https://github.com/HEnquist/realfft/blob/9fdcf59c60c7ecacbf75774d378a068811a2e6ea/LICENSE"
+    }
+  ],
+  "schema": "voiceflow-same-project-upstream-supplemental-notices-v1"
+}

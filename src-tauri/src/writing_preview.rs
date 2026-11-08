@@ -84,6 +84,7 @@ pub(crate) struct PreviewRequest {
 #[serde(rename_all = "snake_case")]
 enum PreviewStatus {
     Model,
+    Off,
     LocalOnly,
     ProviderFallback,
     GuardFallback,
@@ -94,12 +95,101 @@ pub(crate) struct PreviewResult {
     text: String,
     status: PreviewStatus,
     elapsed_ms: u64,
+    /// Only the actual shared adapter's accepted reply, before final guard.
+    /// None means unavailable, not proof that a provider was never attempted.
+    model_candidate: Option<String>,
+    /// Complete parsed provider text before shared cleanup transformations.
+    /// This is preview-only and is never added to normal dictation history.
+    provider_candidate: Option<String>,
+    cleanup_transformations: Vec<String>,
+    cleanup_rejection: Option<llm::CleanupRejectionFact>,
+    provider_error: Option<llm::LlmError>,
+    final_guard_rejected: bool,
+}
+
+impl PreviewResult {
+    fn local(text: String, off: bool) -> Self {
+        Self {
+            text,
+            status: if off {
+                PreviewStatus::Off
+            } else {
+                PreviewStatus::LocalOnly
+            },
+            elapsed_ms: 0,
+            model_candidate: None,
+            provider_candidate: None,
+            cleanup_transformations: Vec::new(),
+            cleanup_rejection: None,
+            provider_error: None,
+            final_guard_rejected: false,
+        }
+    }
+    fn provider(
+        result: Result<llm::AcceptedCleanupReply, queue::ExecuteError<llm::LlmError>>,
+        local: impl FnOnce() -> String,
+    ) -> Result<Self, String> {
+        match result {
+            Ok(reply) => Ok(Self {
+                model_candidate: Some(reply.accepted_text.clone()),
+                provider_candidate: Some(reply.provider_candidate),
+                cleanup_transformations: reply.transformations,
+                cleanup_rejection: None,
+                text: reply.accepted_text,
+                status: PreviewStatus::Model,
+                elapsed_ms: 0,
+                provider_error: None,
+                final_guard_rejected: false,
+            }),
+            Err(queue::ExecuteError::Cancelled) => Err("preview_cancelled".into()),
+            Err(queue::ExecuteError::Operation(error)) => {
+                let status = if llm::is_preservation_guard_error(&error) {
+                    PreviewStatus::GuardFallback
+                } else {
+                    PreviewStatus::ProviderFallback
+                };
+                Ok(Self {
+                    text: local(),
+                    status,
+                    elapsed_ms: 0,
+                    model_candidate: None,
+                    provider_candidate: None,
+                    cleanup_transformations: Vec::new(),
+                    cleanup_rejection: llm::cleanup_rejection(&error),
+                    provider_error: Some(error),
+                    final_guard_rejected: false,
+                })
+            }
+        }
+    }
 }
 
 #[derive(Serialize)]
 pub(crate) struct PreviewResponse {
     saved: Option<PreviewResult>,
     draft: PreviewResult,
+}
+
+// Single route/typed-result owner, also usable with a bounded real HTTP fixture.
+// The provider closure is never invoked for a local/Off route.
+async fn execute_preview_route<F, Fut>(
+    route: lexicon::CleanupRoute,
+    off: bool,
+    provider: F,
+    local: impl FnOnce() -> String,
+) -> Result<PreviewResult, String>
+where
+    F: FnOnce(llm::CleanupEffort) -> Fut,
+    Fut: std::future::Future<
+        Output = Result<llm::AcceptedCleanupReply, queue::ExecuteError<llm::LlmError>>,
+    >,
+{
+    match route {
+        lexicon::CleanupRoute::Provider(effort) => {
+            PreviewResult::provider(provider(effort).await, local)
+        }
+        lexicon::CleanupRoute::LocalOnly => Ok(PreviewResult::local(local(), off)),
+    }
 }
 
 fn validate_request(request: &PreviewRequest) -> Result<(), String> {
@@ -138,6 +228,33 @@ fn settings_are_current(state: &AppState, generation: u64) -> bool {
         && state.exit_state.load(Ordering::Acquire) == 0
 }
 
+fn finalize_trial_result(
+    mut result: PreviewResult,
+    source: &str,
+    context: crate::FinalizationContext<'_>,
+) -> PreviewResult {
+    let (text, guard_reason, rejected_candidate) =
+        crate::guard_final_output_with_reason(source, &result.text, context);
+    let guard_rejected = guard_reason.is_some();
+    if guard_rejected {
+        result.status = PreviewStatus::GuardFallback;
+        if result.cleanup_rejection.is_none() {
+            if let (Some(candidate), Some(reason)) = (rejected_candidate, guard_reason) {
+                if result.model_candidate.is_some() {
+                    result.cleanup_rejection = Some(llm::CleanupRejectionFact {
+                        candidate,
+                        reason,
+                        stage: llm::CleanupRejectionStage::FinalOutput,
+                    });
+                }
+            }
+        }
+    }
+    result.text = text;
+    result.final_guard_rejected = guard_rejected;
+    result
+}
+
 async fn run_trial(
     state: &AppState,
     settings: &store::Settings,
@@ -153,96 +270,95 @@ async fn run_trial(
     let snapshot = trial_context(mode);
     // A tone trial has no actual App target, context grants, or clipboard.
     // Reuse production preparation, routing, provider adapter and final guard.
-    let prepared = crate::prepare_cleanup_transcript_for_scene(
+    let scene = crate::resolve_cleanup_scene(settings, Some(&snapshot));
+    let prepared = crate::prepare_cleanup_transcript_for_resolved_scene(
         None,
         settings,
         text,
-        mode.family,
+        scene,
         1.0,
-        snapshot.policy.input_kind,
+        None,
         settings.fuzzy_dictionary_enabled,
     );
     let input = &prepared.intent.content;
-    let fallback =
-        || crate::local_cleanup_or_raw_for_scene(input, mode.family, snapshot.policy.input_kind);
-    let (candidate, mut status) =
-        match crate::cleanup_route_for(settings, Some(&snapshot), &prepared.intent) {
-            lexicon::CleanupRoute::Provider(effort) => {
-                let scope = crate::cleanup_quota_scope(settings);
-                let result = queue::execute_with_retry_scoped_cancelled(
-                    &state.gate,
-                    queue::RequestKind::WritingPreview,
-                    &scope,
-                    || async {
-                        if !settings_are_current(state, generation) {
-                            return Err(llm::LlmError::ContextAuthorizationChanged);
-                        }
-                        llm::cleanup_with_model_and_limits_and_language_and_profile_and_intent(
+    let fallback = || crate::local_cleanup_or_raw_for_resolved_scene(input, prepared.scene);
+    let route = crate::cleanup_route_for_resolved_scene(settings, prepared.scene, &prepared.intent);
+    let off = route == lexicon::CleanupRoute::LocalOnly;
+    let request_snapshot = &snapshot;
+    let request_prepared = &prepared;
+    let mut result = execute_preview_route(
+        route,
+        off,
+        |effort| async move {
+            let scope = crate::cleanup_quota_scope(settings);
+            let result = queue::execute_with_retry_scoped_cancelled(
+                &state.gate,
+                queue::RequestKind::WritingPreview,
+                &scope,
+                || async {
+                    if !settings_are_current(state, generation) {
+                        return Err(llm::LlmError::ContextAuthorizationChanged);
+                    }
+                    crate::with_cleanup_warmup_model_demand(
+                        state,
+                        settings.cleanup_provider,
+                        llm::cleanup_with_provider_and_native_runtime_and_intent_and_source(
+                            settings.cleanup_provider,
+                            &state.mlx_cleanup_runtime,
                             &settings.cleanup_endpoint(),
                             &settings.cleanup_request_model(),
                             input,
                             settings.cleanup_credential(),
                             &[],
                             None,
-                            Some(&snapshot.policy),
+                            Some(&request_snapshot.policy),
                             Some(&settings.language),
-                            Some(&snapshot.profile),
-                            Some(&prepared.intent),
-                            prepared.pairs_hint.as_deref(),
+                            Some(&request_snapshot.profile),
+                            Some(&request_prepared.intent),
+                            request_prepared.pairs_hint.as_deref(),
                             effort,
                             None,
-                        )
-                        .await
-                    },
-                    cancellation.clone(),
-                )
-                .await;
-                match result {
-                    Ok((text, limits)) if !text.trim().is_empty() => {
-                        state.gate.update_llm_for(&scope, &limits);
-                        (text, PreviewStatus::Model)
-                    }
-                    Ok((_, limits)) => {
-                        state.gate.update_llm_for(&scope, &limits);
-                        (fallback(), PreviewStatus::ProviderFallback)
-                    }
-                    Err(queue::ExecuteError::Cancelled) => {
-                        return Err("preview_cancelled".into());
-                    }
-                    Err(queue::ExecuteError::Operation(ref error))
-                        if llm::is_preservation_guard_error(error) =>
-                    {
-                        (fallback(), PreviewStatus::GuardFallback)
-                    }
-                    Err(_) => (fallback(), PreviewStatus::ProviderFallback),
-                }
-            }
-            _ => (fallback(), PreviewStatus::LocalOnly),
-        };
+                            Some(text),
+                            None,
+                            (settings.cleanup_provider == crate::providers::EngineProvider::Custom)
+                                .then_some(&settings.custom_cleanup_parameters),
+                        ),
+                    )
+                    .await
+                },
+                cancellation.clone(),
+            )
+            .await;
+            result.map(|(reply, limits)| {
+                state.gate.update_llm_for(&scope, &limits);
+                reply
+            })
+        },
+        fallback,
+    )
+    .await?;
     if !settings_are_current(state, generation) || cancellation.is_cancelled() {
         return Err("preview_cancelled".into());
     }
-    let (text, guard_rejected) = crate::guard_final_output_for_scene(
+    result = finalize_trial_result(
+        result,
         input,
-        &candidate,
         crate::FinalizationContext {
-            family: mode.family,
-            input_kind: snapshot.policy.input_kind,
+            scene: prepared.scene,
             operation: prepared.intent.operation,
             revision_source: Some(&prepared.revision_source),
             prepared_transcript: Some(&prepared.text),
             revision_authorizations: &prepared.revision_authorizations,
             promoted_pair_protections: &prepared.promoted_pair_protections,
+            list_revision_proof: prepared.list_revision_proof.as_ref(),
+            structure_safe_source: None,
+            output_projection_list_revision_proof: None,
+            layout_source: None,
+            exact_fallback: false,
         },
     );
-    if guard_rejected {
-        status = PreviewStatus::GuardFallback;
-    }
-    Ok(PreviewResult {
-        text,
-        status,
-        elapsed_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
-    })
+    result.elapsed_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+    Ok(result)
 }
 
 #[tauri::command]
@@ -373,6 +489,202 @@ mod tests {
         assert_eq!(
             validate_request(&request).unwrap_err(),
             "preview_invalid_mode"
+        );
+    }
+    #[tokio::test]
+    async fn off_route_never_invokes_the_actual_provider_boundary() {
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let result = execute_preview_route(
+            lexicon::CleanupRoute::LocalOnly,
+            true,
+            |_| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                async { panic!("Off invoked provider") }
+            },
+            || "local".into(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        assert_eq!(result.status, PreviewStatus::Off);
+        assert!(result.model_candidate.is_none());
+        assert!(result.provider_error.is_none());
+    }
+
+    #[tokio::test]
+    async fn real_shared_parser_empty_length_and_stop_reach_typed_preview_owner() {
+        let _network_policy_guard = crate::network_policy::strict_offline_test_guard().await;
+        for (finish, content, guard) in [
+            ("stop", "", Some(llm::GuardReason::EmptyCompletion)),
+            ("length", "partial", Some(llm::GuardReason::Truncated)),
+            ("stop", "hello", None),
+        ] {
+            let body = format!(
+                "data: {}\n\ndata: [DONE]\n\n",
+                serde_json::json!({
+                "choices":[{"delta":{"content":content},"finish_reason":finish}]})
+            );
+            let mut server =
+                crate::test_http::spawn_scripted(vec![crate::test_http::ResponseStep {
+                    status: 200,
+                    body,
+                    delay: Duration::ZERO,
+                }])
+                .await;
+            let endpoint = format!("{}/v1/chat/completions", server.url);
+            let result = execute_preview_route(
+                lexicon::CleanupRoute::Provider(llm::CleanupEffort::Standard),
+                false,
+                |effort| async move {
+                    llm::cleanup_with_model_and_limits_and_language_and_profile_and_intent(
+                        &endpoint,
+                        "fixture",
+                        "hello",
+                        "fixture-key",
+                        &[],
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        effort,
+                        None,
+                    )
+                    .await
+                    .map(|(text, _)| llm::AcceptedCleanupReply {
+                        provider_candidate: text.clone(),
+                        accepted_text: text,
+                        transformations: Vec::new(),
+                        native_request_id: None,
+                    })
+                    .map_err(queue::ExecuteError::Operation)
+                },
+                || "local fallback".into(),
+            )
+            .await
+            .unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_secs(2), server.receipts.recv())
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+            if let Some(reason) = guard {
+                assert_eq!(result.status, PreviewStatus::ProviderFallback);
+                assert!(
+                    matches!(result.provider_error, Some(llm::LlmError::Guard(actual)) if actual == reason)
+                );
+                assert_eq!(result.text, "local fallback");
+                assert!(result.model_candidate.is_none());
+            } else {
+                assert_eq!(result.status, PreviewStatus::Model);
+                assert_eq!(result.model_candidate.as_deref(), Some("hello"));
+                assert_eq!(result.provider_candidate.as_deref(), Some("hello"));
+                assert!(result.cleanup_transformations.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn shared_error_serialization_keeps_variants_without_transport_payloads() {
+        let value = serde_json::to_value(llm::LlmError::Network("private transport detail".into()))
+            .unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({"kind":"network","guard":null,"native_failure":null})
+        );
+        let value =
+            serde_json::to_value(llm::LlmError::Guard(llm::GuardReason::Truncated)).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({"kind":"guard","guard":"truncated","native_failure":null})
+        );
+        assert_eq!(
+            PreviewResult::provider(Err(queue::ExecuteError::Cancelled), || panic!(
+                "cancel fallback"
+            ))
+            .err()
+            .as_deref(),
+            Some("preview_cancelled")
+        );
+    }
+
+    #[test]
+    fn real_provider_and_fallback_rejections_match_the_shared_preview_wire_fixture() {
+        const SOURCE: &str = "Keep API v2.";
+        const DAMAGED_CANDIDATE: &str = "Keep API v3.";
+
+        let provider_error = llm::accept_cleanup_reply_with_facts(
+            DAMAGED_CANDIDATE.to_owned(),
+            &llm::CleanupIntent::implicit(SOURCE),
+        )
+        .expect_err("the shared cleanup acceptance owner rejects the changed API version");
+        let provider_fact = llm::cleanup_rejection(&provider_error)
+            .expect("the provider-stage rejection is produced by the shared guard");
+        assert_eq!(provider_fact.candidate, DAMAGED_CANDIDATE);
+        assert_eq!(provider_fact.reason, llm::GuardReason::ProtectedToken);
+        assert_eq!(
+            provider_fact.stage,
+            llm::CleanupRejectionStage::ProviderOutput
+        );
+
+        let local_called = std::cell::Cell::new(false);
+        let mut result =
+            PreviewResult::provider(Err(queue::ExecuteError::Operation(provider_error)), || {
+                local_called.set(true);
+                DAMAGED_CANDIDATE.to_owned()
+            })
+            .expect("provider failure falls back through the real preview owner");
+        assert!(local_called.get());
+        assert!(result.model_candidate.is_none());
+
+        result = finalize_trial_result(
+            result,
+            SOURCE,
+            crate::FinalizationContext {
+                scene: crate::ResolvedCleanupScene::observed(
+                    context::ContextFamily::General,
+                    context::FocusKind::Editable,
+                ),
+                operation: llm::CleanupOperation::Cleanup,
+                revision_source: Some(SOURCE),
+                prepared_transcript: Some(SOURCE),
+                revision_authorizations: &[],
+                promoted_pair_protections: &[],
+                list_revision_proof: None,
+                structure_safe_source: None,
+                output_projection_list_revision_proof: None,
+                layout_source: None,
+                exact_fallback: false,
+            },
+        );
+        assert_eq!(result.status, PreviewStatus::GuardFallback);
+        assert_eq!(
+            result.text, SOURCE,
+            "the final guard retains the prepared source"
+        );
+        assert!(result.final_guard_rejected);
+        let rejection = result
+            .cleanup_rejection
+            .as_ref()
+            .expect("provider rejection remains visible after fallback rejection");
+        assert_eq!(rejection.stage, llm::CleanupRejectionStage::ProviderOutput);
+        assert_eq!(rejection.candidate, DAMAGED_CANDIDATE);
+
+        result.elapsed_ms = 17;
+        let actual = serde_json::to_value(PreviewResponse {
+            saved: None,
+            draft: result,
+        })
+        .expect("the actual typed preview response serializes");
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../src/test/fixtures/writing-preview-rejected-fallback.json"
+        ))
+        .expect("shared checked fixture is valid JSON");
+        assert_eq!(
+            actual, fixture,
+            "Rust serde and TypeScript use one wire fixture"
         );
     }
 }

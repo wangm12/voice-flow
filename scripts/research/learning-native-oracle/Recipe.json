@@ -1,0 +1,32 @@
+{
+  "artifact_type": "voice_harness_recipe",
+  "schema_version": 1,
+  "run_id": "90000000-0000-4000-8000-000000000001",
+  "case_id": "owned-native-oracle-v1",
+  "fixture_id": "90000000-0000-4000-8000-000000000002",
+  "before": "Owned target oracle baseline.",
+  "inserted": "unused-sentinel",
+  "selection": {
+    "location": 0,
+    "length": 0
+  },
+  "cursor_policy": "at_trigger",
+  "initial_clipboard": {
+    "items": []
+  },
+  "clipboard_expectation": "unknown",
+  "trigger": {
+    "kind": "fixture",
+    "key_code": null,
+    "flags": null,
+    "release_after_ms": null,
+    "public_action_note": null
+  },
+  "stress": [],
+  "poll_ms": 10,
+  "deadline_ms": 100,
+  "host_lifetime_ms": 5000,
+  "read_only": true,
+  "fixture_action": "no_write",
+  "fixture_delay_ms": 0
+}

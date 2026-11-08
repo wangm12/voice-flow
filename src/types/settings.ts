@@ -3,18 +3,40 @@ import type { ContextMapping, WritingMode } from "../components/ContextSettings"
 import type { Snippet } from "../components/SnippetsSettings";
 import type { UiLanguagePreference } from "../lib/i18n";
 import type { ProviderId } from "../lib/providers";
+import type { JsonObject } from "../lib/customCleanupParameters";
 
 export type ProviderKeyView = {
   configured: boolean;
   hint?: string | null;
+  keychain_state?: CredentialReadState;
+};
+
+export type CredentialReadState = "configured" | "missing" | "unavailable";
+export type ProviderCredentialPurpose = "asr" | "cleanup";
+
+export type ProviderCredentialReadStatus =
+  | "session_configured"
+  | "missing"
+  | "unavailable"
+  | "cancelled"
+  | "busy"
+  | "foreground_required"
+  | "stale"
+  | "unsupported";
+
+export type ProviderCredentialReadResult = {
+  status: ProviderCredentialReadStatus;
+  settings: Settings | null;
 };
 
 export type Settings = {
   schema_version: number;
   api_key_configured: boolean;
   api_key_hint: string | null;
+  api_key_keychain_state?: CredentialReadState;
   asr_api_key_configured?: boolean;
   asr_api_key_hint?: string | null;
+  asr_api_key_keychain_state?: CredentialReadState;
   asr_base_url?: string;
   asr_provider?: ProviderId;
   asr_model: string;
@@ -23,9 +45,11 @@ export type Settings = {
   cleanup_base_url?: string;
   cleanup_api_key_configured?: boolean;
   cleanup_api_key_hint?: string | null;
+  cleanup_api_key_keychain_state?: CredentialReadState;
   custom_base_url?: string;
   custom_asr?: boolean;
   custom_llm?: boolean;
+  custom_cleanup_parameters?: JsonObject;
   ollama_base_url?: string;
   local_whisper_base_url?: string;
   provider_keys?: Partial<Record<ProviderId, ProviderKeyView>>;
@@ -67,6 +91,7 @@ export type Settings = {
   selected_action_hotkey?: string;
   selected_actions_enabled?: boolean;
   dictionary_learn_enabled?: boolean;
+  local_edit_learning_enabled?: boolean;
   input_device: string;
   input_gain?: number;
   verbatim_hotkey?: string;
@@ -93,6 +118,7 @@ export type OnDeviceModelStatus = {
   inference_ready: boolean;
   downloaded_bytes: number;
   error: string | null;
+  error_category?: string | null;
   revision: string | null;
   file_count: number;
   platform_supported: boolean;
@@ -100,11 +126,31 @@ export type OnDeviceModelStatus = {
   loaded: boolean;
 };
 
+export type CleanupModelStatus = {
+  id: string;
+  label: string;
+  repository: string;
+  revision: string;
+  state: "missing" | "partial" | "installed" | "ready" | "downloading" | "importing" | "deleting" | "cancelled" | "error" | "invalid" | string;
+  operation: "download" | "import" | "delete" | string | null;
+  source_kind: "download" | "import" | string | null;
+  bytes_done: number;
+  bytes_total: number;
+  error: string | null;
+  last_operation: string | null;
+  last_operation_error: string | null;
+  managed: boolean;
+  partial_managed: boolean;
+  platform_supported?: boolean | null;
+};
+
 export type LocalCleanupStatus = {
   available: boolean;
   status: string;
   message: string;
   model: string;
+  instance_id?: string;
+  local_source_confirmed?: boolean | null;
 };
 
 export type SaveSettings = (

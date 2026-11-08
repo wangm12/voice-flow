@@ -225,6 +225,65 @@ mod tests {
     use super::*;
 
     #[test]
+    fn unreviewed_mlx_notice_entries_bind_to_the_shipped_manifest_and_notice_files() {
+        use sha2::Digest;
+
+        const SOURCE_MANIFEST: &str =
+            include_str!("../../ThirdPartyLicenses/Models/source-manifest.json");
+        let source: serde_json::Value = serde_json::from_str(SOURCE_MANIFEST).unwrap();
+        let cases = [
+            (
+                QWEN_ASR_17_ID,
+                "ThirdPartyLicenses/Models/Qwen3-ASR-1.7B/NOTICE.md",
+                include_bytes!("../../ThirdPartyLicenses/Models/Qwen3-ASR-1.7B/NOTICE.md")
+                    .as_slice(),
+            ),
+            (
+                COHERE_TRANSCRIBE_ID,
+                "ThirdPartyLicenses/Models/Cohere-Transcribe-2B/NOTICE.md",
+                include_bytes!("../../ThirdPartyLicenses/Models/Cohere-Transcribe-2B/NOTICE.md")
+                    .as_slice(),
+            ),
+        ];
+
+        for (app_id, notice_path, notice_bytes) in cases {
+            let model = mlx_model(app_id).expect("target app id must resolve to its MLX model");
+            let rows = source["models"]
+                .as_array()
+                .expect("source manifest models must be an array")
+                .iter()
+                .filter(|row| {
+                    row["model_id"] == model.repository
+                        && row["converter_revision"] == model.revision
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(rows.len(), 1, "expected one source row for {app_id}");
+            let row = rows[0];
+            assert_eq!(row["model_repository_license_status"], "UNREVIEWED / 许可未审查; converted artifact, converter, full LICENSE and NOTICE unknown");
+            assert_eq!(row.get("declared_base"), Some(&serde_json::Value::Null));
+            assert_eq!(
+                row.get("converter_input_base_commit"),
+                Some(&serde_json::Value::Null)
+            );
+
+            let files = row["included_files"]
+                .as_array()
+                .expect("included_files must be an array");
+            let notice = files
+                .iter()
+                .find(|file| file["output_path"] == notice_path)
+                .expect("notice path must be included in its source row");
+            assert_eq!(notice["bytes"].as_u64(), Some(notice_bytes.len() as u64));
+            let digest = sha2::Sha256::digest(notice_bytes);
+            let digest = digest
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            assert_eq!(notice["sha256"].as_str(), Some(digest.as_str()));
+        }
+    }
+
+    #[test]
     fn catalog_sha256_is_64_lowercase_hex() {
         assert_eq!(SENSEVOICE_ARCHIVE_SHA256.len(), 64);
         assert!(

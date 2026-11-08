@@ -42,6 +42,7 @@ interface Content {
     download: string;
     demo: string;
     compatibility: string;
+    setup: string;
   };
   demo: {
     label: string;
@@ -162,6 +163,7 @@ export const content: Record<Locale, Content> = {
       download: "下载 macOS 版",
       demo: "看看它如何工作",
       compatibility: "为 Mac 打造 · macOS 13 及以上",
+      setup: "云端路线需自备 API Key，服务费用由所选服务商决定。",
     },
     demo: {
       label: "互动示例",
@@ -175,7 +177,7 @@ export const content: Record<Locale, Content> = {
       written: "写下的",
       preview: "效果预览",
       placeholder: "你的想法，会出现在这里。",
-      caption: "预设动画示例 · 自动循环，可随时暂停 · 仅在浏览器本地播放",
+      caption: "预设动画演示 · 不使用麦克风或语音服务 · 浏览器本地播放，可随时暂停",
       appWindow: "应用效果预览",
       phases: {
         idle: "一句话，让想法开始流动。",
@@ -381,6 +383,7 @@ export const content: Record<Locale, Content> = {
       download: "Download for macOS",
       demo: "See how it works",
       compatibility: "Made for Mac · macOS 13 and later",
+      setup: "Cloud routes use your own API key. Provider fees may apply.",
     },
     demo: {
       label: "INTERACTIVE EXAMPLE",
@@ -395,7 +398,7 @@ export const content: Record<Locale, Content> = {
       preview: "Example preview",
       placeholder: "Your next thought goes here.",
       caption:
-        "Preset animation · Loops automatically, pause anytime · Runs locally",
+        "Preset animation · No microphone or speech-service calls · Runs locally, pause anytime",
       appWindow: "Example app window",
       phases: {
         idle: "One thought. A little more flow.",

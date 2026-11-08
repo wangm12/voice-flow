@@ -4,12 +4,18 @@ import { shouldClearTrialDeliveryNote, trialDeliveryNote } from "./trialDelivery
 describe("trialDeliveryNote", () => {
   const translate = (source: string) => source;
 
-  it("keeps clipboard fallback copy after the HUD returns to idle", () => {
+  it("uses the copied terminal state to give truthful paste guidance", () => {
     expect(trialDeliveryNote("copied", "target_unavailable", translate)).toBe(
-      "未能确认输入目标，文字已复制到剪贴板，请手动粘贴",
+      "已复制到剪贴板，请手动粘贴",
     );
     expect(shouldClearTrialDeliveryNote("idle")).toBe(false);
     expect(shouldClearTrialDeliveryNote("copied")).toBe(false);
+  });
+
+  it("keeps an unverified target failure cause-only", () => {
+    expect(trialDeliveryNote("unverified", "target_unavailable", translate)).toBe(
+      "无法确认输入目标",
+    );
   });
 
   it("clears the trial note only when a new recording starts", () => {

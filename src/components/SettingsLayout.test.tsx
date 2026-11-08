@@ -1,7 +1,9 @@
+import { Toggle } from "./Toggle";
+import { Select } from "./Select";
 import { useState } from "react";
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { SettingsDisclosure } from "./SettingsLayout";
+import { SettingsDisclosure, SettingsRow } from "./SettingsLayout";
 
 afterEach(cleanup);
 
@@ -44,4 +46,10 @@ describe("SettingsDisclosure", () => {
     expect(screen.getByRole("alert")).toBeVisible();
     expect(screen.getByRole("textbox", { name: "地址" })).toBeVisible();
   });
+});
+
+it("associates important row descriptions with switches and selectors", () => {
+  render(<><SettingsRow title="Cloud access" description="This sends the selected window to your provider."><Toggle checked={false} label="Cloud access" onChange={vi.fn()} /></SettingsRow><SettingsRow title="Retention" description="This policy controls local deletion."><Select aria-label="Retention" value="7"><option value="7">One week</option></Select></SettingsRow></>);
+  expect(screen.getByRole("switch")).toHaveAccessibleDescription("This sends the selected window to your provider.");
+  expect(screen.getByRole("combobox")).toHaveAccessibleDescription("This policy controls local deletion.");
 });

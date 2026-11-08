@@ -1,4 +1,4 @@
-import { useRef } from "react";
+import { useId, useRef } from "react";
 import { createPortal } from "react-dom";
 import { X } from "lucide-react";
 import { IconButton } from "./IconButton";
@@ -20,6 +20,7 @@ export function WhatsNewDialog({
 }) {
   const { t } = useI18n();
   const dialogRef = useRef<HTMLElement>(null);
+  const titleId = useId();
 
   useDialogBehavior({
     open: true,
@@ -36,13 +37,13 @@ export function WhatsNewDialog({
         tabIndex={-1}
         role="dialog"
         aria-modal="true"
-        aria-labelledby="whats-new-title"
+        aria-labelledby={titleId}
         onClick={(event) => event.stopPropagation()}
         className={`relative flex max-h-[min(calc(100dvh-3rem),640px)] w-full max-w-xl flex-col rounded-2xl border ${colors.border} ${colors.bg.card} shadow-elevated outline-none ${focusRingClass}`}
       >
         <div className="flex items-start justify-between gap-4 border-b border-border px-6 py-6">
           <div>
-            <h2 id="whats-new-title" className="text-lg font-semibold leading-6 text-primary">{t("更新说明")}</h2>
+            <h2 id={titleId} className="text-lg font-semibold leading-6 text-primary">{t("更新说明")}</h2>
             <p className="mt-1 text-xs text-tertiary">{payload.version}</p>
           </div>
           <IconButton label={t("关闭")} icon={<X size={16} aria-hidden="true" />} onClick={onDismiss} />

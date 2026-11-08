@@ -1,3 +1,4 @@
+import { SessionDraftProvider } from "../lib/sessionDraft";
 import { closeSelect, openSelect, selectOption } from "../test/selectOption";
 import { useState } from "react";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
@@ -18,6 +19,11 @@ const listenMock = vi.mocked(listen);
 const openMock = vi.mocked(open);
 let contextMappingsResponse: unknown[] = [];
 let contextSnapshotResponse: unknown = null;
+function revealPermissions() {
+  const control = screen.getByRole("button", { name: /^上下文与样例授权/ });
+  if (control.getAttribute("aria-expanded") !== "true") fireEvent.click(control);
+}
+
 
 describe("ContextSettings", () => {
   const modes: WritingMode[] = [
@@ -36,7 +42,7 @@ describe("ContextSettings", () => {
     const updated = modes.map((mode) => ({ ...mode, prompt: mode.id === "general" ? "后台更新当前语气" : "后台更新另一语气" }));
     view.rerender(<ContextSettings writingModes={updated} onWritingModesChange={onChange} />);
     expect(prompt).toHaveValue("我的未保存草稿");
-    expect(screen.getByText("有未保存的更改")).toBeInTheDocument();
+    expect(screen.getAllByText("有未保存的更改").length).toBeGreaterThan(0);
     expect(onChange).not.toHaveBeenCalled();
     fireEvent.click(within(prompt.closest("section")!).getByRole("button", { name: "保存语气" }));
     expect(onChange).toHaveBeenCalledWith([
@@ -217,7 +223,7 @@ describe("ContextSettings", () => {
     });
   });
 
-  it("keeps basic mapping choices visible and advanced fields collapsed without hiding grants", async () => {
+  it("keeps basic mapping choices visible and discloses independent grants without changing them", async () => {
     render(<ContextSettings />);
     expect(await screen.findByRole("combobox", { name: "选择 App" })).toBeInTheDocument();
     expect(screen.getByRole("combobox", { name: "应用映射语气" }).closest("details")).toBeNull();
@@ -225,6 +231,8 @@ describe("ContextSettings", () => {
     expect(disclosure).not.toHaveAttribute("open");
     expect(screen.getByLabelText("可执行文件名").closest("details")).toBe(disclosure);
     expect(screen.getByLabelText("App 风格示例输入").closest("details")).toBe(disclosure);
+    expect(screen.queryByRole("switch", { name: "允许读取辅助功能文字" })).not.toBeInTheDocument();
+    revealPermissions();
     for (const name of ["允许读取辅助功能文字", "允许本机 OCR", "允许自动云端视觉", "允许文字发送给服务商", "允许风格示例发送给整理服务商"]) {
       const grant = screen.getByRole("switch", { name });
       expect(grant.closest("details")).toBeNull();
@@ -339,6 +347,33 @@ describe("ContextSettings", () => {
     expect(await screen.findByRole("switch", { name: "窗口文字识别" })).toHaveAttribute("aria-checked", "false");
   });
 
+  it("keeps draft preferences and independent source grants while reopening contextual teaching", async () => {
+    const onChange = vi.fn();
+    const onOpenPermissions = vi.fn();
+    render(<ContextSettings writingModes={modes} onWritingModesChange={onChange} onOpenPermissions={onOpenPermissions} />);
+    revealPermissions();
+    await screen.findByRole("combobox", { name: "选择 App" });
+    fireEvent.click(screen.getByRole("button", { name: /编辑 Prompt/ }));
+    const prompt = screen.getByRole("textbox", { name: "语气 Prompt" });
+    fireEvent.change(prompt, { target: { value: "我的未保存偏好" } });
+    fireEvent.click(screen.getByRole("button", { name: "语气与个人偏好：草稿、保存和批准" }));
+    expect(screen.getByText(/草稿不会切换当前听写语气/)).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "收起说明" }));
+    fireEvent.click(screen.getByRole("button", { name: "语气与个人偏好：草稿、保存和批准" }));
+    fireEvent.click(screen.getByRole("button", { name: "上下文与看屏幕：分别选择来源和用途" }));
+    expect(prompt).toHaveValue("我的未保存偏好");
+    for (const name of ["允许读取辅助功能文字", "允许本机 OCR", "允许自动云端视觉", "允许文字发送给服务商", "允许风格示例发送给整理服务商"]) {
+      expect(screen.getByRole("switch", { name })).toHaveAttribute("aria-checked", "false");
+    }
+    expect(onChange).not.toHaveBeenCalled();
+    expect(onOpenPermissions).not.toHaveBeenCalled();
+    expect(invokeMock.mock.calls.some(([command]) => ["preview_writing_mode", "save_context_mapping", "show_permission_guide", "acknowledge_guide"].includes(command as string))).toBe(false);
+    fireEvent.click(screen.getByRole("button", { name: "查看系统权限（不自动申请）" }));
+    expect(onOpenPermissions).toHaveBeenCalledOnce();
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(prompt).toHaveValue("我的未保存偏好");
+  });
+
   it("exposes per-app cleanup effort and learning controls", async () => {
     render(<ContextSettings />);
 
@@ -398,7 +433,7 @@ describe("ContextSettings", () => {
     selectOption(screen.getByRole("combobox", { name: "应用映射语气" }), "prompt_or_code");
     fireEvent.click(screen.getByRole("button", { name: "保存映射" }));
 
-    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("save_context_mapping", {
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("save_context_mapping", { replaceStyleExamples: true,
       mapping: {
         id: "com.todesktop.230313mzl4w4u92",
         label: "Cursor",
@@ -416,6 +451,9 @@ describe("ContextSettings", () => {
           context_text_to_providers: false,
         },
         style_examples_approved: false,
+        style_example_input: null,
+        style_example_output: null,
+        style_example_pairs: [],
         enabled: true,
         cleanup_effort: null,
         cleanup_intensity: null,
@@ -434,7 +472,7 @@ describe("ContextSettings", () => {
     selectOption(intensity, "auto");
     fireEvent.click(screen.getByRole("button", { name: "保存映射" }));
 
-    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("save_context_mapping", {
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("save_context_mapping", { replaceStyleExamples: true,
       mapping: expect.objectContaining({ cleanup_intensity: "auto" }),
     }));
   });
@@ -465,7 +503,7 @@ describe("ContextSettings", () => {
     selectOption(screen.getByRole("combobox", { name: "应用映射语气" }), "custom.reply");
     fireEvent.click(screen.getByRole("button", { name: "保存映射" }));
 
-    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("save_context_mapping", {
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("save_context_mapping", { replaceStyleExamples: true,
       mapping: expect.objectContaining({
         family: "general",
         mode_id: "custom.reply",
@@ -517,7 +555,7 @@ describe("ContextSettings", () => {
     selectOption(screen.getByRole("combobox", { name: "应用映射语气" }), "email");
     fireEvent.click(screen.getByRole("button", { name: "保存映射" }));
 
-    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("save_context_mapping", {
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("save_context_mapping", { replaceStyleExamples: true,
       mapping: {
         id: "com.google.Chrome:mail.google.com",
         label: "Google Chrome",
@@ -535,6 +573,9 @@ describe("ContextSettings", () => {
           context_text_to_providers: false,
         },
         style_examples_approved: false,
+        style_example_input: null,
+        style_example_output: null,
+        style_example_pairs: [],
         enabled: true,
         cleanup_effort: null,
         cleanup_intensity: null,
@@ -546,6 +587,7 @@ describe("ContextSettings", () => {
 
   it("saves path, coding prompt selector, and explicit source grants on an app and website rule", async () => {
     render(<ContextSettings />);
+    revealPermissions();
 
     selectOption(await screen.findByRole("combobox", { name: "选择 App" }), "com.google.Chrome");
     fireEvent.change(screen.getByRole("combobox", { name: "应用映射网站" }), { target: { value: "mail.google.com" } });
@@ -557,7 +599,7 @@ describe("ContextSettings", () => {
     fireEvent.click(screen.getByRole("switch", { name: "允许文字发送给服务商" }));
     fireEvent.click(screen.getByRole("button", { name: "保存映射" }));
 
-    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("save_context_mapping", {
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("save_context_mapping", { replaceStyleExamples: true,
       mapping: expect.objectContaining({
         bundle_id: "com.google.Chrome",
         browser_host: "mail.google.com",
@@ -581,7 +623,7 @@ describe("ContextSettings", () => {
     selectOption(screen.getByRole("combobox", { name: "输入框类型" }), "email");
     fireEvent.click(screen.getByRole("button", { name: "保存映射" }));
 
-    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("save_context_mapping", {
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("save_context_mapping", { replaceStyleExamples: true,
       mapping: expect.objectContaining({
         bundle_id: null,
         executable: null,
@@ -603,7 +645,7 @@ describe("ContextSettings", () => {
 
     fireEvent.change(await screen.findByRole("textbox", { name: "可执行文件名" }), { target: { value: "Cursor" } });
     fireEvent.click(screen.getByRole("button", { name: "保存映射" }));
-    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("save_context_mapping", {
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("save_context_mapping", { replaceStyleExamples: true,
       mapping: expect.objectContaining({ bundle_id: null, executable: "Cursor", browser_host: null }),
     }));
 
@@ -637,7 +679,7 @@ describe("ContextSettings", () => {
     fireEvent.click(screen.getByRole("switch", { name: "允许自动云端视觉" }));
     expect(screen.getByRole("switch", { name: "允许自动云端视觉" })).toHaveAttribute("aria-checked", "false");
     fireEvent.click(screen.getByRole("button", { name: "更新映射" }));
-    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("save_context_mapping", {
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("save_context_mapping", { replaceStyleExamples: true,
       mapping: expect.objectContaining({
         id: "legacy.gmail",
         bundle_id: null,
@@ -656,6 +698,7 @@ describe("ContextSettings", () => {
       enabled: true,
     }];
     render(<ContextSettings />);
+    revealPermissions();
 
     selectOption(await screen.findByRole("combobox", { name: "选择 App" }), "com.todesktop.230313mzl4w4u92");
 
@@ -679,6 +722,7 @@ describe("ContextSettings", () => {
       enabled: true,
     }];
     render(<ContextSettings />);
+    revealPermissions();
 
     selectOption(await screen.findByRole("combobox", { name: "选择 App" }), "com.todesktop.230313mzl4w4u92");
 
@@ -694,7 +738,7 @@ describe("ContextSettings", () => {
     expect(screen.getByText("风格示例会保留，但在你单独批准前不会进入整理服务请求。")).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "更新映射" }));
-    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("save_context_mapping", {
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("save_context_mapping", { replaceStyleExamples: true,
       mapping: expect.objectContaining({
         style_examples_approved: false,
         style_example_input: "could you fix this",
@@ -707,6 +751,7 @@ describe("ContextSettings", () => {
 
   it("saves explicit style-example approval without coupling it to the text provider grant", async () => {
     render(<ContextSettings />);
+    revealPermissions();
 
     selectOption(await screen.findByRole("combobox", { name: "选择 App" }), "com.todesktop.230313mzl4w4u92");
     fireEvent.change(screen.getByRole("textbox", { name: "App 风格示例输入" }), { target: { value: "thanks!" } });
@@ -717,7 +762,7 @@ describe("ContextSettings", () => {
     expect(screen.getByRole("switch", { name: "允许文字发送给服务商" })).toHaveAttribute("aria-checked", "false");
     fireEvent.click(screen.getByRole("button", { name: "保存映射" }));
 
-    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("save_context_mapping", {
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("save_context_mapping", { replaceStyleExamples: true,
       mapping: expect.objectContaining({
         style_examples_approved: true,
         style_example_input: "thanks!",
@@ -726,4 +771,52 @@ describe("ContextSettings", () => {
       }),
     }));
   });
+  it("keeps a dirty Prompt through unmount while reconciling newer saved modes", async () => {
+    const onChange = vi.fn();
+    const view = render(<SessionDraftProvider><ContextSettings writingModes={modes} onWritingModesChange={onChange} /></SessionDraftProvider>);
+    fireEvent.click(screen.getByRole("button", { name: /编辑 Prompt/ }));
+    fireEvent.change(screen.getByRole("textbox", { name: "语气 Prompt" }), { target: { value: "保留我的草稿" } });
+    view.rerender(<SessionDraftProvider>{null}</SessionDraftProvider>);
+    const updated = modes.map((mode) => ({ ...mode, prompt: `后台的 ${mode.id}` }));
+    view.rerender(<SessionDraftProvider><ContextSettings writingModes={updated} onWritingModesChange={onChange} /></SessionDraftProvider>);
+    fireEvent.click(screen.getByRole("button", { name: /编辑 Prompt/ }));
+    const prompt = screen.getByRole("textbox", { name: "语气 Prompt" });
+    expect(prompt).toHaveValue("保留我的草稿");
+    fireEvent.click(within(prompt.closest("section")!).getByRole("button", { name: "保存语气" }));
+    expect(onChange).toHaveBeenCalledWith([{ ...modes[0], prompt: "保留我的草稿" }, updated[1]]);
+  });
+
+  it("removes cleared manual examples instead of restoring the old text", async () => {
+    contextMappingsResponse = [{ id: "cursor", label: "Cursor", family: "general", bundle_id: "com.todesktop.230313mzl4w4u92", enabled: true, style_example_input: "old input", style_example_output: "old output", style_example_pairs: [{ input: "retained", output: "Retained" }] }];
+    render(<ContextSettings />);
+    selectOption(await screen.findByRole("combobox", { name: "选择 App" }), "com.todesktop.230313mzl4w4u92");
+    fireEvent.change(screen.getByLabelText("App 风格示例输入"), { target: { value: "" } });
+    fireEvent.change(screen.getByLabelText("App 风格期望输出"), { target: { value: "" } });
+    fireEvent.click(screen.getByRole("button", { name: "更新映射" }));
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("save_context_mapping", { replaceStyleExamples: true, mapping: expect.objectContaining({ style_example_input: null, style_example_output: null, style_example_pairs: [{ input: "retained", output: "Retained" }] }) }));
+  });
+
+  it("explicitly removes all retained example pairs and revokes their separate approval", async () => {
+    contextMappingsResponse = [{ id: "cursor", label: "Cursor", family: "general", bundle_id: "com.todesktop.230313mzl4w4u92", enabled: true, style_examples_approved: true, style_example_pairs: [{ input: "retained", output: "Retained" }] }];
+    render(<ContextSettings />);
+    selectOption(await screen.findByRole("combobox", { name: "选择 App" }), "com.todesktop.230313mzl4w4u92");
+    revealPermissions();
+    fireEvent.click(screen.getByRole("button", { name: "移除全部样例" }));
+    expect(screen.getByRole("switch", { name: "允许风格示例发送给整理服务商" })).toHaveAttribute("aria-checked", "false");
+    fireEvent.click(screen.getByRole("button", { name: "更新映射" }));
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("save_context_mapping", { replaceStyleExamples: true, mapping: expect.objectContaining({ style_example_input: null, style_example_output: null, style_example_pairs: [], style_examples_approved: false }) }));
+  });
+
+  it("returns keyboard focus to the Prompt after cancelling its changes", async () => {
+    render(<ContextSettings />);
+    fireEvent.click(await screen.findByRole("button", { name: /编辑 Prompt/ }));
+    const prompt = screen.getByRole("textbox", { name: "语气 Prompt" });
+    fireEvent.change(prompt, { target: { value: "Unsaved prompt" } });
+    const cancelButtons = screen.getAllByRole("button", { name: "取消修改" });
+    const cancel = cancelButtons[cancelButtons.length - 1];
+    cancel.focus(); fireEvent.click(cancel);
+    expect(prompt).toHaveFocus();
+    expect(screen.queryByRole("button", { name: "取消修改" })).not.toBeInTheDocument();
+  });
+
 });

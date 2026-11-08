@@ -1,0 +1,203 @@
+{
+  "schema_version": 1,
+  "runtime_id": "11111111-1111-4111-8111-111111111111",
+  "audit_revision": "8",
+  "clear_generation": "0",
+  "observer_epoch": "7",
+  "coverage": {
+    "kind": "current_process",
+    "capacity": 128,
+    "dropped_entries": "0",
+    "dropped_updates": "0",
+    "oldest_sequence": "1",
+    "latest_sequence": "8",
+    "projection_consistency": "stable_revision",
+    "atomicity": "not_cross_store_transaction",
+    "consistency_scope": "audit_metadata_revision_only",
+    "projection_mutation_interval": "not_observed",
+    "projection_inflight_writers": null,
+    "pair_projection": {
+      "kind": "complete_within_budget",
+      "max_rows": 1024,
+      "max_utf8_bytes": 2097152,
+      "max_snapshot_encoded_bytes": 16777216
+    }
+  },
+  "pairs": [
+    {
+      "pair_ref": "22222222-2222-4222-8222-222222222222",
+      "pair_key": "fixture-manual-app-scoped-pair",
+      "before_surface": "知呼",
+      "after_surface": "知乎",
+      "rule_kind": "word_pair",
+      "record_state": "db_promoted",
+      "candidate_hits": 3,
+      "current_classification": { "class": "term", "reason": null },
+      "current_promote_threshold": 3,
+      "classification_authority": "current_owner_classification",
+      "recorded_scope": {
+        "family": "document",
+        "mapping_id": "fixture.document",
+        "browser_host": null,
+        "native_bundle": "test.fixture.document"
+      },
+      "origin": "unknown_not_persisted",
+      "tombstone_reason": null,
+      "latest_record_change_at": "2026-10-22 00:00:00 GMT",
+      "last_output_surface_match_at": null,
+      "current_dictionary_contains_after": false,
+      "replacement_policy": "context_scoped_promoted_rules",
+      "replacement_eligibility": "eligible_now",
+      "eligibility_authority": "current_lexicon_owner_filter",
+      "current_review": { "confirm": false, "ignore": false, "undo": true }
+    }
+  ],
+  "activity": [
+    {
+      "activity_id": "33333333-3333-4333-8333-000000000001",
+      "sequence": "1",
+      "observer_epoch": null,
+      "created_at": "Thu, 22 Oct 2026 00:00:00 GMT",
+      "pair_ref": null,
+      "lifecycle": "in_progress",
+      "fact": {
+        "kind": "review_action",
+        "action": "add_manual_scoped_pair",
+        "source": "dictionary_command",
+        "history_reference": "not_provided",
+        "outcome": "requested",
+        "candidate_store": { "status": "not_attempted", "reason": null },
+        "settings_store": { "status": "not_attempted", "reason": null }
+      }
+    },
+    {
+      "activity_id": "33333333-3333-4333-8333-000000000002",
+      "sequence": "2",
+      "observer_epoch": null,
+      "created_at": "Thu, 22 Oct 2026 00:00:01 GMT",
+      "pair_ref": "22222222-2222-4222-8222-222222222222",
+      "lifecycle": "closed",
+      "fact": {
+        "kind": "review_action",
+        "action": "add_manual_scoped_pair",
+        "source": "dictionary_command",
+        "history_reference": "not_provided",
+        "outcome": "completed",
+        "candidate_store": { "status": "completed", "reason": "manual_scoped_pair_saved" },
+        "settings_store": { "status": "not_attempted", "reason": null }
+      }
+    },
+    {
+      "activity_id": "33333333-3333-4333-8333-000000000003",
+      "sequence": "3",
+      "observer_epoch": null,
+      "created_at": "Thu, 22 Oct 2026 00:00:02 GMT",
+      "pair_ref": null,
+      "lifecycle": "closed",
+      "fact": {
+        "kind": "review_action",
+        "action": "add_manual_scoped_pair",
+        "source": "dictionary_command",
+        "history_reference": "not_provided",
+        "outcome": "failed",
+        "candidate_store": { "status": "failed", "reason": "store_error" },
+        "settings_store": { "status": "not_attempted", "reason": null }
+      }
+    },
+    {
+      "activity_id": "33333333-3333-4333-8333-000000000004",
+      "sequence": "4",
+      "observer_epoch": "7",
+      "created_at": "Thu, 22 Oct 2026 00:00:03 GMT",
+      "pair_ref": null,
+      "lifecycle": "closed",
+      "fact": {
+        "kind": "post_paste_attempt",
+        "registration": { "status": "skipped", "reason": "fixture_baseline_mismatch" },
+        "verified_paste": true,
+        "outcome": "not_observed",
+        "classification": null,
+        "candidate_decision": "not_attempted",
+        "candidate_store": { "status": "not_attempted", "reason": null },
+        "settings_store": { "status": "not_attempted", "reason": null },
+        "attribution": "not_observed"
+      }
+    },
+    {
+      "activity_id": "33333333-3333-4333-8333-000000000005",
+      "sequence": "5",
+      "observer_epoch": "7",
+      "created_at": "Thu, 22 Oct 2026 00:00:04 GMT",
+      "pair_ref": null,
+      "lifecycle": "closed",
+      "fact": {
+        "kind": "post_paste_attempt",
+        "registration": { "status": "skipped", "reason": "ambiguous_inserted_range" },
+        "verified_paste": true,
+        "outcome": "not_observed",
+        "classification": null,
+        "candidate_decision": "not_attempted",
+        "candidate_store": { "status": "not_attempted", "reason": null },
+        "settings_store": { "status": "not_attempted", "reason": null },
+        "attribution": "not_observed"
+      }
+    },
+    {
+      "activity_id": "33333333-3333-4333-8333-000000000006",
+      "sequence": "6",
+      "observer_epoch": "7",
+      "created_at": "Thu, 22 Oct 2026 00:00:05 GMT",
+      "pair_ref": "22222222-2222-4222-8222-222222222222",
+      "lifecycle": "closed",
+      "fact": {
+        "kind": "post_paste_attempt",
+        "registration": { "status": "started", "reason": "registered" },
+        "verified_paste": true,
+        "outcome": "single_token",
+        "classification": { "class": "term", "reason": null },
+        "candidate_decision": "scope_conflict",
+        "candidate_store": { "status": "not_attempted", "reason": null },
+        "settings_store": { "status": "not_attempted", "reason": null },
+        "attribution": "whole_field_difference_only"
+      }
+    },
+    {
+      "activity_id": "33333333-3333-4333-8333-000000000007",
+      "sequence": "7",
+      "observer_epoch": "7",
+      "created_at": "Thu, 22 Oct 2026 00:00:06 GMT",
+      "pair_ref": "22222222-2222-4222-8222-222222222222",
+      "lifecycle": "closed",
+      "fact": {
+        "kind": "post_paste_attempt",
+        "registration": { "status": "started", "reason": "registered" },
+        "verified_paste": true,
+        "outcome": "single_token",
+        "classification": { "class": "term", "reason": null },
+        "candidate_decision": "duplicate_observation",
+        "candidate_store": { "status": "not_attempted", "reason": null },
+        "settings_store": { "status": "not_attempted", "reason": null },
+        "attribution": "whole_field_difference_only"
+      }
+    },
+    {
+      "activity_id": "33333333-3333-4333-8333-000000000008",
+      "sequence": "8",
+      "observer_epoch": "7",
+      "created_at": "Thu, 22 Oct 2026 00:00:07 GMT",
+      "pair_ref": "22222222-2222-4222-8222-222222222222",
+      "lifecycle": "closed",
+      "fact": {
+        "kind": "post_paste_attempt",
+        "registration": { "status": "started", "reason": "registered" },
+        "verified_paste": true,
+        "outcome": "single_token",
+        "classification": { "class": "term", "reason": null },
+        "candidate_decision": "db_promotion_failed",
+        "candidate_store": { "status": "failed", "reason": "store_error" },
+        "settings_store": { "status": "not_attempted", "reason": null },
+        "attribution": "whole_field_difference_only"
+      }
+    }
+  ]
+}

@@ -123,6 +123,7 @@
 				PRODUCT_NAME = "voiceflow-mlx-sidecar";
 				SDKROOT = macosx;
 				SKIP_INSTALL = YES;
+				LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path";
 				SWIFT_VERSION = 6.0;
 			};
 			name = Release;
@@ -142,6 +143,7 @@
 				PRODUCT_NAME = "voiceflow-mlx-sidecar";
 				SDKROOT = macosx;
 				SKIP_INSTALL = YES;
+				LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path";
 				SWIFT_VERSION = 6.0;
 			};
 			name = Debug;

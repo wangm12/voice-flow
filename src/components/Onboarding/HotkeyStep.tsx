@@ -6,6 +6,9 @@ import { FnHotkeyNote } from "../FnHotkeyNote";
 import { formatHotkeyDisplay } from "../../lib/hotkeyFormat";
 import { useI18n } from "../../lib/i18n";
 import { TryItStep } from "./TryItStep";
+import type { TrialLease, TrialReceipt } from "../../lib/onboardingReadiness";
+import type { OnboardingSettingsPage } from "./DataChoices";
+import { secondaryButtonClass } from "../../lib/theme";
 
 export function HotkeyStep({
   trial,
@@ -15,10 +18,12 @@ export function HotkeyStep({
   recording,
   processing,
   error,
+  errorDetail,
   onHotkeyChange,
   onSelectedActionHotkeyChange,
   onActivationModeChange,
   modeSaving = false,
+  trialReady, trialLease, configurationGeneration, hotkeyRegistered, onSaveHotkey, onTrialResult, onRetry, onCancel, onSettings,
 }: {
   trial: "dictation" | "selected_action";
   hotkey: string;
@@ -27,10 +32,13 @@ export function HotkeyStep({
   recording: boolean;
   processing: boolean;
   error: string | null;
+  errorDetail?: string | null;
   onHotkeyChange: (hotkey: string, options?: { persist?: boolean }) => void;
   onActivationModeChange: (mode: ActivationMode) => void;
   modeSaving?: boolean;
   onSelectedActionHotkeyChange: (hotkey: string, options?: { persist?: boolean }) => void;
+  trialReady: boolean; trialLease: TrialLease | null; configurationGeneration: string; hotkeyRegistered: boolean;
+  onSaveHotkey: () => void; onTrialResult: (receipt: TrialReceipt) => void; onRetry: () => void; onCancel: () => Promise<void>; onSettings: (page: OnboardingSettingsPage) => void;
 }) {
   const { t } = useI18n();
   const [captureBusy, setCaptureBusy] = useState(false);
@@ -82,6 +90,8 @@ export function HotkeyStep({
             <FnHotkeyNote hotkey={currentHotkey} />
           </div>
         )}
+        <button type="button" className={`mt-4 ${secondaryButtonClass}`} disabled={recording || processing || modeSaving || captureBusy} onClick={onSaveHotkey}>{t("保存并检查快捷键")}</button>
+        <p role="status" className="mt-2 text-xs text-secondary">{t(hotkeyRegistered ? "快捷键已注册。现在按快捷键，在下面试用。" : "先保存快捷键，再在下面试用。")}</p>
       </div>
 
       <TryItStep
@@ -91,7 +101,11 @@ export function HotkeyStep({
         hotkeyDisplay={isDictation ? currentHotkeyDisplay : formatHotkeyDisplay(hotkey)}
         selectedActionHotkeyDisplay={isDictation ? formatHotkeyDisplay(selectedActionHotkey) : currentHotkeyDisplay}
         activationMode={activationMode}
+        showHotkeyHint={false}
         error={error}
+        errorDetail={errorDetail}
+        trialReady={trialReady} trialLease={trialLease} configurationGeneration={configurationGeneration}
+        onTrialResult={onTrialResult} onRetry={onRetry} onCancel={onCancel} onSettings={onSettings}
       />
     </div>
   );

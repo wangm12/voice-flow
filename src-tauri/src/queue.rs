@@ -8,7 +8,7 @@ use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
@@ -164,7 +164,11 @@ pub struct RequestGate {
     app: Option<AppHandle>,
     session_generation: Arc<AtomicU64>,
     #[cfg(test)]
-    emitted_events: Arc<Mutex<Vec<String>>>,
+    emitted_events: Arc<Mutex<Vec<(String, serde_json::Value)>>>,
+    /// Test stand-in for the live manager `(phase, session_generation)` when
+    /// `app` is `None`. `None` (default) allows HUD emits unconditionally.
+    #[cfg(test)]
+    hud_manager_override: Arc<Mutex<Option<(crate::Phase, u64)>>>,
 }
 impl RequestGate {
     pub fn new(app: Option<AppHandle>) -> Self {
@@ -177,6 +181,8 @@ impl RequestGate {
             session_generation: Arc::new(AtomicU64::new(0)),
             #[cfg(test)]
             emitted_events: Arc::new(Mutex::new(Vec::new())),
+            #[cfg(test)]
+            hud_manager_override: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -342,7 +348,7 @@ impl RequestGate {
     }
     fn emit(&self, event: &str, payload: serde_json::Value) {
         #[cfg(test)]
-        lock_recover(&self.emitted_events).push(event.into());
+        lock_recover(&self.emitted_events).push((event.into(), payload.clone()));
         if let Some(app) = &self.app {
             let _ = app.emit(event, payload);
         }
@@ -351,6 +357,58 @@ impl RequestGate {
     fn current_session_generation(&self) -> u64 {
         self.session_generation.load(Ordering::Acquire)
     }
+
+    /// True only when the live manager is in `Processing` for `generation`.
+    /// The manager lock is held just for the comparison, never across an await.
+    fn hud_owns_processing(&self, generation: u64) -> bool {
+        let Some(app) = &self.app else {
+            #[cfg(test)]
+            return match *lock_recover(&self.hud_manager_override) {
+                Some((phase, manager_generation)) => {
+                    owns_processing(phase, manager_generation, generation)
+                }
+                None => true,
+            };
+            #[cfg(not(test))]
+            return false;
+        };
+        let Some(state) = app.try_state::<crate::AppState>() else {
+            return false;
+        };
+        let manager = lock_recover(&state.manager);
+        owns_processing(manager.phase, manager.session_generation, generation)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_test_manager_state(&self, state: Option<(crate::Phase, u64)>) {
+        *lock_recover(&self.hud_manager_override) = state;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn emitted_event_names(&self) -> Vec<String> {
+        lock_recover(&self.emitted_events)
+            .iter()
+            .map(|(event, _)| event.clone())
+            .collect()
+    }
+
+    /// `dictation://state` and `quota://*` are emitted only for requests that
+    /// own the current processing session; background callers pass `None` and
+    /// never touch the HUD. `history://*` and `writing-preview://*` pass through.
+    fn emit_hud(&self, hud_generation: Option<u64>, event: &str, payload: serde_json::Value) {
+        let hud_facing = event.starts_with("dictation://") || event.starts_with("quota://");
+        if !hud_facing
+            || hud_generation.is_some_and(|generation| self.hud_owns_processing(generation))
+        {
+            self.emit(event, payload);
+        }
+    }
+}
+
+/// A request may drive the HUD only while the manager is Processing for the
+/// same session generation the request was stamped with.
+fn owns_processing(phase: crate::Phase, manager_generation: u64, generation: u64) -> bool {
+    phase == crate::Phase::Processing && manager_generation == generation
 }
 
 #[cfg(test)]
@@ -432,22 +490,92 @@ where
     Fut: Future<Output = Result<T, E>>,
     E: RetryError,
 {
-    execute_with_retry_scoped_cancelled_checked(
+    execute_with_retry_inner(
         gate,
         kind,
         scope,
         operation,
         || std::future::ready(true),
         cancellation,
+        RequestTraceContext {
+            hud_generation: Some(gate.current_session_generation()),
+            trace: None,
+        },
     )
     .await
-    .map_err(|error| match error {
+    .map_err(into_execute_error)
+}
+
+pub async fn execute_with_retry_scoped_cancelled_traced<F, Fut, T, E>(
+    gate: &RequestGate,
+    kind: RequestKind,
+    scope: &RequestScope,
+    operation: F,
+    cancellation: CancellationToken,
+    trace: Option<crate::metrics::TraceHandle>,
+) -> Result<T, ExecuteError<E>>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, E>>,
+    E: RetryError,
+{
+    execute_with_retry_inner(
+        gate,
+        kind,
+        scope,
+        operation,
+        || std::future::ready(true),
+        cancellation,
+        RequestTraceContext {
+            hud_generation: trace
+                .as_ref()
+                .map(crate::metrics::TraceHandle::session_generation)
+                .or_else(|| Some(gate.current_session_generation())),
+            trace,
+        },
+    )
+    .await
+    .map_err(into_execute_error)
+}
+
+/// Background variant (prefetch, History re-runs): shares quota state with live
+/// requests but never emits `dictation://state` or `quota://*` HUD events.
+pub async fn execute_with_retry_scoped_cancelled_background<F, Fut, T, E>(
+    gate: &RequestGate,
+    kind: RequestKind,
+    scope: &RequestScope,
+    operation: F,
+    cancellation: CancellationToken,
+) -> Result<T, ExecuteError<E>>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, E>>,
+    E: RetryError,
+{
+    execute_with_retry_inner(
+        gate,
+        kind,
+        scope,
+        operation,
+        || std::future::ready(true),
+        cancellation,
+        RequestTraceContext {
+            hud_generation: None,
+            trace: None,
+        },
+    )
+    .await
+    .map_err(into_execute_error)
+}
+
+fn into_execute_error<E>(error: CheckedExecuteError<E>) -> ExecuteError<E> {
+    match error {
         CheckedExecuteError::Operation(error) => ExecuteError::Operation(error),
         CheckedExecuteError::Cancelled => ExecuteError::Cancelled,
         CheckedExecuteError::AuthorizationChanged => {
             unreachable!("unconditionally authorized requests cannot be rejected")
         }
-    })
+    }
 }
 
 #[derive(Debug)]
@@ -473,8 +601,8 @@ pub async fn execute_with_retry_scoped_cancelled_checked<F, Fut, Check, CheckFut
     gate: &RequestGate,
     kind: RequestKind,
     scope: &RequestScope,
-    mut operation: F,
-    mut authorized: Check,
+    operation: F,
+    authorized: Check,
     cancellation: CancellationToken,
 ) -> Result<T, CheckedExecuteError<E>>
 where
@@ -484,9 +612,54 @@ where
     CheckFut: Future<Output = bool>,
     E: RetryError,
 {
+    execute_with_retry_inner(
+        gate,
+        kind,
+        scope,
+        operation,
+        authorized,
+        cancellation,
+        RequestTraceContext {
+            hud_generation: Some(gate.current_session_generation()),
+            trace: None,
+        },
+    )
+    .await
+}
+
+/// `hud_generation` is the session generation whose HUD this request may
+/// drive (`None` for background work). Quota state is shared either way.
+struct RequestTraceContext {
+    hud_generation: Option<u64>,
+    trace: Option<crate::metrics::TraceHandle>,
+}
+
+async fn execute_with_retry_inner<F, Fut, Check, CheckFut, T, E>(
+    gate: &RequestGate,
+    kind: RequestKind,
+    scope: &RequestScope,
+    mut operation: F,
+    mut authorized: Check,
+    cancellation: CancellationToken,
+    request_trace: RequestTraceContext,
+) -> Result<T, CheckedExecuteError<E>>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, E>>,
+    Check: FnMut() -> CheckFut,
+    CheckFut: Future<Output = bool>,
+    E: RetryError,
+{
+    let hud_generation = request_trace.hud_generation;
+    let trace = request_trace.trace;
+    let request_session_generation =
+        hud_generation.unwrap_or_else(|| gate.current_session_generation());
     let mut rate_retries = 0;
     let mut transient_retries = 0;
     loop {
+        let mut quota_wait = trace
+            .as_ref()
+            .map(|trace| trace.begin(crate::metrics::Stage::QueueWait));
         if !gate.wait_for_quota(scope, kind, &cancellation).await {
             return Err(CheckedExecuteError::Cancelled);
         }
@@ -498,6 +671,10 @@ where
             _ = cancellation.cancelled() => return Err(CheckedExecuteError::Cancelled),
             permit = gate.semaphore.acquire() => permit.expect("request semaphore is alive")
         };
+        if let Some(wait) = quota_wait.as_mut() {
+            wait.finish();
+        }
+        drop(quota_wait);
         if cancellation.is_cancelled() {
             return Err(CheckedExecuteError::Cancelled);
         }
@@ -510,11 +687,25 @@ where
             _ = cancellation.cancelled() => return Err(CheckedExecuteError::Cancelled),
             authorized = authorized() => authorized,
         };
-        if !is_authorized {
+        if !is_authorized || !crate::research_trace::allowed() {
             return Err(CheckedExecuteError::AuthorizationChanged);
         }
         if cancellation.is_cancelled() {
             return Err(CheckedExecuteError::Cancelled);
+        }
+        if rate_retries > 0 {
+            if let Some(phase) = retry_resume_phase(kind) {
+                gate.emit_hud(
+                    hud_generation,
+                    "dictation://state",
+                    serde_json::json!({
+                        "state": "processing",
+                        "phase": phase,
+                        "phase_confirmed": true,
+                        "session_generation": request_session_generation,
+                    }),
+                );
+            }
         }
         match tokio::select! {
             biased;
@@ -545,26 +736,28 @@ where
                             ("quota://rate_limited", "quota://retrying")
                         }
                     };
-                    gate.emit(
+                    gate.emit_hud(
+                        hud_generation,
                         rate_event,
                         serde_json::json!({
                             "retry_after_secs": seconds,
-                            "session_generation": gate.current_session_generation(),
+                            "session_generation": request_session_generation,
                         }),
                     );
                     if matches!(kind, RequestKind::Asr | RequestKind::Llm) {
-                        gate.emit(
+                        gate.emit_hud(
+                            hud_generation,
                             "dictation://state",
                             serde_json::json!({
                                 "state": "processing",
                                 "phase": "waiting_retry",
                                 "retry_after_secs": seconds.ceil() as u64,
-                                "session_generation": gate.current_session_generation(),
+                                "session_generation": request_session_generation,
                             }),
                         );
                     }
                     let wait_ms = (seconds * 1000.0).ceil() as u64;
-                    gate.emit(retry_event, serde_json::json!({"attempt": rate_retries, "wait_ms": wait_ms, "kind": kind.name(), "session_generation": gate.current_session_generation()}));
+                    gate.emit_hud(hud_generation, retry_event, serde_json::json!({"attempt": rate_retries, "wait_ms": wait_ms, "kind": kind.name(), "session_generation": request_session_generation}));
                     tokio::select! { _ = cancellation.cancelled() => return Err(CheckedExecuteError::Cancelled), _ = tokio::time::sleep(Duration::from_millis(wait_ms)) => {} }
                 }
                 RetryClass::Network | RetryClass::Server { .. } if transient_retries < 3 => {
@@ -585,7 +778,7 @@ where
                     } else {
                         "quota://retrying"
                     };
-                    gate.emit(retry_event, serde_json::json!({"attempt": transient_retries, "wait_ms": wait, "kind": kind.name(), "session_generation": gate.current_session_generation()}));
+                    gate.emit_hud(hud_generation, retry_event, serde_json::json!({"attempt": transient_retries, "wait_ms": wait, "kind": kind.name(), "session_generation": request_session_generation}));
                     tokio::select! { _ = cancellation.cancelled() => return Err(CheckedExecuteError::Cancelled), _ = tokio::time::sleep(Duration::from_millis(wait)) => {} }
                 }
                 _ => return Err(CheckedExecuteError::Operation(error)),
@@ -593,6 +786,15 @@ where
         }
     }
 }
+
+fn retry_resume_phase(kind: RequestKind) -> Option<&'static str> {
+    match kind {
+        RequestKind::Asr => Some("asr"),
+        RequestKind::Llm => Some("cleanup"),
+        RequestKind::HistoryLlm | RequestKind::WritingPreview => None,
+    }
+}
+
 fn default_asr() -> Quota {
     Quota {
         snapshot: QuotaSnapshot {
@@ -739,13 +941,328 @@ mod tests {
         let events = lock_recover(&gate.emitted_events);
         assert!(events
             .iter()
-            .any(|event| event == "writing-preview://rate_limited"));
+            .any(|(event, _)| event == "writing-preview://rate_limited"));
         assert!(events
             .iter()
-            .any(|event| event == "writing-preview://retrying"));
-        assert!(!events.iter().any(|event| event.starts_with("dictation://")
-            || event.starts_with("quota://")
-            || event.starts_with("history://")));
+            .any(|(event, _)| event == "writing-preview://retrying"));
+        assert!(!events
+            .iter()
+            .any(|(event, _)| event.starts_with("dictation://")
+                || event.starts_with("quota://")
+                || event.starts_with("history://")));
+    }
+
+    #[tokio::test]
+    async fn superseded_generation_keeps_waiting_stamp_but_suppresses_resume_phase() {
+        let gate = RequestGate::new(None);
+        gate.set_session_generation(23);
+        gate.set_test_manager_state(Some((crate::Phase::Processing, 23)));
+        let scope = RequestScope::new("test", Some("https://test.invalid"), "model", "fixture");
+        let calls = AtomicUsize::new(0);
+        let authorization_calls = AtomicUsize::new(0);
+        let result = execute_with_retry_scoped_cancelled_checked(
+            &gate,
+            RequestKind::Asr,
+            &scope,
+            || async {
+                if calls.fetch_add(1, Ordering::AcqRel) == 0 {
+                    Err(RetryableError(RetryClass::RateLimited(0.0)))
+                } else {
+                    Ok("transcript")
+                }
+            },
+            || {
+                if authorization_calls.fetch_add(1, Ordering::AcqRel) == 1 {
+                    // A newer session supersedes this request mid-wait; the
+                    // live manager moves on to generation 24 as in production.
+                    gate.set_session_generation(24);
+                    gate.set_test_manager_state(Some((crate::Phase::Processing, 24)));
+                }
+                std::future::ready(true)
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        assert!(result.is_ok());
+        assert_eq!(calls.load(Ordering::Acquire), 2);
+        assert_eq!(gate.current_session_generation(), 24);
+        let events = lock_recover(&gate.emitted_events);
+        let states = events
+            .iter()
+            .filter(|(event, _)| event == "dictation://state")
+            .map(|(_, payload)| payload)
+            .collect::<Vec<_>>();
+        // The wait notice was emitted while generation 23 owned Processing;
+        // the resume phase is suppressed because 24 now owns it.
+        assert_eq!(states.len(), 1);
+        assert_eq!(states[0]["phase"], "waiting_retry");
+        assert_ne!(states[0]["phase_confirmed"], true);
+        assert_eq!(states[0]["session_generation"], 23);
+        assert!(events
+            .iter()
+            .filter(|(event, _)| event == "quota://rate_limited"
+                || event == "quota://retrying"
+                || event == "dictation://state")
+            .all(|(_, payload)| payload["session_generation"] == 23));
+    }
+
+    #[tokio::test]
+    async fn rate_retry_emits_a_confirmed_dictation_phase_only_after_reauthorization() {
+        let gate = RequestGate::new(None);
+        gate.set_session_generation(23);
+        gate.set_test_manager_state(Some((crate::Phase::Processing, 23)));
+        let scope = RequestScope::new("test", Some("https://test.invalid"), "model", "fixture");
+        let calls = AtomicUsize::new(0);
+        let authorization_calls = AtomicUsize::new(0);
+        let result = execute_with_retry_scoped_cancelled_checked(
+            &gate,
+            RequestKind::Asr,
+            &scope,
+            || async {
+                if calls.fetch_add(1, Ordering::AcqRel) == 0 {
+                    Err(RetryableError(RetryClass::RateLimited(0.0)))
+                } else {
+                    Ok("transcript")
+                }
+            },
+            || {
+                authorization_calls.fetch_add(1, Ordering::AcqRel);
+                std::future::ready(true)
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        assert!(result.is_ok());
+        assert_eq!(calls.load(Ordering::Acquire), 2);
+        let events = lock_recover(&gate.emitted_events);
+        let states = events
+            .iter()
+            .filter(|(event, _)| event == "dictation://state")
+            .map(|(_, payload)| payload)
+            .collect::<Vec<_>>();
+        assert_eq!(states.len(), 2);
+        assert_eq!(states[0]["phase"], "waiting_retry");
+        assert_ne!(states[0]["phase_confirmed"], true);
+        assert_eq!(states[1]["phase"], "asr");
+        assert_eq!(states[1]["phase_confirmed"], true);
+        assert_eq!(states[0]["session_generation"], 23);
+        assert_eq!(states[1]["session_generation"], 23);
+        assert!(events
+            .iter()
+            .filter(|(event, _)| event == "quota://rate_limited"
+                || event == "quota://retrying"
+                || event == "dictation://state")
+            .all(|(_, payload)| payload["session_generation"] == 23));
+        assert_eq!(retry_resume_phase(RequestKind::Llm), Some("cleanup"));
+        assert_eq!(retry_resume_phase(RequestKind::HistoryLlm), None);
+    }
+
+    #[tokio::test]
+    async fn processing_with_superseded_generation_emits_no_hud_events() {
+        let gate = RequestGate::new(None);
+        gate.set_session_generation(5);
+        // Request is stamped 5, but the manager is already Processing for 6.
+        gate.set_test_manager_state(Some((crate::Phase::Processing, 6)));
+        let scope = RequestScope::new("test", Some("https://test.invalid"), "model", "sup");
+        let calls = AtomicUsize::new(0);
+        let result = execute_with_retry_scoped_cancelled(
+            &gate,
+            RequestKind::Asr,
+            &scope,
+            || async {
+                if calls.fetch_add(1, Ordering::AcqRel) == 0 {
+                    Err(RetryableError(RetryClass::RateLimited(0.0)))
+                } else {
+                    Ok("transcript")
+                }
+            },
+            CancellationToken::new(),
+        )
+        .await;
+        assert!(result.is_ok());
+        assert!(!gate
+            .emitted_event_names()
+            .iter()
+            .any(|event| event == "dictation://state" || event.starts_with("quota://")));
+    }
+
+    #[tokio::test]
+    async fn background_history_llm_rate_limit_keeps_history_events_stamped_with_live_generation() {
+        let gate = RequestGate::new(None);
+        gate.set_session_generation(5);
+        let scope = RequestScope::new("test", Some("https://test.invalid"), "model", "hist");
+        let calls = AtomicUsize::new(0);
+        let result = execute_with_retry_scoped_cancelled_background(
+            &gate,
+            RequestKind::HistoryLlm,
+            &scope,
+            || async {
+                if calls.fetch_add(1, Ordering::AcqRel) == 0 {
+                    Err(RetryableError(RetryClass::RateLimited(0.0)))
+                } else {
+                    Ok("ok")
+                }
+            },
+            CancellationToken::new(),
+        )
+        .await;
+        assert!(result.is_ok());
+        let events = lock_recover(&gate.emitted_events);
+        let history = events
+            .iter()
+            .filter(|(event, _)| event.starts_with("history://"))
+            .collect::<Vec<_>>();
+        assert!(history.len() >= 2);
+        assert!(history
+            .iter()
+            .all(|(_, payload)| payload["session_generation"] == 5));
+    }
+
+    #[test]
+    fn owns_processing_requires_processing_phase_and_same_generation() {
+        use crate::Phase;
+        assert!(owns_processing(Phase::Processing, 3, 3));
+        assert!(!owns_processing(Phase::Processing, 4, 3));
+        assert!(!owns_processing(Phase::Recording, 3, 3));
+        assert!(!owns_processing(Phase::Idle, 3, 3));
+    }
+
+    #[tokio::test]
+    async fn prefetch_rate_limit_emits_no_dictation_state() {
+        let gate = RequestGate::new(None);
+        gate.set_session_generation(5);
+        let scope = RequestScope::new("test", Some("https://test.invalid"), "model", "bg");
+        let calls = AtomicUsize::new(0);
+        let result = execute_with_retry_scoped_cancelled_background(
+            &gate,
+            RequestKind::Asr,
+            &scope,
+            || async {
+                if calls.fetch_add(1, Ordering::AcqRel) == 0 {
+                    Err(RetryableError(RetryClass::RateLimited(0.0)))
+                } else {
+                    Ok("transcript")
+                }
+            },
+            CancellationToken::new(),
+        )
+        .await;
+        assert!(result.is_ok());
+        assert_eq!(calls.load(Ordering::Acquire), 2);
+        let events = lock_recover(&gate.emitted_events);
+        assert!(!events
+            .iter()
+            .any(|(event, _)| event == "dictation://state" || event.starts_with("quota://")));
+        // Quota state is still shared: the 429 marked the scope.
+        let asr = gate.snapshots_for_scope(&scope).asr;
+        assert_eq!(asr.remaining_requests_rpd, 0);
+        assert!(asr.reset_requests_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn background_transient_retry_emits_no_quota_event() {
+        let gate = RequestGate::new(None);
+        let scope = RequestScope::new("test", Some("https://test.invalid"), "model", "bg2");
+        let calls = AtomicUsize::new(0);
+        let result = execute_with_retry_scoped_cancelled_background(
+            &gate,
+            RequestKind::Llm,
+            &scope,
+            || async {
+                if calls.fetch_add(1, Ordering::AcqRel) == 0 {
+                    Err(RetryableError(RetryClass::Server {
+                        retry_after: Some(Duration::from_millis(1)),
+                    }))
+                } else {
+                    Ok("ok")
+                }
+            },
+            CancellationToken::new(),
+        )
+        .await;
+        assert!(result.is_ok());
+        assert!(!lock_recover(&gate.emitted_events)
+            .iter()
+            .any(|(event, _)| event.starts_with("quota://") || event.starts_with("dictation://")));
+    }
+
+    #[tokio::test]
+    async fn live_rate_limit_emits_no_hud_events_when_manager_is_not_processing() {
+        let gate = RequestGate::new(None);
+        gate.set_session_generation(9);
+        gate.set_test_manager_state(Some((crate::Phase::Recording, 9)));
+        let scope = RequestScope::new("test", Some("https://test.invalid"), "model", "live");
+        let calls = AtomicUsize::new(0);
+        let result = execute_with_retry_scoped_cancelled(
+            &gate,
+            RequestKind::Asr,
+            &scope,
+            || async {
+                if calls.fetch_add(1, Ordering::AcqRel) == 0 {
+                    Err(RetryableError(RetryClass::RateLimited(0.0)))
+                } else {
+                    Ok("transcript")
+                }
+            },
+            CancellationToken::new(),
+        )
+        .await;
+        assert!(result.is_ok());
+        assert!(!lock_recover(&gate.emitted_events)
+            .iter()
+            .any(|(event, _)| event == "dictation://state" || event.starts_with("quota://")));
+        assert_eq!(
+            gate.snapshots_for_scope(&scope).asr.remaining_requests_rpd,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn revoked_authorization_after_rate_wait_does_not_resume_dictation_phase() {
+        let gate = RequestGate::new(None);
+        gate.set_session_generation(23);
+        let scope = RequestScope::new("test", Some("https://test.invalid"), "model", "fixture");
+        let calls = AtomicUsize::new(0);
+        let authorization_calls = AtomicUsize::new(0);
+        let result = execute_with_retry_scoped_cancelled_checked(
+            &gate,
+            RequestKind::Asr,
+            &scope,
+            || async {
+                if calls.fetch_add(1, Ordering::AcqRel) == 0 {
+                    Err(crate::asr::AsrError::RateLimited("0".into()))
+                } else {
+                    Ok("transcript")
+                }
+            },
+            || std::future::ready(authorization_calls.fetch_add(1, Ordering::AcqRel) == 0),
+            CancellationToken::new(),
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(CheckedExecuteError::AuthorizationChanged)
+        ));
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+        let events = lock_recover(&gate.emitted_events);
+        let waiting = events
+            .iter()
+            .find(|(event, payload)| {
+                event == "dictation://state" && payload["phase"] == "waiting_retry"
+            })
+            .expect("waiting phase is emitted");
+        assert_ne!(waiting.1["phase_confirmed"], true);
+        assert_eq!(waiting.1["session_generation"], 23);
+        assert!(!events.iter().any(|(event, payload)| {
+            event == "dictation://state"
+                && payload["phase"] == "asr"
+                && payload["phase_confirmed"] == true
+        }));
+        assert!(retry_resume_phase(RequestKind::Llm) == Some("cleanup"));
+        assert!(retry_resume_phase(RequestKind::HistoryLlm).is_none());
     }
 
     #[tokio::test]
@@ -1133,6 +1650,111 @@ mod tests {
         })
         .await;
         assert!(matches!(result, Err(ExecuteError::Operation(TestError))));
+    }
+
+    #[tokio::test]
+    async fn traced_request_gate_cancelled_before_provider_records_wait() {
+        use std::future::Future;
+        use std::task::{Context, Poll};
+        let gate = RequestGate::new(None);
+        let first = gate.semaphore.clone().acquire_owned().await.unwrap();
+        let second = gate.semaphore.clone().acquire_owned().await.unwrap();
+        let mut timer = crate::metrics::Metrics::default().stop_to_insert(
+            crate::metrics::MetricGroup::unknown("test"),
+            CancellationToken::new(),
+        );
+        let trace = timer.bind_trace(9);
+        let cancellation = CancellationToken::new();
+        let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let called_provider = Arc::clone(&called);
+        let scope = RequestScope::new("test", None, "model", "");
+        let mut future = Box::pin(execute_with_retry_scoped_cancelled_traced(
+            &gate,
+            RequestKind::Asr,
+            &scope,
+            move || {
+                let called = Arc::clone(&called_provider);
+                async move {
+                    called.store(true, Ordering::Release);
+                    Ok::<_, TestError>(())
+                }
+            },
+            cancellation.clone(),
+            Some(trace.clone()),
+        ));
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        assert!(
+            matches!(future.as_mut().poll(&mut cx), Poll::Pending),
+            "request must be pending on the occupied real semaphore"
+        );
+        cancellation.cancel();
+        assert!(matches!(
+            future.as_mut().poll(&mut cx),
+            Poll::Ready(Err(ExecuteError::Cancelled))
+        ));
+        drop(first);
+        drop(second);
+        assert!(!called.load(Ordering::Acquire));
+        assert!(trace
+            .snapshot()
+            .stages
+            .iter()
+            .any(|(stage, _, _)| *stage == crate::metrics::Stage::QueueWait));
+    }
+
+    #[tokio::test]
+    async fn traced_llm_gate_cancelled_before_cleanup_records_only_reached_wait() {
+        use std::future::Future;
+        use std::task::{Context, Poll};
+        let gate = RequestGate::new(None);
+        let permit = gate.semaphore.clone().acquire_owned().await.unwrap();
+        let second_permit = gate.semaphore.clone().acquire_owned().await.unwrap();
+        let mut timer = crate::metrics::Metrics::default().stop_to_insert(
+            crate::metrics::MetricGroup::unknown("llm_gate_cancel_trace_test"),
+            CancellationToken::new(),
+        );
+        let trace = timer.bind_trace(90);
+        let cancellation = CancellationToken::new();
+        let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let provider_called = Arc::clone(&called);
+        let scope = RequestScope::new("test", None, "model", "");
+        let mut future = Box::pin(execute_with_retry_scoped_cancelled_traced(
+            &gate,
+            RequestKind::Llm,
+            &scope,
+            move || {
+                let called = Arc::clone(&provider_called);
+                async move {
+                    called.store(true, Ordering::Release);
+                    Ok::<_, TestError>(())
+                }
+            },
+            cancellation.clone(),
+            Some(trace.clone()),
+        ));
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        assert!(matches!(future.as_mut().poll(&mut cx), Poll::Pending));
+        cancellation.cancel();
+        assert!(matches!(
+            future.as_mut().poll(&mut cx),
+            Poll::Ready(Err(ExecuteError::Cancelled))
+        ));
+        drop(permit);
+        drop(second_permit);
+        assert!(!called.load(Ordering::Acquire));
+        let reached = trace.snapshot().stages;
+        assert!(reached
+            .iter()
+            .any(|(stage, _, _)| *stage == crate::metrics::Stage::QueueWait));
+        assert!(!reached.iter().any(|(stage, _, _)| {
+            matches!(
+                *stage,
+                crate::metrics::Stage::PromptPreparation
+                    | crate::metrics::Stage::MlxGateWait
+                    | crate::metrics::Stage::ModelLoad
+            )
+        }));
+        timer.finish(crate::metrics::DeliveryOutcome::Failed, None);
     }
 
     #[test]

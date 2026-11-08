@@ -1,0 +1,161 @@
+{
+  "scope": "explicit synthetic structural fixture, not publisher proof or audio",
+  "candidate": {
+    "case_id": "explicit-synthetic-member",
+    "source_split": "validation",
+    "project_split": "dev",
+    "source_parquet": "fixture-not-read.parquet",
+    "source_parquet_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+    "row_ordinal": 1,
+    "source_id": "1",
+    "source_path": "publisher-metadata-not-opened.wav",
+    "embedded_audio_path": "source.wav",
+    "language": "en",
+    "original_speaker_id": 7,
+    "session_id": 1,
+    "topic": "not-template",
+    "publisher_duration_seconds": 1.0,
+    "publisher_duration_minus_pcm_seconds": 0.0,
+    "filename_components_observed": {
+      "session": "1",
+      "speaker": "7",
+      "recording_variant": null,
+      "line": "0",
+      "start": "0",
+      "duration": "1"
+    },
+    "raw_recording_group": "fixture-unproven",
+    "conversation_partner_id": null,
+    "conversation_pair_id": null,
+    "global_conversation_session_id": null,
+    "template_family_id": null,
+    "source_annotation": {
+      "text": "hello",
+      "text_sha256": "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+      "origin": "publisher_manual_asr_annotation",
+      "project_review_status": "pending",
+      "contains_unk": false
+    },
+    "audio": {
+      "audio_sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+      "pcm_sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+      "sample_count": 16000,
+      "sample_rate": 16000,
+      "channels": 1,
+      "bits_per_sample": 16,
+      "duration_seconds": 1.0
+    },
+    "conversion": {
+      "recipe": "identity-preserve-v1",
+      "changes": [],
+      "reason": "explicit fixture not media",
+      "source_sample_interval": [
+        0,
+        16000
+      ]
+    },
+    "conditions": {
+      "microphone": "unknown",
+      "noise": "unknown",
+      "speaking_style": "unknown"
+    },
+    "adjacent_wav": "fixture.wav"
+  },
+  "projected": {
+    "case_id": "explicit-synthetic-member",
+    "source_locator": {
+      "source_split": "validation",
+      "source_parquet": "fixture-not-read.parquet",
+      "source_parquet_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+      "row_ordinal": 1,
+      "source_id": "1"
+    },
+    "publisher_record": {
+      "id": "1",
+      "path": "publisher-metadata-not-opened.wav",
+      "transcription": "hello",
+      "duration": 1.0,
+      "language": "en",
+      "original_speaker_id": 7,
+      "session_id": 1,
+      "topic": "not-template"
+    },
+    "source_observations": {
+      "embedded_audio_path": "source.wav",
+      "filename_components_observed": {
+        "session": "1",
+        "speaker": "7",
+        "recording_variant": null,
+        "line": "0",
+        "start": "0",
+        "duration": "1"
+      },
+      "raw_recording_group": "fixture-unproven",
+      "publisher_duration_minus_pcm_seconds": 0.0,
+      "conditions": {
+        "microphone": "unknown",
+        "noise": "unknown",
+        "speaking_style": "unknown"
+      }
+    },
+    "audio_identity_declared_not_revalidated": {
+      "audio_sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+      "pcm_sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+      "sample_count": 16000,
+      "sample_rate": 16000,
+      "channels": 1,
+      "bits_per_sample": 16,
+      "duration_seconds": 1.0
+    },
+    "audio_locator": {
+      "owner_evidence_role": "candidates",
+      "relative_path": "fixture.wav",
+      "access": "metadata_only_not_resolved"
+    },
+    "conversion_declared": {
+      "recipe": "identity-preserve-v1",
+      "changes": [],
+      "reason": "explicit fixture not media",
+      "source_sample_interval": [
+        0,
+        16000
+      ]
+    },
+    "grouping": {
+      "speaker": {
+        "kind": "publisher_id",
+        "namespace": "CAiRE/ASCEND@737e9800ae31be9932ba8464c80366559bd28424",
+        "value": "7",
+        "source_field": "original_speaker_id"
+      },
+      "recording": {
+        "kind": "derived",
+        "value": "fixture-unproven",
+        "owner": "retained_public_candidate_projection",
+        "creator_identity": "not_observed_by_this_tool",
+        "independence": "unproven"
+      },
+      "conversation": {
+        "kind": "unknown",
+        "reason": "global_conversation_and_partner_unavailable"
+      },
+      "template": {
+        "kind": "unknown",
+        "reason": "topic_is_not_template_identity"
+      }
+    },
+    "project_partition": "development_observation",
+    "project_content_review": "pending",
+    "references_by_purpose": {
+      "publisher_reference_asr": {
+        "kind": "publisher_asr",
+        "text": "hello",
+        "text_sha256": "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+        "source_label_origin": "publisher_manual_asr_annotation",
+        "annotation_protocol_id": "ascend-paper-v6",
+        "source_transform": "none",
+        "source_record_case_id": "explicit-synthetic-member"
+      }
+    }
+  }
+}

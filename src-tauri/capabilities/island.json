@@ -1,10 +1,27 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "island",
-  "description": "Capability for the floating island overlay window. It only listens to core events and needs no store/shortcut/clipboard access.",
-  "windows": ["island"],
+  "description": "Capability for the floating island overlay window.",
+  "windows": [
+    "island"
+  ],
   "permissions": [
-    "core:default",
-    "core:event:default"
+    "allow-stop-dictation-from-hud",
+    "allow-cancel-dictation-from-hud",
+    "allow-get-settings",
+    "allow-get-delivery-settlement-snapshot",
+    "allow-undo-learn-pair",
+    "allow-hide-island-if-idle",
+    "allow-set-island-learn-interactive",
+    "allow-set-island-details-visible",
+    "allow-open-hud-destination",
+    "allow-open-recovery-destination",
+    "allow-restore-audio-recovery-to-history",
+    "allow-dismiss-audio-recovery",
+    "allow-copy-history-recovery",
+    "allow-dismiss-history-recovery",
+    "core:event:allow-listen",
+    "core:event:allow-unlisten",
+    "core:event:allow-emit"
   ]
 }

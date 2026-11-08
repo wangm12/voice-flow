@@ -140,6 +140,49 @@ pub async fn spawn_response_with_full_request_capture(
     (format!("http://{address}"), receiver)
 }
 
+/// Capture a bounded sequence of full requests on one loopback origin. This
+/// models separate API routes on a shared Custom connection without involving
+/// a live provider or credential store.
+pub async fn spawn_responses_with_full_request_capture(
+    responses: Vec<(u16, &'static str, Vec<u8>)>,
+) -> (String, oneshot::Receiver<Vec<Vec<u8>>>) {
+    assert!(!responses.is_empty() && responses.len() <= 8);
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind local provider test server");
+    let address = listener
+        .local_addr()
+        .expect("read local provider test address");
+    let (sender, receiver) = oneshot::channel();
+
+    tokio::spawn(async move {
+        let mut requests = Vec::with_capacity(responses.len());
+        for (status, content_type, body) in responses {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            requests.push(read_full_request(&mut stream).await);
+            let reason = match status {
+                200 => "OK",
+                401 => "Unauthorized",
+                403 => "Forbidden",
+                429 => "Too Many Requests",
+                500 => "Internal Server Error",
+                _ => "Test Response",
+            };
+            let response = format!(
+                "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+            let _ = stream.write_all(&body).await;
+        }
+        let _ = sender.send(requests);
+    });
+
+    (format!("http://{address}"), receiver)
+}
+
 async fn read_full_request(stream: &mut tokio::net::TcpStream) -> Vec<u8> {
     let mut request = Vec::new();
     let mut chunk = [0_u8; 4096];
@@ -214,5 +257,62 @@ async fn read_request_body(stream: &mut tokio::net::TcpStream) -> Vec<u8> {
             return request[header_end + 4..header_end + 4 + expected_body_len.unwrap_or(0)]
                 .to_vec();
         }
+    }
+}
+
+/// Bounded scripted responses with request receipts independent of adapter completion.
+/// The owned task is aborted on drop, including delayed-response cancellation tests.
+pub struct ResponseStep {
+    pub status: u16,
+    pub body: String,
+    pub delay: std::time::Duration,
+}
+pub struct ScriptedServer {
+    pub url: String,
+    pub receipts: tokio::sync::mpsc::Receiver<usize>,
+    task: tokio::task::JoinHandle<()>,
+}
+impl Drop for ScriptedServer {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+pub async fn spawn_scripted(steps: Vec<ResponseStep>) -> ScriptedServer {
+    assert!(!steps.is_empty() && steps.len() <= 8);
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("local script listener");
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let (sender, receipts) = tokio::sync::mpsc::channel(8);
+    let task = tokio::spawn(async move {
+        for (index, step) in steps.into_iter().enumerate() {
+            let Ok(Ok((mut stream, _))) =
+                tokio::time::timeout(std::time::Duration::from_secs(10), listener.accept()).await
+            else {
+                return;
+            };
+            let Ok(body) = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                read_request_body(&mut stream),
+            )
+            .await
+            else {
+                return;
+            };
+            if body.is_empty() {
+                return;
+            }
+            if sender.send(index + 1).await.is_err() {
+                return;
+            }
+            tokio::time::sleep(step.delay).await;
+            let response = format!("HTTP/1.1 {} Fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\nRetry-After: 0\r\n\r\n{}", step.status, step.body.len(), step.body);
+            let _ = stream.write_all(response.as_bytes()).await;
+        }
+    });
+    ScriptedServer {
+        url,
+        receipts,
+        task,
     }
 }

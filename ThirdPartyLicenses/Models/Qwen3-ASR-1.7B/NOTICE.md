@@ -1,0 +1,13 @@
+# Qwen3-ASR 1.7B BF16 — model notice
+
+VoiceFlow model ID: `qwen3-asr-1.7b`  
+Configured converted repository: [`mlx-community/Qwen3-ASR-1.7B-bf16`](https://huggingface.co/mlx-community/Qwen3-ASR-1.7B-bf16/tree/e1f6c266914abc5a46e8756e02580f834a6cf8a7)  
+Pinned converted repository revision: `e1f6c266914abc5a46e8756e02580f834a6cf8a7`
+
+## Upstream source context
+
+Official upstream model context is [`Qwen/Qwen3-ASR-1.7B`](https://huggingface.co/Qwen/Qwen3-ASR-1.7B/tree/7278e1e70fe206f11671096ffdd38061171dd6e5), observed at snapshot `7278e1e70fe206f11671096ffdd38061171dd6e5`. Whether this upstream repository is the source of the configured converted artifact above is **UNREVIEWED / UNKNOWN**. Public upstream metadata observed on 2026-11-05 at [https://huggingface.co/api/models/Qwen/Qwen3-ASR-1.7B?blobs=true](https://huggingface.co/api/models/Qwen/Qwen3-ASR-1.7B?blobs=true) reported that snapshot and the publisher’s Apache-2.0 declaration for the upstream model context. The fixed-revision metadata URL [https://huggingface.co/api/models/Qwen/Qwen3-ASR-1.7B/revision/7278e1e70fe206f11671096ffdd38061171dd6e5](https://huggingface.co/api/models/Qwen/Qwen3-ASR-1.7B/revision/7278e1e70fe206f11671096ffdd38061171dd6e5) is a reference only; no response body from that endpoint is claimed as retrieved. The publisher’s declaration describes the upstream model context and does not determine the converted repository’s or weights’ license.
+
+The converted repository is the configured MLX artifact above. Its converter input base commit is **UNKNOWN**; the observed base snapshot does not establish which commit was used as converter input. The converter implementation license, converted artifact license, and any artifact-specific LICENSE or NOTICE are **UNKNOWN**. Therefore the converted model repository license status is **UNREVIEWED / 许可未审查**. The official Qwen implementation [LICENSE](https://github.com/QwenLM/Qwen3-ASR/blob/7c6daf77a2421100f5fb066495372c00129d39ff/LICENSE) is an implementation-code reference only; it is not evidence of this artifact's weight license. The [Apache-2.0 canonical terms reference](../Qwen3-ASR-0.6B/Apache-2.0-canonical-reference.txt) is reference text, not an artifact-specific grant or notice.
+
+The public metadata review recorded the official base revision and publisher declaration only. It did not fetch or inspect converted weights, model payloads, or converter inputs. No converted-file hash, download response, or license payload is asserted here. No model weights are bundled with VoiceFlow. This notice records attribution and source boundaries; it does not establish permission or legal clearance for downloading, shipping, hosting, or redistributing weights.

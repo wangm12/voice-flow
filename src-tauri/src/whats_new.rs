@@ -111,8 +111,16 @@ mod tests {
     }
 
     #[test]
-    fn load_release_notes_reads_bundled_public_file() {
-        let notes = load_release_notes(None, env!("CARGO_PKG_VERSION"));
+    fn load_release_notes_reads_explicit_manifest_resource_dir() {
+        let version = env!("CARGO_PKG_VERSION");
+        let resource_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let bundled_notes = resource_dir
+            .join("resources")
+            .join("release-notes")
+            .join(format!("{version}.md"));
+        assert!(bundled_notes.is_file(), "bundled release notes must exist");
+
+        let notes = load_release_notes(Some(&resource_dir), version);
         assert!(
             notes.is_some(),
             "expected release notes for current version"

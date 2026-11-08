@@ -1,9 +1,11 @@
+import { selectOption } from "../test/selectOption";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type { Settings } from "../types/settings";
 import { DictionarySettings } from "./DictionarySettings";
+import { auditPair, auditSnapshot } from "../test/dictionaryLearningAuditFixtures";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn() }));
@@ -112,6 +114,86 @@ describe("DictionarySettings", () => {
     expect(input).toHaveValue("接下来添加的词条");
     expect(screen.getByRole("button", { name: "添加" })).toBeEnabled();
   });
+
+  it("adds manual ownership for a learned word already in a full dictionary", async () => {
+    const dictionary = ["VoiceFlow", ...Array.from({ length: 255 }, (_, index) => `term-${index}`)];
+    invokeMock.mockImplementation(async (command) => command === "list_learn_pairs"
+      ? [{ ...promotedPair, after_surface: "VoiceFlow" }] : []);
+    render(<DictionarySettings settings={{ ...settings, dictionary }} save={vi.fn()} />);
+    const input = screen.getByRole("textbox", { name: "添加个人词典词条" });
+    fireEvent.change(input, { target: { value: "voiceflow" } });
+    fireEvent.click(screen.getByRole("button", { name: "添加" }));
+
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("add_dictionary_entries", { words: ["VoiceFlow"] }));
+    expect(input).toHaveValue("");
+    expect(await screen.findByText("已有词条已登记为手动词条。")).toBeInTheDocument();
+  });
+
+  it("imports an existing learned word as manual ownership even when the dictionary is full", async () => {
+    const dictionary = ["VoiceFlow", ...Array.from({ length: 255 }, (_, index) => `term-${index}`)];
+    invokeMock.mockImplementation(async (command) => command === "list_learn_pairs"
+      ? [{ ...promotedPair, after_surface: "VoiceFlow" }] : []);
+    const { container } = render(<DictionarySettings settings={{ ...settings, dictionary }} save={vi.fn()} />);
+    const input = container.querySelector('input[type="file"]');
+    expect(input).not.toBeNull();
+    fireEvent.change(input!, { target: { files: [new File(["voiceflow"], "terms.txt", { type: "text/plain" })] } });
+
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("add_dictionary_entries", { words: ["VoiceFlow"] }));
+    expect(await screen.findByText(/已登记个人词条：1 条/)).toBeInTheDocument();
+  });
+
+  it("reports a partial personal dictionary sync after manual ownership was recorded", async () => {
+    invokeMock.mockImplementation(async (command) => {
+      if (command === "add_dictionary_entries") throw "learning_dictionary_partial:settings_save_failed";
+      return [];
+    });
+    render(<DictionarySettings settings={settings} save={vi.fn()} />);
+    fireEvent.change(screen.getByRole("textbox", { name: "添加个人词典词条" }), { target: { value: "OpenAI" } });
+    fireEvent.click(screen.getByRole("button", { name: "添加" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("词条来源已记录，但个人词典未能同步。再次添加此词条可重试。");
+  });
+
+  it("reports a partial personal dictionary sync after importing a file", async () => {
+    invokeMock.mockImplementation(async (command) => {
+      if (command === "add_dictionary_entries") throw "learning_dictionary_partial:settings_save_failed";
+      return [];
+    });
+    const { container } = render(<DictionarySettings settings={settings} save={vi.fn()} />);
+    const input = container.querySelector('input[type="file"]');
+    fireEvent.change(input!, { target: { files: [new File(["OpenAI"], "terms.txt", { type: "text/plain" })] } });
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("词条来源已记录，但个人词典未能同步。请重新导入以重试。");
+  });
+
+  it("reports partial dictionary synchronization for a learned rule action", async () => {
+    invokeMock.mockImplementation(async (command) => {
+      if (command === "list_learn_pairs") return [promotedPair];
+      if (command === "undo_learn_pair") throw "learning_dictionary_partial:settings_save_failed";
+      return [];
+    });
+    render(<DictionarySettings settings={settings} save={vi.fn()} />);
+    await screen.findByText("知呼 → 知乎");
+    fireEvent.click(screen.getByRole("button", { name: "忘记" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("学习规则或词条来源已记录，但个人词典同步未完成。请重试。");
+  });
+
+  it("shows the dictionary capacity message when backend promotion is rejected", async () => {
+    invokeMock.mockImplementation(async (command) => {
+      if (command === "list_learn_pairs") return [pendingPair];
+      if (command === "promote_learn_pair") throw "dictionary_capacity_or_invalid_word";
+      return [];
+    });
+    render(<DictionarySettings settings={settings} save={vi.fn()} />);
+    expect(await screen.findByRole("group", { name: "知呼 → 知乎" })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "确认" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("词条无效或已达到上限。");
+    expect(screen.getByRole("group", { name: "知呼 → 知乎" })).toBeInTheDocument();
+  });
+
   afterEach(() => {
     cleanup();
   });
@@ -134,12 +216,116 @@ describe("DictionarySettings", () => {
 
     const toggle = screen.getByRole("switch", { name: "学习词条" });
     expect(toggle).toHaveAttribute("aria-checked", "true");
-    expect(screen.getByText(/默认第 3 次静默纠正，人名第 2 次/)).toBeInTheDocument();
+    expect(screen.getByText(/普通词需 3 次、人名需 2 次不同听写中的纠正/)).toBeInTheDocument();
     expect(screen.getByText(/继续打字不会学习/)).toBeInTheDocument();
     expect(await screen.findByText(/还没有已生效替换/)).toBeInTheDocument();
 
     fireEvent.click(toggle);
     expect(save).toHaveBeenCalledWith({ dictionary_learn_enabled: false });
+  });
+
+  it("keeps same-field local-edit observation off until the user opts in", () => {
+    const save = vi.fn();
+    render(<DictionarySettings settings={settings} save={save} />);
+
+    const toggle = screen.getByRole("switch", { name: "本机观察插入后的改动" });
+    expect(toggle).toHaveAttribute("aria-checked", "false");
+    expect(screen.getByText(/只学习唯一插入片段内的改动/)).toBeInTheDocument();
+    fireEvent.click(toggle);
+    expect(save).toHaveBeenCalledWith({ local_edit_learning_enabled: true });
+  });
+
+  it("adds a reversible before→after rule for an explicitly selected running native app", async () => {
+    invokeMock.mockImplementation(async (command) => {
+      if (command === "get_manual_learn_applications") {
+        return [{ bundle_id: "com.openai.codex", label: "Codex" }];
+      }
+      return [];
+    });
+    render(<DictionarySettings settings={settings} save={vi.fn()} />);
+    fireEvent.change(await screen.findByRole("textbox", { name: "听写识别为" }), { target: { value: "L O M" } });
+    fireEvent.change(screen.getByRole("textbox", { name: "应替换为" }), { target: { value: "LLM" } });
+    selectOption(await screen.findByRole("combobox", { name: "仅在此 App 生效" }), "com.openai.codex");
+    fireEvent.click(screen.getByRole("button", { name: "添加专用纠正" }));
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("add_manual_scoped_learn_pair", {
+      beforeSurface: "L O M",
+      afterSurface: "LLM",
+      bundleId: "com.openai.codex",
+    }));
+    expect(screen.getByText(/规则只在所选 App 生效，不改全局个人词典，也不改历史记录/)).toBeInTheDocument();
+  });
+
+  it("explains when a manual correction already exists under another scope", async () => {
+    invokeMock.mockImplementation(async (command) => {
+      if (command === "get_manual_learn_applications") {
+        return [{ bundle_id: "com.openai.codex", label: "Codex" }];
+      }
+      if (command === "add_manual_scoped_learn_pair") throw "manual_pair_scope_conflict";
+      return [];
+    });
+    render(<DictionarySettings settings={settings} save={vi.fn()} />);
+    fireEvent.change(await screen.findByRole("textbox", { name: "听写识别为" }), { target: { value: "L O M" } });
+    fireEvent.change(screen.getByRole("textbox", { name: "应替换为" }), { target: { value: "LLM" } });
+    selectOption(await screen.findByRole("combobox", { name: "仅在此 App 生效" }), "com.openai.codex");
+    fireEvent.click(screen.getByRole("button", { name: "添加专用纠正" }));
+    expect(await screen.findByText(/同一纠正已在其他范围登记/)).toBeInTheDocument();
+  });
+
+  it("opens the authoritative audit without replaying controls or multiplying shared term usage", async () => {
+    const save = vi.fn();
+    invokeMock.mockImplementation(async (command) => {
+      if (command === "list_learn_pairs") return [promotedPair, { ...promotedPair, pair_key: "second-rule", before_surface: "知乎" }];
+      if (command === "list_learned_term_usage") return [{ word: "知乎", replacement_runs: 7, last_replaced_at: "2026-10-15 00:00:00" }];
+      if (command === "get_dictionary_learning_audit") return auditSnapshot({ pairs: [auditPair({ before_surface: "知呼", after_surface: "知乎", record_state: "db_promoted" }), auditPair({ pair_ref: "55555555-5555-4555-8555-555555555555", pair_key: "second-rule", before_surface: "知乎", after_surface: "知乎", record_state: "db_promoted" })] });
+      return [];
+    });
+    render(<DictionarySettings settings={{ ...settings, dictionary: ["知乎"] }} save={save} />);
+    await screen.findByText("知呼 → 知乎");
+    expect(invokeMock.mock.calls.some(([command]) => command === "get_dictionary_learning_audit")).toBe(false);
+    fireEvent.click(screen.getByRole("button", { name: /学习统计/ }));
+    expect(screen.getAllByText(/7 次本机处理/)).toHaveLength(1);
+    fireEvent.click(screen.getByRole("button", { name: "学习审查：来源、原因与保存步骤" }));
+    await screen.findByLabelText("学习审查读取结果");
+    expect(screen.getAllByText(/7 次本机处理/)).toHaveLength(1);
+    expect(save).not.toHaveBeenCalled();
+    expect(invokeMock.mock.calls.some(([command]) => ["promote_learn_pair", "undo_learn_pair", "ignore_learn_pair", "get_context_snapshot", "show_permission_guide"].includes(command as string))).toBe(false);
+    expect(invokeMock.mock.calls.filter(([command]) => command === "list_learned_term_usage")).toHaveLength(1);
+  });
+
+  it("teaches at the real dictionary entry without adding its example or discarding a typed term", async () => {
+    const save = vi.fn();
+    const onOpenHistory = vi.fn();
+    const onOpenPreferences = vi.fn();
+    render(<DictionarySettings settings={settings} save={save} onOpenHistory={onOpenHistory} onOpenPreferences={onOpenPreferences} />);
+    const input = screen.getByRole("textbox", { name: "添加个人词典词条" });
+    fireEvent.change(input, { target: { value: "保留我的草稿" } });
+    fireEvent.click(screen.getByRole("button", { name: "词典与纠错：从添加到真正使用" }));
+    expect(screen.getByText(/同一听写只计一次/)).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "添加自己的术语" }));
+    expect(input).toHaveFocus();
+    expect(input).toHaveValue("保留我的草稿");
+    expect(save).not.toHaveBeenCalled();
+    expect(invokeMock.mock.calls.some(([command]) => command === "add_dictionary_entries" || command === "promote_learn_pair")).toBe(false);
+    fireEvent.click(screen.getByRole("button", { name: "去历史纠正文字" }));
+    fireEvent.click(screen.getByRole("button", { name: "查看 App 学习与风格规则" }));
+    expect(onOpenHistory).toHaveBeenCalledOnce();
+    expect(onOpenPreferences).toHaveBeenCalledOnce();
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("list_learn_pairs"));
+  });
+
+  it("shows the actual style pair and future provider approval before the existing confirmation", async () => {
+    invokeMock.mockImplementation(async (command) => command === "list_style_drafts" ? [styleDraft] : []);
+    render(<DictionarySettings settings={settings} save={vi.fn()} />);
+    await screen.findByText(/wechat · 少用句号 · 你好/);
+    fireEvent.click(screen.getByRole("button", { name: "确认" }));
+    const dialog = screen.getByRole("dialog");
+    expect(dialog).toHaveTextContent("并允许用于后续整理请求");
+    expect(dialog).toHaveTextContent("现在不会发送");
+    expect(dialog).toHaveTextContent("示例输入：你好。 → 期望输出：你好");
+    expect(invokeMock.mock.calls.some(([command]) => command === "confirm_style_draft")).toBe(false);
+    fireEvent.click(within(dialog).getByRole("button", { name: "取消" }));
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(invokeMock.mock.calls.some(([command]) => command === "confirm_style_draft")).toBe(false);
   });
 
   it.each(["done", "copied", "history", "unverified", "degraded"])("refreshes actual replacement usage after %s completion", async (state) => {
@@ -174,7 +360,7 @@ describe("DictionarySettings", () => {
     expect(within(screen.getByLabelText("学习反馈")).getByText("已用于本机纠正").parentElement).toHaveTextContent("—");
   });
 
-  it("shows a pending pair as before → after · 2/3", async () => {
+  it("shows the historical correction count without presenting it as the independent threshold", async () => {
     invokeMock.mockImplementation(async (command) => {
       if (command === "list_learn_pairs") return [pendingPair];
       if (command === "list_style_drafts") return [];
@@ -183,7 +369,9 @@ describe("DictionarySettings", () => {
     });
     render(<DictionarySettings settings={settings} save={vi.fn()} />);
 
-    expect(await screen.findByRole("group", { name: "知呼 → 知乎" })).toBeInTheDocument();
+    const pendingRow = await screen.findByRole("group", { name: "知呼 → 知乎" });
+    expect(pendingRow).toHaveTextContent("2 次纠正记录");
+    expect(pendingRow).not.toHaveTextContent("2/3");
     expect(listenMock).toHaveBeenCalledWith("learn_pairs://changed", expect.any(Function));
   });
 
@@ -235,7 +423,7 @@ describe("DictionarySettings", () => {
     );
   });
 
-  it("shows promoted replacements and can forget them", async () => {
+  it("lists promoted dictionary words with deletion and preserves their separate rule Forget action", async () => {
     invokeMock.mockImplementation(async (command) => {
       if (command === "list_learn_pairs") return [promotedPair, promotedName];
       if (command === "list_style_drafts") return [];
@@ -257,8 +445,15 @@ describe("DictionarySettings", () => {
     expect(screen.queryByText(/还没有已生效替换/)).not.toBeInTheDocument();
     const wordList = screen.getByText("词条列表").closest("section");
     expect(wordList).toHaveTextContent("手动导入");
-    expect(wordList).not.toHaveTextContent("知乎");
-    expect(wordList).not.toHaveTextContent("李明");
+    expect(wordList).toHaveTextContent("知乎");
+    expect(wordList).toHaveTextContent("李明");
+
+    fireEvent.click(within(wordList!).getByRole("button", { name: "删除 知乎" }));
+    const deleteDialog = screen.getByRole("dialog", { name: "删除词条" });
+    fireEvent.click(within(deleteDialog).getByRole("button", { name: "删除词条" }));
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("remove_dictionary_word", { word: "知乎" }),
+    );
 
     fireEvent.click(screen.getAllByRole("button", { name: "忘记" })[0]);
     await waitFor(() =>
@@ -389,6 +584,26 @@ describe("DictionarySettings", () => {
     await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
     expect(screen.queryByText(/wechat · 少用句号 · 你好/)).not.toBeInTheDocument();
     expect(attempts).toBe(2);
+  });
+
+  it("refreshes failed App choices in place without losing the correction draft", async () => {
+    const base = invokeMock.getMockImplementation()!;
+    let failed = true;
+    invokeMock.mockImplementation((command, args, options) => {
+      if (command === "get_manual_learn_applications") return failed ? Promise.reject(new Error("unavailable")) : Promise.resolve([{ bundle_id: "com.apple.TextEdit", label: "TextEdit" }]);
+      return base(command, args, options);
+    });
+    render(<DictionarySettings settings={settings} save={vi.fn()} />);
+    await screen.findByText("无法读取当前运行的 App；请重试后再添加。");
+    fireEvent.change(screen.getByRole("textbox", { name: "听写识别为" }), { target: { value: "wrong" } });
+    failed = false;
+    fireEvent.click(screen.getByRole("button", { name: "刷新 App 列表" }));
+    const control = screen.getByRole("combobox", { name: "仅在此 App 生效" });
+    await waitFor(() => expect(control).not.toBeDisabled());
+    selectOption(control, "com.apple.TextEdit");
+    expect(control).toHaveValue("com.apple.TextEdit");
+    expect(screen.getByRole("textbox", { name: "听写识别为" })).toHaveValue("wrong");
+    expect(screen.queryByText("无法读取当前运行的 App；请重试后再添加。")).not.toBeInTheDocument();
   });
 
 });

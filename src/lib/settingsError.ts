@@ -8,12 +8,28 @@ function settingsErrorMessage(reason: unknown): string {
   return String(reason);
 }
 
+export function friendlyDictionaryLearningError(
+  reason: unknown,
+  translate: (source: string) => string,
+): string | null {
+  const message = settingsErrorMessage(reason);
+  if (message.toLowerCase().startsWith("learning_dictionary_partial:")) {
+    return translate("学习规则或词条来源已记录，但个人词典同步未完成。请重试。");
+  }
+  if (message === "dictionary_capacity_or_invalid_word") {
+    return translate("词条无效或已达到上限。");
+  }
+  return null;
+}
+
 export function friendlySettingsError(
   reason: unknown,
   translate: (source: string) => string,
 ): string {
   const message = settingsErrorMessage(reason);
   const normalized = message.toLowerCase();
+  const dictionaryMessage = friendlyDictionaryLearningError(reason, translate);
+  if (dictionaryMessage) return dictionaryMessage;
   if (normalized.includes("translation hotkey")) {
     return translate(normalized.includes("conflicts") ? "翻译快捷键与其他快捷键冲突，请选择不同的组合键。" : "翻译快捷键需要有效的组合键，请重新设置。");
   }

@@ -3,15 +3,19 @@ import type React from "react";
 import { compactButtonClass, secondaryButtonClass } from "../../lib/theme";
 import { iconProps, iconPropsSm } from "../../lib/icons";
 import { useI18n } from "../../lib/i18n";
+import { PermissionGuide } from "./PermissionGuide";
+import type { NativePermissionGuide } from "./usePermissionGuide";
+import { MicrophoneSelector } from "./MicrophoneSelector";
+import type { MicrophoneStatus } from "../MicrophoneCheck";
 import { MicrophoneCheck } from "../MicrophoneCheck";
 
 function statusLabel(kind: "microphone" | "accessibility", ok: boolean, status: string, t: (source: string) => string): string {
   if (ok) return t("已授权");
+  if (status === "checking") return t("检测中…");
+  if (status === "unknown") return t("无法检测，请重试");
   if (kind === "microphone") {
     if (status === "denied") return t("需要在系统设置中开启");
     if (status === "restricted") return t("系统限制，无法授权");
-    if (status === "checking") return t("检测中…");
-    if (status === "unknown") return t("无法检测，请重试");
     return t("等待授权");
   }
   return t("未开启，可稍后设置");
@@ -60,12 +64,18 @@ export function PermissionsStep({
   onRefresh,
   onRequestMicrophone,
   onEnableAccessibility,
+  onRetryGuide,
+  guideOpen, nativeGuide, guideFailed, onCloseGuide, onOpenAccessibilitySettings, inputDevice, configurationKey, onInputDeviceChange, onMicrophoneStatus,
 }: {
   permissions: { microphone: boolean; microphone_status: string; accessibility: boolean } | null;
   settingsError: string | null;
   onRefresh: () => void;
   onRequestMicrophone: () => void;
   onEnableAccessibility: () => void;
+  onRetryGuide: () => void;
+  guideOpen: boolean; onCloseGuide: () => void; onOpenAccessibilitySettings: () => void;
+  nativeGuide: NativePermissionGuide | null; guideFailed: boolean;
+  inputDevice: string; configurationKey: string; onInputDeviceChange: (value: string) => Promise<void>; onMicrophoneStatus: (status: MicrophoneStatus) => void;
 }) {
   const { t } = useI18n();
   return (
@@ -83,7 +93,7 @@ export function PermissionsStep({
           kind="microphone"
           title="麦克风"
           ok={permissions?.microphone ?? false}
-          status={permissions?.microphone_status ?? "checking"}
+          status={permissions?.microphone_status ?? (settingsError ? "unknown" : "checking")}
           action={
             !permissions?.microphone ? (
               <button type="button" onClick={onRequestMicrophone} className={secondaryButtonClass}>
@@ -97,7 +107,7 @@ export function PermissionsStep({
           kind="accessibility"
           title="自动粘贴（可选）"
           ok={permissions?.accessibility ?? false}
-          status={permissions?.accessibility ? "authorized" : "pending"}
+          status={permissions ? permissions.accessibility ? "authorized" : "pending" : settingsError ? "unknown" : "checking"}
           action={
             !permissions?.accessibility ? (
               <button type="button" onClick={onEnableAccessibility} className={secondaryButtonClass}>
@@ -123,7 +133,12 @@ export function PermissionsStep({
           {settingsError}
         </p>
       )}
-      {permissions?.microphone && <MicrophoneCheck />}
+      {guideOpen && <PermissionGuide granted={permissions?.accessibility === true} nativeGuide={nativeGuide} guideFailed={guideFailed} onRefresh={onRefresh} onOpenSettings={onOpenAccessibilitySettings} onRetryGuide={onRetryGuide} onClose={onCloseGuide} />}
+      {permissions?.microphone && <>
+        <MicrophoneSelector value={inputDevice} onChange={onInputDeviceChange} />
+        <MicrophoneCheck configurationKey={configurationKey} onStatus={onMicrophoneStatus} />
+        <p className="text-xs leading-5 text-secondary">{t("没有声音时检查静音、合盖状态或蓝牙连接；更换设备后重新自检。授权成功不等于设备可用。")}</p>
+      </>}
     </div>
   );
 }

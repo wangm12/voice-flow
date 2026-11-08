@@ -1,11 +1,35 @@
+#[path = "src/command_acl.rs"]
+mod command_acl;
+#[allow(dead_code)] // Shared source-facts types also serve the evaluator.
+mod source_identity;
+
 fn main() {
+    let manifest_dir = std::env::var_os("CARGO_MANIFEST_DIR")
+        .map(std::path::PathBuf::from)
+        .expect("Cargo build script requires CARGO_MANIFEST_DIR");
+    let root = manifest_dir
+        .parent()
+        .expect("CARGO_MANIFEST_DIR must have a parent directory");
+    for path in source_identity::rerun_paths(root) {
+        println!("cargo:rerun-if-changed={}", path.display());
+    }
+    let facts = source_identity::capture(root);
+    let out = std::path::PathBuf::from(std::env::var_os("OUT_DIR").expect("Cargo OUT_DIR"));
+    std::fs::write(
+        out.join("voiceflow-source-identity.json"),
+        serde_json::to_vec(&facts).expect("serialize source facts"),
+    )
+    .expect("write embedded source facts");
     // Cargo test/check/clippy run without Tauri's sidecar packaging command.
     // Keep the resource directory available for those debug builds; the real
     // executable and Metal bundles are still produced by package.sh.
     if std::env::var("PROFILE").as_deref() == Ok("debug") {
-        let stage =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/mlx-sidecar/stage");
+        let stage = manifest_dir.join("target/mlx-sidecar/stage");
         std::fs::create_dir_all(stage).expect("failed to create MLX resource staging directory");
     }
-    tauri_build::build()
+    tauri_build::try_build(
+        tauri_build::Attributes::new()
+            .app_manifest(tauri_build::AppManifest::new().commands(command_acl::COMMANDS)),
+    )
+    .expect("failed to generate Tauri command ACL")
 }

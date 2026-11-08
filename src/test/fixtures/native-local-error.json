@@ -1,0 +1,12 @@
+{
+  "kind": "local_native",
+  "guard": null,
+  "native_failure": {
+    "kind": "local_native",
+    "status_code": "input_too_large",
+    "stage": "input_admission",
+    "dispatched": false,
+    "input_utf8_bytes": 4097,
+    "max_input_bytes": 4096
+  }
+}

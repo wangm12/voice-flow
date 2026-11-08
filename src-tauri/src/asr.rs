@@ -1,4 +1,5 @@
 use crate::metrics::{AsrRequestDiagnostics, AsrUsageUnit};
+use crate::observations::{self, AsrObservation, ObservedText, ResolvedRequest};
 use reqwest::multipart::{Form, Part};
 use serde::{Deserialize, Serialize};
 use std::future::Future;
@@ -144,6 +145,13 @@ pub fn validate_asr_base_url(base_url: &str) -> Result<(), &'static str> {
     if (scheme != "http" && scheme != "https") || rest.is_empty() || rest.starts_with('/') {
         return Err(ASR_URL_SCHEME_ERROR);
     }
+    let Ok(parsed) = reqwest::Url::parse(trimmed) else {
+        return Err(ASR_URL_SCHEME_ERROR);
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    if authority.contains('@') || !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(ASR_URL_SCHEME_ERROR);
+    }
     let Some(host) = host_from_url(trimmed) else {
         return Err(ASR_URL_SCHEME_ERROR);
     };
@@ -224,6 +232,9 @@ pub struct AsrOptions {
     pub prompt: Option<String>,
     pub keywords: Vec<String>,
     pub model: String,
+    /// Present only for ASR work owned by an admitted dictation stop.
+    pub session_generation: Option<u64>,
+    pub trace: Option<crate::metrics::TraceHandle>,
 }
 
 impl Default for AsrOptions {
@@ -234,6 +245,8 @@ impl Default for AsrOptions {
             prompt: None,
             keywords: Vec::new(),
             model: MODEL.to_owned(),
+            session_generation: None,
+            trace: None,
         }
     }
 }
@@ -259,14 +272,23 @@ pub fn resolve_recognition_model<'a>(model: &'a str, language: Option<&str>) -> 
     }
 }
 
+fn final_model_name(model: &str) -> String {
+    model
+        .trim()
+        .rsplit('/')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+}
+
 fn is_openai_gpt_4o_transcribe_model(model: &str) -> bool {
-    let model = model.trim().to_ascii_lowercase();
+    let model = final_model_name(model);
     !is_openai_gpt_4o_diarize_model(&model)
         && (model.starts_with("gpt-4o-transcribe") || model.starts_with("gpt-4o-mini-transcribe"))
 }
 
 fn is_openai_gpt_4o_diarize_model(model: &str) -> bool {
-    let model = model.trim().to_ascii_lowercase();
+    let model = final_model_name(model);
     model == "gpt-4o-transcribe-diarize" || model.starts_with("gpt-4o-transcribe-diarize-")
 }
 
@@ -796,6 +818,7 @@ impl AsrProvider for GroqAsrProvider {
         let endpoint = self.endpoint.clone();
         let diagnostics = self.diagnostics.clone();
         Box::pin(async move {
+            observations::requested_asr_model(&options.model);
             transcribe_at_with_diagnostics(
                 &endpoint,
                 audio,
@@ -803,7 +826,7 @@ impl AsrProvider for GroqAsrProvider {
                 options.language.as_deref(),
                 options.prompt.as_deref(),
                 options.keywords,
-                resolve_asr_model(&options.model),
+                &options.model,
                 diagnostics.as_ref(),
             )
             .await
@@ -896,26 +919,6 @@ pub fn parse_rate_limits(h: &reqwest::header::HeaderMap) -> RateLimits {
         retry_after: get("retry-after"),
     }
 }
-#[allow(dead_code)]
-pub async fn transcribe(
-    wav: Vec<u8>,
-    key: &str,
-    language: Option<&str>,
-    prompt: Option<&str>,
-) -> Result<Transcript, AsrError> {
-    GroqAsrProvider::default()
-        .transcribe_batch(
-            wav,
-            AsrOptions {
-                api_key: key.to_owned(),
-                language: language.map(str::to_owned),
-                prompt: prompt.map(str::to_owned),
-                keywords: Vec::new(),
-                model: MODEL.to_owned(),
-            },
-        )
-        .await
-}
 
 pub(crate) async fn probe_transcription(
     endpoint: &str,
@@ -1002,6 +1005,21 @@ fn build_qwen_chat_body(
         ));
     }
     let data = format!("{QWEN_AUDIO_DATA_PREFIX}{}", encode_base64(wav));
+    let mut body = build_qwen_chat_controls(language, prompt, keywords, model);
+    body["messages"]
+        .as_array_mut()
+        .expect("control owner creates messages array")
+        .push(serde_json::json!({
+            "role":"user", "content":[{"type":"input_audio","input_audio":{"data":data}}]
+        }));
+    Ok(body)
+}
+fn build_qwen_chat_controls(
+    language: Option<&str>,
+    prompt: Option<&str>,
+    keywords: &[String],
+    model: &str,
+) -> serde_json::Value {
     let mut messages = Vec::new();
     let capabilities =
         asr_capabilities_for("https://dashscope.aliyuncs.com/compatible-mode/v1", model);
@@ -1030,13 +1048,6 @@ fn build_qwen_chat_body(
             }));
         }
     }
-    messages.push(serde_json::json!({
-        "role": "user",
-        "content": [{
-            "type": "input_audio",
-            "input_audio": { "data": data }
-        }]
-    }));
     let mut body = serde_json::json!({
         "model": resolve_asr_model(model),
         "messages": messages,
@@ -1048,37 +1059,153 @@ fn build_qwen_chat_body(
         }
         body["asr_options"] = asr_options;
     }
-    Ok(body)
+    body
 }
 
-fn qwen_chat_content(value: &serde_json::Value) -> Result<String, AsrError> {
-    let choices = value
-        .get("choices")
-        .and_then(serde_json::Value::as_array)
-        .ok_or_else(|| AsrError::Other("missing choices".into()))?;
-    let first = choices
-        .first()
-        .ok_or_else(|| AsrError::Other("missing choices".into()))?;
-    let content = first
-        .pointer("/message/content")
-        .ok_or(AsrError::EmptyResult)?;
-    let text = match content {
-        serde_json::Value::String(text) => text.clone(),
-        serde_json::Value::Null => String::new(),
-        serde_json::Value::Array(parts) => parts
-            .iter()
-            .filter_map(|part| {
-                part.get("text")
-                    .and_then(serde_json::Value::as_str)
-                    .or_else(|| part.as_str())
-            })
-            .collect(),
-        _ => return Err(AsrError::Other("invalid message content".into())),
-    };
-    if text.trim().is_empty() {
-        return Err(AsrError::EmptyResult);
+#[derive(Debug, PartialEq, Eq)]
+enum QwenChatContent {
+    Text {
+        text: String,
+        source_kind: &'static str,
+    },
+    Unavailable {
+        source_kind: &'static str,
+        reason: &'static str,
+        failure: QwenContentFailure,
+    },
+}
+#[derive(Debug, PartialEq, Eq)]
+enum QwenContentFailure {
+    EmptyResult,
+    Malformed,
+}
+impl QwenChatContent {
+    fn into_text(self, completion: &str, model: Option<&str>) -> Result<String, AsrError> {
+        if observations::enabled() {
+            let (provider_text, source_kind, reason, terminal) = match &self {
+                Self::Text { text, source_kind } => (
+                    ObservedText::known(text),
+                    *source_kind,
+                    None,
+                    "parsed_not_filtered",
+                ),
+                Self::Unavailable {
+                    source_kind,
+                    reason,
+                    failure,
+                } => (
+                    ObservedText::unknown(reason),
+                    *source_kind,
+                    Some(*reason),
+                    match failure {
+                        QwenContentFailure::EmptyResult => "empty_origin_unknown",
+                        QwenContentFailure::Malformed => "provider_failed",
+                    },
+                ),
+            };
+            observations::asr(AsrObservation {
+                provider_text,
+                provider_text_source_kind: Some(source_kind.into()),
+                filtered_text: ObservedText::unknown(reason.unwrap_or("filter_not_completed")),
+                origin: "provider_response".into(),
+                terminal: terminal.into(),
+                filtering_reason: reason.map(str::to_owned),
+                protocol_completion: completion.into(),
+                reported_model: model
+                    .filter(|value| value.len() <= 256)
+                    .map(ObservedText::known)
+                    .unwrap_or_else(|| ObservedText::unknown("provider_not_reported")),
+            });
+        }
+        match self {
+            Self::Text { text, .. } => Ok(text),
+            Self::Unavailable {
+                reason, failure, ..
+            } => Err(match failure {
+                QwenContentFailure::EmptyResult => AsrError::EmptyResult,
+                QwenContentFailure::Malformed => AsrError::Other(reason.into()),
+            }),
+        }
     }
-    Ok(text)
+}
+fn qwen_chat_content(value: &serde_json::Value) -> QwenChatContent {
+    use QwenChatContent::{Text, Unavailable};
+    let Some(choices) = value.get("choices").and_then(serde_json::Value::as_array) else {
+        return Unavailable {
+            source_kind: "choices_missing_or_invalid",
+            reason: "missing choices",
+            failure: QwenContentFailure::Malformed,
+        };
+    };
+    let Some(first) = choices.first() else {
+        return Unavailable {
+            source_kind: "choices_empty",
+            reason: "missing choices",
+            failure: QwenContentFailure::Malformed,
+        };
+    };
+    let Some(content) = first.pointer("/message/content") else {
+        return Unavailable {
+            source_kind: "message_content_missing",
+            reason: "provider_text_missing",
+            failure: QwenContentFailure::EmptyResult,
+        };
+    };
+    match content {
+        serde_json::Value::String(text) => Text {
+            text: text.clone(),
+            source_kind: "message_content_string",
+        },
+        serde_json::Value::Null => Unavailable {
+            source_kind: "message_content_null",
+            reason: "provider_text_null",
+            failure: QwenContentFailure::EmptyResult,
+        },
+        serde_json::Value::Array(parts) => {
+            if parts.is_empty() {
+                return Unavailable {
+                    source_kind: "message_content_array",
+                    reason: "provider_text_array_empty",
+                    failure: QwenContentFailure::EmptyResult,
+                };
+            }
+            let mut text = String::new();
+            for part in parts {
+                let recognized = part.as_str().or_else(|| {
+                    let object = part.as_object()?;
+                    if object
+                        .get("type")
+                        .is_some_and(|kind| kind.as_str() != Some("text"))
+                    {
+                        return None;
+                    }
+                    object.get("text").and_then(serde_json::Value::as_str)
+                });
+                let Some(part_text) = recognized else {
+                    return Unavailable {
+                        source_kind: "message_content_array",
+                        reason: "provider_text_array_contains_unsupported_part",
+                        failure: QwenContentFailure::EmptyResult,
+                    };
+                };
+                text.push_str(part_text);
+            }
+            Text {
+                text,
+                source_kind: "message_content_text_array",
+            }
+        }
+        _ => Unavailable {
+            source_kind: match content {
+                serde_json::Value::Number(_) => "message_content_number",
+                serde_json::Value::Bool(_) => "message_content_boolean",
+                serde_json::Value::Object(_) => "message_content_object",
+                _ => unreachable!("recognized content handled above"),
+            },
+            reason: "invalid message content",
+            failure: QwenContentFailure::Malformed,
+        },
+    }
 }
 
 fn qwen_chat_language(value: &serde_json::Value) -> Option<String> {
@@ -1226,6 +1353,45 @@ fn record_usage_value(value: &serde_json::Value, diagnostics: Option<&AsrRequest
     }
 }
 
+fn qwen_chat_request_facts(
+    url: &str,
+    body: &serde_json::Value,
+    language: Option<&str>,
+    prompt: Option<&str>,
+    keywords: &[String],
+    model: &str,
+) -> ResolvedRequest {
+    let mut facts = ResolvedRequest::new("qwen_chat_audio", url, model, resolve_asr_model(model));
+    facts
+        .fields_constructed
+        .insert("model".into(), body["model"].clone());
+    if let Some(options) = body.get("asr_options") {
+        facts
+            .fields_constructed
+            .insert("asr_options".into(), options.clone());
+    }
+    let system = body["messages"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|message| message["role"] == "system")
+        .cloned();
+    if let Some(system) = system {
+        facts
+            .fields_constructed
+            .insert("system_context".into(), system["content"].clone());
+    }
+    if qwen_asr_language(language).is_some() && body.get("asr_options").is_none() {
+        facts.drop_control("language", "protocol_does_not_support_language_control");
+    }
+    if (prompt.is_some() || !keywords.is_empty())
+        && !facts.fields_constructed.contains_key("system_context")
+    {
+        facts.drop_control("context", "protocol_does_not_support_context");
+    }
+    facts
+}
+
 #[allow(
     clippy::too_many_arguments,
     reason = "Keep provider request inputs explicit; diagnostics are request-scoped."
@@ -1242,6 +1408,8 @@ async fn transcribe_qwen_chat(
 ) -> Result<Transcript, AsrError> {
     let url = resolve_qwen_chat_completions_url(endpoint);
     let body = build_qwen_chat_body(&wav, language, prompt, keywords, model)?;
+    let facts = qwen_chat_request_facts(&url, &body, language, prompt, keywords, model);
+    observations::asr_request(facts);
     let client = http_client()?;
     let response = client
         .post(&url)
@@ -1258,10 +1426,9 @@ async fn transcribe_qwen_chat(
         })?;
     let limits = parse_rate_limits(response.headers());
     let status = response.status();
-    let body = response
-        .text()
-        .await
-        .map_err(|error| AsrError::Other(error.to_string()))?;
+    let body = read_bounded_response(response, 4 * 1024 * 1024).await?;
+    let body =
+        String::from_utf8(body).map_err(|_| AsrError::Other("ASR response is not UTF-8".into()))?;
     if !status.is_success() {
         let detail = qwen_http_error_message(status, &body);
         return Err(status_error_with_detail(status, endpoint, &limits, &detail)
@@ -1270,7 +1437,25 @@ async fn transcribe_qwen_chat(
     let parsed: serde_json::Value =
         serde_json::from_str(&body).map_err(|error| AsrError::Other(error.to_string()))?;
     record_usage_value(&parsed, diagnostics);
-    let text = qwen_chat_content(&parsed)?;
+    let text = qwen_chat_content(&parsed).into_text(
+        parsed
+            .pointer("/choices/0/finish_reason")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("json_complete_finish_not_reported"),
+        parsed.get("model").and_then(serde_json::Value::as_str),
+    )?;
+    if parsed.pointer("/choices/0/message/tool_calls").is_some()
+        || parsed.pointer("/choices/0/message/function_call").is_some()
+        || parsed
+            .pointer("/choices/0/finish_reason")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|reason| reason != "stop")
+    {
+        observations::asr_failure("provider_failed", "protocol_completion_rejected");
+        return Err(AsrError::Other(
+            "ASR response did not complete a text-only result".into(),
+        ));
+    }
     sanitize_transcript(Transcript {
         text,
         asr_text: None,
@@ -1308,6 +1493,7 @@ struct BuiltMultipartTranscriptionRequest {
     request: reqwest::RequestBuilder,
     capabilities: AsrCapabilities,
     include_timestamps: bool,
+    facts: ResolvedRequest,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1323,6 +1509,8 @@ struct OpenAiTokenLogprob {
 #[derive(Debug, Deserialize)]
 struct OpenAiTranscriptionResponse {
     text: String,
+    #[serde(default)]
+    model: Option<serde_json::Value>,
     #[serde(default)]
     language: Option<String>,
     #[serde(default)]
@@ -1352,6 +1540,16 @@ fn mean_token_confidence(logprobs: Option<&[OpenAiTokenLogprob]>) -> Option<f32>
 fn openai_transcript_from_json(body: &str) -> Result<Transcript, AsrError> {
     let response: OpenAiTranscriptionResponse = serde_json::from_str(body)
         .map_err(|error| AsrError::Other(format!("invalid transcription response: {error}")))?;
+    observe_parsed_asr(
+        &response.text,
+        "provider_response",
+        "json_complete",
+        response
+            .model
+            .as_ref()
+            .and_then(serde_json::Value::as_str)
+            .filter(|v| v.len() <= 256),
+    );
     let language = response.language.or_else(|| {
         response
             .languages
@@ -1377,7 +1575,7 @@ fn openai_transcript_from_json(body: &str) -> Result<Transcript, AsrError> {
 }
 
 fn is_gpt_transcribe_model(model: &str) -> bool {
-    let model = model.trim().to_ascii_lowercase();
+    let model = final_model_name(model);
     model == "gpt-transcribe" || model.starts_with("gpt-transcribe-")
 }
 
@@ -1431,6 +1629,197 @@ fn transcription_request_spec(
     }
 }
 
+struct MultipartFactsInput<'a> {
+    endpoint: &'a str,
+    model: &'a str,
+    language: Option<&'a str>,
+    prompt: Option<&'a str>,
+    keywords: &'a [String],
+    audio_bytes: usize,
+}
+fn multipart_request_facts(
+    request: &MultipartFactsInput<'_>,
+    spec: &TranscriptionRequestSpec,
+    capabilities: AsrCapabilities,
+) -> ResolvedRequest {
+    let mut facts = ResolvedRequest::new(
+        &format!("{:?}", capabilities.protocol),
+        request.endpoint,
+        request.model,
+        resolve_asr_model(request.model),
+    );
+    let fields = &mut facts.fields_constructed;
+    fields.insert(
+        "model".into(),
+        serde_json::json!(resolve_asr_model(request.model)),
+    );
+    if let Some(format) = spec.response_format {
+        fields.insert("response_format".into(), serde_json::json!(format));
+    }
+    if spec.include_timestamps {
+        if capabilities.protocol == AsrProtocol::MistralTranscriptions {
+            fields.insert(
+                "timestamp_granularities".into(),
+                serde_json::json!(["segment"]),
+            );
+        } else {
+            fields.insert(
+                "timestamp_granularities[]".into(),
+                serde_json::json!(["word", "segment"]),
+            );
+        }
+    }
+    if let Some(language) = &spec.language {
+        fields.insert("language".into(), serde_json::json!(language));
+    }
+    if !spec.languages.is_empty() {
+        fields.insert("languages[]".into(), serde_json::json!(spec.languages));
+    }
+    if !spec.keywords.is_empty() {
+        fields.insert(
+            if capabilities.protocol == AsrProtocol::MistralTranscriptions {
+                "context_bias"
+            } else {
+                "keywords[]"
+            }
+            .into(),
+            serde_json::json!(spec.keywords.iter().take(100).collect::<Vec<_>>()),
+        );
+    }
+    if spec.include_logprobs {
+        fields.insert("include[]".into(), serde_json::json!(["logprobs"]));
+    }
+    let supports_prompt = capabilities.protocol != AsrProtocol::MistralTranscriptions
+        && matches!(
+            capabilities.context_support,
+            AsrContextSupport::Prompt | AsrContextSupport::PromptAndKeywords
+        );
+    if supports_prompt {
+        if let Some(prompt) = request.prompt.filter(|v| !v.is_empty()) {
+            fields.insert("prompt".into(), serde_json::json!(prompt));
+        }
+    }
+    if normalize_language(request.language).is_some()
+        && spec.language.is_none()
+        && spec.languages.is_empty()
+    {
+        facts.drop_control("language", "protocol_does_not_support_language_control");
+    }
+    if !request.keywords.is_empty() && spec.keywords.is_empty() {
+        facts.drop_control("keywords", "protocol_does_not_support_keywords");
+    }
+    if request.prompt.is_some_and(|v| !v.is_empty()) && !supports_prompt {
+        facts.drop_control("prompt", "protocol_does_not_support_prompt");
+    }
+    facts.fields_constructed.insert(
+        "file".into(),
+        serde_json::json!({"filename":"audio.wav","mime":"audio/wav","bytes":request.audio_bytes}),
+    );
+    facts
+}
+
+#[cfg(any(test, feature = "evaluation"))]
+pub(crate) fn fixture_options(
+    endpoint: &str,
+    model: &str,
+    language: Option<&str>,
+    vocabulary: &[String],
+    context: Option<&str>,
+) -> Result<AsrOptions, &'static str> {
+    let capabilities = asr_capabilities_for(endpoint, model);
+    if normalize_language(language).is_some()
+        && matches!(
+            capabilities.language_support,
+            AsrLanguageSupport::Unsupported | AsrLanguageSupport::AutoDetectOnly
+        )
+    {
+        return Err("language_not_applicable");
+    }
+    let mut options = AsrOptions {
+        model: model.into(),
+        language: language.map(str::to_owned),
+        ..AsrOptions::default()
+    };
+    match capabilities.context_support {
+        AsrContextSupport::Prompt => {
+            let content = context
+                .into_iter()
+                .chain(vocabulary.iter().map(String::as_str))
+                .collect::<Vec<_>>()
+                .join("\n");
+            options.prompt = (!content.is_empty()).then_some(content);
+        }
+        AsrContextSupport::PromptAndKeywords | AsrContextSupport::SystemContext => {
+            options.prompt = context.map(str::to_owned);
+            options.keywords = vocabulary.to_vec();
+        }
+        _ if !vocabulary.is_empty() || context.is_some() => {
+            return Err("context_or_vocabulary_not_applicable")
+        }
+        _ => {}
+    }
+    Ok(options)
+}
+
+/// Constructed field identity only: no HTTP client/key/body submission or fake
+/// audio placeholder. Actual audio SHA/PCM is separately bound by the evaluator.
+#[cfg(any(test, feature = "evaluation"))]
+pub(crate) fn file_request_facts(
+    endpoint: &str,
+    audio_bytes: usize,
+    options: &AsrOptions,
+) -> Option<ResolvedRequest> {
+    let caps = asr_capabilities_for(endpoint, &options.model);
+    match caps.protocol {
+        AsrProtocol::OpenAiCompatibleChatCompletions => {
+            if QWEN_AUDIO_DATA_PREFIX
+                .len()
+                .checked_add(encoded_base64_len(audio_bytes))?
+                > QWEN_CHAT_MAX_ENCODED_BYTES
+            {
+                return None;
+            }
+            let body = build_qwen_chat_controls(
+                options.language.as_deref(),
+                options.prompt.as_deref(),
+                &options.keywords,
+                &options.model,
+            );
+            Some(qwen_chat_request_facts(
+                &resolve_qwen_chat_completions_url(endpoint),
+                &body,
+                options.language.as_deref(),
+                options.prompt.as_deref(),
+                &options.keywords,
+                &options.model,
+            ))
+        }
+        AsrProtocol::OpenAiCompatibleTranscriptions
+        | AsrProtocol::SiliconFlowTranscriptions
+        | AsrProtocol::FireworksTranscriptions
+        | AsrProtocol::MistralTranscriptions => {
+            let spec = transcription_request_spec(
+                endpoint,
+                &options.model,
+                options.language.as_deref(),
+                options.keywords.clone(),
+            );
+            Some(multipart_request_facts(
+                &MultipartFactsInput {
+                    endpoint,
+                    model: &options.model,
+                    language: options.language.as_deref(),
+                    prompt: options.prompt.as_deref(),
+                    keywords: &options.keywords,
+                    audio_bytes,
+                },
+                &spec,
+                caps,
+            ))
+        }
+        _ => None,
+    }
+}
 fn build_multipart_transcription_request(
     client: &reqwest::Client,
     request: MultipartTranscriptionRequest<'_>,
@@ -1440,53 +1829,37 @@ fn build_multipart_transcription_request(
         request.endpoint,
         request.model,
         request.language,
-        request.keywords,
+        request.keywords.clone(),
+    );
+    let facts = multipart_request_facts(
+        &MultipartFactsInput {
+            endpoint: request.endpoint,
+            model: request.model,
+            language: request.language,
+            prompt: request.prompt,
+            keywords: &request.keywords,
+            audio_bytes: request.wav.len(),
+        },
+        &spec,
+        capabilities,
     );
     let audio = Part::bytes(request.wav)
         .file_name("audio.wav")
         .mime_str("audio/wav")
         .map_err(|error| AsrError::Other(error.to_string()))?;
-    let mut form = Form::new()
-        .part("file", audio)
-        .text("model", resolve_asr_model(request.model).to_owned());
-    if let Some(response_format) = spec.response_format {
-        form = form.text("response_format", response_format);
-    }
-    if spec.include_timestamps {
-        if capabilities.protocol == AsrProtocol::MistralTranscriptions {
-            // Mistral uses repeated multipart fields and only segment granularity
-            // is supported by the current response adapter.
-            form = form.text("timestamp_granularities", "segment");
-        } else {
-            form = form
-                .text("timestamp_granularities[]", "word")
-                .text("timestamp_granularities[]", "segment");
+    let mut form = Form::new().part("file", audio);
+    for (name, value) in &facts.fields_constructed {
+        if name == "file" {
+            continue;
         }
-    }
-    if let Some(v) = spec.language {
-        form = form.text("language", v);
-    }
-    for language in spec.languages {
-        form = form.text("languages[]", language);
-    }
-    for keyword in spec.keywords.into_iter().take(100) {
-        form = if capabilities.protocol == AsrProtocol::MistralTranscriptions {
-            form.text("context_bias", keyword)
-        } else {
-            form.text("keywords[]", keyword)
-        };
-    }
-    if spec.include_logprobs {
-        form = form.text("include[]", "logprobs");
-    }
-    if capabilities.protocol != AsrProtocol::MistralTranscriptions
-        && matches!(
-            capabilities.context_support,
-            AsrContextSupport::Prompt | AsrContextSupport::PromptAndKeywords
-        )
-    {
-        if let Some(v) = request.prompt.filter(|v| !v.is_empty()) {
-            form = form.text("prompt", v.to_owned());
+        match value {
+            serde_json::Value::String(value) => form = form.text(name.clone(), value.clone()),
+            serde_json::Value::Array(values) => {
+                for value in values {
+                    form = form.text(name.clone(), value.as_str().unwrap_or_default().to_owned());
+                }
+            }
+            _ => unreachable!("multipart field owner only creates text fields"),
         }
     }
     let request = client
@@ -1497,6 +1870,7 @@ fn build_multipart_transcription_request(
         request,
         capabilities,
         include_timestamps: spec.include_timestamps,
+        facts,
     })
 }
 
@@ -1688,6 +2062,7 @@ async fn transcribe_at_inner(
             model,
         },
     )?;
+    observations::asr_request(built.facts);
     let capabilities = built.capabilities;
     let include_timestamps = built.include_timestamps;
     let response = built.request.send().await.map_err(|e| {
@@ -1702,10 +2077,9 @@ async fn transcribe_at_inner(
     if let Some(error) = asr_status_error(status, endpoint, &limits) {
         return Err(error);
     }
-    let body = response
-        .text()
-        .await
-        .map_err(|error| AsrError::Other(error.to_string()))?;
+    let body = read_bounded_response(response, 4 * 1024 * 1024).await?;
+    let body =
+        String::from_utf8(body).map_err(|_| AsrError::Other("ASR response is not UTF-8".into()))?;
     record_provider_usage(&body, diagnostics);
     let mut result = openai_transcript_from_json(&body)?;
     result.limits = limits;
@@ -1834,6 +2208,34 @@ async fn transcribe_assemblyai(
     } else {
         config.insert("timestamps".into(), serde_json::json!(true));
     }
+    let mut facts = ResolvedRequest::new(
+        if dictation {
+            "assembly_fused_dictation"
+        } else {
+            "assembly_raw_sync"
+        },
+        endpoint,
+        if dictation {
+            "provider_default"
+        } else {
+            ASSEMBLYAI_SYNC_MODEL
+        },
+        if dictation {
+            "provider_default"
+        } else {
+            ASSEMBLYAI_SYNC_MODEL
+        },
+    );
+    facts
+        .fields_constructed
+        .insert("config".into(), serde_json::Value::Object(config.clone()));
+    if !dictation {
+        facts.fields_constructed.insert(
+            "X-AAI-Model".into(),
+            serde_json::json!(ASSEMBLYAI_SYNC_MODEL),
+        );
+    }
+    observations::asr_request(facts);
     let config = serde_json::to_vec(&serde_json::Value::Object(config))
         .map_err(|_| AsrError::Other("ASR request configuration could not be encoded".into()))?;
     let config_part = Part::bytes(config)
@@ -1888,11 +2290,25 @@ async fn transcribe_assemblyai(
     let raw = value
         .get("text")
         .and_then(serde_json::Value::as_str)
-        .ok_or(AsrError::EmptyResult)?
+        .ok_or_else(|| AsrError::Other("ASR response is missing transcript text".into()))?
         .to_owned();
-    if raw.trim().is_empty() || raw.len() > MAX_ASSEMBLYAI_CANDIDATE_BYTES {
+    observe_parsed_asr(
+        &raw,
+        "provider_response",
+        "json_complete",
+        value.get("model").and_then(serde_json::Value::as_str),
+    );
+    if raw.len() > MAX_ASSEMBLYAI_CANDIDATE_BYTES {
+        observations::asr_failure("provider_failed", "response_text_budget");
+        return Err(AsrError::Other(
+            "ASR response text exceeds the candidate capacity".into(),
+        ));
+    }
+    if raw.trim().is_empty() {
+        observe_filtered_asr(&raw, "", "provider_empty", Some("no_usable_provider_text"));
         return Err(AsrError::EmptyResult);
     }
+    observe_filtered_asr(&raw, &raw, "speech_text", None);
     let provider_cleaned_candidate = if dictation {
         let rewrite_failed = value.get("llm_error").is_some_and(|error| {
             !error.is_null()
@@ -2094,6 +2510,25 @@ async fn transcribe_deepgram(
         append_query_parameter(&mut url, "detect_language", "true");
     }
     append_deepgram_context(&mut url, model, prompt, keywords);
+    let mut facts = ResolvedRequest::new("deepgram_listen", &url, model, resolve_asr_model(model));
+    if let Ok(parsed_url) = reqwest::Url::parse(&url) {
+        for (field, value) in parsed_url.query_pairs() {
+            if !matches!(
+                field.as_ref(),
+                "smart_format" | "model" | "language" | "detect_language" | "keyterm" | "keywords"
+            ) {
+                continue;
+            }
+            let values = facts
+                .fields_constructed
+                .entry(field.into_owned())
+                .or_insert_with(|| serde_json::json!([]));
+            if let Some(values) = values.as_array_mut() {
+                values.push(serde_json::json!(value));
+            }
+        }
+    }
+    observations::asr_request(facts);
     let client = http_client()?;
     let response = client
         .post(&url)
@@ -2112,7 +2547,8 @@ async fn transcribe_deepgram(
     let limits = parse_rate_limits(response.headers());
     let status = response.status();
     if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
+        let body = read_bounded_response(response, 512 * 1024).await?;
+        let body = String::from_utf8_lossy(&body);
         let body_detail = body.trim().chars().take(240).collect::<String>();
         let detail = if body_detail.is_empty() {
             format!("HTTP status {status}")
@@ -2122,10 +2558,9 @@ async fn transcribe_deepgram(
         return Err(status_error_with_detail(status, endpoint, &limits, &detail)
             .unwrap_or(AsrError::Other(detail)));
     }
-    let parsed: serde_json::Value = response
-        .json()
-        .await
-        .map_err(|error| AsrError::Other(error.to_string()))?;
+    let body = read_bounded_response(response, 4 * 1024 * 1024).await?;
+    let parsed: serde_json::Value = serde_json::from_slice(&body)
+        .map_err(|_| AsrError::Other("ASR response was not valid JSON".into()))?;
     record_usage_value(&parsed, diagnostics);
     if let Some(seconds) = parsed
         .pointer("/metadata/duration")
@@ -2139,8 +2574,17 @@ async fn transcribe_deepgram(
     let text = alternative
         .and_then(|value| value.get("transcript"))
         .and_then(serde_json::Value::as_str)
-        .unwrap_or("")
+        .ok_or_else(|| AsrError::Other("ASR response is missing transcript text".into()))?
         .to_owned();
+    observe_parsed_asr(
+        &text,
+        "provider_response",
+        "json_complete",
+        parsed
+            .pointer("/metadata/models/0")
+            .and_then(serde_json::Value::as_str),
+    );
+
     let confidence = alternative
         .and_then(|value| value.get("confidence"))
         .and_then(serde_json::Value::as_f64)
@@ -2199,7 +2643,30 @@ pub fn normalize_language(language: Option<&str>) -> Option<&str> {
         .filter(|value| !value.is_empty() && !value.eq_ignore_ascii_case("auto"))
 }
 
+pub(crate) fn observe_parsed_asr(text: &str, origin: &str, completion: &str, model: Option<&str>) {
+    if !observations::enabled() {
+        return;
+    }
+    observations::asr(AsrObservation {
+        provider_text: ObservedText::known(text),
+        provider_text_source_kind: None,
+        filtered_text: ObservedText::unknown("filter_not_completed"),
+        origin: origin.into(),
+        terminal: "parsed_not_filtered".into(),
+        filtering_reason: None,
+        protocol_completion: completion.into(),
+        reported_model: model
+            .filter(|value| value.len() <= 256)
+            .map(ObservedText::known)
+            .unwrap_or_else(|| ObservedText::unknown("provider_not_reported")),
+    });
+}
+fn observe_filtered_asr(raw: &str, filtered: &str, terminal: &str, reason: Option<&str>) {
+    observations::asr_filter(raw, filtered, terminal, reason);
+}
+
 fn sanitize_transcript(mut result: Transcript) -> Result<Transcript, AsrError> {
+    let reconstructed_segments = result.text.trim().is_empty() && !result.segments.is_empty();
     if result.asr_text.is_none() {
         result.asr_text = Some(
             if result.text.trim().is_empty() && !result.segments.is_empty() {
@@ -2215,8 +2682,15 @@ fn sanitize_transcript(mut result: Transcript) -> Result<Transcript, AsrError> {
     }
     if result.segments.is_empty() {
         if result.text.trim().is_empty() {
+            observe_filtered_asr(
+                result.original_text(),
+                "",
+                "provider_empty",
+                Some("no_usable_provider_text"),
+            );
             return Err(AsrError::EmptyResult);
         }
+        observe_filtered_asr(result.original_text(), &result.text, "speech_text", None);
         return Ok(result);
     }
     let kept: Vec<Segment> = result
@@ -2226,13 +2700,38 @@ fn sanitize_transcript(mut result: Transcript) -> Result<Transcript, AsrError> {
         .cloned()
         .collect();
     if kept.is_empty() {
+        observe_filtered_asr(
+            result.original_text(),
+            "",
+            "locally_suppressed",
+            Some("all_segments_filtered"),
+        );
         return Err(AsrError::EmptyResult);
     }
+    let segments_changed = kept.len() != result.segments.len();
     result.text = kept.iter().map(|segment| segment.text.as_str()).collect();
     result.segments = kept;
     if result.text.trim().is_empty() {
+        observe_filtered_asr(
+            result.original_text(),
+            "",
+            "locally_suppressed",
+            Some("kept_segments_empty"),
+        );
         return Err(AsrError::EmptyResult);
     }
+    observe_filtered_asr(
+        result.original_text(),
+        &result.text,
+        "speech_text",
+        if segments_changed {
+            Some("partial_segments_filtered")
+        } else if reconstructed_segments {
+            Some("segment_text_reconstruction")
+        } else {
+            None
+        },
+    );
     Ok(result)
 }
 
@@ -2704,6 +3203,7 @@ mod tests {
 
     #[tokio::test]
     async fn provider_success_and_empty_response_are_safe() {
+        let _network_policy_guard = crate::network_policy::strict_offline_test_guard().await;
         let endpoint = crate::test_http::spawn_response(
             200,
             "application/json",
@@ -2748,6 +3248,7 @@ mod tests {
 
     #[tokio::test]
     async fn provider_auth_rate_limit_and_server_errors_are_classified() {
+        let _network_policy_guard = crate::network_policy::strict_offline_test_guard().await;
         let unauthorized =
             crate::test_http::spawn_response(401, "application/json", b"{}", &[]).await;
         let unauthorized_error = transcribe_at(
@@ -2936,6 +3437,18 @@ mod tests {
             Err("ASR 地址必须是 http:// 或 https:// 开头的完整 URL。")
         );
         assert_eq!(
+            validate_asr_base_url("https://synthetic-user:synthetic-password@asr.example.com/v1"),
+            Err("ASR 地址必须是 http:// 或 https:// 开头的完整 URL。")
+        );
+        assert_eq!(
+            validate_asr_base_url("https://synthetic-user@asr.example.com/v1"),
+            Err("ASR 地址必须是 http:// 或 https:// 开头的完整 URL。")
+        );
+        assert_eq!(
+            validate_asr_base_url("https://@asr.example.com/v1"),
+            Err("ASR 地址必须是 http:// 或 https:// 开头的完整 URL。")
+        );
+        assert_eq!(
             validate_asr_base_url("http://asr.example.com/v1"),
             Err("非本机地址必须使用 https://。")
         );
@@ -2962,6 +3475,8 @@ mod tests {
                     prompt: Some("今天下午在看文档。中英混合听写".into()),
                     keywords,
                     model: model.to_owned(),
+                    session_generation: None,
+                    trace: None,
                 },
             )
             .await
@@ -2970,7 +3485,116 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn custom_router_whisper_request_preserves_prefix_model_and_language_controls() {
+        let _network_policy_guard = crate::network_policy::strict_offline_test_guard().await;
+        for language in [Some("zh"), Some("en"), Some("auto")] {
+            let (host, request) = crate::test_http::spawn_response_with_full_request_capture(
+                200,
+                "application/json",
+                br#"{"text":"captured","segments":[],"words":[]}"#.to_vec(),
+                &[],
+            )
+            .await;
+            let base = format!("{host}/llm/v1");
+            let endpoint = resolve_transcription_url(&base);
+            let transcript = transcribe_at(
+                &endpoint,
+                b"synthetic wav".to_vec(),
+                "synthetic-router-key",
+                language,
+                Some("请保留 Router v1 与 groq/openai/gpt-oss-20b"),
+                Vec::new(),
+                "groq/whisper-large-v3-turbo",
+            )
+            .await
+            .expect("Custom OpenAI-compatible transcription succeeds");
+            assert_eq!(transcript.text, "captured");
+
+            let request = String::from_utf8(request.await.expect("full request captured"))
+                .expect("request is UTF-8");
+            assert!(
+                request.starts_with("POST /llm/v1/audio/transcriptions HTTP/1.1\r\n"),
+                "Custom endpoint path prefix must be retained: {}",
+                request.lines().next().unwrap_or_default()
+            );
+            assert!(
+                request
+                    .to_ascii_lowercase()
+                    .contains("authorization: bearer synthetic-router-key"),
+                "the typed Custom key is sent as bearer authentication"
+            );
+            let multipart = request
+                .split_once("\r\n\r\n")
+                .map(|(_, body)| body)
+                .expect("multipart request body");
+            assert!(multipart.contains("groq/whisper-large-v3-turbo"));
+            assert!(multipart.contains("name=\"response_format\"\r\n\r\nverbose_json"));
+            assert_eq!(
+                multipart
+                    .matches("name=\"timestamp_granularities[]\"")
+                    .count(),
+                2,
+                "Whisper requests word and segment timestamps"
+            );
+            assert!(multipart.contains("请保留 Router v1 与 groq/openai/gpt-oss-20b"));
+            if let Some(language) = language.filter(|language| *language != "auto") {
+                assert!(
+                    multipart.contains(&format!("name=\"language\"\r\n\r\n{language}")),
+                    "fixed language {language} is sent"
+                );
+            } else {
+                assert!(
+                    !multipart_has_field(multipart, "language"),
+                    "automatic language detection omits the language field"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn router_prefixed_gpt_4o_transcribe_sends_json() {
+        let _network_policy_guard = crate::network_policy::strict_offline_test_guard().await;
+        let (host, request) = crate::test_http::spawn_response_with_full_request_capture(
+            200,
+            "application/json",
+            br#"{"text":"captured","segments":[],"words":[]}"#.to_vec(),
+            &[],
+        )
+        .await;
+        let endpoint = format!("{host}/v1/audio/transcriptions");
+        let transcript = transcribe_at(
+            &endpoint,
+            b"synthetic wav".to_vec(),
+            "synthetic-router-key",
+            Some("zh"),
+            Some("recognition context"),
+            Vec::new(),
+            "router/openai/gpt-4o-transcribe",
+        )
+        .await
+        .expect("router-prefixed GPT-4o transcription succeeds");
+        assert_eq!(transcript.text, "captured");
+
+        let request = String::from_utf8(request.await.expect("full request captured"))
+            .expect("request is UTF-8");
+        assert!(request.starts_with("POST /v1/audio/transcriptions HTTP/1.1\r\n"));
+        assert!(request
+            .to_ascii_lowercase()
+            .contains("authorization: bearer synthetic-router-key"));
+        let multipart = request
+            .split_once("\r\n\r\n")
+            .map(|(_, body)| body)
+            .expect("multipart request body");
+        assert!(multipart.contains("name=\"model\"\r\n\r\nrouter/openai/gpt-4o-transcribe"));
+        assert!(multipart.contains("name=\"response_format\"\r\n\r\njson"));
+        assert!(multipart.contains("name=\"language\"\r\n\r\nzh"));
+        assert!(multipart.contains("name=\"prompt\"\r\n\r\nrecognition context"));
+        assert!(!multipart.contains("timestamp_granularities"));
+    }
+
+    #[tokio::test]
     async fn gpt_transcribe_multipart_sends_keywords_without_timestamps() {
+        let _network_policy_guard = crate::network_policy::strict_offline_test_guard().await;
         let body =
             capture_transcription_body("gpt-transcribe", vec!["晓雯".into(), "知乎".into()]).await;
         assert!(multipart_has_field(&body, "keywords[]"), "{body}");
@@ -3036,6 +3660,7 @@ mod tests {
 
     #[tokio::test]
     async fn whisper_multipart_keeps_verbose_json_and_omits_gpt_keywords() {
+        let _network_policy_guard = crate::network_policy::strict_offline_test_guard().await;
         for model in ["whisper-1", "whisper-large-v3-turbo"] {
             let body = capture_transcription_body(model, vec!["晓雯".into()]).await;
             assert!(
@@ -3052,6 +3677,7 @@ mod tests {
 
     #[tokio::test]
     async fn gpt_4o_transcribe_models_request_json_and_logprobs_only() {
+        let _network_policy_guard = crate::network_policy::strict_offline_test_guard().await;
         for model in [
             "gpt-4o-transcribe",
             "gpt-4o-mini-transcribe",
@@ -3073,6 +3699,7 @@ mod tests {
 
     #[tokio::test]
     async fn gpt_4o_diarize_does_not_receive_unsupported_prompt_or_logprobs() {
+        let _network_policy_guard = crate::network_policy::strict_offline_test_guard().await;
         let body = capture_transcription_body("gpt-4o-transcribe-diarize", Vec::new()).await;
         assert!(
             body.contains("name=\"response_format\"\r\n\r\njson"),
@@ -3085,6 +3712,7 @@ mod tests {
 
     #[tokio::test]
     async fn openai_adapter_keeps_provider_text_and_timing_metadata_before_sanitation() {
+        let _network_policy_guard = crate::network_policy::strict_offline_test_guard().await;
         let endpoint = crate::test_http::spawn_response(
             200,
             "application/json",
@@ -3127,6 +3755,7 @@ mod tests {
 
     #[tokio::test]
     async fn deepgram_body_omits_gpt_keywords() {
+        let _network_policy_guard = crate::network_policy::strict_offline_test_guard().await;
         let (host, request) = crate::test_http::spawn_response_with_full_request_capture(
             200,
             "application/json",
@@ -3145,6 +3774,8 @@ mod tests {
                     prompt: Some("晓雯 知乎".into()),
                     keywords: vec!["晓雯".into()],
                     model: "nova-3".into(),
+                    session_generation: None,
+                    trace: None,
                 },
             )
             .await
@@ -3177,6 +3808,43 @@ mod tests {
         assert!(
             !text.contains("keywords"),
             "Deepgram must keep keyterm= and skip GPT keywords: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn deepgram_missing_transcript_is_provider_error() {
+        let _network_policy_guard = crate::network_policy::strict_offline_test_guard().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = vec![0; 8192];
+            let count = stream.read(&mut request).await.unwrap();
+            assert!(count > 0);
+            let body = br#"{"results":{"channels":[{"alternatives":[{}]}]}}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            stream.write_all(body).await.unwrap();
+        });
+        let result = transcribe_deepgram(
+            &format!("http://{address}/v1/listen"),
+            b"wav".to_vec(),
+            "synthetic-key",
+            None,
+            "nova-3",
+            None,
+            &[],
+            None,
+        )
+        .await;
+        server.await.expect("local provider server joins");
+        let error = result.expect_err("missing transcript is a provider protocol error");
+        assert!(
+            matches!(error, AsrError::Other(message) if message.contains("missing transcript"))
         );
     }
 
@@ -3245,6 +3913,7 @@ mod tests {
 
     #[tokio::test]
     async fn groq_provider_exposes_batch_and_prefetch_capabilities() {
+        let _network_policy_guard = crate::network_policy::strict_offline_test_guard().await;
         let endpoint = crate::test_http::spawn_response(
             200,
             "application/json",
@@ -3271,6 +3940,7 @@ mod tests {
 
     #[tokio::test]
     async fn provider_from_base_url_posts_to_resolved_mock_endpoint() {
+        let _network_policy_guard = crate::network_policy::strict_offline_test_guard().await;
         let host = crate::test_http::spawn_response(
             200,
             "application/json",
@@ -3476,39 +4146,88 @@ mod tests {
     }
 
     #[test]
-    fn qwen_chat_content_reads_choices_message() {
-        let value = serde_json::json!({
-            "choices": [{ "message": { "content": "你好世界" } }]
-        });
-        assert_eq!(qwen_chat_content(&value).expect("content"), "你好世界");
-    }
-
-    #[test]
-    fn qwen_chat_content_errors_on_missing_choices_or_empty() {
-        assert!(matches!(
-            qwen_chat_content(&serde_json::json!({})),
-            Err(AsrError::Other(_))
-        ));
-        assert!(matches!(
-            qwen_chat_content(&serde_json::json!({ "choices": [] })),
-            Err(AsrError::Other(_))
-        ));
-        assert!(matches!(
-            qwen_chat_content(&serde_json::json!({
-                "choices": [{ "message": { "content": "" } }]
-            })),
-            Err(AsrError::EmptyResult)
-        ));
-        assert!(matches!(
-            qwen_chat_content(&serde_json::json!({
-                "choices": [{ "message": { "content": null } }]
-            })),
-            Err(AsrError::EmptyResult)
-        ));
+    fn qwen_chat_content_distinguishes_text_representation_and_unavailable_content() {
+        for (content, expected, source_kind) in [
+            (
+                serde_json::json!("你好世界"),
+                "你好世界",
+                "message_content_string",
+            ),
+            (serde_json::json!(""), "", "message_content_string"),
+            (
+                serde_json::json!([{"type":"text","text":"你好"}, "世界"]),
+                "你好世界",
+                "message_content_text_array",
+            ),
+            (
+                serde_json::json!([{"text":""}]),
+                "",
+                "message_content_text_array",
+            ),
+        ] {
+            assert_eq!(
+                qwen_chat_content(&serde_json::json!({
+                    "choices": [{"message":{"content":content}}]
+                })),
+                QwenChatContent::Text {
+                    text: expected.into(),
+                    source_kind
+                }
+            );
+        }
+        for (value, source_kind, reason) in [
+            (
+                serde_json::json!({}),
+                "choices_missing_or_invalid",
+                "missing choices",
+            ),
+            (
+                serde_json::json!({"choices":[]}),
+                "choices_empty",
+                "missing choices",
+            ),
+            (
+                serde_json::json!({"choices":[{"message":{}}]}),
+                "message_content_missing",
+                "provider_text_missing",
+            ),
+            (
+                serde_json::json!({"choices":[{"message":{"content":null}}]}),
+                "message_content_null",
+                "provider_text_null",
+            ),
+            (
+                serde_json::json!({"choices":[{"message":{"content":[]}}]}),
+                "message_content_array",
+                "provider_text_array_empty",
+            ),
+            (
+                serde_json::json!({"choices":[{"message":{"content":[{"type":"audio"}]}}]}),
+                "message_content_array",
+                "provider_text_array_contains_unsupported_part",
+            ),
+            (
+                serde_json::json!({"choices":[{"message":{"content":["hello",{"text":7}]}}]}),
+                "message_content_array",
+                "provider_text_array_contains_unsupported_part",
+            ),
+            (
+                serde_json::json!({"choices":[{"message":{"content":7}}]}),
+                "message_content_number",
+                "invalid message content",
+            ),
+        ] {
+            assert!(
+                matches!(qwen_chat_content(&value), QwenChatContent::Unavailable {
+                source_kind: actual_source, reason: actual_reason, ..
+            } if actual_source == source_kind && actual_reason == reason)
+            );
+        }
     }
 
     #[tokio::test]
     async fn qwen_chat_oversize_does_not_send_request() {
+        let _network_policy_guard = crate::network_policy::strict_offline_test_guard().await;
         let started = std::time::Instant::now();
         let error = transcribe_at(
             "https://dashscope.aliyuncs.com:1/compatible-mode/v1/audio/transcriptions",
@@ -3676,31 +4395,38 @@ mod tests {
         assert!(matches!(error, AsrError::Unauthorized(_)));
     }
 
-    async fn read_http_request_completely(stream: &mut tokio::net::TcpStream) {
+    async fn read_http_request_completely(
+        stream: &mut tokio::net::TcpStream,
+        first_byte_sent: &mut Option<tokio::sync::oneshot::Sender<()>>,
+    ) -> Result<(), usize> {
         use tokio::io::AsyncReadExt;
 
         let mut request = Vec::new();
         let mut chunk = [0_u8; 4096];
         loop {
-            let read = stream.read(&mut chunk).await.expect("read client request");
-            assert_ne!(read, 0, "client closed before sending the request");
+            let read = match stream.read(&mut chunk).await {
+                Ok(0) | Err(_) => return Err(request.len()),
+                Ok(read) => read,
+            };
+            if let Some(sender) = first_byte_sent.take() {
+                let _ = sender.send(());
+            }
             request.extend_from_slice(&chunk[..read]);
             let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n")
             else {
                 continue;
             };
             let headers = String::from_utf8_lossy(&request[..header_end]);
-            let body_length = headers
-                .lines()
-                .find_map(|line| {
-                    let (name, value) = line.split_once(':')?;
-                    name.eq_ignore_ascii_case("content-length")
-                        .then(|| value.trim().parse::<usize>().ok())
-                        .flatten()
-                })
-                .expect("request has content-length");
+            let Some(body_length) = headers.lines().find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            }) else {
+                return Err(request.len());
+            };
             if request.len() >= header_end + 4 + body_length {
-                return;
+                return Ok(());
             }
         }
     }
@@ -3713,16 +4439,25 @@ mod tests {
             .await
             .expect("bind cancellation fixture");
         let address = listener.local_addr().expect("fixture address");
-        let (request_sent, request_received) = tokio::sync::oneshot::channel();
-        let server = tokio::spawn(async move {
+        let (accepted_tx, mut accepted_rx) = tokio::sync::oneshot::channel();
+        let (first_byte_tx, mut first_byte_rx) = tokio::sync::oneshot::channel();
+        let (request_received_tx, request_received_rx) = tokio::sync::oneshot::channel();
+        let mut server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.expect("accept provider request");
-            read_http_request_completely(&mut stream).await;
-            let _ = request_sent.send(());
+            let _ = accepted_tx.send(());
+            let mut first_byte_tx = Some(first_byte_tx);
+            let request = read_http_request_completely(&mut stream, &mut first_byte_tx).await;
+            let request_complete = request.is_ok();
+            let _ = request_received_tx.send(request);
+            if !request_complete {
+                return (request, true);
+            }
             let mut byte = [0_u8; 1];
-            matches!(
+            let closed = matches!(
                 tokio::time::timeout(Duration::from_secs(2), stream.read(&mut byte)).await,
                 Ok(Ok(0)) | Ok(Err(_))
-            )
+            );
+            (request, closed)
         });
 
         let endpoint = format!("http://{address}");
@@ -3739,18 +4474,437 @@ mod tests {
             )
             .await
         });
-        tokio::time::timeout(Duration::from_secs(2), request_received)
-            .await
-            .expect("provider sent request")
-            .expect("server acknowledged request");
+        let request_received =
+            tokio::time::timeout(Duration::from_secs(2), request_received_rx).await;
+        let accepted = accepted_rx.try_recv().is_ok();
+        let first_byte_received = first_byte_rx.try_recv().is_ok();
+        let provider_was_inflight = !request.is_finished();
         request.abort();
-        let closed = tokio::time::timeout(Duration::from_secs(2), server)
-            .await
-            .expect("cancelled client closed its HTTP request")
-            .expect("server task completed");
+        let request_result = request.await;
+        let server_result = match tokio::time::timeout(Duration::from_secs(2), &mut server).await {
+            Ok(result) => result,
+            Err(_) => {
+                server.abort();
+                server.await
+            }
+        };
+        let complete_body_observed = matches!(&server_result, Ok((Ok(()), _)));
+        let full_request_received =
+            matches!(&request_received, Ok(Ok(Ok(())))) && complete_body_observed;
+        let closed = matches!(&server_result, Ok((_, true)));
+        assert!(
+            full_request_received,
+            "server did not receive the complete request within 2s (accepted={accepted}, first_byte={first_byte_received}, provider_was_inflight={provider_was_inflight}, provider_result={request_result:?}, server_result={server_result:?}, complete_body_observed={complete_body_observed})"
+        );
+        assert!(
+            provider_was_inflight,
+            "provider task exited before cancellation: {request_result:?}"
+        );
+        assert!(
+            matches!(request_result, Err(ref error) if error.is_cancelled()),
+            "provider task did not report cancellation: {request_result:?}"
+        );
         assert!(
             closed,
-            "the provider socket remained open after cancellation"
+            "the provider socket remained open after cancellation: {server_result:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod fixture_observation_tests {
+    use super::*;
+    use crate::observations::FixtureCapture;
+    #[tokio::test]
+    async fn multipart_constructed_controls_equal_actual_request_fields() {
+        let _network_policy_guard = crate::network_policy::strict_offline_test_guard().await;
+        for language in [None, Some("zh"), Some("en")] {
+            for model in ["gpt-transcribe", "whisper-large-v3-turbo"] {
+                let (endpoint, request) =
+                    crate::test_http::spawn_response_with_full_request_capture(
+                        200,
+                        "application/json",
+                        br#"{"text":"hello","model":"reported-model"}"#.to_vec(),
+                        &[],
+                    )
+                    .await;
+                let options = fixture_options(
+                    &endpoint,
+                    model,
+                    language,
+                    &["VoiceFlow".into(), "TypeScript".into()],
+                    Some("fixture context"),
+                )
+                .unwrap();
+                let expected = file_request_facts(&endpoint, 3, &options).unwrap();
+                let capture = FixtureCapture::new(false);
+                let provider = GroqAsrProvider::from_resolved_endpoint(&endpoint);
+                capture
+                    .scope(provider.transcribe_batch(
+                        b"wav".to_vec(),
+                        AsrOptions {
+                            api_key: "synthetic-test-key".into(),
+                            ..options
+                        },
+                    ))
+                    .await
+                    .unwrap();
+                let request = String::from_utf8(request.await.unwrap()).unwrap();
+                let facts = capture.snapshot().asr_request.unwrap();
+                assert_eq!(
+                    serde_json::to_value(&facts).unwrap(),
+                    serde_json::to_value(expected).unwrap()
+                );
+                for (name, value) in &facts.fields_constructed {
+                    if name == "file" {
+                        continue;
+                    }
+                    let values = value
+                        .as_array()
+                        .map(|v| v.iter().collect::<Vec<_>>())
+                        .unwrap_or_else(|| vec![value]);
+                    for value in values {
+                        assert!(
+                            request.contains(&format!("name=\"{name}\"")),
+                            "missing field {name}"
+                        );
+                        assert!(
+                            request.contains(value.as_str().unwrap()),
+                            "mismatched field {name}"
+                        );
+                    }
+                }
+                assert_eq!(
+                    facts.fields_constructed.contains_key("language")
+                        || facts.fields_constructed.contains_key("languages[]"),
+                    language.is_some()
+                );
+                assert_eq!(
+                    facts.fields_constructed.contains_key("keywords[]"),
+                    model == "gpt-transcribe"
+                );
+                assert!(!serde_json::to_string(&facts)
+                    .unwrap()
+                    .contains("synthetic-test-key"));
+            }
+        }
+    }
+    #[tokio::test]
+    async fn qwen_constructed_context_and_language_equal_captured_json() {
+        for language in [None, Some("zh"), Some("en")] {
+            let (endpoint,request)=crate::test_http::spawn_response_with_full_request_capture(200,"application/json",br#"{"model":"provider-model","choices":[{"message":{"content":"hello"},"finish_reason":"stop"}]}"#.to_vec(),&[]).await;
+            let capture = FixtureCapture::new(false);
+            capture
+                .scope(transcribe_qwen_chat(
+                    &endpoint,
+                    b"wav".to_vec(),
+                    "synthetic-test-key",
+                    language,
+                    Some("context"),
+                    &["TypeScript".into()],
+                    "qwen3-asr-flash",
+                    None,
+                ))
+                .await
+                .unwrap();
+            let request = request.await.unwrap();
+            let offset = request.windows(4).position(|v| v == b"\r\n\r\n").unwrap() + 4;
+            let actual: serde_json::Value = serde_json::from_slice(&request[offset..]).unwrap();
+            let record = capture.snapshot();
+            let facts = record.asr_request.unwrap();
+            assert_eq!(
+                actual["asr_options"],
+                facts.fields_constructed["asr_options"]
+            );
+            assert_eq!(
+                actual["messages"][0]["content"],
+                facts.fields_constructed["system_context"]
+            );
+            assert_eq!(
+                actual["asr_options"].get("language").is_some(),
+                language.is_some()
+            );
+            assert_eq!(
+                record.asr.unwrap().reported_model,
+                ObservedText::known("provider-model")
+            );
+            assert!(!serde_json::to_string(&facts)
+                .unwrap()
+                .contains("input_audio"));
+        }
+    }
+    #[tokio::test]
+    async fn qwen_loopback_empty_and_unavailable_text_have_distinct_negative_coverage() {
+        let cases = [
+            (
+                serde_json::json!({"choices":[{"message":{"content":""},"finish_reason":"stop"}]}),
+                "message_content_string",
+                Some(""),
+                None,
+            ),
+            (
+                serde_json::json!({"choices":[{"message":{"content":null},"finish_reason":"stop"}]}),
+                "message_content_null",
+                None,
+                Some("provider_text_null"),
+            ),
+            (
+                serde_json::json!({"choices":[{"message":{},"finish_reason":"stop"}]}),
+                "message_content_missing",
+                None,
+                Some("provider_text_missing"),
+            ),
+            (
+                serde_json::json!({"choices":[{"message":{"content":[]},"finish_reason":"stop"}]}),
+                "message_content_array",
+                None,
+                Some("provider_text_array_empty"),
+            ),
+            (
+                serde_json::json!({"choices":[{"message":{"content":[{"type":"audio"}]},"finish_reason":"stop"}]}),
+                "message_content_array",
+                None,
+                Some("provider_text_array_contains_unsupported_part"),
+            ),
+            (
+                serde_json::json!({"choices":[{"message":{"content":["hello",{"type":"audio","text":""}]},"finish_reason":"stop"}]}),
+                "message_content_array",
+                None,
+                Some("provider_text_array_contains_unsupported_part"),
+            ),
+            (
+                serde_json::json!({"choices":[{"message":{"content":[{"type":"text","text":"hello"}," world"]},"finish_reason":"stop"}]}),
+                "message_content_text_array",
+                Some("hello world"),
+                None,
+            ),
+            (
+                serde_json::json!({"choices":[{"message":{"content":[{"text":""}]},"finish_reason":"stop"}]}),
+                "message_content_text_array",
+                Some(""),
+                None,
+            ),
+            (
+                serde_json::json!({"choices":[{"message":{"content":7},"finish_reason":"stop"}]}),
+                "message_content_number",
+                None,
+                Some("invalid message content"),
+            ),
+            (
+                serde_json::json!({}),
+                "choices_missing_or_invalid",
+                None,
+                Some("missing choices"),
+            ),
+        ];
+        for (body, source_kind, text, reason) in cases {
+            let (endpoint, receipt) = crate::test_http::spawn_response_with_full_request_capture(
+                200,
+                "application/json",
+                serde_json::to_vec(&body).unwrap(),
+                &[],
+            )
+            .await;
+            let capture = FixtureCapture::new(false);
+            let result = capture
+                .scope(transcribe_qwen_chat(
+                    &endpoint,
+                    b"wav".to_vec(),
+                    "synthetic-test-key",
+                    None,
+                    None,
+                    &[],
+                    "qwen3-asr-flash",
+                    None,
+                ))
+                .await;
+            receipt.await.unwrap();
+            let captured_result = result
+                .as_ref()
+                .map(|transcript| transcript.text.clone())
+                .map_err(ToString::to_string);
+            let (plain_endpoint, plain_receipt) =
+                crate::test_http::spawn_response_with_full_request_capture(
+                    200,
+                    "application/json",
+                    serde_json::to_vec(&body).unwrap(),
+                    &[],
+                )
+                .await;
+            let plain_result = transcribe_qwen_chat(
+                &plain_endpoint,
+                b"wav".to_vec(),
+                "synthetic-test-key",
+                None,
+                None,
+                &[],
+                "qwen3-asr-flash",
+                None,
+            )
+            .await;
+            plain_receipt.await.unwrap();
+            assert_eq!(
+                captured_result,
+                plain_result
+                    .as_ref()
+                    .map(|transcript| transcript.text.clone())
+                    .map_err(ToString::to_string)
+            );
+            let observed = capture.snapshot().asr.unwrap();
+            assert_eq!(
+                observed.provider_text_source_kind.as_deref(),
+                Some(source_kind)
+            );
+            match text {
+                Some("") => {
+                    assert!(matches!(result, Err(AsrError::EmptyResult)));
+                    assert_eq!(observed.provider_text, ObservedText::KnownEmpty {});
+                    assert_eq!(observed.filtered_text, ObservedText::KnownEmpty {});
+                    assert!(observed.confirmed_empty());
+                }
+                Some(text) => {
+                    assert_eq!(result.unwrap().text, text);
+                    assert_eq!(observed.provider_text, ObservedText::known(text));
+                    assert!(!observed.confirmed_empty());
+                }
+                None => {
+                    assert!(result.is_err());
+                    let reason = reason.unwrap();
+                    assert_eq!(observed.provider_text, ObservedText::unknown(reason));
+                    assert_eq!(observed.filtered_text, ObservedText::unknown(reason));
+                    assert_eq!(observed.filtering_reason.as_deref(), Some(reason));
+                    assert!(!observed.confirmed_empty());
+                }
+            }
+            assert_eq!(
+                observed.protocol_completion,
+                body.pointer("/choices/0/finish_reason")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("json_complete_finish_not_reported")
+            );
+        }
+        // A valid empty text representation does not override an unsuccessful completion.
+        for finish in ["length", "tool_calls"] {
+            let body =
+                serde_json::json!({"choices":[{"message":{"content":""},"finish_reason":finish}]});
+            let (endpoint, receipt) = crate::test_http::spawn_response_with_full_request_capture(
+                200,
+                "application/json",
+                serde_json::to_vec(&body).unwrap(),
+                &[],
+            )
+            .await;
+            let capture = FixtureCapture::new(false);
+            let result = capture
+                .scope(transcribe_qwen_chat(
+                    &endpoint,
+                    b"wav".to_vec(),
+                    "synthetic-test-key",
+                    None,
+                    None,
+                    &[],
+                    "qwen3-asr-flash",
+                    None,
+                ))
+                .await;
+            receipt.await.unwrap();
+            assert!(matches!(result, Err(AsrError::Other(_))));
+            let observed = capture.snapshot().asr.unwrap();
+            assert_eq!(observed.provider_text, ObservedText::KnownEmpty {});
+            assert_eq!(observed.terminal, "provider_failed");
+            assert!(!observed.confirmed_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn observed_empty_and_local_filtering_preserve_distinct_raw_facts() {
+        let _network_policy_guard = crate::network_policy::strict_offline_test_guard().await;
+        let capture = FixtureCapture::new(false);
+        let result = capture
+            .scope(async {
+                observe_parsed_asr(
+                    "provider hallucination",
+                    "provider_response",
+                    "json_complete",
+                    None,
+                );
+                sanitize_transcript(Transcript {
+                    text: "provider hallucination".into(),
+                    asr_text: None,
+                    provider_cleaned_candidate: None,
+                    language: None,
+                    confidence: None,
+                    segments: vec![Segment {
+                        text: "provider hallucination".into(),
+                        start: None,
+                        end: None,
+                        avg_logprob: Some(-3.0),
+                        no_speech_prob: Some(0.99),
+                    }],
+                    words: vec![],
+                    tokens: vec![],
+                    limits: RateLimits::default(),
+                })
+            })
+            .await;
+        assert!(matches!(result, Err(AsrError::EmptyResult)));
+        let observed = capture.snapshot().asr.unwrap();
+        assert_eq!(
+            observed.provider_text,
+            ObservedText::known("provider hallucination")
+        );
+        assert_eq!(observed.filtered_text, ObservedText::KnownEmpty {});
+        assert_eq!(observed.terminal, "locally_suppressed");
+        let (endpoint, _) = crate::test_http::spawn_response_with_request_capture(
+            200,
+            "application/json",
+            br#"{"text":""}"#.to_vec(),
+            &[],
+        )
+        .await;
+        let capture = FixtureCapture::new(false);
+        let result = capture
+            .scope(
+                GroqAsrProvider::from_resolved_endpoint(endpoint).transcribe_batch(
+                    b"wav".to_vec(),
+                    AsrOptions {
+                        api_key: "synthetic-test-key".into(),
+                        ..Default::default()
+                    },
+                ),
+            )
+            .await;
+        assert!(matches!(result, Err(AsrError::EmptyResult)));
+        let observed = capture.snapshot().asr.unwrap();
+        assert_eq!(observed.terminal, "provider_empty");
+        assert_eq!(observed.provider_text, ObservedText::KnownEmpty {});
+    }
+    #[test]
+    fn unsupported_factor_fails_and_ordinary_builder_records_omission() {
+        assert!(fixture_options(
+            "https://api.siliconflow.cn/v1/audio/transcriptions",
+            "Qwen/Qwen3-ASR-1.7B",
+            Some("zh"),
+            &[],
+            None
+        )
+        .is_err());
+        let client = reqwest::Client::new();
+        let built = build_multipart_transcription_request(
+            &client,
+            MultipartTranscriptionRequest {
+                endpoint: "https://api.siliconflow.cn/v1/audio/transcriptions",
+                wav: b"wav".to_vec(),
+                key: "synthetic-test-key",
+                language: Some("zh"),
+                prompt: Some("not supported"),
+                keywords: vec!["term".into()],
+                model: "Qwen/Qwen3-ASR-1.7B",
+            },
+        )
+        .unwrap();
+        assert!(!built.facts.fields_constructed.contains_key("language"));
+        assert!(!built.facts.fields_constructed.contains_key("prompt"));
+        assert_eq!(built.facts.dropped_controls.len(), 3);
     }
 }

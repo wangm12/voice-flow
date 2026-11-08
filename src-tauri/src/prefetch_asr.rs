@@ -301,7 +301,7 @@ impl PrefetchAsrSession {
         }));
         let shared_results = Arc::clone(&results);
         let worker_cancellation = cancellation.clone();
-        tokio::spawn(async move {
+        crate::research_trace::tokio_spawn(async move {
             let mut failed = false;
             let mut receiver = receiver;
             loop {
@@ -348,7 +348,7 @@ impl PrefetchAsrSession {
                 let options = options.clone();
                 let _latency =
                     metrics.timer_for(metrics::MetricKind::PrefetchAsr, metric_group.clone());
-                let result = queue::execute_with_retry_scoped_cancelled(
+                let result = queue::execute_with_retry_scoped_cancelled_background(
                     &gate,
                     queue::RequestKind::Asr,
                     &quota_scope,

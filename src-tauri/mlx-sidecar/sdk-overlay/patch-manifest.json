@@ -1,0 +1,61 @@
+{
+  "schema": "voiceflow-sdk-source-patch-manifest/v2",
+  "patch": "voiceflow-mlx-audio-cancellation-v2.patch",
+  "patch_sha256": "888d17cfe319c05191d2ebd1276000da06906bb6764002e147527740a00883a2",
+  "upstream": {
+    "repository": "https://github.com/Blaizzy/mlx-audio-swift",
+    "revision": "01dec7c9bdce3088a6b6b7ab9f2e403458195efb",
+    "license": "MIT",
+    "license_blob": "e24ffcc8d81ac6b7e4a831375df03611600b7d25",
+    "license_sha256": "fd330bb5d9adf9e65bfe4d8f6f90c808a4196ef5c98aad018a3344256fcb2374"
+  },
+  "files": [
+    {
+      "path": "Sources/MLXAudioCore/DSP.swift",
+      "source_url": "https://github.com/Blaizzy/mlx-audio-swift/blob/01dec7c9bdce3088a6b6b7ab9f2e403458195efb/Sources/MLXAudioCore/DSP.swift",
+      "base_git_blob": "04688b14edd3e4e0d450ab0db2c08a07d263e305",
+      "base_sha256": "1f307c350ebe8454a81ac0bcb798e2f0a06aba2a1f0d2e052b50af3eb725be97",
+      "after_sha256": "b4830558aa62ac6ff9b3291589ee5a3879eac477333f2dcc4293e57fb094e174"
+    },
+    {
+      "path": "Sources/MLXAudioSTT/Models/Qwen3ASR/Qwen3ASR.swift",
+      "source_url": "https://github.com/Blaizzy/mlx-audio-swift/blob/01dec7c9bdce3088a6b6b7ab9f2e403458195efb/Sources/MLXAudioSTT/Models/Qwen3ASR/Qwen3ASR.swift",
+      "base_git_blob": "e9f76952cd8a20c9afe5b8ff6ac14a491c5b68ed",
+      "base_sha256": "8f6de3978ececf44c8ea3e240b19bfdac83b4fd238d9d413bebc8c22327f0068",
+      "after_sha256": "9983a6925350f8a4f60807f7c496dff441622a523c3991cf37067722b136f45a"
+    },
+    {
+      "path": "Sources/MLXAudioSTT/Models/CohereTranscribe/CohereTranscribe.swift",
+      "source_url": "https://github.com/Blaizzy/mlx-audio-swift/blob/01dec7c9bdce3088a6b6b7ab9f2e403458195efb/Sources/MLXAudioSTT/Models/CohereTranscribe/CohereTranscribe.swift",
+      "base_git_blob": "2925b4e0ebc0d7a8165e2fb7d4645a0907672bce",
+      "base_sha256": "28d5672256dcb2b26b416780756ff56846872f674cc1248bfd35c0c4f133b469",
+      "after_sha256": "4af6aebc56911f13469cdf6b8ddb84ff1f5a3a995a0b7ce5a1bf941640882157"
+    }
+  ],
+  "proof": {
+    "whole_file_base_gate": "PASS: independently perturbed unrelated trailing newline in each of the three inputs; all rejected by SHA gate before output root creation",
+    "correct_base": "PASS: validator applied patch in isolated staged copy; all three post SHA-256 values exact",
+    "repeat": "PASS: raw git apply second application rejected with all file hashes unchanged; validator recognizes already-after only when all three post hashes match",
+    "post_hashes": {
+      "DSP.swift": "b4830558aa62ac6ff9b3291589ee5a3879eac477333f2dcc4293e57fb094e174",
+      "Qwen3ASR.swift": "9983a6925350f8a4f60807f7c496dff441622a523c3991cf37067722b136f45a",
+      "CohereTranscribe.swift": "4af6aebc56911f13469cdf6b8ddb84ff1f5a3a995a0b7ce5a1bf941640882157"
+    }
+  },
+  "scope": "External source review artifact only; not integrated into VoiceFlow or SDK cache.",
+  "validator": {
+    "path": "validate-and-apply.py",
+    "sha256": "d2a255b629f5d45617d8f343dc9deb601c22a33f6e42f0994ca56cdee2522072",
+    "behavior": "whole-file SHA-256 gate on all three pinned inputs before staging; optional Git HEAD equality when source is a checkout; applies into private stage and verifies exact after hashes before publishing"
+  },
+  "repair": {
+    "independent_review_markdown_sha256": "25e783bbc0bf298e1f37e98dad61e5fbbf1399577826b904cdf2ba7c0a1f6be4",
+    "independent_review_json_sha256": "bdbfa227ed23b54f3ff7d82d7a77aa5d8dc06bf2cc111aa4d22272668be96f20",
+    "findings_closed": [
+      "SDK-23-R1",
+      "SDK-23-R2",
+      "SDK-23-R3"
+    ],
+    "scope": "Only the three reviewed Qwen call-site/checkpoint edits; DSP.swift and CohereTranscribe.swift after files unchanged from V1."
+  }
+}

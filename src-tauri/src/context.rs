@@ -91,6 +91,10 @@ pub struct ContextPolicy {
     /// conservative Auto cleanup and lexicon rules even inside a known IDE.
     #[serde(default)]
     pub input_kind: FocusKind,
+    /// Ephemeral shared-cleanup instruction. It is deliberately excluded from
+    /// History and settings persistence; retry paths resolve it again.
+    #[serde(skip)]
+    pub(crate) cleanup_output_plan: Option<crate::cleanup_prompt::EffectiveCleanupPlan>,
 }
 
 impl ContextPolicy {
@@ -103,6 +107,7 @@ impl ContextPolicy {
         policy.style_example_output = None;
         policy.style_example_pairs.clear();
         policy.style_examples_approved = false;
+        policy.cleanup_output_plan = None;
         policy
     }
 
@@ -129,6 +134,7 @@ impl ContextPolicy {
             style_example_pairs: Vec::new(),
             style_examples_approved: false,
             input_kind: FocusKind::Unknown,
+            cleanup_output_plan: None,
         };
         match family {
             ContextFamily::Email => {
@@ -247,9 +253,16 @@ pub struct TargetAppGuard {
     pub bundle_id: Option<String>,
     pub browser_host: Option<String>,
     /// Local-only fingerprint of the active browser target. It includes the
-    /// URL and, when the browser exposes them, the active tab index/title. The
+    /// URL and, when the browser exposes them, the active tab index and title,
+    /// so a title change alone changes it. Used by the pre-paste guard. The
     /// raw URL/title never crosses the detector boundary or gets serialized.
     pub browser_target_token: Option<u64>,
+    /// Local-only fingerprint of the same browser target built from the URL
+    /// and tab index only (no title). The post-paste final check compares this
+    /// one, because a page title often changes after text lands (unread
+    /// counts, "saved"). Same-site tab switches still change it. Computed from
+    /// the same browser query as `browser_target_token`; never serialized.
+    pub browser_tab_token: Option<u64>,
     /// Local-only fingerprints of the active native window and focused
     /// editable element. They never cross the detector boundary. They are
     /// best-effort because macOS can omit them for some apps or during a
@@ -259,6 +272,8 @@ pub struct TargetAppGuard {
     /// present, this disambiguates two windows that share the same title and
     /// geometry.
     pub window_id: Option<u64>,
+    /// Whether CoreGraphics found multiple matching windows for this target.
+    pub window_identity_ambiguous: bool,
     pub input_token: Option<u64>,
     /// Secure/password fields are never eligible for automatic injection.
     pub secure_input: bool,
@@ -270,6 +285,15 @@ pub struct ContextSnapshot {
     pub policy: ContextPolicy,
     pub captured_at_ms: u64,
     pub browser_access_status: BrowserAccessStatus,
+    /// Whether the already-observed focused native field can accept multiline
+    /// text. This is an in-memory capability for formatting decisions only;
+    /// it is never sent over IPC or stored in History.
+    #[serde(skip)]
+    pub multiline_capable: bool,
+    /// Whether the already-read native role was present, distinguishing a
+    /// known single-line field from an unavailable/unknown observation.
+    #[serde(skip)]
+    pub multiline_capability_known: bool,
     /// Raw evidence is memory-only. ContextSnapshot crosses IPC and History
     /// serialization paths, so evidence must never be serialized by default.
     #[serde(skip)]
@@ -368,6 +392,99 @@ pub fn display_app_name(snapshot: &ContextSnapshot) -> Option<&str> {
         return None;
     }
     Some(label)
+}
+
+/// Read the public NSWorkspace icon for the app captured with this recording.
+/// The caller supplies the immutable recording target bundle id; this helper
+/// never consults the live foreground application. It is intended for one HUD
+/// publication per recording, not the audio event path.
+pub fn recording_target_icon_data_url(bundle_id: Option<&str>) -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        use std::ffi::CString;
+
+        let bundle_id = bundle_id?.trim();
+        if bundle_id.is_empty() {
+            return None;
+        }
+        let bundle_id = CString::new(bundle_id).ok()?;
+        let png = unsafe {
+            use objc::{class, msg_send, runtime::Object, sel, sel_impl};
+
+            let bundle_string: *mut Object =
+                msg_send![class!(NSString), stringWithUTF8String: bundle_id.as_ptr()];
+            if bundle_string.is_null() {
+                return None;
+            }
+            let workspace: *mut Object = msg_send![class!(NSWorkspace), sharedWorkspace];
+            let app_url: *mut Object =
+                msg_send![workspace, URLForApplicationWithBundleIdentifier: bundle_string];
+            if app_url.is_null() {
+                return None;
+            }
+            let app_path: *mut Object = msg_send![app_url, path];
+            if app_path.is_null() {
+                return None;
+            }
+            let image: *mut Object = msg_send![workspace, iconForFile: app_path];
+            if image.is_null() {
+                return None;
+            }
+            let tiff: *mut Object = msg_send![image, TIFFRepresentation];
+            if tiff.is_null() {
+                return None;
+            }
+            let bitmap: *mut Object = msg_send![class!(NSBitmapImageRep), imageRepWithData: tiff];
+            if bitmap.is_null() {
+                return None;
+            }
+            let properties: *mut Object = msg_send![class!(NSDictionary), dictionary];
+            let png: *mut Object =
+                msg_send![bitmap, representationUsingType: 4usize properties: properties];
+            if png.is_null() {
+                return None;
+            }
+            let length: usize = msg_send![png, length];
+            let bytes: *const u8 = msg_send![png, bytes];
+            if length == 0 || length > 262_144 || bytes.is_null() {
+                return None;
+            }
+            std::slice::from_raw_parts(bytes, length).to_vec()
+        };
+        Some(format!(
+            "data:image/png;base64,{}",
+            encode_icon_base64(&png)
+        ))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = bundle_id;
+        None
+    }
+}
+
+fn encode_icon_base64(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut output = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = chunk.get(1).copied().unwrap_or(0);
+        let b2 = chunk.get(2).copied().unwrap_or(0);
+        let triple = (u32::from(b0) << 16) | (u32::from(b1) << 8) | u32::from(b2);
+        output.push(TABLE[((triple >> 18) & 63) as usize] as char);
+        output.push(TABLE[((triple >> 12) & 63) as usize] as char);
+        output.push(if chunk.len() > 1 {
+            TABLE[((triple >> 6) & 63) as usize] as char
+        } else {
+            '='
+        });
+        output.push(if chunk.len() > 2 {
+            TABLE[(triple & 63) as usize] as char
+        } else {
+            '='
+        });
+    }
+    output
 }
 
 fn is_placeholder_app_label(label: &str) -> bool {
@@ -826,15 +943,21 @@ impl AppMapping {
     }
 }
 
-pub fn merge_saved_mapping(existing: &AppMapping, mut incoming: AppMapping) -> AppMapping {
-    if incoming.style_example_pairs.is_empty() {
-        incoming.style_example_pairs = existing.style_example_pairs.clone();
-    }
-    if incoming.style_example_input.is_none() {
-        incoming.style_example_input = existing.style_example_input.clone();
-    }
-    if incoming.style_example_output.is_none() {
-        incoming.style_example_output = existing.style_example_output.clone();
+pub fn merge_saved_mapping(
+    existing: &AppMapping,
+    mut incoming: AppMapping,
+    replace_style_examples: bool,
+) -> AppMapping {
+    if !replace_style_examples {
+        if incoming.style_example_pairs.is_empty() {
+            incoming.style_example_pairs = existing.style_example_pairs.clone();
+        }
+        if incoming.style_example_input.is_none() {
+            incoming.style_example_input = existing.style_example_input.clone();
+        }
+        if incoming.style_example_output.is_none() {
+            incoming.style_example_output = existing.style_example_output.clone();
+        }
     }
     if let (Some(input), Some(output)) = (
         incoming.style_example_input.clone(),
@@ -861,14 +984,106 @@ struct AppSignal {
     process_name: String,
     window_title: String,
     focus_kind: FocusKind,
+    multiline_capable: bool,
+    multiline_capability_known: bool,
     browser_host: Option<String>,
     /// Used only for local, app-aware policy resolution; never copied to a snapshot.
     browser_path: Option<String>,
     browser_target_token: Option<u64>,
+    browser_tab_token: Option<u64>,
     window_token: Option<u64>,
     window_id: Option<u64>,
+    window_identity_ambiguous: bool,
     input_token: Option<u64>,
     browser_access_status: BrowserAccessStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum NativeFocusCaptureStage {
+    NotStarted,
+    ApplicationIdentity,
+    FocusedElement,
+    WindowIdentity,
+    FrontmostRecheck,
+    Complete,
+    UnsupportedPlatform,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum NativeFocusCaptureReason {
+    ApplicationUnavailable,
+    ApplicationIdentityUnknown,
+    SelectedApplicationMismatch,
+    AccessibilityObservationUnknown,
+    FocusedElementUnavailable,
+    FocusedRoleUnknown,
+    FocusedInputNotEditable,
+    SecureInput,
+    WindowIdentityUnknown,
+    WindowIdentityAmbiguous,
+    IdentityDrift,
+    UnsupportedPlatform,
+}
+
+/// One PID-bound native focus observation. Accessibility labels and geometry
+/// are used transiently to derive local identities and are never retained in
+/// this value or serialized to IPC.
+pub(crate) struct NativeFocusCapture {
+    pub(crate) target: TargetAppGuard,
+    pub(crate) stage: NativeFocusCaptureStage,
+    pub(crate) reason: Option<NativeFocusCaptureReason>,
+    pub(crate) stable_frontmost_identity: bool,
+    process_name: String,
+    pub(crate) window_title: String,
+    /// Transient, in-process native document identity used only by the owned
+    /// TextEdit fixture admission. It is never copied to snapshots or IPC.
+    pub(crate) window_document_path: Option<std::path::PathBuf>,
+    focus_kind: FocusKind,
+    multiline_capable: bool,
+    multiline_capability_known: bool,
+    #[cfg(target_os = "macos")]
+    github_field_hint: GitHubFieldHint,
+    /// Retained only for the active native operation that requested this
+    /// observation. It is never serialized or stored beyond that operation.
+    pub(crate) focused_anchor: Option<crate::paste::FocusedFieldAnchor>,
+}
+
+impl NativeFocusCapture {
+    fn unavailable(reason: NativeFocusCaptureReason) -> Self {
+        let stage = if reason == NativeFocusCaptureReason::UnsupportedPlatform {
+            NativeFocusCaptureStage::UnsupportedPlatform
+        } else {
+            NativeFocusCaptureStage::ApplicationIdentity
+        };
+        Self {
+            target: TargetAppGuard {
+                pid: 0,
+                bundle_id: None,
+                browser_host: None,
+                browser_target_token: None,
+                browser_tab_token: None,
+                window_token: None,
+                window_id: None,
+                window_identity_ambiguous: false,
+                input_token: None,
+                secure_input: false,
+            },
+            stage,
+            reason: Some(reason),
+            stable_frontmost_identity: false,
+            process_name: String::new(),
+            window_title: String::new(),
+            window_document_path: None,
+            focus_kind: FocusKind::Unknown,
+            multiline_capable: false,
+            multiline_capability_known: false,
+            #[cfg(target_os = "macos")]
+            github_field_hint: GitHubFieldHint::None,
+            focused_anchor: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -900,7 +1115,8 @@ impl FocusKind {
 
 fn known_ide_process(process_name: &str) -> bool {
     let process = process_name.to_ascii_lowercase();
-    process.contains("cursor")
+    process == "codex"
+        || process.contains("cursor")
         || process.contains("visual studio code")
         || process == "code"
         || process.contains("xcode")
@@ -927,7 +1143,7 @@ fn classify_focus_for_app(
     }
     let field = format!("{focused_description} {focused_title}").to_ascii_lowercase();
     match classified {
-        FocusKind::Chat
+        FocusKind::Chat | FocusKind::Editable
             if ["chat", "composer", "prompt"]
                 .iter()
                 .any(|marker| focus_marker(&field, marker)) =>
@@ -951,6 +1167,33 @@ fn classify_focus_for_app(
         }
         FocusKind::CodingPrompt => classified,
     }
+}
+
+fn classify_focus_for_native_app(
+    process_name: &str,
+    bundle_id: Option<&str>,
+    role: &str,
+    subrole: &str,
+    window_title: &str,
+    focused_description: &str,
+    focused_title: &str,
+) -> FocusKind {
+    let known_coding_bundle = matches!(bundle_id, Some("com.openai.codex"));
+    let process_name = if known_coding_bundle {
+        // The app's bundle identity is stable even when macOS gives the
+        // process a product display name such as "ChatGPT".
+        "Codex"
+    } else {
+        process_name
+    };
+    classify_focus_for_app(
+        process_name,
+        role,
+        subrole,
+        window_title,
+        focused_description,
+        focused_title,
+    )
 }
 
 /// Coarse transient hint only. Raw Accessibility labels are discarded by the
@@ -1023,6 +1266,10 @@ fn is_github_issue_or_review_path(path: &str) -> bool {
 
 fn is_decimal_segment(value: &str) -> bool {
     !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn role_is_multiline_capable(role: &str, secure_input: bool) -> bool {
+    role == "AXTextArea" && !secure_input
 }
 
 #[cfg(target_os = "macos")]
@@ -1123,14 +1370,18 @@ fn snapshot_for_signal_with_modes(
         policy,
         captured_at_ms: now_ms(),
         browser_access_status: browser_status,
+        multiline_capable: signal.multiline_capable,
+        multiline_capability_known: signal.multiline_capability_known,
         evidence: crate::screen_text::ContextEvidence::default(),
         target_guard: TargetAppGuard {
             pid: signal.pid,
             bundle_id: signal.bundle_id.clone(),
             browser_host: signal.browser_host.clone(),
             browser_target_token: signal.browser_target_token,
+            browser_tab_token: signal.browser_tab_token,
             window_token: signal.window_token,
             window_id: signal.window_id,
+            window_identity_ambiguous: signal.window_identity_ambiguous,
             input_token: signal.input_token,
             secure_input: signal.focus_kind.is_secure(),
         },
@@ -1758,6 +2009,7 @@ fn native_profile(
     bundle_id: &str,
 ) -> Option<(&'static str, ContextFamily, &'static str, &'static str)> {
     match bundle_id {
+        "com.openai.codex" => Some(("code.codex", ContextFamily::PromptOrCode, "Codex", "codex")),
         "com.todesktop.230313mzl4w4u92" => Some((
             "code.cursor",
             ContextFamily::PromptOrCode,
@@ -1894,7 +2146,7 @@ pub fn focus_mismatch_reason(
     guard: &TargetAppGuard,
     current: &TargetAppGuard,
 ) -> Option<&'static str> {
-    target_mismatch_without_browser(guard, current)
+    target_mismatch_for_pre_paste(guard, current)
 }
 
 /// Strict check for reading or observing one focused editable field.
@@ -1907,19 +2159,21 @@ pub fn same_field_mismatch_reason(
     current: &TargetAppGuard,
     require_browser_identity: bool,
 ) -> Option<&'static str> {
-    if let Some(reason) = target_mismatch_without_browser(guard, current) {
+    if let Some(reason) = target_mismatch_for_pre_paste(guard, current) {
         return Some(reason);
     }
 
-    match (guard.window_id, current.window_id) {
-        (Some(expected), Some(actual)) if expected == actual => {}
-        (Some(_), Some(_)) => return Some("target_changed"),
-        (Some(_), None) => return Some("target_unavailable"),
-        (None, _) => match (guard.window_token, current.window_token) {
+    if !guard.window_identity_ambiguous && !current.window_identity_ambiguous {
+        match (guard.window_id, current.window_id) {
             (Some(expected), Some(actual)) if expected == actual => {}
             (Some(_), Some(_)) => return Some("target_changed"),
-            _ => return Some("target_unavailable"),
-        },
+            (Some(_), None) => return Some("target_unavailable"),
+            (None, _) => match (guard.window_token, current.window_token) {
+                (Some(expected), Some(actual)) if expected == actual => {}
+                (Some(_), Some(_)) => return Some("target_changed"),
+                _ => return Some("target_unavailable"),
+            },
+        }
     }
 
     match (guard.input_token, current.input_token) {
@@ -1945,7 +2199,22 @@ pub fn same_field_mismatch_reason(
     None
 }
 
-fn target_mismatch_without_browser(
+fn apply_window_identity_resolution(
+    target: &mut TargetAppGuard,
+    window_title: &str,
+    resolution: WindowIdentityResolution,
+) {
+    if resolution == WindowIdentityResolution::Ambiguous {
+        target.window_identity_ambiguous = true;
+        if window_title.trim().is_empty() {
+            target.window_token = None;
+        }
+    }
+}
+
+/// Pid/bundle/window-id/secure-input comparison without any browser data.
+/// The lightweight guard for post-paste readback polling.
+pub(crate) fn target_mismatch_without_browser(
     guard: &TargetAppGuard,
     current: &TargetAppGuard,
 ) -> Option<&'static str> {
@@ -1971,18 +2240,65 @@ fn target_mismatch_without_browser(
     None
 }
 
+/// Pre-paste target comparison. Ambiguous CoreGraphics identity requires the
+/// captured title-and-geometry token to remain available and unchanged.
+fn target_mismatch_for_pre_paste(
+    guard: &TargetAppGuard,
+    current: &TargetAppGuard,
+) -> Option<&'static str> {
+    if guard.window_identity_ambiguous || current.window_identity_ambiguous {
+        if guard.pid <= 0
+            || current.pid <= 0
+            || guard.bundle_id.is_none()
+            || current.bundle_id.is_none()
+        {
+            return Some("target_unavailable");
+        }
+        if guard.pid != current.pid || guard.bundle_id != current.bundle_id {
+            return Some("target_changed");
+        }
+        if guard.secure_input || current.secure_input {
+            return Some("secure_input");
+        }
+        return match (guard.window_token, current.window_token) {
+            (Some(expected), Some(actual)) if expected == actual => None,
+            (Some(_), Some(_)) => Some("target_changed"),
+            _ => Some("target_unavailable"),
+        };
+    }
+    target_mismatch_without_browser(guard, current)
+}
+
 /// Frontmost app/window/input tokens without the browser AppleScript query.
 pub fn probe_focus_guard() -> TargetAppGuard {
-    let signal = frontmost_signal(false);
-    TargetAppGuard {
-        pid: signal.pid,
-        bundle_id: signal.bundle_id,
-        browser_host: None,
-        browser_target_token: None,
-        window_token: signal.window_token,
-        window_id: signal.window_id,
-        input_token: signal.input_token,
-        secure_input: signal.focus_kind.is_secure(),
+    let capture = capture_frontmost_focus(None);
+    if capture.stable_frontmost_identity {
+        capture.target
+    } else {
+        TargetAppGuard {
+            pid: 0,
+            bundle_id: None,
+            browser_host: None,
+            browser_target_token: None,
+            browser_tab_token: None,
+            window_token: None,
+            window_id: None,
+            window_identity_ambiguous: false,
+            input_token: None,
+            secure_input: false,
+        }
+    }
+}
+
+pub(crate) fn capture_frontmost_focus(expected_bundle_id: Option<&str>) -> NativeFocusCapture {
+    #[cfg(target_os = "macos")]
+    {
+        capture_frontmost_focus_macos(expected_bundle_id)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = expected_bundle_id;
+        NativeFocusCapture::unavailable(NativeFocusCaptureReason::UnsupportedPlatform)
     }
 }
 
@@ -1992,7 +2308,32 @@ pub fn target_mismatch_reason(
     guard: &TargetAppGuard,
     current: &TargetAppGuard,
 ) -> Option<&'static str> {
-    if let Some(reason) = target_mismatch_without_browser(guard, current) {
+    target_mismatch_reason_with_browser_token(guard, current, |g| g.browser_target_token, true)
+}
+
+/// Same rules as `target_mismatch_reason`, but the browser tab is compared by
+/// the title-free `browser_tab_token` (URL + tab index). For the single check
+/// after paste, where a changed page title is expected and must not make the
+/// delivery unverified; a different URL or tab still does.
+pub fn target_mismatch_reason_after_paste(
+    guard: &TargetAppGuard,
+    current: &TargetAppGuard,
+) -> Option<&'static str> {
+    target_mismatch_reason_with_browser_token(guard, current, |g| g.browser_tab_token, false)
+}
+
+fn target_mismatch_reason_with_browser_token(
+    guard: &TargetAppGuard,
+    current: &TargetAppGuard,
+    token: fn(&TargetAppGuard) -> Option<u64>,
+    check_ambiguous_window: bool,
+) -> Option<&'static str> {
+    let base_mismatch = if check_ambiguous_window {
+        target_mismatch_for_pre_paste(guard, current)
+    } else {
+        target_mismatch_without_browser(guard, current)
+    };
+    if let Some(reason) = base_mismatch {
         return Some(reason);
     }
     // Browser URL/tab metadata is only needed for context-aware writing
@@ -2004,7 +2345,7 @@ pub fn target_mismatch_reason(
         if guard.browser_host.is_some() && current.browser_host.is_none() {
             return Some("target_unavailable");
         }
-        if guard.browser_target_token.is_some() && current.browser_target_token.is_none() {
+        if token(guard).is_some() && token(current).is_none() {
             return Some("target_unavailable");
         }
         if let (Some(expected), Some(actual)) = (&guard.browser_host, &current.browser_host) {
@@ -2012,9 +2353,7 @@ pub fn target_mismatch_reason(
                 return Some("target_changed");
             }
         }
-        if let (Some(expected), Some(actual)) =
-            (&guard.browser_target_token, &current.browser_target_token)
-        {
+        if let (Some(expected), Some(actual)) = (token(guard), token(current)) {
             if expected != actual {
                 return Some("target_changed");
             }
@@ -2058,7 +2397,7 @@ fn extract_browser_location(raw_url: &str) -> Option<(String, String)> {
     Some((host, url.path().to_owned()))
 }
 
-fn query_browser_url(application: &str) -> Result<(String, String, u64), BrowserAccessStatus> {
+fn query_browser_url(application: &str) -> Result<(String, String, u64, u64), BrowserAccessStatus> {
     let script = match application {
         "Google Chrome" => {
             "tell application \"Google Chrome\"\n  set activeTab to active tab of front window\n  return (URL of activeTab) & (ASCII character 9) & (index of activeTab as text) & (ASCII character 9) & (title of activeTab)\nend tell"
@@ -2107,21 +2446,7 @@ fn query_browser_url(application: &str) -> Result<(String, String, u64), Browser
                     .map_err(|_| BrowserAccessStatus::Unavailable)?;
                 let identity = String::from_utf8(output.stdout)
                     .map_err(|_| BrowserAccessStatus::NeedsPermission)?;
-                let mut fields = identity.trim().split('\t');
-                let raw_url = fields.next().unwrap_or_default();
-                let (host, path) = extract_browser_location(raw_url)
-                    .ok_or(BrowserAccessStatus::NeedsPermission)?;
-                // Keep the full tab identity local and hash it immediately.
-                // If an adapter only returns a URL, the URL remains a safe
-                // conservative fallback; adapters with tab metadata also
-                // reject same-URL tab switches.
-                let tab_metadata = fields.collect::<Vec<_>>().join("\t");
-                let fingerprint_input = if tab_metadata.is_empty() {
-                    raw_url.to_owned()
-                } else {
-                    format!("{raw_url}\t{tab_metadata}")
-                };
-                return Ok((host, path, browser_target_token(&fingerprint_input)));
+                return browser_identity_from_output(&identity);
             }
             Ok(Some(_)) => return Err(BrowserAccessStatus::NeedsPermission),
             Ok(None) if std::time::Instant::now() < deadline => {
@@ -2141,22 +2466,49 @@ fn query_browser_url(application: &str) -> Result<(String, String, u64), Browser
     }
 }
 
+/// Parse the osascript output (`URL[\tindex[\ttitle]]`) into host, path, the
+/// title-including target token and the title-free tab token.
+fn browser_identity_from_output(
+    identity: &str,
+) -> Result<(String, String, u64, u64), BrowserAccessStatus> {
+    let mut fields = identity.trim().split('\t');
+    let raw_url = fields.next().unwrap_or_default();
+    let (host, path) =
+        extract_browser_location(raw_url).ok_or(BrowserAccessStatus::NeedsPermission)?;
+    // Keep the full tab identity local and hash it immediately.
+    // If an adapter only returns a URL, the URL remains a safe
+    // conservative fallback; adapters with tab metadata also
+    // reject same-URL tab switches.
+    let tab_index = fields.next().unwrap_or_default();
+    let title = fields.collect::<Vec<_>>().join("\t");
+    let tab_metadata = if title.is_empty() {
+        tab_index.to_owned()
+    } else {
+        format!("{tab_index}\t{title}")
+    };
+    let fingerprint_input = if tab_metadata.is_empty() {
+        raw_url.to_owned()
+    } else {
+        format!("{raw_url}\t{tab_metadata}")
+    };
+    // Title-free variant: URL + tab index, from the same query.
+    let tab_input = if tab_index.is_empty() {
+        raw_url.to_owned()
+    } else {
+        format!("{raw_url}\t{tab_index}")
+    };
+    Ok((
+        host,
+        path,
+        browser_target_token(&fingerprint_input),
+        browser_target_token(&tab_input),
+    ))
+}
+
 fn browser_target_token(raw_url: &str) -> u64 {
     let mut hasher = DefaultHasher::new();
     raw_url.trim().hash(&mut hasher);
     hasher.finish()
-}
-
-#[cfg(target_os = "macos")]
-#[derive(Debug, Default)]
-struct WindowIdentity {
-    title: String,
-    focus_kind: FocusKind,
-    /// Coarse field meaning only; never keep the raw focused label here.
-    github_field_hint: GitHubFieldHint,
-    window_token: Option<u64>,
-    window_id: Option<u64>,
-    input_token: Option<u64>,
 }
 
 #[cfg(target_os = "macos")]
@@ -2222,7 +2574,6 @@ fn window_bounds(
     ))
 }
 
-#[cfg(target_os = "macos")]
 fn parse_pair(value: &str) -> Option<(f64, f64)> {
     let values = value
         .split(|character: char| {
@@ -2234,7 +2585,6 @@ fn parse_pair(value: &str) -> Option<(f64, f64)> {
     (values.len() == 2).then(|| (values[0], values[1]))
 }
 
-#[cfg(target_os = "macos")]
 fn bounds_match(
     candidate: (f64, f64, f64, f64),
     position: Option<(f64, f64)>,
@@ -2251,10 +2601,142 @@ fn bounds_match(
 }
 
 /// Resolve the Accessibility front window to a stable CoreGraphics window
-/// number. If the list cannot identify exactly one candidate, return `None` so
-/// delivery falls back to the clipboard rather than guessing.
+/// number using metadata from the same focused AX element. Missing and
+/// ambiguous candidates stay distinct so callers never guess an owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowIdentityResolution {
+    Unique(u64),
+    Unknown,
+    Ambiguous,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct WindowIdentityCandidate {
+    pid: i32,
+    id: u64,
+    name: Option<String>,
+    bounds: Option<(f64, f64, f64, f64)>,
+}
+
+fn resolve_window_identity(
+    pid: i32,
+    title: &str,
+    position: &str,
+    size: &str,
+    candidates: &[WindowIdentityCandidate],
+) -> WindowIdentityResolution {
+    if pid <= 0 {
+        return WindowIdentityResolution::Unknown;
+    }
+    let title = (!title.trim().is_empty()).then_some(title);
+    let position = parse_pair(position);
+    let size = parse_pair(size);
+    let matching = candidates
+        .iter()
+        .filter(|candidate| candidate.pid == pid)
+        .filter_map(|candidate| {
+            let title_matches = match (title, candidate.name.as_deref()) {
+                (Some(expected), Some(observed)) if expected == observed => true,
+                (Some(_), Some(_)) => return None,
+                _ => false,
+            };
+            let geometry_matches = match (position, size, candidate.bounds) {
+                (Some(_), Some(_), Some(bounds)) if bounds_match(bounds, position, size) => true,
+                (Some(_), Some(_), Some(_)) => return None,
+                _ => false,
+            };
+            (title_matches || geometry_matches).then_some(candidate.id)
+        })
+        .collect::<Vec<_>>();
+    match matching.as_slice() {
+        [id] => WindowIdentityResolution::Unique(*id),
+        [] => WindowIdentityResolution::Unknown,
+        [_, _, ..] => WindowIdentityResolution::Ambiguous,
+    }
+}
+
+fn parse_finite_pair(value: &str) -> Option<(f64, f64)> {
+    let (first, second) = value.split_once(',')?;
+    if second.contains(',') {
+        return None;
+    }
+    let first = first.trim().parse::<f64>().ok()?;
+    let second = second.trim().parse::<f64>().ok()?;
+    (first.is_finite() && second.is_finite()).then_some((first, second))
+}
+
+fn valid_window_bounds(bounds: (f64, f64, f64, f64)) -> bool {
+    bounds.0.is_finite()
+        && bounds.1.is_finite()
+        && bounds.2.is_finite()
+        && bounds.3.is_finite()
+        && bounds.2 > 0.0
+        && bounds.3 > 0.0
+}
+
+fn resolve_window_identity_with_focus_proof(
+    pid: i32,
+    title: &str,
+    position: &str,
+    size: &str,
+    app_focused_window_matches: Option<bool>,
+    candidates: &[WindowIdentityCandidate],
+) -> WindowIdentityResolution {
+    match app_focused_window_matches {
+        Some(false) => WindowIdentityResolution::Unknown,
+        None => resolve_window_identity(pid, title, position, size, candidates),
+        Some(true) => {
+            if pid <= 0 {
+                return WindowIdentityResolution::Unknown;
+            }
+            let Some(position) = parse_finite_pair(position) else {
+                return WindowIdentityResolution::Unknown;
+            };
+            let Some(size) = parse_finite_pair(size) else {
+                return WindowIdentityResolution::Unknown;
+            };
+            if size.0 <= 0.0 || size.1 <= 0.0 {
+                return WindowIdentityResolution::Unknown;
+            }
+
+            let same_pid_candidates = candidates
+                .iter()
+                .filter(|candidate| candidate.pid == pid)
+                .collect::<Vec<_>>();
+            if same_pid_candidates.iter().any(|candidate| {
+                candidate
+                    .bounds
+                    .is_none_or(|bounds| !valid_window_bounds(bounds))
+            }) {
+                return WindowIdentityResolution::Unknown;
+            }
+
+            let matching = same_pid_candidates
+                .into_iter()
+                .filter(|candidate| {
+                    candidate
+                        .bounds
+                        .is_some_and(|bounds| bounds_match(bounds, Some(position), Some(size)))
+                })
+                .map(|candidate| candidate.id)
+                .collect::<Vec<_>>();
+            match matching.as_slice() {
+                [id] => WindowIdentityResolution::Unique(*id),
+                [] => WindowIdentityResolution::Unknown,
+                [_, _, ..] => WindowIdentityResolution::Ambiguous,
+            }
+        }
+    }
+}
+
 #[cfg(target_os = "macos")]
-fn query_window_id(pid: i32, title: &str, position: &str, size: &str) -> Option<u64> {
+fn query_window_id(
+    pid: i32,
+    title: &str,
+    position: &str,
+    size: &str,
+    app_focused_window_matches: Option<bool>,
+) -> WindowIdentityResolution {
     use core_foundation::base::TCFType;
     use core_foundation::string::CFString;
     use core_graphics::window::{
@@ -2263,10 +2745,15 @@ fn query_window_id(pid: i32, title: &str, position: &str, size: &str) -> Option<
         kCGWindowNumber, kCGWindowOwnerPID,
     };
 
-    let dictionaries = copy_window_info(
+    if app_focused_window_matches == Some(false) {
+        return WindowIdentityResolution::Unknown;
+    }
+    let Some(dictionaries) = copy_window_info(
         kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
         kCGNullWindowID,
-    )?;
+    ) else {
+        return WindowIdentityResolution::Unknown;
+    };
     let owner_pid_key = unsafe { CFString::wrap_under_get_rule(kCGWindowOwnerPID) };
     let window_number_key = unsafe { CFString::wrap_under_get_rule(kCGWindowNumber) };
     let layer_key = unsafe { CFString::wrap_under_get_rule(kCGWindowLayer) };
@@ -2276,15 +2763,6 @@ fn query_window_id(pid: i32, title: &str, position: &str, size: &str) -> Option<
     let y_key = CFString::from("Y");
     let width_key = CFString::from("Width");
     let height_key = CFString::from("Height");
-    let position = parse_pair(position);
-    let size = parse_pair(size);
-
-    struct Candidate {
-        id: u64,
-        name: Option<String>,
-        bounds: Option<(f64, f64, f64, f64)>,
-    }
-
     let mut candidates = Vec::new();
     for raw in dictionaries.get_all_values() {
         if raw.is_null() {
@@ -2292,17 +2770,21 @@ fn query_window_id(pid: i32, title: &str, position: &str, size: &str) -> Option<
         }
         let dictionary = unsafe { WindowDictionary::wrap_under_get_rule(raw as _) };
         if cf_number(&dictionary, &owner_pid_key) != Some(pid as i64)
-            || cf_number(&dictionary, &layer_key).unwrap_or(0) != 0
+            || cf_number(&dictionary, &layer_key) != Some(0)
         {
             continue;
         }
-        let Some(id) = cf_number(&dictionary, &window_number_key)
+        let id = cf_number(&dictionary, &window_number_key)
             .filter(|id| *id > 0)
-            .map(|id| id as u64)
-        else {
+            .map(|id| id as u64);
+        if id.is_none() && app_focused_window_matches == Some(true) {
+            return WindowIdentityResolution::Unknown;
+        }
+        let Some(id) = id else {
             continue;
         };
-        candidates.push(Candidate {
+        candidates.push(WindowIdentityCandidate {
+            pid,
             id,
             name: cf_string(&dictionary, &name_key).filter(|name| !name.trim().is_empty()),
             bounds: window_bounds(
@@ -2316,37 +2798,14 @@ fn query_window_id(pid: i32, title: &str, position: &str, size: &str) -> Option<
         });
     }
 
-    let exact_title = candidates
-        .iter()
-        .filter(|candidate| candidate.name.as_deref() == Some(title))
-        .collect::<Vec<_>>();
-    if exact_title.len() == 1 {
-        return Some(exact_title[0].id);
-    }
-    if !exact_title.is_empty() {
-        let matching_bounds = exact_title
-            .iter()
-            .filter(|candidate| {
-                candidate
-                    .bounds
-                    .is_some_and(|bounds| bounds_match(bounds, position, size))
-            })
-            .collect::<Vec<_>>();
-        return (matching_bounds.len() == 1).then(|| matching_bounds[0].id);
-    }
-
-    let matching_bounds = candidates
-        .iter()
-        .filter(|candidate| {
-            candidate
-                .bounds
-                .is_some_and(|bounds| bounds_match(bounds, position, size))
-        })
-        .collect::<Vec<_>>();
-    if matching_bounds.len() == 1 {
-        return Some(matching_bounds[0].id);
-    }
-    (candidates.len() == 1).then(|| candidates[0].id)
+    resolve_window_identity_with_focus_proof(
+        pid,
+        title,
+        position,
+        size,
+        app_focused_window_matches,
+        &candidates,
+    )
 }
 
 /// Look up the on-screen bounds for a recorded CoreGraphics window number so
@@ -2399,6 +2858,57 @@ pub fn window_bounds_for_id(pid: i32, window_id: u64) -> Option<(f64, f64, f64, 
         );
     }
     None
+}
+
+/// Geometry-only lookup for the user-initiated permission companion. An
+/// ambiguous/missing window remains unknown; this does not read window content
+/// or require Accessibility / a screenshot to place the first AX guide.
+#[cfg(target_os = "macos")]
+pub(crate) fn sole_visible_window_bounds(pid: i32) -> Option<(f64, f64, f64, f64)> {
+    use core_foundation::base::TCFType;
+    use core_foundation::string::CFString;
+    use core_graphics::window::{
+        copy_window_info, kCGNullWindowID, kCGWindowBounds, kCGWindowLayer,
+        kCGWindowListExcludeDesktopElements, kCGWindowListOptionOnScreenOnly, kCGWindowOwnerPID,
+    };
+    let dictionaries = copy_window_info(
+        kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
+        kCGNullWindowID,
+    )?;
+    let pid_key = unsafe { CFString::wrap_under_get_rule(kCGWindowOwnerPID) };
+    let layer_key = unsafe { CFString::wrap_under_get_rule(kCGWindowLayer) };
+    let bounds_key = unsafe { CFString::wrap_under_get_rule(kCGWindowBounds) };
+    let keys = (
+        CFString::from("X"),
+        CFString::from("Y"),
+        CFString::from("Width"),
+        CFString::from("Height"),
+    );
+    let mut result = None;
+    for raw in dictionaries.get_all_values() {
+        if raw.is_null() {
+            continue;
+        }
+        let dictionary = unsafe { WindowDictionary::wrap_under_get_rule(raw as _) };
+        if cf_number(&dictionary, &pid_key) != Some(pid as i64)
+            || cf_number(&dictionary, &layer_key) != Some(0)
+        {
+            continue;
+        }
+        let bounds = window_bounds(&dictionary, &bounds_key, &keys.0, &keys.1, &keys.2, &keys.3)?;
+        if ![bounds.0, bounds.1, bounds.2, bounds.3]
+            .iter()
+            .all(|n| n.is_finite())
+            || bounds.2 <= 0.0
+            || bounds.3 <= 0.0
+        {
+            return None;
+        }
+        if result.replace(bounds).is_some() {
+            return None;
+        }
+    }
+    result
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -2507,135 +3017,46 @@ fn classify_focus(
     FocusKind::Editable
 }
 
-/// Read only a local identity for target safety and conservative scene hints.
-/// The raw title and focused-element metadata are hashed before they can enter
-/// a snapshot, history record, IPC payload, or provider request.
 #[cfg(target_os = "macos")]
-fn query_frontmost_window(pid: i32, process_name: &str) -> WindowIdentity {
-    const TIMEOUT_MS: u64 = 350;
-    let script = r#"
-tell application "System Events"
-  set p to first application process whose frontmost is true
-  set wTitle to ""
-  set wPosition to ""
-  set wSize to ""
-  try
-    set frontWindow to front window of p
-    set wTitle to name of frontWindow
-    try
-      set wPosition to (position of frontWindow) as text
-      set wSize to (size of frontWindow) as text
-    end try
-  end try
-  set focusedRole to ""
-  set focusedSubrole to ""
-  set focusedDescription to ""
-  set focusedTitle to ""
-  set focusedPosition to ""
-  set focusedSize to ""
-    try
-    -- System Events does not expose a `focused UI element` property on the
-    -- process object. Read the standard Accessibility attribute instead.
-    set focusedElement to value of attribute "AXFocusedUIElement" of p
-    set focusedRole to role of focusedElement
-    try
-      set focusedSubrole to subrole of focusedElement
-    end try
-    try
-      set focusedDescription to description of focusedElement
-    end try
-    try
-      set focusedTitle to title of focusedElement
-    end try
-    try
-      set focusedPosition to (position of focusedElement) as text
-      set focusedSize to (size of focusedElement) as text
-    end try
-  end try
-  set separator to (ASCII character 9)
-  return wTitle & separator & wPosition & separator & wSize & separator & focusedRole & separator & focusedSubrole & separator & focusedDescription & separator & focusedTitle & separator & focusedPosition & separator & focusedSize
-end tell
-"#;
-    let mut child = match Command::new("osascript")
-        .args(["-e", script])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(_) => return WindowIdentity::default(),
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FrontmostApplicationIdentity {
+    pid: i32,
+    bundle_id: Option<String>,
+    process_name: String,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FrontmostIdentityRecheck {
+    Same,
+    Unknown,
+    Changed,
+}
+
+#[cfg(target_os = "macos")]
+fn recheck_frontmost_identity(
+    before: &FrontmostApplicationIdentity,
+    after: Option<&FrontmostApplicationIdentity>,
+) -> FrontmostIdentityRecheck {
+    let Some(after) = after else {
+        return FrontmostIdentityRecheck::Unknown;
     };
-    let deadline = std::time::Instant::now() + Duration::from_millis(TIMEOUT_MS);
-    let output = loop {
-        match child.try_wait() {
-            Ok(Some(status)) if status.success() => match child.wait_with_output() {
-                Ok(output) => break output,
-                Err(_) => return WindowIdentity::default(),
-            },
-            Ok(Some(_)) => return WindowIdentity::default(),
-            Ok(None) if std::time::Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(15));
-            }
-            Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return WindowIdentity::default();
-            }
-            Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return WindowIdentity::default();
-            }
-        }
-    };
-    let raw = String::from_utf8_lossy(&output.stdout);
-    let mut fields = raw.trim().split('\t');
-    let title = fields.next().unwrap_or_default().trim().to_owned();
-    let window_position = fields.next().unwrap_or_default().trim();
-    let window_size = fields.next().unwrap_or_default().trim();
-    let role = fields
-        .next()
-        .unwrap_or_default()
-        .trim()
-        .to_ascii_lowercase();
-    let subrole = fields
-        .next()
-        .unwrap_or_default()
-        .trim()
-        .to_ascii_lowercase();
-    let description = fields.next().unwrap_or_default().trim();
-    let focused_title = fields.next().unwrap_or_default().trim();
-    let focused_position = fields.next().unwrap_or_default().trim();
-    let focused_size = fields.next().unwrap_or_default().trim();
-    let focus_kind = classify_focus_for_app(
-        process_name,
-        &role,
-        &subrole,
-        &title,
-        description,
-        focused_title,
-    );
-    let github_field_hint = github_field_hint(focus_kind, description, focused_title);
-    let input_token = focus_kind
-        .is_editable()
-        .then(|| {
-            identity_token(&format!(
-                "{role}\t{subrole}\t{description}\t{focused_title}\t{focused_position}\t{focused_size}"
-            ))
-        })
-        .flatten();
-    WindowIdentity {
-        window_token: identity_token(&format!("{title}\t{window_position}\t{window_size}")),
-        window_id: query_window_id(pid, &title, window_position, window_size),
-        input_token,
-        focus_kind,
-        github_field_hint,
-        title,
+    if before.pid <= 0 || after.pid <= 0 {
+        return FrontmostIdentityRecheck::Unknown;
+    }
+    if before.pid != after.pid {
+        return FrontmostIdentityRecheck::Changed;
+    }
+    match (&before.bundle_id, &after.bundle_id) {
+        (Some(before), Some(after)) if before == after => FrontmostIdentityRecheck::Same,
+        (None, None) => FrontmostIdentityRecheck::Unknown,
+        (Some(_), Some(_)) => FrontmostIdentityRecheck::Changed,
+        _ => FrontmostIdentityRecheck::Unknown,
     }
 }
 
 #[cfg(target_os = "macos")]
-fn frontmost_signal(browser_access_enabled: bool) -> AppSignal {
+fn current_frontmost_application() -> Option<FrontmostApplicationIdentity> {
     use std::ffi::CStr;
     use std::os::raw::c_char;
 
@@ -2646,101 +3067,276 @@ fn frontmost_signal(browser_access_enabled: bool) -> AppSignal {
         unsafe {
             use objc::{msg_send, sel, sel_impl};
             let bytes: *const c_char = msg_send![value, UTF8String];
-            if bytes.is_null() {
-                None
-            } else {
-                CStr::from_ptr(bytes).to_str().ok().map(str::to_owned)
+            (!bytes.is_null()).then(|| CStr::from_ptr(bytes).to_string_lossy().into_owned())
+        }
+    }
+
+    unsafe {
+        use objc::{class, msg_send, sel, sel_impl};
+        let workspace: *mut objc::runtime::Object = msg_send![class!(NSWorkspace), sharedWorkspace];
+        let application: *mut objc::runtime::Object = msg_send![workspace, frontmostApplication];
+        if application.is_null() {
+            return None;
+        }
+        Some(FrontmostApplicationIdentity {
+            pid: msg_send![application, processIdentifier],
+            bundle_id: ns_string(msg_send![application, bundleIdentifier]),
+            process_name: ns_string(msg_send![application, localizedName]).unwrap_or_default(),
+        })
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn capture_frontmost_focus_macos(expected_bundle_id: Option<&str>) -> NativeFocusCapture {
+    let Some(application) = current_frontmost_application() else {
+        return NativeFocusCapture::unavailable(NativeFocusCaptureReason::ApplicationUnavailable);
+    };
+    let mut capture = NativeFocusCapture {
+        target: TargetAppGuard {
+            pid: application.pid,
+            bundle_id: application.bundle_id.clone(),
+            browser_host: None,
+            browser_target_token: None,
+            browser_tab_token: None,
+            window_token: None,
+            window_id: None,
+            window_identity_ambiguous: false,
+            input_token: None,
+            secure_input: false,
+        },
+        stage: NativeFocusCaptureStage::ApplicationIdentity,
+        reason: None,
+        stable_frontmost_identity: false,
+        process_name: application.process_name.clone(),
+        window_title: String::new(),
+        window_document_path: None,
+        focus_kind: FocusKind::Unknown,
+        multiline_capable: false,
+        multiline_capability_known: false,
+        github_field_hint: GitHubFieldHint::None,
+        focused_anchor: None,
+    };
+    if application.pid <= 0 {
+        capture.reason = Some(NativeFocusCaptureReason::ApplicationUnavailable);
+        return capture;
+    }
+    if application.bundle_id.is_none() {
+        capture.reason = Some(NativeFocusCaptureReason::ApplicationIdentityUnknown);
+    } else if expected_bundle_id
+        .is_some_and(|expected| application.bundle_id.as_deref() != Some(expected))
+    {
+        capture.reason = Some(NativeFocusCaptureReason::SelectedApplicationMismatch);
+    }
+
+    if capture.reason.is_none() {
+        capture.stage = NativeFocusCaptureStage::FocusedElement;
+        if !crate::permissions::accessibility_is_trusted() {
+            capture.reason = Some(NativeFocusCaptureReason::AccessibilityObservationUnknown);
+        } else {
+            match crate::paste::FocusedFieldAnchor::capture_with_metadata(application.pid) {
+                Err(_) => {
+                    capture.reason = Some(NativeFocusCaptureReason::FocusedElementUnavailable);
+                }
+                Ok((anchor, metadata)) => {
+                    let role = metadata.role.as_deref().unwrap_or_default();
+                    let subrole = metadata.subrole.as_deref().unwrap_or_default();
+                    let description = metadata.description.as_deref().unwrap_or_default();
+                    let focused_title = metadata.title.as_deref().unwrap_or_default();
+                    let window_title = metadata.window_title.as_deref().unwrap_or_default();
+                    let focus_kind = classify_focus_for_native_app(
+                        &application.process_name,
+                        application.bundle_id.as_deref(),
+                        role,
+                        subrole,
+                        window_title,
+                        description,
+                        focused_title,
+                    );
+                    capture.focus_kind = focus_kind;
+                    capture.multiline_capable =
+                        role_is_multiline_capable(role, metadata.secure_input);
+                    capture.multiline_capability_known = !role.trim().is_empty();
+                    capture.window_title = window_title.to_owned();
+                    capture.window_document_path = metadata.window_document_path.clone();
+                    capture.github_field_hint =
+                        github_field_hint(focus_kind, description, focused_title);
+                    capture.target.secure_input = metadata.secure_input;
+                    if focus_kind.is_editable() && !metadata.secure_input {
+                        capture.target.input_token = identity_token(&format!(
+                            "{role}\t{subrole}\t{description}\t{focused_title}\t{}\t{}",
+                            metadata.position.as_deref().unwrap_or_default(),
+                            metadata.size.as_deref().unwrap_or_default()
+                        ));
+                    }
+                    let window_title = metadata.window_title.as_deref().unwrap_or_default();
+                    let window_position = metadata.window_position.as_deref().unwrap_or_default();
+                    let window_size = metadata.window_size.as_deref().unwrap_or_default();
+                    capture.target.window_token = identity_token(&format!(
+                        "{window_title}\t{window_position}\t{window_size}"
+                    ));
+                    capture.stage = NativeFocusCaptureStage::WindowIdentity;
+                    let window_identity = query_window_id(
+                        application.pid,
+                        window_title,
+                        window_position,
+                        window_size,
+                        metadata.ax_window_matches_app_focused_window,
+                    );
+                    apply_window_identity_resolution(
+                        &mut capture.target,
+                        window_title,
+                        window_identity,
+                    );
+                    match window_identity {
+                        WindowIdentityResolution::Unique(window_id) => {
+                            capture.target.window_id = Some(window_id);
+                        }
+                        WindowIdentityResolution::Unknown => {
+                            capture.reason = Some(NativeFocusCaptureReason::WindowIdentityUnknown);
+                        }
+                        WindowIdentityResolution::Ambiguous => {
+                            capture.reason =
+                                Some(NativeFocusCaptureReason::WindowIdentityAmbiguous);
+                        }
+                    }
+                    if metadata.secure_input {
+                        capture.stage = NativeFocusCaptureStage::FocusedElement;
+                        capture.reason = Some(NativeFocusCaptureReason::SecureInput);
+                    } else if role.is_empty() || focus_kind == FocusKind::Unknown {
+                        capture.stage = NativeFocusCaptureStage::FocusedElement;
+                        capture.reason = Some(NativeFocusCaptureReason::FocusedRoleUnknown);
+                    } else if !focus_kind.is_editable() {
+                        capture.stage = NativeFocusCaptureStage::FocusedElement;
+                        capture.reason = Some(NativeFocusCaptureReason::FocusedInputNotEditable);
+                    }
+                    match anchor.current_focus_matches() {
+                        Some(true) => {}
+                        Some(false) => {
+                            capture.reason = Some(NativeFocusCaptureReason::IdentityDrift);
+                            capture.stage = NativeFocusCaptureStage::FocusedElement;
+                        }
+                        None => {
+                            capture.reason =
+                                Some(NativeFocusCaptureReason::FocusedElementUnavailable);
+                            capture.stage = NativeFocusCaptureStage::FocusedElement;
+                        }
+                    }
+                    capture.focused_anchor = Some(anchor);
+                }
             }
         }
     }
 
-    unsafe {
-        use objc::{class, msg_send, sel, sel_impl};
-        let workspace: *mut objc::runtime::Object = msg_send![class!(NSWorkspace), sharedWorkspace];
-        let application: *mut objc::runtime::Object = msg_send![workspace, frontmostApplication];
-        if application.is_null() {
-            return AppSignal::default();
-        }
-        let pid: i32 = msg_send![application, processIdentifier];
-        let bundle_id = ns_string(msg_send![application, bundleIdentifier]);
-        let process_name = ns_string(msg_send![application, localizedName]).unwrap_or_default();
-        // NSWorkspace app identity is available without Accessibility. Do not
-        // invoke System Events until the user has granted Accessibility: the
-        // window/focused-element probe is both unnecessary for the native
-        // profile preview and can trigger an avoidable macOS permission flow.
-        let window = if crate::permissions::accessibility_is_trusted() {
-            query_frontmost_window(pid, &process_name)
-        } else {
-            WindowIdentity::default()
-        };
-        let browser_application = browser_application(bundle_id.as_deref(), &process_name);
-        let (browser_host, browser_path, browser_target_token, browser_access_status) =
-            if let Some(browser_application) = browser_application {
-                if browser_access_enabled {
-                    match query_browser_url(browser_application) {
-                        Ok((host, path, token)) => (
-                            Some(host),
-                            Some(path),
-                            Some(token),
-                            BrowserAccessStatus::Granted,
-                        ),
-                        Err(status) => (None, None, None, status),
-                    }
-                } else {
-                    (None, None, None, BrowserAccessStatus::Disabled)
+    let capture_stage_before_recheck = capture.stage;
+    capture.stage = NativeFocusCaptureStage::FrontmostRecheck;
+    let after = current_frontmost_application();
+    match recheck_frontmost_identity(&application, after.as_ref()) {
+        FrontmostIdentityRecheck::Same => {
+            capture.stable_frontmost_identity = true;
+            match capture
+                .focused_anchor
+                .as_ref()
+                .map(crate::paste::FocusedFieldAnchor::current_focus_matches)
+            {
+                Some(Some(true)) | None => {}
+                Some(Some(false)) => {
+                    capture.reason = Some(NativeFocusCaptureReason::IdentityDrift);
+                    capture.stage = NativeFocusCaptureStage::FocusedElement;
+                    capture.stable_frontmost_identity = false;
                 }
-            } else {
-                (None, None, None, BrowserAccessStatus::NotApplicable)
-            };
-        let focus_kind = classify_github_field(
-            browser_host.as_deref(),
-            browser_path.as_deref(),
-            window.focus_kind,
-            window.github_field_hint,
-        );
-        AppSignal {
-            pid,
-            bundle_id,
-            process_name,
-            window_title: window.title,
-            focus_kind,
-            browser_host,
-            browser_path,
-            browser_target_token,
-            window_token: window.window_token,
-            window_id: window.window_id,
-            input_token: window.input_token,
-            browser_access_status,
+                Some(None) => {
+                    capture.reason = Some(NativeFocusCaptureReason::FocusedElementUnavailable);
+                    capture.stage = NativeFocusCaptureStage::FocusedElement;
+                    capture.stable_frontmost_identity = false;
+                }
+            }
+            if capture.stable_frontmost_identity && capture.reason.is_none() {
+                capture.stage = NativeFocusCaptureStage::Complete;
+            } else if capture.reason.is_some()
+                && capture.stage == NativeFocusCaptureStage::FrontmostRecheck
+            {
+                capture.stage = capture_stage_before_recheck;
+            }
         }
+        FrontmostIdentityRecheck::Unknown => {
+            capture.reason = Some(NativeFocusCaptureReason::ApplicationIdentityUnknown);
+            capture.stage = NativeFocusCaptureStage::FrontmostRecheck;
+            capture.stable_frontmost_identity = false;
+        }
+        FrontmostIdentityRecheck::Changed => {
+            capture.reason = Some(NativeFocusCaptureReason::IdentityDrift);
+            capture.stable_frontmost_identity = false;
+        }
+    }
+    capture
+}
+
+#[cfg(target_os = "macos")]
+fn frontmost_signal(browser_access_enabled: bool) -> AppSignal {
+    let capture = capture_frontmost_focus_macos(None);
+    if !capture.stable_frontmost_identity {
+        return AppSignal::default();
+    }
+    let browser_application =
+        browser_application(capture.target.bundle_id.as_deref(), &capture.process_name);
+    let (
+        browser_host,
+        browser_path,
+        browser_target_token,
+        browser_tab_token,
+        browser_access_status,
+    ) = if let Some(browser_application) = browser_application {
+        if browser_access_enabled {
+            match query_browser_url(browser_application) {
+                Ok((host, path, token, tab_token)) => (
+                    Some(host),
+                    Some(path),
+                    Some(token),
+                    Some(tab_token),
+                    BrowserAccessStatus::Granted,
+                ),
+                Err(status) => (None, None, None, None, status),
+            }
+        } else {
+            (None, None, None, None, BrowserAccessStatus::Disabled)
+        }
+    } else {
+        (None, None, None, None, BrowserAccessStatus::NotApplicable)
+    };
+    let focus_kind = classify_github_field(
+        browser_host.as_deref(),
+        browser_path.as_deref(),
+        capture.focus_kind,
+        capture.github_field_hint,
+    );
+    AppSignal {
+        pid: capture.target.pid,
+        bundle_id: capture.target.bundle_id,
+        process_name: capture.process_name,
+        window_title: capture.window_title,
+        focus_kind,
+        multiline_capable: capture.multiline_capable,
+        multiline_capability_known: capture.multiline_capability_known,
+        browser_host,
+        browser_path,
+        browser_target_token,
+        browser_tab_token,
+        window_token: capture.target.window_token,
+        window_id: capture.target.window_id,
+        window_identity_ambiguous: capture.target.window_identity_ambiguous,
+        input_token: capture.target.input_token,
+        browser_access_status,
     }
 }
 
 /// Read the cheap part of context detection used by the idle preview loop.
-/// The expensive Accessibility/browser probe remains reserved for an actual
-/// frontmost-app change or the fresh capture taken at recording start.
+/// The same NSWorkspace identity owner is used for fresh capture at recording
+/// start; the heavier Accessibility observation remains on that fresh path.
 #[cfg(target_os = "macos")]
 pub fn frontmost_application_key() -> (i32, Option<String>) {
-    use std::ffi::CStr;
-    use std::os::raw::c_char;
-
-    unsafe {
-        use objc::{class, msg_send, sel, sel_impl};
-
-        let workspace: *mut objc::runtime::Object = msg_send![class!(NSWorkspace), sharedWorkspace];
-        let application: *mut objc::runtime::Object = msg_send![workspace, frontmostApplication];
-        if application.is_null() {
-            return (0, None);
-        }
-        let pid: i32 = msg_send![application, processIdentifier];
-        let bundle: *mut objc::runtime::Object = msg_send![application, bundleIdentifier];
-        let bundle_id = if bundle.is_null() {
-            None
-        } else {
-            let bytes: *const c_char = msg_send![bundle, UTF8String];
-            (!bytes.is_null()).then(|| CStr::from_ptr(bytes).to_string_lossy().into_owned())
-        };
-        (pid, bundle_id)
-    }
+    current_frontmost_application()
+        .map(|application| (application.pid, application.bundle_id))
+        .unwrap_or((0, None))
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -2926,9 +3522,349 @@ fn snapshot_for_enabled_state(
     snapshot
 }
 
+/// Reconcile an already cached snapshot for a background preview without
+/// asking the operating system for a new foreground target. This is used when
+/// automatic context becomes unavailable (for example, after the user turns
+/// it off or before onboarding is complete). The target guard, evidence, and
+/// input classification remain attached to the cached snapshot; its writing
+/// policy and browser status are generalized, then any explicit manual
+/// override is applied.
+pub(crate) fn reconcile_cached_preview(
+    cached: &ContextSnapshot,
+    automatic_context_enabled: bool,
+    manual_override: Option<ContextFamily>,
+    writing_modes: &[WritingMode],
+) -> ContextSnapshot {
+    let mut snapshot =
+        snapshot_for_enabled_state(cached.clone(), automatic_context_enabled, writing_modes);
+    if !automatic_context_enabled {
+        snapshot.browser_access_status = BrowserAccessStatus::Disabled;
+        if manual_override.is_none() && cached.profile.source == ContextSource::ManualOverride {
+            let mut profile = ContextSnapshot::general().profile;
+            profile.confidence = 0.4;
+            snapshot.profile = profile;
+        }
+    }
+    apply_manual_override_with_modes(&mut snapshot, manual_override, writing_modes);
+    snapshot
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn window_identity_requires_matching_ax_window_facts() {
+        let candidate = WindowIdentityCandidate {
+            pid: 42,
+            id: 1001,
+            name: Some("Editor".into()),
+            bounds: Some((10.0, 20.0, 640.0, 480.0)),
+        };
+        assert_eq!(
+            resolve_window_identity(
+                42,
+                "Editor",
+                "10,20",
+                "640,480",
+                std::slice::from_ref(&candidate),
+            ),
+            WindowIdentityResolution::Unique(1001)
+        );
+        assert_eq!(
+            resolve_window_identity(
+                42,
+                "Different",
+                "10,20",
+                "640,480",
+                std::slice::from_ref(&candidate),
+            ),
+            WindowIdentityResolution::Unknown,
+            "known title and geometry contradictions cannot use the only PID candidate"
+        );
+        assert_eq!(
+            resolve_window_identity(
+                42,
+                "Editor",
+                "13,20",
+                "640,480",
+                std::slice::from_ref(&candidate),
+            ),
+            WindowIdentityResolution::Unknown,
+            "a matching AX title cannot override contradictory known geometry"
+        );
+        assert_eq!(
+            resolve_window_identity(42, "", "", "", std::slice::from_ref(&candidate)),
+            WindowIdentityResolution::Unknown,
+            "a sole candidate is not proof when AXWindow metadata is absent"
+        );
+        assert_eq!(
+            resolve_window_identity(
+                42,
+                "Editor",
+                "10,20",
+                "640,480",
+                &[
+                    candidate.clone(),
+                    WindowIdentityCandidate {
+                        id: 1002,
+                        ..candidate.clone()
+                    },
+                ],
+            ),
+            WindowIdentityResolution::Ambiguous,
+            "duplicate title and geometry matches remain ambiguous"
+        );
+        assert_eq!(
+            resolve_window_identity(
+                42,
+                "Editor",
+                "10,20",
+                "640,480",
+                &[WindowIdentityCandidate {
+                    pid: 43,
+                    ..candidate
+                }],
+            ),
+            WindowIdentityResolution::Unknown,
+            "a matching window from another PID is not evidence for this AX element"
+        );
+    }
+
+    #[test]
+    fn app_focused_window_proof_allows_only_unique_complete_geometry_match() {
+        let candidate =
+            |pid: i32, id: u64, name: Option<&str>, bounds: Option<(f64, f64, f64, f64)>| {
+                WindowIdentityCandidate {
+                    pid,
+                    id,
+                    name: name.map(str::to_owned),
+                    bounds,
+                }
+            };
+        let matching = candidate(
+            42,
+            1001,
+            Some("Different CG title"),
+            Some((10.0, 20.0, 640.0, 480.0)),
+        );
+
+        assert_eq!(
+            resolve_window_identity_with_focus_proof(
+                42,
+                "AX window title",
+                "10,20",
+                "640,480",
+                Some(true),
+                std::slice::from_ref(&matching),
+            ),
+            WindowIdentityResolution::Unique(1001),
+            "AX object equality permits a unique same-PID geometry match despite a mutable title"
+        );
+        assert_eq!(
+            resolve_window_identity_with_focus_proof(
+                42,
+                "Different CG title",
+                "13,20",
+                "640,480",
+                Some(true),
+                std::slice::from_ref(&matching),
+            ),
+            WindowIdentityResolution::Unknown,
+            "the proof branch never falls back to a matching title when geometry differs"
+        );
+        assert_eq!(
+            resolve_window_identity_with_focus_proof(
+                42,
+                "Different CG title",
+                "10,20",
+                "640,480",
+                Some(false),
+                std::slice::from_ref(&matching),
+            ),
+            WindowIdentityResolution::Unknown,
+            "an explicit AXWindow mismatch fails closed even when title and geometry match"
+        );
+        assert_eq!(
+            resolve_window_identity_with_focus_proof(
+                42,
+                "AX window title",
+                "10,20",
+                "640,480",
+                None,
+                std::slice::from_ref(&matching),
+            ),
+            WindowIdentityResolution::Unknown,
+            "unknown AX object proof retains the legacy strict title path"
+        );
+        assert_eq!(
+            resolve_window_identity_with_focus_proof(
+                42,
+                "Different CG title",
+                "10,20",
+                "640,480",
+                Some(true),
+                &[
+                    candidate(
+                        42,
+                        1001,
+                        Some("AX window title"),
+                        Some((10.0, 20.0, 640.0, 480.0))
+                    ),
+                    candidate(
+                        42,
+                        1002,
+                        Some("Different CG title"),
+                        Some((10.0, 20.0, 640.0, 480.0))
+                    ),
+                ],
+            ),
+            WindowIdentityResolution::Ambiguous,
+            "all geometry matches count even when only one candidate title matches"
+        );
+        assert_eq!(
+            resolve_window_identity_with_focus_proof(
+                42,
+                "AX window title",
+                "10,20",
+                "640,480",
+                Some(true),
+                &[candidate(
+                    43,
+                    1001,
+                    Some("AX window title"),
+                    Some((10.0, 20.0, 640.0, 480.0))
+                )],
+            ),
+            WindowIdentityResolution::Unknown,
+            "a matching geometry owned by another PID is not eligible"
+        );
+        assert_eq!(
+            resolve_window_identity_with_focus_proof(
+                42,
+                "Different CG title",
+                "10,20",
+                "640,480",
+                Some(true),
+                &[
+                    matching.clone(),
+                    candidate(42, 1002, Some("other candidate"), None),
+                ],
+            ),
+            WindowIdentityResolution::Unknown,
+            "missing bounds on another same-PID layer-0 candidate prevents claiming uniqueness"
+        );
+        assert_eq!(
+            resolve_window_identity_with_focus_proof(
+                42,
+                "Different CG title",
+                "10,20",
+                "640,480",
+                Some(true),
+                &[candidate(
+                    42,
+                    1001,
+                    Some("Different CG title"),
+                    Some((10.0, 20.0, 0.0, 480.0))
+                )],
+            ),
+            WindowIdentityResolution::Unknown,
+            "invalid CG bounds are not potential geometry evidence"
+        );
+        assert_eq!(
+            resolve_window_identity_with_focus_proof(
+                42,
+                "Different CG title",
+                "10,20",
+                "640,480",
+                Some(true),
+                &[candidate(
+                    42,
+                    1001,
+                    Some("Different CG title"),
+                    Some((10.0, 20.0, f64::NAN, 480.0)),
+                )],
+            ),
+            WindowIdentityResolution::Unknown,
+            "non-finite CG bounds cannot establish window identity"
+        );
+        assert_eq!(
+            resolve_window_identity_with_focus_proof(
+                42,
+                "Different CG title",
+                "NaN,20",
+                "640,480",
+                Some(true),
+                std::slice::from_ref(&matching),
+            ),
+            WindowIdentityResolution::Unknown,
+            "non-finite AX geometry cannot use title fallback"
+        );
+        assert_eq!(
+            resolve_window_identity_with_focus_proof(
+                42,
+                "Different CG title",
+                "10,20",
+                "",
+                Some(true),
+                std::slice::from_ref(&matching),
+            ),
+            WindowIdentityResolution::Unknown,
+            "incomplete AX geometry cannot use title fallback"
+        );
+        assert_eq!(
+            resolve_window_identity_with_focus_proof(
+                42,
+                "Different CG title",
+                "10,20",
+                "640,0",
+                Some(true),
+                &[matching],
+            ),
+            WindowIdentityResolution::Unknown,
+            "non-positive AX size cannot use title fallback"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn frontmost_identity_bracket_keeps_missing_facts_unknown() {
+        let before = FrontmostApplicationIdentity {
+            pid: 42,
+            bundle_id: Some("com.apple.TextEdit".into()),
+            process_name: "TextEdit".into(),
+        };
+        let same = FrontmostApplicationIdentity {
+            pid: 42,
+            bundle_id: Some("com.apple.TextEdit".into()),
+            process_name: "TextEdit".into(),
+        };
+        let other_pid = FrontmostApplicationIdentity {
+            pid: 43,
+            ..same.clone()
+        };
+        let unknown_bundle = FrontmostApplicationIdentity {
+            pid: 42,
+            bundle_id: None,
+            process_name: "TextEdit".into(),
+        };
+        assert_eq!(
+            recheck_frontmost_identity(&before, Some(&same)),
+            FrontmostIdentityRecheck::Same
+        );
+        assert_eq!(
+            recheck_frontmost_identity(&before, Some(&other_pid)),
+            FrontmostIdentityRecheck::Changed
+        );
+        assert_eq!(
+            recheck_frontmost_identity(&before, Some(&unknown_bundle)),
+            FrontmostIdentityRecheck::Unknown
+        );
+        assert_eq!(
+            recheck_frontmost_identity(&before, None),
+            FrontmostIdentityRecheck::Unknown
+        );
+    }
 
     fn signal(bundle_id: &str, process_name: &str, host: Option<&str>) -> AppSignal {
         AppSignal {
@@ -2937,14 +3873,57 @@ mod tests {
             process_name: process_name.into(),
             window_title: String::new(),
             focus_kind: FocusKind::Unknown,
+            multiline_capable: false,
+            multiline_capability_known: false,
             browser_host: host.map(str::to_owned),
             browser_path: None,
             browser_target_token: None,
+            browser_tab_token: None,
             window_token: None,
             window_id: None,
+            window_identity_ambiguous: false,
             input_token: None,
             browser_access_status: BrowserAccessStatus::Granted,
         }
+    }
+
+    #[test]
+    fn multiline_capability_uses_only_the_captured_text_area_role() {
+        assert!(role_is_multiline_capable("AXTextArea", false));
+        assert!(!role_is_multiline_capable("AXTextField", false));
+        assert!(!role_is_multiline_capable("", false));
+        assert!(!role_is_multiline_capable("AXTextArea", true));
+
+        for focus_kind in [FocusKind::Email, FocusKind::Chat] {
+            let mut signal = signal("com.example.editor", "Editor", None);
+            signal.focus_kind = focus_kind;
+            signal.multiline_capability_known = true;
+            let snapshot = snapshot_for_signal(&signal, &[], false);
+            assert!(!snapshot.multiline_capable, "focus_kind={focus_kind:?}");
+            assert!(snapshot.multiline_capability_known);
+        }
+        let unknown =
+            snapshot_for_signal(&signal("com.example.editor", "Editor", None), &[], false);
+        assert!(!unknown.multiline_capability_known);
+    }
+
+    #[test]
+    fn multiline_capability_is_not_serialized() {
+        let mut signal = signal("com.example.editor", "Editor", None);
+        signal.multiline_capable = true;
+        signal.multiline_capability_known = true;
+        let snapshot = snapshot_for_signal(&signal, &[], false);
+        let serialized = serde_json::to_value(snapshot).expect("snapshot serializes");
+        assert!(serialized.get("multiline_capable").is_none());
+        assert!(serialized.get("multiline_capability_known").is_none());
+    }
+
+    #[test]
+    fn snapshot_preserves_ambiguous_window_identity() {
+        let mut signal = signal("com.example.editor", "Editor", None);
+        signal.window_identity_ambiguous = true;
+        let snapshot = snapshot_for_signal(&signal, &[], false);
+        assert!(snapshot.target_guard.window_identity_ambiguous);
     }
 
     #[test]
@@ -3024,16 +4003,18 @@ mod tests {
 
     #[test]
     fn disabled_context_keeps_detected_app_with_general_style() {
-        let detected = snapshot_for_signal(
+        let mut detected = snapshot_for_signal(
             &signal("com.todesktop.230313mzl4w4u92", "Cursor", None),
             &[],
             false,
         );
+        detected.policy.input_kind = FocusKind::Code;
         let snapshot = snapshot_for_enabled_state(detected, false, &builtin_writing_modes());
         assert_eq!(snapshot.profile.app_label, "Cursor");
         assert_eq!(snapshot.profile.family, ContextFamily::General);
         assert!(snapshot.profile.confidence < 0.75);
         assert!(!snapshot.policy.preserve_technical_tokens);
+        assert_eq!(snapshot.policy.input_kind, FocusKind::Code);
         assert_eq!(display_label(&snapshot), "Cursor · 通用");
         assert_eq!(hud_style_id(&snapshot), "general");
     }
@@ -3058,6 +4039,11 @@ mod tests {
             snapshot_for_signal(&signal("com.tencent.xinWeChat", "WeChat", None), &[], false);
         assert_eq!(wechat.profile.app_label, "WeChat");
         assert_eq!(display_label(&wechat), "WeChat · 口语");
+
+        let codex = snapshot_for_signal(&signal("com.openai.codex", "Codex", None), &[], false);
+        assert_eq!(codex.profile.id, "code.codex");
+        assert_eq!(codex.profile.family, ContextFamily::PromptOrCode);
+        assert_eq!(codex.profile.app_label, "Codex");
     }
 
     #[test]
@@ -3499,6 +4485,26 @@ mod tests {
             FocusKind::Unknown
         );
         assert_eq!(
+            classify_focus_for_app("Codex", "AXTextArea", "", "", "", ""),
+            FocusKind::Unknown
+        );
+        assert_eq!(
+            classify_focus_for_app("Codex", "AXTextArea", "", "", "Prompt", ""),
+            FocusKind::CodingPrompt
+        );
+        assert_eq!(
+            classify_focus_for_app("Codex", "AXTextArea", "", "", "Composer", ""),
+            FocusKind::CodingPrompt
+        );
+        assert_eq!(
+            classify_focus_for_app("Codex", "AXTextArea", "", "", "Editor content", ""),
+            FocusKind::Code
+        );
+        assert_eq!(
+            classify_focus_for_app("Codex", "AXTextField", "", "", "Terminal input", ""),
+            FocusKind::Terminal
+        );
+        assert_eq!(
             classify_focus_for_app("Cursor", "AXTextArea", "", "", "Chat", ""),
             FocusKind::CodingPrompt
         );
@@ -3592,7 +4598,59 @@ mod tests {
     }
 
     #[test]
-    fn save_mapping_keeps_learned_style_pairs() {
+    fn codex_bundle_uses_explicit_composer_metadata_without_process_name_assumptions() {
+        assert_eq!(
+            classify_focus_for_native_app(
+                "ChatGPT",
+                Some("com.openai.codex"),
+                "AXTextArea",
+                "",
+                "",
+                "",
+                "Prompt",
+            ),
+            FocusKind::CodingPrompt
+        );
+        assert_eq!(
+            classify_focus_for_native_app(
+                "ChatGPT",
+                Some("com.openai.codex"),
+                "AXTextArea",
+                "",
+                "",
+                "",
+                "Editor content",
+            ),
+            FocusKind::Code
+        );
+        assert_eq!(
+            classify_focus_for_native_app(
+                "ChatGPT",
+                Some("com.openai.codex"),
+                "AXTextArea",
+                "",
+                "",
+                "",
+                "",
+            ),
+            FocusKind::Unknown
+        );
+        assert_eq!(
+            classify_focus_for_native_app(
+                "ChatGPT",
+                Some("com.example.other"),
+                "AXTextArea",
+                "",
+                "",
+                "",
+                "Prompt",
+            ),
+            FocusKind::Editable
+        );
+    }
+
+    #[test]
+    fn save_mapping_preserves_or_explicitly_replaces_style_examples() {
         let existing = AppMapping {
             id: "wechat".into(),
             label: "微信".into(),
@@ -3629,9 +4687,27 @@ mod tests {
             style_example_pairs: Vec::new(),
             ..existing.clone()
         };
-        let merged = merge_saved_mapping(&existing, incoming);
+        let merged = merge_saved_mapping(&existing, incoming.clone(), false);
         assert_eq!(merged.style_example_pairs.len(), 2);
         assert_eq!(merged.style_example_pairs[1].output, "稍等下");
+
+        let cleared = merge_saved_mapping(&existing, incoming, true);
+        assert!(cleared.style_example_input.is_none());
+        assert!(cleared.style_example_output.is_none());
+        assert!(cleared.style_example_pairs.is_empty());
+
+        let manual_cleared = merge_saved_mapping(
+            &existing,
+            AppMapping {
+                style_example_input: None,
+                style_example_output: None,
+                ..existing.clone()
+            },
+            true,
+        );
+        assert!(manual_cleared.style_example_input.is_none());
+        assert!(manual_cleared.style_example_output.is_none());
+        assert_eq!(manual_cleared.style_example_pairs.len(), 2);
     }
 
     #[test]
@@ -3928,8 +5004,10 @@ mod tests {
             bundle_id: Some("com.google.Chrome".into()),
             browser_host: Some("gmail.com".into()),
             browser_target_token: Some(1),
+            browser_tab_token: Some(1),
             window_token: Some(10),
             window_id: Some(100),
+            window_identity_ambiguous: false,
             input_token: Some(20),
             secure_input: false,
         };
@@ -3942,6 +5020,7 @@ mod tests {
             &original,
             &TargetAppGuard {
                 browser_target_token: Some(2),
+                browser_tab_token: Some(2),
                 ..original.clone()
             }
         ));
@@ -3949,6 +5028,7 @@ mod tests {
             &TargetAppGuard {
                 browser_host: None,
                 browser_target_token: None,
+                browser_tab_token: None,
                 window_token: None,
                 window_id: None,
                 input_token: None,
@@ -3957,6 +5037,7 @@ mod tests {
             &TargetAppGuard {
                 browser_host: None,
                 browser_target_token: None,
+                browser_tab_token: None,
                 window_token: None,
                 input_token: None,
                 ..original.clone()
@@ -4003,6 +5084,7 @@ mod tests {
                 &original,
                 &TargetAppGuard {
                     browser_target_token: None,
+                    browser_tab_token: None,
                     ..original.clone()
                 }
             ),
@@ -4037,8 +5119,10 @@ mod tests {
             bundle_id: Some("com.todesktop.230313mzl4w4u92".into()),
             browser_host: None,
             browser_target_token: None,
+            browser_tab_token: None,
             window_token: Some(10),
             window_id: Some(100),
+            window_identity_ambiguous: false,
             input_token: Some(20),
             secure_input: false,
         };
@@ -4073,8 +5157,10 @@ mod tests {
             bundle_id: Some("com.example.editor".into()),
             browser_host: None,
             browser_target_token: None,
+            browser_tab_token: None,
             window_token: Some(7),
             window_id: Some(1001),
+            window_identity_ambiguous: false,
             input_token: Some(9),
             secure_input: false,
         };
@@ -4116,22 +5202,27 @@ mod tests {
             bundle_id: Some("com.google.Chrome".into()),
             browser_host: Some("example.com".into()),
             browser_target_token: Some(10),
+            browser_tab_token: Some(10),
             window_token: Some(7),
             window_id: Some(1001),
+            window_identity_ambiguous: false,
             input_token: Some(9),
             secure_input: false,
         };
         let changed_tab = TargetAppGuard {
             browser_target_token: Some(11),
+            browser_tab_token: Some(11),
             ..original.clone()
         };
         let missing_tab_probe = TargetAppGuard {
             browser_target_token: None,
+            browser_tab_token: None,
             ..original.clone()
         };
         let identity_not_enabled = TargetAppGuard {
             browser_host: None,
             browser_target_token: None,
+            browser_tab_token: None,
             ..original.clone()
         };
 
@@ -4156,8 +5247,10 @@ mod tests {
             bundle_id: Some("com.example.editor".into()),
             browser_host: None,
             browser_target_token: None,
+            browser_tab_token: None,
             window_token: Some(7),
             window_id: Some(1001),
+            window_identity_ambiguous: false,
             input_token: Some(9),
             secure_input: false,
         };
@@ -4243,8 +5336,10 @@ mod tests {
             bundle_id: Some("com.google.Chrome.canary".into()),
             browser_host: None,
             browser_target_token: None,
+            browser_tab_token: None,
             window_token: Some(10),
             window_id: Some(100),
+            window_identity_ambiguous: false,
             input_token: Some(20),
             secure_input: false,
         };
@@ -4264,8 +5359,10 @@ mod tests {
             bundle_id: Some("com.example.editor".into()),
             browser_host: None,
             browser_target_token: None,
+            browser_tab_token: None,
             window_token: Some(10),
             window_id: Some(100),
+            window_identity_ambiguous: false,
             input_token: Some(20),
             secure_input: false,
         };
@@ -4278,5 +5375,244 @@ mod tests {
 
         assert_eq!(target_mismatch_reason(&complete, &incomplete), None);
         assert_eq!(target_mismatch_reason(&incomplete, &complete), None);
+    }
+
+    fn browser_guard(url: &str, index: u32, title: &str) -> TargetAppGuard {
+        TargetAppGuard {
+            pid: 42,
+            bundle_id: Some("com.google.Chrome".into()),
+            browser_host: Some("example.com".into()),
+            browser_target_token: Some(browser_target_token(&format!("{url}\t{index}\t{title}"))),
+            browser_tab_token: Some(browser_target_token(&format!("{url}\t{index}"))),
+            window_token: Some(10),
+            window_id: Some(100),
+            window_identity_ambiguous: false,
+            input_token: Some(20),
+            secure_input: false,
+        }
+    }
+
+    #[test]
+    fn readback_ignores_browser_title_change_when_anchor_is_same() {
+        let before = browser_guard("https://example.com/a", 1, "Inbox");
+        let after = browser_guard("https://example.com/a", 1, "(1) Inbox - saved");
+        assert_eq!(target_mismatch_reason_after_paste(&before, &after), None);
+        // The pre-paste guard keeps the stricter title-including token.
+        assert_eq!(
+            target_mismatch_reason(&before, &after),
+            Some("target_changed")
+        );
+    }
+
+    #[test]
+    fn readback_rejects_same_host_different_tab() {
+        let before = browser_guard("https://example.com/a", 1, "Inbox");
+        let other_tab = browser_guard("https://example.com/a", 2, "Inbox");
+        let other_page = browser_guard("https://example.com/b", 1, "Inbox");
+        assert_eq!(
+            target_mismatch_reason_after_paste(&before, &other_tab),
+            Some("target_changed")
+        );
+        assert_eq!(
+            target_mismatch_reason_after_paste(&before, &other_page),
+            Some("target_changed")
+        );
+        let missing = TargetAppGuard {
+            browser_tab_token: None,
+            ..before.clone()
+        };
+        assert_eq!(
+            target_mismatch_reason_after_paste(&before, &missing),
+            Some("target_unavailable")
+        );
+    }
+
+    #[test]
+    fn browser_tab_token_ignores_title_but_tracks_index_and_url() {
+        let tab = |raw: &str| browser_target_token(raw);
+        let base = tab("https://example.com/a?x=1#f\t1");
+        assert_eq!(base, tab("https://example.com/a?x=1#f\t1"));
+        assert_ne!(base, tab("https://example.com/a?x=1#f\t2"));
+        assert_ne!(base, tab("https://example.com/b?x=1#f\t1"));
+        assert_ne!(base, tab("https://example.com/a?x=2#f\t1"));
+        assert_ne!(base, tab("https://example.com/a?x=1#g\t1"));
+        let a = browser_guard("https://example.com/a?x=1#f", 1, "One");
+        let b = browser_guard("https://example.com/a?x=1#f", 1, "Two");
+        assert_eq!(a.browser_tab_token, b.browser_tab_token);
+        assert_ne!(a.browser_target_token, b.browser_target_token);
+    }
+
+    #[test]
+    fn lightweight_mismatch_ignores_browser_tokens() {
+        let a = browser_guard("https://example.com/a", 1, "Inbox");
+        let b = browser_guard("https://example.com/z", 9, "Other");
+        assert_eq!(target_mismatch_without_browser(&a, &b), None);
+        let other_window = TargetAppGuard {
+            window_id: Some(101),
+            ..b
+        };
+        assert_eq!(
+            target_mismatch_without_browser(&a, &other_window),
+            Some("target_changed")
+        );
+    }
+
+    #[test]
+    fn delivery_guard_handles_ambiguous_window_identity_per_policy() {
+        let mut expected = browser_guard("https://example.com/a", 1, "Inbox");
+        expected.window_id = None;
+        expected.window_token = Some(55);
+        expected.window_identity_ambiguous = true;
+        let mut current = expected.clone();
+
+        assert_eq!(target_mismatch_reason(&expected, &current), None);
+
+        current.window_token = Some(56);
+        assert_eq!(
+            target_mismatch_reason(&expected, &current),
+            Some("target_changed")
+        );
+
+        current.window_token = None;
+        assert_eq!(
+            target_mismatch_reason(&expected, &current),
+            Some("target_unavailable")
+        );
+        let mut missing_expected_token = expected.clone();
+        missing_expected_token.window_token = None;
+        current.window_token = Some(55);
+        assert_eq!(
+            target_mismatch_reason(&missing_expected_token, &current),
+            Some("target_unavailable")
+        );
+        current.window_token = Some(55);
+        current.window_identity_ambiguous = false;
+        assert_eq!(target_mismatch_reason(&expected, &current), None);
+
+        let mut current_only_ambiguous = expected.clone();
+        current_only_ambiguous.window_identity_ambiguous = false;
+        assert_eq!(
+            target_mismatch_reason(&current_only_ambiguous, &expected),
+            None
+        );
+        let mut changed_current_only_ambiguous = expected.clone();
+        changed_current_only_ambiguous.window_identity_ambiguous = false;
+        changed_current_only_ambiguous.window_token = Some(56);
+        assert_eq!(
+            target_mismatch_reason(&changed_current_only_ambiguous, &expected),
+            Some("target_changed")
+        );
+        let mut missing_current_only_ambiguous = expected.clone();
+        missing_current_only_ambiguous.window_identity_ambiguous = false;
+        missing_current_only_ambiguous.window_token = None;
+        assert_eq!(
+            target_mismatch_reason(&missing_current_only_ambiguous, &expected),
+            Some("target_unavailable")
+        );
+
+        let mut ordinary_without_window_id = expected.clone();
+        ordinary_without_window_id.window_identity_ambiguous = false;
+        ordinary_without_window_id.window_token = None;
+        let mut ordinary_current = ordinary_without_window_id.clone();
+        ordinary_current.window_token = Some(999);
+        assert_eq!(
+            target_mismatch_reason(&ordinary_without_window_id, &ordinary_current),
+            None
+        );
+    }
+
+    #[test]
+    fn ambiguous_untitled_window_requires_token_for_same_field() {
+        let mut expected = browser_guard("https://example.com/a", 1, "Inbox");
+        expected.window_id = None;
+        expected.window_token = None;
+        expected.window_identity_ambiguous = true;
+        assert_eq!(
+            same_field_mismatch_reason(&expected, &expected, false),
+            Some("target_unavailable")
+        );
+    }
+
+    #[test]
+    fn readback_guard_ignores_window_ambiguity_and_changed_tokens() {
+        let mut before = browser_guard("https://example.com/a", 1, "Inbox");
+        before.window_id = None;
+        before.window_identity_ambiguous = true;
+        let mut after = before.clone();
+        after.window_token = Some(999);
+        assert_eq!(target_mismatch_reason_after_paste(&before, &after), None);
+        assert_eq!(target_mismatch_without_browser(&before, &after), None);
+    }
+
+    #[test]
+    fn ambiguous_window_capture_drops_only_untitled_geometry_token() {
+        let mut ambiguous_titled = browser_guard("https://example.com/a", 1, "Inbox");
+        ambiguous_titled.window_token = Some(55);
+        apply_window_identity_resolution(
+            &mut ambiguous_titled,
+            " Inbox ",
+            WindowIdentityResolution::Ambiguous,
+        );
+        assert!(ambiguous_titled.window_identity_ambiguous);
+        assert_eq!(ambiguous_titled.window_token, Some(55));
+
+        let mut ambiguous_untitled = ambiguous_titled.clone();
+        ambiguous_untitled.window_token = Some(55);
+        apply_window_identity_resolution(
+            &mut ambiguous_untitled,
+            " \t ",
+            WindowIdentityResolution::Ambiguous,
+        );
+        assert!(ambiguous_untitled.window_identity_ambiguous);
+        assert_eq!(ambiguous_untitled.window_token, None);
+
+        for resolution in [
+            WindowIdentityResolution::Unique(100),
+            WindowIdentityResolution::Unknown,
+        ] {
+            let mut unchanged = browser_guard("https://example.com/a", 1, "Inbox");
+            unchanged.window_token = Some(55);
+            apply_window_identity_resolution(&mut unchanged, "", resolution);
+            assert!(!unchanged.window_identity_ambiguous);
+            assert_eq!(unchanged.window_token, Some(55));
+        }
+    }
+
+    #[test]
+    fn browser_identity_parses_url_only_and_tab_metadata_output() {
+        let (host, path, url_only, url_only_tab) =
+            browser_identity_from_output("https://Example.com/a?x=1\n").unwrap();
+        assert_eq!((host.as_str(), path.as_str()), ("example.com", "/a"));
+        // URL-only adapters fall back to the URL for both tokens.
+        assert_eq!(url_only, url_only_tab);
+
+        let (_, _, full, tab) =
+            browser_identity_from_output("https://example.com/a?x=1\t1\tInbox\n").unwrap();
+        let (_, _, retitled, retitled_tab) =
+            browser_identity_from_output("https://example.com/a?x=1\t1\t(1) Inbox\n").unwrap();
+        assert_ne!(full, retitled);
+        assert_eq!(tab, retitled_tab);
+
+        let (_, _, moved, moved_tab) =
+            browser_identity_from_output("https://example.com/a?x=1\t2\tInbox\n").unwrap();
+        assert_ne!(full, moved);
+        assert_ne!(tab, moved_tab);
+
+        // A title containing a tab stays part of the title, not the index.
+        let (_, _, _, tabbed_title) =
+            browser_identity_from_output("https://example.com/a?x=1\t1\ta\tb").unwrap();
+        assert_eq!(tab, tabbed_title);
+    }
+
+    #[test]
+    fn browser_identity_rejects_non_http_url() {
+        assert_eq!(
+            browser_identity_from_output("file:///tmp/x\t1\tTitle").unwrap_err(),
+            BrowserAccessStatus::NeedsPermission
+        );
+        assert_eq!(
+            browser_identity_from_output("").unwrap_err(),
+            BrowserAccessStatus::NeedsPermission
+        );
     }
 }

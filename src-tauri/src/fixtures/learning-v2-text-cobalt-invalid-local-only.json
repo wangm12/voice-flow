@@ -1,0 +1,174 @@
+{
+  "artifact_type": "voiceflow_learning_episode_fixture",
+  "schema_version": 2,
+  "episode": {
+    "schema_version": 2,
+    "ttl_ms": 120000,
+    "episode_id": "50000000-0000-4000-8000-000000000001",
+    "arm_state_id": "50000000-0000-4000-8000-000000000002",
+    "selected_state_id": "50000000-0000-4000-8000-000000000003",
+    "baseline_run": null,
+    "edit_fixture_id": "50000000-0000-4000-8000-000000000004",
+    "purpose": "correction",
+    "source": {
+      "kind": "deterministic_text",
+      "fixture_id": "50000000-0000-4000-8000-000000000005",
+      "sha256": "a9d75e0038d9971bbd8ed629113130b2cf6183742b73052000480a1eb90fa8ad",
+      "byte_length": 19,
+      "rights": "synthetic"
+    },
+    "source_text_learning_authorized": true,
+    "learning_authorized": true,
+    "actor": "programmatic_fixture",
+    "authorized_text_layers": [
+      "source",
+      "post_insert",
+      "settled",
+      "final_output"
+    ],
+    "edit_states": [
+      {
+        "sequence": 0,
+        "state_id": "50000000-0000-4000-8000-000000000006",
+        "layer": "post_insert",
+        "sha256": "a9d75e0038d9971bbd8ed629113130b2cf6183742b73052000480a1eb90fa8ad",
+        "byte_length": 19
+      },
+      {
+        "sequence": 1,
+        "state_id": "50000000-0000-4000-8000-000000000007",
+        "layer": "settled",
+        "sha256": "03af036e2714195fe1368ec13dedb90d57645e0fdf7f98541de816522ed19e0f",
+        "byte_length": 19
+      }
+    ],
+    "scope": {
+      "mapping_id": "controlled-learning",
+      "family": "general",
+      "native_bundle": "com.example.learning-fixture"
+    },
+    "local_only_grant": true,
+    "target_oracle": "none",
+    "terms": [
+      {
+        "fixture_id": "50000000-0000-4000-8000-000000000008",
+        "before": "cobolt",
+        "after": "cobalt"
+      }
+    ],
+    "operations": [
+      {
+        "operation_id": "50000000-0000-4000-8000-000000000009",
+        "source_sha256": "a9d75e0038d9971bbd8ed629113130b2cf6183742b73052000480a1eb90fa8ad",
+        "settled_state_sha256": "03af036e2714195fe1368ec13dedb90d57645e0fdf7f98541de816522ed19e0f",
+        "term_fixture_id": "50000000-0000-4000-8000-000000000008"
+      },
+      {
+        "operation_id": "50000000-0000-4000-8000-000000000010",
+        "source_sha256": "a9d75e0038d9971bbd8ed629113130b2cf6183742b73052000480a1eb90fa8ad",
+        "settled_state_sha256": "03af036e2714195fe1368ec13dedb90d57645e0fdf7f98541de816522ed19e0f",
+        "term_fixture_id": "50000000-0000-4000-8000-000000000008"
+      },
+      {
+        "operation_id": "50000000-0000-4000-8000-000000000011",
+        "source_sha256": "a9d75e0038d9971bbd8ed629113130b2cf6183742b73052000480a1eb90fa8ad",
+        "settled_state_sha256": "03af036e2714195fe1368ec13dedb90d57645e0fdf7f98541de816522ed19e0f",
+        "term_fixture_id": "50000000-0000-4000-8000-000000000008"
+      }
+    ],
+    "followups": [
+      {
+        "task_id": "50000000-0000-4000-8000-000000000012",
+        "operation_id": "50000000-0000-4000-8000-000000000013",
+        "source": {
+          "kind": "deterministic_text",
+          "fixture_id": "50000000-0000-4000-8000-000000000014",
+          "sha256": "84f78a9e93b952b533ea457ca2dbba91f8e2cf96b5153cf0537f49c4907a84ab",
+          "byte_length": 27,
+          "rights": "synthetic"
+        },
+        "scope": {
+          "mapping_id": "controlled-learning",
+          "family": "general",
+          "native_bundle": "com.example.learning-fixture"
+        },
+        "term_fixture_id": "50000000-0000-4000-8000-000000000008",
+        "expected_rule_state": "promoted",
+        "expected_output_sha256": "752456e4e707bbe6225e7899fa1cd4268922044417a03aaad21c63ed0b2769c3",
+        "expected_output_byte_length": 27
+      },
+      {
+        "task_id": "50000000-0000-4000-8000-000000000016",
+        "operation_id": "50000000-0000-4000-8000-000000000017",
+        "source": {
+          "kind": "deterministic_text",
+          "fixture_id": "50000000-0000-4000-8000-000000000018",
+          "sha256": "cd3f43ca6706483b9735efc952d66874f10d78da2edb97ff474aa0edf7eeef76",
+          "byte_length": 28,
+          "rights": "synthetic"
+        },
+        "scope": {
+          "mapping_id": "controlled-learning",
+          "family": "general",
+          "native_bundle": "com.example.learning-fixture"
+        },
+        "term_fixture_id": "50000000-0000-4000-8000-000000000008",
+        "expected_rule_state": "tombstoned",
+        "expected_output_sha256": "cd3f43ca6706483b9735efc952d66874f10d78da2edb97ff474aa0edf7eeef76",
+        "expected_output_byte_length": 28
+      }
+    ],
+    "undo_operations": [
+      {
+        "operation_id": "50000000-0000-4000-8000-000000000015",
+        "term_fixture_id": "50000000-0000-4000-8000-000000000008",
+        "required_followup_task_id": "50000000-0000-4000-8000-000000000012"
+      }
+    ]
+  },
+  "apply_text_template": {
+    "op": "apply_text",
+    "operation": {
+      "episode_id": "50000000-0000-4000-8000-000000000001",
+      "operation_id": "50000000-0000-4000-8000-000000000009",
+      "source_fixture_id": "50000000-0000-4000-8000-000000000005",
+      "states": [
+        {
+          "sequence": 0,
+          "state_id": "50000000-0000-4000-8000-000000000006",
+          "layer": "post_insert",
+          "text": "we saw cobolt today"
+        },
+        {
+          "sequence": 1,
+          "state_id": "50000000-0000-4000-8000-000000000007",
+          "layer": "settled",
+          "text": "we saw cobalt today"
+        }
+      ]
+    }
+  },
+  "followup_templates": [
+    {
+      "op": "apply_followup",
+      "task_id": "50000000-0000-4000-8000-000000000012",
+      "operation_id": "50000000-0000-4000-8000-000000000013",
+      "text": "we will see cobolt tomorrow",
+      "expected_output_text": "we will see cobalt tomorrow"
+    },
+    {
+      "op": "undo",
+      "operation_id": "50000000-0000-4000-8000-000000000015"
+    },
+    {
+      "op": "apply_followup",
+      "task_id": "50000000-0000-4000-8000-000000000016",
+      "operation_id": "50000000-0000-4000-8000-000000000017",
+      "text": "we will see cobolt next week",
+      "expected_output_text": "we will see cobolt next week"
+    }
+  ],
+  "scope": "synthetic controlled input; actual observer diff/classifier and candidate SQL only; followups call the local replacement owner and production usage/tombstone effects, with a fixture-authorized output layer; no target insertion, AX, human edit, ASR, cleanup, or quality evidence",
+  "parity_status": "invalid_for_production_local_only_classifier_parity",
+  "parity_note": "Historical cobolt-to-cobalt fixture retained for audit. The production local-only history_lexical_correction guard rejects this spelling change; its earlier promotion/settings assertions do not establish local-only parity."
+}

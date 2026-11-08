@@ -1,0 +1,43 @@
+{
+  "classification": {
+    "copyright_owner_inferred_from_author_metadata": false,
+    "interpretation": "The saved adjacent-version missing-license repair adds a MIT LICENSE and changes only package version metadata, that LICENSE and README; the Rust source is unchanged from locked 3.5.0. Preserve the exact-release archive-absence fact while providing the later authentic notice as supplemental attribution evidence.",
+    "later_notice_is_locked_archive_bytes": false,
+    "legal_clearance": false,
+    "locked_archive_text_status": "unresolved_no_full_text_candidate",
+    "type": "authentic_later_upstream_notice_for_unchanged_locked_source"
+  },
+  "evidence_refs": {
+    "interpretation_path": "candidates/release-six-notice-gap-evidence-v42.noindex/NOTICE-EVIDENCE-INTERPRETATION.md",
+    "interpretation_sha256": "e070d917a4c0bfa61a6b6452d78b0e1a2b29f650f9c6af3c6a5981335bbceba3",
+    "review_path": "candidates/release-six-notice-gap-evidence-v42.noindex/REVIEW.md",
+    "review_sha256": "bf49449a465f07431e657ea105777a2c0a013bc299b1037ddb5c9c887a77c7f1"
+  },
+  "later_upstream_missing_license_repair": {
+    "changed_paths": [
+      "Cargo.toml",
+      "LICENSE",
+      "README.md"
+    ],
+    "commit": "9fdcf59c60c7ecacbf75774d378a068811a2e6ea",
+    "commit_message": "Add MIT license file, bump version to 3.5.1",
+    "copyright_line": "Copyright (c) 2020 Henrik Enquist and RealFFT contributors",
+    "notice_bytes": 1096,
+    "notice_sha256": "080766c57f9e48f00218f4e43c7d671d4b6ffee85a39417b5ab3c916dfe29b0d",
+    "notice_source_path": "LICENSE",
+    "notice_source_url": "https://github.com/HEnquist/realfft/blob/9fdcf59c60c7ecacbf75774d378a068811a2e6ea/LICENSE",
+    "package_version": "3.5.1",
+    "parent_commit": "d0d4eee0525fd27c96c8a046d6d107acd5ed84a6",
+    "repository": "https://github.com/HEnquist/realfft",
+    "rust_source_changed": false
+  },
+  "locked_package": {
+    "archive_contains_license_file": false,
+    "archive_sha256": "f821338fddb99d089116342c46e9f1fbf3828dba077674613e734e01d6ea8677",
+    "name": "realfft",
+    "registry": "crates.io",
+    "source_revision": "d0d4eee0525fd27c96c8a046d6d107acd5ed84a6",
+    "version": "3.5.0"
+  },
+  "schema": "voiceflow-realfft-later-upstream-notice-provenance-v1"
+}

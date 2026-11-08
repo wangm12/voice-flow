@@ -102,6 +102,26 @@ pub fn ensure_terminal(text: &str, family: ContextFamily) -> String {
     if has_terminal_mark(content) {
         return text.to_owned();
     }
+    match trailing_numbered_list_item(text, leading_end..content_end) {
+        TrailingNumberedListTail::Item(item) => {
+            let body = &text[item.body];
+            let Some(mark) = list_item_terminal_mark(body) else {
+                return text.to_owned();
+            };
+            let separator_start = item.separator.start;
+            let separator_end = item.separator.end;
+            let without_separator =
+                format!("{}{}", &text[..separator_start], &text[separator_end..]);
+            let adjusted_end = without_separator.trim_end().len();
+            return format!(
+                "{}{mark}{}",
+                &without_separator[..adjusted_end],
+                &without_separator[adjusted_end..]
+            );
+        }
+        TrailingNumberedListTail::Abstain => return text.to_owned(),
+        TrailingNumberedListTail::NotList => {}
+    }
     let mark = if is_question(content) {
         if cjk_count(content) > 0 {
             "？"
@@ -120,6 +140,223 @@ pub fn ensure_terminal(text: &str, family: ContextFamily) -> String {
         &text[..leading_end],
         &text[content_end..]
     )
+}
+
+struct TrailingNumberedListItem {
+    body: std::ops::Range<usize>,
+    separator: std::ops::Range<usize>,
+}
+
+enum TrailingNumberedListTail {
+    NotList,
+    Abstain,
+    Item(TrailingNumberedListItem),
+}
+
+fn trailing_numbered_list_item(
+    text: &str,
+    content_range: std::ops::Range<usize>,
+) -> TrailingNumberedListTail {
+    let content = &text[content_range.clone()];
+    if !content
+        .chars()
+        .next_back()
+        .is_some_and(|ch| matches!(ch, ',' | '，'))
+    {
+        return TrailingNumberedListTail::NotList;
+    }
+    let literals = crate::spoken_revision::literal_ranges(text);
+    let mut last_item_body_start = None;
+    let mut saw_protected_list_marker = false;
+    let mut offset = content_range.start;
+    for line in content.split_inclusive('\n') {
+        let line_without_newline = line.strip_suffix('\n').unwrap_or(line);
+        let trimmed = line_without_newline.trim_start();
+        let indentation = line_without_newline.len() - trimmed.len();
+        let digits = trimmed.chars().take_while(|ch| ch.is_ascii_digit()).count();
+        let is_numbered_item = digits > 0
+            && trimmed
+                .get(digits..)
+                .is_some_and(|rest| rest.starts_with(". "));
+        if is_numbered_item {
+            let body_start = offset + indentation + digits + 2;
+            let marker = offset + indentation..body_start;
+            if literals
+                .iter()
+                .any(|literal| ranges_overlap(literal, &marker))
+            {
+                saw_protected_list_marker = true;
+            } else {
+                last_item_body_start = Some(body_start);
+            }
+        }
+        offset += line.len();
+    }
+    let Some(body_start) = last_item_body_start else {
+        return if saw_protected_list_marker {
+            TrailingNumberedListTail::Abstain
+        } else {
+            TrailingNumberedListTail::NotList
+        };
+    };
+    let Some((separator_offset, separator)) = content.char_indices().next_back() else {
+        return TrailingNumberedListTail::Abstain;
+    };
+    if !matches!(separator, ',' | '，') {
+        return TrailingNumberedListTail::Abstain;
+    }
+    let separator_start = content_range.start + separator_offset;
+    let separator_range = separator_start..separator_start + separator.len_utf8();
+    let Some(raw_body) = text.get(body_start..separator_start) else {
+        return TrailingNumberedListTail::Abstain;
+    };
+    let mut continuation_offset = body_start;
+    let mut is_first_line = true;
+    for continuation in raw_body.split_inclusive('\n') {
+        if is_first_line {
+            is_first_line = false;
+            continuation_offset += continuation.len();
+            continue;
+        }
+        let line_without_newline = continuation.strip_suffix('\n').unwrap_or(continuation);
+        if !line_without_newline.trim().is_empty() {
+            let line_range = continuation_offset..continuation_offset + continuation.len();
+            let has_indentation = line_without_newline
+                .chars()
+                .next()
+                .is_some_and(char::is_whitespace);
+            let protected_line = literals
+                .iter()
+                .any(|literal| ranges_overlap(literal, &line_range));
+            if !has_indentation && !protected_line {
+                return TrailingNumberedListTail::Abstain;
+            }
+        }
+        continuation_offset += continuation.len();
+    }
+    let body_leading = raw_body.len() - raw_body.trim_start().len();
+    let body_end = raw_body.trim_end().len();
+    if body_leading >= body_end {
+        return TrailingNumberedListTail::Abstain;
+    }
+    let body_range = body_start + body_leading..body_start + body_end;
+    if literals.iter().any(|literal| {
+        ranges_overlap(literal, &body_range) || ranges_overlap(literal, &separator_range)
+    }) {
+        return TrailingNumberedListTail::Abstain;
+    }
+    TrailingNumberedListTail::Item(TrailingNumberedListItem {
+        body: body_range,
+        separator: separator_range,
+    })
+}
+
+fn ranges_overlap(left: &std::ops::Range<usize>, right: &std::ops::Range<usize>) -> bool {
+    left.start < right.end && right.start < left.end
+}
+
+fn list_item_terminal_mark(body: &str) -> Option<&'static str> {
+    if has_terminal_mark(body) || looks_like_numeric_or_technical_literal(body) {
+        return None;
+    }
+    if is_question(body) {
+        return Some(if cjk_count(body) > 0 { "？" } else { "?" });
+    }
+    if cjk_count(body) >= 2 {
+        Some("。")
+    } else if looks_like_latin_sentence(body) {
+        Some(".")
+    } else {
+        None
+    }
+}
+
+fn looks_like_numeric_or_technical_literal(text: &str) -> bool {
+    let compact: String = text.chars().filter(|ch| !ch.is_whitespace()).collect();
+    if compact.is_empty() {
+        return true;
+    }
+    let data_label = [
+        "金额为",
+        "星期",
+        "版本",
+        "日期",
+        "金额",
+        "价格",
+        "编号",
+        "数量",
+        "总额",
+        "余额",
+        "时间",
+    ]
+    .iter()
+    .find(|label| compact.starts_with(*label));
+    let candidate = data_label.map_or(compact.as_str(), |label| {
+        compact.strip_prefix(*label).unwrap_or(compact.as_str())
+    });
+    let candidate = candidate.trim_start_matches([':', '：']);
+    if data_label.is_some() && candidate.is_empty() {
+        return true;
+    }
+    let numeric_chars_only = candidate.chars().all(|ch| {
+        ch.is_ascii_digit()
+            || matches!(
+                ch,
+                ',' | '，'
+                    | '.'
+                    | '。'
+                    | '-'
+                    | '－'
+                    | '+'
+                    | '/'
+                    | ':'
+                    | '%'
+                    | '$'
+                    | '¥'
+                    | '￥'
+                    | '€'
+                    | '£'
+                    | '零'
+                    | '〇'
+                    | '一'
+                    | '二'
+                    | '两'
+                    | '三'
+                    | '四'
+                    | '五'
+                    | '六'
+                    | '七'
+                    | '八'
+                    | '九'
+                    | '十'
+                    | '百'
+                    | '千'
+                    | '万'
+                    | '亿'
+                    | '兆'
+                    | '年'
+                    | '月'
+                    | '日'
+                    | '号'
+                    | '时'
+                    | '秒'
+                    | '周'
+                    | '元'
+                    | '圆'
+                    | '角'
+                    | '分'
+            )
+    });
+    if numeric_chars_only {
+        return true;
+    }
+    let has_digit = candidate.chars().any(|ch| ch.is_ascii_digit());
+    let no_spaces = data_label.is_some() || text.chars().all(|ch| !ch.is_whitespace());
+    has_digit
+        && no_spaces
+        && candidate
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_' | ':' | '/' | '+'))
 }
 
 fn has_terminal_mark(text: &str) -> bool {
@@ -271,6 +508,9 @@ fn match_token_at(
     if precedes_classifier_ge(text, start) {
         return None;
     }
+    if !from.is_ascii() && follows_spoken_edit_verb(text, start) {
+        return None;
+    }
     if from.is_ascii() {
         if !is_ascii_word_left(text, start) || !is_ascii_word_right(text, end) {
             return None;
@@ -287,6 +527,13 @@ fn match_token_at(
         from,
         to,
     })
+}
+
+fn follows_spoken_edit_verb(text: &str, start: usize) -> bool {
+    let before = text[..start].trim_end();
+    ["换成", "改成", "删掉", "输入", "把", "用", "加"]
+        .iter()
+        .any(|verb| before.ends_with(verb))
 }
 
 fn is_ascii_word_left(text: &str, start: usize) -> bool {
@@ -433,6 +680,21 @@ mod tests {
     }
 
     #[test]
+    fn punctuation_words_after_spoken_edit_verbs_remain_literal() {
+        for input in [
+            "把逗号换成分号",
+            "用逗号",
+            "加句号",
+            "换成问号",
+            "改成冒号",
+            "删掉顿号",
+            "输入感叹号",
+        ] {
+            assert_eq!(apply(input), input, "{input}");
+        }
+    }
+
+    #[test]
     fn does_not_rewrite_surrounding_chat() {
         assert_eq!(apply("今晚吃饭吗"), "今晚吃饭吗");
         assert_eq!(apply("嗯就这样吧哈哈"), "嗯就这样吧哈哈");
@@ -528,6 +790,171 @@ mod tests {
             ensure_terminal("  你好世界\n", ContextFamily::PersonalChat),
             "  你好世界。\n"
         );
+    }
+
+    #[test]
+    fn closes_only_the_final_numbered_list_separator_before_local_terminal_punctuation() {
+        let chinese = "測試一下,看一下具体的流程是什么,看一下详细的准确度是什么。\n\n1. 看它的稳定性,\n2. 看它的准确度,";
+        assert_eq!(
+            ensure_terminal(chinese, ContextFamily::General),
+            "測試一下,看一下具体的流程是什么,看一下详细的准确度是什么。\n\n1. 看它的稳定性,\n2. 看它的准确度。"
+        );
+        assert_eq!(
+            ensure_terminal(
+                "1. Please review the system stability carefully,\n2. Please review the accuracy results carefully,",
+                ContextFamily::General
+            ),
+            "1. Please review the system stability carefully,\n2. Please review the accuracy results carefully."
+        );
+        assert_eq!(
+            ensure_terminal("1. 检查稳定性，\n2. 检查准确度，", ContextFamily::General),
+            "1. 检查稳定性，\n2. 检查准确度。"
+        );
+        assert_eq!(
+            ensure_terminal("前言。\r\n\r\n1. 看它的准确度,\r\n", ContextFamily::General,),
+            "前言。\r\n\r\n1. 看它的准确度。\r\n"
+        );
+    }
+
+    #[test]
+    fn list_tail_punctuation_preserves_terminal_marks_quotes_and_numeric_literals() {
+        let already_terminal = "1. 检查稳定性,\n2. 检查准确度。";
+        assert_eq!(
+            ensure_terminal(already_terminal, ContextFamily::General),
+            already_terminal
+        );
+
+        assert_eq!(
+            ensure_terminal(
+                "1. 保留 \"准确度,\"\n2. 继续检查 \"x,y\",",
+                ContextFamily::General,
+            ),
+            "1. 保留 \"准确度,\"\n2. 继续检查 \"x,y\","
+        );
+        assert_eq!(
+            ensure_terminal(
+                "1. 保留金额 $1,234.50 和版本 v2.7,\n2. 保留日期 2026-10-20 和 0xCafe,",
+                ContextFamily::General,
+            ),
+            "1. 保留金额 $1,234.50 和版本 v2.7,\n2. 保留日期 2026-10-20 和 0xCafe。"
+        );
+
+        let command = "1. Run `echo \"a,b\"`,\n2. Keep `--format json`,";
+        assert_eq!(
+            ensure_terminal(command, ContextFamily::PromptOrCode),
+            command
+        );
+    }
+
+    #[test]
+    fn numbered_list_tail_uses_only_clear_prose_in_the_final_item() {
+        let csv = "1. 1,2,\r\n2. 3,4,";
+        assert_eq!(ensure_terminal(csv, ContextFamily::General), csv);
+
+        let amount_only = "中文前言。\n\n1. 已有预算\n2. $1,234.50,";
+        assert_eq!(
+            ensure_terminal(amount_only, ContextFamily::General),
+            amount_only
+        );
+        for data_tail in [
+            "1. 1,234元,",
+            "1. 日期 2026年10月20日,",
+            "1. 版本 v2.7,",
+            "1. 金额：1,234元,",
+            "1. 版本：v2.7,",
+            "1. 金额 : 1,234元,",
+            "1. 版本 ： v2.7,",
+        ] {
+            assert_eq!(
+                ensure_terminal(data_tail, ContextFamily::General),
+                data_tail,
+                "data-like list item should not inherit punctuation from outside its body"
+            );
+        }
+
+        assert_eq!(
+            ensure_terminal(
+                "中文前言。\n\n1. Do you have the results,",
+                ContextFamily::General,
+            ),
+            "中文前言。\n\n1. Do you have the results?"
+        );
+        assert_eq!(
+            ensure_terminal(
+                "中文前言。\n\n1. Please review the detailed accuracy results carefully,",
+                ContextFamily::General,
+            ),
+            "中文前言。\n\n1. Please review the detailed accuracy results carefully."
+        );
+
+        let empty = "中文前言。\n\n1. ,";
+        assert_eq!(ensure_terminal(empty, ContextFamily::General), empty);
+    }
+
+    #[test]
+    fn numbered_lists_without_trailing_separators_keep_legacy_terminal_fallback() {
+        assert_eq!(
+            ensure_terminal("1. 检查稳定性\n2. 检查准确度", ContextFamily::General,),
+            "1. 检查稳定性\n2. 检查准确度。"
+        );
+        assert_eq!(
+            ensure_terminal(
+                "1. 检查稳定性\n2. 检查准确度\n\n还有一件事需要补充",
+                ContextFamily::General,
+            ),
+            "1. 检查稳定性\n2. 检查准确度\n\n还有一件事需要补充。"
+        );
+        assert_eq!(
+            ensure_terminal(
+                "1. 检查稳定性\n2. 检查准确度\n\n接下来怎么",
+                ContextFamily::General,
+            ),
+            "1. 检查稳定性\n2. 检查准确度\n\n接下来怎么？"
+        );
+    }
+
+    #[test]
+    fn numbered_list_tail_preserves_literals_and_ambiguous_multiline_items() {
+        assert_eq!(
+            ensure_terminal(
+                "中文前言 \"x,y\" 仍保留。\n\n1. 检查准确度,",
+                ContextFamily::General,
+            ),
+            "中文前言 \"x,y\" 仍保留。\n\n1. 检查准确度。"
+        );
+
+        let quoted = "中文前言。\n\n1. Keep \"x,y\",";
+        assert_eq!(ensure_terminal(quoted, ContextFamily::General), quoted);
+
+        let fenced = "中文前言。\n\n1. Keep this:\n   ```text\n   3,4\n   ```,";
+        assert_eq!(ensure_terminal(fenced, ContextFamily::General), fenced);
+
+        let unclosed_quote = "中文前言。\n\n1. Keep \"an unfinished literal,";
+        assert_eq!(
+            ensure_terminal(unclosed_quote, ContextFamily::General),
+            unclosed_quote
+        );
+
+        let unclosed_fence = "中文前言。\n\n1. Keep this:\n```text\n3,4,";
+        assert_eq!(
+            ensure_terminal(unclosed_fence, ContextFamily::General),
+            unclosed_fence
+        );
+    }
+
+    #[test]
+    fn original_row12_native_output_remains_byte_identical() {
+        use sha2::{Digest, Sha256};
+
+        let row12 = "详细的情况帮我看一下。然后这个具体的UI为什么变了？\n\n1. 看一下稳定性怎么样。\n2. 看一下它的这个准确率怎么样。";
+        assert_eq!(row12.len(), 155);
+        assert_eq!(
+            hex::encode(Sha256::digest(row12.as_bytes())),
+            "5c3e1e7fc6755f54a59a14372f29d7a30e15e0a0ba20fc9bc2f5ebdb7a4be3ff"
+        );
+        for family in [ContextFamily::PromptOrCode, ContextFamily::General] {
+            assert_eq!(ensure_terminal(row12, family).as_bytes(), row12.as_bytes());
+        }
     }
 
     #[test]

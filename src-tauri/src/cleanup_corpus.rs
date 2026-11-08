@@ -857,7 +857,7 @@ mod tests {
         );
         assert_eq!(
             layout("zh_oh_bu_dui_list_backtrack", 1.0),
-            "我们来测试一下,看一下具体的 ASR 流程。\n1. 是 system prompt,看一下具体的流程怎么样。\n2. 是看一下 style,和它的逻辑是怎么样。\n3. 是看一下它整个的识别率怎么样。"
+            "我们来测试一下,看一下具体的 ASR 流程。\n\n1. 是 system prompt,看一下具体的流程怎么样。\n2. 是看一下 style,和它的逻辑是怎么样。\n3. 是看一下它整个的识别率怎么样。"
         );
     }
 
@@ -1011,6 +1011,7 @@ mod tests {
 #[cfg(test)]
 mod grouped_production_eval {
     use crate::context::{builtin_family_for_id, ContextFamily, FocusKind};
+    use crate::evaluation::quantile::linear_quantile;
     use crate::llm::{self, CleanupOperation};
     use crate::snippets::{self, Snippet};
     use crate::{CleanupDecision, FinalText};
@@ -1121,10 +1122,27 @@ mod grouped_production_eval {
         identity_cases: usize,
         identity_rewrites: usize,
         latency_sample_count: usize,
-        latency_p50_ms: f64,
-        latency_p95_ms: f64,
+        latency_p50_ms: Option<f64>,
+        latency_p95_ms: Option<f64>,
         groups: BTreeMap<String, GroupSummary>,
         cases: Vec<CaseResult>,
+    }
+
+    fn latency_summary(samples: &[f64]) -> (usize, Option<f64>, Option<f64>) {
+        let count = samples
+            .iter()
+            .filter(|value| value.is_finite() && **value >= 0.0)
+            .count();
+        (
+            count,
+            linear_quantile(samples, 0.50),
+            linear_quantile(samples, 0.95),
+        )
+    }
+    fn display_latency_quantile(value: Option<f64>) -> String {
+        value
+            .map(|value| format!("{value:.3}"))
+            .unwrap_or_else(|| "unavailable".into())
     }
 
     #[test]
@@ -1133,8 +1151,8 @@ mod grouped_production_eval {
         assert_eq!(corpus.schema_version, 1);
         assert_eq!(
             corpus.cases.len(),
-            160,
-            "the approved corpus has 160 fixtures"
+            161,
+            "the approved corpus has 161 fixtures"
         );
         let mut ids = HashSet::new();
         let mut groups = HashSet::new();
@@ -1290,9 +1308,9 @@ mod grouped_production_eval {
         }
 
         assert!(groups.len() >= 10, "fixtures must remain grouped by scene");
-        assert_eq!(totals.case_count, 160);
-        assert_eq!(timings.len(), 160);
-        assert_eq!(production_span_guard_cases, 160);
+        assert_eq!(totals.case_count, 161);
+        assert_eq!(timings.len(), 161);
+        assert_eq!(production_span_guard_cases, 161);
         let identity_failures: Vec<String> = results
             .iter()
             .filter(|result| result.mode == "identity" && result.actual != result.expected)
@@ -1330,6 +1348,7 @@ mod grouped_production_eval {
         );
 
         timings.sort_by(f64::total_cmp);
+        let (latency_sample_count, latency_p50_ms, latency_p95_ms) = latency_summary(&timings);
         let report = EvalReport {
             schema_version: corpus.schema_version,
             runner: "production_offline_cleanup_fallback_guard",
@@ -1359,9 +1378,9 @@ mod grouped_production_eval {
             mixed_language_preserved,
             identity_cases,
             identity_rewrites,
-            latency_sample_count: timings.len(),
-            latency_p50_ms: percentile(&timings, 0.50),
-            latency_p95_ms: percentile(&timings, 0.95),
+            latency_sample_count,
+            latency_p50_ms,
+            latency_p95_ms,
             groups: group_summaries,
             cases: results,
         };
@@ -1370,7 +1389,7 @@ mod grouped_production_eval {
             std::fs::write(path, json.as_bytes()).expect("write aggregate eval artifact");
         }
         eprintln!(
-            "production cleanup eval: {}/{} reference matches; CER {:.3}, WER {:.3}; protected cases {}/{}, protected spans {}/{}, raw source {}/{}, mixed cases {}/{}, identity rewrites {}/{}; local latency p50 {:.3}ms p95 {:.3}ms (n={})",
+            "production cleanup eval: {}/{} reference matches; CER {:.3}, WER {:.3}; protected cases {}/{}, protected spans {}/{}, raw source {}/{}, mixed cases {}/{}, identity rewrites {}/{}; local latency p50 {}ms p95 {}ms (n={})",
             report.reference_matches,
             report.case_count,
             report.character_error_rate,
@@ -1385,8 +1404,8 @@ mod grouped_production_eval {
             report.mixed_language_cases,
             report.identity_rewrites,
             report.identity_cases,
-            report.latency_p50_ms,
-            report.latency_p95_ms,
+            display_latency_quantile(report.latency_p50_ms),
+            display_latency_quantile(report.latency_p95_ms),
             report.latency_sample_count,
         );
     }
@@ -1399,13 +1418,16 @@ mod grouped_production_eval {
             cleanup_enabled: case.mode != "ai-off",
             ..crate::store::Settings::default()
         };
-        let prepared = crate::prepare_cleanup_transcript_for_scene(
+        let snapshot = context_snapshot(family, input_kind);
+        let scene =
+            crate::resolve_cleanup_scene_for_transcript(&settings, Some(&snapshot), &case.input);
+        let prepared = crate::prepare_cleanup_transcript_for_resolved_scene(
             None,
             &settings,
             &case.input,
-            family,
+            scene,
             0.9,
-            input_kind,
+            None,
             settings.fuzzy_dictionary_enabled,
         );
         let source = prepared.text.clone();
@@ -1436,8 +1458,7 @@ mod grouped_production_eval {
 
         let intent =
             llm::parse_cleanup_intent(&source, crate::spoken_translation_target(&settings));
-        let snapshot = context_snapshot(family, input_kind);
-        let route = crate::cleanup_route_for(&settings, Some(&snapshot), &intent);
+        let route = crate::cleanup_route_for_resolved_scene(&settings, prepared.scene, &intent);
         let decision = match case.mode.as_str() {
             "ai-off" => CleanupDecision::Disabled,
             "provider-failure" | "normal" | "spoken-correction" | "identity" => match route {
@@ -1486,8 +1507,9 @@ mod grouped_production_eval {
             source,
             decision,
             crate::FinalizationContext {
-                family,
-                input_kind,
+                scene: prepared
+                    .map(|value| value.scene)
+                    .unwrap_or_else(|| crate::ResolvedCleanupScene::observed(family, input_kind)),
                 operation,
                 revision_source: prepared.map(|value| value.revision_source.as_str()),
                 prepared_transcript: prepared.map(|value| value.text.as_str()),
@@ -1497,6 +1519,11 @@ mod grouped_production_eval {
                 promoted_pair_protections: prepared
                     .map(|value| value.promoted_pair_protections.as_slice())
                     .unwrap_or(&[]),
+                list_revision_proof: prepared.and_then(|value| value.list_revision_proof.as_ref()),
+                structure_safe_source: None,
+                output_projection_list_revision_proof: None,
+                layout_source: None,
+                exact_fallback: false,
             },
         )
         .unwrap_or_else(|error| {
@@ -1505,6 +1532,8 @@ mod grouped_production_eval {
                 text: String::new(),
                 degraded: false,
                 degraded_reason: None,
+                cleanup_rejection: None,
+                final_guard_reason: None,
             }
         })
     }
@@ -1583,6 +1612,31 @@ mod grouped_production_eval {
         value.chars().any(|ch| ch.is_ascii_alphabetic())
     }
 
+    #[test]
+    fn corpus_latency_report_serializes_empty_as_null_and_uses_shared_interpolation() {
+        let empty = latency_summary(&[]);
+        let empty_json = serde_json::json!({
+            "latency_sample_count": empty.0,
+            "latency_p50_ms": empty.1,
+            "latency_p95_ms": empty.2,
+        });
+        assert_eq!(empty_json["latency_sample_count"], 0);
+        assert!(empty_json["latency_p50_ms"].is_null());
+        assert!(empty_json["latency_p95_ms"].is_null());
+        assert_eq!(display_latency_quantile(empty.1), "unavailable");
+
+        let populated = latency_summary(&[0.0, 10.0, 20.0, 100.0, f64::NAN]);
+        let populated_json = serde_json::json!({
+            "latency_sample_count": populated.0,
+            "latency_p50_ms": populated.1,
+            "latency_p95_ms": populated.2,
+        });
+        assert_eq!(populated_json["latency_sample_count"], 4);
+        assert_eq!(populated_json["latency_p50_ms"], 15.0);
+        assert!((populated_json["latency_p95_ms"].as_f64().unwrap() - 88.0).abs() < 1e-9);
+        assert_eq!(display_latency_quantile(populated.1), "15.000");
+    }
+
     fn levenshtein<T: Eq>(reference: &[T], candidate: &[T]) -> usize {
         let mut previous: Vec<usize> = (0..=candidate.len()).collect();
         for (row, left) in reference.iter().enumerate() {
@@ -1596,62 +1650,29 @@ mod grouped_production_eval {
         }
         previous[candidate.len()]
     }
-
-    fn percentile(sorted: &[f64], proportion: f64) -> f64 {
-        if sorted.is_empty() {
-            return 0.0;
-        }
-        let index = ((sorted.len() as f64 * proportion).ceil() as usize)
-            .saturating_sub(1)
-            .min(sorted.len() - 1);
-        sorted[index]
-    }
 }
 
 #[cfg(test)]
 mod live_paired_eval {
-    mod audio_trial {
-        include!("audio_trial_eval.rs");
-    }
-    use crate::asr::{AsrError, AsrOptions, AsrProvider, GroqAsrProvider};
-    use crate::context::{ContextFamily, ContextPolicy, ContextSnapshot, FocusKind};
+    use crate::context::FocusKind;
     use crate::engine::EngineProvider;
+    use crate::evaluation::authorization::{AuthorizationBlocks, AuthorizationScope};
+    use crate::evaluation::legacy::*;
     use crate::llm;
     use crate::providers;
     use serde::{Deserialize, Serialize};
     use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
-
+    mod audio_trial {
+        include!("audio_trial_eval.rs");
+    }
     const CORPUS: &str = include_str!("../evals/cleanup-cases.json");
-    const REPORT_SCHEMA_VERSION: u32 = 2;
-    const QWEN_CHAT_BASE: &str = "https://dashscope.aliyuncs.com/compatible-mode/v1";
-    const QWEN_ASR_BASE: &str = "https://dashscope.aliyuncs.com/compatible-mode/v1";
-    const REQUEST_BUILDER_REVISION: &str = "live-cleanup-request-v2";
     const TEXT_ACTION_REQUEST_BUILDER_REVISION: &str = "live-text-action-request-v1";
-    const RATE_LIMIT_RETRIES_PER_CASE: usize = 1;
-    const DEFAULT_MIN_REQUEST_GAP_MS: u64 = 250;
-
     #[derive(Debug, Deserialize)]
     struct Corpus {
         schema_version: u32,
         cases: Vec<EvalCase>,
-    }
-
-    #[derive(Debug, Deserialize, Clone)]
-    struct EvalCase {
-        id: String,
-        group: String,
-        input: String,
-        expected: String,
-        #[serde(default)]
-        reference_variants: Vec<String>,
-        cleanup: String,
-        family: String,
-        focus_kind: String,
-        mode: String,
-        #[serde(default)]
-        protected: Vec<String>,
     }
 
     #[derive(Serialize)]
@@ -1672,282 +1693,6 @@ mod live_paired_eval {
         resume_compatible_case_count: usize,
         cleanup_models: Vec<CleanupModelReport>,
         asr_models: Vec<AsrModelReport>,
-    }
-
-    #[derive(Serialize)]
-    struct CleanupModelReport {
-        candidate: String,
-        provider: String,
-        model: String,
-        sanitized_host: String,
-        key_source: String,
-        verification_status: String,
-        stop_category: Option<String>,
-        route_eligible_cases: usize,
-        candidate_coverage_cases: usize,
-        candidate_coverage_rate: Option<f64>,
-        provider_invoked_cases: usize,
-        provider_http_attempts: usize,
-        rate_limit_retries: usize,
-        rate_limit_retry_wait_ms: f64,
-        minimum_request_gap_ms: u64,
-        resumed_candidate_samples: usize,
-        provider_skipped_after_error_cases: usize,
-        adapter_candidate_successes: usize,
-        adapter_guard_rejections: usize,
-        app_final_guard_rejections: usize,
-        provider_error_categories: BTreeMap<String, usize>,
-        bypass_counts: BTreeMap<String, usize>,
-        declared_protected_cases: usize,
-        declared_protected_spans: usize,
-        declared_protected_candidate_samples: usize,
-        declared_protected_candidate_preserved: usize,
-        declared_protected_candidate_span_samples: usize,
-        declared_protected_candidate_spans_preserved: usize,
-        declared_protected_final_samples: usize,
-        declared_protected_final_preserved: usize,
-        declared_protected_final_span_samples: usize,
-        declared_protected_final_spans_preserved: usize,
-        mixed_script_proxy_cases: usize,
-        mixed_script_candidate_samples: usize,
-        mixed_script_candidate_preserved: usize,
-        mixed_script_final_samples: usize,
-        mixed_script_final_preserved: usize,
-        identity_candidate_cases: usize,
-        identity_candidate_rewrites: usize,
-        identity_final_rewrites: usize,
-        adapter_candidate_quality: QualitySummary,
-        finalized_provider_success_quality: QualitySummary,
-        all_path_final_quality: QualitySummary,
-        timings: BTreeMap<String, TimingSummary>,
-        cases: Vec<CleanupCaseReport>,
-    }
-
-    #[derive(Serialize)]
-    struct CleanupCaseReport {
-        id: String,
-        group: String,
-        mode: String,
-        cleanup: String,
-        family: String,
-        focus_kind: String,
-        input: String,
-        request_fingerprint: String,
-        route: String,
-        provider_invoked: bool,
-        resumed_candidate: bool,
-        provider_call_state: String,
-        provider_attempts: usize,
-        adapter_candidate: Option<String>,
-        final_text: String,
-        expected: String,
-        adapter_candidate_reference_match: Option<bool>,
-        final_reference_match: bool,
-        adapter_candidate_declared_protected_preserved: Option<bool>,
-        final_declared_protected_preserved: bool,
-        final_span_guard_preserved: bool,
-        mixed_script_proxy_preserved: Option<bool>,
-        identity_candidate_rewrite: Option<bool>,
-        identity_final_rewrite: Option<bool>,
-        adapter_guard_rejected: bool,
-        app_final_guard_rejected: bool,
-        error_category: Option<String>,
-        status: Option<u16>,
-        preparation_ms: f64,
-        provider_ms: Option<f64>,
-        provider_wait_ms: f64,
-        retry_wait_ms: f64,
-        finalize_ms: f64,
-        total_ms: f64,
-    }
-
-    #[derive(Debug, Default)]
-    struct QualityAccumulator {
-        sample_count: usize,
-        reference_matches: usize,
-        character_edits: usize,
-        reference_characters: usize,
-        word_edits: usize,
-        reference_words: usize,
-    }
-
-    #[derive(Serialize, Default)]
-    struct QualitySummary {
-        sample_count: usize,
-        any_variant_reference_matches: usize,
-        any_variant_reference_match_rate: Option<f64>,
-        character_edits_min_variant: usize,
-        reference_codepoints_min_variant: usize,
-        character_error_rate_min_variant: Option<f64>,
-        word_edits_min_variant: usize,
-        reference_words_min_variant: usize,
-        word_error_rate_min_variant: Option<f64>,
-    }
-
-    #[derive(Serialize)]
-    struct TimingSummary {
-        sample_count: usize,
-        p50_ms: Option<f64>,
-        p95_ms: Option<f64>,
-    }
-
-    #[derive(Debug, Default)]
-    struct ResumeState {
-        compatible: bool,
-        ignored_reason: Option<String>,
-        cases_by_candidate: BTreeMap<String, BTreeMap<String, ResumeCase>>,
-    }
-
-    #[derive(Debug, Clone)]
-    struct ResumeCase {
-        request_fingerprint: String,
-        adapter_candidate: String,
-    }
-
-    #[derive(Serialize)]
-    struct ResumeCheckpoint<'a> {
-        schema_version: u32,
-        corpus_fingerprint: &'a str,
-        cleanup_code_fingerprint: &'a str,
-        checkpoint_candidates: Vec<ResumeCheckpointCandidate<'a>>,
-    }
-
-    #[derive(Serialize)]
-    struct ResumeCheckpointCandidate<'a> {
-        candidate: &'a str,
-        cases: Vec<ResumeCheckpointCase<'a>>,
-    }
-
-    #[derive(Serialize)]
-    struct ResumeCheckpointCase<'a> {
-        id: &'a str,
-        request_fingerprint: &'a str,
-        adapter_candidate: &'a str,
-    }
-
-    #[derive(Serialize)]
-    struct CleanupRequestIdentity<'a> {
-        request_builder_revision: &'static str,
-        corpus_fingerprint: &'a str,
-        cleanup_code_fingerprint: &'a str,
-        candidate: &'a str,
-        provider: &'a str,
-        model: &'a str,
-        endpoint: &'a str,
-        case_id: &'a str,
-        group: &'a str,
-        mode: &'a str,
-        cleanup: &'a str,
-        family: &'a str,
-        focus_kind: &'a str,
-        source: &'a str,
-        request_content: &'a str,
-        intent: &'a llm::CleanupIntent,
-        pairs_hint: Option<&'a str>,
-        profile: &'a crate::context::ContextProfile,
-        policy: &'a ContextPolicy,
-        effort: Option<&'a str>,
-        fixed_options: &'static str,
-    }
-
-    struct CleanupRequestFingerprintContext<'a> {
-        endpoint: &'a str,
-        model: &'a str,
-        policy: &'a ContextPolicy,
-        effort: Option<crate::llm::CleanupEffort>,
-        corpus_fingerprint: &'a str,
-        cleanup_code_fingerprint: &'a str,
-    }
-
-    #[derive(Clone)]
-    struct CleanupCandidate {
-        id: &'static str,
-        provider: EngineProvider,
-        model: String,
-        base_url: String,
-        key: Option<String>,
-        key_source: String,
-    }
-
-    struct PreparedCleanupCase {
-        family: ContextFamily,
-        input_kind: FocusKind,
-        source: String,
-        intent: llm::CleanupIntent,
-        pairs_hint: Option<String>,
-        snapshot: ContextSnapshot,
-        route: crate::lexicon::CleanupRoute,
-        bypass: Option<&'static str>,
-        snippet: bool,
-    }
-
-    struct CleanupCandidateRun<'a> {
-        cases: &'a [EvalCase],
-        blocked_reason: Option<String>,
-        resume_state: &'a mut ResumeState,
-        checkpoint_path: &'a Path,
-        corpus_fingerprint: &'a str,
-        cleanup_code_fingerprint: &'a str,
-        pacer: &'a mut RequestPacer,
-    }
-
-    #[derive(Debug, Deserialize)]
-    struct AudioManifest {
-        cases: Vec<AudioFixture>,
-    }
-
-    #[derive(Debug, Deserialize)]
-    struct AudioFixture {
-        id: String,
-        audio: String,
-        reference: String,
-    }
-
-    #[derive(Serialize)]
-    struct AsrModelReport {
-        candidate: String,
-        provider: String,
-        model: String,
-        sanitized_host: String,
-        key_source: String,
-        verification_status: String,
-        stop_category: Option<String>,
-        provider_invoked_cases: usize,
-        successful_transcriptions: usize,
-        no_speech_results: usize,
-        error_categories: BTreeMap<String, usize>,
-        raw_asr_quality: QualitySummary,
-        sanitized_text_quality: QualitySummary,
-        timings: TimingSummary,
-        cases: Vec<AsrCaseReport>,
-    }
-
-    #[derive(Serialize)]
-    struct AsrCaseReport {
-        id: String,
-        reference: String,
-        provider_invoked: bool,
-        transcription_state: String,
-        raw_asr_text: Option<String>,
-        sanitized_text: Option<String>,
-        detected_language: Option<String>,
-        confidence: Option<f32>,
-        segment_count: Option<usize>,
-        word_count: Option<usize>,
-        error_category: Option<String>,
-        status: Option<u16>,
-        latency_ms: Option<f64>,
-    }
-
-    #[derive(Clone)]
-    struct AsrCandidate {
-        id: &'static str,
-        provider: &'static str,
-        model: String,
-        endpoint: String,
-        host: String,
-        key: Option<String>,
-        key_source: String,
     }
 
     #[derive(Serialize)]
@@ -2015,7 +1760,7 @@ mod live_paired_eval {
     async fn live_paired_cleanup_and_asr_eval_uses_production_adapters() {
         let corpus: Corpus = serde_json::from_str(CORPUS).expect("valid grouped eval corpus");
         assert_eq!(corpus.schema_version, 1);
-        assert_eq!(corpus.cases.len(), 160);
+        assert_eq!(corpus.cases.len(), 161);
         let requested_case_ids = std::env::var("VOICEFLOW_LIVE_CLEANUP_CASE_IDS").ok();
         let selected_cases = select_cleanup_cases(&corpus.cases, requested_case_ids.as_deref())
             .unwrap_or_else(|error| panic!("invalid VOICEFLOW_LIVE_CLEANUP_CASE_IDS: {error}"));
@@ -2050,6 +1795,7 @@ mod live_paired_eval {
         }
         let minimum_request_gap = minimum_request_gap();
 
+        let mut artifacts = crate::evaluation::artifacts::ArtifactStore::default();
         let mut report = LiveReport {
             schema_version: REPORT_SCHEMA_VERSION,
             runner: "opt_in_live_production_adapter_and_finalizer",
@@ -2075,16 +1821,14 @@ mod live_paired_eval {
             &resume_state,
             &corpus_fingerprint,
             &cleanup_code_fingerprint,
-        );
-        let mut blocked_cleanup_providers = BTreeMap::<String, String>::new();
-        let mut pacers = BTreeMap::<String, RequestPacer>::new();
+        )
+        .expect("owned legacy checkpoint");
+        let mut blocked_providers = AuthorizationBlocks::default();
+        let mut pacers = BTreeMap::<Option<AuthorizationScope>, RequestPacer>::new();
         for candidate in candidates {
-            let blocked_reason = blocked_cleanup_providers
-                .get(candidate.provider.as_str())
-                .cloned();
-            let provider_name = candidate.provider.as_str().to_owned();
+            let blocked_reason = blocked_providers.reason(candidate.authorization_scope.as_ref());
             let pacer = pacers
-                .entry(provider_name.clone())
+                .entry(candidate.authorization_scope.clone())
                 .or_insert_with(|| RequestPacer::new(minimum_request_gap));
             let model_report = run_cleanup_candidate(
                 &candidate,
@@ -2092,42 +1836,47 @@ mod live_paired_eval {
                     cases: &selected_cases,
                     blocked_reason,
                     resume_state: &mut resume_state,
-                    checkpoint_path: &checkpoint_path,
+                    checkpoint_path: Some(&checkpoint_path),
                     corpus_fingerprint: &corpus_fingerprint,
                     cleanup_code_fingerprint: &cleanup_code_fingerprint,
                     pacer,
+                    observer: None,
+                    preparation: None,
+                    replay: None,
                 },
             )
-            .await;
-            if model_report.stop_category.as_deref() == Some("authorization_error") {
-                blocked_cleanup_providers.insert(
-                    candidate.provider.as_str().to_owned(),
-                    model_report.stop_category.clone().unwrap_or_default(),
-                );
-            }
+            .await
+            .expect("shared cleanup evaluator");
+            blocked_providers.observe(
+                candidate.authorization_scope.as_ref(),
+                model_report.stop_category.as_deref(),
+            );
             report.resume_compatible_case_count += model_report.resumed_candidate_samples;
             report.cleanup_models.push(model_report);
-            write_json_report(&report_path, &report);
+            write_json_report(&mut artifacts, &report_path, &report).expect("owned live report");
         }
 
         let asr_manifest_path = std::env::var_os("VOICEFLOW_LIVE_ASR_MANIFEST").map(PathBuf::from);
         if let Some(manifest_path) = asr_manifest_path {
             let manifest = read_audio_manifest(&manifest_path);
-            let mut blocked_asr_providers = BTreeMap::<String, String>::new();
             for candidate in asr_candidates() {
-                let blocked_reason = blocked_asr_providers.get(candidate.provider).cloned();
+                let blocked_reason =
+                    blocked_providers.reason(candidate.authorization_scope.as_ref());
                 let model_report =
-                    run_asr_candidate(&candidate, &manifest_path, &manifest, blocked_reason).await;
-                if model_report.stop_category.as_deref() == Some("authorization_error") {
-                    blocked_asr_providers
-                        .insert(candidate.provider.into(), "authorization_error".into());
-                }
+                    run_asr_candidate(&candidate, &manifest_path, &manifest, blocked_reason, None)
+                        .await
+                        .expect("shared ASR evaluator");
+                blocked_providers.observe(
+                    candidate.authorization_scope.as_ref(),
+                    model_report.stop_category.as_deref(),
+                );
                 report.asr_models.push(model_report);
-                write_json_report(&report_path, &report);
+                write_json_report(&mut artifacts, &report_path, &report)
+                    .expect("owned live report");
             }
         }
 
-        write_json_report(&report_path, &report);
+        write_json_report(&mut artifacts, &report_path, &report).expect("owned live report");
         eprintln!(
             "live provider evaluation report written outside the repository at {}; cleanup cases {}/{}, selected IDs {:?}, cleanup candidates {}, ASR candidates {}",
             report_path.display(),
@@ -2177,6 +1926,7 @@ mod live_paired_eval {
             .unwrap_or_else(|| std::env::temp_dir().join("voiceflow-live-text-action-eval.json"));
         let report_path = unique_output_path(&requested_report_path, None);
         let minimum_request_gap = minimum_request_gap();
+        let mut artifacts = crate::evaluation::artifacts::ArtifactStore::default();
         let mut report = TextActionLiveReport {
             schema_version: 1,
             runner: "opt_in_live_production_text_action_pipeline",
@@ -2187,18 +1937,18 @@ mod live_paired_eval {
             models: Vec::new(),
         };
 
-        let mut blocked_providers = BTreeMap::<String, String>::new();
+        let mut blocked_providers = AuthorizationBlocks::default();
         for candidate in candidates {
-            let endpoint = providers::resolve_llm_endpoint(candidate.provider, &candidate.base_url);
+            let endpoint = candidate.endpoint.clone();
             let host = providers::host_of(&endpoint);
-            let blocked_reason = blocked_providers.get(candidate.provider.as_str()).cloned();
+            let blocked_reason = blocked_providers.reason(candidate.authorization_scope.as_ref());
             let mut model_report = TextActionModelReport {
                 candidate: candidate.id.to_owned(),
-                provider: candidate.provider.as_str().to_owned(),
+                provider: candidate.provider_name().to_owned(),
                 model: candidate.model.clone(),
                 model_fingerprint: stable_fingerprint(&[
                     candidate.id.as_bytes(),
-                    candidate.provider.as_str().as_bytes(),
+                    candidate.provider_name().as_bytes(),
                     candidate.model.as_bytes(),
                 ]),
                 sanitized_host: host,
@@ -2312,9 +2062,9 @@ mod live_paired_eval {
                             stop_category = Some(category.into());
                             model_report.stop_category = stop_category.clone();
                             if category == "authorization_error" {
-                                blocked_providers.insert(
-                                    candidate.provider.as_str().to_owned(),
-                                    category.into(),
+                                blocked_providers.observe(
+                                    candidate.authorization_scope.as_ref(),
+                                    Some(category),
                                 );
                             }
                         }
@@ -2322,68 +2072,15 @@ mod live_paired_eval {
                 }
             }
             report.models.push(model_report);
-            write_json_report(&report_path, &report);
+            write_json_report(&mut artifacts, &report_path, &report).expect("owned live report");
         }
 
-        write_json_report(&report_path, &report);
+        write_json_report(&mut artifacts, &report_path, &report).expect("owned live report");
         eprintln!(
             "synthetic text-action evaluation report written outside the repository at {}; models {}",
             report_path.display(),
             report.models.len()
         );
-    }
-
-    fn cleanup_candidates() -> Vec<CleanupCandidate> {
-        let app_data = app_data_dir();
-        let groq_key = key_material(
-            "VOICEFLOW_EVAL_GROQ_API_KEY",
-            "VOICEFLOW_EVAL_GROQ_KEY_FILE",
-            Some(app_data.join("secrets/api_key")),
-        );
-        let openai_key = key_material(
-            "VOICEFLOW_EVAL_OPENAI_API_KEY",
-            "VOICEFLOW_EVAL_OPENAI_KEY_FILE",
-            Some(app_data.join("secrets/provider_openai")),
-        );
-        let qwen_key = key_material(
-            "VOICEFLOW_EVAL_QWEN_API_KEY",
-            "VOICEFLOW_EVAL_QWEN_KEY_FILE",
-            None,
-        );
-        vec![
-            CleanupCandidate {
-                id: "groq_gpt_oss_120b",
-                provider: EngineProvider::Groq,
-                model: model_override("VOICEFLOW_EVAL_GROQ_PRIMARY_MODEL", "openai/gpt-oss-120b"),
-                base_url: String::new(),
-                key: groq_key.0.clone(),
-                key_source: groq_key.1.clone(),
-            },
-            CleanupCandidate {
-                id: "groq_gpt_oss_20b",
-                provider: EngineProvider::Groq,
-                model: model_override("VOICEFLOW_EVAL_GROQ_SECONDARY_MODEL", "openai/gpt-oss-20b"),
-                base_url: String::new(),
-                key: groq_key.0,
-                key_source: groq_key.1,
-            },
-            CleanupCandidate {
-                id: "openai_gpt_4o_mini",
-                provider: EngineProvider::OpenAi,
-                model: model_override("VOICEFLOW_EVAL_OPENAI_MODEL", "gpt-4o-mini"),
-                base_url: EngineProvider::OpenAi.default_base_url().to_owned(),
-                key: openai_key.0,
-                key_source: openai_key.1,
-            },
-            CleanupCandidate {
-                id: "qwen_plus_dashscope",
-                provider: EngineProvider::Custom,
-                model: model_override("VOICEFLOW_EVAL_QWEN_MODEL", "qwen-plus"),
-                base_url: QWEN_CHAT_BASE.to_owned(),
-                key: qwen_key.0,
-                key_source: qwen_key.1,
-            },
-        ]
     }
 
     fn selected_cleanup_candidates() -> Vec<CleanupCandidate> {
@@ -2440,35 +2137,6 @@ mod live_paired_eval {
         } else {
             "selected_case_ids_only"
         }
-    }
-
-    fn parse_id_filter(
-        raw_filter: &str,
-        supported_ids: &[&str],
-        label: &str,
-    ) -> Result<Vec<String>, String> {
-        if raw_filter.trim().is_empty() {
-            return Err(format!("{label} ID filter is empty"));
-        }
-        let requested = raw_filter.split(',').map(str::trim).collect::<Vec<_>>();
-        if requested.iter().any(|id| id.is_empty()) {
-            return Err(format!("{label} ID filter contains an empty entry"));
-        }
-        let mut seen = BTreeMap::new();
-        for id in &requested {
-            if seen.insert(*id, ()).is_some() {
-                return Err(format!("{label} ID filter repeats {id}"));
-            }
-        }
-        let unknown = requested
-            .iter()
-            .copied()
-            .filter(|id| !supported_ids.contains(id))
-            .collect::<Vec<_>>();
-        if !unknown.is_empty() {
-            return Err(format!("unknown {label} IDs: {}", unknown.join(",")));
-        }
-        Ok(requested.into_iter().map(str::to_owned).collect())
     }
 
     fn text_action_fixtures() -> Vec<TextActionFixture> {
@@ -2633,841 +2301,10 @@ mod live_paired_eval {
         ])
     }
 
-    fn configure_cleanup_candidates(
-        mut candidates: Vec<CleanupCandidate>,
-        filter: Option<&str>,
-        preference: Option<&str>,
-    ) -> Vec<CleanupCandidate> {
-        if let Some(filter) = filter {
-            let requested: Vec<&str> = filter
-                .split(',')
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .collect();
-            candidates.retain(|candidate| requested.contains(&candidate.id));
-            assert!(
-                !candidates.is_empty(),
-                "live cleanup candidate filter did not match a supported candidate id"
-            );
-        }
-        if let Some(preference) = preference {
-            let preferred_ids: Vec<&str> = preference
-                .split(',')
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .collect();
-            candidates.sort_by_key(|candidate| {
-                preferred_ids
-                    .iter()
-                    .position(|id| *id == candidate.id)
-                    .unwrap_or(usize::MAX)
-            });
-        }
-        candidates
-    }
-
-    async fn run_cleanup_candidate(
-        candidate: &CleanupCandidate,
-        run: CleanupCandidateRun<'_>,
-    ) -> CleanupModelReport {
-        let CleanupCandidateRun {
-            cases,
-            blocked_reason,
-            resume_state,
-            checkpoint_path,
-            corpus_fingerprint,
-            cleanup_code_fingerprint,
-            pacer,
-        } = run;
-        let host = cleanup_host(candidate);
-        let mut settings = crate::store::Settings {
-            cleanup_provider: candidate.provider,
-            cleanup_model: candidate.model.clone(),
-            cleanup_base_url: candidate.base_url.clone(),
-            cleanup_intensity: "auto".into(),
-            cleanup_enabled: true,
-            ..crate::store::Settings::default()
-        };
-        settings.provider_api_keys.insert(
-            candidate.provider.as_str().to_owned(),
-            candidate.key.clone().unwrap_or_default(),
-        );
-        if candidate.provider == EngineProvider::Custom {
-            settings.custom_base_url = candidate.base_url.clone();
-            settings.custom_llm = true;
-        }
-
-        let mut results = Vec::with_capacity(cases.len());
-        let mut candidate_quality = QualityAccumulator::default();
-        let mut finalized_provider_quality = QualityAccumulator::default();
-        let mut all_path_quality = QualityAccumulator::default();
-        let mut provider_latencies = Vec::new();
-        let mut provider_wait_latencies = Vec::new();
-        let mut pacing_wait_latencies = Vec::new();
-        let mut retry_wait_latencies = Vec::new();
-        let mut preparation_latencies = Vec::new();
-        let mut finalize_latencies = Vec::new();
-        let mut total_latencies = Vec::new();
-        let mut provider_error_categories = BTreeMap::new();
-        let mut bypass_counts = BTreeMap::new();
-        let mut route_eligible_cases = 0usize;
-        let mut candidate_coverage_cases = 0usize;
-        let mut provider_invoked_cases = 0usize;
-        let mut provider_http_attempts = 0usize;
-        let mut rate_limit_retries = 0usize;
-        let mut rate_limit_retry_wait_ms = 0.0;
-        let mut resumed_candidate_samples = 0usize;
-        let mut provider_skipped_after_error_cases = 0usize;
-        let mut candidate_successes = 0usize;
-        let mut adapter_guard_rejections = 0usize;
-        let mut app_final_guard_rejections = 0usize;
-        let declared_protected_cases = cases
-            .iter()
-            .filter(|case| !case.protected.is_empty())
-            .count();
-        let declared_protected_spans = cases.iter().map(|case| case.protected.len()).sum();
-        let mut declared_protected_candidate_samples = 0usize;
-        let mut declared_protected_candidate_preserved = 0usize;
-        let mut declared_protected_candidate_span_samples = 0usize;
-        let mut declared_protected_candidate_spans_preserved = 0usize;
-        let mut declared_protected_final_samples = 0usize;
-        let mut declared_protected_final_preserved = 0usize;
-        let mut declared_protected_final_span_samples = 0usize;
-        let mut declared_protected_final_spans_preserved = 0usize;
-        let mixed_script_proxy_cases = cases
-            .iter()
-            .filter(|case| has_cjk(&case.input) && has_latin(&case.input))
-            .count();
-        let mut mixed_script_candidate_samples = 0usize;
-        let mut mixed_script_candidate_preserved = 0usize;
-        let mut mixed_script_final_samples = 0usize;
-        let mut mixed_script_final_preserved = 0usize;
-        let mut identity_candidate_cases = 0usize;
-        let mut identity_candidate_rewrites = 0usize;
-        let mut identity_final_rewrites = 0usize;
-        let blocked_before_start = blocked_reason.is_some();
-        let mut stop_category: Option<String> = blocked_reason;
-        let had_unverified_key = candidate.key.is_none();
-
-        for case in stratified_case_order(cases) {
-            let preparation_started = Instant::now();
-            let prepared = prepare_cleanup_case(case);
-            let preparation_ms = elapsed_ms(preparation_started);
-            preparation_latencies.push(preparation_ms);
-            let route = if prepared.snippet {
-                "snippet_bypass".to_owned()
-            } else {
-                match prepared.route {
-                    crate::lexicon::CleanupRoute::LocalOnly => "local_only".to_owned(),
-                    crate::lexicon::CleanupRoute::Provider(effort) => {
-                        format!("provider:{}", effort.as_label())
-                    }
-                }
-            };
-
-            let should_invoke = prepared.bypass.is_none()
-                && matches!(prepared.route, crate::lexicon::CleanupRoute::Provider(_));
-            route_eligible_cases += usize::from(should_invoke && case.mode != "provider-failure");
-            let endpoint = settings.cleanup_endpoint();
-            let model = settings.cleanup_request_model();
-            let policy = crate::cleanup_policy_for(&settings, &prepared.snapshot);
-            let effort = match prepared.route {
-                crate::lexicon::CleanupRoute::Provider(effort) => Some(effort),
-                crate::lexicon::CleanupRoute::LocalOnly => None,
-            };
-            let request_fingerprint = cleanup_request_fingerprint(
-                candidate,
-                case,
-                &prepared,
-                CleanupRequestFingerprintContext {
-                    endpoint: &endpoint,
-                    model: &model,
-                    policy: &policy,
-                    effort,
-                    corpus_fingerprint,
-                    cleanup_code_fingerprint,
-                },
-            );
-            let resumed = if should_invoke {
-                resume_candidate(resume_state, candidate.id, &case.id, &request_fingerprint)
-            } else {
-                None
-            };
-            let mut provider_invoked = false;
-            let mut resumed_candidate = false;
-            let mut provider_call_state = String::new();
-            let mut adapter_candidate = None;
-            let mut provider_ms = None;
-            let mut provider_wait_ms = 0.0;
-            let mut retry_wait_ms = 0.0;
-            let mut provider_attempts = 0usize;
-            let mut error_category = None;
-            let mut status = None;
-            let mut adapter_guard_rejected = false;
-            let decision = if prepared.snippet {
-                *bypass_counts.entry("snippet_bypass".into()).or_insert(0) += 1;
-                crate::CleanupDecision::Disabled
-            } else if case.mode == "provider-failure" && should_invoke {
-                provider_call_state = "simulated_provider_failure_no_live_call".into();
-                *bypass_counts
-                    .entry("simulated_provider_failure".into())
-                    .or_insert(0) += 1;
-                crate::CleanupDecision::Failed
-            } else if case.mode == "provider-failure" || !should_invoke {
-                if let Some(bypass) = prepared.bypass {
-                    provider_call_state = bypass.to_owned();
-                    *bypass_counts.entry(bypass.to_owned()).or_insert(0) += 1;
-                } else {
-                    provider_call_state = "production_route_local_only".into();
-                    *bypass_counts
-                        .entry("production_route_local_only".into())
-                        .or_insert(0) += 1;
-                }
-                crate::CleanupDecision::Disabled
-            } else if let Some(text) = resumed {
-                resumed_candidate = true;
-                resumed_candidate_samples += 1;
-                candidate_successes += 1;
-                provider_call_state = "resumed_compatible_adapter_candidate".into();
-                adapter_candidate = Some(text.clone());
-                crate::CleanupDecision::Provider(text)
-            } else if had_unverified_key {
-                provider_call_state = "not_verified_missing_key".into();
-                error_category = Some("no_explicit_key".into());
-                *bypass_counts
-                    .entry("not_verified_missing_key".into())
-                    .or_insert(0) += 1;
-                crate::CleanupDecision::Failed
-            } else if let Some(stopped) = stop_category.as_deref() {
-                provider_call_state = "not_called_after_provider_error".into();
-                error_category = Some(stopped.to_owned());
-                provider_skipped_after_error_cases += 1;
-                crate::CleanupDecision::Failed
-            } else {
-                let key = settings.cleanup_credential().to_owned();
-                let effort = effort.expect("provider routes have cleanup effort");
-                let mut call_total_ms = 0.0;
-                let mut retries_this_case = 0usize;
-                let result = loop {
-                    let pacing_wait = pacer.wait_before_request().await;
-                    let pacing_ms = duration_ms(pacing_wait);
-                    provider_wait_ms += pacing_ms;
-                    if pacing_ms > 0.0 {
-                        pacing_wait_latencies.push(pacing_ms);
-                    }
-                    if !provider_invoked {
-                        provider_invoked = true;
-                        provider_invoked_cases += 1;
-                    }
-                    provider_attempts += 1;
-                    provider_http_attempts += 1;
-                    let provider_started = Instant::now();
-                    let response =
-                        llm::cleanup_with_model_and_limits_and_language_and_profile_and_intent(
-                            &endpoint,
-                            &model,
-                            &prepared.intent.content,
-                            &key,
-                            &[],
-                            None,
-                            Some(&policy),
-                            Some("auto"),
-                            Some(&prepared.snapshot.profile),
-                            Some(&prepared.intent),
-                            prepared.pairs_hint.as_deref(),
-                            effort,
-                            None,
-                        )
-                        .await;
-                    let call_ms = elapsed_ms(provider_started);
-                    call_total_ms += call_ms;
-                    provider_latencies.push(call_ms);
-                    let retry_delay = match &response {
-                        Err(llm::LlmError::RateLimited(retry_after))
-                            if retries_this_case < RATE_LIMIT_RETRIES_PER_CASE =>
-                        {
-                            Some(bounded_retry_delay(retry_after))
-                        }
-                        _ => None,
-                    };
-                    if let Some(delay) = retry_delay {
-                        retries_this_case += 1;
-                        let wait_ms = duration_ms(delay);
-                        rate_limit_retries += 1;
-                        rate_limit_retry_wait_ms += wait_ms;
-                        retry_wait_ms += wait_ms;
-                        provider_wait_ms += wait_ms;
-                        retry_wait_latencies.push(wait_ms);
-                        tokio::time::sleep(delay).await;
-                        continue;
-                    }
-                    break response;
-                };
-                provider_ms = Some(call_total_ms);
-                match result {
-                    Ok((text, _limits)) => {
-                        candidate_successes += 1;
-                        candidate_coverage_cases += 1;
-                        provider_call_state = if provider_attempts > 1 {
-                            "adapter_candidate_returned_after_rate_limit_retry".into()
-                        } else {
-                            "adapter_candidate_returned".into()
-                        };
-                        adapter_candidate = Some(text.clone());
-                        resume_state.insert(
-                            candidate.id.to_owned(),
-                            case.id.clone(),
-                            request_fingerprint.clone(),
-                            text.clone(),
-                        );
-                        write_resume_checkpoint(
-                            checkpoint_path,
-                            resume_state,
-                            corpus_fingerprint,
-                            cleanup_code_fingerprint,
-                        );
-                        crate::CleanupDecision::Provider(text)
-                    }
-                    Err(error) => {
-                        let (category, http_status, is_guard_rejection, stop_after_error) =
-                            classify_llm_error(&error);
-                        error_category = Some(category.to_owned());
-                        status = http_status;
-                        *provider_error_categories
-                            .entry(category.to_owned())
-                            .or_insert(0) += 1;
-                        if is_guard_rejection {
-                            adapter_guard_rejections += 1;
-                            adapter_guard_rejected = true;
-                            provider_call_state =
-                                "adapter_guard_rejected_candidate_unavailable".into();
-                            crate::CleanupDecision::GuardRejected
-                        } else {
-                            provider_call_state = "provider_error_fallback".into();
-                            if stop_after_error {
-                                stop_category = Some(category.to_owned());
-                            }
-                            crate::CleanupDecision::Failed
-                        }
-                    }
-                }
-            };
-            if adapter_candidate.is_some() && resumed_candidate {
-                candidate_coverage_cases += 1;
-            }
-            if provider_wait_ms > 0.0 {
-                provider_wait_latencies.push(provider_wait_ms);
-            }
-
-            let finalize_started = Instant::now();
-            let finalized = super::grouped_production_eval::finalize(
-                &prepared.source,
-                decision,
-                prepared.family,
-                prepared.input_kind,
-                prepared.intent.operation,
-                true,
-            );
-            let finalize_ms = elapsed_ms(finalize_started);
-            finalize_latencies.push(finalize_ms);
-            if finalized.degraded_reason == Some("preservation_guard") {
-                app_final_guard_rejections += 1;
-            }
-
-            let candidate_protected = adapter_candidate.as_deref().map(|candidate| {
-                case.protected
-                    .iter()
-                    .all(|span| candidate.to_lowercase().contains(&span.to_lowercase()))
-            });
-            let final_protected = case
-                .protected
-                .iter()
-                .all(|span| finalized.text.to_lowercase().contains(&span.to_lowercase()));
-            if !case.protected.is_empty() {
-                if let Some(candidate_preserved) = candidate_protected {
-                    declared_protected_candidate_samples += 1;
-                    declared_protected_candidate_preserved += usize::from(candidate_preserved);
-                    let candidate = adapter_candidate
-                        .as_deref()
-                        .expect("candidate preservation is Some only for a candidate");
-                    for span in &case.protected {
-                        declared_protected_candidate_span_samples += 1;
-                        declared_protected_candidate_spans_preserved +=
-                            usize::from(candidate.to_lowercase().contains(&span.to_lowercase()));
-                    }
-                }
-                declared_protected_final_samples += 1;
-                declared_protected_final_preserved += usize::from(final_protected);
-                let finalized_lower = finalized.text.to_lowercase();
-                for span in &case.protected {
-                    declared_protected_final_span_samples += 1;
-                    declared_protected_final_spans_preserved +=
-                        usize::from(finalized_lower.contains(&span.to_lowercase()));
-                }
-            }
-
-            let mixed = has_cjk(&case.input) && has_latin(&case.input);
-            let candidate_mixed = adapter_candidate
-                .as_deref()
-                .map(|candidate| has_cjk(candidate) && has_latin(candidate));
-            let final_mixed = has_cjk(&finalized.text) && has_latin(&finalized.text);
-            if mixed {
-                if let Some(candidate_preserved) = candidate_mixed {
-                    mixed_script_candidate_samples += 1;
-                    mixed_script_candidate_preserved += usize::from(candidate_preserved);
-                }
-                mixed_script_final_samples += 1;
-                mixed_script_final_preserved += usize::from(final_mixed);
-            }
-            let identity_candidate_rewrite = if case.mode == "identity" {
-                adapter_candidate.as_deref().map(|candidate| {
-                    identity_candidate_cases += 1;
-                    let changed = candidate != prepared.source;
-                    identity_candidate_rewrites += usize::from(changed);
-                    changed
-                })
-            } else {
-                None
-            };
-            let identity_final_rewrite = if case.mode == "identity" && adapter_candidate.is_some() {
-                let changed = finalized.text != prepared.source;
-                identity_final_rewrites += usize::from(changed);
-                Some(changed)
-            } else {
-                None
-            };
-
-            let expected_metrics = QualityAccumulator::observation(case, &finalized.text);
-            all_path_quality.add(expected_metrics);
-            let final_reference_match = any_reference_match(case, &finalized.text);
-            let adapter_reference_match = adapter_candidate
-                .as_deref()
-                .map(|candidate| any_reference_match(case, candidate));
-            if let Some(candidate) = adapter_candidate.as_deref() {
-                let candidate_observation = QualityAccumulator::observation(case, candidate);
-                candidate_quality.add(candidate_observation);
-                let final_observation = QualityAccumulator::observation(case, &finalized.text);
-                finalized_provider_quality.add(final_observation);
-            }
-            let final_span_guard_preserved = crate::protected_span::preserves(
-                &prepared.source,
-                &finalized.text,
-                Some(prepared.intent.operation),
-            );
-            let total_ms = preparation_ms + provider_ms.unwrap_or(0.0) + finalize_ms;
-            total_latencies.push(total_ms);
-            results.push(CleanupCaseReport {
-                id: case.id.clone(),
-                group: case.group.clone(),
-                mode: case.mode.clone(),
-                cleanup: case.cleanup.clone(),
-                family: case.family.clone(),
-                focus_kind: case.focus_kind.clone(),
-                input: case.input.clone(),
-                request_fingerprint,
-                route,
-                provider_invoked,
-                resumed_candidate,
-                provider_call_state,
-                provider_attempts,
-                adapter_candidate,
-                final_text: finalized.text,
-                expected: case.expected.clone(),
-                adapter_candidate_reference_match: adapter_reference_match,
-                final_reference_match,
-                adapter_candidate_declared_protected_preserved: candidate_protected,
-                final_declared_protected_preserved: final_protected,
-                final_span_guard_preserved,
-                mixed_script_proxy_preserved: candidate_mixed,
-                identity_candidate_rewrite,
-                identity_final_rewrite,
-                adapter_guard_rejected,
-                app_final_guard_rejected: finalized.degraded_reason == Some("preservation_guard"),
-                error_category,
-                status,
-                preparation_ms,
-                provider_ms,
-                provider_wait_ms,
-                retry_wait_ms,
-                finalize_ms,
-                total_ms,
-            });
-        }
-
-        let all_candidates_covered =
-            route_eligible_cases > 0 && candidate_coverage_cases == route_eligible_cases;
-        let verification_status = if all_candidates_covered
-            && provider_invoked_cases == 0
-            && resumed_candidate_samples > 0
-        {
-            "resumed"
-        } else if all_candidates_covered {
-            "completed"
-        } else if stop_category.is_some() {
-            "partial"
-        } else if candidate.key.is_none() || blocked_before_start {
-            if candidate_coverage_cases > 0 {
-                "partial"
-            } else {
-                "not_verified"
-            }
-        } else if candidate_coverage_cases > 0 {
-            "partial"
-        } else {
-            "not_verified"
-        };
-        let mut timings = BTreeMap::new();
-        timings.insert("preparation".into(), timing_summary(preparation_latencies));
-        timings.insert("provider".into(), timing_summary(provider_latencies));
-        timings.insert(
-            "provider_wait".into(),
-            timing_summary(provider_wait_latencies),
-        );
-        timings.insert(
-            "request_pacing_wait".into(),
-            timing_summary(pacing_wait_latencies),
-        );
-        timings.insert(
-            "retry_after_wait".into(),
-            timing_summary(retry_wait_latencies),
-        );
-        timings.insert("finalize".into(), timing_summary(finalize_latencies));
-        timings.insert("total".into(), timing_summary(total_latencies));
-        CleanupModelReport {
-            candidate: candidate.id.into(),
-            provider: candidate.provider.as_str().into(),
-            model: candidate.model.clone(),
-            sanitized_host: host,
-            key_source: candidate.key_source.clone(),
-            verification_status: verification_status.into(),
-            stop_category,
-            route_eligible_cases,
-            candidate_coverage_cases,
-            candidate_coverage_rate: (route_eligible_cases != 0)
-                .then(|| candidate_coverage_cases as f64 / route_eligible_cases as f64),
-            provider_invoked_cases,
-            provider_http_attempts,
-            rate_limit_retries,
-            rate_limit_retry_wait_ms,
-            minimum_request_gap_ms: pacer.minimum_gap.as_millis().min(u64::MAX as u128) as u64,
-            resumed_candidate_samples,
-            provider_skipped_after_error_cases,
-            adapter_candidate_successes: candidate_successes,
-            adapter_guard_rejections,
-            app_final_guard_rejections,
-            provider_error_categories,
-            bypass_counts,
-            declared_protected_cases,
-            declared_protected_spans,
-            declared_protected_candidate_samples,
-            declared_protected_candidate_preserved,
-            declared_protected_candidate_span_samples,
-            declared_protected_candidate_spans_preserved,
-            declared_protected_final_samples,
-            declared_protected_final_preserved,
-            declared_protected_final_span_samples,
-            declared_protected_final_spans_preserved,
-            mixed_script_proxy_cases,
-            mixed_script_candidate_samples,
-            mixed_script_candidate_preserved,
-            mixed_script_final_samples,
-            mixed_script_final_preserved,
-            identity_candidate_cases,
-            identity_candidate_rewrites,
-            identity_final_rewrites,
-            adapter_candidate_quality: candidate_quality.summary(),
-            finalized_provider_success_quality: finalized_provider_quality.summary(),
-            all_path_final_quality: all_path_quality.summary(),
-            timings,
-            cases: results,
-        }
-    }
-
-    fn prepare_cleanup_case(case: &EvalCase) -> PreparedCleanupCase {
-        let family = corpus_family(case);
-        let input_kind = corpus_focus_kind(&case.focus_kind);
-        let mut snapshot = ContextSnapshot::general();
-        snapshot.profile.family = family;
-        snapshot.profile.confidence = 1.0;
-        snapshot.policy = ContextPolicy::for_family(family);
-        snapshot.policy.input_kind = input_kind;
-        let settings = crate::store::Settings {
-            cleanup_intensity: case.cleanup.clone(),
-            cleanup_enabled: case.mode != "ai-off",
-            ..crate::store::Settings::default()
-        };
-        if case.mode == "snippet" {
-            let snippet = crate::snippets::Snippet {
-                id: case.id.clone(),
-                trigger: case.input.clone(),
-                expansion: case.expected.clone(),
-                enabled: true,
-            };
-            let expanded =
-                crate::snippets::resolve_exact_with_clipboard(&[snippet], &case.input, None)
-                    .unwrap_or_default();
-            let intent = llm::parse_cleanup_intent(&expanded, None);
-            return PreparedCleanupCase {
-                family,
-                input_kind,
-                source: expanded,
-                intent,
-                pairs_hint: None,
-                snapshot,
-                route: crate::lexicon::CleanupRoute::LocalOnly,
-                bypass: Some("snippet_bypass"),
-                snippet: true,
-            };
-        }
-
-        let corrected = crate::prepare_spoken_transcript(&case.input, family, 1.0);
-        let (source, pairs_hint) = crate::prepare_lexicon_transcript_for_scene(
-            None,
-            &settings.dictionary,
-            &corrected,
-            family,
-            input_kind,
-        );
-        let intent =
-            llm::parse_cleanup_intent(&source, crate::spoken_translation_target(&settings));
-        let route = crate::cleanup_route_for(&settings, Some(&snapshot), &intent);
-        let bypass = match case.mode.as_str() {
-            "ai-off" => Some("cleanup_off"),
-            "provider-failure" if matches!(route, crate::lexicon::CleanupRoute::LocalOnly) => {
-                Some("provider_failure_but_local_route")
-            }
-            "snippet" => Some("snippet_bypass"),
-            _ => None,
-        };
-        PreparedCleanupCase {
-            family,
-            input_kind,
-            source,
-            intent,
-            pairs_hint,
-            snapshot,
-            route,
-            bypass,
-            snippet: false,
-        }
-    }
-
-    fn cleanup_host(candidate: &CleanupCandidate) -> String {
-        let base = if candidate.provider == EngineProvider::Groq {
-            String::new()
-        } else {
-            candidate.base_url.clone()
-        };
-        let endpoint = providers::resolve_llm_endpoint(candidate.provider, &base);
-        providers::host_of(&endpoint)
-    }
-
-    fn app_data_dir() -> PathBuf {
-        if let Some(path) = std::env::var_os("VOICEFLOW_EVAL_APP_DATA_DIR") {
-            return PathBuf::from(path);
-        }
-        if let Some(home) = std::env::var_os("HOME") {
-            return PathBuf::from(home)
-                .join("Library")
-                .join("Application Support")
-                .join("com.voiceflow.desktop");
-        }
-        PathBuf::from(".")
-    }
-
-    fn key_material(
-        key_env: &str,
-        file_env: &str,
-        default_file: Option<PathBuf>,
-    ) -> (Option<String>, String) {
-        if let Ok(value) = std::env::var(key_env) {
-            if !value.trim().is_empty() {
-                return (Some(value.trim().to_owned()), "explicit_environment".into());
-            }
-        }
-        if let Some(path) = std::env::var_os(file_env).map(PathBuf::from) {
-            let value = std::fs::read_to_string(path).ok();
-            return match value
-                .map(|value| value.trim().to_owned())
-                .filter(|value| !value.is_empty())
-            {
-                Some(value) => (Some(value), "explicit_key_file".into()),
-                None => (None, "explicit_key_file_unavailable".into()),
-            };
-        }
-        if let Some(path) = default_file {
-            let value = std::fs::read_to_string(path).ok();
-            return match value
-                .map(|value| value.trim().to_owned())
-                .filter(|value| !value.is_empty())
-            {
-                Some(value) => (Some(value), "app_data_sidecar".into()),
-                None => (None, "no_explicit_key".into()),
-            };
-        }
-        (None, "no_explicit_key".into())
-    }
-
-    fn model_override(name: &str, default: &str) -> String {
-        std::env::var(name)
-            .ok()
-            .map(|value| value.trim().to_owned())
-            .filter(|value| !value.is_empty() && value.len() <= 256)
-            .unwrap_or_else(|| default.to_owned())
-    }
-
     fn report_path(name: &str) -> PathBuf {
         std::env::var_os(name)
             .map(PathBuf::from)
             .unwrap_or_else(|| std::env::temp_dir().join("voiceflow-live-provider-eval.json"))
-    }
-
-    fn minimum_request_gap() -> Duration {
-        let milliseconds = std::env::var("VOICEFLOW_LIVE_MIN_REQUEST_GAP_MS")
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            .unwrap_or(DEFAULT_MIN_REQUEST_GAP_MS)
-            .min(5_000);
-        Duration::from_millis(milliseconds)
-    }
-
-    fn stable_fingerprint(parts: &[&[u8]]) -> String {
-        // FNV-1a is used as a stable compatibility fingerprint, not as a
-        // security boundary or a hash of credentials.
-        let mut hash = 0xcbf2_9ce4_8422_2325u64;
-        for part in parts {
-            for byte in *part {
-                hash ^= u64::from(*byte);
-                hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-            }
-            hash ^= 0xff;
-            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-        }
-        format!("fnv1a64:{hash:016x}")
-    }
-
-    fn cleanup_code_fingerprint() -> String {
-        let lib = include_str!("lib.rs");
-        let corpus_eval = include_str!("cleanup_corpus.rs");
-        let sources: &[(&[u8], &[u8])] = &[
-            (
-                b"request_builder_revision",
-                REQUEST_BUILDER_REVISION.as_bytes(),
-            ),
-            (
-                b"finalizer_context_and_guards",
-                source_between(
-                    lib,
-                    "pub(crate) struct FinalizationContext<'a> {",
-                    "fn scene_allows_automatic_lexicon(",
-                )
-                .as_bytes(),
-            ),
-            (
-                b"scene_cleanup_policy_translation",
-                source_between(
-                    lib,
-                    "fn scene_allows_automatic_lexicon(",
-                    "fn delivery_fallback_reason(",
-                )
-                .as_bytes(),
-            ),
-            (
-                b"preparation_functions",
-                source_between(
-                    lib,
-                    "pub(crate) fn load_learn_pairs(",
-                    "fn asr_prompt_for_snapshot(",
-                )
-                .as_bytes(),
-            ),
-            (
-                b"cleanup_routing",
-                source_between(lib, "fn cleanup_route_for(", "fn abort_processing_manager(")
-                    .as_bytes(),
-            ),
-            (
-                b"grouped_finalizer",
-                source_between(
-                    corpus_eval,
-                    "pub(super) fn finalize(",
-                    "fn context_snapshot(",
-                )
-                .as_bytes(),
-            ),
-            (b"llm.rs", include_str!("llm.rs").as_bytes()),
-            (b"context.rs", include_str!("context.rs").as_bytes()),
-            (b"providers.rs", include_str!("providers.rs").as_bytes()),
-            (b"store.rs", include_str!("store.rs").as_bytes()),
-            (b"lexicon.rs", include_str!("lexicon.rs").as_bytes()),
-            (
-                b"protected_span.rs",
-                include_str!("protected_span.rs").as_bytes(),
-            ),
-            (
-                b"spoken_layout.rs",
-                include_str!("spoken_layout.rs").as_bytes(),
-            ),
-            (
-                b"spoken_punctuation.rs",
-                include_str!("spoken_punctuation.rs").as_bytes(),
-            ),
-            (
-                b"spoken_revision.rs",
-                include_str!("spoken_revision.rs").as_bytes(),
-            ),
-            (b"snippets.rs", include_str!("snippets.rs").as_bytes()),
-            (b"queue.rs", include_str!("queue.rs").as_bytes()),
-        ];
-        let parts: Vec<&[u8]> = sources
-            .iter()
-            .flat_map(|(name, source)| [*name, *source])
-            .collect();
-        stable_fingerprint(&parts)
-    }
-
-    fn source_between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
-        let start_index = source
-            .find(start)
-            .unwrap_or_else(|| panic!("missing cleanup fingerprint section {start}"));
-        let content = &source[start_index..];
-        let end_index = content
-            .find(end)
-            .unwrap_or_else(|| panic!("missing cleanup fingerprint boundary {end}"));
-        &content[..end_index]
-    }
-
-    fn cleanup_request_fingerprint(
-        candidate: &CleanupCandidate,
-        case: &EvalCase,
-        prepared: &PreparedCleanupCase,
-        context: CleanupRequestFingerprintContext<'_>,
-    ) -> String {
-        let identity = CleanupRequestIdentity {
-            request_builder_revision: REQUEST_BUILDER_REVISION,
-            corpus_fingerprint: context.corpus_fingerprint,
-            cleanup_code_fingerprint: context.cleanup_code_fingerprint,
-            candidate: candidate.id,
-            provider: candidate.provider.as_str(),
-            model: context.model,
-            endpoint: context.endpoint,
-            case_id: &case.id,
-            group: &case.group,
-            mode: &case.mode,
-            cleanup: &case.cleanup,
-            family: &case.family,
-            focus_kind: &case.focus_kind,
-            source: &prepared.source,
-            request_content: &prepared.intent.content,
-            intent: &prepared.intent,
-            pairs_hint: prepared.pairs_hint.as_deref(),
-            profile: &prepared.snapshot.profile,
-            policy: context.policy,
-            effort: context.effort.map(crate::llm::CleanupEffort::as_label),
-            fixed_options: "dictionary=[];context=None;language=auto;visible_context=None;temperature=0;max_completion_tokens=4096;stream=true",
-        };
-        let bytes = serde_json::to_vec(&identity).expect("serialize cleanup request identity");
-        stable_fingerprint(&[&bytes])
     }
 
     fn load_resume_state(
@@ -3591,707 +2428,9 @@ mod live_paired_eval {
         state
     }
 
-    impl ResumeState {
-        fn insert(
-            &mut self,
-            candidate: String,
-            case_id: String,
-            request_fingerprint: String,
-            adapter_candidate: String,
-        ) {
-            self.cases_by_candidate
-                .entry(candidate)
-                .or_default()
-                .insert(
-                    case_id,
-                    ResumeCase {
-                        request_fingerprint,
-                        adapter_candidate,
-                    },
-                );
-        }
-    }
-
-    fn resume_candidate(
-        state: &ResumeState,
-        candidate: &str,
-        case_id: &str,
-        request_fingerprint: &str,
-    ) -> Option<String> {
-        state
-            .cases_by_candidate
-            .get(candidate)?
-            .get(case_id)
-            .filter(|previous| previous.request_fingerprint == request_fingerprint)
-            .map(|previous| previous.adapter_candidate.clone())
-    }
-
-    fn write_resume_checkpoint(
-        path: &Path,
-        state: &ResumeState,
-        corpus_fingerprint: &str,
-        cleanup_code_fingerprint: &str,
-    ) {
-        let candidates: Vec<ResumeCheckpointCandidate<'_>> = state
-            .cases_by_candidate
-            .iter()
-            .map(|(candidate, cases)| ResumeCheckpointCandidate {
-                candidate,
-                cases: cases
-                    .iter()
-                    .map(|(id, value)| ResumeCheckpointCase {
-                        id,
-                        request_fingerprint: &value.request_fingerprint,
-                        adapter_candidate: &value.adapter_candidate,
-                    })
-                    .collect(),
-            })
-            .collect();
-        let checkpoint = ResumeCheckpoint {
-            schema_version: REPORT_SCHEMA_VERSION,
-            corpus_fingerprint,
-            cleanup_code_fingerprint,
-            checkpoint_candidates: candidates,
-        };
-        let bytes = serde_json::to_vec_pretty(&checkpoint).expect("serialize live checkpoint");
-        atomic_write(path, &bytes).expect("write live cleanup checkpoint");
-    }
-
-    fn unique_output_path(path: &Path, reserved: Option<&Path>) -> PathBuf {
-        if !path.exists() && reserved != Some(path) {
-            return path.to_path_buf();
-        }
-        for index in 2..10_000 {
-            let candidate = with_path_suffix(path, "run", index);
-            if !candidate.exists() && reserved != Some(candidate.as_path()) {
-                return candidate;
-            }
-        }
-        panic!("unable to choose a unique external evaluation output path");
-    }
-
-    fn with_path_suffix(path: &Path, suffix: &str, index: usize) -> PathBuf {
-        let parent = path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
-        let file_name = path
-            .file_name()
-            .and_then(|value| value.to_str())
-            .unwrap_or("voiceflow-live-eval.json");
-        let file_path = Path::new(file_name);
-        let stem = file_path
-            .file_stem()
-            .and_then(|value| value.to_str())
-            .unwrap_or(file_name);
-        let extension = file_path.extension().and_then(|value| value.to_str());
-        let name = match extension {
-            Some(extension) => format!("{stem}.{suffix}-{index}.{extension}"),
-            None => format!("{stem}.{suffix}-{index}"),
-        };
-        parent.join(name)
-    }
-
-    fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-        if let Some(parent) = path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-        {
-            std::fs::create_dir_all(parent)?;
-        }
-        let mut temporary = with_path_suffix(path, "tmp", 1);
-        let mut index = 2;
-        while temporary.exists() {
-            temporary = with_path_suffix(path, "tmp", index);
-            index += 1;
-        }
-        std::fs::write(&temporary, bytes)?;
-        std::fs::rename(temporary, path)
-    }
-
-    struct RequestPacer {
-        minimum_gap: Duration,
-        last_request_started: Option<Instant>,
-    }
-
-    impl RequestPacer {
-        fn new(minimum_gap: Duration) -> Self {
-            Self {
-                minimum_gap,
-                last_request_started: None,
-            }
-        }
-
-        async fn wait_before_request(&mut self) -> Duration {
-            let Some(last_started) = self.last_request_started else {
-                self.last_request_started = Some(Instant::now());
-                return Duration::ZERO;
-            };
-            let remaining = self.minimum_gap.saturating_sub(last_started.elapsed());
-            if !remaining.is_zero() {
-                tokio::time::sleep(remaining).await;
-            }
-            self.last_request_started = Some(Instant::now());
-            remaining
-        }
-    }
-
-    fn bounded_retry_delay(value: &str) -> Duration {
-        crate::queue::bounded_retry_after(Some(value)).unwrap_or(Duration::from_secs(1))
-    }
-
-    fn duration_ms(duration: Duration) -> f64 {
-        duration.as_secs_f64() * 1_000.0
-    }
-
-    fn stratified_case_order(cases: &[EvalCase]) -> Vec<&EvalCase> {
-        let mut mixed = Vec::new();
-        let mut chinese = Vec::new();
-        let mut identity = Vec::new();
-        let mut remaining = Vec::new();
-        for case in cases {
-            if case.group == "mixed" || (has_cjk(&case.input) && has_latin(&case.input)) {
-                mixed.push(case);
-            } else if case.group == "chinese" || has_cjk(&case.input) {
-                chinese.push(case);
-            } else if case.mode == "identity" {
-                identity.push(case);
-            } else {
-                remaining.push(case);
-            }
-        }
-        let mut ordered = Vec::with_capacity(cases.len());
-        let bucket_count = mixed
-            .len()
-            .max(chinese.len())
-            .max(identity.len())
-            .max(remaining.len());
-        for index in 0..bucket_count {
-            if let Some(case) = mixed.get(index) {
-                ordered.push(*case);
-            }
-            if let Some(case) = chinese.get(index) {
-                ordered.push(*case);
-            }
-            if let Some(case) = identity.get(index) {
-                ordered.push(*case);
-            }
-            if let Some(case) = remaining.get(index) {
-                ordered.push(*case);
-            }
-        }
-        ordered
-    }
-
-    fn write_json_report<T: Serialize>(path: &Path, report: &T) {
-        let json = serde_json::to_vec_pretty(report).expect("serialize live report");
-        atomic_write(path, &json).expect("write external live report");
-    }
-
     fn read_audio_manifest(path: &Path) -> AudioManifest {
         let bytes = std::fs::read(path).expect("read external synthetic audio manifest");
         serde_json::from_slice(&bytes).expect("valid external synthetic audio manifest")
-    }
-
-    fn asr_candidates() -> Vec<AsrCandidate> {
-        let app_data = app_data_dir();
-        let groq_key = key_material(
-            "VOICEFLOW_EVAL_GROQ_API_KEY",
-            "VOICEFLOW_EVAL_GROQ_KEY_FILE",
-            Some(app_data.join("secrets/api_key")),
-        );
-        let openai_key = key_material(
-            "VOICEFLOW_EVAL_OPENAI_API_KEY",
-            "VOICEFLOW_EVAL_OPENAI_KEY_FILE",
-            Some(app_data.join("secrets/provider_openai")),
-        );
-        let qwen_key = key_material(
-            "VOICEFLOW_EVAL_QWEN_API_KEY",
-            "VOICEFLOW_EVAL_QWEN_KEY_FILE",
-            None,
-        );
-        let mut candidates = Vec::new();
-        for (id, model) in [
-            (
-                "groq_whisper_large_v3_turbo",
-                model_override(
-                    "VOICEFLOW_EVAL_GROQ_ASR_PRIMARY_MODEL",
-                    "whisper-large-v3-turbo",
-                ),
-            ),
-            (
-                "groq_whisper_large_v3",
-                model_override(
-                    "VOICEFLOW_EVAL_GROQ_ASR_SECONDARY_MODEL",
-                    "whisper-large-v3",
-                ),
-            ),
-        ] {
-            candidates.push(asr_candidate(
-                id,
-                "groq",
-                model,
-                EngineProvider::Groq.default_base_url(),
-                groq_key.clone(),
-            ));
-        }
-        candidates.push(asr_candidate(
-            "openai_gpt_transcribe",
-            "openai",
-            model_override("VOICEFLOW_EVAL_OPENAI_ASR_MODEL", "gpt-transcribe"),
-            EngineProvider::OpenAi.default_base_url(),
-            openai_key,
-        ));
-        candidates.push(asr_candidate(
-            "qwen3_asr_flash_dashscope",
-            "qwen",
-            model_override("VOICEFLOW_EVAL_QWEN_ASR_MODEL", "qwen3-asr-flash"),
-            QWEN_ASR_BASE,
-            qwen_key,
-        ));
-        candidates
-    }
-
-    fn asr_candidate(
-        id: &'static str,
-        provider: &'static str,
-        model: String,
-        base: &str,
-        key: (Option<String>, String),
-    ) -> AsrCandidate {
-        let engine_provider = match provider {
-            "groq" => EngineProvider::Groq,
-            "openai" => EngineProvider::OpenAi,
-            "qwen" => EngineProvider::Custom,
-            _ => unreachable!(),
-        };
-        let endpoint = providers::resolve_asr_endpoint(engine_provider, base)
-            .expect("HTTP ASR candidate must have an endpoint");
-        let host = providers::host_of(&endpoint);
-        AsrCandidate {
-            id,
-            provider,
-            model,
-            endpoint,
-            host,
-            key: key.0,
-            key_source: key.1,
-        }
-    }
-
-    async fn run_asr_candidate(
-        candidate: &AsrCandidate,
-        manifest_path: &Path,
-        manifest: &AudioManifest,
-        blocked_reason: Option<String>,
-    ) -> AsrModelReport {
-        let mut raw_quality = QualityAccumulator::default();
-        let mut sanitized_quality = QualityAccumulator::default();
-        let mut latencies = Vec::new();
-        let mut results = Vec::new();
-        let mut errors = BTreeMap::new();
-        let mut invoked = 0usize;
-        let mut successful = 0usize;
-        let mut no_speech = 0usize;
-        let blocked_before_start = blocked_reason.is_some();
-        let mut stop_category = blocked_reason;
-        for fixture in &manifest.cases {
-            let mut result = AsrCaseReport {
-                id: fixture.id.clone(),
-                reference: fixture.reference.clone(),
-                provider_invoked: false,
-                transcription_state: String::new(),
-                raw_asr_text: None,
-                sanitized_text: None,
-                detected_language: None,
-                confidence: None,
-                segment_count: None,
-                word_count: None,
-                error_category: None,
-                status: None,
-                latency_ms: None,
-            };
-            if candidate.key.is_none() {
-                result.transcription_state = "not_verified_missing_key".into();
-                result.error_category = Some("no_explicit_key".into());
-                *errors.entry("no_explicit_key".into()).or_insert(0) += 1;
-                results.push(result);
-                continue;
-            }
-            if let Some(stopped) = stop_category.as_deref() {
-                result.transcription_state = "not_called_after_provider_error".into();
-                result.error_category = Some(stopped.to_owned());
-                *errors.entry(stopped.to_owned()).or_insert(0) += 1;
-                results.push(result);
-                continue;
-            }
-            let audio_path = safe_audio_fixture_path(manifest_path, &fixture.audio);
-            let audio = std::fs::read(audio_path).expect("read synthetic WAV fixture");
-            result.provider_invoked = true;
-            invoked += 1;
-            let provider = GroqAsrProvider::from_resolved_endpoint(&candidate.endpoint);
-            let started = Instant::now();
-            let response = provider
-                .transcribe_batch(
-                    audio,
-                    AsrOptions {
-                        api_key: candidate.key.clone().unwrap_or_default(),
-                        language: None,
-                        prompt: Some("VoiceFlow, TypeScript, API".into()),
-                        keywords: vec!["VoiceFlow".into(), "TypeScript".into(), "API".into()],
-                        model: candidate.model.clone(),
-                    },
-                )
-                .await;
-            let elapsed = elapsed_ms(started);
-            result.latency_ms = Some(elapsed);
-            latencies.push(elapsed);
-            match response {
-                Ok(transcript) => {
-                    successful += 1;
-                    result.transcription_state = "transcribed".into();
-                    let raw_text = transcript.original_text().to_owned();
-                    let sanitized_text = transcript.text.clone();
-                    result.raw_asr_text = Some(raw_text.clone());
-                    result.sanitized_text = Some(sanitized_text.clone());
-                    result.detected_language = transcript.language.clone();
-                    result.confidence = transcript.confidence;
-                    result.segment_count = Some(transcript.segments.len());
-                    result.word_count = Some(transcript.words.len());
-                    raw_quality.add(quality_for_pair(&fixture.reference, &[], &raw_text));
-                    sanitized_quality.add(quality_for_pair(
-                        &fixture.reference,
-                        &[],
-                        &sanitized_text,
-                    ));
-                }
-                Err(AsrError::EmptyResult) => {
-                    no_speech += 1;
-                    successful += 1;
-                    result.transcription_state = "empty_result".into();
-                    result.raw_asr_text = Some(String::new());
-                    result.sanitized_text = Some(String::new());
-                    raw_quality.add(quality_for_pair(&fixture.reference, &[], ""));
-                    sanitized_quality.add(quality_for_pair(&fixture.reference, &[], ""));
-                }
-                Err(error) => {
-                    let (category, http_status, should_stop) = classify_asr_error(&error);
-                    result.transcription_state = "provider_error".into();
-                    result.error_category = Some(category.to_owned());
-                    result.status = http_status;
-                    *errors.entry(category.to_owned()).or_insert(0) += 1;
-                    if should_stop {
-                        stop_category = Some(category.to_owned());
-                    }
-                }
-            }
-            results.push(result);
-        }
-        let verification_status = if candidate.key.is_none() || blocked_before_start {
-            "not_verified"
-        } else if stop_category.is_some() {
-            "partial"
-        } else {
-            "completed"
-        };
-        AsrModelReport {
-            candidate: candidate.id.into(),
-            provider: candidate.provider.into(),
-            model: candidate.model.clone(),
-            sanitized_host: candidate.host.clone(),
-            key_source: candidate.key_source.clone(),
-            verification_status: verification_status.into(),
-            stop_category,
-            provider_invoked_cases: invoked,
-            successful_transcriptions: successful,
-            no_speech_results: no_speech,
-            error_categories: errors,
-            raw_asr_quality: raw_quality.summary(),
-            sanitized_text_quality: sanitized_quality.summary(),
-            timings: timing_summary(latencies),
-            cases: results,
-        }
-    }
-
-    fn safe_audio_fixture_path(manifest_path: &Path, audio: &str) -> PathBuf {
-        let relative = Path::new(audio);
-        assert!(
-            !relative.is_absolute()
-                && relative.components().count() == 1
-                && relative.extension().and_then(|value| value.to_str()) == Some("wav"),
-            "audio manifest entries must be WAV filenames adjacent to the manifest"
-        );
-        manifest_path
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .join(relative)
-    }
-
-    fn classify_llm_error(error: &llm::LlmError) -> (&'static str, Option<u16>, bool, bool) {
-        match error {
-            llm::LlmError::Network(_) => ("network_error", None, false, true),
-            llm::LlmError::Timeout => ("timeout", None, false, true),
-            llm::LlmError::Unauthorized => ("authorization_error", Some(401), false, true),
-            llm::LlmError::RateLimited(_) => ("rate_limited", Some(429), false, true),
-            llm::LlmError::ContextAuthorizationChanged => {
-                ("context_authorization_changed", None, true, true)
-            }
-            llm::LlmError::Server(message) => {
-                ("server_error", parse_http_status(message), false, true)
-            }
-            llm::LlmError::Other(_) if llm::is_preservation_guard_error(error) => {
-                ("adapter_guard_rejected", None, true, false)
-            }
-            llm::LlmError::Other(message) => {
-                let status = parse_http_status(message);
-                if status.is_some() {
-                    ("http_error", status, false, true)
-                } else {
-                    ("provider_response_error", None, false, true)
-                }
-            }
-        }
-    }
-
-    fn classify_asr_error(error: &AsrError) -> (&'static str, Option<u16>, bool) {
-        match error {
-            AsrError::Network(_) => ("network_error", None, true),
-            AsrError::Timeout => ("timeout", None, true),
-            AsrError::Unauthorized(_) => ("authorization_error", Some(401), true),
-            AsrError::RateLimited(_) => ("rate_limited", Some(429), true),
-            AsrError::RetryableServer { message, .. } => {
-                ("server_error", parse_http_status(message), true)
-            }
-            AsrError::Server(message) => ("server_error", parse_http_status(message), true),
-            AsrError::EmptyResult => ("no_speech", None, false),
-            AsrError::ContextAuthorizationChanged => ("context_authorization_changed", None, true),
-            AsrError::OnDeviceModelMissing(_) => ("on_device_model_missing", None, true),
-            AsrError::OnDeviceInferenceUnavailable(_) => {
-                ("on_device_inference_unavailable", None, true)
-            }
-            AsrError::Other(message) => {
-                let status = parse_http_status(message);
-                if status.is_some() {
-                    ("http_error", status, true)
-                } else {
-                    ("provider_response_error", None, true)
-                }
-            }
-        }
-    }
-
-    fn parse_http_status(message: &str) -> Option<u16> {
-        let marker = "HTTP status ";
-        let start = message.find(marker)? + marker.len();
-        let digits: String = message[start..]
-            .chars()
-            .take_while(char::is_ascii_digit)
-            .collect();
-        if digits.len() == 3 {
-            digits.parse().ok()
-        } else {
-            None
-        }
-    }
-
-    fn quality_for_pair(
-        reference: &str,
-        variants: &[String],
-        candidate: &str,
-    ) -> QualityObservation {
-        let mut refs = Vec::with_capacity(variants.len() + 1);
-        refs.push(reference);
-        refs.extend(variants.iter().map(String::as_str));
-        let reference_matches = refs.contains(&candidate);
-        let (char_edits, ref_characters) = best_normalized_distance(&refs, candidate, false);
-        let (word_edits, ref_words) = best_normalized_distance(&refs, candidate, true);
-        QualityObservation {
-            reference_matches,
-            char_edits,
-            ref_characters,
-            word_edits,
-            ref_words,
-        }
-    }
-
-    impl QualityAccumulator {
-        fn observation(case: &EvalCase, candidate: &str) -> QualityObservation {
-            quality_for_pair(&case.expected, &case.reference_variants, candidate)
-        }
-
-        fn add(&mut self, observation: QualityObservation) {
-            self.sample_count += 1;
-            self.reference_matches += usize::from(observation.reference_matches);
-            self.character_edits += observation.char_edits;
-            self.reference_characters += observation.ref_characters;
-            self.word_edits += observation.word_edits;
-            self.reference_words += observation.ref_words;
-        }
-
-        fn summary(&self) -> QualitySummary {
-            QualitySummary {
-                sample_count: self.sample_count,
-                any_variant_reference_matches: self.reference_matches,
-                any_variant_reference_match_rate: (self.sample_count != 0)
-                    .then(|| self.reference_matches as f64 / self.sample_count as f64),
-                character_edits_min_variant: self.character_edits,
-                reference_codepoints_min_variant: self.reference_characters,
-                character_error_rate_min_variant: (self.sample_count != 0)
-                    .then(|| self.character_edits as f64 / self.reference_characters.max(1) as f64),
-                word_edits_min_variant: self.word_edits,
-                reference_words_min_variant: self.reference_words,
-                word_error_rate_min_variant: (self.sample_count != 0)
-                    .then(|| self.word_edits as f64 / self.reference_words.max(1) as f64),
-            }
-        }
-    }
-
-    struct QualityObservation {
-        reference_matches: bool,
-        char_edits: usize,
-        ref_characters: usize,
-        word_edits: usize,
-        ref_words: usize,
-    }
-
-    fn any_reference_match(case: &EvalCase, actual: &str) -> bool {
-        case.expected == actual || case.reference_variants.iter().any(|item| item == actual)
-    }
-
-    fn best_normalized_distance(
-        references: &[&str],
-        candidate: &str,
-        words: bool,
-    ) -> (usize, usize) {
-        if words {
-            let candidate_tokens = normalized_words(candidate);
-            let mut best: Option<(usize, usize, f64)> = None;
-            for reference in references {
-                let reference_tokens = normalized_words(reference);
-                let edits = levenshtein(&reference_tokens, &candidate_tokens);
-                let denominator = reference_tokens.len().max(1);
-                let rate = edits as f64 / denominator as f64;
-                if best.is_none_or(|(_, _, best_rate)| rate < best_rate) {
-                    best = Some((edits, reference_tokens.len(), rate));
-                }
-            }
-            best.map(|(edits, count, _)| (edits, count))
-                .unwrap_or((0, 0))
-        } else {
-            let candidate_tokens = normalized_characters(candidate);
-            let mut best: Option<(usize, usize, f64)> = None;
-            for reference in references {
-                let reference_tokens = normalized_characters(reference);
-                let edits = levenshtein(&reference_tokens, &candidate_tokens);
-                let denominator = reference_tokens.len().max(1);
-                let rate = edits as f64 / denominator as f64;
-                if best.is_none_or(|(_, _, best_rate)| rate < best_rate) {
-                    best = Some((edits, reference_tokens.len(), rate));
-                }
-            }
-            best.map(|(edits, count, _)| (edits, count))
-                .unwrap_or((0, 0))
-        }
-    }
-
-    fn normalized_characters(value: &str) -> Vec<char> {
-        value
-            .chars()
-            .filter(|ch| ch.is_alphanumeric())
-            .flat_map(char::to_lowercase)
-            .collect()
-    }
-
-    fn normalized_words(value: &str) -> Vec<String> {
-        let mut words = Vec::new();
-        let mut current = String::new();
-        for ch in value.chars() {
-            if is_cjk(ch) {
-                if !current.is_empty() {
-                    words.push(std::mem::take(&mut current));
-                }
-                words.push(ch.to_lowercase().collect());
-            } else if ch.is_alphanumeric() {
-                current.extend(ch.to_lowercase());
-            } else if !current.is_empty() {
-                words.push(std::mem::take(&mut current));
-            }
-        }
-        if !current.is_empty() {
-            words.push(current);
-        }
-        words
-    }
-
-    fn is_cjk(ch: char) -> bool {
-        matches!(ch, '\u{3400}'..='\u{4DBF}' | '\u{4E00}'..='\u{9FFF}' | '\u{F900}'..='\u{FAFF}')
-    }
-
-    fn has_cjk(value: &str) -> bool {
-        value.chars().any(is_cjk)
-    }
-
-    fn has_latin(value: &str) -> bool {
-        value.chars().any(|ch| ch.is_ascii_alphabetic())
-    }
-
-    fn levenshtein<T: Eq>(reference: &[T], candidate: &[T]) -> usize {
-        let mut previous: Vec<usize> = (0..=candidate.len()).collect();
-        for (row, left) in reference.iter().enumerate() {
-            let mut current = vec![row + 1; candidate.len() + 1];
-            for (column, right) in candidate.iter().enumerate() {
-                current[column + 1] = (previous[column + 1] + 1)
-                    .min(current[column] + 1)
-                    .min(previous[column] + usize::from(left != right));
-            }
-            previous = current;
-        }
-        previous[candidate.len()]
-    }
-
-    fn timing_summary(mut samples: Vec<f64>) -> TimingSummary {
-        samples.sort_by(f64::total_cmp);
-        TimingSummary {
-            sample_count: samples.len(),
-            p50_ms: percentile(&samples, 0.50),
-            p95_ms: percentile(&samples, 0.95),
-        }
-    }
-
-    fn percentile(sorted: &[f64], proportion: f64) -> Option<f64> {
-        if sorted.is_empty() {
-            return None;
-        }
-        let index = ((sorted.len() as f64 * proportion).ceil() as usize)
-            .saturating_sub(1)
-            .min(sorted.len() - 1);
-        Some(sorted[index])
-    }
-
-    fn elapsed_ms(started: Instant) -> f64 {
-        started.elapsed().as_secs_f64() * 1_000.0
-    }
-
-    fn corpus_family(case: &EvalCase) -> ContextFamily {
-        crate::context::builtin_family_for_id(&case.family)
-            .unwrap_or_else(|| panic!("unknown family {}", case.family))
-    }
-
-    fn corpus_focus_kind(value: &str) -> FocusKind {
-        match value {
-            "secure" => FocusKind::Secure,
-            "search" => FocusKind::Search,
-            "code" => FocusKind::Code,
-            "coding_prompt" => FocusKind::CodingPrompt,
-            "terminal" => FocusKind::Terminal,
-            "email" => FocusKind::Email,
-            "chat" => FocusKind::Chat,
-            "document" => FocusKind::Document,
-            "form" => FocusKind::Form,
-            "editable" => FocusKind::Editable,
-            "unknown" => FocusKind::Unknown,
-            other => panic!("unknown focus kind {other}"),
-        }
     }
 
     #[test]

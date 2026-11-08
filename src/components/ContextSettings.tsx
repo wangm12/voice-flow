@@ -1,3 +1,4 @@
+import { useSessionDraftState } from "../lib/sessionDraft";
 import { Autocomplete } from "./Autocomplete";
 import { Select } from "./Select";
 import { useEffect, useRef, useState } from "react";
@@ -11,6 +12,7 @@ import { IconButton } from "./IconButton";
 import { Toggle } from "./Toggle";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { WritingPreview } from "./WritingPreview";
+import { ContextLesson, SceneLesson } from "./Onboarding/ContextualLessons";
 import { SettingsAlert, SettingsDisclosure, SettingsGroup, SettingsPageHeader, SettingsRow, SettingsShell, type SettingsSaveFailure } from "./SettingsLayout";
 import { translationLanguageOptions } from "../lib/translationLanguages";
 import type { ProviderId } from "../lib/providers";
@@ -282,6 +284,9 @@ export function ContextSettings({
   automationOnly = false,
   saveFailure,
   combined = false,
+  onOpenPermissions,
+  onOpenMappings,
+  onOpenDictionary,
   outputMode,
   translationTargetLanguage,
   onOutputModeChange,
@@ -306,6 +311,9 @@ export function ContextSettings({
   automationOnly?: boolean;
   saveFailure?: SettingsSaveFailure | null;
   combined?: boolean;
+  onOpenPermissions?: () => void;
+  onOpenMappings?: () => void;
+  onOpenDictionary?: () => void;
   outputMode?: string;
   translationTargetLanguage?: string;
   onOutputModeChange?: (outputMode: string) => void;
@@ -326,33 +334,35 @@ export function ContextSettings({
   onAccurateAsrBaseUrlChange?: (url: string) => void;
 }) {
   const { t } = useI18n();
+  const draftKey = automationOnly && !combined ? "smart" : "writing";
   const [snapshot, setSnapshot] = useState<ContextSnapshot | null>(null);
   const [mappings, setMappings] = useState<ContextMapping[]>([]);
   const [applications, setApplications] = useState<ApplicationOption[]>([]);
-  const [selectedApplicationId, setSelectedApplicationId] = useState("");
-  const [selectedExecutable, setSelectedExecutable] = useState("");
-  const [selectedWebsite, setSelectedWebsite] = useState("");
-  const [browserPathPrefix, setBrowserPathPrefix] = useState("");
-  const [focusedField, setFocusedField] = useState<FocusKind | "">("");
-  const [editingMappingId, setEditingMappingId] = useState<string | null>(null);
-  const [sourcePermissions, setSourcePermissions] = useState<ContextSourcePermissions>({
+  const [selectedApplicationId, setSelectedApplicationId] = useSessionDraftState(`${draftKey}:selectedApplicationId`, "");
+  const [selectedExecutable, setSelectedExecutable] = useSessionDraftState(`${draftKey}:selectedExecutable`, "");
+  const [selectedWebsite, setSelectedWebsite] = useSessionDraftState(`${draftKey}:selectedWebsite`, "");
+  const [browserPathPrefix, setBrowserPathPrefix] = useSessionDraftState(`${draftKey}:browserPathPrefix`, "");
+  const [focusedField, setFocusedField] = useSessionDraftState<FocusKind | "">(`${draftKey}:focusedField`, "");
+  const [editingMappingId, setEditingMappingId] = useSessionDraftState<string | null>(`${draftKey}:editingMappingId`, null);
+  const [sourcePermissions, setSourcePermissions] = useSessionDraftState<ContextSourcePermissions>(`${draftKey}:sourcePermissions`, {
     ax_text: false,
     local_ocr: false,
     cloud_vision: false,
     context_text_to_providers: false,
   });
-  const [selectedModeId, setSelectedModeId] = useState("general");
-  const [styleExampleInput, setStyleExampleInput] = useState("");
-  const [styleExampleOutput, setStyleExampleOutput] = useState("");
-  const [styleExamplesApproved, setStyleExamplesApproved] = useState(false);
-  const [mappingIntensity, setMappingIntensity] = useState<"inherit" | "auto" | "off" | "light" | "standard" | "heavy">("inherit");
-  const [mappingCleanupEnabled, setMappingCleanupEnabled] = useState(true);
-  const [mappingLearnEnabled, setMappingLearnEnabled] = useState(true);
-  const [writingModes, setWritingModes] = useState<WritingMode[]>(managedWritingModes);
-  const [draftModeId, setDraftModeId] = useState<string | null>(null);
-  const [editingModeId, setEditingModeId] = useState("general");
-  const [modeLabelDraft, setModeLabelDraft] = useState("");
-  const [modePromptDraft, setModePromptDraft] = useState("");
+  const [selectedModeId, setSelectedModeId] = useSessionDraftState(`${draftKey}:selectedModeId`, "general");
+  const [styleExampleInput, setStyleExampleInput] = useSessionDraftState(`${draftKey}:styleExampleInput`, "");
+  const [styleExampleOutput, setStyleExampleOutput] = useSessionDraftState(`${draftKey}:styleExampleOutput`, "");
+  const [removeStyleExamples, setRemoveStyleExamples] = useSessionDraftState(`${draftKey}:removeStyleExamples`, false);
+  const [styleExamplesApproved, setStyleExamplesApproved] = useSessionDraftState(`${draftKey}:styleExamplesApproved`, false);
+  const [mappingIntensity, setMappingIntensity] = useSessionDraftState<"inherit" | "auto" | "off" | "light" | "standard" | "heavy">(`${draftKey}:mappingIntensity`, "inherit");
+  const [mappingCleanupEnabled, setMappingCleanupEnabled] = useSessionDraftState(`${draftKey}:mappingCleanupEnabled`, true);
+  const [mappingLearnEnabled, setMappingLearnEnabled] = useSessionDraftState(`${draftKey}:mappingLearnEnabled`, true);
+  const [writingModes, setWritingModes] = useSessionDraftState<WritingMode[]>(`${draftKey}:writingModes`, managedWritingModes);
+  const [draftModeId, setDraftModeId] = useSessionDraftState<string | null>(`${draftKey}:draftModeId`, null);
+  const [editingModeId, setEditingModeId] = useSessionDraftState(`${draftKey}:editingModeId`, "general");
+  const [modeLabelDraft, setModeLabelDraft] = useSessionDraftState(`${draftKey}:modeLabelDraft`, "");
+  const [modePromptDraft, setModePromptDraft, restoredPrompt] = useSessionDraftState(`${draftKey}:modePromptDraft`, "");
   const [applicationsLoading, setApplicationsLoading] = useState(true);
   const [enabled, setEnabled] = useState(true);
   const [overrideFamily, setOverrideFamily] = useState<ContextFamily | null>(null);
@@ -362,8 +372,10 @@ export function ContextSettings({
   const [promptErrorPlacement, setPromptErrorPlacement] = useState<"preview" | "prompt">("preview");
   const mappingDetailsRef = useRef<HTMLDetailsElement>(null);
   const editingModeSelectRef = useRef<HTMLButtonElement>(null);
+  const modePromptRef = useRef<HTMLTextAreaElement>(null);
   const confirmationFocusRef = useRef<HTMLElement | null>(null);
-  const previousManagedModesRef = useRef(managedWritingModes);
+  const [managedModesSnapshot, setManagedModesSnapshot] = useSessionDraftState(`${draftKey}:savedModes`, managedWritingModes);
+  const previousManagedModesRef = useRef(managedModesSnapshot);
   const [busyAction, setBusyAction] = useState<"context" | "browser" | "override" | "applications" | "mapping" | "delete_mapping" | null>(null);
   const busy = busyAction !== null;
   useEffect(() => {
@@ -381,12 +393,19 @@ export function ContextSettings({
   const editingMode = writingModes.find((mode) => mode.id === editingModeId) ?? writingModes[0];
   const editingModeLabel = editingMode?.builtin ? editingMode.label : modeLabelDraft;
   const modeIsDirty = Boolean(editingMode && (editingModeLabel !== editingMode.label || modePromptDraft !== editingMode.prompt));
+  const guideDestinations = { permissions: onOpenPermissions, mappings: onOpenMappings, dictionary: onOpenDictionary };
+  const openGuideDestination = (destination: keyof typeof guideDestinations) => {
+    const navigate = guideDestinations[destination];
+    if (!navigate || busy) return;
+    navigate();
+  };
 
   useEffect(() => {
     // Only reconcile an incoming settings snapshot. Local saves must not be
     // replaced by the previous prop value while persistence is pending.
     if (previousManagedModesRef.current === managedWritingModes) return;
     previousManagedModesRef.current = managedWritingModes;
+    setManagedModesSnapshot(managedWritingModes);
     setWritingModes((current) => {
       const keepEditing = modeIsDirty || Boolean(draftModeId);
       const next = managedWritingModes.map((incoming) => {
@@ -398,9 +417,11 @@ export function ContextSettings({
       if (protectedMode && !next.some((mode) => mode.id === protectedMode.id)) next.push(protectedMode);
       return next.length === current.length && next.every((mode, index) => mode === current[index]) ? current : next;
     });
-  }, [managedWritingModes, draftModeId, editingModeId, modeIsDirty]);
+  }, [managedWritingModes, draftModeId, editingModeId, modeIsDirty, setManagedModesSnapshot]);
 
+  const restorePromptOnMount = useRef(restoredPrompt);
   useEffect(() => {
+    if (restorePromptOnMount.current) { restorePromptOnMount.current = false; return; }
     if (!editingMode) return;
     setEditingModeId(editingMode.id);
     setModeLabelDraft(editingMode.label);
@@ -599,6 +620,14 @@ export function ContextSettings({
     setErrorScope(null);
   };
 
+  const cancelModeEditing = (origin: "preview" | "prompt") => {
+    const mode = managedWritingModes.find((item) => item.id === editingModeId) ?? managedWritingModes[0];
+    setWritingModes(managedWritingModes); setDraftModeId(null);
+    if (mode) { setEditingModeId(mode.id); setModeLabelDraft(mode.label); setModePromptDraft(mode.prompt); }
+    setError(null); setErrorScope(null);
+    (origin === "prompt" ? modePromptRef.current : editingModeSelectRef.current)?.focus({ preventScroll: true });
+  };
+
   const deleteEditingMode = () => {
     setErrorScope("prompt");
     setPromptErrorPlacement("preview");
@@ -651,6 +680,7 @@ export function ContextSettings({
     setBrowserPathPrefix(existing?.browser_path_prefix ?? "");
     setFocusedField(existing?.focused_field ?? "");
     setSelectedModeId(existing?.mode_id ?? familyModeId(existing?.family ?? "general"));
+    setRemoveStyleExamples(false);
     setStyleExampleInput(existing?.style_example_input ?? "");
     setStyleExampleOutput(existing?.style_example_output ?? "");
     setStyleExamplesApproved(existing?.style_examples_approved === true);
@@ -823,15 +853,12 @@ export function ContextSettings({
       };
       const styleInput = styleExampleInput.trim();
       const styleOutput = styleExampleOutput.trim();
-      if (styleInput) mapping.style_example_input = styleInput;
-      else if (existing?.style_example_input) mapping.style_example_input = existing.style_example_input;
-      if (styleOutput) mapping.style_example_output = styleOutput;
-      else if (existing?.style_example_output) mapping.style_example_output = existing.style_example_output;
-      if (existing?.style_example_pairs?.length) {
-        mapping.style_example_pairs = existing.style_example_pairs;
-      }
-      const next = await invoke<ContextMapping[]>("save_context_mapping", { mapping });
+      mapping.style_example_input = styleInput || null;
+      mapping.style_example_output = styleOutput || null;
+      mapping.style_example_pairs = removeStyleExamples ? [] : existing?.style_example_pairs ?? [];
+      const next = await invoke<ContextMapping[]>("save_context_mapping", { mapping, replaceStyleExamples: true });
       setMappings(next);
+      setRemoveStyleExamples(false);
       setEditingMappingId(null);
       setSelectedApplicationId("");
       setSelectedExecutable("");
@@ -884,12 +911,10 @@ export function ContextSettings({
   };
   const selectedExistingMapping = mappings.find((mapping) => selectorsEqual(mapping, selectedSelectors));
   const editedMapping = mappings.find((mapping) => mapping.id === editingMappingId) ?? selectedExistingMapping;
-  const retainedStylePairs = editedMapping?.style_example_pairs ?? [];
+  const retainedStylePairs = removeStyleExamples ? [] : editedMapping?.style_example_pairs ?? [];
   const hasStyleExamples = Boolean(
     styleExampleInput.trim()
     || styleExampleOutput.trim()
-    || editedMapping?.style_example_input
-    || editedMapping?.style_example_output
     || retainedStylePairs.length > 0
   );
   const cloudVisionAvailable = Boolean(selectedApplication?.bundle_id || selectedExecutable.trim());
@@ -905,6 +930,7 @@ export function ContextSettings({
       <SettingsPageHeader
         title={t(automationOnly || combined ? "智能整理" : "语气")}
         description={t(combined ? "根据当前 App、输入框和你说的内容整理文字，也可以编辑 Prompt 和 App / 网站规则。" : automationOnly ? "根据当前 App、输入框和你说的内容，自动选择合适的 Prompt 和输出格式。" : "编辑语气 Prompt，并为 App 或网站指定固定语气。")}
+        saveHint={t(automationOnly && !combined ? "更改自动保存" : "更改需保存；草稿在本窗口切页保留。")}
       />
       {initializationError && <SettingsAlert>{initializationError}</SettingsAlert>}
       {errorScope === null && error && <SettingsAlert>{error}</SettingsAlert>}
@@ -963,7 +989,7 @@ export function ContextSettings({
               </SettingsRow>
             )}
           </SettingsGroup>
-          <SettingsGroup title={t("输出格式")} description={t("自动整理会综合 App 上下文和你说的内容；手动模式只影响当前录音。")}>
+          <SettingsGroup title={t("输出格式")} description={t("自动整理按场景决定格式；手动选择会作为默认模式持续生效，直到你再次更改。")}>
             <SettingsRow title={t("输出模式")} description={t("自动根据当前 App、输入框和你说的内容选择整理方式；手动模式会覆盖自动判断。")}>
               <Select aria-label={t("输出模式")} value={outputMode ?? "auto"} onValueChange={(value) => onOutputModeChange?.(value)} className={`w-40 max-w-full ${fieldClass}`}>
                 {outputModeOptions.map((option) => <option key={option.value} value={option.value}>{t(option.label)}</option>)}
@@ -975,6 +1001,7 @@ export function ContextSettings({
               </Select>
             </SettingsRow>}
           </SettingsGroup>
+      {(automationOnly || combined) && <ContextLesson onOpenPermissions={onOpenPermissions ? () => openGuideDestination("permissions") : undefined} onOpenMappings={onOpenMappings ? () => openGuideDestination("mappings") : undefined} />}
           <SettingsDisclosure title={t("高级整理设置")} description={t("临时场景、精确转写和视觉模型。授权选项保持独立。")} error={advancedError}>
             {inlineError(advancedError)}
             <div className="divide-y divide-border">
@@ -1078,6 +1105,8 @@ export function ContextSettings({
           {editingMode && <WritingPreview mode={{ ...editingMode, label: editingModeLabel, prompt: modePromptDraft }} compareSaved={modeIsDirty && editingMode.id !== draftModeId} isDraft={modeIsDirty || Boolean(draftModeId)} />}
           <div className="mt-4 flex flex-wrap items-center gap-2">
             <button type="button" onClick={() => saveEditingMode("preview")} disabled={busy || !editingMode} className={`${buttonClass} min-w-28`}>{t("保存语气")}</button>
+            {(modeIsDirty || draftModeId) && <button type="button" disabled={busy} onClick={() => cancelModeEditing("preview")} className={secondaryButtonClass}>{t("取消修改")}</button>}
+            <span role="status" className="text-xs text-secondary">{t(modeIsDirty || draftModeId ? "有未保存的更改" : "更改需保存")}</span>
             {!editingMode?.builtin && <button type="button" onClick={deleteEditingMode} disabled={busy} className={dangerButtonClass}>{t("删除自定义语气")}</button>}
           </div>
           {promptErrorPlacement === "preview" && inlineError(promptError)}
@@ -1093,16 +1122,19 @@ export function ContextSettings({
           <p className="mb-4 max-w-prose text-xs leading-5 text-secondary">{t("Prompt 只作为写作指导，不会覆盖 VoiceFlow 的事实保护规则。")}</p>
           <label className="block text-xs text-secondary">
             {t("Prompt")}
-            <textarea aria-label={t("语气 Prompt")} value={modePromptDraft} onChange={(event) => setModePromptDraft(event.target.value)} disabled={busy} maxLength={8_000} rows={6} className={`mt-2 w-full resize-y rounded-lg border ${colors.border} ${colors.bg.elevated} ${colors.text.primary} px-3 py-2.5 text-sm leading-6 outline-none transition-colors duration-150 ${focusRingClass}`} />
+            <textarea ref={modePromptRef} aria-label={t("语气 Prompt")} value={modePromptDraft} onChange={(event) => setModePromptDraft(event.target.value)} disabled={busy} maxLength={8_000} rows={6} className={`mt-2 w-full resize-y rounded-lg border ${colors.border} ${colors.bg.elevated} ${colors.text.primary} px-3 py-2.5 text-sm leading-6 outline-none transition-colors duration-150 ${focusRingClass}`} />
             <span className="mt-1 block text-xs text-tertiary">{t("可以用中文或英文描述希望保留什么、如何组织，以及明确禁止添加什么。")} </span>
           </label>
           <div className="mt-4 flex flex-wrap items-center gap-2">
             <button type="button" onClick={() => saveEditingMode("prompt")} disabled={busy || !editingMode} className={`${buttonClass} min-w-28`}>{t("保存语气")}</button>
+            {(modeIsDirty || draftModeId) && <button type="button" disabled={busy} onClick={() => cancelModeEditing("prompt")} className={secondaryButtonClass}>{t("取消修改")}</button>}
+            <span role="status" className="text-xs text-secondary">{t(modeIsDirty || draftModeId ? "有未保存的更改" : "更改需保存")}</span>
           </div>
           {promptErrorPlacement === "prompt" && inlineError(promptError)}
         </div>
       </SettingsDisclosure>
 
+      <SceneLesson onOpenDictionary={onOpenDictionary ? () => openGuideDestination("dictionary") : undefined} />
       <SettingsGroup variant="surface" title={t("App / 网站映射")} description={t("可组合 App、可执行文件、网站、路径和输入框条件；所有已选条件必须同时匹配。")}>
         <div className="vf-mapping-form space-y-4 px-5 py-4">
           <div className="flex flex-wrap items-end gap-2">
@@ -1196,6 +1228,7 @@ export function ContextSettings({
           </SettingsRow>
             </div>
           </details>
+          <SettingsDisclosure variant="plain" title={t("上下文与样例授权")} description={t("按需要逐项授权，保存规则后生效。收起不会撤销授权。") } summary={t("{count} 项已开启").replace("{count}", String(Object.values(sourcePermissions).filter(Boolean).length + Number(styleExamplesApproved)))} error={errorScope === "mapping" ? error : null}>
           <SettingsRow
             title={t("允许风格示例发送给整理服务商")}
             description={t("启用后，此映射保留的输入、期望输出和已学习示例对可能随整理请求发送给已配置的整理服务商。关闭时仍保留这些示例，但不发送。此权限独立于“允许文字发送给服务商”。")}
@@ -1224,10 +1257,13 @@ export function ContextSettings({
               </div>
             </details>
           )}
+          {hasStyleExamples && <button type="button" disabled={busy} className={dangerButtonClass} onClick={() => { setRemoveStyleExamples(true); setStyleExampleInput(""); setStyleExampleOutput(""); setStyleExamplesApproved(false); }}>{t("移除全部样例")}</button>}
+          {removeStyleExamples && <p role="status" className="text-xs text-secondary">{t("保存规则后移除样例，并撤销样例发送批准。")}</p>}
           {hasStyleExamples && !styleExamplesApproved && (
             <p className="text-xs leading-5 text-warning-ink">{t("风格示例会保留，但在你单独批准前不会进入整理服务请求。")}</p>
           )}
-          <div className="vf-mapping-permissions rounded-xl border border-border bg-elevated/30 px-3 sm:px-4">
+          {!combined && <ContextLesson onOpenPermissions={onOpenPermissions ? () => openGuideDestination("permissions") : undefined} />}
+          <div className="vf-mapping-permissions">
             <div className="py-3">
               <p className="text-sm font-medium text-primary">{t("自动文字来源权限")}</p>
               <p className="mt-1 max-w-2xl text-xs leading-5 text-tertiary">{t("新规则和缺少来源授权的旧规则默认关闭；迁移时只会按之前明确开启的全局 OCR 选择恢复本机 OCR。全局上下文开关仍会统一关闭自动读取。")}</p>
@@ -1278,6 +1314,7 @@ export function ContextSettings({
             </SettingsRow>
           </div>
           <p className="text-xs text-tertiary">{t("示例不会自动从历史记录学习。")}</p>
+          </SettingsDisclosure>
           {selectedExistingMapping && (
             <p className="text-xs text-secondary">
               {t(editingMappingId

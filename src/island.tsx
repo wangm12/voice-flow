@@ -31,7 +31,7 @@ function IslandRoot() {
   }, []);
 
   return (
-    <I18nProvider key={language} initialLanguage={language}>
+    <I18nProvider initialLanguage={language}>
       <IslandWindow />
     </I18nProvider>
   );

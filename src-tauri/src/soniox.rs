@@ -10,6 +10,7 @@ use futures_util::{SinkExt, StreamExt};
 use hound::{SampleFormat, WavReader};
 use serde::Deserialize;
 use serde_json::json;
+use std::future::Future;
 use std::io::Cursor;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -404,7 +405,7 @@ impl SonioxStreamSession {
         let task_failure_notify = sender.failure_notify.clone();
         let task_cancellation = cancellation.clone();
         let task_policy_cancellation = crate::network_policy::cloud_request_token();
-        session.result_task = Some(tokio::spawn(async move {
+        session.result_task = Some(crate::research_trace::tokio_spawn(async move {
             let connection = tokio::select! {
                 biased;
                 _ = task_stop.cancelled() => {
@@ -417,7 +418,12 @@ impl SonioxStreamSession {
                 }
                 _ = task_cancellation.cancelled() => Err(cancelled_failure(0)),
                 _ = task_policy_cancellation.cancelled() => Err(cancelled_failure(0)),
-                result = open_socket_and_config(options, task_cancellation.clone()) => result,
+                result = open_socket_and_config(
+                    options,
+                    task_cancellation.clone(),
+                    task_policy_cancellation.clone(),
+                    SONIOX_WEBSOCKET_ENDPOINT,
+                ) => result,
             };
             let socket = match connection {
                 Ok(socket) => socket,
@@ -458,10 +464,23 @@ impl SonioxStreamSession {
         cancellation: CancellationToken,
         diagnostics: Option<AsrRequestDiagnostics>,
         is_replay: bool,
+        policy_cancellation: CancellationToken,
+        endpoint: &str,
     ) -> Result<(Self, SonioxAudioSender), SonioxStreamFailure> {
         let attempt_started = Instant::now();
         let diagnostics_guard = diagnostics.map(|diagnostics| diagnostics.begin_stream());
-        let socket = match open_socket_and_config(options, cancellation.clone()).await {
+        let connection = tokio::select! {
+            biased;
+            _ = policy_cancellation.cancelled() => Err(cancelled_failure(0)),
+            _ = cancellation.cancelled() => Err(cancelled_failure(0)),
+            result = open_socket_and_config(
+                options,
+                cancellation.clone(),
+                policy_cancellation.clone(),
+                endpoint,
+            ) => result,
+        };
+        let socket = match connection {
             Ok(socket) => socket,
             Err(failure) => {
                 complete_guard(
@@ -478,20 +497,28 @@ impl SonioxStreamSession {
         let task_state = session.state.clone();
         let task_stop = session.stop.clone();
         let task_failure_notify = sender.failure_notify.clone();
-        session.result_task = Some(tokio::spawn(async move {
-            run_stream_actor(
-                socket,
-                queue,
-                finish,
-                task_state,
-                task_stop,
-                task_failure_notify,
-                cancellation,
-                attempt_started,
-                diagnostics_guard,
-                is_replay,
-            )
-            .await
+        let task_policy_cancellation = policy_cancellation.clone();
+        let task_policy_cancel_state = task_state.clone();
+        session.result_task = Some(crate::research_trace::tokio_spawn(async move {
+            tokio::select! {
+                biased;
+                _ = task_policy_cancellation.cancelled() => {
+                    lock_state(&task_policy_cancel_state).closed = true;
+                    Err(cancelled_failure(0))
+                },
+                result = run_stream_actor(
+                    socket,
+                    queue,
+                    finish,
+                    task_state,
+                    task_stop,
+                    task_failure_notify,
+                    cancellation,
+                    attempt_started,
+                    diagnostics_guard,
+                    is_replay,
+                ) => result,
+            }
         }));
         Ok((session, sender))
     }
@@ -567,6 +594,8 @@ fn new_session_shell() -> (
 async fn open_socket_and_config(
     options: SonioxStreamOptions,
     cancellation: CancellationToken,
+    policy_cancellation: CancellationToken,
+    endpoint: &str,
 ) -> Result<SonioxSocket, SonioxStreamFailure> {
     if options.api_key.trim().is_empty() {
         return Err(local_failure(
@@ -576,23 +605,22 @@ async fn open_socket_and_config(
             0,
         ));
     }
-    if cancellation.is_cancelled() {
+    if cancellation.is_cancelled() || !crate::research_trace::allowed() {
         return Err(cancelled_failure(0));
     }
 
-    // The URL is fixed. `tokio-tungstenite` does not follow HTTP redirects,
-    // so a redirect response is rejected rather than sent to another host.
+    // Production uses the fixed Soniox URL; the private endpoint seam keeps
+    // replay cancellation tests on a local WebSocket server. Redirects fail.
     let websocket_config = WebSocketConfig::default()
         .max_frame_size(Some(MAX_FRAME_BYTES))
         .max_message_size(Some(MAX_FRAME_BYTES));
-    let policy_cancellation = crate::network_policy::cloud_request_token();
     let connected = tokio::select! {
         biased;
         _ = policy_cancellation.cancelled() => return Err(cancelled_failure(0)),
         _ = cancellation.cancelled() => return Err(cancelled_failure(0)),
         result = timeout(
             CONNECT_TIMEOUT,
-            connect_async_with_config(SONIOX_WEBSOCKET_ENDPOINT, Some(websocket_config), false),
+            connect_async_with_config(endpoint, Some(websocket_config), false),
         ) => result,
     };
     let (mut socket, _) = match connected {
@@ -611,6 +639,20 @@ async fn open_socket_and_config(
     if let Some(hints) = language_hints(options.language.as_deref()) {
         config["language_hints"] = json!(hints);
     }
+    let mut facts = crate::observations::ResolvedRequest::new(
+        "soniox_token_stream",
+        endpoint,
+        SONIOX_MODEL,
+        SONIOX_MODEL,
+    );
+    for (field, value) in config.as_object().unwrap() {
+        if field != "api_key" {
+            facts
+                .fields_constructed
+                .insert(field.clone(), value.clone());
+        }
+    }
+    crate::observations::asr_request(facts);
     let config_result = tokio::select! {
         biased;
         _ = policy_cancellation.cancelled() => return Err(cancelled_failure(0)),
@@ -646,6 +688,35 @@ pub async fn transcribe_complete_wav(
     diagnostics: Option<AsrRequestDiagnostics>,
     is_replay: bool,
 ) -> Result<Transcript, SonioxStreamFailure> {
+    transcribe_complete_wav_with_endpoint(
+        wav,
+        options,
+        cancellation,
+        diagnostics,
+        is_replay,
+        SONIOX_WEBSOCKET_ENDPOINT,
+        |_| async {},
+    )
+    .await
+}
+
+async fn transcribe_complete_wav_with_endpoint<F, Fut>(
+    wav: Vec<u8>,
+    options: SonioxStreamOptions,
+    cancellation: CancellationToken,
+    diagnostics: Option<AsrRequestDiagnostics>,
+    is_replay: bool,
+    endpoint: &str,
+    mut after_frame_queued: F,
+) -> Result<Transcript, SonioxStreamFailure>
+where
+    F: FnMut(usize) -> Fut,
+    Fut: Future<Output = ()>,
+{
+    let policy_cancellation = crate::network_policy::cloud_request_token();
+    if policy_cancellation.is_cancelled() || cancellation.is_cancelled() {
+        return Err(cancelled_failure(0));
+    }
     let samples = decode_captured_wav(&wav)?;
     if samples.is_empty() {
         return Err(local_failure(
@@ -672,29 +743,52 @@ pub async fn transcribe_complete_wav(
         ));
     }
 
-    let (session, sender) =
-        SonioxStreamSession::connect_inner(options, cancellation.clone(), diagnostics, is_replay)
-            .await?;
+    let (session, sender) = SonioxStreamSession::connect_inner(
+        options,
+        cancellation.clone(),
+        diagnostics,
+        is_replay,
+        policy_cancellation.clone(),
+        endpoint,
+    )
+    .await?;
+    let mut sent_samples = 0u64;
     for (frame_index, frame) in samples.chunks(REPLAY_FRAME_SAMPLES).enumerate() {
-        if cancellation.is_cancelled() {
-            break;
-        }
         let start_sample = frame_index as u64 * REPLAY_FRAME_SAMPLES as u64;
-        if sender
-            .send_samples_bounded(start_sample, frame, &cancellation)
-            .await
-            .is_err()
-        {
-            break;
+        let send_result = tokio::select! {
+            biased;
+            _ = policy_cancellation.cancelled() => return Err(cancelled_failure(sent_samples)),
+            _ = cancellation.cancelled() => return Err(cancelled_failure(sent_samples)),
+            result = sender.send_samples_bounded(start_sample, frame, &cancellation) => result,
+        };
+        if send_result.is_err() {
+            if policy_cancellation.is_cancelled() || cancellation.is_cancelled() {
+                return Err(cancelled_failure(sent_samples));
+            }
+            return session.finish(sample_count).await;
+        }
+        sent_samples = sent_samples.saturating_add(frame.len() as u64);
+        tokio::select! {
+            biased;
+            _ = policy_cancellation.cancelled() => return Err(cancelled_failure(sent_samples)),
+            _ = cancellation.cancelled() => return Err(cancelled_failure(sent_samples)),
+            _ = after_frame_queued(frame_index) => {}
         }
         if (frame_index + 1) * REPLAY_FRAME_SAMPLES < samples.len() {
             tokio::select! {
-                _ = cancellation.cancelled() => break,
+                biased;
+                _ = policy_cancellation.cancelled() => return Err(cancelled_failure(sent_samples)),
+                _ = cancellation.cancelled() => return Err(cancelled_failure(sent_samples)),
                 _ = tokio::time::sleep(Duration::from_millis(100)) => {}
             }
         }
     }
-    session.finish(sample_count).await
+    tokio::select! {
+        biased;
+        _ = policy_cancellation.cancelled() => Err(cancelled_failure(sent_samples)),
+        _ = cancellation.cancelled() => Err(cancelled_failure(sent_samples)),
+        result = session.finish(sample_count) => result,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1176,6 +1270,22 @@ impl TranscriptBuilder {
     }
 
     fn finish(self) -> Transcript {
+        crate::asr::observe_parsed_asr(
+            &self.text,
+            "provider_final_stream",
+            "finished_token_stream",
+            None,
+        );
+        crate::observations::asr_filter(
+            &self.text,
+            &self.text,
+            if self.text.is_empty() {
+                "provider_empty"
+            } else {
+                "speech_text"
+            },
+            None,
+        );
         Transcript {
             text: self.text.clone(),
             asr_text: Some(self.text),
@@ -1453,4 +1563,105 @@ fn lock_state(state: &Mutex<ProducerState>) -> MutexGuard<'_, ProducerState> {
     state
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures_util::StreamExt;
+    use tokio::net::TcpListener;
+    use tokio::sync::oneshot;
+    use tokio_tungstenite::accept_async;
+    use tokio_util::sync::CancellationToken;
+
+    struct StrictOfflineReset;
+
+    impl Drop for StrictOfflineReset {
+        fn drop(&mut self) {
+            crate::network_policy::set_strict_offline(false);
+        }
+    }
+
+    fn captured_wav(sample_count: usize) -> Vec<u8> {
+        let mut wav = Cursor::new(Vec::new());
+        let spec = hound::WavSpec {
+            channels: CHANNEL_COUNT,
+            sample_rate: SAMPLE_RATE as u32,
+            bits_per_sample: 16,
+            sample_format: SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::new(&mut wav, spec).unwrap();
+        for _ in 0..sample_count {
+            writer.write_sample(123i16).unwrap();
+        }
+        writer.finalize().unwrap();
+        wav.into_inner()
+    }
+
+    #[tokio::test]
+    async fn replay_stops_when_strict_offline_enabled_mid_stream() {
+        let _network_policy_guard = crate::network_policy::strict_offline_test_guard().await;
+        crate::network_policy::set_strict_offline(false);
+        let _policy_reset = StrictOfflineReset;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+        let (first_frame_seen_tx, first_frame_seen_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = accept_async(stream).await.unwrap();
+            let config = socket.next().await.unwrap().unwrap();
+            assert!(matches!(config, Message::Text(_)));
+            let first_audio = socket.next().await.unwrap().unwrap();
+            assert!(matches!(
+                first_audio,
+                Message::Binary(ref bytes) if bytes.len() == REPLAY_FRAME_SAMPLES * 2
+            ));
+            first_frame_seen_tx.send(()).unwrap();
+
+            let next_message = tokio::time::timeout(Duration::from_secs(2), socket.next())
+                .await
+                .expect("client should stop after strict offline cancels the replay");
+            assert!(matches!(
+                next_message,
+                None
+                    | Some(Ok(Message::Close(_)))
+                    | Some(Err(WebSocketError::Protocol(
+                        tokio_tungstenite::tungstenite::error::ProtocolError::ResetWithoutClosingHandshake
+                    )))
+            ));
+        });
+
+        let mut first_frame_seen_rx = Some(first_frame_seen_rx);
+        let result = transcribe_complete_wav_with_endpoint(
+            captured_wav(REPLAY_FRAME_SAMPLES * 3),
+            SonioxStreamOptions {
+                api_key: "local-test-only-dummy-key".to_owned(),
+                language: Some("en".to_owned()),
+            },
+            CancellationToken::new(),
+            None,
+            true,
+            &endpoint,
+            move |frame_index| {
+                let first_frame_seen = if frame_index == 0 {
+                    first_frame_seen_rx.take()
+                } else {
+                    None
+                };
+                async move {
+                    if let Some(first_frame_seen) = first_frame_seen {
+                        first_frame_seen.await.unwrap();
+                        crate::network_policy::set_strict_offline(true);
+                        crate::network_policy::set_strict_offline(false);
+                    }
+                }
+            },
+        )
+        .await;
+
+        let failure = result.expect_err("policy cancellation is an error");
+        assert_eq!(failure.failure_code, "cancelled");
+        server.await.unwrap();
+    }
 }

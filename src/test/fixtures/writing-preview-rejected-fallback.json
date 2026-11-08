@@ -1,0 +1,22 @@
+{
+  "saved": null,
+  "draft": {
+    "text": "Keep API v2.",
+    "status": "guard_fallback",
+    "elapsed_ms": 17,
+    "model_candidate": null,
+    "provider_candidate": null,
+    "cleanup_transformations": [],
+    "cleanup_rejection": {
+      "candidate": "Keep API v3.",
+      "reason": "protected_token_changed",
+      "stage": "provider_output"
+    },
+    "provider_error": {
+      "kind": "guard",
+      "guard": "protected_token_changed",
+      "native_failure": null
+    },
+    "final_guard_rejected": true
+  }
+}

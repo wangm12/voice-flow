@@ -1,9 +1,9 @@
 import { closeSelect, openSelect, selectOption } from "./test/selectOption";
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
 import type { SelectedActionPreview, TextActionOutcome } from "./components/SelectedPreviewDialog";
-import App from "./App";
+import App, { recoveryDestinationView } from "./App";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 const { listenMock } = vi.hoisted(() => ({ listenMock: vi.fn() }));
@@ -15,6 +15,18 @@ vi.mock("@tauri-apps/api/webview", () => ({
 }));
 
 const invokeMock = vi.mocked(invoke);
+
+describe("HUD and recovery destinations", () => {
+  it("routes only the supported settings and History pages", () => {
+    expect(recoveryDestinationView("history")).toBe("history");
+    expect(recoveryDestinationView("system")).toBe("system");
+    expect(recoveryDestinationView("general")).toBe("general");
+    expect(recoveryDestinationView("engine")).toBe("engine");
+    expect(recoveryDestinationView("permissions")).toBe("permissions");
+    expect(recoveryDestinationView("../../history")).toBeNull();
+  });
+});
+
 let selectedActionOutcome: TextActionOutcome = "replaced";
 const selectedPreviewPayload: SelectedActionPreview = {
   transaction_id: "tx-selected-1",
@@ -96,8 +108,97 @@ describe("settings navigation", () => {
 
   afterEach(() => {
     cleanup();
+    vi.unstubAllEnvs();
     invokeMock.mockReset();
     listenMock.mockReset();
+  });
+
+  it("keeps Prompt and snippet drafts when navigating away and back without saving", async () => {
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "语气" }));
+    fireEvent.click(screen.getByRole("button", { name: /编辑 Prompt/ }));
+    fireEvent.change(screen.getByRole("textbox", { name: "语气 Prompt" }), { target: { value: "保留跨页面草稿" } });
+    fireEvent.click(screen.getByRole("button", { name: "系统设置" }));
+    fireEvent.click(screen.getByRole("button", { name: "语气" }));
+    fireEvent.click(screen.getByRole("button", { name: /编辑 Prompt/ }));
+    expect(screen.getByRole("textbox", { name: "语气 Prompt" })).toHaveValue("保留跨页面草稿");
+    fireEvent.click(screen.getByRole("button", { name: "语音片段" }));
+    fireEvent.change(screen.getByRole("textbox", { name: "触发短语" }), { target: { value: "插入未保存的片段" } });
+    fireEvent.change(screen.getByRole("textbox", { name: "展开内容" }), { target: { value: "片段草稿" } });
+    fireEvent.click(screen.getByRole("button", { name: "录音与输出" }));
+    fireEvent.click(screen.getByRole("button", { name: "语音片段" }));
+    expect(screen.getByRole("textbox", { name: "触发短语" })).toHaveValue("插入未保存的片段");
+    expect(screen.getByRole("textbox", { name: "展开内容" })).toHaveValue("片段草稿");
+    expect(invokeMock.mock.calls.some(([command]) => command === "update_settings_patch")).toBe(false);
+  });
+
+  it.each([false, true])("keeps snippet writes locked across page changes until native acknowledgment (away: %s)", async (awayAtAcknowledgment) => {
+    const base = invokeMock.getMockImplementation()!;
+    let finish: (() => void) | undefined;
+    invokeMock.mockImplementation((command, args, options) => {
+      if (command === "update_settings_patch") return new Promise<void>((resolve) => { finish = resolve; });
+      return base(command, args, options);
+    });
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "语音片段" }));
+    fireEvent.change(screen.getByRole("textbox", { name: "触发短语" }), { target: { value: "插入签名" } });
+    fireEvent.change(screen.getByRole("textbox", { name: "展开内容" }), { target: { value: "测试签名" } });
+    fireEvent.click(screen.getByRole("button", { name: "添加片段" }));
+    await waitFor(() => expect(finish).toBeDefined());
+    fireEvent.click(screen.getByRole("button", { name: "系统设置" }));
+    fireEvent.click(screen.getByRole("button", { name: "语音片段" }));
+    expect(screen.getByRole("button", { name: "保存中…" })).toBeDisabled();
+    expect(screen.getByRole("textbox", { name: "触发短语" })).toBeDisabled();
+    if (awayAtAcknowledgment) fireEvent.click(screen.getByRole("button", { name: "系统设置" }));
+    await act(async () => finish?.());
+    if (awayAtAcknowledgment) fireEvent.click(screen.getByRole("button", { name: "语音片段" }));
+    expect(await screen.findByText("测试签名")).toBeVisible();
+    expect(screen.getByRole("textbox", { name: "触发短语" })).toHaveValue("");
+    expect(invokeMock.mock.calls.filter(([command]) => command === "update_settings_patch")).toHaveLength(1);
+  });
+
+  it("keeps an unapplied service model across page changes", async () => {
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "服务配置" }));
+    selectOption(screen.getByRole("combobox", { name: "ASR 模型" }), "whisper-large-v3");
+    fireEvent.click(screen.getByRole("button", { name: "录音与输出" }));
+    fireEvent.click(screen.getByRole("button", { name: "服务配置" }));
+    expect(screen.getByRole("combobox", { name: "ASR 模型" })).toHaveValue("whisper-large-v3");
+    expect(invokeMock.mock.calls.some(([command]) => command === "probe_engine_draft")).toBe(false);
+  });
+
+  it("keeps the shared service draft across the four model configuration pages", async () => {
+    render(<App />);
+    const navigation = await screen.findByRole("navigation", { name: "设置页面" });
+    expect(within(navigation).getByRole("heading", { name: "模型配置" })).toBeInTheDocument();
+
+    fireEvent.click(within(navigation).getByRole("button", { name: "服务配置" }));
+    selectOption(screen.getByRole("combobox", { name: "ASR 模型" }), "whisper-large-v3");
+    expect(screen.getByRole("button", { name: "保存并使用" })).toBeInTheDocument();
+
+    fireEvent.click(within(navigation).getByRole("button", { name: "API Key" }));
+    expect(await screen.findByRole("heading", { name: "API Key" })).toBeInTheDocument();
+    expect(screen.getByLabelText("Groq API Key")).not.toBeVisible();
+    expect(screen.getByRole("button", { name: "保存并使用" })).toBeInTheDocument();
+
+    fireEvent.click(within(navigation).getByRole("button", { name: "本地模型" }));
+    expect(await screen.findByRole("heading", { name: "本地模型" })).toBeInTheDocument();
+    fireEvent.click(within(navigation).getByRole("button", { name: "高级设置" }));
+    expect(await screen.findByRole("heading", { name: "高级设置" })).toBeInTheDocument();
+
+    fireEvent.click(within(navigation).getByRole("button", { name: "服务配置" }));
+    expect(screen.getByRole("combobox", { name: "ASR 模型" })).toHaveValue("whisper-large-v3");
+    expect(invokeMock.mock.calls.some(([command]) => command === "probe_engine_draft")).toBe(false);
+  });
+
+  it("reports a failed permission check as unknown instead of waiting forever", async () => {
+    const base = invokeMock.getMockImplementation()!;
+    invokeMock.mockImplementation((command, args, options) => command === "check_permissions" ? Promise.reject(new Error("native check failed")) : base(command, args, options));
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "系统权限" }));
+    await screen.findByText("暂时无法检测系统权限，请重新检测。");
+    await waitFor(() => expect(screen.getAllByText("无法检测，请重试")).toHaveLength(3));
+    expect(screen.queryByText("检测中…")).not.toBeInTheDocument();
   });
 
   it("shows actual OS login state when registration differs from stored settings", async () => {
@@ -111,6 +212,86 @@ describe("settings navigation", () => {
     fireEvent.click(await screen.findByRole("button", { name: "系统设置" }));
     expect(await screen.findByText("系统登录启动状态与设置不同，请重新切换开关。")).toBeInTheDocument();
     expect(screen.getByRole("switch", { name: "开机启动" })).toHaveAttribute("aria-checked", "false");
+  });
+
+  it("does not adopt a late Keychain result after leaving Engine settings", async () => {
+    const unconfigured = {
+      ...settings,
+      asr_provider: "groq",
+      cleanup_provider: "openai",
+      api_key_configured: false,
+      api_key_hint: null,
+      provider_keys: {},
+    };
+    const configured = {
+      ...unconfigured,
+      api_key_configured: true,
+      api_key_hint: "••••abcd",
+      provider_keys: { groq: { configured: true, hint: "••••abcd" } },
+    };
+    const base = invokeMock.getMockImplementation()!;
+    let finishRead!: (result: { status: "session_configured"; settings: typeof configured }) => void;
+    invokeMock.mockImplementation(async (command, args, options) => {
+      if (command === "get_settings") return unconfigured;
+      if (command === "read_provider_credential_from_keychain") {
+        return await new Promise<{ status: "session_configured"; settings: typeof configured }>((resolve) => {
+          finishRead = resolve;
+        });
+      }
+      if (command === "cancel_provider_credential_read") return true;
+      return base(command, args, options);
+    });
+
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "API Key" }));
+    const readButton = await screen.findByRole("button", { name: "从钥匙串重新读取" });
+    fireEvent.click(readButton);
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith(
+      "read_provider_credential_from_keychain",
+      expect.objectContaining({ provider: "groq" }),
+    ));
+    const request = invokeMock.mock.calls.find(([command]) => command === "read_provider_credential_from_keychain")?.[1] as { requestId: string };
+
+    fireEvent.click(screen.getByRole("button", { name: "系统设置" }));
+    await screen.findByRole("heading", { name: "系统设置" });
+    await act(async () => {
+      finishRead({ status: "session_configured", settings: configured });
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "API Key" }));
+    expect(await screen.findByRole("button", { name: "从钥匙串重新读取" })).toBeInTheDocument();
+    expect(invokeMock).toHaveBeenCalledWith("cancel_provider_credential_read", { requestId: request.requestId });
+  });
+
+  it("sends only the saved active Custom purpose to the backend reread command", async () => {
+    const customSettings = {
+      ...settings,
+      onboarded: true,
+      asr_provider: "custom",
+      cleanup_provider: "openai",
+      cleanup_enabled: true,
+      custom_base_url: "https://router.example.test/v1",
+      api_key_configured: false,
+      provider_keys: { custom: { configured: false, keychain_state: "unavailable" } },
+    };
+    const base = invokeMock.getMockImplementation()!;
+    invokeMock.mockImplementation(async (command, args, options) => {
+      if (command === "get_settings") return customSettings;
+      if (command === "read_provider_credential_from_keychain") {
+        return { status: "missing", settings: null };
+      }
+      return base(command, args, options);
+    });
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "API Key" }));
+    const row = document.querySelector<HTMLElement>('[data-provider="custom"]')!;
+    fireEvent.click(await within(row).findByRole("button", { name: "从钥匙串重新读取" }));
+
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith(
+      "read_provider_credential_from_keychain",
+      expect.objectContaining({ provider: "custom", purpose: "asr" }),
+    ));
+    expect(await within(row).findByText("未添加")).toBeInTheDocument();
   });
 
   it("loads settings when optional release notes fail", async () => {
@@ -146,7 +327,24 @@ describe("settings navigation", () => {
     expect(invokeMock.mock.calls.filter(([command]) => command === "undo_learn_pair")).toHaveLength(2);
   });
 
+  it("distinguishes a persisted learning undo from its pending dictionary sync", async () => {
+    const native = captureNativeEvents();
+    const base = invokeMock.getMockImplementation()!;
+    invokeMock.mockImplementation(async (command, args, options) => {
+      if (command === "undo_learn_pair") throw "learning_dictionary_partial:settings_save_failed";
+      return base(command, args, options);
+    });
+    render(<App />);
+    await screen.findByRole("button", { name: "系统设置" });
+    native.emit("learn_pairs://promoted", { pair_key: "pair", before: "old", after: "new" });
+    fireEvent.click(screen.getByRole("button", { name: "撤销" }));
+
+    expect(await screen.findByText("学习规则已撤销，但个人词典同步未完成；请重试。")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "重试撤销" })).toBeInTheDocument();
+  });
+
   it("ignores the debug shortcut in editing, composing and repeated key events", async () => {
+    vi.stubEnv("DEV", true);
     render(<App />);
     await screen.findByRole("button", { name: "系统设置" });
     const input = document.createElement("input");
@@ -158,6 +356,30 @@ describe("settings navigation", () => {
     expect(screen.queryByRole("heading", { name: "调试设置" })).not.toBeInTheDocument();
     fireEvent.keyDown(window, { key: "D", metaKey: true, shiftKey: true });
     expect(await screen.findByRole("heading", { name: "调试设置" })).toBeInTheDocument();
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("update_settings_patch", { patch: { debug_mode: true } }));
+  });
+
+  it("does not expose or persist the debug surface in distribution builds with a stored debug flag", async () => {
+    vi.stubEnv("DEV", false);
+    const base = invokeMock.getMockImplementation()!;
+    invokeMock.mockImplementation(async (command, args, options) => {
+      if (command === "get_settings") return { ...settings, debug_mode: true };
+      return base(command, args, options);
+    });
+
+    render(<App />);
+    const generalNavigation = await screen.findByRole("button", { name: "录音与输出" });
+    expect(generalNavigation).toHaveAttribute("aria-current", "page");
+    expect(screen.queryByRole("button", { name: "调试设置" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "调试设置" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("spinbutton", { name: "句尾缓冲" })).not.toBeInTheDocument();
+
+    fireEvent.keyDown(window, { key: "D", metaKey: true, shiftKey: true });
+
+    expect(generalNavigation).toHaveAttribute("aria-current", "page");
+    expect(screen.queryByRole("button", { name: "调试设置" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "调试设置" })).not.toBeInTheDocument();
+    expect(invokeMock.mock.calls.some(([command]) => command === "update_settings_patch")).toBe(false);
   });
 
   it("opens the dedicated permissions page from the system navigation group", async () => {
@@ -202,6 +424,74 @@ describe("settings navigation", () => {
       patch: { input_device: "MacBook Pro Microphone" },
     }));
     expect(screen.getByText("选定麦克风 · MacBook Pro Microphone")).toBeInTheDocument();
+  });
+
+  it("keeps the default microphone label tied to the catalog after a late poll", async () => {
+    const devices = [
+      { name: "External USB Microphone", is_default: false },
+      { name: "Built-in MacBook Microphone", is_default: true },
+    ];
+    const base = invokeMock.getMockImplementation()!;
+    let deviceRequestCount = 0;
+    let resolveLateCatalog: ((value: typeof devices) => void) | undefined;
+    invokeMock.mockImplementation((command, args, options) => {
+      if (command === "get_audio_input_devices") {
+        deviceRequestCount += 1;
+        if (deviceRequestCount === 2) {
+          return new Promise<typeof devices>((resolve) => { resolveLateCatalog = resolve; });
+        }
+        return Promise.resolve(devices);
+      }
+      return base(command, args, options);
+    });
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "系统设置" }));
+
+    const input = await screen.findByRole("combobox", { name: "输入设备" });
+    await waitFor(() => expect(screen.getByText("当前麦克风 · Built-in MacBook Microphone")).toBeInTheDocument());
+    selectOption(input, "External USB Microphone");
+    await waitFor(() => expect(resolveLateCatalog).toBeDefined());
+    selectOption(input, "");
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("update_settings_patch", {
+      patch: { input_device: "" },
+    }));
+    await waitFor(() => expect(screen.getByText("当前麦克风 · Built-in MacBook Microphone")).toBeInTheDocument());
+
+    await act(async () => {
+      resolveLateCatalog?.(devices);
+    });
+    expect(screen.getByText("当前麦克风 · Built-in MacBook Microphone")).toBeInTheDocument();
+    expect(screen.queryByText("当前麦克风 · External USB Microphone")).not.toBeInTheDocument();
+  });
+
+  it("marks an uncommitted microphone selection and blocks the check until retry succeeds", async () => {
+    const base = invokeMock.getMockImplementation()!;
+    let failSave = true;
+    invokeMock.mockImplementation(async (command, args, options) => {
+      if (command === "update_settings_patch" && failSave) throw new Error("disk unavailable");
+      return base(command, args, options);
+    });
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "系统设置" }));
+
+    const input = await screen.findByRole("combobox", { name: "输入设备" });
+    selectOption(input, "MacBook Pro Microphone");
+    expect(screen.getByText("未保存的麦克风选择 · MacBook Pro Microphone")).toBeInTheDocument();
+    const checkButton = screen.getByRole("button", { name: "开始麦克风测试" });
+    expect(checkButton).toBeDisabled();
+    fireEvent.click(checkButton);
+    expect(invokeMock).not.toHaveBeenCalledWith("start_microphone_check", expect.anything());
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("disk unavailable");
+    fireEvent.click(screen.getByRole("button", { name: "录音与输出" }));
+    fireEvent.click(screen.getByRole("button", { name: "系统设置" }));
+    expect(screen.getByText("未保存的麦克风选择 · MacBook Pro Microphone")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "开始麦克风测试" })).toBeDisabled();
+
+    failSave = false;
+    fireEvent.click(screen.getByRole("button", { name: "重试" }));
+    await waitFor(() => expect(screen.getByText("选定麦克风 · MacBook Pro Microphone")).toBeInTheDocument());
+    expect(screen.getByRole("button", { name: "开始麦克风测试" })).toBeEnabled();
   });
 
   it("puts automatic context and output formatting on the smart formatting page", async () => {
@@ -358,6 +648,235 @@ describe("settings navigation", () => {
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
     previewHandler?.({ payload: selectedPreviewPayload });
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+
+  it("reports an unconfirmed cancellation without reopening the preview or leaking native errors", async () => {
+    const base = invokeMock.getMockImplementation()!;
+    let rejectCancellation: (() => void) | undefined;
+    invokeMock.mockImplementation((command, args, options) => {
+      if (command === "cancel_selected_action_preview") {
+        return new Promise((_resolve, reject) => { rejectCancellation = () => reject(new Error("private native error")); });
+      }
+      return base(command, args, options);
+    });
+    const events = captureNativeEvents();
+    render(<App />);
+    await waitFor(() => expect(events.has("selected-action://preview")).toBe(true));
+    events.emit("selected-action://preview", selectedPreviewPayload);
+    const cancelButton = await screen.findByRole("button", { name: "取消" });
+
+    await act(async () => {
+      fireEvent.click(cancelButton);
+      fireEvent.click(cancelButton);
+    });
+    await waitFor(() => expect(rejectCancellation).toBeDefined());
+    await act(async () => rejectCancellation?.());
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("无法确认取消，请等待当前操作结束。");
+    expect(screen.queryByText("private native error")).not.toBeInTheDocument();
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(invokeMock.mock.calls.filter(([command]) => command === "cancel_selected_action_preview")).toHaveLength(1);
+    events.emit("selected-action://preview", selectedPreviewPayload);
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+
+  it("clears an unconfirmed-cancel notice when that transaction later becomes terminal", async () => {
+    const base = invokeMock.getMockImplementation()!;
+    invokeMock.mockImplementation((command, args, options) => command === "cancel_selected_action_preview"
+      ? Promise.reject(new Error("private native error"))
+      : base(command, args, options));
+    const events = captureNativeEvents();
+    render(<App />);
+    await waitFor(() => expect(events.has("selected-action://preview")).toBe(true));
+    events.emit("selected-action://preview", selectedPreviewPayload);
+    fireEvent.click(await screen.findByRole("button", { name: "取消" }));
+    expect(await screen.findByText("无法确认取消，请等待当前操作结束。")).toBeVisible();
+
+    events.emit("selected-action://lifecycle", {
+      action_sequence: 1,
+      transaction_id: "tx-selected-1",
+      state: "cancelled",
+    });
+    await waitFor(() => expect(screen.queryByText("无法确认取消，请等待当前操作结束。")).not.toBeInTheDocument());
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+
+  it("does not show a stale cancellation rejection over a newer preview", async () => {
+    const base = invokeMock.getMockImplementation()!;
+    let rejectCancellation: (() => void) | undefined;
+    invokeMock.mockImplementation((command, args, options) => {
+      if (command === "cancel_selected_action_preview") {
+        return new Promise((_resolve, reject) => { rejectCancellation = () => reject(new Error("private native error")); });
+      }
+      return base(command, args, options);
+    });
+    const events = captureNativeEvents();
+    render(<App />);
+    await waitFor(() => expect(events.has("selected-action://preview")).toBe(true));
+    events.emit("selected-action://preview", selectedPreviewPayload);
+    fireEvent.click(await screen.findByRole("button", { name: "取消" }));
+    await waitFor(() => expect(rejectCancellation).toBeDefined());
+
+    const nextPreview: SelectedActionPreview = {
+      ...selectedPreviewPayload,
+      transaction_id: "tx-selected-2",
+      action_sequence: 2,
+      final_text: "下一条预览",
+    };
+    events.emit("selected-action://lifecycle", {
+      action_sequence: 2,
+      transaction_id: "tx-selected-2",
+      state: "started",
+    });
+    events.emit("selected-action://preview", nextPreview);
+    expect(await screen.findByRole("dialog")).toBeInTheDocument();
+
+    await act(async () => rejectCancellation?.());
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+    expect(screen.getByRole("textbox", { name: "VoiceFlow 生成结果" })).toHaveValue("下一条预览");
+    expect(screen.queryByText("无法确认取消，请等待当前操作结束。")).not.toBeInTheDocument();
+  });
+
+  it("does not report cancellation failure after the same transaction reaches a terminal lifecycle state", async () => {
+    const base = invokeMock.getMockImplementation()!;
+    let rejectCancellation: (() => void) | undefined;
+    invokeMock.mockImplementation((command, args, options) => {
+      if (command === "cancel_selected_action_preview") {
+        return new Promise((_resolve, reject) => { rejectCancellation = () => reject(new Error("late cancellation reply")); });
+      }
+      return base(command, args, options);
+    });
+    const events = captureNativeEvents();
+    render(<App />);
+    await waitFor(() => expect(events.has("selected-action://preview")).toBe(true));
+    events.emit("selected-action://preview", selectedPreviewPayload);
+    fireEvent.click(await screen.findByRole("button", { name: "取消" }));
+    await waitFor(() => expect(rejectCancellation).toBeDefined());
+
+    events.emit("selected-action://lifecycle", {
+      action_sequence: 1,
+      transaction_id: "tx-selected-1",
+      state: "completed",
+    });
+    await act(async () => rejectCancellation?.());
+
+    expect(screen.queryByText("无法确认取消，请等待当前操作结束。")).not.toBeInTheDocument();
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+
+  it("cancels the matching selected preview while confirmation is unresolved and does not replay its late reply", async () => {
+    const base = invokeMock.getMockImplementation()!;
+    let finishConfirmation: ((outcome: TextActionOutcome) => void) | undefined;
+    invokeMock.mockImplementation((command, args, options) => {
+      if (command === "confirm_selected_action_preview") {
+        return new Promise<TextActionOutcome>((resolve) => { finishConfirmation = resolve; });
+      }
+      if (command === "cancel_selected_action_preview") return Promise.reject(new Error("private native cancellation failure"));
+      return base(command, args, options);
+    });
+    const events = captureNativeEvents();
+    render(<App />);
+    await waitFor(() => expect(events.has("selected-action://preview")).toBe(true));
+    events.emit("selected-action://preview", selectedPreviewPayload);
+    fireEvent.click(await screen.findByRole("button", { name: "确认" }));
+    await waitFor(() => expect(finishConfirmation).toBeDefined());
+    fireEvent.click(screen.getByRole("button", { name: "取消" }));
+
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("cancel_selected_action_preview", {
+      transaction_id: "tx-selected-1",
+    }));
+    expect(invokeMock.mock.calls.filter(([command]) => command === "confirm_selected_action_preview")).toHaveLength(1);
+    expect(invokeMock.mock.calls.filter(([command]) => command === "cancel_selected_action_preview")).toHaveLength(1);
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(await screen.findByText("无法确认取消，请等待当前操作结束。")).toBeVisible();
+
+    await act(async () => finishConfirmation?.("replaced"));
+    expect(await screen.findByText("结果已替换并验证")).toBeVisible();
+    expect(screen.queryByText("无法确认取消，请等待当前操作结束。")).not.toBeInTheDocument();
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(screen.getAllByText("结果已替换并验证")).toHaveLength(1);
+    events.emit("selected-action://preview", selectedPreviewPayload);
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(invokeMock.mock.calls.filter(([command]) => command === "confirm_selected_action_preview")).toHaveLength(1);
+  });
+
+  it("keeps a canceled selected confirmation closed when the backend rejects its pending reply", async () => {
+    const base = invokeMock.getMockImplementation()!;
+    let rejectConfirmation: (() => void) | undefined;
+    invokeMock.mockImplementation((command, args, options) => {
+      if (command === "confirm_selected_action_preview") {
+        return new Promise((_resolve, reject) => { rejectConfirmation = () => reject(new Error("preview_cancelled")); });
+      }
+      return base(command, args, options);
+    });
+    const events = captureNativeEvents();
+    render(<App />);
+    await waitFor(() => expect(events.has("selected-action://preview")).toBe(true));
+    events.emit("selected-action://preview", selectedPreviewPayload);
+    fireEvent.click(await screen.findByRole("button", { name: "确认" }));
+    await waitFor(() => expect(rejectConfirmation).toBeDefined());
+    fireEvent.click(screen.getByRole("button", { name: "取消" }));
+
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("cancel_selected_action_preview", {
+      transaction_id: "tx-selected-1",
+    }));
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    await act(async () => rejectConfirmation?.());
+    events.emit("selected-action://preview", selectedPreviewPayload);
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(screen.queryByText("结果已替换并验证")).not.toBeInTheDocument();
+    expect(invokeMock.mock.calls.filter(([command]) => command === "confirm_selected_action_preview")).toHaveLength(1);
+    expect(invokeMock.mock.calls.filter(([command]) => command === "cancel_selected_action_preview")).toHaveLength(1);
+  });
+
+  it("routes cancellation to a screen transaction while screen copy is unresolved", async () => {
+    const base = invokeMock.getMockImplementation()!;
+    let finishCopy: (() => void) | undefined;
+    invokeMock.mockImplementation((command, args, options) => {
+      if (command === "copy_screen_action_preview") {
+        return new Promise((_resolve, reject) => { finishCopy = () => reject(new Error("preview_cancelled")); });
+      }
+      return base(command, args, options);
+    });
+    const events = captureNativeEvents();
+    const screenPreview: SelectedActionPreview = {
+      ...selectedPreviewPayload,
+      transaction_id: "tx-screen-1",
+      kind: "screen",
+      operation: "screen_assist",
+      target_kind: "screen",
+      target_label: "captured_screen",
+      source_text: "",
+      selected_text: "",
+      delivery_mode: "clipboard_only",
+      delivery_notice: "clipboard_only",
+      replace_allowed: false,
+    };
+    render(<App />);
+    await waitFor(() => expect(events.has("selected-action://preview")).toBe(true));
+    events.emit("selected-action://preview", screenPreview);
+    fireEvent.click(await screen.findByRole("button", { name: "只复制" }));
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("copy_screen_action_preview", {
+      transaction_id: "tx-screen-1",
+      final_text: screenPreview.final_text,
+    }));
+    expect(finishCopy).toBeDefined();
+    fireEvent.click(screen.getByRole("button", { name: "取消" }));
+
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("cancel_screen_action_preview", {
+      transaction_id: "tx-screen-1",
+    }));
+    expect(invokeMock.mock.calls.filter(([command]) => command === "copy_screen_action_preview")).toHaveLength(1);
+    expect(invokeMock.mock.calls.filter(([command]) => command === "cancel_screen_action_preview")).toHaveLength(1);
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+
+    await act(async () => finishCopy?.());
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(screen.queryByText("结果已复制")).not.toBeInTheDocument();
+    expect(screen.queryByText("preview_cancelled")).not.toBeInTheDocument();
+    events.emit("selected-action://preview", screenPreview);
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(invokeMock.mock.calls.filter(([command]) => command === "copy_screen_action_preview")).toHaveLength(1);
   });
 
   it("orders previews by action sequence and tombstones a terminal same-sequence preview", async () => {
@@ -548,7 +1067,7 @@ describe("settings navigation", () => {
     }));
   });
 
-  it("reloads history when dictation completes while the page stays open", async () => {
+  it("reloads History on history outcome", async () => {
     let stateHandler: ((event: { payload: { state: string } }) => void) | undefined;
     listenMock.mockImplementation((event: string, handler: (event: { payload: { state: string } }) => void) => {
       if (event === "dictation://state") stateHandler = handler;
@@ -567,7 +1086,7 @@ describe("settings navigation", () => {
     await waitFor(() => expect(stateHandler).toBeDefined());
 
     const historyCallsBeforeCompletion = invokeMock.mock.calls.filter(([command]) => command === "get_history").length;
-    stateHandler?.({ payload: { state: "copied" } });
+    stateHandler?.({ payload: { state: "history" } });
 
     await waitFor(() => expect(invokeMock.mock.calls.filter(([command]) => command === "get_history")).toHaveLength(historyCallsBeforeCompletion + 1));
   });

@@ -3,7 +3,7 @@ set -euo pipefail
 umask 077
 
 SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="/Users/mingjie/Documents/github/personal-projects/voice-flow"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 EXTERNAL_SOURCE="/Users/mingjie/Documents/voice-dictation-research/tools/voice-harness/macos"
 RECIPE_SOURCE="$SCRIPT_DIR/learning-native-paste-session/Recipe.json"
 INFO_PLIST_SOURCE="$SCRIPT_DIR/learning-native-paste-session/Info.plist"

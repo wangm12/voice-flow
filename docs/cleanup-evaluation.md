@@ -40,7 +40,7 @@ Run its synthetic fixture matrix with:
 cargo test --manifest-path src-tauri/Cargo.toml --lib edit_attribution
 ```
 
-This checks classification and abstention rules only. The controlled fixture protocol and its separate stdio/temporary-SQLite validation are documented in the [production integration research plan](learning-harness-production-research-plan.md); that entry point is not exercised by this command. This judge suite does not exercise the native observer, learning admission, database writes, delivery, microphone/ASR quality, or human corrections.
+This checks classification and abstention rules only. The controlled fixture protocol and its separate stdio/temporary-SQLite validation are documented in [end-to-end-workflows.md](end-to-end-workflows.md#standalone-deterministic-text-learning-fixture); that entry point is not exercised by this command. This judge suite does not exercise the native observer, learning admission, database writes, delivery, microphone/ASR quality, or human corrections.
 
 ### Paired filter quality (internal observation)
 

@@ -165,12 +165,22 @@ fn other_keys_down() -> bool {
 
 pub async fn wait_for_key_release() {
     #[cfg(target_os = "macos")]
-    while unsafe { CGEventSourceFlagsState(0) }
-        & ((1 << 17) | (1 << 18) | (1 << 19) | (1 << 20) | (1 << 23))
-        != 0
-        || (0..128).any(|key| unsafe { CGEventSourceKeyState(0, key) })
     {
-        tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+        let start = std::time::Instant::now();
+        let timeout = std::time::Duration::from_millis(1500);
+        while unsafe { CGEventSourceFlagsState(0) }
+            & ((1 << 17) | (1 << 18) | (1 << 19) | (1 << 20) | (1 << 23))
+            != 0
+            || (0..128).any(|key| unsafe { CGEventSourceKeyState(0, key) })
+        {
+            if start.elapsed() >= timeout {
+                log::warn!(
+                    "modifier_hotkey::wait_for_key_release timed out after 1500ms; proceeding"
+                );
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+        }
     }
 }
 

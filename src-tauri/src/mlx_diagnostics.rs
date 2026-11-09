@@ -1684,6 +1684,12 @@ impl FileSink {
         if current_bytes.saturating_add(line_bytes as u64) > self.max_file_bytes {
             self.rotate(current_bytes)?;
         }
+        if let Some(parent) = self.active.parent() {
+            if !parent.is_dir() {
+                fs::create_dir_all(parent)?;
+                set_private_directory_permissions(parent)?;
+            }
+        }
         let mut options = OpenOptions::new();
         options.create(true).append(true);
         #[cfg(unix)]

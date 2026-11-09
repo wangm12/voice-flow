@@ -338,9 +338,9 @@ describe("VoicePill", () => {
     expect(document.querySelector(".voice-pill-stack")).toHaveAttribute("aria-hidden", "true");
     expect(document.querySelector(".voice-pill-stack")).toHaveClass("voice-pill-stack--hidden-now");
   });
-});
 
-it("announces recovery action failures without relying on visual detail text", () => {
-  renderPill({ state: "error", detailsOpen: true, detailsActionError: "Could not open History. Try again." });
-  expect(screen.getByRole("status")).toHaveTextContent("Could not open History. Try again.");
+  it("announces recovery action failures without relying on visual detail text", () => {
+    renderPill({ state: "error", detailsOpen: true, detailsActionError: "Could not open History. Try again." });
+    expect(screen.getByRole("status")).toHaveTextContent("Could not open History. Try again.");
+  });
 });

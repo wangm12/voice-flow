@@ -28,7 +28,6 @@
 | --- | --- |
 | [Chatterfly 改进计划](chatterfly-improvement-plan-2026-10-26.md) | 尚未关闭的分阶段改进、验证协议、成功门槛与回退条件 |
 | [Cleanup 与纠错学习 harness 改进计划](cleanup-learning-harness-plan-2026-11-05.md) | 尚未关闭的编辑观察、归因、作用域规则、晋升/召回、prompt 消融与学习 episode 门槛 |
-| [纠错 Harness 生产接入与规则晋升研究计划](learning-harness-production-research-plan.md) | 独立提案：受控 V2/V3 fixture、隔离 SQLite 与后续研究门槛；实施状态以本文为准 |
 
 ## 设计参考（归档，不作为实现规范）
 

@@ -1,4 +1,4 @@
-import { useState, type CSSProperties } from "react";
+import { useEffect, useState, type CSSProperties } from "react";
 import { BorderBeam } from "border-beam";
 import { VoiceHudOrb } from "../../src/components/Island/VoiceHudOrb";
 import {
@@ -36,6 +36,18 @@ function useHudLabel(next: string | null, reduced: boolean) {
     setOutgoing(null);
     setEntering(false);
   }
+
+  useEffect(() => {
+    if (outgoing == null) return undefined;
+    const timer = window.setTimeout(() => setOutgoing(null), HUD_LABEL_OUT_MS);
+    return () => window.clearTimeout(timer);
+  }, [outgoing, text]);
+
+  useEffect(() => {
+    if (!entering) return undefined;
+    const timer = window.setTimeout(() => setEntering(false), HUD_LABEL_FADE_MS);
+    return () => window.clearTimeout(timer);
+  }, [entering, text]);
 
   return { text, outgoing, entering };
 }

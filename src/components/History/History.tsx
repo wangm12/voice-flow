@@ -331,6 +331,9 @@ function HistoryRow({ item, reload, windowed = false, onDeleteStart, onDeleteSuc
   const [showRaw, setShowRaw] = useState(false);
   const [showRevisions, setShowRevisions] = useState(false);
   const [revisions, setRevisions] = useState<HistoryRevision[] | null>(null);
+  useEffect(() => {
+    setRevisions(null);
+  }, [item.revision_count, item.final_text]);
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(item.final_text || item.raw_text);
   const [showReclean, setShowReclean] = useState(false);

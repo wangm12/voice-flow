@@ -1,6 +1,6 @@
 # MIT attribution overlay
 
-This additive attribution directory is included in VoiceFlow’s source tree. The existing `src-tauri/mlx-sidecar/scripts/package.sh` recursively copies `ThirdPartyLicenses/` into staged resources, and the `DependencyTexts/` verification walks this subtree. This integration has not been packaged or release-tested.
+This additive attribution directory is included in VoiceFlow’s source tree. The existing `src-tauri/mlx-sidecar/scripts/package.sh` recursively copies `ThirdPartyLicenses/` into staged resources, and the `DependencyTexts/` verification walks this subtree.
 
 `standard/MIT.txt` is a byte-exact copy of the official SPDX MIT standard text saved with the audit. It remains a terms reference with the literal `<year> <copyright holders>` placeholder. It is not represented as a full body shipped by any of the six locked packages.
 

@@ -328,6 +328,7 @@ pub(crate) fn rerun_paths(root: &Path) -> Vec<PathBuf> {
             "Package.resolved",
             "scripts/package.sh",
             "scripts/apply-sdk-cancellation-overlay.py",
+            "scripts/normalize-staged-third-party-licenses.py",
             "sdk-overlay/patch-manifest.json",
             "sdk-overlay/voiceflow-mlx-audio-cancellation-v2.patch",
             "xcode/VoiceFlowMLXSidecar.xcodeproj/project.pbxproj",

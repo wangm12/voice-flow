@@ -3,6 +3,14 @@ import nativeLearningAuditWire from "../test/fixtures/dictionary-learning-audit-
 import { auditObservation, auditPair, auditSnapshot } from "../test/dictionaryLearningAuditFixtures";
 import { parseDictionaryLearningAudit, parseLearningAuditChanged, parseLearningAuditReadError } from "./dictionaryLearningAudit";
 
+function nativeObservationFact(patch: Record<string, unknown>): unknown {
+  const value = JSON.parse(JSON.stringify(auditSnapshot())) as {
+    activity: Array<{ fact: Record<string, unknown> }>;
+  };
+  Object.assign(value.activity[0].fact, patch);
+  return value;
+}
+
 describe("normal learning audit native boundary", () => {
   it("parses the shared content-controlled wire serialized by the native audit DTOs", () => {
     const result = parseDictionaryLearningAudit(nativeLearningAuditWire);
@@ -28,8 +36,43 @@ describe("normal learning audit native boundary", () => {
     expect(parseDictionaryLearningAudit(withActivityFact(1, { candidate_store: { status: "completed", reason: "future_reason" } }))).toBeNull();
     expect(parseDictionaryLearningAudit(withActivityFact(4, { registration: { status: "skipped", reason: "future_skip" } }))).toBeNull();
     expect(parseDictionaryLearningAudit(withActivityFact(5, { candidate_decision: "future_decision" }))).toBeNull();
+    expect(parseDictionaryLearningAudit(withActivityFact(5, { outcome: "future_outcome" }))).toBeNull();
     expect(parseDictionaryLearningAudit({ ...nativeLearningAuditWire, schema_version: 2 })).toBeNull();
     expect(parseDictionaryLearningAudit({ ...nativeLearningAuditWire, unexpected: true })).toBeNull();
+  });
+  it("accepts every current Rust registration, outcome, and candidate decision code", () => {
+    // Keep these values aligned with dictionary_learn.rs audit call sites and
+    // LearnPairSkipReason::code; dictation_origin_unknown is a candidate decision.
+    const registrationReasons = [
+      "unverified", "read_owner_unavailable", "delivery_owner_mismatch", "read_lease_expired",
+      "secure", "no_grant", "unreadable", "delivery_fact_mismatch", "fixture_baseline_mismatch",
+      "ambiguous_inserted_range", "stale_or_cancelled", "protected_target", "no_mapping",
+      "ax_or_learning_not_allowed", "scene_not_allowed", "target_changed",
+    ];
+    for (const reason of registrationReasons) {
+      const value = nativeObservationFact({
+        registration: { status: "skipped", reason },
+        outcome: reason === "stale_or_cancelled" ? "stale_or_cancelled" : "not_observed",
+      });
+      expect(parseDictionaryLearningAudit(value), reason).not.toBeNull();
+    }
+
+    const outcomes = [
+      "not_observed", "observing", "nochange", "target_changed", "unreadable", "single_token",
+      "multiple_tokens", "short_style_rewrite", "style_signal", "ambiguous", "stale_or_cancelled",
+    ];
+    for (const outcome of outcomes) {
+      expect(parseDictionaryLearningAudit(nativeObservationFact({ outcome })), outcome).not.toBeNull();
+    }
+
+    const candidateDecisions = [
+      "not_attempted", "pending", "db_promoted", "already_db_promoted", "rejected",
+      "tombstone_or_ignored", "cap", "unknown", "unknown_scope", "scope_conflict",
+      "duplicate_observation", "dictation_origin_unknown", "db_promotion_failed",
+    ];
+    for (const candidate_decision of candidateDecisions) {
+      expect(parseDictionaryLearningAudit(nativeObservationFact({ candidate_decision })), candidate_decision).not.toBeNull();
+    }
   });
   it("retains lossless identity, explicit nulls and independent persistence legs", () => {
     const activity = auditObservation();

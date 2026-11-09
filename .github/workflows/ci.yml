@@ -25,11 +25,15 @@ jobs:
       - run: npm run lint
       - run: npm run build
       - run: npm audit --registry=https://registry.npmjs.org --audit-level=high
+      - name: Release workflow hermetic tests
+        run: ./scripts/release-test.sh
 
   rust:
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
+      - name: Select Xcode 26 and verify Swift 6.2
+        run: ./scripts/select-xcode-26.sh
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: stable
@@ -40,6 +44,8 @@ jobs:
         run: ./scripts/select-codesign-identity-test.sh
       - name: VoiceFlow DMG mount listing tests
         run: ./scripts/list-voiceflow-dmg-mounts-test.sh
+      - name: Xcode 26 selector tests
+        run: ./scripts/select-xcode-26-test.sh
       - run: cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
       - run: cargo test --manifest-path src-tauri/Cargo.toml
       - run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --all-features -- -D warnings
@@ -47,9 +53,11 @@ jobs:
       - run: cargo check --manifest-path src-tauri/Cargo.toml --target x86_64-apple-darwin
 
   tauri-config:
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
+      - name: Select Xcode 26 and verify Swift 6.2
+        run: ./scripts/select-xcode-26.sh
       - uses: actions/setup-node@v4
         with:
           node-version: 22

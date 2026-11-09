@@ -318,16 +318,30 @@ fn apply_current_history_retry_output_mode(
     policy.cleanup_output_plan = None;
 }
 
-fn history_retry_output_projection(
-    settings: &store::Settings,
-    profile_id: Option<&str>,
+struct HistoryRetryOutputProjectionInput<'a> {
+    settings: &'a store::Settings,
+    profile_id: Option<&'a str>,
     family: context::ContextFamily,
     input_kind: context::FocusKind,
     scene: crate::ResolvedCleanupScene,
-    intent: &llm::CleanupIntent,
+    intent: &'a llm::CleanupIntent,
     route_effort: llm::CleanupEffort,
-    source: &str,
+    source: &'a str,
+}
+
+fn history_retry_output_projection(
+    input: HistoryRetryOutputProjectionInput<'_>,
 ) -> Option<crate::cleanup_output_resolver::ResolvedCleanupProjection> {
+    let HistoryRetryOutputProjectionInput {
+        settings,
+        profile_id,
+        family,
+        input_kind,
+        scene,
+        intent,
+        route_effort,
+        source,
+    } = input;
     use crate::cleanup_output_resolver::{CleanupOutputFacts, OutputOperation};
     use crate::cleanup_prompt::OutputMode;
 
@@ -1295,16 +1309,16 @@ async fn retry_dictation_inner(
     let cleanup_route = crate::cleanup_route_for_resolved_scene(&settings, prepared.scene, &intent);
     let cleanup_output_projection = match cleanup_route {
         lexicon::CleanupRoute::Provider(effort) if snippet_expansion.is_none() => {
-            history_retry_output_projection(
-                &settings,
-                scene.profile_id.as_deref(),
+            history_retry_output_projection(HistoryRetryOutputProjectionInput {
+                settings: &settings,
+                profile_id: scene.profile_id.as_deref(),
                 family,
                 input_kind,
-                retry_scene,
-                &intent,
-                effort,
-                &cleanup_input,
-            )
+                scene: retry_scene,
+                intent: &intent,
+                route_effort: effort,
+                source: &cleanup_input,
+            })
         }
         _ => None,
     };
@@ -1798,16 +1812,16 @@ mod tests {
             context::FocusKind::Document,
         );
 
-        let resolved = history_retry_output_projection(
-            &settings,
-            Some("docs.work"),
-            context::ContextFamily::Document,
-            context::FocusKind::Document,
+        let resolved = history_retry_output_projection(HistoryRetryOutputProjectionInput {
+            settings: &settings,
+            profile_id: Some("docs.work"),
+            family: context::ContextFamily::Document,
+            input_kind: context::FocusKind::Document,
             scene,
-            &intent,
-            llm::CleanupEffort::Standard,
+            intent: &intent,
+            route_effort: llm::CleanupEffort::Standard,
             source,
-        )
+        })
         .expect("eligible retry keeps a shared output plan");
 
         assert_eq!(
@@ -1832,16 +1846,16 @@ mod tests {
             context::FocusKind::Document,
         );
 
-        let resolved = history_retry_output_projection(
-            &settings,
-            Some("docs.work"),
-            context::ContextFamily::Document,
-            context::FocusKind::Document,
+        let resolved = history_retry_output_projection(HistoryRetryOutputProjectionInput {
+            settings: &settings,
+            profile_id: Some("docs.work"),
+            family: context::ContextFamily::Document,
+            input_kind: context::FocusKind::Document,
             scene,
-            &intent,
-            llm::CleanupEffort::Heavy,
+            intent: &intent,
+            route_effort: llm::CleanupEffort::Heavy,
             source,
-        )
+        })
         .expect("eligible retry keeps a shared output plan");
 
         assert_eq!(

@@ -23,6 +23,19 @@ describe("dictionary import", () => {
     expect(result.invalid).toBe(2);
   });
 
+  it("measures each dictionary word against the 256-byte UTF-8 limit", () => {
+    const exactly256Bytes = "é".repeat(128);
+    const overLimitAt258Bytes = "é".repeat(129);
+    expect(new TextEncoder().encode(exactly256Bytes)).toHaveLength(256);
+    expect(new TextEncoder().encode(overLimitAt258Bytes)).toHaveLength(258);
+
+    const result = mergeDictionary([], [exactly256Bytes, overLimitAt258Bytes]);
+    expect(result.words).toEqual([exactly256Bytes]);
+    expect(result.requested).toEqual([exactly256Bytes]);
+    expect(result.added).toBe(1);
+    expect(result.invalid).toBe(1);
+  });
+
   it("requests existing valid spellings once even when the dictionary is full", () => {
     const result = mergeDictionary(["VoiceFlow", "Cursor"], ["voiceflow", "Cursor", "cursor", "NewTerm"], 2);
 

@@ -241,6 +241,31 @@ pub(crate) fn apply_session_mode(
     }
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct SessionLearningSnapshot {
+    dictionary: Vec<String>,
+    dictionary_sources: crate::store::DictionarySources,
+    context_mappings: Vec<context::AppMapping>,
+}
+
+impl SessionLearningSnapshot {
+    pub(crate) fn from_settings(settings: &crate::store::Settings) -> Self {
+        Self {
+            dictionary: settings.dictionary.clone(),
+            dictionary_sources: settings.dictionary_sources.clone(),
+            context_mappings: settings.context_mappings.clone(),
+        }
+    }
+
+    pub(crate) fn apply_to(&self, settings: &mut crate::store::Settings) {
+        settings.dictionary.clone_from(&self.dictionary);
+        settings
+            .dictionary_sources
+            .clone_from(&self.dictionary_sources);
+        settings.context_mappings.clone_from(&self.context_mappings);
+    }
+}
+
 pub(crate) struct DictationManager {
     pub(crate) phase: Phase,
     pub(crate) started: std::time::Instant,
@@ -250,6 +275,8 @@ pub(crate) struct DictationManager {
     pub(crate) delivery_settlement: Option<std::sync::Arc<DeliverySettlementOwner>>,
     pub(crate) cancellation: CancellationToken,
     pub(crate) recording_context: Option<context::ContextSnapshot>,
+    pub(crate) recording_learning_snapshot: Option<SessionLearningSnapshot>,
+    pub(crate) recording_translation_target_language: Option<String>,
     pub(crate) hotkey_session: Option<HotkeySession>,
     pub(crate) recording_source: Option<HotkeySource>,
     pub(crate) onboarding_trial: Option<crate::onboarding::TrialSnapshot>,
@@ -271,6 +298,8 @@ impl DictationManager {
             delivery_settlement: None,
             cancellation: CancellationToken::new(),
             recording_context: None,
+            recording_learning_snapshot: None,
+            recording_translation_target_language: None,
             hotkey_session: None,
             recording_source: None,
             onboarding_trial: None,
@@ -454,6 +483,8 @@ pub(crate) struct StopClaim {
     pub(crate) owned_replay_history_authority: Option<OwnedReplayHistoryAuthority>,
     pub(crate) cancellation: CancellationToken,
     pub(crate) recording_context: context::ContextSnapshot,
+    pub(crate) recording_learning_snapshot: Option<SessionLearningSnapshot>,
+    pub(crate) recording_translation_target_language: Option<String>,
     pub(crate) onboarding_trial: Option<crate::onboarding::TrialSnapshot>,
     pub(crate) research_trace: Option<crate::research_trace::Trace>,
 }
@@ -484,6 +515,8 @@ pub(crate) fn claim_start_manager(
         Some(DeliverySettlementOwner::new(DictationTransactionId::fresh()));
     manager.cancellation = CancellationToken::new();
     manager.recording_context = None;
+    manager.recording_learning_snapshot = None;
+    manager.recording_translation_target_language = None;
     manager.stop_when_recording = false;
     clear_hotkey_session(manager);
     Some(manager.session_generation)
@@ -604,6 +637,8 @@ pub(crate) fn claim_stop_manager(manager: &mut DictationManager) -> Option<StopC
             .recording_context
             .take()
             .unwrap_or_else(context::ContextSnapshot::general),
+        recording_learning_snapshot: manager.recording_learning_snapshot.take(),
+        recording_translation_target_language: manager.recording_translation_target_language.take(),
     };
     if let Some(trace) = &claim.research_trace {
         trace.stop(claim.session_generation);
@@ -780,6 +815,8 @@ pub(crate) fn finish_onboarding_fixture_operation(
     manager.owned_replay_target = None;
     manager.owned_replay_source_admission = None;
     manager.recording_context = None;
+    manager.recording_learning_snapshot = None;
+    manager.recording_translation_target_language = None;
     manager.stop_when_recording = false;
     clear_hotkey_session(manager);
     Some(manager.session_generation)
@@ -950,6 +987,8 @@ pub(crate) fn reset_starting_manager(manager: &mut DictationManager) -> u64 {
         manager.owned_replay_source_admission = None;
         manager.session_generation = manager.session_generation.wrapping_add(1);
         manager.recording_context = None;
+        manager.recording_learning_snapshot = None;
+        manager.recording_translation_target_language = None;
         manager.stop_when_recording = false;
         clear_hotkey_session(manager);
     }
@@ -1015,6 +1054,8 @@ pub(crate) fn claim_cancel_manager(manager: &mut DictationManager, had_preview: 
         manager.owned_replay_source_admission = None;
         manager.session_generation = manager.session_generation.wrapping_add(1);
         manager.recording_context = None;
+        manager.recording_learning_snapshot = None;
+        manager.recording_translation_target_language = None;
         manager.stop_when_recording = false;
         clear_hotkey_session(manager);
     }
@@ -1052,9 +1093,9 @@ fn claim_cancel_for_text_action(
     }
     let delivery_settlement = manager.delivery_settlement.clone();
     let phase = claim_cancel_manager(&mut manager, had_action);
-    if phase != Phase::Idle || had_action {
-        crate::dictionary_learn::invalidate_learning_observers(&state.learning_observer_epoch);
-    }
+    // Explicit cancel also stops any post-paste observer that outlived a
+    // successful delivery into Idle.
+    crate::dictionary_learn::invalidate_learning_observers(&state.learning_observer_epoch);
     CancelClaim {
         phase,
         generation: manager.session_generation,
@@ -2963,6 +3004,64 @@ mod skip_session_tests {
         claim_start_manager_with_mode(&mut manager, &mut lease, RecordingMode::Dictation).unwrap();
         assert!(manager.translation_target_language.is_none());
         assert_eq!(claim.translation_target_language.as_deref(), Some("ja"));
+    }
+
+    #[test]
+    fn session_learning_snapshot_keeps_captured_dictionary_and_context() {
+        let mapping = context::AppMapping {
+            id: "editor".into(),
+            label: "Editor".into(),
+            family: context::ContextFamily::Document,
+            mode_id: None,
+            bundle_id: Some("com.example.editor".into()),
+            executable: None,
+            browser_host: None,
+            browser_path_prefix: None,
+            focused_field: None,
+            source_permissions: context::ContextSourcePermissions::default(),
+            style_example_input: Some("captured input".into()),
+            style_example_output: Some("captured output".into()),
+            style_example_pairs: vec![context::StyleExamplePair {
+                input: "captured input".into(),
+                output: "captured output".into(),
+            }],
+            style_examples_approved: true,
+            enabled: true,
+            cleanup_effort: None,
+            cleanup_intensity: None,
+            cleanup_enabled: true,
+            dictionary_learn_enabled: true,
+        };
+        let mut captured = crate::store::Settings {
+            dictionary: vec!["TypeScript".into()],
+            context_mappings: vec![mapping],
+            ..crate::store::Settings::default()
+        };
+        assert!(
+            captured.add_dictionary_source("TypeScript", crate::store::DictionarySource::Manual)
+        );
+        let snapshot = SessionLearningSnapshot::from_settings(&captured);
+
+        let mut updated = captured.clone();
+        updated.dictionary = vec!["JavaScript".into()];
+        updated.context_mappings[0].style_example_input = Some("learned input".into());
+        updated.context_mappings[0].style_example_output = Some("learned output".into());
+        updated.context_mappings[0].style_example_pairs = vec![context::StyleExamplePair {
+            input: "learned input".into(),
+            output: "learned output".into(),
+        }];
+        updated.output_mode = "bullets".into();
+        snapshot.apply_to(&mut updated);
+
+        assert_eq!(updated.dictionary, vec!["TypeScript"]);
+        assert!(
+            updated.has_dictionary_source("TypeScript", &crate::store::DictionarySource::Manual)
+        );
+        assert_eq!(
+            updated.context_mappings[0].style_example_input.as_deref(),
+            Some("captured input")
+        );
+        assert_eq!(updated.output_mode, "bullets");
     }
 
     #[test]

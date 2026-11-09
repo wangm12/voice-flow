@@ -436,11 +436,11 @@ fn validate_trial_eligibility_facts(
             ),
         ]
         .iter()
-        .all(|(declared, expected)| declared.map_or(true, |declared| declared == *expected))
+        .all(|(declared, expected)| declared.is_none_or(|declared| declared == *expected))
             && binding
                 .and_then(|value| value.get("repeat"))
                 .and_then(serde_json::Value::as_u64)
-                .map_or(true, |repeat| repeat == u64::from(row.repeat));
+                .is_none_or(|repeat| repeat == u64::from(row.repeat));
         if !compatible {
             continue;
         }
@@ -2107,7 +2107,10 @@ pub(super) fn run(evidence_arg: &Path, report_arg: &Path) -> Result<i32, validat
                 ) {
                     trial_identity = Some(TrialIdentity {
                         id: id.to_owned(),
-                        proof: format!("{unit}|{protocol_sha}|{roster_sha}|{independence_sha}"),
+                        proof: format!(
+                            "{unit}|{protocol_sha}|{roster_sha}|{independence_sha}|{}|{}|{}",
+                            row.job_id, row.case_id, row.repeat
+                        ),
                     });
                 }
                 let binding = body.get("row_binding");
@@ -2648,7 +2651,10 @@ pub(super) fn run(evidence_arg: &Path, report_arg: &Path) -> Result<i32, validat
             ) {
                 trial_identity = Some(TrialIdentity {
                     id: id.to_owned(),
-                    proof: format!("{unit}|{protocol_sha}|{roster_sha}|{independence_sha}"),
+                    proof: format!(
+                        "{unit}|{protocol_sha}|{roster_sha}|{independence_sha}|{}|{}|{}",
+                        on.job_id, on.case_id, on.repeat
+                    ),
                 });
             }
             if let (Some((roster_body, _)), Some((_, protocol_sha))) = (&roster_receipt, &protocol)
@@ -2767,12 +2773,11 @@ pub(super) fn run(evidence_arg: &Path, report_arg: &Path) -> Result<i32, validat
                     ),
                 ]
                 .iter()
-                .all(|(declared, expected)| {
-                    declared.map_or(true, |declared| declared == *expected)
-                }) && declaration_binding
-                    .and_then(|b| b.get("repeat"))
-                    .and_then(serde_json::Value::as_u64)
-                    .map_or(true, |repeat| repeat == u64::from(on.repeat));
+                .all(|(declared, expected)| declared.is_none_or(|declared| declared == *expected))
+                    && declaration_binding
+                        .and_then(|b| b.get("repeat"))
+                        .and_then(serde_json::Value::as_u64)
+                        .is_none_or(|repeat| repeat == u64::from(on.repeat));
                 if row_candidate
                     && (declaration
                         .get("run_sha256")
@@ -3999,6 +4004,7 @@ mod tests {
             serde_json::from_slice(&std::fs::read(&on_path).unwrap()).unwrap();
         let mut second_on_row = on_run["cases"][0].clone();
         second_on_row["case_id"] = serde_json::json!("synthetic-off-only");
+        second_on_row["repeat"] = serde_json::json!(1);
         on_run["cases"].as_array_mut().unwrap().push(second_on_row);
         let on_bytes = serde_json::to_vec(&on_run).unwrap();
         directory.write("run-on.json", &on_run);
@@ -4021,12 +4027,15 @@ mod tests {
 
         let mut second_pair = evidence["pairs"][0].clone();
         second_pair["source_case_id"] = serde_json::json!("synthetic-off-only");
+        second_pair["repeat"] = serde_json::json!(1);
         for arm in ["filter_off", "filter_on"] {
             second_pair["arms"][arm]["row_binding"]["case_id"] =
                 serde_json::json!("synthetic-off-only");
+            second_pair["arms"][arm]["row_binding"]["repeat"] = serde_json::json!(1);
         }
         let mut second_proof = first_proof;
         second_proof["row_binding"]["case_id"] = serde_json::json!("synthetic-off-only");
+        second_proof["row_binding"]["repeat"] = serde_json::json!(1);
         rebind_trial_proof(&directory, &mut second_proof, "cp-second-case");
         second_pair["arms"]["filter_on"]["trial_proof"] = receipt(
             &directory,
@@ -4090,7 +4099,6 @@ mod tests {
             .join(old_proof_ref["relative_path"].as_str().unwrap());
         let original_proof: serde_json::Value =
             serde_json::from_slice(&std::fs::read(old_proof_path).unwrap()).unwrap();
-        let protocol_ref = original_proof["protocol"].clone();
         let old_roster_path = directory
             .0
             .join(original_proof["roster"]["relative_path"].as_str().unwrap());
@@ -4098,7 +4106,7 @@ mod tests {
             serde_json::from_slice(&std::fs::read(old_roster_path).unwrap()).unwrap();
         let mut second_declaration = roster["trials"][0].clone();
         roster["trials"][0]["run_sha256"] = serde_json::json!(on_sha);
-        roster["trials"][0]["row_binding"]["repeat"] = serde_json::json!(1);
+        roster["trials"][0]["row_binding"]["repeat"] = serde_json::json!(0);
         second_declaration["run_sha256"] = serde_json::json!(on_sha);
         second_declaration["row_binding"]["repeat"] = serde_json::json!(2);
         roster["trials"]

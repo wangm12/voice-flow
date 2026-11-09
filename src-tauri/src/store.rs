@@ -3396,15 +3396,12 @@ fn credential_hint(key: &str) -> Option<String> {
     Some(format!("••••{}", tail.chars().rev().collect::<String>()))
 }
 
+#[cfg(test)]
 pub(crate) fn add_manual_dictionary_words(settings: &mut Settings, words: &[String]) -> usize {
     words
         .iter()
         .filter(|word| settings.add_dictionary_source(word, DictionarySource::Manual))
         .count()
-}
-
-pub(crate) fn remove_dictionary_word(settings: &mut Settings, word: &str) -> bool {
-    settings.remove_dictionary_word(word)
 }
 
 pub(crate) fn reconcile_dictionary_patch(
@@ -8135,7 +8132,7 @@ impl LearnPairObservation {
         }
     }
 
-    #[cfg(any(test, feature = "research-harness"))]
+    #[cfg(test)]
     pub(crate) fn research_fixture_origin(source_origin_id: &str, pair_key: &str) -> Self {
         Self::research_fixture_origin_with_observation_id(
             source_origin_id,
@@ -8167,6 +8164,7 @@ impl LearnPairObservation {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn proof_eligible(&self) -> bool {
         self.proof_eligible
     }
@@ -16905,8 +16903,10 @@ mod tests {
     #[test]
     fn dictionary_projection_and_persistence_are_capped_without_resurrecting_dropped_words() {
         let dir = temp_dir("dictionary-owner-cap");
-        let mut settings = Settings::default();
-        settings.dictionary = (0..257).map(|index| format!("term-{index:03}")).collect();
+        let mut settings = Settings {
+            dictionary: (0..257).map(|index| format!("term-{index:03}")).collect(),
+            ..Settings::default()
+        };
         settings.dictionary_sources.owners.insert(
             "term-256".into(),
             [DictionarySource::Screen("late-screen-origin".into())]

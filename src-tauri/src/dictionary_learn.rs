@@ -1134,7 +1134,7 @@ pub(crate) async fn add_dictionary_entries(
 ) -> Result<store::SettingsView, String> {
     let mut audit = AuditAttempt::review(&app, "add_dictionary_entries");
     let result = mutate_dictionary_sources(&app, &mut audit, |_, settings| {
-        store::add_manual_dictionary_words(settings, &words);
+        add_manual_dictionary_words(settings, &words)?;
         Ok(false)
     })
     .await;
@@ -1288,7 +1288,7 @@ pub(crate) async fn promote_learn_pair(
                 }
             };
             if outcome.saved {
-                crate::commit_settings_snapshot(&state, snapshot.clone());
+                crate::commit_learning_settings_snapshot(&state, snapshot.clone());
                 let _ = app.emit("settings://changed", store::SettingsView::from(&*snapshot));
             }
             if let Some(error) = outcome.sync_error {
@@ -1512,7 +1512,7 @@ pub(crate) async fn undo_learn_pair(
                 }
             };
             if outcome.saved {
-                crate::commit_settings_snapshot(&state, snapshot.clone());
+                crate::commit_learning_settings_snapshot(&state, snapshot.clone());
                 let _ = app.emit("settings://changed", store::SettingsView::from(&snapshot));
             }
             if let Some(error) = outcome.sync_error {
@@ -1525,8 +1525,7 @@ pub(crate) async fn undo_learn_pair(
                 audit
                     .settings_result(Ok::<(), anyhow::Error>(()))
                     .map_err(|error| error.to_string())?;
-                let view = store::SettingsView::from(&snapshot);
-                view
+                store::SettingsView::from(&snapshot)
             } else {
                 store::SettingsView::from(&lock_recover(&state.settings).clone())
             }
@@ -1629,7 +1628,7 @@ async fn restore_mapping_learn(
     audit
         .settings_result(store::save_settings(dir, &snapshot))
         .map_err(|error| error.to_string())?;
-    crate::commit_settings_snapshot(&state, snapshot.clone());
+    crate::commit_learning_settings_snapshot(&state, snapshot.clone());
     {
         let mut context = lock_recover(&state.context);
         context.mappings = snapshot.context_mappings.clone();
@@ -1733,7 +1732,7 @@ pub(crate) async fn confirm_style_draft(
         audit
             .settings_result(store::save_settings(&dir, &snapshot))
             .map_err(|error| error.to_string())?;
-        crate::commit_settings_snapshot(&state, snapshot.clone());
+        crate::commit_learning_settings_snapshot(&state, snapshot.clone());
         {
             let mut context = lock_recover(&state.context);
             context.mappings = snapshot.context_mappings.clone();
@@ -1808,7 +1807,7 @@ async fn mutate_dictionary_sources(
     let saved = outcome.saved;
     let sync_error = outcome.sync_error;
     if saved {
-        crate::commit_settings_snapshot(&state, snapshot.clone());
+        crate::commit_learning_settings_snapshot(&state, snapshot.clone());
     }
     let view = if saved {
         store::SettingsView::from(&snapshot)
@@ -1843,7 +1842,7 @@ fn mutate_dictionary_settings(
     mutate(&mut snapshot.dictionary);
     snapshot.normalize();
     store::save_settings(dir, &snapshot).map_err(|error| error.to_string())?;
-    crate::commit_settings_snapshot(state, snapshot.clone());
+    crate::commit_learning_settings_snapshot(state, snapshot.clone());
     Ok(snapshot)
 }
 
@@ -1901,7 +1900,6 @@ pub(crate) fn save_settings_with_dictionary_effects(
     save_even_without_effects: bool,
     mut save: impl FnMut(&store::Settings) -> anyhow::Result<()>,
 ) -> Result<DictionarySettingsSaveOutcome, String> {
-    let mut database_change_committed = database_change_committed;
     let mut retrying_changed_effect = false;
     let mut previously_saved_settings = None;
     for attempt in 0..2 {
@@ -1922,7 +1920,6 @@ pub(crate) fn save_settings_with_dictionary_effects(
                 });
             }
         };
-        database_change_committed |= !effects.is_empty();
         if effects.is_empty() && !save_even_without_effects && !retrying_changed_effect {
             return Ok(DictionarySettingsSaveOutcome {
                 saved: false,
@@ -1939,9 +1936,13 @@ pub(crate) fn save_settings_with_dictionary_effects(
                     )),
                 });
             }
-            return Err(format!(
-                "learning_dictionary_partial:dictionary_capacity_or_invalid_word"
-            ));
+            return Err(if database_change_committed {
+                format!(
+                    "{DICTIONARY_SETTINGS_PARTIAL_ERROR}: dictionary capacity or word validation"
+                )
+            } else {
+                "dictionary capacity or word validation".into()
+            });
         }
         settings.normalize();
         if let Err(error) = save(settings) {
@@ -2002,6 +2003,28 @@ pub(crate) fn save_settings_with_dictionary_effects(
             "{DICTIONARY_ACK_PARTIAL_ERROR}: reconciliation did not settle"
         )),
     })
+}
+
+fn add_manual_dictionary_words(
+    settings: &mut store::Settings,
+    words: &[String],
+) -> Result<(), String> {
+    let mut candidate = settings.clone();
+    let manual = store::DictionarySource::Manual;
+    for word in words {
+        let word = word.trim();
+        if word.is_empty() || candidate.has_dictionary_source(word, &manual) {
+            continue;
+        }
+        if word.len() > 256 {
+            return Err("dictionary word exceeds 256 UTF-8 bytes".into());
+        }
+        if !candidate.add_dictionary_source(word, manual.clone()) {
+            return Err("dictionary capacity of 256 words reached".into());
+        }
+    }
+    *settings = candidate;
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2407,31 +2430,24 @@ where
                 .min(elapsed.saturating_add(limits.idle_grace));
             stable_sample = false;
         } else {
-            if last_change_elapsed
-                .is_some_and(|changed_at| elapsed.saturating_sub(changed_at) >= limits.idle_grace)
-            {
+            let changed_sample_settled = last_change_elapsed
+                .is_some_and(|changed_at| elapsed.saturating_sub(changed_at) >= limits.idle_grace);
+            if changed_sample_settled {
                 last_successful_same_sample_elapsed = Some(elapsed);
-                stable_sample = true;
-            } else if last_change_elapsed.is_none() {
-                #[cfg(test)]
-                {
-                    stable_sample = if first_unchanged_sample_elapsed
-                        .is_some_and(|first| elapsed.saturating_sub(first) >= limits.idle_grace)
-                    {
-                        true
-                    } else {
-                        if first_unchanged_sample_elapsed.is_none() {
-                            first_unchanged_sample_elapsed = Some(elapsed);
-                        }
-                        false
-                    };
+            }
+            #[cfg(test)]
+            {
+                let initially_unchanged_sample_settled = last_change_elapsed.is_none()
+                    && first_unchanged_sample_elapsed
+                        .is_some_and(|first| elapsed.saturating_sub(first) >= limits.idle_grace);
+                if last_change_elapsed.is_none() && first_unchanged_sample_elapsed.is_none() {
+                    first_unchanged_sample_elapsed = Some(elapsed);
                 }
-                #[cfg(not(test))]
-                {
-                    stable_sample = false;
-                }
-            } else {
-                stable_sample = false;
+                stable_sample = changed_sample_settled || initially_unchanged_sample_settled;
+            }
+            #[cfg(not(test))]
+            {
+                stable_sample = changed_sample_settled;
             }
         }
         on_sample(Some(&current), stable_sample);
@@ -2470,7 +2486,6 @@ pub(crate) enum ControlledAttributionSample {
 
 #[cfg(test)]
 pub(crate) struct ControlledAttributionResult {
-    pub(crate) operation_id: String,
     pub(crate) observer_outcome: &'static str,
     pub(crate) judgment: crate::edit_attribution::Judgment,
     pub(crate) samples_observed: usize,
@@ -2604,13 +2619,16 @@ fn controlled_candidate_scope(
 fn record_controlled_candidate_owner(
     dir: &std::path::Path,
     dictionary: &mut Vec<String>,
-    before: &str,
-    after: &str,
-    candidate_scope: &store::LearnPairScope,
-    observation_id: &str,
-    stable_source_origin_id: Option<&str>,
-    auto_scoped: bool,
+    candidate: ControlledCandidate<'_>,
 ) -> anyhow::Result<&'static str> {
+    let ControlledCandidate {
+        before,
+        after,
+        scope: candidate_scope,
+        observation_id,
+        stable_source_origin_id,
+        auto_scoped,
+    } = candidate;
     let key = pair_key(before, after);
     let observation = stable_source_origin_id
         .map(|origin| {
@@ -2670,6 +2688,16 @@ fn record_controlled_candidate_owner(
             RecordPairResult::Ignored => "candidate_owner_ignored",
         }
     })
+}
+
+#[cfg(any(test, feature = "research-harness"))]
+struct ControlledCandidate<'a> {
+    before: &'a str,
+    after: &'a str,
+    scope: &'a store::LearnPairScope,
+    observation_id: &'a str,
+    stable_source_origin_id: Option<&'a str>,
+    auto_scoped: bool,
 }
 
 /// Preserve the existing two-state research call by routing it through the
@@ -2901,12 +2929,14 @@ pub(crate) fn record_controlled_fixture_edit_trajectory(
     let candidate_write = record_controlled_candidate_owner(
         dir,
         dictionary,
-        &before_span,
-        &after,
-        &candidate_scope,
-        &observation_id,
-        Some(proof_source_origin),
-        auto_scoped,
+        ControlledCandidate {
+            before: &before_span,
+            after: &after,
+            scope: &candidate_scope,
+            observation_id: &observation_id,
+            stable_source_origin_id: Some(proof_source_origin),
+            auto_scoped,
+        },
     )?;
     Ok(controlled_fixture_pair_result(
         "single_token",
@@ -3036,7 +3066,7 @@ fn observe_controlled_attribution_samples(
 
 /// Run the pure judge on the token-bound fixture and the existing same-field
 /// observer. The manifest supplies evidence, scope, limits, and ordered poll
-/// events; only authorization and operation identity arrive separately.
+/// events; the learning grant arrives separately.
 #[cfg(test)]
 pub(crate) fn record_controlled_fixture_attribution_trajectory(
     dir: &std::path::Path,
@@ -3045,7 +3075,7 @@ pub(crate) fn record_controlled_fixture_attribution_trajectory(
     verified_origin: &crate::learning_research::edit_attribution_tests::VerifiedAttributionOrigin<
         '_,
     >,
-    operation_id: &str,
+    _operation_id: &str,
 ) -> anyhow::Result<ControlledAttributionResult> {
     use crate::edit_attribution::{self, EditSettlement, EditSourceTrust, UnknownReason, Verdict};
 
@@ -3059,7 +3089,6 @@ pub(crate) fn record_controlled_fixture_attribution_trajectory(
         Some(UnknownReason::EditUnsettled | UnknownReason::EditSourceUntrusted)
     ) {
         return Ok(ControlledAttributionResult {
-            operation_id: operation_id.to_owned(),
             observer_outcome: "delivery_preflight_rejected",
             judgment: preflight_judgment,
             samples_observed: 0,
@@ -3193,19 +3222,20 @@ pub(crate) fn record_controlled_fixture_attribution_trajectory(
             let candidate_write = record_controlled_candidate_owner(
                 dir,
                 dictionary,
-                before_span,
-                after,
-                &candidate_scope,
-                &observation_id,
-                Some(verified_origin.origin_id()),
-                auto_scoped,
+                ControlledCandidate {
+                    before: before_span,
+                    after,
+                    scope: &candidate_scope,
+                    observation_id: &observation_id,
+                    stable_source_origin_id: Some(verified_origin.origin_id()),
+                    auto_scoped,
+                },
             )?;
             Ok((true, candidate_write))
         },
     )?;
 
     Ok(ControlledAttributionResult {
-        operation_id: operation_id.to_owned(),
         observer_outcome: if observation.capture.outcome == ObserveOutcome::LeftTarget {
             "left_field"
         } else {
@@ -3956,7 +3986,7 @@ async fn persist_screen_lexicon_locked(
     if !outcome.saved {
         return;
     }
-    crate::commit_settings_snapshot(&state, snapshot.clone());
+    crate::commit_learning_settings_snapshot(&state, snapshot.clone());
     if let Some(error) = outcome.sync_error {
         log::warn!("screen dictionary effect acknowledgement remains pending: {error}");
     }
@@ -4220,7 +4250,7 @@ pub fn record_learn_pair_with_scope(
 /// the independent-origin promotion threshold. Ordinary test calls through
 /// `record_learn_pair_with_scope` remain proof-free, matching production.
 #[cfg(test)]
-fn record_test_proof_pair(
+pub(crate) fn record_test_proof_pair(
     dir: &std::path::Path,
     dictionary: &mut Vec<String>,
     before: &str,
@@ -4653,6 +4683,7 @@ fn try_promote_learn_pair(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn add_dictionary_words(dictionary: &mut Vec<String>, words: &[String]) -> usize {
     words
         .iter()
@@ -4660,6 +4691,7 @@ pub(crate) fn add_dictionary_words(dictionary: &mut Vec<String>, words: &[String
         .count()
 }
 
+#[cfg(test)]
 pub(crate) fn remove_dictionary_entry(dictionary: &mut Vec<String>, word: &str) -> bool {
     let before = dictionary.len();
     dictionary.retain(|item| !store::dictionary_words_equal(item, word));
@@ -5393,7 +5425,7 @@ pub(crate) async fn learn_from_manual_history_edit(
             Err(error) => return Err(anyhow::anyhow!(error)),
         };
     if settings_outcome.saved {
-        crate::commit_settings_snapshot(state, snapshot.clone());
+        crate::commit_learning_settings_snapshot(state, snapshot.clone());
         let _ = app.emit("settings://changed", store::SettingsView::from(&snapshot));
     }
     if settings_outcome.sync_error.is_some() {
@@ -5747,7 +5779,7 @@ async fn persist_style_intensity_learn_locked(
         log::warn!("style learn settings persist failed: {error}");
         return;
     }
-    crate::commit_settings_snapshot(&state, snapshot.clone());
+    crate::commit_learning_settings_snapshot(&state, snapshot.clone());
     crate::learning_research::stage(
         LearningStage::SettingsPersistence,
         "save_settings_completed",
@@ -6048,7 +6080,7 @@ async fn persist_learn_pair_locked(
         if let Err(error) = audit.settings_result(Ok::<(), anyhow::Error>(())) {
             log::warn!("dictionary learn audit persistence failed: {error}");
         }
-        crate::commit_settings_snapshot(&state, snapshot.clone());
+        crate::commit_learning_settings_snapshot(&state, snapshot.clone());
         crate::learning_research::stage(
             LearningStage::SettingsPersistence,
             "save_settings_completed",
@@ -6177,6 +6209,112 @@ mod tests {
     }
 
     #[test]
+    fn manual_dictionary_add_rejects_oversized_utf8_and_capacity_atomically() {
+        let mut settings = crate::store::Settings::default();
+        let original = settings.clone();
+        let oversized = "界".repeat(86);
+        assert_eq!(oversized.len(), 258);
+        let error = super::add_manual_dictionary_words(&mut settings, &[oversized])
+            .expect_err("terms over the UTF-8 byte limit must be rejected");
+        assert!(error.contains("256 UTF-8 bytes"));
+        assert_eq!(settings.dictionary, original.dictionary);
+        assert_eq!(settings.dictionary_sources, original.dictionary_sources);
+
+        let mut settings = crate::store::Settings {
+            dictionary: (0..255).map(|index| format!("term-{index}")).collect(),
+            ..crate::store::Settings::default()
+        };
+        let original = settings.clone();
+        let error = super::add_manual_dictionary_words(
+            &mut settings,
+            &["last-slot".into(), "over-capacity".into()],
+        )
+        .expect_err("a batch that exceeds capacity must be rejected atomically");
+        assert!(error.contains("capacity"));
+        assert_eq!(settings.dictionary, original.dictionary);
+        assert_eq!(settings.dictionary_sources, original.dictionary_sources);
+
+        let mut exact_capacity = crate::store::Settings::default();
+        let words: Vec<String> = (0..256).map(|index| format!("allowed-{index}")).collect();
+        super::add_manual_dictionary_words(&mut exact_capacity, &words)
+            .expect("exactly 256 unique terms fit");
+        assert_eq!(exact_capacity.dictionary.len(), 256);
+    }
+
+    #[test]
+    fn unrelated_pending_dictionary_effect_is_not_partial_manual_success() {
+        let dir = temp_dir("unrelated-dictionary-effect-manual-write");
+        let mut persisted = crate::store::Settings::default();
+        crate::store::save_configuration(&dir, &persisted).unwrap();
+        let before = "VoiceFlo";
+        let after = "VoiceFlow";
+        let key = super::pair_key(before, after);
+        let scope = crate::store::LearnPairScope {
+            family: Some("general".into()),
+            mapping_id: Some("fixture".into()),
+            native_bundle: Some("com.example.fixture".into()),
+            ..Default::default()
+        };
+        assert!(matches!(
+            crate::store::upsert_learn_pair_with_scope(&dir, &key, before, after, Some(&scope))
+                .unwrap(),
+            crate::store::LearnPairUpsert::Stored(_)
+        ));
+        crate::store::ensure_learn_pair_promoted(&dir, &key, before, after, Some(&scope)).unwrap();
+        assert_eq!(
+            crate::store::list_pending_dictionary_effects(&dir)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        super::add_manual_dictionary_words(&mut persisted, &["manual-term".into()]).unwrap();
+        let error = match super::save_settings_with_dictionary_effects(
+            &dir,
+            &mut persisted,
+            false,
+            true,
+            |_| Err(anyhow::anyhow!("injected Settings write failure")),
+        ) {
+            Ok(_) => panic!("the failed Settings write must fail this manual addition"),
+            Err(error) => error,
+        };
+        assert_eq!(error, "injected Settings write failure");
+        assert!(!error.starts_with(super::DICTIONARY_SETTINGS_PARTIAL_ERROR));
+
+        let saved: crate::store::Settings =
+            serde_json::from_slice(&std::fs::read(dir.join("settings.json")).unwrap()).unwrap();
+        assert!(!saved.dictionary.iter().any(|word| word == "manual-term"));
+        assert!(crate::store::list_pending_dictionary_effects(&dir)
+            .unwrap()
+            .iter()
+            .any(|effect| effect.pair_key == key));
+
+        let mut full_settings = crate::store::Settings {
+            dictionary: (0..256).map(|index| format!("full-{index}")).collect(),
+            ..crate::store::Settings::default()
+        };
+        crate::store::save_configuration(&dir, &full_settings).unwrap();
+        let error = match super::save_settings_with_dictionary_effects(
+            &dir,
+            &mut full_settings,
+            false,
+            true,
+            |_| panic!("capacity failure must happen before Settings write"),
+        ) {
+            Ok(_) => panic!("unrelated pending add cannot exceed a full dictionary"),
+            Err(error) => error,
+        };
+        assert_eq!(error, "dictionary capacity or word validation");
+        assert!(!error.starts_with(super::DICTIONARY_SETTINGS_PARTIAL_ERROR));
+        assert!(crate::store::list_pending_dictionary_effects(&dir)
+            .unwrap()
+            .iter()
+            .any(|effect| effect.pair_key == key));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn learning_during_processing_does_not_cancel_or_leak_lease() {
         let _network_policy_guard = crate::network_policy::strict_offline_test_guard_blocking();
         let root = temp_dir("learning-during-processing");
@@ -6188,6 +6326,10 @@ mod tests {
             let mut manager = crate::lock_recover(&state.manager);
             manager.phase = crate::Phase::Processing;
             manager.session_generation = 41;
+            manager.recording_learning_snapshot =
+                Some(crate::dictation::SessionLearningSnapshot::from_settings(
+                    &crate::lock_recover(&state.settings),
+                ));
             manager.cancellation.clone()
         };
         assert!(crate::try_claim_operation(
@@ -6207,9 +6349,20 @@ mod tests {
             state
                 .processing_configuration_generation
                 .load(Ordering::Acquire),
-            active_configuration_generation + 1
+            active_configuration_generation
         );
         assert!(!processing_cancellation.is_cancelled());
+        let captured = crate::lock_recover(&state.manager)
+            .recording_learning_snapshot
+            .clone()
+            .expect("active processing retains captured learning settings");
+        let mut processing_settings = crate::lock_recover(&state.settings).clone();
+        captured.apply_to(&mut processing_settings);
+        assert!(processing_settings.dictionary.is_empty());
+        assert!(crate::lock_recover(&state.settings)
+            .dictionary
+            .iter()
+            .any(|word| word == "Tokio"));
         assert_eq!(
             *crate::lock_recover(&state.operation_lease),
             crate::OperationLease::LiveDictation
@@ -6750,6 +6903,68 @@ mod tests {
         assert_eq!(result, ObserveOutcome::Unchanged);
         assert_eq!(*reads.borrow(), 0);
         assert!(!super::learning_observer_is_current(&epoch, observer_epoch));
+    }
+
+    #[test]
+    fn post_delivery_observer_survives_success_but_clear_epoch_stops_reads() {
+        let expected = test_target(42, false);
+        let epoch = AtomicU64::new(0);
+        let observer_epoch = epoch.load(Ordering::Acquire);
+        let recording_cancellation = tokio_util::sync::CancellationToken::new();
+        let observer_cancellation = crate::new_learning_observer_cancellation();
+        recording_cancellation.cancel();
+        assert!(!observer_cancellation.is_cancelled());
+
+        let reads = Cell::new(0usize);
+        let outcome = super::observe_after_paste_with_identity(
+            "前文 知呼 后文",
+            "知呼",
+            &expected,
+            super::ObserveOptions {
+                dictionary_learn_enabled: true,
+                require_browser_identity: false,
+                inserted_range_after: None,
+                limits: ObserveLimits::default(),
+            },
+            || {
+                reads.set(reads.get() + 1);
+                Some("前文 知乎 后文".into())
+            },
+            || expected.clone(),
+            |_| {},
+            || true,
+            || {
+                !observer_cancellation.is_cancelled()
+                    && super::learning_observer_is_current(&epoch, observer_epoch)
+            },
+        );
+        assert_eq!(outcome, zhihu_token());
+        assert!(reads.get() > 0);
+
+        let current_epoch = epoch.load(Ordering::Acquire);
+        super::invalidate_learning_observers(&epoch);
+        let reads_after_clear = Cell::new(0usize);
+        let stale_outcome = super::observe_after_paste_with_identity(
+            "前文 知呼 后文",
+            "知呼",
+            &expected,
+            super::ObserveOptions {
+                dictionary_learn_enabled: true,
+                require_browser_identity: false,
+                inserted_range_after: None,
+                limits: ObserveLimits::default(),
+            },
+            || {
+                reads_after_clear.set(reads_after_clear.get() + 1);
+                Some("前文 知乎 后文".into())
+            },
+            || expected.clone(),
+            |_| {},
+            || true,
+            || super::learning_observer_is_current(&epoch, current_epoch),
+        );
+        assert_eq!(stale_outcome, ObserveOutcome::Unchanged);
+        assert_eq!(reads_after_clear.get(), 0);
     }
 
     #[test]
@@ -7815,8 +8030,10 @@ mod tests {
             crate::store::LearnPairUpsert::Stored(_)
         ));
 
-        let mut full = crate::store::Settings::default();
-        full.dictionary = (0..256).map(|index| format!("word{index}")).collect();
+        let mut full = crate::store::Settings {
+            dictionary: (0..256).map(|index| format!("word{index}")).collect(),
+            ..crate::store::Settings::default()
+        };
         let rejected = super::require_dictionary_confirmation_capacity(&dir, &full, after);
         if rejected.is_ok() {
             crate::store::ensure_learn_pair_promoted(&dir, &key, before, after, Some(&scope))
@@ -7867,8 +8084,10 @@ mod tests {
             ));
         }
 
-        let mut settings = crate::store::Settings::default();
-        settings.dictionary = (0..255).map(|index| format!("word{index}")).collect();
+        let settings = crate::store::Settings {
+            dictionary: (0..255).map(|index| format!("word{index}")).collect(),
+            ..crate::store::Settings::default()
+        };
         assert!(
             super::require_dictionary_confirmation_capacity(&dir, &settings, first_after).is_ok()
         );

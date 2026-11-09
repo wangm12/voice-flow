@@ -575,7 +575,7 @@ function AppContent() {
     setHistoryError(null);
     setHistoryLoading(true);
     void invoke<HistoryPage>("get_history", {
-      before_id: beforeId,
+      beforeId,
       limit: 50,
       query: historyQueryRef.current.trim() || null,
     })

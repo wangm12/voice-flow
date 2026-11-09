@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 
 static HOTKEYS_SUSPENDED: AtomicBool = AtomicBool::new(false);
@@ -211,6 +211,10 @@ pub fn is_suspended() -> bool {
     HOTKEYS_SUSPENDED.load(Ordering::SeqCst)
 }
 
+fn should_dispatch_action_hotkey(suspended: bool, state: ShortcutState) -> bool {
+    !suspended && state == ShortcutState::Pressed
+}
+
 pub fn register(app: &AppHandle, hotkey: &str, activation_mode: &str) -> Result<(), String> {
     let hotkey = canonicalize_hotkey(hotkey);
     let hotkey = hotkey.as_str();
@@ -339,8 +343,12 @@ pub fn register_selected_action(app: &AppHandle, hotkey: &str) -> Result<(), Str
         .map_err(|error| format!("invalid selected action hotkey `{hotkey}`: {error}"))?;
     app.global_shortcut()
         .on_shortcut(shortcut, move |app, _, event| {
-            if !is_suspended() && event.state == ShortcutState::Pressed {
-                let _ = app.emit("hotkey://selected-action", ());
+            if should_dispatch_action_hotkey(is_suspended(), event.state) {
+                let app = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    let state = app.state::<crate::AppState>();
+                    crate::selected_action::handle_selected_action_hotkey(&app, &state).await;
+                });
             }
         })
         .map_err(|error| format!("failed to register selected action hotkey: {error}"))?;
@@ -377,8 +385,12 @@ pub fn register_screen_action(app: &AppHandle, hotkey: &str) -> Result<(), Strin
         .map_err(|error| format!("invalid look-at-screen hotkey `{hotkey}`: {error}"))?;
     app.global_shortcut()
         .on_shortcut(shortcut, move |app, _, event| {
-            if !is_suspended() && event.state == ShortcutState::Pressed {
-                let _ = app.emit("hotkey://screen-action", ());
+            if should_dispatch_action_hotkey(is_suspended(), event.state) {
+                let app = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    let state = app.state::<crate::AppState>();
+                    crate::screen_action::handle_screen_action_hotkey(&app, &state).await;
+                });
             }
         })
         .map_err(|error| format!("failed to register look-at-screen hotkey: {error}"))?;
@@ -651,6 +663,21 @@ pub async fn apply_selected_action_hotkey(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selected_and_screen_action_shortcuts_dispatch_only_unsuspended_presses() {
+        assert!(should_dispatch_action_hotkey(false, ShortcutState::Pressed));
+        assert!(!should_dispatch_action_hotkey(
+            false,
+            ShortcutState::Released
+        ));
+        assert!(!should_dispatch_action_hotkey(true, ShortcutState::Pressed));
+        assert!(!should_dispatch_action_hotkey(
+            true,
+            ShortcutState::Released
+        ));
+    }
+
     #[test]
     fn option_slash_is_canonicalized() {
         assert_eq!(

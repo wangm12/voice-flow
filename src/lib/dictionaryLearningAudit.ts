@@ -26,11 +26,11 @@ const persistence = object({
 });
 const observation = object({
   kind: literal("post_paste_attempt"),
-  registration: object({ status: choice("checking", "started", "skipped"), reason: nullable(choice("registered", "unverified", "secure", "unreadable", "stale_or_cancelled", "no_grant", "protected_target", "no_mapping", "ax_or_learning_not_allowed", "scene_not_allowed", "target_changed", "ambiguous_inserted_range", "fixture_baseline_mismatch")) }),
+  registration: object({ status: choice("checking", "started", "skipped"), reason: nullable(choice("registered", "unverified", "read_owner_unavailable", "delivery_owner_mismatch", "read_lease_expired", "delivery_fact_mismatch", "secure", "unreadable", "stale_or_cancelled", "no_grant", "protected_target", "no_mapping", "ax_or_learning_not_allowed", "scene_not_allowed", "target_changed", "ambiguous_inserted_range", "fixture_baseline_mismatch")) }),
   verified_paste: boolean,
-  outcome: choice("not_observed", "observing", "nochange", "target_changed", "unreadable", "single_token", "short_style_rewrite", "style_signal", "ambiguous", "stale_or_cancelled"),
+  outcome: choice("not_observed", "observing", "nochange", "target_changed", "unreadable", "single_token", "multiple_tokens", "short_style_rewrite", "style_signal", "ambiguous", "stale_or_cancelled"),
   classification: nullable(classification),
-  candidate_decision: choice("not_attempted", "pending", "db_promoted", "already_db_promoted", "rejected", "tombstone_or_ignored", "cap", "unknown", "scope_conflict", "duplicate_observation", "db_promotion_failed"),
+  candidate_decision: choice("not_attempted", "pending", "db_promoted", "already_db_promoted", "rejected", "tombstone_or_ignored", "cap", "unknown", "unknown_scope", "scope_conflict", "duplicate_observation", "dictation_origin_unknown", "db_promotion_failed"),
   candidate_store: persistence, settings_store: persistence,
   attribution: choice("not_observed", "whole_field_difference_only"),
 });

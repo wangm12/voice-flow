@@ -1564,7 +1564,6 @@ fn dictation_configuration_changed(previous: &store::Settings, next: &store::Set
         || previous.vision_credential() != next.vision_credential()
         || previous.snippets != next.snippets
         || previous.output_mode != next.output_mode
-        || previous.translation_target_language != next.translation_target_language
         || previous.dictionary_learn_enabled != next.dictionary_learn_enabled
         || previous.local_edit_learning_enabled != next.local_edit_learning_enabled
         || previous.keep_success_audio != next.keep_success_audio
@@ -1577,6 +1576,22 @@ fn dictation_configuration_changed(previous: &store::Settings, next: &store::Set
 
 fn commit_settings_snapshot(state: &AppState, settings: store::Settings) -> bool {
     commit_settings_snapshot_if_generation(state, settings, None).unwrap_or(false)
+}
+
+/// Learning owns only the dictionary, its source metadata, and learned
+/// context examples/intensity. These edits affect future sessions; the current
+/// recording keeps the snapshot captured at its start and must not be
+/// invalidated by its own background learning write.
+pub(crate) fn commit_learning_settings_snapshot(state: &AppState, settings: store::Settings) {
+    let mut current = lock_recover(&state.settings);
+    apply_learning_settings_snapshot(&mut current, settings);
+    state.settings_generation.fetch_add(1, Ordering::AcqRel);
+}
+
+fn apply_learning_settings_snapshot(current: &mut store::Settings, learned: store::Settings) {
+    current.dictionary = learned.dictionary;
+    current.dictionary_sources = learned.dictionary_sources;
+    current.context_mappings = learned.context_mappings;
 }
 
 fn commit_settings_snapshot_if_generation(
@@ -3215,6 +3230,42 @@ pub(crate) fn spoken_translation_target(settings: &store::Settings) -> Option<&s
     (settings.output_mode == "translation")
         .then_some(settings.translation_target_language.as_str())
         .filter(|value| !value.trim().is_empty() && *value != "auto")
+}
+
+fn captured_translation_target<'a>(
+    mode_override: Option<&'a str>,
+    recording_target: Option<&'a str>,
+) -> Option<&'a str> {
+    mode_override.or(recording_target)
+}
+
+fn translation_cleanup_route_available(
+    settings: &store::Settings,
+    recording_context: &context::ContextSnapshot,
+) -> bool {
+    matches!(
+        cleanup_route_for(
+            settings,
+            Some(recording_context),
+            &llm::CleanupIntent::implicit("translation trial")
+        ),
+        lexicon::CleanupRoute::Provider(_)
+    ) && cleanup_provider_credentials_available(settings)
+}
+
+fn cleanup_provider_credentials_available(settings: &store::Settings) -> bool {
+    use crate::engine::EngineProvider;
+
+    match settings.cleanup_provider {
+        EngineProvider::OnDeviceMlx => true,
+        EngineProvider::Ollama | EngineProvider::LmStudio => {
+            let base = settings.resolved_provider_base(settings.cleanup_provider);
+            let loopback = crate::providers::is_loopback_url(&base);
+            (!settings.strict_offline_enabled || loopback)
+                && (loopback || !settings.cleanup_credential().trim().is_empty())
+        }
+        _ => !settings.cleanup_credential().trim().is_empty(),
+    }
 }
 
 #[cfg(test)]
@@ -4997,6 +5048,7 @@ async fn start_selected_action_with_feedback(
     // Escape must remain responsive while the selected text is captured.
     let session_generation = claim.session_generation;
     let Some(identity) = begin_text_action(state, "selected", &claim).await else {
+        let _ = reset_selected_action_start(app, state, session_generation).await;
         return Ok(());
     };
     hotkey::register_cancel(app);
@@ -5197,6 +5249,7 @@ pub(crate) async fn start_screen_action_with_feedback(
     };
     let session_generation = claim.session_generation;
     let Some(identity) = begin_text_action(state, "screen", &claim).await else {
+        let _ = reset_selected_action_start(app, state, session_generation).await;
         return Ok(());
     };
     hotkey::register_cancel(app);
@@ -5434,6 +5487,10 @@ async fn start_claimed_inner(
     owned_wav: Option<audio::OwnedWavReplay>,
     owned_route: Option<cli::OwnedWavReplayRoute>,
 ) -> Result<(), StartError> {
+    // An earlier delivered dictation may still own a bounded post-paste edit
+    // observer. A newly claimed recording makes that observer stale even
+    // though successful delivery already cancelled the recording token.
+    dictionary_learn::invalidate_learning_observers(&state.learning_observer_epoch);
     clear_stale_audio_recovery_ticket(app, state, session_generation);
     let owned_wav_replay = owned_wav.is_some();
     let (start_is_current, onboarding_trial, owned_target_is_bound) = {
@@ -5565,6 +5622,7 @@ async fn start_claimed_inner(
             manager.translation_target_language.as_deref(),
         );
         manager.translation_target_language.is_some()
+            || spoken_translation_target(&settings_snapshot).is_some()
     };
     state
         .active_processing_configuration_generation
@@ -5662,16 +5720,7 @@ async fn start_claimed_inner(
 
     if translation_session {
         let snapshot = lock_recover(&state.context).snapshot.clone();
-        let can_translate = matches!(
-            cleanup_route_for(
-                &settings_snapshot,
-                Some(&snapshot),
-                &llm::CleanupIntent::implicit("translation trial")
-            ),
-            lexicon::CleanupRoute::Provider(_)
-        ) && (settings_snapshot.cleanup_provider
-            == crate::engine::EngineProvider::Ollama
-            || !settings_snapshot.cleanup_credential().trim().is_empty());
+        let can_translate = translation_cleanup_route_available(&settings_snapshot, &snapshot);
         if !can_translate {
             let Some(generation) = reset_starting(state, session_generation) else {
                 return Ok(());
@@ -5978,6 +6027,11 @@ async fn start_claimed_inner(
         {
             (true, None, m.session_generation, m.cancellation.clone())
         } else {
+            m.recording_learning_snapshot = Some(
+                dictation::SessionLearningSnapshot::from_settings(&settings_snapshot),
+            );
+            m.recording_translation_target_language =
+                spoken_translation_target(&settings_snapshot).map(str::to_owned);
             let pending = dictation::enter_recording(&mut m, recording_context.clone());
             (false, pending, m.session_generation, m.cancellation.clone())
         }
@@ -6144,8 +6198,11 @@ async fn start_claimed_inner(
     Ok(())
 }
 
-fn reset_starting(state: &AppState, expected_generation: u64) -> Option<u64> {
-    let mut manager = lock_recover(&state.manager);
+fn reset_starting_owner(
+    manager: &mut DictationManager,
+    operation_lease: &mut OperationLease,
+    expected_generation: u64,
+) -> Option<(u64, bool, Option<Arc<DeliverySettlementOwner>>)> {
     let was_starting =
         manager.phase == Phase::Starting && manager.session_generation == expected_generation;
     let owns_cancelled_start = manager.phase == Phase::Idle
@@ -6154,15 +6211,31 @@ fn reset_starting(state: &AppState, expected_generation: u64) -> Option<u64> {
         return None;
     }
     let settlement = manager.delivery_settlement.clone();
-    let generation = dictation::reset_starting_manager(&mut manager);
+    let generation = dictation::reset_starting_manager(manager);
+    if *operation_lease == OperationLease::LiveDictation {
+        *operation_lease = OperationLease::Idle;
+    }
+    Some((generation, was_starting, settlement))
+}
+
+fn reset_starting(state: &AppState, expected_generation: u64) -> Option<u64> {
+    // Start claims acquire the lease before the manager, so keep that lock
+    // order when rolling back a failed selected/screen action claim.
+    let mut operation_lease = lock_recover(&state.operation_lease);
+    let mut manager = lock_recover(&state.manager);
+    let (generation, was_starting, settlement) =
+        reset_starting_owner(&mut manager, &mut operation_lease, expected_generation)?;
+    // A new start may claim the just-released lease immediately, but it cannot
+    // install its manager owner until this guard is dropped. Clear only the
+    // failed start's captured action state inside that window.
+    clear_selected_action(state);
+    screen_action::clear_screen_action(state);
     drop(manager);
     if let Some(settlement) = settlement {
         state.delivery_settlements.record_terminal(settlement);
     }
     store_session_screen_text(state, generation, None);
-    clear_selected_action(state);
-    screen_action::clear_screen_action(state);
-    release_operation(state, OperationLease::LiveDictation);
+    drop(operation_lease);
     was_starting.then_some(generation)
 }
 
@@ -7728,6 +7801,8 @@ async fn handle_audio_error(
             manager.translation_target_language = None;
             manager.session_generation = manager.session_generation.wrapping_add(1);
             manager.recording_context = None;
+            manager.recording_learning_snapshot = None;
+            manager.recording_translation_target_language = None;
             Some(manager.session_generation)
         }
     };
@@ -7852,6 +7927,10 @@ async fn handle_audio_limit(app: &tauri::AppHandle, state: &AppState, session_ge
     let _ = stop_claimed(app, state, claim).await;
 }
 
+pub(crate) fn new_learning_observer_cancellation() -> CancellationToken {
+    CancellationToken::new()
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn paste_text(
     app: &tauri::AppHandle,
@@ -7879,7 +7958,10 @@ async fn paste_text(
     // A later text-action start can then expire this transaction even if this
     // continuation resumes after the new action has already begun.
     let expected_observer_epoch = state.learning_observer_epoch.load(Ordering::Acquire);
-    let observer_cancellation = cancellation.clone();
+    // The dictation token is cancelled on successful completion as well as on
+    // explicit user cancellation. The observer has its own bounded read lease;
+    // explicit cancel/clear and target changes still invalidate its epoch.
+    let observer_cancellation = new_learning_observer_cancellation();
     let worker_app = app.clone();
     let worker_text = text.to_owned();
     let inserted_text = worker_text.clone();
@@ -8199,7 +8281,10 @@ async fn undo_last_delivery(
                 cancellation,
                 deadline,
                 || anchor.is_current_focus(),
-                || paste::undo(accessibility),
+                || {
+                    dictionary_learn::invalidate_learning_observers(&state.learning_observer_epoch);
+                    paste::undo(accessibility)
+                },
             );
             drop(manager);
             result
@@ -8304,6 +8389,8 @@ async fn stop_claimed_inner(
         owned_replay_history_authority,
         cancellation,
         mut recording_context,
+        recording_learning_snapshot,
+        recording_translation_target_language,
         onboarding_trial,
         research_trace: _,
     } = claim;
@@ -8440,6 +8527,8 @@ async fn stop_claimed_inner(
                     m.skip_llm_cleanup = false;
                     m.translation_target_language = None;
                     m.recording_context = None;
+                    m.recording_learning_snapshot = None;
+                    m.recording_translation_target_language = None;
                     drop(m);
                     release_operation(state, OperationLease::LiveDictation);
                     sync_modifier_hotkey_phase(Phase::Idle);
@@ -8506,6 +8595,8 @@ async fn stop_claimed_inner(
                 }
                 manager.phase = Phase::Idle;
                 manager.recording_context = None;
+                manager.recording_learning_snapshot = None;
+                manager.recording_translation_target_language = None;
                 manager.skip_llm_cleanup = false;
                 manager.translation_target_language = None;
                 drop(manager);
@@ -8598,7 +8689,7 @@ async fn stop_claimed_inner(
     };
     if phase3 != StopPhase3::Process {
         if let Some(spool) = capture_spool {
-            spool.request_finish(audio::SpoolDisposition::Completed);
+            spool.request_finish(stop_phase3_spool_disposition(&phase3));
         }
         if phase3 == StopPhase3::NotCurrent {
             let current_generation = lock_recover(&state.manager).session_generation;
@@ -8609,10 +8700,16 @@ async fn stop_claimed_inner(
     sync_modifier_hotkey_phase(Phase::Processing);
 
     let mut settings = lock_recover(&state.settings).clone();
+    if let Some(snapshot) = recording_learning_snapshot.as_ref() {
+        snapshot.apply_to(&mut settings);
+    }
     dictation::apply_session_mode(
         &mut settings,
         skip_llm_cleanup,
-        translation_target_language.as_deref(),
+        captured_translation_target(
+            translation_target_language.as_deref(),
+            recording_translation_target_language.as_deref(),
+        ),
     );
     let soniox_selected = settings.asr_provider == crate::providers::EngineProvider::Soniox;
     let recording_secs = started.elapsed().as_secs();
@@ -10143,6 +10240,8 @@ async fn move_processing_to_selected_preview(
     manager.skip_llm_cleanup = false;
     manager.translation_target_language = None;
     manager.recording_context = None;
+    manager.recording_learning_snapshot = None;
+    manager.recording_translation_target_language = None;
     drop(manager);
     emit_preview();
     true
@@ -10870,7 +10969,7 @@ async fn process_short(
             lexicon::CleanupRoute::LocalOnly => CleanupDecision::Disabled,
             lexicon::CleanupRoute::Provider(effort) => {
                 if settings.asr_provider == crate::providers::EngineProvider::AssemblyAi
-                    && settings.cleanup_credential().trim().is_empty()
+                    && !cleanup_provider_credentials_available(settings)
                 {
                     cleanup_attempt_kind = Some("credentials_unavailable".to_owned());
                     cleanup_failure_reason = Some("credentials_unavailable".to_owned());
@@ -13678,7 +13777,7 @@ async fn process_long(
         expansion
     } else if matches!(cleanup_route, lexicon::CleanupRoute::Provider(_))
         && settings.asr_provider == crate::providers::EngineProvider::AssemblyAi
-        && settings.cleanup_credential().trim().is_empty()
+        && !cleanup_provider_credentials_available(settings)
     {
         cleanup_failure_reason = Some("cleanup_credentials_unavailable");
         cleanup_failure_detail = Some("credentials_unavailable".to_owned());
@@ -14740,6 +14839,8 @@ fn claim_processing_timeout(
     manager.skip_llm_cleanup = false;
     manager.translation_target_language = None;
     manager.recording_context = None;
+    manager.recording_learning_snapshot = None;
+    manager.recording_translation_target_language = None;
     manager.session_generation = manager.session_generation.wrapping_add(1);
     Some(manager.session_generation)
 }
@@ -14828,6 +14929,13 @@ enum StopPhase3 {
     NotCurrent,
 }
 
+fn stop_phase3_spool_disposition(outcome: &StopPhase3) -> audio::SpoolDisposition {
+    match outcome {
+        StopPhase3::ConfigurationChanged => audio::SpoolDisposition::Recoverable,
+        StopPhase3::Process | StopPhase3::NotCurrent => audio::SpoolDisposition::Completed,
+    }
+}
+
 fn claim_stop_phase3(
     manager: &mut DictationManager,
     lease: &mut OperationLease,
@@ -14854,6 +14962,8 @@ fn claim_stop_phase3(
     manager.cancellation.cancel();
     manager.phase = Phase::Idle;
     manager.recording_context = None;
+    manager.recording_learning_snapshot = None;
+    manager.recording_translation_target_language = None;
     manager.skip_llm_cleanup = false;
     manager.translation_target_language = None;
     manager.session_generation = manager.session_generation.wrapping_add(1);
@@ -15825,8 +15935,59 @@ fn settings_with_current_context_permissions(
     settings.context_enabled = current_settings.context_enabled;
     settings.browser_access_enabled = current_settings.browser_access_enabled;
     settings.window_ocr_enabled = current_settings.window_ocr_enabled;
-    settings.context_mappings = current_settings.context_mappings.clone();
+    settings.context_mappings = current_settings
+        .context_mappings
+        .iter()
+        .filter_map(|current_mapping| {
+            let captured = request_settings
+                .context_mappings
+                .iter()
+                .find(|mapping| mapping.id == current_mapping.id)?;
+            let mut mapping = current_mapping.clone();
+            let examples_remain_approved =
+                current_mapping.style_examples_approved && captured.style_examples_approved;
+            let current_pairs = style_example_pairs_for_mapping(current_mapping);
+            let captured_pairs = style_example_pairs_for_mapping(captured);
+            mapping.style_example_pairs = if examples_remain_approved {
+                captured_pairs
+                    .into_iter()
+                    .filter(|pair| current_pairs.contains(pair))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            mapping.style_examples_approved = examples_remain_approved;
+            if let Some(pair) = mapping.style_example_pairs.first() {
+                mapping.style_example_input = Some(pair.input.clone());
+                mapping.style_example_output = Some(pair.output.clone());
+            } else {
+                mapping.style_example_input = None;
+                mapping.style_example_output = None;
+            }
+            mapping.cleanup_intensity = captured.cleanup_intensity;
+            Some(mapping)
+        })
+        .collect();
     settings
+}
+
+fn style_example_pairs_for_mapping(
+    mapping: &context::AppMapping,
+) -> Vec<context::StyleExamplePair> {
+    if mapping.style_example_pairs.is_empty() {
+        return mapping
+            .style_example_input
+            .as_ref()
+            .zip(mapping.style_example_output.as_ref())
+            .map(|(input, output)| {
+                vec![context::StyleExamplePair {
+                    input: input.clone(),
+                    output: output.clone(),
+                }]
+            })
+            .unwrap_or_default();
+    }
+    mapping.style_example_pairs.clone()
 }
 
 fn current_asr_request_for_attempt(
@@ -16557,6 +16718,8 @@ fn abort_processing_manager(manager: &mut DictationManager) -> bool {
     manager.skip_llm_cleanup = false;
     manager.translation_target_language = None;
     manager.recording_context = None;
+    manager.recording_learning_snapshot = None;
+    manager.recording_translation_target_language = None;
     true
 }
 
@@ -16734,6 +16897,8 @@ async fn finish_with_delivery(
         m.skip_llm_cleanup = false;
         m.translation_target_language = None;
         m.recording_context = None;
+        m.recording_learning_snapshot = None;
+        m.recording_translation_target_language = None;
         let completion_generation = m.session_generation;
         let completed_trial = m.onboarding_trial.clone();
         drop(m);
@@ -19977,22 +20142,6 @@ pub fn run(cli_args: cli::CliArgs) {
             dictation::install_hotkey_dispatcher(app.handle().clone());
             modifier_hotkey::install_sleep_observer();
             let h = app.handle().clone();
-            app.listen("hotkey://selected-action", move |_| {
-                let h = h.clone();
-                tauri::async_runtime::spawn(async move {
-                    let state = h.state::<AppState>();
-                    selected_action::handle_selected_action_hotkey(&h, &state).await;
-                });
-            });
-            let h = app.handle().clone();
-            app.listen("hotkey://screen-action", move |_| {
-                let h = h.clone();
-                tauri::async_runtime::spawn(async move {
-                    let state = h.state::<AppState>();
-                    screen_action::handle_screen_action_hotkey(&h, &state).await;
-                });
-            });
-            let h = app.handle().clone();
             app.listen("audio://error", move |event| {
                 let h = h.clone();
                 let Ok(payload) = serde_json::from_str::<AudioDeviceErrorPayload>(event.payload())
@@ -21421,22 +21570,98 @@ mod tests {
 
     #[test]
     fn current_context_settings_narrow_a_captured_request_without_switching_asr_choice() {
+        use crate::context::{AppMapping, ContextFamily, StyleExamplePair};
+
         let captured = store::Settings {
             asr_provider: crate::providers::EngineProvider::Custom,
             asr_model: "captured-model".into(),
             context_enabled: true,
+            context_mappings: vec![AppMapping {
+                id: "editor".into(),
+                label: "Editor".into(),
+                family: ContextFamily::Document,
+                mode_id: None,
+                bundle_id: Some("com.example.editor".into()),
+                executable: None,
+                browser_host: None,
+                browser_path_prefix: None,
+                focused_field: None,
+                source_permissions: context::ContextSourcePermissions {
+                    ax_text: true,
+                    local_ocr: false,
+                    cloud_vision: false,
+                    context_text_to_providers: true,
+                },
+                style_example_input: Some("captured input".into()),
+                style_example_output: Some("captured output".into()),
+                style_example_pairs: vec![StyleExamplePair {
+                    input: "captured input".into(),
+                    output: "captured output".into(),
+                }],
+                style_examples_approved: true,
+                enabled: true,
+                cleanup_effort: None,
+                cleanup_intensity: None,
+                cleanup_enabled: true,
+                dictionary_learn_enabled: true,
+            }],
             ..store::Settings::default()
         };
         let revoked = store::Settings {
             asr_provider: crate::providers::EngineProvider::Groq,
             asr_model: "current-model".into(),
             context_enabled: false,
+            context_mappings: vec![AppMapping {
+                id: "editor".into(),
+                label: "Editor".into(),
+                family: ContextFamily::Document,
+                mode_id: None,
+                bundle_id: Some("com.example.editor".into()),
+                executable: None,
+                browser_host: None,
+                browser_path_prefix: None,
+                focused_field: None,
+                source_permissions: context::ContextSourcePermissions::default(),
+                style_example_input: None,
+                style_example_output: None,
+                style_example_pairs: Vec::new(),
+                style_examples_approved: false,
+                enabled: false,
+                cleanup_effort: None,
+                cleanup_intensity: Some(llm::CleanupIntensity::Heavy),
+                cleanup_enabled: true,
+                dictionary_learn_enabled: true,
+            }],
             ..store::Settings::default()
         };
         let projection = super::settings_with_current_context_permissions(&captured, &revoked);
         assert_eq!(projection.asr_provider, captured.asr_provider);
         assert_eq!(projection.asr_model, captured.asr_model);
         assert!(!projection.context_enabled);
+        let projected_mapping = &projection.context_mappings[0];
+        assert!(!projected_mapping.enabled);
+        assert_eq!(
+            projected_mapping.source_permissions,
+            context::ContextSourcePermissions::default()
+        );
+        assert!(!projected_mapping.style_examples_approved);
+        assert!(projected_mapping.style_example_input.is_none());
+        assert!(projected_mapping.style_example_pairs.is_empty());
+        assert_eq!(projected_mapping.cleanup_intensity, None);
+
+        let mut replaced = revoked.clone();
+        replaced.context_mappings[0].style_example_input = Some("replacement input".into());
+        replaced.context_mappings[0].style_example_output = Some("replacement output".into());
+        replaced.context_mappings[0].style_example_pairs = vec![StyleExamplePair {
+            input: "replacement input".into(),
+            output: "replacement output".into(),
+        }];
+        replaced.context_mappings[0].style_examples_approved = true;
+        let projection = super::settings_with_current_context_permissions(&captured, &replaced);
+        let projected_mapping = &projection.context_mappings[0];
+        assert!(projected_mapping.style_examples_approved);
+        assert!(projected_mapping.style_example_input.is_none());
+        assert!(projected_mapping.style_example_pairs.is_empty());
 
         let at_capture = context::ContextSourcePermissions {
             ax_text: true,
@@ -24105,6 +24330,18 @@ mod tests {
     }
 
     #[test]
+    fn stop_phase3_spool_is_recoverable_only_for_configuration_invalidation() {
+        assert_eq!(
+            super::stop_phase3_spool_disposition(&super::StopPhase3::ConfigurationChanged),
+            crate::audio::SpoolDisposition::Recoverable
+        );
+        assert_eq!(
+            super::stop_phase3_spool_disposition(&super::StopPhase3::NotCurrent),
+            crate::audio::SpoolDisposition::Completed
+        );
+    }
+
+    #[test]
     fn stop_phase3_config_change_releases_live_lease() {
         let mut lease = OperationLease::Idle;
         let mut manager = stopping_manager(&mut lease);
@@ -24432,6 +24669,72 @@ mod tests {
 
         // A completion retry must not invalidate the generation again.
         assert_eq!(reset_starting_manager(&mut manager), 8);
+    }
+
+    #[test]
+    fn failed_text_action_begin_releases_its_live_start_lease() {
+        let mut manager = DictationManager::new();
+        let mut lease = OperationLease::Idle;
+        let generation = crate::dictation::claim_start_manager(&mut manager, &mut lease)
+            .expect("text action start owns the live lease");
+        manager.cancellation.cancel();
+
+        let (reset_generation, was_starting, settlement) =
+            super::reset_starting_owner(&mut manager, &mut lease, generation)
+                .expect("cancelled begin claim is still owned by this start");
+
+        assert!(was_starting);
+        assert_eq!(reset_generation, generation + 1);
+        assert!(settlement.is_some());
+        assert_eq!(manager.phase, Phase::Idle);
+        assert_eq!(lease, OperationLease::Idle);
+    }
+
+    #[test]
+    fn successful_delivery_cancellation_does_not_expire_learning_observer() {
+        let recording_cancellation = CancellationToken::new();
+        let observer_cancellation = super::new_learning_observer_cancellation();
+        let epoch = std::sync::atomic::AtomicU64::new(0);
+        let observer_epoch = epoch.load(Ordering::Acquire);
+
+        recording_cancellation.cancel();
+        assert!(!observer_cancellation.is_cancelled());
+        assert_eq!(epoch.load(Ordering::Acquire), observer_epoch);
+
+        crate::dictionary_learn::invalidate_learning_observers(&epoch);
+        assert_ne!(epoch.load(Ordering::Acquire), observer_epoch);
+    }
+
+    #[test]
+    fn guarded_undo_invalidates_learning_only_after_final_authorization() {
+        let epoch = std::sync::atomic::AtomicU64::new(0);
+        let cancellation = CancellationToken::new();
+        let status = paste::run_guarded_undo(
+            &cancellation,
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+            || true,
+            || {
+                crate::dictionary_learn::invalidate_learning_observers(&epoch);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(status, "success");
+        assert_eq!(epoch.load(Ordering::Acquire), 1);
+
+        let before_stale_attempt = epoch.load(Ordering::Acquire);
+        let stale = paste::run_guarded_undo(
+            &cancellation,
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+            || false,
+            || {
+                crate::dictionary_learn::invalidate_learning_observers(&epoch);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(stale, "stale_target");
+        assert_eq!(epoch.load(Ordering::Acquire), before_stale_attempt);
     }
 
     #[test]
@@ -27718,6 +28021,135 @@ mod tests {
         let mut translating = settings;
         translating.output_mode = "translation".into();
         assert_eq!(super::spoken_translation_target(&translating), Some("en"));
+    }
+
+    #[test]
+    fn translation_target_only_changes_future_session_and_stop_uses_captured_target() {
+        let initial = store::Settings {
+            output_mode: "translation".into(),
+            translation_target_language: "en".into(),
+            ..store::Settings::default()
+        };
+        let mut updated = initial.clone();
+        updated.translation_target_language = "ja".into();
+        assert!(!super::dictation_configuration_changed(&initial, &updated));
+
+        let mut manager = DictationManager::new();
+        let mut lease = OperationLease::Idle;
+        super::dictation::claim_start_manager(&mut manager, &mut lease).expect("start claim");
+        manager.recording_translation_target_language =
+            super::spoken_translation_target(&initial).map(str::to_owned);
+        super::dictation::enter_recording(&mut manager, context::ContextSnapshot::general());
+        let claim = super::dictation::claim_stop_manager(&mut manager).expect("stop claim");
+        assert_eq!(
+            super::captured_translation_target(
+                claim.translation_target_language.as_deref(),
+                claim.recording_translation_target_language.as_deref(),
+            ),
+            Some("en")
+        );
+        super::dictation::release_operation_lease(&mut lease, OperationLease::LiveDictation);
+    }
+
+    #[test]
+    fn learning_settings_commit_preserves_unrelated_processing_configuration() {
+        let mut current = store::Settings {
+            asr_provider: crate::providers::EngineProvider::Groq,
+            asr_model: "captured-asr".into(),
+            cleanup_provider: crate::providers::EngineProvider::OpenAi,
+            cleanup_model: "captured-cleanup".into(),
+            dictionary: vec!["TypeScript".into()],
+            ..store::Settings::default()
+        };
+        let learned = store::Settings {
+            asr_provider: crate::providers::EngineProvider::Deepgram,
+            asr_model: "stale-asr".into(),
+            cleanup_provider: crate::providers::EngineProvider::Groq,
+            cleanup_model: "stale-cleanup".into(),
+            dictionary: vec!["TypeScript".into(), "Deno".into()],
+            ..current.clone()
+        };
+
+        super::apply_learning_settings_snapshot(&mut current, learned);
+        assert_eq!(current.dictionary, vec!["TypeScript", "Deno"]);
+        assert_eq!(current.asr_provider, crate::providers::EngineProvider::Groq);
+        assert_eq!(current.asr_model, "captured-asr");
+        assert_eq!(
+            current.cleanup_provider,
+            crate::providers::EngineProvider::OpenAi
+        );
+        assert_eq!(current.cleanup_model, "captured-cleanup");
+    }
+
+    #[test]
+    fn translation_start_accepts_configured_keyless_local_cleanup_providers() {
+        use crate::engine::EngineProvider;
+
+        let context = context::ContextSnapshot::general();
+        let settings = store::Settings {
+            output_mode: "translation".into(),
+            cleanup_provider: EngineProvider::OnDeviceMlx,
+            cleanup_model: EngineProvider::OnDeviceMlx.default_llm_model().into(),
+            cleanup_api_key: String::new(),
+            ..store::Settings::default()
+        };
+        assert!(super::translation_cleanup_route_available(
+            &settings, &context
+        ));
+
+        let lmstudio = store::Settings {
+            output_mode: "translation".into(),
+            cleanup_provider: EngineProvider::LmStudio,
+            cleanup_model: crate::lmstudio_local::MODEL_VARIANT.into(),
+            cleanup_api_key: String::new(),
+            ..store::Settings::default()
+        };
+        assert!(super::translation_cleanup_route_available(
+            &lmstudio, &context
+        ));
+
+        let key_required = store::Settings {
+            output_mode: "translation".into(),
+            cleanup_provider: EngineProvider::Groq,
+            cleanup_api_key: String::new(),
+            ..store::Settings::default()
+        };
+        assert!(!super::cleanup_provider_credentials_available(
+            &key_required
+        ));
+
+        let strict_offline_cloud = store::Settings {
+            output_mode: "translation".into(),
+            strict_offline_enabled: true,
+            cleanup_provider: EngineProvider::Groq,
+            api_key: "configured-cloud-key".into(),
+            ..store::Settings::default()
+        };
+        assert!(!super::translation_cleanup_route_available(
+            &strict_offline_cloud,
+            &context
+        ));
+
+        let strict_offline_local = store::Settings {
+            strict_offline_enabled: true,
+            ..settings
+        };
+        assert!(super::translation_cleanup_route_available(
+            &strict_offline_local,
+            &context
+        ));
+
+        let secure_context = context::ContextSnapshot {
+            policy: context::ContextPolicy {
+                input_kind: context::FocusKind::Secure,
+                ..context::ContextPolicy::for_family(context::ContextFamily::General)
+            },
+            ..context
+        };
+        assert!(!super::translation_cleanup_route_available(
+            &strict_offline_local,
+            &secure_context
+        ));
     }
 
     #[tokio::test]

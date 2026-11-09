@@ -84,6 +84,8 @@ pub(crate) struct DictationTraceSink {
     #[cfg(test)]
     io_gate: Option<Arc<TestIoGate>>,
     #[cfg(test)]
+    blocking_test_root_admission: bool,
+    #[cfg(test)]
     test_registry: Arc<crate::audio::SpoolOwnerRegistry>,
     #[cfg(test)]
     io_failure: Option<InjectedIoFailure>,
@@ -116,6 +118,8 @@ impl DictationTraceSink {
             #[cfg(test)]
             io_gate: None,
             #[cfg(test)]
+            blocking_test_root_admission: false,
+            #[cfg(test)]
             test_registry: crate::audio::SpoolOwnerRegistry::new_test(3),
             #[cfg(test)]
             io_failure: None,
@@ -132,6 +136,14 @@ impl DictationTraceSink {
     #[cfg(test)]
     fn with_io_gate(mut self, gate: TestIoGate) -> Self {
         self.io_gate = Some(Arc::new(gate));
+        self
+    }
+
+    #[cfg(test)]
+    fn with_blocking_root_admission_for_test(mut self) -> Self {
+        // Persistence fixtures should not fail on unrelated roots' short-lived
+        // global admission-map lock; the contention test continues to use `bind`.
+        self.blocking_test_root_admission = true;
         self
     }
 
@@ -213,7 +225,16 @@ impl DictationTraceSink {
         }
         line.push(b'\n');
         let reserved_bytes = line.len();
-        let mutation = match crate::store::try_begin_spool_root_mutation(&self.root) {
+        #[cfg(test)]
+        let mutation_admission = if self.blocking_test_root_admission {
+            crate::store::begin_spool_root_mutation(&self.root)
+        } else {
+            crate::store::try_begin_spool_root_mutation(&self.root)
+        };
+        #[cfg(not(test))]
+        let mutation_admission = crate::store::try_begin_spool_root_mutation(&self.root);
+
+        let mutation = match mutation_admission {
             Ok(mutation) => mutation,
             Err(_error) => {
                 #[cfg(test)]
@@ -673,7 +694,7 @@ mod tests {
     async fn trace_sink_contains_no_text_fields() {
         let _serial = TEST_LOCK.lock().await;
         let root = owned_root();
-        let sink = DictationTraceSink::new(root.0.clone());
+        let sink = DictationTraceSink::new(root.0.clone()).with_blocking_root_admission_for_test();
         let metrics = Metrics::default();
         let mut timer =
             metrics.stop_to_insert(MetricGroup::unknown("dictation"), CancellationToken::new());

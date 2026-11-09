@@ -71,7 +71,7 @@ export function mergeDictionary(existing: string[], imported: string[], limit = 
 
   for (const value of imported) {
     const word = value.trim();
-    if (!word || word.length > 256) {
+    if (!word || new TextEncoder().encode(word).length > 256) {
       invalid += 1;
       continue;
     }

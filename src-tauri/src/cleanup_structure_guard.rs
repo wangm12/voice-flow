@@ -25,6 +25,13 @@ struct PunctuationEvent {
     question_like_line: bool,
 }
 
+struct PunctuationExclusions<'a> {
+    literals: &'a [Range<usize>],
+    code_regions: &'a [Range<usize>],
+    protected: &'a [crate::protected_span::ProtectedSpan],
+    list_prefixes: &'a [Range<usize>],
+}
+
 /// Whether a candidate preserves structured cleanup source except for a
 /// narrow set of punctuation-only changes in prose.
 ///
@@ -69,21 +76,18 @@ fn safe_view(text: &str) -> Option<SafeView> {
     let protected =
         crate::protected_span::protected_spans(text, Some(crate::llm::CleanupOperation::Cleanup));
     let list_prefixes = list_prefix_ranges(text);
+    let exclusions = PunctuationExclusions {
+        literals: &literals,
+        code_regions: &code_regions,
+        protected: &protected,
+        list_prefixes: &list_prefixes,
+    };
 
     let mut skeleton = String::with_capacity(text.len());
     let mut punctuation = Vec::new();
     for (offset, ch) in text.char_indices() {
         let range = offset..offset + ch.len_utf8();
-        if let Some(event) = eligible_punctuation(
-            text,
-            offset,
-            ch,
-            skeleton.len(),
-            &literals,
-            &code_regions,
-            &protected,
-            &list_prefixes,
-        ) {
+        if let Some(event) = eligible_punctuation(text, offset, ch, skeleton.len(), &exclusions) {
             punctuation.push(event);
         } else {
             skeleton.push(ch);
@@ -102,16 +106,13 @@ fn eligible_punctuation(
     offset: usize,
     ch: char,
     skeleton_slot: usize,
-    literals: &[Range<usize>],
-    code_regions: &[Range<usize>],
-    protected: &[crate::protected_span::ProtectedSpan],
-    list_prefixes: &[Range<usize>],
+    exclusions: &PunctuationExclusions<'_>,
 ) -> Option<PunctuationEvent> {
     let range = offset..offset + ch.len_utf8();
-    if overlaps(literals, range.clone())
-        || overlaps(code_regions, range.clone())
-        || overlaps_protected(protected, range.clone())
-        || overlaps(list_prefixes, range)
+    if overlaps(exclusions.literals, range.clone())
+        || overlaps(exclusions.code_regions, range.clone())
+        || overlaps_protected(exclusions.protected, range.clone())
+        || overlaps(exclusions.list_prefixes, range)
     {
         return None;
     }
@@ -131,7 +132,7 @@ fn eligible_punctuation(
                 kind: SafePunctuation::Period,
                 line_terminal,
                 question_like_line: line_terminal
-                    && line_is_question_like(text, offset, list_prefixes),
+                    && line_is_question_like(text, offset, exclusions.list_prefixes),
             })
         }
         ',' | '，'

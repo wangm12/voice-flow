@@ -3,6 +3,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testi
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
 import type { SelectedActionPreview, TextActionOutcome } from "./components/SelectedPreviewDialog";
+import type { HistoryItem } from "./components/History/History";
 import App, { recoveryDestinationView } from "./App";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
@@ -1089,5 +1090,48 @@ describe("settings navigation", () => {
     stateHandler?.({ payload: { state: "history" } });
 
     await waitFor(() => expect(invokeMock.mock.calls.filter(([command]) => command === "get_history")).toHaveLength(historyCallsBeforeCompletion + 1));
+  });
+
+  it("loads earlier History through the camelCase cursor and appends the page", async () => {
+    const recent: HistoryItem = {
+      id: 20,
+      created_at: "2026-11-08 10:00:00",
+      raw_text: "recent raw",
+      final_text: "Recent page entry",
+      duration: 2,
+      status: "ok",
+    };
+    const earlier: HistoryItem = {
+      id: 10,
+      created_at: "2026-11-08 09:00:00",
+      raw_text: "earlier raw",
+      final_text: "Earlier page entry",
+      duration: 1,
+      status: "ok",
+    };
+    invokeMock.mockImplementation(async (command, args) => {
+      if (command === "get_settings") return settings;
+      if (command === "check_permissions") return { microphone: false, microphone_status: "denied", accessibility: false };
+      if (command === "get_history") {
+        const beforeId = (args as { beforeId?: number } | undefined)?.beforeId;
+        return beforeId === undefined
+          ? { items: [recent], has_more: true }
+          : { items: [earlier], has_more: false };
+      }
+      return undefined;
+    });
+
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "历史记录" }));
+    expect(await screen.findByText("Recent page entry")).toBeInTheDocument();
+    fireEvent.click(await screen.findByRole("button", { name: "加载更早的记录" }));
+
+    expect(await screen.findByText("Earlier page entry")).toBeInTheDocument();
+    expect(screen.getByText("Recent page entry")).toBeInTheDocument();
+    expect(invokeMock).toHaveBeenCalledWith("get_history", {
+      beforeId: recent.id,
+      limit: 50,
+      query: null,
+    });
   });
 });

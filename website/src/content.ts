@@ -4,8 +4,7 @@ export type Phase =
   "idle" | "listening" | "processing" | "writing" | "complete";
 
 export const links = {
-  download:
-    "https://github.com/wangm12/voice-flow/releases/latest/download/VoiceFlow.dmg",
+  download: "https://github.com/wangm12/voice-flow/releases/latest",
   github: "https://github.com/wangm12/voice-flow",
   guide: "https://github.com/wangm12/voice-flow#readme",
   privacy: "https://github.com/wangm12/voice-flow/blob/main/docs/privacy.md",
@@ -147,7 +146,7 @@ export const content: Record<Locale, Content> = {
       features: "功能",
       how: "使用方式",
       privacy: "隐私",
-      download: "下载",
+      download: "发行版",
       open: "打开导航",
       close: "关闭导航",
       language: "Switch to English",
@@ -160,7 +159,7 @@ export const content: Record<Locale, Content> = {
       title: ["少打字，", "多表达。"],
       description:
         "自然地说，清晰地写。\n把声音变成文字，送回你正在使用的应用。",
-      download: "下载 macOS 版",
+      download: "查看最新发行版",
       demo: "看看它如何工作",
       compatibility: "为 Mac 打造 · macOS 13 及以上",
       setup: "云端路线需自备 API Key，服务费用由所选服务商决定。",
@@ -367,7 +366,7 @@ export const content: Record<Locale, Content> = {
       features: "Features",
       how: "How it works",
       privacy: "Privacy",
-      download: "Download",
+      download: "Releases",
       open: "Open navigation",
       close: "Close navigation",
       language: "切换到中文",
@@ -380,7 +379,7 @@ export const content: Record<Locale, Content> = {
       title: ["Less typing.", "More flow."],
       description:
         "Speak naturally. Write clearly.\nYour voice becomes text, right where you work.",
-      download: "Download for macOS",
+      download: "Get the latest release",
       demo: "See how it works",
       compatibility: "Made for Mac · macOS 13 and later",
       setup: "Cloud routes use your own API key. Provider fees may apply.",

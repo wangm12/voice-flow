@@ -231,7 +231,7 @@ npm run build --prefix website    # 静态产物：website/dist/
 npm run preview --prefix website  # http://127.0.0.1:4173
 ```
 
-部署时将 `website/dist/` 作为静态站点发布。字体、Logo 和演示素材随站点托管；官网界面图标使用 [Hugeicons](https://hugeicons.com/) 的免费 Stroke Rounded 系列，统一 1.5 线宽。字体、图标与动画库许可见 `website/public/licenses/`。下载入口指向 GitHub 最新发行版的 `VoiceFlow.dmg`，下载版本的功能以对应发行说明为准。网页仅在浏览器本地记住语言选择。
+部署时将 `website/dist/` 作为静态站点发布。字体、Logo 和演示素材随站点托管；官网界面图标使用 [Hugeicons](https://hugeicons.com/) 的免费 Stroke Rounded 系列，统一 1.5 线宽。字体、图标与动画库许可见 `website/public/licenses/`。官网入口打开 GitHub 最新发行版页面，用户可下载该版本实际提供的 `VoiceFlow.dmg` 或 `VoiceFlow-unsigned.dmg`；下载版本的功能以对应发行说明为准。网页仅在浏览器本地记住语言选择。
 
 ### 桌面应用
 
@@ -379,7 +379,7 @@ git tag v0.1.4
 git push origin v0.1.4
 ```
 
-签名状态以 workflow 实际解析到的身份和 Team ID 为准：有效身份会发布 `VoiceFlow.dmg`，release notes 标为 signed；没有身份时默认失败。只有在仓库 Actions variables 中显式设置 `VOICEFLOW_ALLOW_UNSIGNED=1` 才允许未签名发布，此时资产名为 `VoiceFlow-unsigned.dmg`，release notes 标为 unsigned；只要解析到有效身份，即使该变量为 `1` 仍会签名。上传重名资产会失败，不会覆盖已有文件。Signed 仅表示代码签名，不代表 Apple notarization。CI 的 reusable workflow 不接收签名 secrets。
+签名状态以 workflow 实际解析到的身份和 Team ID 为准：有效身份会发布 `VoiceFlow.dmg`，release notes 标为 signed；没有身份时默认失败。只有在仓库 Actions variables 中显式设置 `VOICEFLOW_ALLOW_UNSIGNED=1` 才允许未签名发布，此时资产名为 `VoiceFlow-unsigned.dmg`，release notes 标为 unsigned；只要解析到有效身份，即使该变量为 `1` 仍会签名。上传重名资产会失败，不会覆盖已有文件。CI 的 reusable workflow 不接收签名 secrets。Release workflow 在导入证书前校验标签版本及源 commit；手动发布若版本标签已存在，标签（含 annotated tag 解引用后的 commit）必须与本次 `main` 构建 commit 相同，若标签不存在则只会在该 commit 创建发行版。Signed 仅表示代码签名，不代表 Apple notarization。
 
 CI **不会**在 runner 上现做一张新证。每次新证都会让所有人的 TCC 悄悄失效。
 

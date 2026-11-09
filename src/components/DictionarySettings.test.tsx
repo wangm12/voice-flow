@@ -166,6 +166,37 @@ describe("DictionarySettings", () => {
     expect(await screen.findByRole("alert")).toHaveTextContent("词条来源已记录，但个人词典未能同步。请重新导入以重试。");
   });
 
+  it("does not claim a manual word was recorded after an ordinary backend failure", async () => {
+    invokeMock.mockImplementation(async (command) => {
+      if (command === "add_dictionary_entries") throw new Error("dictionary write rejected");
+      return [];
+    });
+    render(<DictionarySettings settings={settings} save={vi.fn()} />);
+    const input = screen.getByRole("textbox", { name: "添加个人词典词条" });
+    fireEvent.change(input, { target: { value: "OpenAI" } });
+    fireEvent.click(screen.getByRole("button", { name: "添加" }));
+
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent("词条添加失败：dictionary write rejected");
+    expect(alert).not.toHaveTextContent("来源已记录");
+    expect(input).toHaveValue("OpenAI");
+  });
+
+  it("does not claim imported words were recorded after an ordinary backend failure", async () => {
+    invokeMock.mockImplementation(async (command) => {
+      if (command === "add_dictionary_entries") throw new Error("dictionary write rejected");
+      return [];
+    });
+    const { container } = render(<DictionarySettings settings={settings} save={vi.fn()} />);
+    const input = container.querySelector('input[type="file"]');
+    expect(input).not.toBeNull();
+    fireEvent.change(input!, { target: { files: [new File(["OpenAI"], "terms.txt", { type: "text/plain" })] } });
+
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent("导入失败：dictionary write rejected");
+    expect(alert).not.toHaveTextContent("已登记");
+  });
+
   it("reports partial dictionary synchronization for a learned rule action", async () => {
     invokeMock.mockImplementation(async (command) => {
       if (command === "list_learn_pairs") return [promotedPair];

@@ -98,6 +98,31 @@ describe("normal Settings learning audit", () => {
     const pair = openPairCard(result, "知呼 → 知乎");
     expect(pair.getByText(/已晋升词语按记录的 App 与场景范围/)).toBeVisible();
   });
+  it("renders newly supported native observation values in both languages", async () => {
+    const observation = auditObservation();
+    if (observation.fact.kind !== "post_paste_attempt") throw new Error("fixture kind");
+    observation.fact.registration = { status: "skipped", reason: "read_owner_unavailable" };
+    observation.fact.outcome = "multiple_tokens";
+    observation.fact.candidate_decision = "unknown_scope";
+    read = async () => auditSnapshot({ activity: [observation] });
+
+    render(<DictionaryLearningAudit />);
+    openAudit();
+    const result = await screen.findByLabelText("学习审查读取结果");
+    const card = openActivityCard(result, 1, "插入后观察尝试").card;
+    expect(card.getByText("开始观察的检查").parentElement).toHaveTextContent("无法确认输入框读取身份");
+    expect(card.getByText("观察结果").parentElement).toHaveTextContent("检测到多个词项变化");
+    expect(card.getByText("候选决定").parentElement).toHaveTextContent("规则范围未知");
+
+    cleanup();
+    render(<I18nProvider initialLanguage="en"><DictionaryLearningAudit /></I18nProvider>);
+    fireEvent.click(screen.getByRole("button", { name: "Learning audit: sources, reasons, and save steps" }));
+    const englishResult = await screen.findByLabelText("Learning audit read result");
+    const englishCard = openActivityCard(englishResult, 1, "Post-insertion observation attempt").card;
+    expect(englishCard.getByText("Observer admission").parentElement).toHaveTextContent("Could not confirm the focused field reader identity");
+    expect(englishCard.getByText("Observation outcome").parentElement).toHaveTextContent("Multiple token changes detected");
+    expect(englishCard.getByText("Candidate decision").parentElement).toHaveTextContent("Rule scope unknown");
+  });
   it("renders the same native wire with English labels instead of internal enum names", async () => {
     read = async () => nativeLearningAuditWire;
     render(<I18nProvider initialLanguage="en"><DictionaryLearningAudit /></I18nProvider>);

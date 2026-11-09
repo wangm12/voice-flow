@@ -1501,7 +1501,7 @@ mod learning_owner_fixtures {
                     let ObserveOutcome::SingleToken { before_span, after } = outcome else {
                         panic!("fixture did not reach actual lexeme observer")
                     };
-                    dictionary_learn::record_learn_pair_with_scope(
+                    dictionary_learn::record_test_proof_pair(
                         &dir.0,
                         &mut dictionary,
                         &before_span,
@@ -1547,7 +1547,8 @@ mod learning_owner_fixtures {
                     if corrections == 0 {
                         None
                     } else {
-                        Some(corrections.min(3))
+                        // Promotion threshold controls activation, not the count of later independent origins.
+                        Some(corrections)
                     }
                 );
             });
@@ -1563,7 +1564,7 @@ mod learning_owner_fixtures {
         let mut dictionary = Vec::new();
         sync_scope(Some(a.clone()), || {
             for _ in 0..2 {
-                dictionary_learn::record_learn_pair_with_scope(
+                dictionary_learn::record_test_proof_pair(
                     &dir.0,
                     &mut dictionary,
                     "王小名",
@@ -1575,7 +1576,7 @@ mod learning_owner_fixtures {
             let key = dictionary_learn::pair_key("王小名", "王小明");
             assert!(dictionary.contains(&"王小明".into()));
             crate::store::tombstone_learn_pair(&dir.0, &key).unwrap();
-            dictionary_learn::record_learn_pair_with_scope(
+            dictionary_learn::record_test_proof_pair(
                 &dir.0,
                 &mut dictionary,
                 "王小名",

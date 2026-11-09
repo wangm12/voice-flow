@@ -27,7 +27,6 @@ export function MainPillPreview({ live = false }: { live?: boolean }) {
         lastAudioLevelAtMs={null}
         clockNowMs={0}
         stageElapsedMs={0}
-        progress={0}
         reduced
       />
     </div>

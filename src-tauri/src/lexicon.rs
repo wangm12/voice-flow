@@ -1,7 +1,7 @@
 //! Local lexicon replace, ASR ranking, cleanup hit-pairs, and cleanup effort.
 
 use crate::context::{AppMapping, ContextFamily, ContextPolicy, ContextSnapshot};
-use crate::dictionary_learn::{is_cjk, is_latin_cont, is_latin_start, pair_key};
+use crate::dictionary_learn::{is_cjk, is_latin_cont, is_latin_start};
 use crate::llm::{CleanupEffort, CleanupIntensity, CleanupIntent, IntentSource};
 use crate::screen_text::ScreenTextContext;
 use crate::store::LearnPairRecord;
@@ -1554,11 +1554,6 @@ fn cjk_embedded_in_blocker(
         }
     }
     false
-}
-
-#[allow(dead_code)]
-pub fn pair_key_for(before: &str, after: &str) -> String {
-    pair_key(before, after)
 }
 
 #[cfg(test)]

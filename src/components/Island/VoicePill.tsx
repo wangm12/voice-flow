@@ -184,8 +184,6 @@ export const VoicePill = memo(function VoicePill({
   recoveryAction = null,
   recordingHint = null,
   waveformLevels,
-  progress: _progress,
-  chunkProgress: _chunkProgress,
   partialText: _partialText = null,
   reduced,
   detailsOpen = false,
@@ -223,8 +221,6 @@ export const VoicePill = memo(function VoicePill({
   recoveryAction?: VoicePillRecoveryAction | null;
   recordingHint?: string | null;
   waveformLevels: number[];
-  progress: number;
-  chunkProgress?: { completed: number; total: number } | null;
   partialText?: string | null;
   reduced: boolean;
   detailsOpen?: boolean;

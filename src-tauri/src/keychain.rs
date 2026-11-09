@@ -1776,14 +1776,6 @@ pub fn get_asr_api_key_state() -> ApiKeyState {
     secret_state(read_stored_asr_api_key)
 }
 
-#[allow(dead_code)]
-pub fn get_asr_api_key() -> Option<String> {
-    match get_asr_api_key_state() {
-        ApiKeyState::Configured(key) => Some(key),
-        ApiKeyState::Missing | ApiKeyState::Unavailable(_) => None,
-    }
-}
-
 pub fn set_asr_api_key(key: &str) -> Result<(), String> {
     if keychain_disabled() {
         return Ok(());
@@ -1855,30 +1847,6 @@ pub fn set_provider_api_key(
     set_secret(service, fallback, provider.keychain_account(), key)
 }
 
-fn resolve_legacy_secret(
-    plaintext: &str,
-    read: fn() -> ApiKeyState,
-    write: fn(&str) -> Result<(), String>,
-) -> ApiKeyState {
-    match read() {
-        configured @ ApiKeyState::Configured(_) => configured,
-        unavailable @ ApiKeyState::Unavailable(_) => unavailable,
-        ApiKeyState::Missing if plaintext.is_empty() => ApiKeyState::Missing,
-        ApiKeyState::Missing => match write(plaintext) {
-            Err(error) => ApiKeyState::Unavailable(error),
-            Ok(()) => match read() {
-                ApiKeyState::Configured(stored) if stored == plaintext => {
-                    ApiKeyState::Configured(stored)
-                }
-                ApiKeyState::Configured(_) | ApiKeyState::Missing => ApiKeyState::Unavailable(
-                    "credential_storage: legacy credential write was not verified".into(),
-                ),
-                ApiKeyState::Unavailable(error) => ApiKeyState::Unavailable(error),
-            },
-        },
-    }
-}
-
 /// Read the optional application-layer history encryption key.
 pub fn get_history_key() -> Result<Option<Vec<u8>>, String> {
     if keychain_disabled() {
@@ -1934,23 +1902,6 @@ fn decode_history_key(value: &str) -> Result<Vec<u8>, String> {
                 .map_err(|_| "stored history key must be 32-byte hex".to_string())
         })
         .collect()
-}
-
-/// Migrate a legacy plaintext key (from `settings.json`) into the keychain.
-/// Returns the key that should now be held in memory. The caller is
-/// responsible for clearing the plaintext field and re-saving settings.
-#[allow(dead_code)]
-pub fn migrate_plaintext(plaintext: &str) -> Option<String> {
-    match resolve_api_key(plaintext) {
-        ApiKeyState::Configured(key) => Some(key),
-        ApiKeyState::Missing | ApiKeyState::Unavailable(_) => None,
-    }
-}
-
-/// Resolve a legacy plaintext key or an existing OS credential without
-/// converting an unavailable keychain into a destructive settings update.
-pub fn resolve_api_key(plaintext: &str) -> ApiKeyState {
-    resolve_legacy_secret(plaintext, get_api_key_state, set_api_key)
 }
 
 #[cfg(test)]

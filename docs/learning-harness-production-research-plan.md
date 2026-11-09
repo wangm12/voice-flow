@@ -147,4 +147,4 @@ C0 待验证的顺序是短录音和长录音的实际完成入口产生 origin�
 4. 接正式旁路，只产生归因与拟议行动。先比较三组隔离 arm，冻结指标和分歧样本。将真实样本和生产开关的结论作为单独验收。
 5. 只有数据证明正反例均通过，并且旁路未导致不可接受的覆盖损失，才考虑在明确作用域内启用新自动晋升。保留关闭和撤销路径。
 
-现有工作索引：[纠错 Harness 总计划](cleanup-learning-harness-plan-2026-11-05.md)、[编辑归因与隔离夹具计划](cleanup-edit-attribution-harness-plan.md)、[公开语料准备](public-corpus-preparation.md)。它们记录开发工作目录的研究与既有设计，发布状态以对应 Git 提交和实际验收为准。
+相关的未完工作目标见[纠错 Harness 总计划](cleanup-learning-harness-plan-2026-11-05.md)，语料来源与准备边界见[公开语料准备](public-corpus-preparation.md)。纯裁判和受控文本 SQLite 的独立实施切片已经落地；本文仍记录未完成的生产接入提案，不能作为代码状态或验收结果。

@@ -1299,7 +1299,7 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 fn snapshot_for_signal(
     signal: &AppSignal,
     mappings: &[AppMapping],
@@ -3474,20 +3474,6 @@ pub fn application_from_path(path: &str) -> Result<ApplicationOption, String> {
 #[cfg(not(target_os = "macos"))]
 pub fn application_from_path(_path: &str) -> Result<ApplicationOption, String> {
     Err("从应用程序文件夹选择仅支持 macOS".to_owned())
-}
-
-#[allow(dead_code)]
-pub fn detect_snapshot_for_state(
-    enabled: bool,
-    mappings: &[AppMapping],
-    browser_access_enabled: bool,
-) -> ContextSnapshot {
-    detect_snapshot_for_state_with_modes(
-        enabled,
-        mappings,
-        browser_access_enabled,
-        &builtin_writing_modes(),
-    )
 }
 
 pub fn detect_snapshot_for_state_with_modes(

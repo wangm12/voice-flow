@@ -43,9 +43,6 @@ pub(crate) const COMMANDS: &[&str] = &[
     "set_context_override",
     "request_browser_access",
     "update_settings_patch",
-    "remove_api_key",
-    "remove_asr_api_key",
-    "remove_cleanup_api_key",
     "remove_provider_key",
     "get_history",
     "export_history",
@@ -152,9 +149,6 @@ mod tests {
         "set_context_override",
         "request_browser_access",
         "update_settings_patch",
-        "remove_api_key",
-        "remove_asr_api_key",
-        "remove_cleanup_api_key",
         "remove_provider_key",
         "get_history",
         "export_history",
@@ -341,7 +335,7 @@ mod tests {
         assert_eq!(ip, expected_i);
         let ms: BTreeSet<_> = MAIN.iter().copied().collect();
         let is: BTreeSet<_> = ISLAND.iter().copied().collect();
-        assert_eq!(ms.len(), 93);
+        assert_eq!(ms.len(), 90);
         assert_eq!(is.len(), 14);
         assert_eq!(
             ms.intersection(&is).copied().collect::<BTreeSet<_>>(),
@@ -351,7 +345,7 @@ mod tests {
             ms.union(&is).copied().collect::<BTreeSet<_>>(),
             COMMANDS.iter().copied().collect()
         );
-        assert_eq!(ms.union(&is).count(), 105);
+        assert_eq!(ms.union(&is).count(), 102);
         for c in [
             "clear_all_data",
             "update_settings_patch",
@@ -368,7 +362,7 @@ mod tests {
         let app = acl["__app-acl__"]["permissions"]
             .as_object()
             .expect("generated app permissions");
-        assert_eq!(app.len(), 210);
+        assert_eq!(app.len(), 204);
         for c in COMMANDS {
             let allow = &app[&format!("allow-{}", c.replace('_', "-"))]["commands"];
             let deny = &app[&format!("deny-{}", c.replace('_', "-"))]["commands"];

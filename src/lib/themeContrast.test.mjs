@@ -73,12 +73,6 @@ describe("shared HUD contrast", () => {
       expectContrast(colors.focus, colors[surface], 3, `HUD action focus on ${surface}`);
     }
   });
-  it("keeps status text readable over the brightest progress fill", () => {
-    const fill = hudStylesheet.match(/\.voice-pill__progress\s*\{[^}]+background:\s*linear-gradient\(90deg,\s*(rgba\([^)]+\))/)[1];
-    const opacity = Number(hudStylesheet.match(/\.voice-pill__progress--visible\s*\{[^}]+opacity:\s*([\d.]+)/)[1]);
-    const progress = rgba(fill);
-    for (const surface of ["top", "bottom"]) expectContrast(colors.text, composite(progress, rgba(colors[surface]), progress[3] * opacity), 4.5, "HUD label over progress");
-  });
 });
 
 describe("settings contrast", () => {

@@ -19102,88 +19102,6 @@ async fn update_settings_patch(
 }
 
 #[tauri::command]
-async fn remove_api_key(
-    app: tauri::AppHandle,
-    state: State<'_, AppState>,
-) -> Result<store::SettingsView, String> {
-    let _guard = state.settings_gate.lock().await;
-    keychain::set_api_key("")
-        .map_err(|error| format!("failed to remove API key securely: {error}"))?;
-    let dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|error| error.to_string())?;
-    let mut settings = lock_recover(&state.settings).clone();
-    settings.api_key.clear();
-    settings.provider_api_keys.remove("groq");
-    settings
-        .credential_read_states
-        .insert("groq_api_key".into(), store::CredentialReadState::Missing);
-    store::clear_provider_key_sidecars(&dir, crate::providers::EngineProvider::Groq);
-    if settings.asr_provider == crate::providers::EngineProvider::Groq {
-        settings.onboarded = false;
-    }
-    if settings.cleanup_enabled
-        && settings.cleanup_provider == crate::providers::EngineProvider::Groq
-    {
-        settings.cleanup_enabled = false;
-    }
-    store::save_settings(&dir, &settings).map_err(|error| error.to_string())?;
-    let configuration_changed = commit_settings_snapshot(&state, settings.clone());
-    cancel_invalidated_dictation(&app, &state, configuration_changed).await;
-    Ok(store::SettingsView::from(&settings))
-}
-
-#[tauri::command]
-async fn remove_asr_api_key(
-    app: tauri::AppHandle,
-    state: State<'_, AppState>,
-) -> Result<store::SettingsView, String> {
-    let _guard = state.settings_gate.lock().await;
-    keychain::set_asr_api_key("")
-        .map_err(|error| format!("failed to remove ASR API key securely: {error}"))?;
-    let dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|error| error.to_string())?;
-    let mut settings = lock_recover(&state.settings).clone();
-    settings.asr_api_key.clear();
-    settings
-        .credential_read_states
-        .insert("asr_api_key".into(), store::CredentialReadState::Missing);
-    store::clear_asr_key_sidecar(&dir);
-    store::save_settings(&dir, &settings).map_err(|error| error.to_string())?;
-    let configuration_changed = commit_settings_snapshot(&state, settings.clone());
-    cancel_invalidated_dictation(&app, &state, configuration_changed).await;
-    Ok(store::SettingsView::from(&settings))
-}
-
-#[tauri::command]
-async fn remove_cleanup_api_key(
-    app: tauri::AppHandle,
-    state: State<'_, AppState>,
-) -> Result<store::SettingsView, String> {
-    let _guard = state.settings_gate.lock().await;
-    keychain::set_cleanup_api_key("")
-        .map_err(|error| format!("failed to remove cleanup API key securely: {error}"))?;
-    let dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|error| error.to_string())?;
-    let mut settings = lock_recover(&state.settings).clone();
-    settings.cleanup_api_key.clear();
-    settings.credential_read_states.insert(
-        "cleanup_api_key".into(),
-        store::CredentialReadState::Missing,
-    );
-    store::clear_cleanup_key_sidecar(&dir);
-    store::save_settings(&dir, &settings).map_err(|error| error.to_string())?;
-    let configuration_changed = commit_settings_snapshot(&state, settings.clone());
-    cancel_invalidated_dictation(&app, &state, configuration_changed).await;
-    Ok(store::SettingsView::from(&settings))
-}
-
-#[tauri::command]
 async fn remove_provider_key(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
@@ -20308,9 +20226,6 @@ pub fn run(cli_args: cli::CliArgs) {
             set_context_override,
             request_browser_access,
             update_settings_patch,
-            remove_api_key,
-            remove_asr_api_key,
-            remove_cleanup_api_key,
             remove_provider_key,
             history_commands::get_history,
             history_commands::export_history,

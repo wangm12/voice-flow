@@ -9183,16 +9183,6 @@ pub(crate) fn tombstone_research_learn_pair(
     tombstone_learn_pair_with_observation(dir, pair_key, Some(observation))
 }
 
-#[allow(dead_code)]
-pub fn set_learn_pair_pinned(dir: &Path, pair_key: &str, pinned: bool) -> anyhow::Result<bool> {
-    let c = open_history(dir)?;
-    c.execute(
-        "UPDATE learn_pairs SET pinned = ?2, last_at = datetime('now') WHERE pair_key = ?1",
-        params![pair_key, i64::from(pinned)],
-    )?;
-    Ok(c.changes() > 0)
-}
-
 pub fn ensure_pinned_dictionary_term(
     dir: &Path,
     after_surface: &str,

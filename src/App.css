@@ -46,16 +46,6 @@
   -webkit-font-smoothing: antialiased;
 }
 
-@keyframes vf-fade-slide-in {
-  from { opacity: 0; }
-  to { opacity: 1; }
-}
-
-@keyframes vf-step-in {
-  from { opacity: 0; }
-  to { opacity: 1; }
-}
-
 @keyframes vf-status-in {
   from { opacity: 0; }
   to { opacity: 1; }
@@ -109,28 +99,16 @@
   display: none;
 }
 
-.vf-enter {
-  animation: vf-fade-slide-in 180ms var(--ease-emphasized) both;
-}
-
-.vf-step-enter {
-  animation: vf-step-in 180ms var(--ease-emphasized) both;
-}
-
 .vf-status-enter {
   animation: vf-status-in 160ms var(--ease-emphasized) both;
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .vf-enter,
-  .vf-step-enter,
   .vf-status-enter,
   .rb-animated-content {
     animation: none;
   }
 
-  .vf-enter,
-  .vf-step-enter,
   .vf-status-enter,
   .rb-animated-content,
   .vf-icon-button::after {

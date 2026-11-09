@@ -20,7 +20,6 @@ function renderPill(props: Partial<ComponentProps<typeof VoicePill>> = {}) {
         state="recording"
         contextLabel={null}
         waveformLevels={[]}
-        progress={0}
         reduced
         {...props}
       />
@@ -93,7 +92,6 @@ describe("VoicePill", () => {
           state="recording"
           contextLabel={null}
           waveformLevels={[0.7]}
-          progress={0}
           lastAudioLevelAtMs={Date.now() - 1_000}
           clockNowMs={0}
           reduced={false}
@@ -111,7 +109,7 @@ describe("VoicePill", () => {
     for (const phase of phases) {
       rerender(
         <I18nProvider initialLanguage="en">
-          <VoicePill state="processing" phase={phase} phaseConfirmed contextLabel={null} waveformLevels={[]} progress={0.2} reduced={false} sessionGeneration={8} />
+          <VoicePill state="processing" phase={phase} phaseConfirmed contextLabel={null} waveformLevels={[]} reduced={false} sessionGeneration={8} />
         </I18nProvider>,
       );
       expect(document.querySelector(".voice-pill__label")).toHaveTextContent("Processing");
@@ -234,7 +232,7 @@ describe("VoicePill", () => {
 
     rerender(
       <I18nProvider initialLanguage="en">
-        <VoicePill state="history" contextLabel={null} waveformLevels={[]} progress={0} reduced deliveryMethod="history" fallbackReason="target_changed" />
+        <VoicePill state="history" contextLabel={null} waveformLevels={[]} reduced deliveryMethod="history" fallbackReason="target_changed" />
       </I18nProvider>,
     );
     expect(document.querySelector(".voice-pill__label")).toHaveTextContent("The input target changed");
@@ -277,7 +275,7 @@ describe("VoicePill", () => {
 
     rerender(
       <I18nProvider initialLanguage="en">
-        <VoicePill state="error" contextLabel={null} waveformLevels={[]} progress={0} reduced detailsOpen recoveryAction={recoveryAction} onDetailsOpenChange={onDetailsOpenChange} />
+        <VoicePill state="error" contextLabel={null} waveformLevels={[]} reduced detailsOpen recoveryAction={recoveryAction} onDetailsOpenChange={onDetailsOpenChange} />
       </I18nProvider>,
     );
     expect(screen.getByText("The recording was saved to History.")).toBeInTheDocument();
@@ -334,7 +332,7 @@ describe("VoicePill", () => {
 
     rerender(
       <I18nProvider initialLanguage="en">
-        <VoicePill state="idle" contextLabel={null} waveformLevels={[]} progress={0} reduced hideImmediately sessionGeneration={9} />
+        <VoicePill state="idle" contextLabel={null} waveformLevels={[]} reduced hideImmediately sessionGeneration={9} />
       </I18nProvider>,
     );
     expect(document.querySelector(".voice-pill-stack")).toHaveAttribute("aria-hidden", "true");

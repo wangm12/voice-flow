@@ -40,9 +40,6 @@ type HudState = {
   cleanupStatus: string | null;
   waveformLevels: number[];
   lastAudioLevelAtMs: number | null;
-  progress: number;
-  completedChunks: number | null;
-  totalChunks: number | null;
   selectedActionState: string | null;
   partialText: string | null;
   recordingMode: string | null;
@@ -287,41 +284,6 @@ export function hudPartialAfterState(
   return currentPartial;
 }
 
-export function normalizeChunkProgress(
-  completed?: number,
-  total?: number,
-): { completed: number; total: number } | null {
-  if (
-    completed === undefined
-    || total === undefined
-    || !Number.isInteger(completed)
-    || !Number.isInteger(total)
-    || total <= 0
-    || completed < 0
-    || completed > total
-  ) {
-    return null;
-  }
-  return { completed, total };
-}
-
-export function hudProgressForState(
-  next: string,
-  phase: string,
-  currentProgress: number,
-): number {
-  if (next === "idle" || next === "recording" || next === "starting") return 0;
-  if (["done", "unverified", "copied", "degraded", "history"].includes(next)) return 1;
-  if (next === "rate_limited") return currentProgress;
-  if (next !== "processing") return currentProgress;
-  if (phase === "asr") return 0.35;
-  if (phase === "soniox_recovery") return 0.35;
-  if (phase === "cascade_accurate") return 0.5;
-  if (phase === "cleanup") return 0.65;
-  if (phase === "delivery") return 0.9;
-  return 0.05;
-}
-
 type HudContext = {
   contextApp: string | null;
   contextStyle: string | null;
@@ -426,9 +388,6 @@ export function IslandWindow() {
     cleanupStatus: null,
     waveformLevels: emptyWaveform(),
     lastAudioLevelAtMs: null,
-    progress: 0,
-    completedChunks: null,
-    totalChunks: null,
     selectedActionState: null,
     partialText: null,
     recordingMode: null,
@@ -637,10 +596,6 @@ export function IslandWindow() {
               && nextAudioRecovery == null
               && nextHistoryRecovery == null);
           const displayState = quietCompletion ? "idle" : next;
-          const chunkProgress = normalizeChunkProgress(
-            event.payload.completed_chunks,
-            event.payload.total_chunks,
-          );
           const context = hudContextFromEvent(displayState, current, event.payload);
           const contextSource = hudContextSourceFromEvent(
             displayState,
@@ -690,9 +645,6 @@ export function IslandWindow() {
               : next === "starting" || next === "recording"
                 ? current.lastAudioLevelAtMs
                 : null,
-            progress: hudProgressForState(displayState, phase, current.progress),
-            completedChunks: displayState === "processing" ? chunkProgress?.completed ?? null : null,
-            totalChunks: displayState === "processing" ? chunkProgress?.total ?? null : null,
             selectedActionState: selectedActionStateForDictation(current.selectedActionState, displayState),
             partialText: hudPartialAfterState(
               current.sessionGeneration,
@@ -722,9 +674,6 @@ export function IslandWindow() {
             && current.cleanupStatus === nextHud.cleanupStatus
             && current.waveformLevels === nextHud.waveformLevels
             && current.lastAudioLevelAtMs === nextHud.lastAudioLevelAtMs
-            && current.progress === nextHud.progress
-            && current.completedChunks === nextHud.completedChunks
-            && current.totalChunks === nextHud.totalChunks
             && current.selectedActionState === nextHud.selectedActionState
             && current.partialText === nextHud.partialText
             && current.historyRecovery === nextHud.historyRecovery
@@ -759,9 +708,6 @@ export function IslandWindow() {
           cleanupStatus: null,
           waveformLevels: emptyWaveform(),
           lastAudioLevelAtMs: null,
-          progress: 0,
-          completedChunks: null,
-          totalChunks: null,
           selectedActionState: null,
           partialText: null,
           audioCapture: null,
@@ -948,37 +894,21 @@ export function IslandWindow() {
           };
       });
     });
-    register<{
-      progress?: number;
-      chunks_done?: number;
-      total?: number;
-      session_generation?: number;
-    }>("dictation://progress", (event) => {
+    register<{ session_generation?: number }>("dictation://progress", (event) => {
       const eventGeneration = event.payload.session_generation;
       if (!acceptsSessionGeneration(hudRef.current.sessionGeneration, eventGeneration)
         || !acceptsSessionGeneration(recoveryGenerationRef.current, eventGeneration)) return;
       if (eventGeneration > recoveryGenerationRef.current) adoptRecoveryGeneration(eventGeneration);
-      const nextProgress = Math.max(0, Math.min(1, event.payload.progress ?? 0));
       setHud((current) => {
         if (!acceptsSessionGeneration(current.sessionGeneration, eventGeneration)) return current;
-        const chunkProgress = normalizeChunkProgress(event.payload.chunks_done, event.payload.total);
-        const nextCompleted = chunkProgress?.completed ?? current.completedChunks;
-        const nextTotal = chunkProgress?.total ?? current.totalChunks;
-        return current.sessionGeneration === eventGeneration
-          && current.progress === nextProgress
-          && current.completedChunks === nextCompleted
-          && current.totalChunks === nextTotal
-          ? current
-          : {
-            ...current,
-            sessionGeneration: eventGeneration,
-            audioRecovery: eventGeneration > current.sessionGeneration ? null : current.audioRecovery,
-            historyRecovery: eventGeneration > current.sessionGeneration ? null : current.historyRecovery,
-            audioCapture: eventGeneration > current.sessionGeneration ? null : current.audioCapture,
-            progress: nextProgress,
-            completedChunks: nextCompleted,
-            totalChunks: nextTotal,
-          };
+        if (current.sessionGeneration === eventGeneration) return current;
+        return {
+          ...current,
+          sessionGeneration: eventGeneration,
+          audioRecovery: null,
+          historyRecovery: null,
+          audioCapture: null,
+        };
       });
     });
     register<{ max_recording_secs: number; session_generation?: number }>("audio://limit", (event) => {
@@ -1001,8 +931,6 @@ export function IslandWindow() {
           fallbackReason: null,
           waveformLevels: emptyWaveform(),
           lastAudioLevelAtMs: null,
-          completedChunks: null,
-          totalChunks: null,
         });
     });
     register<{ retry_after_secs: number; session_generation?: number }>("quota://rate_limited", (event) => {
@@ -1026,8 +954,6 @@ export function IslandWindow() {
           fallbackReason: null,
           waveformLevels: emptyWaveform(),
           lastAudioLevelAtMs: null,
-          completedChunks: null,
-          totalChunks: null,
         });
     });
     register<{ state?: string; session_generation?: number; action_sequence?: number }>("selected-action://state", (event) => {
@@ -1406,8 +1332,6 @@ export function IslandWindow() {
         fallbackReason={hud.fallbackReason}
         selectedActionState={hud.selectedActionState}
         waveformLevels={hud.waveformLevels}
-        progress={hud.progress}
-        chunkProgress={hud.completedChunks != null && hud.totalChunks != null ? { completed: hud.completedChunks, total: hud.totalChunks } : null}
         partialText={hud.partialText}
         reduced={reduced}
         sessionGeneration={hud.sessionGeneration}
@@ -1477,4 +1401,4 @@ export function IslandWindow() {
   );
 }
 
-type DictationStatePayload = { recording_mode?: string | null; recording_hotkey?: string | null; recording_target_icon?: string | null; translation_target_language?: string | null; state: DictationState; session_generation?: number; phase?: ProcessingPhase; phase_confirmed?: boolean; retry_after_secs?: number; completed_chunks?: number; total_chunks?: number; cleanup_status?: string | null; undo_available?: boolean; context_id?: string; context_app?: string | null; context_style?: string | null; context_label?: string; context_source?: ContextSourcePayload | null; cleanup_intensity?: "off" | "light" | "standard" | "heavy" | null; delivery_method?: string; fallback_reason?: string | null };
+type DictationStatePayload = { recording_mode?: string | null; recording_hotkey?: string | null; recording_target_icon?: string | null; translation_target_language?: string | null; state: DictationState; session_generation?: number; phase?: ProcessingPhase; phase_confirmed?: boolean; retry_after_secs?: number; cleanup_status?: string | null; undo_available?: boolean; context_id?: string; context_app?: string | null; context_style?: string | null; context_label?: string; context_source?: ContextSourcePayload | null; cleanup_intensity?: "off" | "light" | "standard" | "heavy" | null; delivery_method?: string; fallback_reason?: string | null };

@@ -750,61 +750,6 @@ function AppContent() {
     void emit("settings://ui-language", ui_language);
   };
 
-  const saveApiKey = async (apiKey: string) => {
-    let startedAtRevision = captureSettingsRevision();
-    try {
-      await flushPendingSave();
-      startedAtRevision = captureSettingsRevision();
-      await invoke("update_settings_patch", { patch: { api_key: apiKey.trim() } });
-      const next = await invoke<Settings>("get_settings");
-      applySettingsSnapshot(next, startedAtRevision);
-      if (!hasPendingSettings()) setSaveError(null);
-    } catch (reason) {
-      if (captureSettingsRevision() === startedAtRevision && !hasPendingSettings()) {
-        setSaveError(friendlySettingsError(reason, t));
-      }
-      throw reason;
-    }
-  };
-  const removeApiKey = async () => {
-    await flushPendingSave();
-    const startedAtRevision = captureSettingsRevision();
-    const next = await invoke<Settings>("remove_api_key");
-    applySettingsSnapshot(next, startedAtRevision);
-    if (!hasPendingSettings()) setSaveError(null);
-  };
-  const saveAsrApiKey = async (apiKey: string, asrBaseUrl?: string) => {
-    let startedAtRevision = captureSettingsRevision();
-    try {
-      await flushPendingSave();
-      startedAtRevision = captureSettingsRevision();
-      const patch: Record<string, string> = { asr_api_key: apiKey.trim() };
-      if (asrBaseUrl !== undefined) patch.asr_base_url = asrBaseUrl;
-      await invoke("update_settings_patch", { patch });
-      const next = await invoke<Settings>("get_settings");
-      applySettingsSnapshot(next, startedAtRevision);
-      if (!hasPendingSettings()) setSaveError(null);
-    } catch (reason) {
-      if (captureSettingsRevision() === startedAtRevision && !hasPendingSettings()) {
-        setSaveError(friendlySettingsError(reason, t));
-      }
-      throw reason;
-    }
-  };
-  const removeAsrApiKey = async () => {
-    await flushPendingSave();
-    const startedAtRevision = captureSettingsRevision();
-    const next = await invoke<Settings>("remove_asr_api_key");
-    applySettingsSnapshot(next, startedAtRevision);
-    if (!hasPendingSettings()) setSaveError(null);
-  };
-  const removeCleanupApiKey = async () => {
-    await flushPendingSave();
-    const startedAtRevision = captureSettingsRevision();
-    const next = await invoke<Settings>("remove_cleanup_api_key");
-    applySettingsSnapshot(next, startedAtRevision);
-    if (!hasPendingSettings()) setSaveError(null);
-  };
   const commitEngine = async (patch: Record<string, unknown>) => {
     await flushPendingSave();
     const startedAtRevision = captureSettingsRevision();
@@ -1049,7 +994,7 @@ function AppContent() {
                         : view === "permissions" ? <PermissionsSettings permissions={permissions} checking={permissionsChecking} checkError={permissionsError} onRefresh={refreshPermissions} />
                           : import.meta.env.DEV && view === "debug" ? <DebugSettings settings={settings} save={save} />
                           : view === "system" ? <SystemSettings settings={settings} audioInputDevice={audioInputDevice} audioInputDevices={audioInputDevices} save={save} uncommittedFields={unsavedFields} onUiLanguageChange={changeInterfaceLanguage} />
-                            : view === "engine" ? <EngineSettings settings={settings} page={enginePage} onPageChange={setEnginePage} save={save} saveApiKey={saveApiKey} removeApiKey={removeApiKey} saveAsrApiKey={saveAsrApiKey} removeAsrApiKey={removeAsrApiKey} removeCleanupApiKey={removeCleanupApiKey} removeProviderKey={removeProviderKey} commitEngine={commitEngine} readProviderCredential={readProviderCredential} cancelProviderCredentialRead={cancelProviderCredentialRead} />
+                            : view === "engine" ? <EngineSettings settings={settings} page={enginePage} onPageChange={setEnginePage} removeProviderKey={removeProviderKey} commitEngine={commitEngine} readProviderCredential={readProviderCredential} cancelProviderCredentialRead={cancelProviderCredentialRead} />
                               : <RecordingSettings settings={settings} save={save} saveFailure={saveFailure} dictationBusy={dictationBusy} onOpenPermissions={() => openContextualRoute("permissions")} onOpenMappings={() => openContextualRoute("writing")} />}
             </AnimatedContent>
           </div>

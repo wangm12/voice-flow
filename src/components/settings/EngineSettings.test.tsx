@@ -51,15 +51,6 @@ const settings: Settings = {
   },
 };
 
-const unused = {
-  saveApiKey: vi.fn(),
-  removeApiKey: vi.fn(),
-  saveAsrApiKey: vi.fn(),
-  removeAsrApiKey: vi.fn(),
-  removeCleanupApiKey: vi.fn(),
-  removeProviderKey: vi.fn(),
-};
-
 const customJsonSaveCases: Array<{ label: string; parameters: JsonObject; source: string }> = [
   { label: "an empty object", parameters: {}, source: "{}" },
   {
@@ -116,9 +107,8 @@ function renderEngine(overrides: Partial<Settings> = {}, handlers: Partial<Param
   }
   const props: Parameters<typeof EngineSettings>[0] = {
     settings: { ...settings, ...overrides },
-    save: handlers.save ?? vi.fn(),
     commitEngine: handlers.commitEngine ?? vi.fn(),
-    ...unused,
+    removeProviderKey: handlers.removeProviderKey ?? vi.fn(),
     ...handlers,
     page: "service",
     onPageChange: vi.fn(),
@@ -471,12 +461,10 @@ describe("EngineSettings form", () => {
   });
 
   it("keeps model changes pending and the saved route visible until explicit application", async () => {
-    const save = vi.fn();
     const commitEngine = vi.fn().mockResolvedValue(undefined);
     vi.mocked(invoke).mockResolvedValue({ asr: { ok: true }, cleanup: { ok: true } });
-    renderEngine({}, { save, commitEngine });
+    renderEngine({}, { commitEngine });
     selectOption(screen.getByRole("combobox", { name: "ASR 模型" }), "whisper-large-v3");
-    expect(save).not.toHaveBeenCalled();
     expect(commitEngine).not.toHaveBeenCalled();
     expect(within(servicePanel()).getByLabelText("当前生效路线")).toHaveTextContent("whisper-large-v3-turbo");
     expect(screen.getByText("有待应用的更改；当前听写仍使用已保存路线。")).toBeInTheDocument();
@@ -540,12 +528,10 @@ describe("EngineSettings form", () => {
       if (command === "list_on_device_models") return [];
       return undefined;
     });
-    const save = vi.fn();
     const commitEngine = vi.fn();
     const initialProps: Parameters<typeof EngineSettings>[0] = {
-      ...unused,
       settings,
-      save,
+      removeProviderKey: vi.fn(),
       commitEngine,
       page: "service",
       onPageChange: vi.fn(),
@@ -807,9 +793,8 @@ describe("EngineSettings form", () => {
     })));
 
     view.rerender(engineTestElement({
-      ...unused,
       settings: { ...initial, cleanup_model: "provider/model-after-save", custom_cleanup_parameters: parameters },
-      save: vi.fn(),
+      removeProviderKey: vi.fn(),
       commitEngine,
       page: "service",
       onPageChange: vi.fn(),
@@ -908,12 +893,10 @@ describe("EngineSettings form", () => {
   });
 
   it("keeps AI off and the local cleanup preset pending until the common apply action", async () => {
-    const save = vi.fn();
     const commitEngine = vi.fn().mockResolvedValue(undefined);
     vi.mocked(invoke).mockResolvedValue({ asr: { ok: true }, cleanup: { ok: true } });
-    renderEngine({}, { save, commitEngine });
+    renderEngine({}, { commitEngine });
     fireEvent.click(screen.getByRole("switch", { name: "AI 文字整理" }));
-    expect(save).not.toHaveBeenCalled();
     expect(commitEngine).not.toHaveBeenCalled();
     expect(screen.getByLabelText("当前生效路线")).toHaveTextContent("OpenAI");
     fireEvent.click(screen.getByRole("button", { name: "保存并使用" }));
@@ -922,7 +905,6 @@ describe("EngineSettings form", () => {
     selectOption(screen.getByRole("combobox", { name: "整理服务" }), "ollama");
     activatePage("高级设置");
     fireEvent.click(openAdvancedConnections().getByRole("button", { name: "使用本机 Qwen3.5:4b 整理" }));
-    expect(save).not.toHaveBeenCalled();
     expect(commitEngine).toHaveBeenCalledTimes(1);
     activatePage("服务配置");
     fireEvent.click(screen.getByRole("button", { name: "保存并使用" }));
@@ -1491,9 +1473,8 @@ describe("EngineSettings form", () => {
   it("refreshes an untouched draft when actual settings change without replacing a user's pending route", () => {
     const commitEngine = vi.fn();
     const initialProps: Parameters<typeof EngineSettings>[0] = {
-      ...unused,
       settings,
-      save: vi.fn(),
+      removeProviderKey: vi.fn(),
       commitEngine,
       page: "service",
       onPageChange: vi.fn(),
@@ -1517,9 +1498,8 @@ describe("EngineSettings form", () => {
       provider_keys: { custom: { configured: true, hint: "••••key" } },
     };
     const props: Parameters<typeof EngineSettings>[0] = {
-      ...unused,
       settings: initialSettings,
-      save: vi.fn(),
+      removeProviderKey: vi.fn(),
       commitEngine: vi.fn(),
       page: "service",
       onPageChange: vi.fn(),

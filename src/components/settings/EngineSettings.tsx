@@ -40,7 +40,7 @@ import {
 } from "../../lib/providers";
 import { friendlySettingsError } from "../../lib/settingsError";
 import { buttonClass, ghostButtonClass, compactButtonClass, compactDangerButtonClass, colors, focusRingClass, radius } from "../../lib/theme";
-import type { CleanupModelStatus, LocalCleanupStatus, OnDeviceModelStatus, ProviderCredentialPurpose, ProviderCredentialReadResult, SaveSettings, Settings } from "../../types/settings";
+import type { CleanupModelStatus, LocalCleanupStatus, OnDeviceModelStatus, ProviderCredentialPurpose, ProviderCredentialReadResult, Settings } from "../../types/settings";
 
 const controlClass = `${radius.control} h-9 border ${colors.border} ${colors.bg.elevated} ${colors.text.primary} px-3 py-0 text-sm outline-none transition-colors duration-150 focus:border-accent ${focusRingClass}`;
 
@@ -613,12 +613,6 @@ export function EngineSettings({
   settings: Settings;
   page: EnginePage;
   onPageChange: (page: EnginePage) => void;
-  save: SaveSettings;
-  saveApiKey?: (apiKey: string) => Promise<void>;
-  removeApiKey?: () => Promise<void>;
-  saveAsrApiKey?: (apiKey: string, asrBaseUrl?: string) => Promise<void>;
-  removeAsrApiKey?: () => Promise<void>;
-  removeCleanupApiKey?: () => Promise<void>;
   removeProviderKey: (provider: string) => Promise<void>;
   commitEngine: (patch: Record<string, unknown>) => Promise<void>;
   readProviderCredential?: (provider: string, requestId: string, purpose?: ProviderCredentialPurpose) => Promise<ProviderCredentialReadResult>;

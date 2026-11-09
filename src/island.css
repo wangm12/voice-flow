@@ -434,31 +434,6 @@
   border-color: var(--voice-hud-border);
 }
 
-.voice-pill__progress {
-  position: absolute;
-  inset: 0 auto 0 0;
-  width: 100%;
-  z-index: 0;
-  border-radius: inherit;
-  background: linear-gradient(90deg, rgba(255, 255, 255, 0.34), rgba(255, 255, 255, 0.12));
-  opacity: 0;
-  pointer-events: none;
-  transform-origin: left center;
-  transition: transform 180ms linear, opacity var(--hud-motion-duration, 220ms) var(--voice-ease);
-}
-
-.voice-pill__progress--visible {
-  opacity: 0.9;
-}
-
-
-
-
-
-
-
-
-
 .voice-pill__indicator {
   position: relative;
   display: none;

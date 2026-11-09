@@ -40,6 +40,8 @@
 | --- | --- |
 | [competitive-research.md](competitive-research.md) | 竞品分层与能力对照 |
 | [harness-deep-research-2026-08-30.md](harness-deep-research-2026-08-30.md) | 无自有模型时的纠错 harness |
+| [cleanup-learning-source-research-2026-10-20.md](cleanup-learning-source-research-2026-10-20.md) | Cleanup prompt、编辑归因与学习的固定源码对照、评估设计及来源索引 |
+| [speaker-filter-pilot-research-2026-10-25.md](speaker-filter-pilot-research-2026-10-25.md) | 滤声试验结论、反例复现、证据限制和离线评估入口 |
 | [asr-cleanup-pipeline-research-2026-08-25.md](asr-cleanup-pipeline-research-2026-08-25.md) | 2026-08-25 管线研究快照 |
 | [asr-leaderboard-2026-09.md](asr-leaderboard-2026-09.md) | 2026-09 英文 / 中文 ASR 榜单与插头取舍 |
 

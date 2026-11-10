@@ -331,6 +331,9 @@ pub(crate) fn rerun_paths(root: &Path) -> Vec<PathBuf> {
             "scripts/normalize-staged-third-party-licenses.py",
             "sdk-overlay/patch-manifest.json",
             "sdk-overlay/voiceflow-mlx-audio-cancellation-v2.patch",
+            "sdk-overlay/fun-asr-source/FunASRNanoAudio.swift",
+            "sdk-overlay/fun-asr-source/FunASRNanoConfig.swift",
+            "sdk-overlay/fun-asr-source/FunASRNanoModel.swift",
             "xcode/VoiceFlowMLXSidecar.xcodeproj/project.pbxproj",
             "xcode/VoiceFlowMLXSidecar.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved",
         ]

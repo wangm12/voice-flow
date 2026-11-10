@@ -1,7 +1,7 @@
 {
   "schema": "voiceflow-sdk-source-patch-manifest/v2",
   "patch": "voiceflow-mlx-audio-cancellation-v2.patch",
-  "patch_sha256": "888d17cfe319c05191d2ebd1276000da06906bb6764002e147527740a00883a2",
+  "patch_sha256": "0116f87126825fb81c48ee04938955fc6d6ccb046d2f39c6674bd383a391d257",
   "upstream": {
     "repository": "https://github.com/Blaizzy/mlx-audio-swift",
     "revision": "01dec7c9bdce3088a6b6b7ab9f2e403458195efb",
@@ -30,23 +30,64 @@
       "base_git_blob": "2925b4e0ebc0d7a8165e2fb7d4645a0907672bce",
       "base_sha256": "28d5672256dcb2b26b416780756ff56846872f674cc1248bfd35c0c4f133b469",
       "after_sha256": "4af6aebc56911f13469cdf6b8ddb84ff1f5a3a995a0b7ce5a1bf941640882157"
+    },
+    {
+      "path": "Sources/MLXAudioSTT/Models/Parakeet/ParakeetModel.swift",
+      "source_url": "https://github.com/Blaizzy/mlx-audio-swift/blob/01dec7c9bdce3088a6b6b7ab9f2e403458195efb/Sources/MLXAudioSTT/Models/Parakeet/ParakeetModel.swift",
+      "base_git_blob": "e6fee8d01317aee79627fda6d5c1057a48eba859",
+      "base_sha256": "0c9311e8d4b27f1a701a080d106528b62fbfdd0fc4269ef688094dc5a8f2bfa8",
+      "after_sha256": "026714db0ed8a431444f90aaa4fda5bee3a8668de27abcdbd157c424adf477e0"
+    }
+  ],
+  "added_files": [
+    {
+      "path": "Sources/MLXAudioSTT/Models/FunASRNano/FunASRNanoAudio.swift",
+      "source_path": "fun-asr-source/FunASRNanoAudio.swift",
+      "source_revision": "262a391a6a63c2e6923e826bcc7122caee0f18f6",
+      "source_url": "https://github.com/Blaizzy/mlx-audio-swift/blob/262a391a6a63c2e6923e826bcc7122caee0f18f6/Sources/MLXAudioSTT/Models/FunASRNano/FunASRNanoAudio.swift",
+      "upstream_sha256": "25be68e67a9c99069037f29ca766e998c05fcd3326f63764d383a956a691ea05",
+      "source_sha256": "25be68e67a9c99069037f29ca766e998c05fcd3326f63764d383a956a691ea05",
+      "after_sha256": "25be68e67a9c99069037f29ca766e998c05fcd3326f63764d383a956a691ea05"
+    },
+    {
+      "path": "Sources/MLXAudioSTT/Models/FunASRNano/FunASRNanoConfig.swift",
+      "source_path": "fun-asr-source/FunASRNanoConfig.swift",
+      "source_revision": "262a391a6a63c2e6923e826bcc7122caee0f18f6",
+      "source_url": "https://github.com/Blaizzy/mlx-audio-swift/blob/262a391a6a63c2e6923e826bcc7122caee0f18f6/Sources/MLXAudioSTT/Models/FunASRNano/FunASRNanoConfig.swift",
+      "upstream_sha256": "00c4452d04c949a5a03402f61ebbbf13f859c359fe97153643a18e8e233fe916",
+      "source_sha256": "00c4452d04c949a5a03402f61ebbbf13f859c359fe97153643a18e8e233fe916",
+      "after_sha256": "00c4452d04c949a5a03402f61ebbbf13f859c359fe97153643a18e8e233fe916"
+    },
+    {
+      "path": "Sources/MLXAudioSTT/Models/FunASRNano/FunASRNanoModel.swift",
+      "source_path": "fun-asr-source/FunASRNanoModel.swift",
+      "source_revision": "262a391a6a63c2e6923e826bcc7122caee0f18f6",
+      "source_url": "https://github.com/Blaizzy/mlx-audio-swift/blob/262a391a6a63c2e6923e826bcc7122caee0f18f6/Sources/MLXAudioSTT/Models/FunASRNano/FunASRNanoModel.swift",
+      "upstream_sha256": "babd970f04282e7093d4f6cce5595bd130aba9cb336be062817d987c7aadc015",
+      "source_sha256": "366ddccd298e7e14cc6496fa4a3c42cee20d8fcc5686c5df69e276b1405fd449",
+      "after_sha256": "366ddccd298e7e14cc6496fa4a3c42cee20d8fcc5686c5df69e276b1405fd449",
+      "compatibility_change": "Added direct MLXLMCommon import and qualified Tokenizers.Tokenizer for pinned target dependencies."
     }
   ],
   "proof": {
-    "whole_file_base_gate": "PASS: independently perturbed unrelated trailing newline in each of the three inputs; all rejected by SHA gate before output root creation",
-    "correct_base": "PASS: validator applied patch in isolated staged copy; all three post SHA-256 values exact",
-    "repeat": "PASS: raw git apply second application rejected with all file hashes unchanged; validator recognizes already-after only when all three post hashes match",
+    "whole_file_base_gate": "PASS: each patched input has a complete base-file hash gate before staged patch application",
+    "correct_base": "PASS: `xcodebuild` Release arm64 compiled against the exact pinned Xcode SwiftPM checkout after overlay application; package.sh validates the exact base and post-state in both SwiftPM checkouts. No model inference or model download was performed.",
+    "repeat": "PASS: validator recognizes already-after only when every patched and added source hash matches",
     "post_hashes": {
-      "DSP.swift": "b4830558aa62ac6ff9b3291589ee5a3879eac477333f2dcc4293e57fb094e174",
-      "Qwen3ASR.swift": "9983a6925350f8a4f60807f7c496dff441622a523c3991cf37067722b136f45a",
-      "CohereTranscribe.swift": "4af6aebc56911f13469cdf6b8ddb84ff1f5a3a995a0b7ce5a1bf941640882157"
+      "Sources/MLXAudioCore/DSP.swift": "b4830558aa62ac6ff9b3291589ee5a3879eac477333f2dcc4293e57fb094e174",
+      "Sources/MLXAudioSTT/Models/Qwen3ASR/Qwen3ASR.swift": "9983a6925350f8a4f60807f7c496dff441622a523c3991cf37067722b136f45a",
+      "Sources/MLXAudioSTT/Models/CohereTranscribe/CohereTranscribe.swift": "4af6aebc56911f13469cdf6b8ddb84ff1f5a3a995a0b7ce5a1bf941640882157",
+      "Sources/MLXAudioSTT/Models/Parakeet/ParakeetModel.swift": "026714db0ed8a431444f90aaa4fda5bee3a8668de27abcdbd157c424adf477e0",
+      "Sources/MLXAudioSTT/Models/FunASRNano/FunASRNanoAudio.swift": "25be68e67a9c99069037f29ca766e998c05fcd3326f63764d383a956a691ea05",
+      "Sources/MLXAudioSTT/Models/FunASRNano/FunASRNanoConfig.swift": "00c4452d04c949a5a03402f61ebbbf13f859c359fe97153643a18e8e233fe916",
+      "Sources/MLXAudioSTT/Models/FunASRNano/FunASRNanoModel.swift": "366ddccd298e7e14cc6496fa4a3c42cee20d8fcc5686c5df69e276b1405fd449"
     }
   },
-  "scope": "External source review artifact only; not integrated into VoiceFlow or SDK cache.",
+  "scope": "The package script applies this pinned source overlay only to its sidecar and Xcode SwiftPM checkouts, verifies the complete base and after-state before and after build, and records the overlay hashes in the staged dependency manifest.",
   "validator": {
-    "path": "validate-and-apply.py",
-    "sha256": "d2a255b629f5d45617d8f343dc9deb601c22a33f6e42f0994ca56cdee2522072",
-    "behavior": "whole-file SHA-256 gate on all three pinned inputs before staging; optional Git HEAD equality when source is a checkout; applies into private stage and verifies exact after hashes before publishing"
+    "path": "src-tauri/mlx-sidecar/scripts/apply-sdk-cancellation-overlay.py",
+    "sha256": "b629dbb5016492b553efdfff3da19dbee344ba296f3b4e2c5017b4d26fa33d4e",
+    "behavior": "checks the exact upstream checkout revision, allowlisted source paths, four full base-file hashes and Git blobs, three added source hashes and their recorded compatibility transform; stages the complete overlay from pinned Git blobs; migrates only the exact prior three-file after-image with unstaged-only status and missing added files; requires the exact current after-state for post-build verification; cleans same-directory publish and rollback temporary files when writing or replacement fails"
   },
   "repair": {
     "independent_review_markdown_sha256": "25e783bbc0bf298e1f37e98dad61e5fbbf1399577826b904cdf2ba7c0a1f6be4",
@@ -57,5 +98,13 @@
       "SDK-23-R3"
     ],
     "scope": "Only the three reviewed Qwen call-site/checkpoint edits; DSP.swift and CohereTranscribe.swift after files unchanged from V1."
+  },
+  "legacy_prior_overlay": {
+    "patch_sha256": "888d17cfe319c05191d2ebd1276000da06906bb6764002e147527740a00883a2",
+    "after_sha256": {
+      "Sources/MLXAudioCore/DSP.swift": "b4830558aa62ac6ff9b3291589ee5a3879eac477333f2dcc4293e57fb094e174",
+      "Sources/MLXAudioSTT/Models/Qwen3ASR/Qwen3ASR.swift": "9983a6925350f8a4f60807f7c496dff441622a523c3991cf37067722b136f45a",
+      "Sources/MLXAudioSTT/Models/CohereTranscribe/CohereTranscribe.swift": "4af6aebc56911f13469cdf6b8ddb84ff1f5a3a995a0b7ce5a1bf941640882157"
+    }
   }
 }

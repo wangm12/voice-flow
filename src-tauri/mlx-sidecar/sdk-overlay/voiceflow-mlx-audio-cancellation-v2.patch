@@ -932,3 +932,14 @@
      }
  
      func effectiveMaxGenerationTokens(promptLength: Int, requestedMaxTokens: Int) -> Int {
+--- a/Sources/MLXAudioSTT/Models/Parakeet/ParakeetModel.swift
++++ b/Sources/MLXAudioSTT/Models/Parakeet/ParakeetModel.swift
+@@ -161,6 +161,7 @@
+         return STTOutput(
+             text: result.text,
+             segments: result.segments,
+-            language: generationParameters.language
++            language: generationParameters.language,
++            generationTokens: result.sentences.reduce(0) { $0 + $1.tokens.count }
+         )
+     }

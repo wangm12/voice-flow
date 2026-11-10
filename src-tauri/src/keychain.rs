@@ -82,9 +82,6 @@ const API_FALLBACK_SERVICE: &str = FALLBACK_SERVICE;
 const API_SERVICE: &str = SERVICE;
 #[cfg(not(target_os = "macos"))]
 const API_FALLBACK_SERVICE: &str = PREVIOUS_SERVICE;
-const HISTORY_KEY_ACCOUNT: &str = "history-key";
-const HISTORY_KEY_SERVICE: &str = "com.voiceflow.desktop.history-key.v1";
-const HISTORY_KEY_FALLBACK_SERVICE: &str = "com.voiceflow.desktop.history-key.dev.v1";
 pub(crate) const INSTALLABLE_TEST_BUNDLE_IDENTIFIER: &str = "com.voiceflow.installable-test";
 #[cfg(any(not(target_os = "macos"), not(debug_assertions)))]
 const INSTALLABLE_TEST_API_SERVICE: &str = "com.voiceflow.installable-test.credentials.v1";
@@ -102,9 +99,6 @@ const INSTALLABLE_TEST_GROQ_API_FALLBACK_SERVICE: &str =
 #[cfg(all(target_os = "macos", debug_assertions))]
 const INSTALLABLE_TEST_GROQ_API_DEV_SERVICE: &str =
     "com.voiceflow.installable-test.groq-credentials.dev.v2";
-const INSTALLABLE_TEST_HISTORY_KEY_SERVICE: &str = "com.voiceflow.installable-test.history-key.v1";
-const INSTALLABLE_TEST_HISTORY_KEY_FALLBACK_SERVICE: &str =
-    "com.voiceflow.installable-test.history-key.fallback.v1";
 
 static KEYCHAIN_OPERATION_GATE: std::sync::OnceLock<std::sync::Mutex<()>> =
     std::sync::OnceLock::new();
@@ -293,22 +287,6 @@ fn groq_api_services_for(namespace: CredentialNamespace) -> (&'static str, &'sta
 fn groq_api_services() -> Result<(&'static str, &'static str), String> {
     let namespace = initialized_credential_namespace(CREDENTIAL_NAMESPACE.get().copied())?;
     Ok(groq_api_services_for(namespace))
-}
-
-fn history_key_services_for(namespace: CredentialNamespace) -> (&'static str, &'static str) {
-    if namespace == CredentialNamespace::InstallableTest {
-        (
-            INSTALLABLE_TEST_HISTORY_KEY_SERVICE,
-            INSTALLABLE_TEST_HISTORY_KEY_FALLBACK_SERVICE,
-        )
-    } else {
-        (HISTORY_KEY_SERVICE, HISTORY_KEY_FALLBACK_SERVICE)
-    }
-}
-
-fn history_key_services() -> Result<(&'static str, &'static str), String> {
-    let namespace = initialized_credential_namespace(CREDENTIAL_NAMESPACE.get().copied())?;
-    Ok(history_key_services_for(namespace))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1847,63 +1825,6 @@ pub fn set_provider_api_key(
     set_secret(service, fallback, provider.keychain_account(), key)
 }
 
-/// Read the optional application-layer history encryption key.
-pub fn get_history_key() -> Result<Option<Vec<u8>>, String> {
-    if keychain_disabled() {
-        return Ok(None);
-    }
-    let (service, fallback) = history_key_services()?;
-    let result = with_timeout(move || read_stored_secret(service, fallback, HISTORY_KEY_ACCOUNT));
-    match result {
-        Some(Ok(Some(value))) => decode_history_key(&value).map(Some),
-        Some(Ok(None)) => Ok(None),
-        Some(Err(error)) => Err(error),
-        None => Err("keychain read timed out".into()),
-    }
-}
-
-/// Store or remove the optional application-layer history encryption key.
-pub fn set_history_key(key: Option<&[u8]>) -> Result<(), String> {
-    if let Some(key) = key {
-        if key.len() != 32 {
-            return Err("history key must be exactly 32 bytes".into());
-        }
-    }
-    if keychain_disabled() {
-        return Ok(());
-    }
-    if let Some(key) = key {
-        let value = encode_history_key(key);
-        let (service, fallback) = history_key_services()?;
-        set_secret(service, fallback, HISTORY_KEY_ACCOUNT, &value)
-    } else {
-        let (service, fallback) = history_key_services()?;
-        set_secret(service, fallback, HISTORY_KEY_ACCOUNT, "")
-    }
-}
-
-fn encode_history_key(key: &[u8]) -> String {
-    let mut encoded = String::with_capacity(key.len() * 2);
-    for byte in key {
-        use std::fmt::Write;
-        let _ = write!(encoded, "{byte:02x}");
-    }
-    encoded
-}
-
-fn decode_history_key(value: &str) -> Result<Vec<u8>, String> {
-    if value.len() != 64 || !value.is_ascii() {
-        return Err("stored history key must be 32-byte hex".into());
-    }
-    (0..value.len())
-        .step_by(2)
-        .map(|offset| {
-            u8::from_str_radix(&value[offset..offset + 2], 16)
-                .map_err(|_| "stored history key must be 32-byte hex".to_string())
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2033,8 +1954,6 @@ mod tests {
         let test_api = api_services_for(CredentialNamespace::InstallableTest);
         let normal_groq = groq_api_services_for(CredentialNamespace::Normal);
         let test_groq = groq_api_services_for(CredentialNamespace::InstallableTest);
-        let normal_history = history_key_services_for(CredentialNamespace::Normal);
-        let test_history = history_key_services_for(CredentialNamespace::InstallableTest);
         assert_eq!(
             INSTALLABLE_TEST_GROQ_API_SERVICE,
             "com.voiceflow.installable-test.groq-credentials.v7"
@@ -2066,30 +1985,16 @@ mod tests {
             )
         );
         assert_eq!(normal_api, (API_SERVICE, API_FALLBACK_SERVICE));
-        assert_eq!(
-            normal_history,
-            (HISTORY_KEY_SERVICE, HISTORY_KEY_FALLBACK_SERVICE)
-        );
         assert_eq!(normal_groq, normal_api);
         assert_ne!(test_groq, test_api);
         assert!(test_groq.0.contains("groq-credentials"));
         assert!(test_groq.1.contains("groq-credentials"));
         assert!(test_api.0.starts_with("com.voiceflow.installable-test."));
         assert!(test_api.1.starts_with("com.voiceflow.installable-test."));
-        assert!(test_history
-            .0
-            .starts_with("com.voiceflow.installable-test."));
-        assert!(test_history
-            .1
-            .starts_with("com.voiceflow.installable-test."));
         assert_ne!(normal_api.0, test_api.0);
         assert_ne!(normal_api.0, test_api.1);
         assert_ne!(normal_api.1, test_api.0);
         assert_ne!(normal_api.1, test_api.1);
-        assert_ne!(normal_history.0, test_history.0);
-        assert_ne!(normal_history.0, test_history.1);
-        assert_ne!(normal_history.1, test_history.0);
-        assert_ne!(normal_history.1, test_history.1);
     }
 
     #[test]
@@ -2343,15 +2248,5 @@ mod tests {
                 ASR_ACCOUNT.to_owned(),
             ]
         );
-    }
-
-    #[test]
-    fn history_key_encoding_is_binary_safe_and_exactly_32_bytes() {
-        let key = (0_u8..32).collect::<Vec<_>>();
-        let encoded = encode_history_key(&key);
-        assert_eq!(encoded.len(), 64);
-        assert_eq!(decode_history_key(&encoded).unwrap(), key);
-        assert!(decode_history_key("00").is_err());
-        assert!(decode_history_key(&"zz".repeat(32)).is_err());
     }
 }

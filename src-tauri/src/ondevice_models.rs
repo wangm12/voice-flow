@@ -1,9 +1,8 @@
-//! Pinned manifests for the existing SenseVoice archive and local MLX models.
+//! Pinned manifests for retained SenseVoice files and local MLX models.
 
 pub const SENSEVOICE_ID: &str = "sensevoice-small";
 pub const SENSEVOICE_ARCHIVE_SHA256: &str =
     "7d1efa2138a65b0b488df37f8b89e3d91a60676e416f515b952358d83dfd347e";
-pub const SENSEVOICE_URL: &str = "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17.tar.bz2";
 pub const SENSEVOICE_ARCHIVE_BYTES: u64 = 163_002_883;
 pub const SENSEVOICE_INNER_ONNX: &str =
     "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17/model.int8.onnx";
@@ -12,6 +11,9 @@ pub const SENSEVOICE_INNER_TOKENS: &str =
 
 pub const QWEN_ASR_06_ID: &str = "qwen3-asr-0.6b";
 pub const QWEN_ASR_17_ID: &str = "qwen3-asr-1.7b";
+pub const PARAKEET_ASR_8BIT_ID: &str = "parakeet-tdt-0.6b-v3-8bit";
+pub const FIRERED_ASR2_AED_ID: &str = "firered-asr2-aed-mlx";
+pub const FUN_ASR_NANO_2512_ID: &str = "fun-asr-nano-2512-mlx";
 pub const COHERE_TRANSCRIBE_ID: &str = "cohere-transcribe-2b";
 /// First locally executable model offered to new On Device selections.
 pub const DEFAULT_LOCAL_MODEL_ID: &str = QWEN_ASR_06_ID;
@@ -32,10 +34,13 @@ pub struct MlxModelManifest {
     pub bytes: u64,
     pub files: &'static [ModelFile],
     pub language_policy: MlxLanguagePolicy,
+    pub language_note: &'static str,
+    pub download_available: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MlxLanguagePolicy {
+    AutoOnly,
     AutoOrExplicit,
     ExplicitChineseOrEnglish,
 }
@@ -106,6 +111,105 @@ const QWEN_17_FILES: &[ModelFile] = &[
         path: "model.safetensors.index.json",
         bytes: 51_384,
         sha256: "a3ee6037ec82e95dc8577216ac84cf0b3c92cfefc099cf20b2296571f2fb3fc0",
+    },
+];
+
+const PARAKEET_ASR_8BIT_FILES: &[ModelFile] = &[
+    ModelFile {
+        path: "config.json",
+        bytes: 161_386,
+        sha256: "b6ff3627914218db0408f64cc96cbc2fd052003d105879d6a724e383661ed09d",
+    },
+    ModelFile {
+        path: "model.safetensors",
+        bytes: 744_018_816,
+        sha256: "41abe1e55db0aefcc9788b5e9afb8b51333b6744415f672d3f6b7cb4a08b1dfe",
+    },
+    ModelFile {
+        path: "tokenizer.model",
+        bytes: 360_916,
+        sha256: "eacec2b0a77f336d4a2ca4a25a7047575d3c2b74de47e997f4c205126ed3135e",
+    },
+    ModelFile {
+        path: "tokenizer.vocab",
+        bytes: 101_024,
+        sha256: "41130ff456706304a1adec782ccc9e003c4d417e8e324353d281be958cac4e17",
+    },
+    ModelFile {
+        path: "vocab.txt",
+        bytes: 46_772,
+        sha256: "3cde1409fd78783a79b29ed4d32da57c746993856f7c8263bcb905d2e5839db7",
+    },
+];
+
+const FIRERED_ASR2_AED_FILES: &[ModelFile] = &[
+    ModelFile {
+        path: "cmvn.json",
+        bytes: 3_255,
+        sha256: "3f702336649609864b8a7c91ec3d25ae36be15f2d70f37cb35afeebf178be584",
+    },
+    ModelFile {
+        path: "config.json",
+        bytes: 369,
+        sha256: "ef3be4345675bf62b873de2b256b60e92fcfe44f95b3d9d810cb90a29ea69e91",
+    },
+    ModelFile {
+        path: "dict.txt",
+        bytes: 79_172,
+        sha256: "1bc613de2112d257e61a349c3e72d1b1a9cf19c33d3ca954197ad2171e5ea07b",
+    },
+    ModelFile {
+        path: "model.safetensors",
+        bytes: 4_565_783_672,
+        sha256: "e91fa08c58f07accd1803c8f0a9ffce24f4b3952c9fbc8ea476a82873e0386d4",
+    },
+    ModelFile {
+        path: "train_bpe1000.model",
+        bytes: 251_707,
+        sha256: "473bbc157cb4eade2059b30a3c877a1c29bd50cadbfbed869ae36eeade7fee07",
+    },
+];
+
+const FUN_ASR_NANO_2512_FILES: &[ModelFile] = &[
+    ModelFile {
+        path: "config.json",
+        bytes: 1_706,
+        sha256: "4df3d9ff5b222b7a0be5dcf3f815dba995f37c6fbefe387436072303670c0ad8",
+    },
+    ModelFile {
+        path: "model.safetensors",
+        bytes: 1_659_734_710,
+        sha256: "2e2ba5e2591f75f63b25ee5b53a895d3cd5afcc642c3db4482d3ee27b0a00449",
+    },
+    ModelFile {
+        path: "Qwen3-0.6B/config.json",
+        bytes: 726,
+        sha256: "660db3b73d788119c04535e48cf9be5f55bc3100841a718637ae695b442f27dd",
+    },
+    ModelFile {
+        path: "Qwen3-0.6B/generation_config.json",
+        bytes: 239,
+        sha256: "2325da0f15bb848e018c5ae071b7943332e9f871d6b60e2ed22ca97d4cb993d2",
+    },
+    ModelFile {
+        path: "Qwen3-0.6B/merges.txt",
+        bytes: 1_671_853,
+        sha256: "8831e4f1a044471340f7c0a83d7bd71306a5b867e95fd870f74d0c5308a904d5",
+    },
+    ModelFile {
+        path: "Qwen3-0.6B/tokenizer.json",
+        bytes: 11_422_654,
+        sha256: "aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4",
+    },
+    ModelFile {
+        path: "Qwen3-0.6B/tokenizer_config.json",
+        bytes: 9_732,
+        sha256: "d5d09f07b48c3086c508b30d1c9114bd1189145b74e982a265350c923acd8101",
+    },
+    ModelFile {
+        path: "Qwen3-0.6B/vocab.json",
+        bytes: 2_776_833,
+        sha256: "ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910",
     },
 ];
 
@@ -184,6 +288,8 @@ pub const MLX_MODELS: &[MlxModelManifest] = &[
         bytes: 1_569_435_907,
         files: QWEN_06_ALL,
         language_policy: MlxLanguagePolicy::AutoOrExplicit,
+        language_note: "Auto or fixed Chinese/English.",
+        download_available: true,
     },
     MlxModelManifest {
         id: QWEN_ASR_17_ID,
@@ -193,6 +299,41 @@ pub const MLX_MODELS: &[MlxModelManifest] = &[
         bytes: 4_080_707_826,
         files: QWEN_17_ALL,
         language_policy: MlxLanguagePolicy::AutoOrExplicit,
+        language_note: "Auto or fixed Chinese/English.",
+        download_available: true,
+    },
+    MlxModelManifest {
+        id: PARAKEET_ASR_8BIT_ID,
+        label: "Parakeet TDT v3 0.6B 8-bit MLX",
+        repository: "transcriber-app/parakeet-tdt-0.6b-v3-mlx-8bit",
+        revision: "b56210e2fad422736810524963c24b5e2a1985ab",
+        bytes: 744_688_914,
+        files: PARAKEET_ASR_8BIT_FILES,
+        language_policy: MlxLanguagePolicy::AutoOnly,
+        language_note: "Auto only; the model card lists 25 European languages. The runtime does not report detected language.",
+        download_available: true,
+    },
+    MlxModelManifest {
+        id: FIRERED_ASR2_AED_ID,
+        label: "FireRedASR2-AED MLX",
+        repository: "mlx-community/FireRedASR2-AED-mlx",
+        revision: "f3212eacfa49b851130b97c63653c8e06ee09bdb",
+        bytes: 4_566_118_175,
+        files: FIRERED_ASR2_AED_FILES,
+        language_policy: MlxLanguagePolicy::AutoOnly,
+        language_note: "Mandarin, Chinese dialects/accents, English, and code-switching per upstream. The runtime has no language control or detected-language result.",
+        download_available: true,
+    },
+    MlxModelManifest {
+        id: FUN_ASR_NANO_2512_ID,
+        label: "Fun-ASR-Nano 2512 MLX",
+        repository: "mlx-community/Fun-ASR-Nano-2512",
+        revision: "a7bc96fceaafce39ed6748e0c0fa9a9508b67f86",
+        bytes: 1_675_618_453,
+        files: FUN_ASR_NANO_2512_FILES,
+        language_policy: MlxLanguagePolicy::AutoOrExplicit,
+        language_note: "Auto or fixed Chinese/English prompt; no detected-language result. The pinned runtime prompt supports Chinese and English.",
+        download_available: true,
     },
     MlxModelManifest {
         id: COHERE_TRANSCRIBE_ID,
@@ -202,6 +343,8 @@ pub const MLX_MODELS: &[MlxModelManifest] = &[
         bytes: 4_132_561_814,
         files: COHERE_FILES,
         language_policy: MlxLanguagePolicy::ExplicitChineseOrEnglish,
+        language_note: "Legacy selection only; requires fixed Chinese/English.",
+        download_available: false,
     },
 ];
 
@@ -211,6 +354,12 @@ pub fn mlx_model(id: &str) -> Option<&'static MlxModelManifest> {
 
 pub fn is_mlx_model(id: &str) -> bool {
     mlx_model(id).is_some()
+}
+
+/// Retired catalog rows remain recognized for existing saved settings/files,
+/// but cannot be newly downloaded or selected.
+pub fn mlx_model_download_retired(id: &str) -> bool {
+    mlx_model(id).is_some_and(|model| !model.download_available)
 }
 
 pub fn inner_file_name(inner: &str) -> &str {
@@ -295,21 +444,8 @@ mod tests {
     }
 
     #[test]
-    fn catalog_url_bytes_and_id_are_pinned() {
+    fn catalog_bytes_and_id_are_pinned() {
         assert_eq!(SENSEVOICE_ID, "sensevoice-small");
-        assert_eq!(
-            SENSEVOICE_URL,
-            "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17.tar.bz2"
-        );
-        assert!(
-            SENSEVOICE_URL.starts_with("https://") && !SENSEVOICE_URL.is_empty(),
-            "url must be a non-empty https link"
-        );
-        assert!(
-            SENSEVOICE_URL.ends_with(".tar.bz2"),
-            "official archive must be .tar.bz2, not Handy .tar.gz"
-        );
-        assert!(!SENSEVOICE_URL.contains("handy.computer"));
         assert_eq!(SENSEVOICE_ARCHIVE_BYTES, 163_002_883);
         const { assert!(SENSEVOICE_ARCHIVE_BYTES > 0) };
         assert_eq!(

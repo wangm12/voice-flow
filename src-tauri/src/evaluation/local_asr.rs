@@ -50,7 +50,7 @@ impl LocalModelIdentity {
                     && r.observed_revision.as_deref() == Some(self.revision.as_str())
             })
             .and_then(|r| r.loaded_attestation.as_ref())
-            .filter(|a| a.complete())
+            .filter(|a| a.complete(&self.model_id))
             .map(|a| serde_json::to_string(&a.parameter_dtypes).expect("dtype inventory"));
     }
 }

@@ -4,9 +4,9 @@
   "version": "0.1.4",
   "identifier": "com.voiceflow.desktop",
   "build": {
-    "beforeDevCommand": "bash \"${PWD%/src-tauri}/src-tauri/mlx-sidecar/scripts/package.sh\" --dev && npm run dev",
+    "beforeDevCommand": "bash \"${PWD%/src-tauri}/src-tauri/llama-runtime/scripts/package.sh\" && bash \"${PWD%/src-tauri}/src-tauri/mlx-sidecar/scripts/package.sh\" --dev && npm run dev",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "npm run build && bash \"${PWD%/src-tauri}/src-tauri/mlx-sidecar/scripts/package.sh\"",
+    "beforeBuildCommand": "npm run build && bash \"${PWD%/src-tauri}/src-tauri/llama-runtime/scripts/package.sh\" && bash \"${PWD%/src-tauri}/src-tauri/mlx-sidecar/scripts/package.sh\"",
     "frontendDist": "../dist"
   },
   "app": {
@@ -52,6 +52,7 @@
     "active": true,
     "targets": "all",
     "resources": {
+      "target/llama-runtime/stage/llama-runtime/": "llama-runtime/",
       "target/mlx-sidecar/stage/": "",
       "../THIRD_PARTY_NOTICES.md": "THIRD_PARTY_NOTICES.md",
       "resources/": "resources/"

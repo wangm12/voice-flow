@@ -11,14 +11,14 @@ export type ProviderId =
   | "deepseek"
   | "anthropic"
   | "ollama"
-  | "lmstudio"
+  | "on_device_llama_cpp"
   | "on_device_mlx"
   | "local_whisper"
   | "on_device"
   | "custom";
 
 export type ProviderCapability = "asr" | "llm";
-export type ProviderProtocol = "openai_compat" | "deepgram" | "anthropic" | "lmstudio_native" | "on_device_local" | "on_device_mlx_local" | "soniox_realtime" | "assemblyai_dictation_sync" | "dashscope_message";
+export type ProviderProtocol = "openai_compat" | "deepgram" | "anthropic" | "on_device_local" | "on_device_mlx_local" | "on_device_llama_cpp_local" | "soniox_realtime" | "assemblyai_dictation_sync" | "dashscope_message";
 export type AsrTransport = "http_batch" | "websocket_stream" | "websocket_completed_audio" | "on_device";
 export type ModelField = "select" | "text";
 export type AsrLanguageSupport =
@@ -79,7 +79,7 @@ export const PROVIDER_IDS = [
   "deepseek",
   "anthropic",
   "ollama",
-  "lmstudio",
+  "on_device_llama_cpp",
   "on_device_mlx",
   "local_whisper",
   "on_device",
@@ -453,21 +453,19 @@ export const PROVIDERS: readonly ProviderDefinition[] = [
     defaultLlmModel: "qwen3.5:4b",
   },
   {
-    id: "lmstudio",
-    label: "LM Studio",
+    id: "on_device_llama_cpp",
+    label: "VoiceFlow llama.cpp",
     capabilities: ["llm"],
-    protocol: "lmstudio_native",
-    defaultBaseUrl: "http://127.0.0.1:1234",
+    protocol: "on_device_llama_cpp_local",
+    defaultBaseUrl: "",
     allowsEmptyKey: true,
     editableBaseUrl: false,
     asrModelField: "select",
     llmModelField: "select",
     asrModels: [],
-    llmModels: [
-      { value: "qwen/qwen3.8-27b@6bit", label: "Qwen 3.8 27B · MLX 6-bit", note: "需 LM Studio 已加载 voiceflow-cleanup 本机实例" },
-    ],
+    llmModels: [],
     defaultAsrModel: "",
-    defaultLlmModel: "qwen/qwen3.8-27b@6bit",
+    defaultLlmModel: "",
   },
   {
     id: "on_device_mlx",
@@ -528,13 +526,28 @@ export const PROVIDERS: readonly ProviderDefinition[] = [
       {
         value: "qwen3-asr-1.7b",
         label: "Qwen3-ASR 1.7B",
-        note: "需 Apple Silicon 与 macOS 14 或更新版本",
+        asrProfile: { languageSupport: "auto_detect_or_fixed_language" },
+      },
+      {
+        value: "parakeet-tdt-0.6b-v3-8bit",
+        label: "Parakeet TDT v3 0.6B · 8-bit MLX",
+        asrProfile: { languageSupport: "auto_detect_only" },
+      },
+      {
+        value: "firered-asr2-aed-mlx",
+        label: "FireRedASR2-AED · MLX",
+        asrProfile: { languageSupport: "auto_detect_only" },
+      },
+      {
+        value: "fun-asr-nano-2512-mlx",
+        label: "Fun-ASR Nano 2512 · MLX",
         asrProfile: { languageSupport: "auto_detect_or_fixed_language" },
       },
       {
         value: "cohere-transcribe-2b",
         label: "Cohere Transcribe 2B",
-        note: "需 Apple Silicon、macOS 14 或更新版本，以及中文或 English 固定语言",
+        note: "旧配置保留；不提供新下载或选择",
+        retiredForNewSelection: true,
         asrProfile: {
           languageSupport: "explicit_language_required",
           capabilityNote: "此模型不支持自动语言检测；请选择中文或 English。",
@@ -613,6 +626,23 @@ export function isProviderId(value: string | undefined | null): value is Provide
 export function providerById(id: string | undefined | null): ProviderDefinition | undefined {
   if (!id) return undefined;
   return PROVIDERS.find((provider) => provider.id === id);
+}
+
+/** Retired on-device models keep existing files manageable but cannot be downloaded. */
+export function isRetiredOnDeviceModel(id: string): boolean {
+  return providerById("on_device")?.asrModels.some((model) => model.value === id && model.retiredForNewSelection) === true;
+}
+
+export function onDeviceMemoryCompatibilityCopy(
+  code: string | null | undefined,
+  translate: (source: string) => string,
+): string | null {
+  switch (code) {
+    case "insufficient_memory": return translate("此模型的固定内存预留超过本机物理内存的 80% 上限。");
+    case "memory_unknown": return translate("无法读取本机物理内存，无法确认此模型的固定容量要求。");
+    case "memory_unavailable": return translate("无法确认此模型的固定内存兼容性。");
+    default: return null;
+  }
 }
 
 export function asrModelProfile(id: ProviderId, model: string): AsrModelProfile | undefined {

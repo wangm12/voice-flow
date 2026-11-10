@@ -34,15 +34,19 @@ import {
   defaultModel,
   isLoopbackUrl,
   isProviderId,
+  isRetiredOnDeviceModel,
+  onDeviceMemoryCompatibilityCopy,
   providerById,
   providersFor,
+  type ModelOption,
   type ProviderId,
 } from "../../lib/providers";
 import { friendlySettingsError } from "../../lib/settingsError";
 import { buttonClass, ghostButtonClass, compactButtonClass, compactDangerButtonClass, colors, focusRingClass, radius } from "../../lib/theme";
-import type { CleanupModelStatus, LocalCleanupStatus, OnDeviceModelStatus, ProviderCredentialPurpose, ProviderCredentialReadResult, Settings } from "../../types/settings";
+import type { CleanupModelStatus, LocalCleanupModelStatus, LocalCleanupStatus, MlxCleanupModelStatus, OnDeviceModelStatus, ProviderCredentialPurpose, ProviderCredentialReadResult, Settings } from "../../types/settings";
 
 const controlClass = `${radius.control} h-9 border ${colors.border} ${colors.bg.elevated} ${colors.text.primary} px-3 py-0 text-sm outline-none transition-colors duration-150 focus:border-accent ${focusRingClass}`;
+const LEGACY_MLX_CLEANUP_MODEL_ID = "qwen3_8_27b_mlx_6bit";
 
 type ProbeStage = {
   ok: boolean;
@@ -248,6 +252,79 @@ function cleanupModelStoreSummaryCopy(state: string, t: (key: string) => string)
     case "error": return t("操作失败");
     default: return t("状态未知");
   }
+}
+
+function localCleanupModelStateCopy(state: string, verified: boolean, t: (key: string) => string, partialManaged = false): string {
+  switch (state) {
+    case "missing": return partialManaged ? t("下载未完成") : t("尚未下载");
+    case "downloading": return t("正在下载");
+    case "installed": return verified ? t("已下载并校验") : t("文件尚未校验");
+    case "corrupt": return t("文件校验失败");
+    case "deleting": return t("正在删除");
+    default: return `${t("文件状态")}: ${state}`;
+  }
+}
+
+function mlxCleanupModelStateCopy(model: MlxCleanupModelStatus, t: (key: string) => string): string {
+  if (model.operation === "verify") return t("正在校验模型文件");
+  switch (model.state) {
+    case "missing": return model.partial_managed ? t("下载未完成") : t("尚未下载");
+    case "downloading": return t("正在下载");
+    case "canceling": return t("正在取消下载");
+    case "installed": return model.verified ? t("已下载并校验") : t("文件尚未校验");
+    case "ready": return model.verified ? t("已下载并校验") : t("已安装；首次使用时会重新校验");
+    case "corrupt": return t("文件校验失败");
+    case "deleting": return t("正在删除");
+    case "error": return t("操作失败");
+    default: return `${t("文件状态")}: ${model.state}`;
+  }
+}
+
+function mlxCleanupCompatibilityCopy(code: string | null | undefined, t: (key: string) => string): string {
+  switch (code) {
+    case "runtime_missing": return t("本机推理组件未安装");
+    case "unsupported_platform": return t("VoiceFlow 本机 MLX 整理需要 Apple Silicon 和 macOS 14 或更新版本。");
+    case "model_not_verified": return t("模型文件尚未通过校验。");
+    case "uncalibrated_memory": return t("此模型的最低内存档尚未完成验证。");
+    case "insufficient_memory": return t("当前可用内存不足以运行此模型。");
+    default: return code ? `${t("兼容性检查未通过")} (${code})` : t("当前设备不满足此模型的兼容条件。");
+  }
+}
+
+function mlxCleanupLanguageCopy(language: string): string | null {
+  return language === "Multilingual; product language coverage pending verification" ? null : language;
+}
+
+function isMlxCleanupModelOperationActive(model: MlxCleanupModelStatus): boolean {
+  return Boolean(model.operation) || ["downloading", "canceling", "deleting"].includes(model.state);
+}
+
+function isCancellationError(message: string | null | undefined): boolean {
+  return /cancel/i.test(message ?? "");
+}
+
+function localCleanupCompatibilityCopy(code: string | null | undefined, t: (key: string) => string): string {
+  switch (code) {
+    case "runtime_missing": return t("本机 llama.cpp 运行时不可用；请重新安装 VoiceFlow。");
+    case "unsupported_platform": return t("当前设备或 macOS 版本不支持此模型。");
+    case "model_not_verified": return t("模型文件尚未通过校验。");
+    case "uncalibrated_memory": return t("此模型的最低内存档尚未完成验证。");
+    case "insufficient_memory": return t("当前可用内存不足以运行此模型。");
+    default: return code ? `${t("兼容性检查未通过")} (${code})` : t("当前设备不满足此模型的兼容条件。");
+  }
+}
+
+function isReadyLocalCleanupModel(model: LocalCleanupModelStatus | undefined): boolean {
+  return Boolean(model
+    && model.state === "installed"
+    && model.managed
+    && model.verified
+    && model.compatible
+    && !model.operation);
+}
+
+function isSelectableLocalCleanupModel(model: LocalCleanupModelStatus | undefined): boolean {
+  return model?.selectable === true && isReadyLocalCleanupModel(model);
 }
 
 function normalizeLatencySummary(value: unknown): LatencySummary {
@@ -583,7 +660,7 @@ function capabilityText(id: ProviderId, t: (key: string) => string): string {
 }
 
 function providerHasCredentialInput(id: ProviderId): boolean {
-  return id !== "on_device" && id !== "on_device_mlx" && id !== "lmstudio";
+  return id !== "on_device" && id !== "on_device_mlx" && id !== "on_device_llama_cpp";
 }
 
 function keepEngineControlInsideRails(target: HTMLElement, alignFirst = false) {
@@ -788,13 +865,22 @@ export function EngineSettings({
   const [cleanupModelStoreActionError, setCleanupModelStoreActionError] = useState<string | null>(null);
   const [cleanupModelStoreReadError, setCleanupModelStoreReadError] = useState<string | null>(null);
   const [confirmDeleteCleanupModel, setConfirmDeleteCleanupModel] = useState(false);
+  const [localCleanupModels, setLocalCleanupModels] = useState<LocalCleanupModelStatus[]>([]);
+  const [localCleanupModelsLoading, setLocalCleanupModelsLoading] = useState(true);
+  const [localCleanupModelsReadError, setLocalCleanupModelsReadError] = useState<string | null>(null);
+  const [localCleanupModelBusy, setLocalCleanupModelBusy] = useState<Record<string, string>>({});
+  const [localCleanupModelActionErrors, setLocalCleanupModelActionErrors] = useState<Record<string, string>>({});
+  const [confirmDeleteLocalCleanupModel, setConfirmDeleteLocalCleanupModel] = useState<string | null>(null);
+  const [mlxCleanupModels, setMlxCleanupModels] = useState<MlxCleanupModelStatus[]>([]);
+  const [mlxCleanupModelsLoading, setMlxCleanupModelsLoading] = useState(true);
+  const [mlxCleanupModelsReadError, setMlxCleanupModelsReadError] = useState<string | null>(null);
+  const [mlxCleanupModelBusy, setMlxCleanupModelBusy] = useState<Record<string, string>>({});
+  const [mlxCleanupModelActionErrors, setMlxCleanupModelActionErrors] = useState<Record<string, string>>({});
+  const [confirmDeleteMlxCleanupModel, setConfirmDeleteMlxCleanupModel] = useState<string | null>(null);
   const [confirmDeleteModel, setConfirmDeleteModel] = useState<string | null>(null);
   const [localCleanupStatus, setLocalCleanupStatus] = useState<LocalCleanupStatus | null>(null);
   const [localCleanupChecking, setLocalCleanupChecking] = useState(false);
   const [localCleanupError, setLocalCleanupError] = useState<string | null>(null);
-  const [lmStudioCleanupStatus, setLmStudioCleanupStatus] = useState<LocalCleanupStatus | null>(null);
-  const [lmStudioCleanupChecking, setLmStudioCleanupChecking] = useState(false);
-  const [lmStudioCleanupError, setLmStudioCleanupError] = useState<string | null>(null);
   const [strictOfflineSaving, setStrictOfflineSaving] = useState(false);
   const [strictOfflineSaveError, setStrictOfflineSaveError] = useState<string | null>(null);
   const [savedDraftSnapshot, setSavedDraftSnapshot] = useSessionDraftState("engine:saved", () => ({ draft: draftFromSettings(settings), cleanup: settings.cleanup_enabled }));
@@ -938,6 +1024,96 @@ export function EngineSettings({
     }
   };
 
+  const refreshLocalCleanupModels = async (showLoading = false) => {
+    if (showLoading) setLocalCleanupModelsLoading(true);
+    try {
+      const models = await invoke<LocalCleanupModelStatus[]>("list_local_cleanup_models");
+      setLocalCleanupModels(Array.isArray(models) ? models : []);
+      setLocalCleanupModelsReadError(null);
+    } catch (reason) {
+      setLocalCleanupModelsReadError(`${t("本机整理模型状态读取失败，请重试。")} ${String(reason)}`.trim());
+    } finally {
+      if (showLoading) setLocalCleanupModelsLoading(false);
+    }
+  };
+
+  const runLocalCleanupModelAction = async (id: string, action: "download" | "cancel" | "delete") => {
+    setLocalCleanupModelBusy((current) => ({ ...current, [id]: action }));
+    setLocalCleanupModelActionErrors((current) => ({ ...current, [id]: "" }));
+    try {
+      if (action === "download") await invoke("download_local_cleanup_model", { id });
+      else if (action === "cancel") {
+        const cancelled = await invoke<boolean>("cancel_local_cleanup_model_download", { id });
+        if (!cancelled) setLocalCleanupModelActionErrors((current) => ({
+          ...current,
+          [id]: t("下载已经结束或当前无法取消；模型状态已刷新。"),
+        }));
+      } else await invoke("delete_local_cleanup_model", { id });
+    } catch (reason) {
+      const rawMessage = typeof reason === "string"
+        ? reason
+        : reason instanceof Error
+          ? reason.message
+          : reason && typeof reason === "object" && "message" in reason && typeof (reason as { message: unknown }).message === "string"
+            ? (reason as { message: string }).message
+            : String(reason);
+      const message = rawMessage === "local_cleanup_model_is_active"
+        ? t("先在服务配置中切换此模型或关闭 AI 整理，再删除模型。")
+        : `${action === "download" ? t("模型下载失败") : action === "cancel" ? t("取消下载失败") : t("删除模型失败")}: ${rawMessage}`;
+      setLocalCleanupModelActionErrors((current) => ({ ...current, [id]: message }));
+    } finally {
+      await refreshLocalCleanupModels();
+      setLocalCleanupModelBusy((current) => {
+        const next = { ...current };
+        delete next[id];
+        return next;
+      });
+    }
+  };
+
+  const refreshMlxCleanupModels = async (showLoading = false) => {
+    if (showLoading) setMlxCleanupModelsLoading(true);
+    try {
+      const models = await invoke<MlxCleanupModelStatus[]>("list_mlx_cleanup_models");
+      setMlxCleanupModels(Array.isArray(models) ? models : []);
+      setMlxCleanupModelsReadError(null);
+    } catch (reason) {
+      setMlxCleanupModelsReadError(`${t("本机 MLX 整理模型状态读取失败，请重试。")} ${String(reason)}`.trim());
+    } finally {
+      if (showLoading) setMlxCleanupModelsLoading(false);
+    }
+  };
+
+  const runMlxCleanupModelAction = async (id: string, action: "download" | "verify" | "cancel" | "delete") => {
+    setMlxCleanupModelBusy((current) => ({ ...current, [id]: action }));
+    setMlxCleanupModelActionErrors((current) => ({ ...current, [id]: "" }));
+    try {
+      if (action === "download") await invoke("download_mlx_cleanup_model", { id });
+      else if (action === "verify") await invoke("verify_mlx_cleanup_model", { id });
+      else if (action === "cancel") await invoke("cancel_mlx_cleanup_model_download", { id });
+      else await invoke("delete_mlx_cleanup_model", { id });
+    } catch (reason) {
+      const rawMessage = typeof reason === "string"
+        ? reason
+        : reason instanceof Error
+          ? reason.message
+          : reason && typeof reason === "object" && "message" in reason && typeof (reason as { message: unknown }).message === "string"
+            ? (reason as { message: string }).message
+            : String(reason);
+      const message = rawMessage === "local_cleanup_model_is_active"
+        ? t("先在服务配置中切换此模型或关闭 AI 整理，再删除模型。")
+        : `${action === "download" ? t("MLX 整理模型下载失败") : action === "verify" ? t("验证 MLX 整理模型失败") : action === "cancel" ? t("取消 MLX 整理模型下载失败") : t("删除 MLX 整理模型失败")}: ${rawMessage}`;
+      setMlxCleanupModelActionErrors((current) => ({ ...current, [id]: message }));
+    } finally {
+      await refreshMlxCleanupModels();
+      setMlxCleanupModelBusy((current) => {
+        const next = { ...current };
+        delete next[id];
+        return next;
+      });
+    }
+  };
+
   const runCleanupModelStoreAction = async (action: "import" | "download" | "cancel" | "delete") => {
     setCleanupModelStoreBusy(true);
     setCleanupModelStoreActionError(null);
@@ -971,6 +1147,57 @@ export function EngineSettings({
   }, [t]);
 
   useEffect(() => {
+    let cancelled = false;
+    const applyModels = (models: MlxCleanupModelStatus[]) => {
+      if (cancelled) return;
+      setMlxCleanupModels(Array.isArray(models) ? models : []);
+      setMlxCleanupModelsReadError(null);
+      setMlxCleanupModelsLoading(false);
+    };
+    void Promise.resolve(invoke<MlxCleanupModelStatus[]>("list_mlx_cleanup_models"))
+      .then(applyModels)
+      .catch((reason) => {
+        if (!cancelled) {
+          setMlxCleanupModelsReadError(`${t("本机 MLX 整理模型状态读取失败，请重试。")} ${String(reason)}`.trim());
+          setMlxCleanupModelsLoading(false);
+        }
+      });
+    const subscription = listen<MlxCleanupModelStatus>("mlx-cleanup-model://status", (event) => {
+      if (cancelled || !event.payload?.id) return;
+      setMlxCleanupModels((current) => {
+        const next = current.filter((model) => model.id !== event.payload.id);
+        return [...next, event.payload];
+      });
+      setMlxCleanupModelsReadError(null);
+      setMlxCleanupModelsLoading(false);
+    });
+    return () => {
+      cancelled = true;
+      void subscription.then((unlisten) => unlisten()).catch(() => undefined);
+    };
+  }, [t]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const load = async () => {
+      try {
+        const models = await invoke<LocalCleanupModelStatus[]>("list_local_cleanup_models");
+        if (cancelled) return;
+        const nextModels = Array.isArray(models) ? models : [];
+        setLocalCleanupModels(nextModels);
+        setLocalCleanupModelsReadError(null);
+      } catch (reason) {
+        if (cancelled) return;
+        setLocalCleanupModelsReadError(`${t("本机整理模型状态读取失败，请重试。")} ${String(reason)}`.trim());
+      } finally {
+        if (!cancelled) setLocalCleanupModelsLoading(false);
+      }
+    };
+    void load();
+    return () => { cancelled = true; };
+  }, [t]);
+
+  useEffect(() => {
     if (!cleanupModelStoreStatus?.operation) return;
     let cancelled = false;
     let timer: number | undefined;
@@ -994,6 +1221,74 @@ export function EngineSettings({
       if (timer !== undefined) window.clearTimeout(timer);
     };
   }, [cleanupModelStoreStatus?.operation, t]);
+
+  const localCleanupOperationsKey = localCleanupModels
+    .filter((model) => Boolean(model.operation) || model.state === "downloading")
+    .map((model) => `${model.id}:${model.operation ?? model.state}`)
+    .sort()
+    .join("|");
+
+  useEffect(() => {
+    if (!localCleanupOperationsKey) return;
+    let cancelled = false;
+    let timer: number | undefined;
+    const poll = async () => {
+      try {
+        const models = await invoke<LocalCleanupModelStatus[]>("list_local_cleanup_models");
+        if (cancelled) return;
+        const nextModels = Array.isArray(models) ? models : [];
+        setLocalCleanupModels(nextModels);
+        setLocalCleanupModelsReadError(null);
+        if (nextModels.some((model) => Boolean(model.operation) || model.state === "downloading")) {
+          timer = window.setTimeout(() => void poll(), 900);
+        }
+      } catch (reason) {
+        if (!cancelled) {
+          setLocalCleanupModelsReadError(`${t("本机整理模型状态读取失败，请重试。")} ${String(reason)}`.trim());
+          timer = window.setTimeout(() => void poll(), 900);
+        }
+      }
+    };
+    timer = window.setTimeout(() => void poll(), 900);
+    return () => {
+      cancelled = true;
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
+  }, [localCleanupOperationsKey, t]);
+
+  const mlxCleanupOperationsKey = mlxCleanupModels
+    .filter(isMlxCleanupModelOperationActive)
+    .map((model) => `${model.id}:${model.operation ?? model.state}`)
+    .sort()
+    .join("|");
+
+  useEffect(() => {
+    if (!mlxCleanupOperationsKey) return;
+    let cancelled = false;
+    let timer: number | undefined;
+    const poll = async () => {
+      try {
+        const models = await invoke<MlxCleanupModelStatus[]>("list_mlx_cleanup_models");
+        if (cancelled) return;
+        const nextModels = Array.isArray(models) ? models : [];
+        setMlxCleanupModels(nextModels);
+        setMlxCleanupModelsReadError(null);
+        if (nextModels.some(isMlxCleanupModelOperationActive)) {
+          timer = window.setTimeout(() => void poll(), 900);
+        }
+      } catch (reason) {
+        if (!cancelled) {
+          setMlxCleanupModelsReadError(`${t("本机 MLX 整理模型状态读取失败，请重试。")} ${String(reason)}`.trim());
+          timer = window.setTimeout(() => void poll(), 900);
+        }
+      }
+    };
+    timer = window.setTimeout(() => void poll(), 900);
+    return () => {
+      cancelled = true;
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
+  }, [mlxCleanupOperationsKey, t]);
 
   const runOnDeviceAction = async (id: string, action: "download" | "cancel" | "cancel_load" | "delete") => {
     setOnDeviceActionId(id);
@@ -1025,19 +1320,6 @@ export function EngineSettings({
     }
   };
 
-  const checkLmStudioCleanupStatus = async () => {
-    setLmStudioCleanupChecking(true);
-    setLmStudioCleanupError(null);
-    try {
-      setLmStudioCleanupStatus(await invoke<LocalCleanupStatus>("get_lmstudio_cleanup_status"));
-    } catch {
-      setLmStudioCleanupStatus(null);
-      setLmStudioCleanupError(t("无法读取本机 LM Studio 状态，请重试。"));
-    } finally {
-      setLmStudioCleanupChecking(false);
-    }
-  };
-
   const chooseLocalCleanup = () => {
     const ollamaBaseUrl = providerById("ollama")?.defaultBaseUrl ?? "http://127.0.0.1:11434/v1";
     setDraft((current) => ({
@@ -1051,6 +1333,29 @@ export function EngineSettings({
     setLocalCleanupStatus(null);
   };
 
+  const currentCleanupProvider = providerOf(settings.cleanup_provider, settings.cleanup_base_url);
+  const savedCleanupModel = settings.cleanup_model || defaultModel(currentCleanupProvider, "llm");
+  const selectableLocalCleanupModels = localCleanupModels.filter(isSelectableLocalCleanupModel);
+  const selectedLocalCleanupModel = localCleanupModels.find((model) => model.id === draft.cleanupModel);
+  const selectedSavedLocalCleanupModel = localCleanupModels.find((model) => model.id === savedCleanupModel);
+  const draftLocalCleanupModelReady = isSelectableLocalCleanupModel(selectedLocalCleanupModel)
+    || (draft.cleanupProvider === "on_device_llama_cpp"
+      && currentCleanupProvider === "on_device_llama_cpp"
+      && draft.cleanupModel === savedCleanupModel
+      && isReadyLocalCleanupModel(selectedLocalCleanupModel));
+  const savedLocalCleanupModelReady = isReadyLocalCleanupModel(selectedSavedLocalCleanupModel);
+  const localCleanupDeleteTarget = localCleanupModels.find((model) => model.id === confirmDeleteLocalCleanupModel);
+  const cleaningOnlyPartialModel = Boolean(localCleanupDeleteTarget && !localCleanupDeleteTarget.managed && localCleanupDeleteTarget.partial_managed);
+  const selectedMlxCleanupModel = mlxCleanupModels.find((model) => model.id === draft.cleanupModel);
+  const selectedMlxCleanupLanguage = selectedMlxCleanupModel
+    ? mlxCleanupLanguageCopy(selectedMlxCleanupModel.language)
+    : null;
+  const mlxCleanupDeleteTarget = mlxCleanupModels.find((model) => model.id === confirmDeleteMlxCleanupModel);
+  const cleaningOnlyPartialMlxCleanupModel = Boolean(mlxCleanupDeleteTarget && !mlxCleanupDeleteTarget.managed && mlxCleanupDeleteTarget.partial_managed);
+  const mlxCleanupManageTarget = draft.cleanupModel === LEGACY_MLX_CLEANUP_MODEL_ID
+    ? "local-cleanup-model"
+    : selectedMlxCleanupModel ? `mlx-cleanup-model-${selectedMlxCleanupModel.id}` : "local-mlx-cleanup-models";
+
   const selectedAsrIsLocal = draft.asrProvider === "on_device";
   const cleanupMlxPlatformSupported = cleanupModelStoreStatus?.platform_supported === true;
   const cleanupMlxPlatformUnsupported = cleanupModelStoreStatus?.platform_supported === false;
@@ -1063,17 +1368,29 @@ export function EngineSettings({
     && cleanupModelStoreStatus != null
     && cleanupModelStoreStatus.managed
     && ["ready", "installed"].includes(cleanupModelStoreStatus.state);
+  const draftMlxCleanupModelReady = draft.cleanupModel === LEGACY_MLX_CLEANUP_MODEL_ID
+    ? cleanupMlxInstalled
+    : selectedMlxCleanupModel?.selectable === true
+      || (draft.cleanupProvider === "on_device_mlx"
+        && currentCleanupProvider === "on_device_mlx"
+        && draft.cleanupModel === savedCleanupModel
+        && selectedMlxCleanupModel?.state === "ready"
+        && selectedMlxCleanupModel.verified
+        && selectedMlxCleanupModel.compatible
+        && !isMlxCleanupModelOperationActive(selectedMlxCleanupModel));
   const selectedCleanupIsLocal = (draft.cleanupProvider === "ollama" && isLoopbackUrl(draft.ollamaBaseUrl))
-    || (draft.cleanupProvider === "lmstudio"
-      && lmStudioCleanupStatus?.available === true
-      && lmStudioCleanupStatus.local_source_confirmed === true)
-    || (draft.cleanupProvider === "on_device_mlx" && cleanupMlxInstalled);
+    || (draft.cleanupProvider === "on_device_mlx" && draftMlxCleanupModelReady)
+    || (draft.cleanupProvider === "on_device_llama_cpp" && draftLocalCleanupModelReady);
   const strictOfflineRoutesAllowed = settings.strict_offline_enabled !== true
     || (selectedAsrIsLocal && (!draftCleanupEnabled || selectedCleanupIsLocal));
   const asrMissing = !hasProviderSecret(draft.asrProvider, draft, settings, onDeviceReady);
   const cleanupMissing = draftCleanupEnabled && !hasProviderSecret(draft.cleanupProvider, draft, settings);
   const hasSupportedAsrLanguageSetting = hasSupportedAsrLanguage(asrModelProfile(draft.asrProvider, draft.asrModel), settings.language);
-  const cleanupModelRouteReady = draft.cleanupProvider !== "on_device_mlx" || cleanupMlxInstalled;
+  const cleanupModelRouteReady = draft.cleanupProvider === "on_device_mlx"
+    ? draftMlxCleanupModelReady
+    : draft.cleanupProvider === "on_device_llama_cpp"
+      ? draftLocalCleanupModelReady
+      : true;
   const ready = step2Ready(draft, draftSettings, onDeviceReady)
     && hasSupportedAsrLanguageSetting
     && strictOfflineRoutesAllowed
@@ -1096,10 +1413,14 @@ export function EngineSettings({
                   ? { message: t("请先填写自定义服务地址。"), page: "advanced", target: "advanced-custom-base-url", action: t("管理连接地址") }
                   : draftCleanupEnabled && cleanupMissing && draft.asrProvider !== "assemblyai"
                     ? { message: t("请先添加当前整理服务的 API Key。"), page: "api_key", target: `provider-key-${draft.cleanupProvider}`, action: t("管理凭据") }
+                    : draftCleanupEnabled && draft.cleanupProvider === "on_device_llama_cpp" && selectableLocalCleanupModels.length === 0
+                      ? { message: t("请先下载并验证兼容的本机整理模型。"), page: "local_models", target: "local-cleanup-models", action: t("管理模型") }
                     : draftCleanupEnabled && !draft.cleanupModel.trim()
                       ? { message: t("请先选择整理模型。"), page: "service", target: "engine-cleanup-provider", action: t("修改路线") }
                       : draftCleanupEnabled && !cleanupModelRouteReady
-                        ? { message: t("请先安装并验证 VoiceFlow MLX 整理模型。"), page: "local_models", target: "local-cleanup-model", action: t("管理模型") }
+                        ? draft.cleanupProvider === "on_device_llama_cpp"
+                          ? { message: t("请先下载并验证兼容的本机整理模型。"), page: "local_models", target: "local-cleanup-models", action: t("管理模型") }
+                          : { message: t("请先安装并验证 VoiceFlow MLX 整理模型。"), page: "local_models", target: mlxCleanupManageTarget, action: t("管理模型") }
                         : draftCleanupEnabled && draft.cleanupProvider === "custom" && !customParametersParse.ok
                           ? { message: customParametersParse.error, page: "advanced", target: "advanced-custom-cleanup-parameters", action: t("检查参数") }
                           : { message: t("请检查当前服务配置后再保存。"), page: "service", target: "engine-asr-provider", action: t("修改路线") }
@@ -1126,9 +1447,7 @@ export function EngineSettings({
   }, [asrMissing, cleanupMissing, draft.asrProvider, draft.cleanupProvider, draftCleanupEnabled, navigateToPage]);
 
   const currentAsrProvider = providerOf(settings.asr_provider, settings.asr_base_url);
-  const currentCleanupProvider = providerOf(settings.cleanup_provider, settings.cleanup_base_url);
   const savedAsrModel = settings.asr_model || defaultModel(currentAsrProvider, "asr");
-  const savedCleanupModel = settings.cleanup_model || defaultModel(currentCleanupProvider, "llm");
   const legacyModel = onDeviceModels.find((model) => model.id === "sensevoice-small");
   const legacyModelSavedSelected = currentAsrProvider === "on_device" && savedAsrModel === "sensevoice-small";
   const legacyModelDraftSelected = draft.asrProvider === "on_device" && draft.asrModel === "sensevoice-small";
@@ -1173,7 +1492,7 @@ export function EngineSettings({
     if (settings.strict_offline_enabled !== true) return false;
     if (stage === "asr") return provider !== "on_device";
     if (provider === "ollama") return !isLoopbackUrl(draft.ollamaBaseUrl);
-    return provider !== "lmstudio" && provider !== "on_device_mlx";
+    return provider !== "on_device_mlx" && provider !== "on_device_llama_cpp";
   };
 
   const applyDraft = async () => {
@@ -1393,11 +1712,88 @@ export function EngineSettings({
 
   const asrOptions = providersFor("asr", true, true);
   const cleanupOptions = providersFor("llm", true, true);
+  const onDeviceAsrModelDefinitions = providerById("on_device")?.asrModels ?? [];
+  const reportedOnDeviceAsrModelOptions: ModelOption[] = onDeviceModels
+    .filter((model) => model.download_available === true
+      || (currentAsrProvider === "on_device" && model.id === savedAsrModel))
+    .map((model) => {
+      const definition = onDeviceAsrModelDefinitions.find((option) => option.value === model.id);
+      return {
+        value: model.id,
+        label: model.label,
+        note: model.download_available === true ? formatModelBytes(model.bytes) : t("旧配置保留；不提供新下载或选择"),
+        retiredForNewSelection: model.download_available !== true,
+        asrProfile: definition?.asrProfile,
+      };
+    });
+  const onDeviceAsrModelOptions = reportedOnDeviceAsrModelOptions.length > 0
+    ? reportedOnDeviceAsrModelOptions
+    : onDeviceAsrModelDefinitions.filter((option) => (
+      option.value === defaultModel("on_device", "asr")
+      || (currentAsrProvider === "on_device" && option.value === savedAsrModel)
+    ));
   const cloudAsrOptions = asrOptions.filter((provider) => provider.id !== "custom" && provider.id !== "on_device" && provider.id !== "local_whisper");
   const localAsrOptions = asrOptions.filter((provider) => provider.id === "on_device" || provider.id === "local_whisper");
   const customAsrOptions = asrOptions.filter((provider) => provider.id === "custom");
-  const cloudCleanupOptions = cleanupOptions.filter((provider) => !["custom", "ollama", "lmstudio", "on_device_mlx"].includes(provider.id));
-  const localCleanupOptions = cleanupOptions.filter((provider) => ["ollama", "lmstudio", "on_device_mlx"].includes(provider.id));
+  const localCleanupModelOptions: ModelOption[] = selectableLocalCleanupModels.map((model) => ({
+    value: model.id,
+    label: model.label,
+    note: formatModelBytes(model.bytes),
+  }));
+  const selectableMlxCleanupModels = mlxCleanupModels.filter((model) => model.selectable);
+  const visibleLocalCleanupModels = localCleanupModels.filter((model) => (
+    model.download_available === true
+    || model.managed
+    || model.partial_managed
+    || Boolean(model.operation)
+    || ["downloading", "canceling", "deleting"].includes(model.state)
+    || (currentCleanupProvider === "on_device_llama_cpp" && model.id === savedCleanupModel)
+    || (draft.cleanupProvider === "on_device_llama_cpp" && model.id === draft.cleanupModel)
+  ));
+  const localCleanupManagementRequired = visibleLocalCleanupModels.length > 0
+    || localCleanupModelsReadError !== null
+    || currentCleanupProvider === "on_device_llama_cpp"
+    || draft.cleanupProvider === "on_device_llama_cpp";
+  const visibleMlxCleanupModels = mlxCleanupModels.filter((model) => (
+    model.download_available === true
+    || model.managed
+    || model.partial_managed
+    || isMlxCleanupModelOperationActive(model)
+    || (currentCleanupProvider === "on_device_mlx" && model.id === savedCleanupModel)
+  ));
+  const mlxCleanupModelOptions: ModelOption[] = [
+    ...(providerById("on_device_mlx")?.llmModels ?? []),
+    ...selectableMlxCleanupModels.map((model) => ({
+      value: model.id,
+      label: model.label,
+      note: model.bytes > 0 ? formatModelBytes(model.bytes) : t("大小未知"),
+    })),
+  ];
+  if (draft.cleanupProvider === "on_device_mlx" && draft.cleanupModel && !mlxCleanupModelOptions.some((option) => option.value === draft.cleanupModel)) {
+    const unavailableModel = mlxCleanupModels.find((model) => model.id === draft.cleanupModel);
+    mlxCleanupModelOptions.push({
+      value: draft.cleanupModel,
+      label: unavailableModel?.label ?? draft.cleanupModel,
+      note: unavailableModel ? mlxCleanupModelStateCopy(unavailableModel, t) : t("模型状态暂不可用"),
+      retiredForNewSelection: true,
+    });
+  }
+  if (draft.cleanupProvider === "on_device_llama_cpp"
+    && currentCleanupProvider === "on_device_llama_cpp"
+    && draft.cleanupModel === savedCleanupModel
+    && !localCleanupModelOptions.some((option) => option.value === draft.cleanupModel)) {
+    const savedModel = localCleanupModels.find((model) => model.id === draft.cleanupModel);
+    if (savedModel) {
+      localCleanupModelOptions.push({
+        value: savedModel.id,
+        label: savedModel.label,
+        note: localCleanupModelStateCopy(savedModel.state, savedModel.verified, t, savedModel.partial_managed),
+        retiredForNewSelection: true,
+      });
+    }
+  }
+  const cloudCleanupOptions = cleanupOptions.filter((provider) => !["custom", "ollama", "on_device_llama_cpp", "on_device_mlx"].includes(provider.id));
+  const localCleanupOptions = cleanupOptions.filter((provider) => ["ollama", "on_device_llama_cpp", "on_device_mlx"].includes(provider.id));
   const customCleanupOptions = cleanupOptions.filter((provider) => provider.id === "custom");
   const renderAsrOption = (provider: typeof PROVIDERS[number]) => (
     <option
@@ -1407,7 +1803,13 @@ export function EngineSettings({
     >{provider.id === "custom" ? t("自定义语音转写") : provider.id === "on_device" ? t("本机模型") : provider.label}</option>
   );
   const renderCleanupOption = (provider: typeof PROVIDERS[number]) => (
-    <option key={provider.id} value={provider.id}>{provider.id === "custom" ? t("自定义 AI 整理") : provider.label}</option>
+    <option
+      key={provider.id}
+      value={provider.id}
+      disabled={provider.id === "on_device_llama_cpp"
+        && selectableLocalCleanupModels.length === 0
+        && !(currentCleanupProvider === "on_device_llama_cpp" && draft.cleanupModel === savedCleanupModel)}
+    >{provider.id === "custom" ? t("自定义 AI 整理") : provider.label}</option>
   );
   const customRecoveryPurpose: ProviderCredentialPurpose | null = settings.asr_provider === "custom"
     ? "asr"
@@ -1419,14 +1821,14 @@ export function EngineSettings({
   const groqLatestReadStatus = credentialReadTarget === "groq" ? credentialReadStatus : null;
   const customLatestReadStatus = credentialReadTarget === "custom" ? credentialReadStatus : null;
   const asrProfile = asrModelProfile(draft.asrProvider, draft.asrModel);
-  const hasSupportedDeviceModel = onDeviceModels.some((model) => model.id !== "sensevoice-small" && model.platform_supported);
+  const hasSupportedDeviceModel = onDeviceModels.some((model) => model.download_available === true && model.platform_supported);
   const savedOllamaBaseUrl = settings.ollama_base_url || providerById("ollama")?.defaultBaseUrl || "";
   const localCleanupRouteSaved = draft.ollamaBaseUrl.trim() === savedOllamaBaseUrl.trim();
   const savedAsrBlocked = settings.strict_offline_enabled === true && currentAsrProvider !== "on_device";
   const savedCleanupBlocked = settings.strict_offline_enabled === true && settings.cleanup_enabled
     && !(currentCleanupProvider === "ollama" && isLoopbackUrl(savedOllamaBaseUrl))
-    && !(currentCleanupProvider === "lmstudio" && lmStudioCleanupStatus?.available === true && lmStudioCleanupStatus.local_source_confirmed === true)
-    && currentCleanupProvider !== "on_device_mlx";
+    && currentCleanupProvider !== "on_device_mlx"
+    && !(currentCleanupProvider === "on_device_llama_cpp" && savedLocalCleanupModelReady);
   const asrFailLabel = failKind(stageFail.asr);
   const credentialStatus = (provider: ProviderId, tested: boolean) => tested
     ? { label: t("服务检查通过"), tone: "success" as const }
@@ -1460,24 +1862,54 @@ export function EngineSettings({
       ? { label: asrFailLabel, tone: "error" as const }
     : credentialStatus(draft.asrProvider, testedAsrRoute === asrRoute);
   const cleanupFailLabel = failKind(stageFail.cleanup);
+  const mlxCleanupRouteStatus = (() => {
+    if (draft.cleanupModel === LEGACY_MLX_CLEANUP_MODEL_ID) {
+      if (!cleanupMlxPlatformSupported) {
+        return { label: cleanupMlxPlatformUnsupported ? t("VoiceFlow 本机 MLX 整理需要 Apple Silicon 和 macOS 14 或更新版本。") : t("无法确认此 Mac 是否支持 VoiceFlow 本机 MLX 整理；请刷新模型状态后重试。"), tone: "warning" as const };
+      }
+      if (cleanupModelStoreStatus?.operation) {
+        return { label: cleanupModelStoreStatus.operation === "download" ? t("正在下载本机模型") : cleanupModelStoreStatus.operation === "import" ? t("正在导入本机模型") : t("正在删除本机模型"), tone: "warning" as const };
+      }
+      if (cleanupMlxInstalled && cleanupModelStoreStatus?.state === "ready") return { label: t("本机 MLX 模型已验证"), tone: "success" as const };
+      if (cleanupMlxInstalled) return { label: t("已安装；首次使用时会重新校验"), tone: "neutral" as const };
+      return { label: t("先导入或下载本机模型"), tone: "warning" as const };
+    }
+    if (!selectedMlxCleanupModel) {
+      return mlxCleanupModelsReadError
+        ? { label: t("本机整理模型状态读取失败"), tone: "error" as const }
+        : { label: t("先下载并验证兼容的本机整理模型"), tone: "warning" as const };
+    }
+    if (selectedMlxCleanupModel.selectable) return { label: t("本机 MLX 模型文件已校验"), tone: "success" as const };
+    if (isMlxCleanupModelOperationActive(selectedMlxCleanupModel)) {
+      return { label: selectedMlxCleanupModel.operation === "verify"
+        ? t("正在校验模型文件")
+        : selectedMlxCleanupModel.operation === "delete" || selectedMlxCleanupModel.state === "deleting"
+          ? t("正在删除")
+          : t("正在下载 MLX 整理模型"), tone: "warning" as const };
+    }
+    if (!selectedMlxCleanupModel.compatible) {
+      return { label: mlxCleanupCompatibilityCopy(selectedMlxCleanupModel.compatibility_error, t), tone: "warning" as const };
+    }
+    return { label: mlxCleanupModelStateCopy(selectedMlxCleanupModel, t), tone: "warning" as const };
+  })();
   const cleanupStatus = !draftCleanupEnabled
     ? { label: t("关闭 · 只用本地规则"), tone: "unused" as const }
+    : draft.cleanupProvider === "on_device_llama_cpp"
+      ? draftLocalCleanupModelReady
+        ? { label: t("本机整理模型已下载、校验并兼容"), tone: "success" as const }
+        : selectedLocalCleanupModel?.operation === "download" || selectedLocalCleanupModel?.state === "downloading"
+          ? { label: t("正在下载本机整理模型"), tone: "warning" as const }
+          : selectedLocalCleanupModel?.compatible === false
+            ? { label: localCleanupCompatibilityCopy(selectedLocalCleanupModel.compatibility_error, t), tone: "warning" as const }
+            : selectedLocalCleanupModel
+              ? { label: localCleanupModelStateCopy(selectedLocalCleanupModel.state, selectedLocalCleanupModel.verified, t, selectedLocalCleanupModel.partial_managed), tone: "warning" as const }
+              : localCleanupModelsReadError
+                ? { label: t("本机整理模型状态读取失败"), tone: "error" as const }
+                : { label: selectableLocalCleanupModels.length > 0 ? t("请选择已下载并验证的模型") : t("先下载并验证兼容的本机整理模型"), tone: "warning" as const }
     : draft.cleanupProvider === "on_device_mlx"
-      ? !cleanupMlxPlatformSupported
-        ? { label: cleanupMlxPlatformUnsupported ? t("VoiceFlow 本机 MLX 整理需要 Apple Silicon 和 macOS 14 或更新版本。") : t("无法确认此 Mac 是否支持 VoiceFlow 本机 MLX 整理；请刷新模型状态后重试。"), tone: "warning" as const }
-        : cleanupModelStoreStatus?.operation
-          ? { label: cleanupModelStoreStatus.operation === "download" ? t("正在下载本机模型") : cleanupModelStoreStatus.operation === "import" ? t("正在导入本机模型") : t("正在删除本机模型"), tone: "warning" as const }
-          : cleanupMlxInstalled && cleanupModelStoreStatus?.state === "ready"
-            ? { label: t("本机 MLX 模型已验证"), tone: "success" as const }
-            : cleanupMlxInstalled
-              ? { label: t("已安装；首次使用时会重新校验"), tone: "neutral" as const }
-              : { label: t("先导入或下载本机模型"), tone: "warning" as const }
-    : settings.strict_offline_enabled && !["ollama", "lmstudio", "on_device_mlx"].includes(draft.cleanupProvider)
+      ? mlxCleanupRouteStatus
+    : settings.strict_offline_enabled && !["ollama", "on_device_llama_cpp", "on_device_mlx"].includes(draft.cleanupProvider)
       ? { label: t("严格离线模式会阻止此云端整理服务"), tone: "warning" as const }
-      : settings.strict_offline_enabled && draft.cleanupProvider === "lmstudio" && !selectedCleanupIsLocal
-        ? { label: t("先检查 LM Studio 本机实例，确认后才能用于严格离线整理"), tone: "warning" as const }
-      : draft.cleanupProvider === "lmstudio" && lmStudioCleanupStatus && !lmStudioCleanupStatus.available
-        ? { label: t("本机 LM Studio 实例不可用"), tone: "warning" as const }
       : draft.cleanupProvider === "ollama" && localCleanupStatus && !localCleanupStatus.available
         ? { label: t("本机整理服务不可用"), tone: "warning" as const }
         : draft.asrProvider === "assemblyai"
@@ -1791,6 +2223,10 @@ export function EngineSettings({
     const savedSelected = currentAsrProvider === "on_device" && savedAsrModel === model.id;
     const draftSelected = draft.asrProvider === "on_device" && draft.asrModel === model.id && !savedSelected;
     const downloadCancelled = model.error?.trim().toLowerCase() === "download cancelled";
+    const downloadAvailable = model.download_available === true && !isRetiredOnDeviceModel(model.id);
+    const retired = !downloadAvailable || isRetiredOnDeviceModel(model.id);
+    const memoryCompatibilityIssue = onDeviceMemoryCompatibilityCopy(model.memory_compatibility_error, t);
+    const canDownloadOnThisDevice = downloadAvailable && !unsupported && !memoryCompatibilityIssue;
     const runtimeLabel = model.runtime_status === "loading"
       ? t("加载中")
       : model.loaded || model.runtime_status === "loaded"
@@ -1806,7 +2242,6 @@ export function EngineSettings({
             ? t("本机运行时启动失败")
             : null;
     const showRuntimeIssue = legacy || unsupported || Boolean(runtimeIssue && (savedSelected || draftSelected));
-    const licenseReviewRequired = model.id === "qwen3-asr-1.7b" || model.id === "cohere-transcribe-2b";
     const detailId = `local-asr-details-${model.id}`;
     const summary = [
       model.bytes > 0 ? formatModelBytes(model.bytes) : t("大小未知"),
@@ -1827,16 +2262,17 @@ export function EngineSettings({
                 {savedSelected && <SettingsStatus label={t("服务配置已选")} tone="accent" />}
                 {draftSelected && <SettingsStatus label={t("待应用")} tone="warning" />}
                 {model.id === "qwen3-asr-0.6b" && <SettingsStatus label={t("默认选项")} tone="neutral" />}
-                {licenseReviewRequired && <SettingsStatus label={t("许可未审查")} tone="warning" />}
+                {canDownloadOnThisDevice && <SettingsStatus label={t("可下载")} tone="neutral" />}
+                {!downloadAvailable && (savedSelected || draftSelected) && <SettingsStatus label={t("旧配置保留")} tone="warning" />}
                 <details className="inline-block max-w-full text-xs leading-5">
                   <summary aria-controls={detailId} className={`cursor-pointer text-tertiary underline-offset-2 hover:text-primary hover:underline ${focusRingClass}`}>{t("技术信息")}</summary>
                   <div id={detailId} className="mt-1 space-y-1 text-xs leading-5 text-secondary">
                     <p>{t("本机运行时状态")}: {onDeviceRuntimeCopy(model.runtime_status, t)}</p>
                     <p>{t("运行要求")}: {t("Apple Silicon 与 macOS 14 或更新版本")}</p>
+                    {model.language_note && <p>{t("语言能力说明")}: {model.language_note}</p>}
                     {model.revision && <p className="break-all">{t("模型版本")}: {model.revision}</p>}
                     {model.file_count > 0 && <p>{t("模型文件数")}: {model.file_count}</p>}
                     {model.sha256 && <p className="break-all">SHA-256: {model.sha256}</p>}
-                    {licenseReviewRequired && <p role="note" className="text-warning-ink">{t("参考官方模型卡声明 Apache-2.0；此固定 MLX 转换产物许可未审查。")}</p>}
                   </div>
                 </details>
               </div>
@@ -1848,7 +2284,8 @@ export function EngineSettings({
                   value={Math.min(model.bytes, model.downloaded_bytes)}
                 />
               )}
-              {showRuntimeIssue && runtimeIssue && <p role={legacy || unsupported ? "note" : undefined} className="text-warning-ink">{runtimeIssue}</p>}
+              {showRuntimeIssue && runtimeIssue && <p role={legacy || retired || unsupported ? "note" : undefined} className="text-warning-ink">{runtimeIssue}</p>}
+              {memoryCompatibilityIssue && <p role="note" className="text-warning-ink">{memoryCompatibilityIssue}</p>}
               {model.id === "cohere-transcribe-2b" && <p role="note" className="text-warning-ink">{t("需固定选择中文或 English；不支持自动语言识别。")}</p>}
               {model.error_category === "disk_full" && <p className="text-error-ink">{t("检查可用空间后重试下载。")}</p>}
               {model.error && !downloadCancelled && <p role="alert" className="break-words text-error-ink">{model.error}</p>}
@@ -1858,8 +2295,195 @@ export function EngineSettings({
         >
               {downloading ? <button type="button" disabled={actionBusy} onClick={() => void runOnDeviceAction(model.id, "cancel")} className={compactButtonClass}>{t("取消下载")}</button>
             : model.runtime_status === "loading" ? <button type="button" disabled={actionBusy} onClick={() => void runOnDeviceAction(model.id, "cancel_load")} className={compactButtonClass}>{actionBusy ? t("正在取消…") : t("取消模型加载")}</button>
-                : model.state === "ready" ? <button type="button" aria-label={`${t("删除模型")}: ${model.label}`} disabled={actionBusy} onClick={() => setConfirmDeleteModel(model.id)} className={compactDangerButtonClass}>{t("删除模型")}</button>
-                : <button type="button" disabled={actionBusy || unsupported} onClick={() => void runOnDeviceAction(model.id, "download")} className={compactButtonClass}>{unsupported ? t("当前设备不支持") : actionBusy ? t("准备中…") : model.state === "corrupt" ? t("重新下载") : t("下载模型")}</button>}
+                : model.state === "ready" || (retired && model.state !== "missing") ? <button type="button" aria-label={`${t("删除模型")}: ${model.label}`} disabled={actionBusy} onClick={() => setConfirmDeleteModel(model.id)} className={compactDangerButtonClass}>{t("删除模型")}</button>
+                : retired ? null
+                : <button type="button" disabled={actionBusy || unsupported || Boolean(memoryCompatibilityIssue)} onClick={() => void runOnDeviceAction(model.id, "download")} className={compactButtonClass}>{unsupported ? t("当前设备不支持") : actionBusy ? t("准备中…") : model.state === "corrupt" ? t("重新下载") : t("下载模型")}</button>}
+        </SettingsRow>
+      </div>
+    );
+  };
+
+  const renderLocalCleanupModelRow = (model: LocalCleanupModelStatus) => {
+    const savedSelected = settings.cleanup_enabled
+      && currentCleanupProvider === "on_device_llama_cpp"
+      && savedCleanupModel === model.id;
+    const draftSelected = draftCleanupEnabled
+      && draft.cleanupProvider === "on_device_llama_cpp"
+      && draft.cleanupModel === model.id
+      && !savedSelected;
+    const selected = savedSelected || draftSelected;
+    const busy = Boolean(localCleanupModelBusy[model.id]);
+    const downloading = model.operation === "download" || model.state === "downloading";
+    const deleting = model.operation === "delete" || model.state === "deleting";
+    const detailId = `local-cleanup-details-${model.id}`;
+    const transferBytes = model.bytes_total > 0 ? model.bytes_total : model.bytes;
+    const partialOnly = !model.managed && Boolean(model.partial_managed);
+    const statusSummary = [
+      partialOnly && !downloading
+        ? `${formatModelBytes(model.bytes_done)} / ${formatModelBytes(transferBytes)}`
+        : model.bytes > 0 ? formatModelBytes(model.bytes) : t("大小未知"),
+      deleting ? t("正在删除") : localCleanupModelStateCopy(model.state, model.verified, t, model.partial_managed),
+      !model.operation && /cancel/i.test(`${model.error ?? ""} ${model.last_operation_error ?? ""}`) ? t("已取消") : null,
+    ].filter(Boolean).join(" · ");
+    const operationErrors = [...new Set([model.error, model.last_operation_error].filter((error): error is string => Boolean(error?.trim())))];
+    const canOfferDownload = model.download_available === true
+      && (model.state === "missing" || model.state === "corrupt");
+
+    return (
+      <div id={`local-cleanup-model-${model.id}`} key={model.id} tabIndex={-1} data-model-row={model.id} className="outline-none">
+        <SettingsRow
+          className="items-center py-3"
+          title={model.label}
+          description={(
+            <div className="space-y-1">
+              <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs leading-5">
+                <span>{statusSummary}</span>
+                {savedSelected && <SettingsStatus label={t("服务配置已选")} tone="accent" />}
+                {draftSelected && <SettingsStatus label={t("待应用")} tone="warning" />}
+                {isSelectableLocalCleanupModel(model) && <SettingsStatus label={t("可用于服务配置")} tone="success" />}
+                {!model.compatible && <SettingsStatus label={t("当前设备不兼容")} tone="warning" />}
+                <details className="inline-block max-w-full text-xs leading-5">
+                  <summary aria-controls={detailId} className={`cursor-pointer text-tertiary underline-offset-2 hover:text-primary hover:underline ${focusRingClass}`}>{operationErrors.length > 0 || !model.compatible ? t("查看技术信息与错误") : t("技术信息")}</summary>
+                  <div id={detailId} className="mt-1 space-y-1 text-xs leading-5 text-secondary">
+                    <p>{t("用途")}: {t("通用文字整理")}</p>
+                    <p>{t("运行时")}: {t("由 VoiceFlow 随包提供的 llama.cpp")}</p>
+                    <p>{t("最低系统与内存要求")}: {t("该模型最低支持档尚待实机验收；兼容状态按本机检查结果显示。")}</p>
+                    <p>{t("目标验收档")}: {t("Apple M1 · 16 GB；待实机验证")}</p>
+                    <p>{t("文件大小")}: {formatModelBytes(model.bytes)}</p>
+                    <p>{t("文件状态")}: {localCleanupModelStateCopy(model.state, model.verified, t, model.partial_managed)}</p>
+                    <p>{t("文件校验")}: {model.verified ? t("已通过") : t("尚未通过")}</p>
+                    <p>{t("设备兼容性")}: {model.compatible ? t("兼容检查通过") : localCleanupCompatibilityCopy(model.compatibility_error, t)}</p>
+                    <p>{t("来源仓库")}: {model.repository}</p>
+                    <p className="break-all">{t("固定版本")}: {model.revision}</p>
+                    {model.sha256 && <p className="break-all">SHA-256: {model.sha256}</p>}
+                    {model.compatibility_error && <p>{t("兼容性错误代码")}: {model.compatibility_error}</p>}
+                    {operationErrors.map((error) => <p key={error} className="break-words text-error-ink">{error}</p>)}
+                  </div>
+                </details>
+              </div>
+              {downloading && transferBytes > 0 && (
+                <div className="space-y-1">
+                  <p role="status" className="text-xs text-tertiary">{formatModelBytes(model.bytes_done)} / {formatModelBytes(transferBytes)}</p>
+                  <progress
+                    aria-label={`${t("模型下载进度")}: ${model.label}`}
+                    className="h-1.5 w-full accent-accent"
+                    max={transferBytes}
+                    value={Math.min(transferBytes, model.bytes_done)}
+                  />
+                </div>
+              )}
+              {partialOnly && !downloading && <p role="note" className="text-secondary">{t(model.download_available ? "下载已中断；可以重新下载或清理部分文件。" : "此版本不再提供重新下载；可以清理未完成文件。")}</p>}
+              {!model.compatible && <p role="note" className="text-warning-ink">{localCleanupCompatibilityCopy(model.compatibility_error, t)}</p>}
+              {operationErrors.map((error) => <p key={error} role="alert" className="break-words text-error-ink">{error}</p>)}
+              {localCleanupModelActionErrors[model.id] && <p role="alert" className="break-words text-error-ink">{localCleanupModelActionErrors[model.id]}</p>}
+              {selected && <p role="note" className="text-warning-ink">{t("先在服务配置中切换此模型或关闭 AI 整理，再删除模型。")}</p>}
+            </div>
+          )}
+        >
+          {downloading && <button type="button" disabled={busy} onClick={() => void runLocalCleanupModelAction(model.id, "cancel")} className={compactButtonClass}>{busy ? t("处理中…") : t("取消下载")}</button>}
+          {!downloading && !deleting && canOfferDownload && <button type="button" disabled={busy || model.downloadable !== true} onClick={() => void runLocalCleanupModelAction(model.id, "download")} className={compactButtonClass}>{busy ? t("准备中…") : model.state === "corrupt" ? t("重新下载") : t("下载模型")}</button>}
+          {!downloading && !deleting && (model.managed || model.partial_managed) && <button type="button" aria-label={`${t(partialOnly ? "清理未完成文件" : "删除模型")}: ${model.label}`} disabled={busy || selected} onClick={() => setConfirmDeleteLocalCleanupModel(model.id)} className={compactDangerButtonClass}>{t(partialOnly ? "清理未完成文件" : "删除模型")}</button>}
+        </SettingsRow>
+      </div>
+    );
+  };
+
+  const renderMlxCleanupModelRow = (model: MlxCleanupModelStatus) => {
+    const savedSelected = settings.cleanup_enabled
+      && currentCleanupProvider === "on_device_mlx"
+      && savedCleanupModel === model.id;
+    const draftSelected = draftCleanupEnabled
+      && draft.cleanupProvider === "on_device_mlx"
+      && draft.cleanupModel === model.id
+      && !savedSelected;
+    const busy = Boolean(mlxCleanupModelBusy[model.id]);
+    const downloading = model.operation === "download" || ["downloading", "canceling"].includes(model.state);
+    const canceling = model.state === "canceling";
+    const verifying = model.operation === "verify";
+    const operationActive = isMlxCleanupModelOperationActive(model);
+    const partialOnly = !model.managed && model.partial_managed;
+    const transferBytes = model.bytes_total > 0 ? model.bytes_total : model.bytes;
+    const canOfferDownload = model.download_available === true
+      && ["missing", "corrupt", "error"].includes(model.state);
+    const canVerify = model.state === "installed" && model.managed && !model.verified
+      && (!model.operation || model.operation === "verify");
+    const showProgress = downloading || verifying;
+    const operationErrors = [...new Set([model.error, model.last_operation_error]
+      .filter((error): error is string => Boolean(error?.trim()) && !isCancellationError(error)))];
+    const operationWasCancelled = !isMlxCleanupModelOperationActive(model)
+      && isCancellationError(model.error ?? model.last_operation_error);
+    const statusSummary = [
+      model.bytes > 0 ? formatModelBytes(model.bytes) : t("大小未知"),
+      mlxCleanupModelStateCopy(model, t),
+      operationWasCancelled ? t("已取消") : null,
+    ].filter(Boolean).join(" · ");
+    const language = mlxCleanupLanguageCopy(model.language);
+    const detailId = `mlx-cleanup-details-${model.id}`;
+
+    return (
+      <div id={`mlx-cleanup-model-${model.id}`} key={model.id} tabIndex={-1} data-model-row={model.id} className="outline-none">
+        <SettingsRow
+          className="items-center py-3"
+          title={model.label}
+          description={(
+            <div className="space-y-1">
+              <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs leading-5">
+                <span>{statusSummary}</span>
+                {savedSelected && <SettingsStatus label={t("服务配置已选")} tone="accent" />}
+                {draftSelected && <SettingsStatus label={t("待应用")} tone="warning" />}
+                {model.selectable && <SettingsStatus label={t("可用于服务配置")} tone="success" />}
+                {!model.compatible && <SettingsStatus label={t("当前设备不兼容")} tone="warning" />}
+                <details className="inline-block max-w-full text-xs leading-5">
+                  <summary aria-controls={detailId} className={`cursor-pointer text-tertiary underline-offset-2 hover:text-primary hover:underline ${focusRingClass}`}>{operationErrors.length > 0 || !model.compatible ? t("查看技术信息与错误") : t("技术信息")}</summary>
+                  <div id={detailId} className="mt-1 space-y-1 text-xs leading-5 text-secondary">
+                    <p>{t("用途")}: {t("通用文字整理")}</p>
+                    {language && <p>{t("语言与模式")}: {language}</p>}
+                    <p>{t("运行时")}: VoiceFlow MLX</p>
+                    <p>{t("文件大小")}: {model.bytes > 0 ? formatModelBytes(model.bytes) : t("大小未知")}</p>
+                    <p>{t("文件状态")}: {mlxCleanupModelStateCopy(model, t)}</p>
+                    <p>{t("文件校验")}: {model.verified ? t("已通过") : t("尚未通过")}</p>
+                    <p>{t("设备兼容性")}: {model.compatible ? t("兼容检查通过") : mlxCleanupCompatibilityCopy(model.compatibility_error, t)}</p>
+                    <p>{t("来源仓库")}: {model.repository}</p>
+                    <p className="break-all">{t("固定版本")}: {model.revision}</p>
+                    {model.compatibility_error && <p>{t("兼容性错误代码")}: {model.compatibility_error}</p>}
+                    {operationErrors.map((error) => <p key={error} className="break-words text-error-ink">{error}</p>)}
+                  </div>
+                </details>
+              </div>
+              {showProgress && (verifying || transferBytes > 0) && (
+                <div className="space-y-1">
+                  {verifying ? (
+                    <>
+                      <p role="status" className="text-xs text-tertiary">{t("正在校验模型文件")}</p>
+                      <progress aria-label={`${t("模型校验进度")}: ${model.label}`} className="h-1.5 w-full accent-accent" />
+                    </>
+                  ) : (
+                    <>
+                      <p role="status" className="text-xs text-tertiary">{formatModelBytes(model.bytes_done)} / {formatModelBytes(transferBytes)}</p>
+                      <progress
+                        aria-label={`${t("模型下载进度")}: ${model.label}`}
+                        className="h-1.5 w-full accent-accent"
+                        max={transferBytes}
+                        value={Math.min(transferBytes, model.bytes_done)}
+                      />
+                    </>
+                  )}
+                </div>
+              )}
+              {partialOnly && !downloading && <p role="note" className="text-secondary">{t(model.download_available ? "下载已中断；可以重新下载或清理部分文件。" : "此版本不再提供重新下载；可以清理未完成文件。")}</p>}
+              {!model.compatible && <p role="note" className="text-warning-ink">{mlxCleanupCompatibilityCopy(model.compatibility_error, t)}</p>}
+              {model.download_available && !model.downloadable && canOfferDownload && model.compatible && <p role="note" className="text-warning-ink">{t("下载暂不可用")}</p>}
+              {!model.download_available && (model.managed || model.partial_managed || savedSelected) && <p role="note" className="text-tertiary">{t("仅保留已安装文件管理和当前已保存路线；不提供新的下载或选择。")}</p>}
+              {operationErrors.map((error) => <p key={error} role="alert" className="break-words text-error-ink">{error}</p>)}
+              {mlxCleanupModelActionErrors[model.id] && <p role="alert" className="break-words text-error-ink">{mlxCleanupModelActionErrors[model.id]}</p>}
+              {savedSelected && <p role="note" className="text-warning-ink">{t("先在服务配置中切换此模型或关闭 AI 整理，再删除模型。")}</p>}
+            </div>
+          )}
+        >
+          {downloading && <button type="button" disabled={busy || canceling} onClick={() => void runMlxCleanupModelAction(model.id, "cancel")} className={compactButtonClass}>{busy || canceling ? t("正在取消下载") : t("取消下载")}</button>}
+          {canVerify && <button type="button" disabled={busy || verifying} onClick={() => void runMlxCleanupModelAction(model.id, "verify")} className={compactButtonClass}>{busy || verifying ? t("正在校验…") : t("校验模型")}</button>}
+          {!operationActive && canOfferDownload && <button type="button" disabled={busy || !model.downloadable} onClick={() => void runMlxCleanupModelAction(model.id, "download")} className={compactButtonClass}>{busy ? t("准备中…") : model.state === "corrupt" ? t("重新下载") : t("下载模型")}</button>}
+          {!operationActive && (model.managed || model.partial_managed) && <button type="button" aria-label={`${t(partialOnly ? "清理未完成文件" : "删除模型")}: ${model.label}`} disabled={busy || savedSelected} onClick={() => setConfirmDeleteMlxCleanupModel(model.id)} className={compactDangerButtonClass}>{t(partialOnly ? "清理未完成文件" : "删除模型")}</button>}
         </SettingsRow>
       </div>
     );
@@ -1892,7 +2516,7 @@ export function EngineSettings({
         inert={page !== "service"}
         className="vf-engine-page-content"
       >
-        <SettingsGroup variant="surface" title={t("当前路线与草稿")} description={t(pendingChanges ? "有待应用的更改；当前听写仍使用已保存路线。" : "调整服务或模型后，可分别测试，再保存并使用。")}>
+        <SettingsGroup title={t("当前路线与草稿")} description={t(pendingChanges ? "有待应用的更改；当前听写仍使用已保存路线。" : "调整服务或模型后，可分别测试，再保存并使用。")}>
         <fieldset aria-label={t("当前生效路线")} disabled={probing || rowProbing !== null || removing || strictOfflineSaving} className="min-w-0">
         <div className="px-5 py-4">
           <div className="flex flex-wrap items-center gap-2">
@@ -1944,6 +2568,7 @@ export function EngineSettings({
               ariaLabel={t("ASR 模型")}
               onChange={changeAsrModel}
               deviceModels={onDeviceModels}
+              optionsOverride={draft.asrProvider === "on_device" ? onDeviceAsrModelOptions : undefined}
             />
           </div>
           {draft.asrProvider === "local_whisper" && (
@@ -2002,14 +2627,15 @@ export function EngineSettings({
             {draftCleanupEnabled && providerHasCredentialInput(draft.cleanupProvider) && (
               <button type="button" className={compactButtonClass} onClick={() => navigateToPage("api_key", `provider-key-${draft.cleanupProvider}`)}>{t("管理凭据")}</button>
             )}
-            {draft.cleanupProvider === "on_device_mlx" && <button type="button" className={compactButtonClass} onClick={() => navigateToPage("local_models", "local-cleanup-model")}>{t("管理模型")}</button>}
+            {draft.cleanupProvider === "on_device_llama_cpp" && <button type="button" className={compactButtonClass} onClick={() => navigateToPage("local_models", "local-cleanup-models")}>{t("管理模型")}</button>}
+            {draft.cleanupProvider === "on_device_mlx" && <button type="button" className={compactButtonClass} onClick={() => navigateToPage("local_models", mlxCleanupManageTarget)}>{t("管理模型")}</button>}
             {draft.cleanupProvider === "custom" && <button type="button" className={compactButtonClass} onClick={() => navigateToPage("advanced", "advanced-custom-base-url")}>{t("管理连接地址")}</button>}
             {draftCleanupEnabled && (
               <button
                 type="button"
                 onClick={() => void testConnection(draft.cleanupProvider, "cleanup")}
                 aria-busy={rowProbing === draft.cleanupProvider && rowProbingStage === "cleanup"}
-                disabled={rowProbing !== null || probing || removing || strictOfflineSaving || strictOfflineBlocksProbe(draft.cleanupProvider, "cleanup") || (draft.cleanupProvider === "custom" && !customParametersParse.ok)}
+                disabled={rowProbing !== null || probing || removing || strictOfflineSaving || strictOfflineBlocksProbe(draft.cleanupProvider, "cleanup") || (draft.cleanupProvider === "custom" && !customParametersParse.ok) || (draft.cleanupProvider === "on_device_llama_cpp" && !draftLocalCleanupModelReady)}
                 className={compactButtonClass}
               >
                 {rowProbing === draft.cleanupProvider && rowProbingStage === "cleanup" ? t("测试中…") : t("测试整理")}
@@ -2034,7 +2660,17 @@ export function EngineSettings({
                 value={draft.cleanupModel}
                 ariaLabel={t("AI 文字整理模型")}
                 onChange={changeCleanupModel}
+                optionsOverride={draft.cleanupProvider === "on_device_llama_cpp"
+                  ? localCleanupModelOptions
+                  : draft.cleanupProvider === "on_device_mlx" ? mlxCleanupModelOptions : undefined}
               />
+            </div>
+          )}
+          {draftCleanupEnabled && draft.cleanupProvider === "on_device_llama_cpp" && (
+            <div className="mt-2 space-y-1 text-xs leading-5 text-tertiary">
+              <p>{t("只列出已下载、校验且兼容本机的模型；下载不会自动切换当前使用模型。")}</p>
+              {selectedLocalCleanupModel?.compatible === false && <p role="note" className="text-warning-ink">{localCleanupCompatibilityCopy(selectedLocalCleanupModel.compatibility_error, t)}</p>}
+              {localCleanupModelsReadError && <p role="alert" className="text-error-ink">{localCleanupModelsReadError}</p>}
             </div>
           )}
           {draft.asrProvider === "assemblyai" && (
@@ -2052,19 +2688,21 @@ export function EngineSettings({
               <button type="button" className={`${compactButtonClass} mt-2`} onClick={() => navigateToPage("advanced", "advanced-ollama-url")}>{t("管理本机连接")}</button>
             </div>
           )}
-          {draft.cleanupProvider === "lmstudio" && (
-            <div className="mt-3 rounded-lg bg-elevated px-3 py-3 text-xs leading-5 text-tertiary">
-              <p className="font-medium text-primary">{t("本机整理依赖")}: LM Studio · Qwen 3.8 27B · MLX 6-bit</p>
-              {lmStudioCleanupStatus && <p role="status" className={lmStudioCleanupStatus.available && lmStudioCleanupStatus.local_source_confirmed === true ? "text-success-ink" : "text-warning-ink"}>{lmStudioCleanupStatus.available ? t("本机 LM Studio 实例可用") : t("本机 LM Studio 实例未确认可用")} · {lmStudioCleanupStatus.status}</p>}
-              {lmStudioCleanupError && <p role="alert" className="text-error-ink">{lmStudioCleanupError}</p>}
-              <button type="button" className={`${compactButtonClass} mt-2`} onClick={() => navigateToPage("advanced", "advanced-lmstudio-connection")}>{t("管理本机连接")}</button>
-            </div>
-          )}
           {draft.cleanupProvider === "on_device_mlx" && (
-            <div className="mt-3 flex flex-wrap items-center gap-2 text-xs leading-5">
-              <span className="text-secondary">{cleanupModelStoreStatus ? cleanupModelStoreStateCopy(cleanupModelStoreStatus.state, t) : t("本机模型状态尚未读取")}</span>
-              {cleanupModelStoreStatus?.operation && cleanupModelStoreStatus.operation !== "delete" && <span className="text-tertiary">{formatModelBytes(cleanupModelStoreStatus.bytes_done)} / {formatModelBytes(cleanupModelStoreStatus.bytes_total)}</span>}
-              <button type="button" className={compactButtonClass} onClick={() => navigateToPage("local_models", "local-cleanup-model")}>{t("管理模型")}</button>
+            <div className="mt-3 space-y-1 text-xs leading-5 text-tertiary">
+              <p>{t("只列出可用于服务配置的本机 MLX 模型；下载不会自动切换当前模型。")}</p>
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="text-secondary">{draft.cleanupModel === LEGACY_MLX_CLEANUP_MODEL_ID
+                  ? cleanupModelStoreStatus ? cleanupModelStoreStateCopy(cleanupModelStoreStatus.state, t) : t("本机模型状态尚未读取")
+                  : selectedMlxCleanupModel ? mlxCleanupModelStateCopy(selectedMlxCleanupModel, t) : t("本机模型状态尚未读取")}</span>
+                {draft.cleanupModel === LEGACY_MLX_CLEANUP_MODEL_ID && cleanupModelStoreStatus?.operation && cleanupModelStoreStatus.operation !== "delete"
+                  ? <span>{formatModelBytes(cleanupModelStoreStatus.bytes_done)} / {formatModelBytes(cleanupModelStoreStatus.bytes_total)}</span>
+                  : null}
+                {selectedMlxCleanupLanguage && <span>{t("语言与模式")}: {selectedMlxCleanupLanguage}</span>}
+              </div>
+              {selectedMlxCleanupModel?.compatible === false && <p role="note" className="text-warning-ink">{mlxCleanupCompatibilityCopy(selectedMlxCleanupModel.compatibility_error, t)}</p>}
+              {mlxCleanupModelsReadError && <p role="alert" className="text-error-ink">{mlxCleanupModelsReadError}</p>}
+              <button type="button" className={compactButtonClass} onClick={() => navigateToPage("local_models", mlxCleanupManageTarget)}>{t("管理模型")}</button>
             </div>
           )}
         </div>
@@ -2129,11 +2767,14 @@ export function EngineSettings({
                 </div>
               ) : (
                 <>
-                  {onDeviceModels.filter((model) => model.id !== "sensevoice-small").map((model) => renderOnDeviceModelRow(model))}
+                  {onDeviceModels.filter((model) => model.id !== "sensevoice-small" && (model.download_available === true
+                    || model.state !== "missing"
+                    || (currentAsrProvider === "on_device" && savedAsrModel === model.id)
+                    || (draft.asrProvider === "on_device" && draft.asrModel === model.id))).map((model) => renderOnDeviceModelRow(model))}
                   {onDeviceModels.some((model) => model.id !== "sensevoice-small" && !model.platform_supported) && (
                     <p role="note" className="px-5 py-2 text-xs leading-5 text-warning-ink">{t("本机转写模型需要 Apple Silicon 与 macOS 14 或更新版本。")}</p>
                   )}
-                  {legacyModel && (
+                  {legacyModel && (legacyModel.state !== "missing" || legacyModelSavedSelected || legacyModelDraftSelected) && (
                     <>
                       {(legacyModelSavedSelected || legacyModelDraftSelected) && (
                         <p role="note" className="px-5 py-2 text-xs leading-5 text-warning-ink">
@@ -2158,6 +2799,28 @@ export function EngineSettings({
         </SettingsGroup>
         <SettingsGroup title={t("本机文字整理")} description={t("在这台 Mac 上调整转写文字和排版。")}>
           <fieldset disabled={probing || rowProbing !== null || removing || strictOfflineSaving} className="w-full min-w-0 border-0 p-0">
+            <div id="local-mlx-cleanup-models" tabIndex={-1} className="divide-y divide-border outline-none">
+              {mlxCleanupModelsReadError && visibleMlxCleanupModels.length > 0 && (
+                <div className="flex flex-wrap items-center justify-between gap-3 px-5 py-2">
+                  <p role="alert" className="text-xs leading-5 text-error-ink">{mlxCleanupModelsReadError}</p>
+                  <button type="button" disabled={mlxCleanupModelsLoading} onClick={() => void refreshMlxCleanupModels(true)} className={compactButtonClass}>{mlxCleanupModelsLoading ? t("正在读取…") : t("重新读取 MLX 整理模型状态")}</button>
+                </div>
+              )}
+              {mlxCleanupModelsLoading && visibleMlxCleanupModels.length === 0 ? (
+                <p role="status" className="px-5 py-3 text-xs leading-5 text-tertiary">{t("正在读取本机 MLX 整理模型状态…")}</p>
+              ) : mlxCleanupModelsReadError && visibleMlxCleanupModels.length === 0 ? (
+                <div className="flex flex-wrap items-center justify-between gap-3 px-5 py-3">
+                  <p role="alert" className="text-xs leading-5 text-error-ink">{mlxCleanupModelsReadError}</p>
+                  <button type="button" disabled={mlxCleanupModelsLoading} onClick={() => void refreshMlxCleanupModels(true)} className={compactButtonClass}>{mlxCleanupModelsLoading ? t("正在读取…") : t("刷新 MLX 整理模型状态")}</button>
+                </div>
+              ) : visibleMlxCleanupModels.length === 0 ? (
+                <div className="flex flex-wrap items-center justify-between gap-3 px-5 py-3">
+                  <p role="status" className="text-xs leading-5 text-tertiary">{t("没有其他可下载或需要管理的本机 MLX 整理模型。")}</p>
+                  <button type="button" disabled={mlxCleanupModelsLoading} onClick={() => void refreshMlxCleanupModels(true)} className={compactButtonClass}>{mlxCleanupModelsLoading ? t("正在读取…") : t("刷新 MLX 整理模型状态")}</button>
+                </div>
+              ) : (
+                visibleMlxCleanupModels.map(renderMlxCleanupModelRow)
+              )}
             <div id="local-cleanup-model" tabIndex={-1} className="outline-none">
               {cleanupModelStoreStatus ? (() => {
                 const status = cleanupModelStoreStatus;
@@ -2240,6 +2903,41 @@ export function EngineSettings({
                 </div>
               )}
             </div>
+            </div>
+            <div id="local-cleanup-models" tabIndex={-1} className="outline-none">
+              {localCleanupManagementRequired && (
+                <div className="border-t border-border">
+                  <h3 className="px-5 pb-2 pt-4 text-xs font-medium text-tertiary">{t("旧版 GGUF 文件管理")}</h3>
+                  <div className="divide-y divide-border">
+                    {localCleanupModelsLoading && visibleLocalCleanupModels.length === 0 ? (
+                      <p role="status" className="px-5 py-3 text-xs leading-5 text-tertiary">{t("正在读取本机整理模型状态…")}</p>
+                    ) : localCleanupModelsReadError && visibleLocalCleanupModels.length === 0 ? (
+                      <div className="flex flex-wrap items-center justify-between gap-3 px-5 py-3">
+                        <p role="alert" className="text-xs leading-5 text-error-ink">{localCleanupModelsReadError}</p>
+                        <button type="button" disabled={localCleanupModelsLoading} onClick={() => void refreshLocalCleanupModels(true)} className={compactButtonClass}>{localCleanupModelsLoading ? t("正在读取…") : t("重新读取本机整理模型状态")}</button>
+                      </div>
+                    ) : (
+                      <>
+                        {localCleanupModelsReadError && (
+                          <div className="flex flex-wrap items-center justify-between gap-3 px-5 py-2">
+                            <p role="alert" className="text-xs leading-5 text-error-ink">{localCleanupModelsReadError}</p>
+                            <button type="button" disabled={localCleanupModelsLoading} onClick={() => void refreshLocalCleanupModels(true)} className={compactButtonClass}>{localCleanupModelsLoading ? t("正在读取…") : t("重新读取本机整理模型状态")}</button>
+                          </div>
+                        )}
+                        {visibleLocalCleanupModels.length === 0 ? (
+                          <div className="flex flex-wrap items-center justify-between gap-3 px-5 py-3">
+                            <p role="status" className="text-xs leading-5 text-tertiary">{t("没有可管理的 GGUF 模型。")}</p>
+                            <button type="button" disabled={localCleanupModelsLoading} onClick={() => void refreshLocalCleanupModels(true)} className={compactButtonClass}>{localCleanupModelsLoading ? t("正在读取…") : t("刷新本机整理模型状态")}</button>
+                          </div>
+                        ) : (
+                          visibleLocalCleanupModels.map(renderLocalCleanupModelRow)
+                        )}
+                      </>
+                    )}
+                  </div>
+                </div>
+              )}
+            </div>
           </fieldset>
         </SettingsGroup>
       </div>
@@ -2256,7 +2954,7 @@ export function EngineSettings({
           <div id="advanced-strict-offline" className="flex flex-wrap items-center justify-between gap-3 px-5 py-4">
             <div className="min-w-0 flex-1">
               <p className="text-sm font-medium text-primary">{t("严格离线模式")} <span className="ml-1 text-xs font-normal text-tertiary">{t("立即生效")}</span></p>
-              <p id="strict-offline-description" className="mt-1 text-xs leading-5 text-tertiary">{t("开启后会阻止云端回退和视觉请求；可继续使用经检查的本机 Ollama、LM Studio 或 VoiceFlow MLX 整理。本机模型下载仍是单独的联网操作。整理不可用时会回退到本地规则或关闭整理。")}</p>
+              <p id="strict-offline-description" className="mt-1 text-xs leading-5 text-tertiary">{t("开启后会阻止云端回退和视觉请求；可继续使用经检查的本机 Ollama、VoiceFlow llama.cpp 或 VoiceFlow MLX 整理。本机模型下载仍是单独的联网操作。整理不可用时会回退到本地规则或关闭整理。")}</p>
               {strictOfflineSaveError && <p role="alert" className="mt-1 text-xs leading-5 text-error-ink">{strictOfflineSaveError}</p>}
             </div>
             <Toggle
@@ -2416,27 +3114,6 @@ export function EngineSettings({
                 </div>
               </section>
 
-              <section id="advanced-lmstudio-connection" tabIndex={-1} className="space-y-3 rounded-lg bg-elevated p-4">
-                <div>
-                  <h3 className="text-sm font-medium text-primary">LM Studio · Qwen 3.8 27B · MLX 6-bit</h3>
-                  <p className="mt-1 text-xs leading-5 text-tertiary">{t("VoiceFlow 不会安装 LM Studio 或下载模型。检查会核对固定本机服务、已加载实例、模型 variant 和本机来源。")}</p>
-                </div>
-                {lmStudioCleanupStatus && <div role="status" className={`text-xs leading-5 ${lmStudioCleanupStatus.available && lmStudioCleanupStatus.local_source_confirmed === true ? "text-success-ink" : "text-warning-ink"}`}>
-                  <p>{lmStudioCleanupStatus.available ? t("本机 LM Studio 实例可用") : t("本机 LM Studio 实例未确认可用")} · {lmStudioCleanupStatus.status}</p>
-                  <p>{lmStudioCleanupStatus.model} · {lmStudioCleanupStatus.instance_id || "voiceflow-cleanup"}</p>
-                  {lmStudioCleanupStatus.message && <p>{lmStudioCleanupStatus.message}</p>}
-                </div>}
-                {lmStudioCleanupError && <p role="alert" className="text-xs leading-5 text-error-ink">{lmStudioCleanupError}</p>}
-                <div className="flex flex-wrap gap-2">
-                  <button type="button" disabled={lmStudioCleanupChecking} onClick={() => void checkLmStudioCleanupStatus()} className={compactButtonClass}>{lmStudioCleanupChecking ? t("检查中…") : t("检查本机 LM Studio")}</button>
-                  <button type="button" onClick={() => {
-                    setDraft(switchProvider(draft, "cleanup", "lmstudio"));
-                    setDraftCleanupEnabled(true);
-                    setProbeSuccess("");
-                  }} className={compactButtonClass}>{t("使用本机 Qwen 3.8 27B 整理")}</button>
-                </div>
-              </section>
-
               {draftCleanupEnabled && draft.cleanupProvider === "custom" && (
                 <section id="advanced-custom-cleanup-parameters-section" className="rounded-lg bg-elevated p-4">
                   <label className="block text-xs font-medium text-secondary">
@@ -2530,6 +3207,63 @@ export function EngineSettings({
           void runCleanupModelStoreAction("delete");
         }}
       />
+      <ConfirmDialog
+        open={confirmDeleteMlxCleanupModel !== null}
+        title={t(cleaningOnlyPartialMlxCleanupModel ? "清理未完成模型文件" : "删除本机整理模型")}
+        description={t(cleaningOnlyPartialMlxCleanupModel
+          ? "这会从本机删除此模型尚未完成的下载文件；之后可以重新启动下载。确定清理吗？"
+          : "这会从本机删除 VoiceFlow 管理的 MLX 整理模型文件；之后可以重新下载。确定删除吗？")}
+        confirmLabel={t(cleaningOnlyPartialMlxCleanupModel ? "清理文件" : "删除模型")}
+        cancelLabel={t("取消")}
+        onCancel={() => setConfirmDeleteMlxCleanupModel(null)}
+        onConfirm={() => {
+          const id = confirmDeleteMlxCleanupModel;
+          if (!id) return;
+          const savedSelected = settings.cleanup_enabled
+            && currentCleanupProvider === "on_device_mlx"
+            && savedCleanupModel === id;
+          if (savedSelected) {
+            setMlxCleanupModelActionErrors((current) => ({
+              ...current,
+              [id]: t("先在服务配置中切换此模型或关闭 AI 整理，再删除模型。"),
+            }));
+            setConfirmDeleteMlxCleanupModel(null);
+            return;
+          }
+          setConfirmDeleteMlxCleanupModel(null);
+          void runMlxCleanupModelAction(id, "delete");
+        }}
+      />
+      <ConfirmDialog
+        open={confirmDeleteLocalCleanupModel !== null}
+        title={t(cleaningOnlyPartialModel ? "清理未完成模型文件" : "删除本机整理模型")}
+        description={t(cleaningOnlyPartialModel
+          ? "这会从本机删除此模型尚未完成的下载文件；之后可以重新启动下载。确定清理吗？"
+          : "这会从本机删除 VoiceFlow 管理的模型文件；之后需要你再次手动下载。确定删除吗？")}
+        confirmLabel={t(cleaningOnlyPartialModel ? "清理文件" : "删除模型")}
+        cancelLabel={t("取消")}
+        onCancel={() => setConfirmDeleteLocalCleanupModel(null)}
+        onConfirm={() => {
+          const id = confirmDeleteLocalCleanupModel;
+          if (!id) return;
+          const savedSelected = settings.cleanup_enabled
+            && currentCleanupProvider === "on_device_llama_cpp"
+            && savedCleanupModel === id;
+          const draftSelected = draftCleanupEnabled
+            && draft.cleanupProvider === "on_device_llama_cpp"
+            && draft.cleanupModel === id;
+          if (savedSelected || draftSelected) {
+            setLocalCleanupModelActionErrors((current) => ({
+              ...current,
+              [id]: t("先在服务配置中切换此模型或关闭 AI 整理，再删除模型。"),
+            }));
+            setConfirmDeleteLocalCleanupModel(null);
+            return;
+          }
+          setConfirmDeleteLocalCleanupModel(null);
+          void runLocalCleanupModelAction(id, "delete");
+        }}
+      />
     </SettingsShell>
   );
 }
@@ -2541,6 +3275,7 @@ function ModelControl({
   ariaLabel,
   onChange,
   deviceModels = [],
+  optionsOverride,
 }: {
   id: ProviderId;
   side: "asr" | "llm";
@@ -2548,12 +3283,34 @@ function ModelControl({
   ariaLabel: string;
   onChange: (value: string) => void;
   deviceModels?: OnDeviceModelStatus[];
+  optionsOverride?: readonly ModelOption[];
 }) {
   const { t } = useI18n();
   const definition = providerById(id);
   if (!definition) return null;
   const field = side === "asr" ? definition.asrModelField : definition.llmModelField;
-  const options = side === "asr" ? definition.asrModels : definition.llmModels;
+  const options = optionsOverride ?? (side === "asr" ? definition.asrModels : definition.llmModels);
+  if (id === "on_device_llama_cpp") {
+    const selectedValue = options.some((option) => option.value === value) ? value : "";
+    return (
+      <Select
+        aria-label={ariaLabel}
+        value={selectedValue}
+        onValueChange={(next) => onChange(next)}
+        disabled={options.length === 0}
+        className={`${controlClass} w-[220px] max-w-full`}
+      >
+        {selectedValue === "" && <option value="" disabled>{t("请选择已下载并验证的模型")}</option>}
+        {options.map((option) => (
+          <option
+            key={option.value}
+            value={option.value}
+            disabled={Boolean(option.retiredForNewSelection && option.value !== value)}
+          >{option.note ? `${option.label} · ${t(option.note)}` : option.label}</option>
+        ))}
+      </Select>
+    );
+  }
   if (field === "select" && options.length > 0) {
     return (
       <Select aria-label={ariaLabel} value={value} onValueChange={(value) => onChange(value)} className={`${controlClass} w-[220px] max-w-full`}>

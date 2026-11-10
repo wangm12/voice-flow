@@ -37,39 +37,6 @@ export function isFnOnlyHotkey(hotkey: string): boolean {
   return isModifierOnlyHotkey(trimmed) && FN_KEYS.has(trimmed);
 }
 
-export function toTauriHotkey(tanstack: string): string {
-  const parts = tanstack.split("+").map((part) => part.trim()).filter(Boolean);
-  if (parts.length === 0) return tanstack;
-
-  if (parts.length === 1) {
-    const only = parts[0]!;
-    if (only === "Mod" || only === "Meta") return "CmdOrControl";
-    if (only === "Alt" || only === "Option") return "Alt";
-    if (only === "Control" || only === "Ctrl") return "Control";
-    if (only === "Shift") return "Shift";
-    if (only === "Fn" || only === "Function" || only === "Globe") return "Fn";
-  }
-
-  const key = parts[parts.length - 1]!;
-  const tauriKey = key === "/" ? "Slash" : key === "\\" ? "Backslash" : key;
-  const modifiers = new Set<string>();
-
-  for (const part of parts.slice(0, -1)) {
-    if (TAURI_PRIMARY.has(part)) {
-      modifiers.add("CmdOrControl");
-    } else if (part === "Control" || part === "Ctrl") {
-      modifiers.add("Control");
-    } else if (part === "Alt" || part === "Option") {
-      modifiers.add("Alt");
-    } else if (part === "Shift") {
-      modifiers.add("Shift");
-    }
-  }
-
-  const ordered = MODIFIER_ORDER.filter((modifier) => modifiers.has(modifier));
-  return [...ordered, tauriKey].join("+");
-}
-
 export function toTanStackHotkey(tauri: string): string {
   const parts = tauri.split("+").map((part) => part.trim()).filter(Boolean);
   if (parts.length === 0) return tauri;

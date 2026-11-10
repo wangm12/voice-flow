@@ -6,7 +6,7 @@ VoiceFlow 是 macOS 优先的系统听写工具。默认点按 `⌘⌥Space` 开
 
 ## 快速开始
 
-要求 macOS 13+、Node.js 22.13+ 或 24 LTS、Rust 和 Xcode Command Line Tools。Apple Silicon 上构建 MLX sidecar 与 Metal 资源还需要完整 Xcode。默认产品支持 macOS 13；随包 MLX 本机路线要求 Apple Silicon 与 macOS 14+。universal 构建选项不代表 Intel 已通过发布验收。
+开发构建要求 macOS 13+、Node.js 22.13+ 或 24 LTS、Rust 和 Xcode Command Line Tools。Apple Silicon 上构建 MLX sidecar、Metal 资源与随包 llama.cpp runtime 还需要完整 Xcode；从固定源码构建 llama.cpp 另外需要 Git、CMake、Python 3 和首次源码抓取所需的网络。已打包应用的用户不需要这些构建工具。应用基线仍是 macOS 13；MLX 本机路线要求 Apple Silicon 与 macOS 14+，随包 GGUF runtime 要求 Apple Silicon 与 macOS 13.3+。universal 构建选项不代表 Intel 已通过发布验收。
 
 ```bash
 npm ci
@@ -21,7 +21,8 @@ make run
 - 云端 ASR 路线会把录音发送到所选 provider；On Device 路线在本机识别。默认 batch 预取不显示为实时字幕；Soniox 是独立的可选实时路线。
 - 默认听写不会截图或向 LLM 发送窗口图片。「看屏幕」是独立的用户动作，需要视觉模型和 Screen Recording 权限。逐 App 的文字与图像授权默认关闭。
 - 选用 AssemblyAI 时，符合条件的短录音可使用它自己的 Dictation 整理候选；候选不可用时会按当前整理路线回退。长录音走 raw Sync 后最多做一次共同整理。keyless 本机整理路线不需要云端整理 key。
-- Apple Silicon 本机 MLX 模型需要用户主动下载或导入；下载、文件校验、运行时握手、模型加载和识别质量是不同状态。VoiceFlow 不自动下载模型，也不安装 Ollama 或 LM Studio。
+- VoiceFlow MLX 本机文字整理提供五款模型：Qwen3.5 2B / 4B、Gemma 4 E4B IT、Ministral 3 3B Instruct 和原有 Qwen3.8 27B。用户主动下载并通过文件校验后，还要在「服务配置」中选择并保存；下载不会自动切换当前路线。新增模型尚未完成完整整理质量评测；文件校验只确认文件符合固定清单，不代表整理质量已通过评测。已安装的旧版 MLX / GGUF 文件仍可管理，当前已保存的旧路线保留；不提供新的 GGUF 下载或选择。
+- Apple Silicon 本机 MLX 路线按设备和模型预算检查兼容性，但这不代表任何特定机型的整理速度或质量已经通过性能验收。VoiceFlow 不会自动下载模型；听写中的本机整理模型运行失败时按现有本地规则或原稿回退，不会静默改用 Ollama 或云端服务。已保存的 GGUF 路线使用随包 llama.cpp，在本机通过私有 Unix socket 运行，不需要安装或运行 Ollama。
 - 「模型配置」分为服务配置、API Key、本地模型和高级设置四页；六类选中文本操作是精确修改、改写、缩短、翻译、整理和拟答，均先预览再确认。
 - HUD 使用 220 × 48 pt、R24 胶囊；批准方案与关键尺寸演进见 [Beam v10 设计参考](docs/design/voice-hud/README.md)。
 - 自动粘贴依赖 Accessibility；看屏幕依赖 Screen Recording。产品主要支持 macOS，Windows/Linux 尚未作为完整体验验收。质量、最低内存和 RSS 没有未测量的保证。
@@ -61,7 +62,7 @@ npm run preview --prefix website
 make dmg
 ```
 
-默认产物为 `.build/release/VoiceFlow.dmg`，使用可复用的签名身份；本机缺少身份时会尝试创建 `VoiceFlow` 自签证书。把 App 安装到 `/Applications`，首次打开若被 Gatekeeper 拦截，在「系统设置 → 隐私与安全性」选择「仍要打开」。自签不等于公证；授予 Accessibility 时，选择安装后的 `/Applications/VoiceFlow.app`。签名身份、TCC 权限、unsigned 产物与迁移说明见[发布检查表](docs/release-checklist.md)。
+默认产物为 `.build/release/VoiceFlow.dmg`，优先使用钥匙串中的 `VoiceFlow` 自签身份；未设置 `APPLE_SIGNING_IDENTITY` 且钥匙串中没有 `VoiceFlow` 身份时，即使已有 Developer ID 或 Apple Development 证书，也会先尝试创建 `VoiceFlow` 自签证书，使本机 DMG 与 GitHub Release 一致。把 App 安装到 `/Applications`，首次打开若被 Gatekeeper 拦截，在「系统设置 → 隐私与安全性」选择「仍要打开」。自签不等于公证；授予 Accessibility 时，选择安装后的 `/Applications/VoiceFlow.app`。签名身份、TCC 权限、unsigned 产物与迁移说明见[发布检查表](docs/release-checklist.md)。
 
 只有在明确允许未签名构建且没有可用签名身份时，`VOICEFLOW_ALLOW_UNSIGNED=1 make dmg` 才输出 `.build/release/VoiceFlow-unsigned.dmg`。Developer ID 公证是独立流程，需要 Developer ID、匹配的 Team ID 和 Apple 公证凭据：
 

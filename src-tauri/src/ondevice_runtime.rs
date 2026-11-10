@@ -363,15 +363,17 @@ impl AsrOwnerContext {
             .loaded_attestation
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = response.loaded_attestation.clone();
-        if let (Some(model_id), Some(model_version)) = (
-            response.loaded_model_id.as_deref(),
-            response.loaded_model_version.as_deref(),
-        ) {
-            crate::observations::local_attestation(
-                model_id,
-                model_version,
-                response.loaded_attestation.clone(),
-            );
+        if crate::observations::enabled() {
+            if let (Some(model_id), Some(model_version)) = (
+                response.loaded_model_id.as_deref(),
+                response.loaded_model_version.as_deref(),
+            ) {
+                crate::observations::local_attestation(
+                    model_id,
+                    model_version,
+                    response.loaded_attestation.clone(),
+                );
+            }
         }
 
         #[cfg(test)]
@@ -2837,7 +2839,7 @@ async fn successful_transcription_handoff_cannot_overwrite_later_unload_or_model
 
 #[cfg(test)]
 #[tokio::test]
-async fn uncalibrated_asr_cold_load_is_denied_before_load_dispatch() {
+async fn asr_cold_load_is_denied_when_provisional_reserve_exceeds_budget() {
     let fixture = asr_cancellation_fixture("success-immediate", Arc::new(|_| {}));
     let second_model_dir = model_dir(
         &fixture.runtime.models_root,
@@ -2848,17 +2850,31 @@ async fn uncalibrated_asr_cold_load_is_denied_before_load_dispatch() {
         model_dir(&fixture.runtime.models_root, fixture.model_id).join("fixture.bin"),
         second_model_dir.join("fixture.bin"),
     )
-    .expect("prepare the pinned file fixture for the uncalibrated model");
+    .expect("prepare the fixture for the provisional reserve check");
 
+    let status = fixture.runtime.status().await;
+    assert_eq!(status.runtime_status, "runtime_ready");
+    {
+        let session = fixture.runtime.session.lock().await;
+        session
+            .as_ref()
+            .expect("status call starts an owned sidecar")
+            .registration
+            .set_test_sampler(crate::model_resources::FixedMemorySampler {
+                pressure: crate::model_resources::HostMemoryPressure::Normal,
+                physical_memory: Some(4 * 1024 * 1024 * 1024),
+                footprint: crate::model_resources::FootprintSample::Observed(0),
+            });
+    }
     let error = fixture
         .runtime
         .preload(crate::ondevice_models::QWEN_ASR_17_ID)
         .await
-        .expect_err("uncalibrated ASR 1.7B cold loading is paused");
-    assert!(error.contains("内存预算"));
+        .expect_err("the 10 GiB provisional reserve exceeds the 4 GiB budget");
+    assert!(error.contains("本机内存预算暂不可用"), "{error}");
     assert!(
         !fixture.loads.exists(),
-        "admission refusal must happen before any ASR LOAD dispatch"
+        "budget refusal must happen before any ASR LOAD dispatch"
     );
     fixture
         .runtime
@@ -3337,9 +3353,13 @@ impl OnDeviceRuntime {
         }
         let audio_samples = validate_wav(&audio)?;
         match manifest.language_policy {
+            MlxLanguagePolicy::AutoOnly => {}
             MlxLanguagePolicy::AutoOrExplicit => {
                 if language.is_some_and(|value| !matches!(value, "zh" | "en")) {
-                    return Err("Qwen local ASR accepts auto, Chinese, or English.".into());
+                    return Err(format!(
+                        "{} accepts auto, Chinese, or English language settings.",
+                        manifest.label
+                    ));
                 }
             }
             MlxLanguagePolicy::ExplicitChineseOrEnglish => {
@@ -3532,13 +3552,16 @@ impl OnDeviceRuntime {
             model_id: Some(model_id.to_owned()),
             model_directory: None,
             audio_path: Some(audio_file.path.to_string_lossy().into_owned()),
-            language: language.map(str::to_owned),
+            language: (manifest.language_policy != MlxLanguagePolicy::AutoOnly)
+                .then(|| language.map(str::to_owned))
+                .flatten(),
             audio_max_bytes: Some(MAX_AUDIO_BYTES),
             max_tokens_per_chunk: Some(4_096),
             max_tokens_total: Some(total_tokens),
         };
-        let facts = file_request_facts(model_id, language, audio_samples);
-        crate::observations::asr_request(facts);
+        if crate::observations::enabled() {
+            crate::observations::asr_request(file_request_facts(model_id, language, audio_samples));
+        }
         let deadline = Duration::from_secs((audio_secs as u64 * 20).clamp(120, 1_800));
         let mut inference_observation =
             LocalStageGuard::start(model_id, &version, LocalStage::Inference);
@@ -4003,11 +4026,13 @@ impl OnDeviceRuntime {
         revision: &str,
         value: Option<crate::observations::LoadedAttestation>,
     ) {
+        if crate::observations::enabled() {
+            crate::observations::local_attestation(model, revision, value.clone());
+        }
         *self
             .loaded_attestation
             .lock()
-            .unwrap_or_else(|p| p.into_inner()) = value.clone();
-        crate::observations::local_attestation(model, revision, value);
+            .unwrap_or_else(|p| p.into_inner()) = value;
     }
     pub(crate) fn attestation(&self) -> Option<crate::observations::LoadedAttestation> {
         self.loaded_attestation
@@ -4195,6 +4220,12 @@ impl OnDeviceRuntime {
         self.update_status("shutting_down", None, None, None, None);
         let pid = self.active_pid.load(Ordering::Acquire);
         kill_process(pid);
+    }
+
+    /// Re-send the kill for the owned sidecar whose exit shutdown could not
+    /// observe, immediately before the app forces its own exit.
+    pub fn kill_active_child(&self) {
+        kill_process(self.active_pid.load(Ordering::Acquire));
     }
 
     pub fn cancel_model_load(&self, model_id: &str) -> bool {
@@ -4575,7 +4606,9 @@ impl OnDeviceRuntime {
                 actual.id,
                 actual.revision,
             );
-            crate::observations::local_attestation(model_id, model_version, self.attestation());
+            if crate::observations::enabled() {
+                crate::observations::local_attestation(model_id, model_version, self.attestation());
+            }
             load_observation.completed(
                 Some("reused_previously_observed_loaded_identity"),
                 snapshot.runtime_version.as_deref(),
@@ -4632,7 +4665,14 @@ impl OnDeviceRuntime {
                 model_version,
                 crate::model_resources::LoadKind::Asr,
             )
-            .map_err(|_| "本机内存预算暂不可用，无法加载本地语音识别模型。".to_owned())?;
+            .map_err(|reason| {
+                if reason == crate::model_resources::MemoryUnavailableReason::UncalibratedModel {
+                    "此本机语音模型版本没有可用的内存准入预算，无法加载。请重新下载当前版本或联系支持。"
+                        .to_owned()
+                } else {
+                    "本机内存预算暂不可用，无法加载本地语音识别模型。".to_owned()
+                }
+            })?;
         let exchange_result = Self::exchange(child, &request, Duration::from_secs(300)).await;
         let response = match exchange_result {
             Ok(response) => response,
@@ -5269,12 +5309,16 @@ pub(crate) fn file_request_facts(
         model_id,
         model_id,
     );
+    let manifest = mlx_model(model_id);
+    let language = manifest
+        .filter(|model| model.language_policy != MlxLanguagePolicy::AutoOnly)
+        .and(language);
     if let Some(language) = language {
         facts
             .fields_constructed
             .insert("language".into(), serde_json::json!(language));
     }
-    let version = mlx_model(model_id).map(|m| m.revision);
+    let version = manifest.map(|m| m.revision);
     facts
         .fields_constructed
         .extend(std::collections::BTreeMap::from([
@@ -5332,6 +5376,7 @@ fn asr_proof_binding<'a>(
         .map(|file| (file.path, file.bytes, file.sha256))
         .collect::<Vec<_>>();
     let language_policy = match manifest.language_policy {
+        crate::ondevice_models::MlxLanguagePolicy::AutoOnly => "auto_only",
         crate::ondevice_models::MlxLanguagePolicy::AutoOrExplicit => "auto_or_explicit",
         crate::ondevice_models::MlxLanguagePolicy::ExplicitChineseOrEnglish => {
             "explicit_chinese_or_english"
@@ -7081,7 +7126,7 @@ mod sidecar_response_line_bounds_tests {
                 "parameter_layout_sha256": "d".repeat(64),
                 "parameter_count": 1,
                 "parameter_dtypes": {"float32": 1},
-                "decoder_recipe": "voiceflow-mlx-decoder-v1:chunks30s/min1s;temperature0;context-empty;qwen-repetition1.05/window32;inner-chunk1200s;cohere-topP1/topK0/vad-nil;ordered-trim-language-join"
+                "decoder_recipe": "voiceflow-mlx-decoder-v1:chunks30s/min1s;temperature0;context-empty;qwen-repetition1.05/window32;inner-chunk1200s;ordered-trim-language-join"
             }
         }))
         .unwrap()
@@ -7125,7 +7170,7 @@ mod sidecar_response_line_bounds_tests {
         let response = read_from_bytes(line).await.unwrap();
         let attestation = response.loaded_attestation.unwrap();
         assert_eq!(attestation.loaded_images, expected);
-        assert!(attestation.complete());
+        assert!(attestation.complete(crate::ondevice_models::QWEN_ASR_06_ID));
     }
 
     #[tokio::test]

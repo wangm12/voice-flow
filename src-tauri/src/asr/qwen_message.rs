@@ -222,18 +222,20 @@ async fn transcribe_inner(
 
     let session_deadline = TokioInstant::now() + SESSION_TIMEOUT;
     let start_message = run_task_message(&task_id, &vocabulary);
-    let mut facts = crate::observations::ResolvedRequest::new(
-        "qwen_message_websocket",
-        endpoint.as_str(),
-        QWEN_MESSAGE_MODEL,
-        QWEN_MESSAGE_MODEL,
-    );
-    if let Some(parameters) = start_message.pointer("/payload/parameters") {
-        facts
-            .fields_constructed
-            .insert("parameters".into(), parameters.clone());
+    if crate::observations::enabled() {
+        let mut facts = crate::observations::ResolvedRequest::new(
+            "qwen_message_websocket",
+            endpoint.as_str(),
+            QWEN_MESSAGE_MODEL,
+            QWEN_MESSAGE_MODEL,
+        );
+        if let Some(parameters) = start_message.pointer("/payload/parameters") {
+            facts
+                .fields_constructed
+                .insert("parameters".into(), parameters.clone());
+        }
+        crate::observations::asr_request(facts);
     }
-    crate::observations::asr_request(facts);
     send_control_message(
         &mut socket,
         Message::Text(start_message.to_string().into()),

@@ -27,8 +27,6 @@ unexpected_cfgs = { level = "allow", check-cfg = ['cfg(cargo_clippy)'] }
 
 [features]
 default = []
-macos-private-api = ["tauri/macos-private-api"]
-encrypted-spool = []
 evaluation = []
 research-harness = []
 
@@ -60,8 +58,6 @@ rubato = "0.16"
 chacha20poly1305 = { version = "0.10", features = ["getrandom"] }
 pinyin = "0.10"
 image = { version = "0.25", default-features = false, features = ["png"] }
-tar = "0.4"
-bzip2 = "0.5"
 sha2 = "0.10"
 hex = "0.4"
 httpdate = "1"

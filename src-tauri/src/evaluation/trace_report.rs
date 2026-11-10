@@ -161,7 +161,7 @@ fn input_error(
 ) -> validation::InputError {
     validation::error(path, code, detail)
 }
-fn stages() -> [Stage; 13] {
+fn stages() -> [Stage; 12] {
     [
         Stage::AsrInference,
         Stage::FileValidation,
@@ -175,7 +175,6 @@ fn stages() -> [Stage; 13] {
         Stage::FinalGuard,
         Stage::Paste,
         Stage::TargetConfirmation,
-        Stage::LmStudioStatusProbe,
     ]
 }
 fn union_duration(intervals: &[(u64, u64)]) -> u64 {
@@ -628,7 +627,7 @@ mod tests {
         let context_path = directory.0.join("branches.json");
         let output_path = directory.0.join("report.json");
         let traces = [
-            serde_json::json!({"timestamp_ms":1,"session_generation":55,"class":"unclassified","outcome":"failed","total_ms":9000,"stages":[["asr_inference",0,5000],["asr_inference",4000,3000],["decode",6000,1000],["lm_studio_status_probe",0,1000]],"reported_stages":[{"stage":"prefill","duration_ms":90,"scope":"full_prompt"},{"stage":"decode","duration_ms":40,"scope":"generation"}],"cache_status":"unknown"}),
+            serde_json::json!({"timestamp_ms":1,"session_generation":55,"class":"unclassified","outcome":"failed","total_ms":9000,"stages":[["asr_inference",0,5000],["asr_inference",4000,3000],["decode",6000,1000],["final_guard",0,1000]],"reported_stages":[{"stage":"prefill","duration_ms":90,"scope":"full_prompt"},{"stage":"decode","duration_ms":40,"scope":"generation"}],"cache_status":"unknown"}),
             serde_json::json!({"timestamp_ms":2,"session_generation":55,"class":"unclassified","outcome":"paste_unconfirmed","total_ms":8000,"stages":[],"reported_stages":[]}),
             serde_json::json!({"timestamp_ms":3,"session_generation":55,"class":"long","outcome":"paste_confirmed","total_ms":9001,"stages":[["model_load",0,500]],"reported_stages":[]}),
             serde_json::json!({"timestamp_ms":4,"session_generation":56,"class":"unclassified","outcome":"cancelled","total_ms":8001,"stages":[],"reported_stages":[]}),
@@ -683,24 +682,20 @@ mod tests {
         assert_eq!(saved["slow_short_terminals"][1]["source_line"], 5);
         assert_eq!(saved["slow_unknown_membership"][0]["source_line"], 4);
         assert_eq!(saved["host_stage_summaries"][0]["stage"], "asr_inference");
+        assert_eq!(saved["host_stage_summaries"][9]["stage"], "final_guard");
         assert_eq!(
-            saved["host_stage_summaries"][12]["stage"],
-            "lm_studio_status_probe"
-        );
-        assert_eq!(
-            saved["host_stage_summaries"][12]["per_terminal_stage_union_ms"]["sample_count"],
+            saved["host_stage_summaries"][9]["per_terminal_stage_union_ms"]["sample_count"],
             1
         );
         assert_eq!(
-            saved["host_stage_summaries"][12]["per_terminal_stage_union_ms"]["p50_ms"].as_f64(),
+            saved["host_stage_summaries"][9]["per_terminal_stage_union_ms"]["p50_ms"].as_f64(),
             Some(1000.0)
         );
         assert!(saved["terminals"][0]["host_stages"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|stage| stage["stage"] == "lm_studio_status_probe"
-                && stage["union_duration_ms"] == 1000));
+            .any(|stage| stage["stage"] == "final_guard" && stage["union_duration_ms"] == 1000));
         assert_eq!(
             saved["host_stage_summaries"][1]["per_terminal_stage_union_ms"]["sample_count"],
             0

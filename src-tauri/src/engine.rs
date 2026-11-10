@@ -176,8 +176,7 @@ pub fn classify_asr_error(error: &AsrError) -> ProbeErrorKind {
         AsrError::OnDeviceModelMissing(_) => ProbeErrorKind::OnDeviceModelMissing,
         AsrError::OnDeviceInferenceUnavailable(_) => ProbeErrorKind::OnDeviceInferenceUnavailable,
         AsrError::Other(message) => classify_status_body(status_from_message(message), message),
-        AsrError::Server(_)
-        | AsrError::RetryableServer { .. }
+        AsrError::RetryableServer { .. }
         | AsrError::RateLimited(_)
         | AsrError::EmptyResult
         | AsrError::ContextAuthorizationChanged => ProbeErrorKind::Provider,
@@ -191,7 +190,6 @@ pub fn classify_llm_error(error: &LlmError) -> ProbeErrorKind {
         LlmError::Other(message) => classify_status_body(status_from_message(message), message),
         LlmError::NativeLocal(failure) => match failure.category() {
             llm::NativeFailureCategory::Address => ProbeErrorKind::Address,
-            llm::NativeFailureCategory::Path => ProbeErrorKind::Path,
             llm::NativeFailureCategory::Model => ProbeErrorKind::Model,
             llm::NativeFailureCategory::Provider => ProbeErrorKind::Provider,
         },
@@ -283,7 +281,7 @@ fn resolve_side_key(
     }
     if matches!(
         provider,
-        EngineProvider::OnDevice | EngineProvider::OnDeviceMlx
+        EngineProvider::OnDevice | EngineProvider::OnDeviceMlx | EngineProvider::OnDeviceLlamaCpp
     ) {
         return Ok(String::new());
     }
@@ -376,9 +374,6 @@ fn draft_cleanup_url(draft: &EngineDraft) -> String {
             draft.ollama_base_url.trim()
         };
         return crate::ollama_local::chat_endpoint(base);
-    }
-    if draft.cleanup_provider == EngineProvider::LmStudio {
-        return crate::lmstudio_local::chat_endpoint(EngineProvider::LmStudio.default_base_url());
     }
     let base = if draft.cleanup_provider == EngineProvider::Custom {
         draft_custom_cleanup_base_url(draft).to_owned()
@@ -558,10 +553,32 @@ pub async fn probe_engine_draft(
     probe_engine_draft_with_cleanup_demand(draft, stored, models_root, || ()).await
 }
 
+#[cfg(test)]
 pub(crate) async fn probe_engine_draft_with_cleanup_demand<F, G>(
     draft: &EngineDraft,
     stored: &Settings,
     models_root: &Path,
+    begin_cleanup_demand: F,
+) -> ProbeResult
+where
+    F: FnMut() -> G + Send,
+    G: Send,
+{
+    probe_engine_draft_with_cleanup_demand_and_gguf_runtime(
+        draft,
+        stored,
+        models_root,
+        None,
+        begin_cleanup_demand,
+    )
+    .await
+}
+
+pub(crate) async fn probe_engine_draft_with_cleanup_demand_and_gguf_runtime<F, G>(
+    draft: &EngineDraft,
+    stored: &Settings,
+    models_root: &Path,
+    llama_runtime: Option<&crate::llama_cleanup_runtime::Runtime>,
     mut begin_cleanup_demand: F,
 ) -> ProbeResult
 where
@@ -654,7 +671,7 @@ where
     if crate::network_policy::is_strict_offline()
         && !matches!(
             draft.cleanup_provider,
-            EngineProvider::Ollama | EngineProvider::LmStudio | EngineProvider::OnDeviceMlx
+            EngineProvider::Ollama | EngineProvider::OnDeviceMlx | EngineProvider::OnDeviceLlamaCpp
         )
     {
         return ProbeResult {
@@ -696,8 +713,6 @@ where
                         &draft_cleanup_model(draft),
                         "嗯 那个 你好",
                         &key,
-                        &[],
-                        None,
                         None,
                         None,
                         None,
@@ -721,6 +736,12 @@ where
             },
             Err(message) => ProbeStageResult::failure(ProbeErrorKind::Provider, message),
         }
+    } else if draft.cleanup_provider == EngineProvider::OnDeviceLlamaCpp && llama_runtime.is_none()
+    {
+        ProbeStageResult::failure(
+            ProbeErrorKind::Provider,
+            "the bundled local GGUF cleanup runtime is unavailable",
+        )
     } else {
         match resolve_cleanup_key(draft, stored) {
             Ok(key) => {
@@ -729,15 +750,14 @@ where
                     models_root,
                     crate::modelstore::shared_manager(),
                 );
-                match llm::cleanup_with_provider_and_native_runtime_and_intent_and_source(
+                match llm::cleanup_with_provider_and_local_runtimes_and_intent_and_source(
                     draft.cleanup_provider,
                     &runtime,
+                    llama_runtime,
                     &draft_cleanup_url(draft),
                     &draft_cleanup_model(draft),
                     "嗯 那个 你好",
                     &key,
-                    &[],
-                    None,
                     None,
                     None,
                     None,
@@ -827,25 +847,24 @@ mod tests {
 
     #[test]
     fn classify_native_llm_errors_from_owner_categories() {
-        use crate::lmstudio_local::LocalError;
+        use crate::mlx_cleanup_runtime::RuntimeError;
 
         for (error, expected) in [
-            (LocalError::Unreachable, ProbeErrorKind::Address),
-            (LocalError::CliTimeout, ProbeErrorKind::Address),
-            (LocalError::InvalidEndpoint, ProbeErrorKind::Path),
-            (LocalError::ModelMismatch, ProbeErrorKind::Model),
-            (LocalError::InstanceNotReady, ProbeErrorKind::Model),
+            (RuntimeError::Timeout, ProbeErrorKind::Address),
+            (RuntimeError::ModelUnavailable, ProbeErrorKind::Model),
+            (RuntimeError::UnsupportedPlatform, ProbeErrorKind::Model),
             (
-                LocalError::InputTooLarge {
-                    input_bytes: 4097,
-                    max_bytes: 4096,
+                RuntimeError::InputTooLarge {
+                    prompt_tokens: 4097,
+                    requested_output_tokens: 1,
+                    requested_total_tokens: Some(4098),
+                    max_total_tokens: 4096,
                 },
                 ProbeErrorKind::Provider,
             ),
-            (LocalError::InstanceSourceUnknown, ProbeErrorKind::Provider),
-            (LocalError::Http, ProbeErrorKind::Provider),
+            (RuntimeError::InvalidResponse, ProbeErrorKind::Provider),
         ] {
-            let mapped = llm::map_lmstudio_error(error);
+            let mapped = llm::map_on_device_mlx_error(error);
             assert_eq!(classify_llm_error(&mapped), expected);
         }
     }

@@ -302,17 +302,16 @@ async fn run_trial(
                     crate::with_cleanup_warmup_model_demand(
                         state,
                         settings.cleanup_provider,
-                        llm::cleanup_with_provider_and_native_runtime_and_intent_and_source(
+                        llm::cleanup_with_provider_and_local_runtimes_and_intent_and_source(
                             settings.cleanup_provider,
                             &state.mlx_cleanup_runtime,
+                            Some(&state.llama_cleanup_runtime),
                             &settings.cleanup_endpoint(),
                             &settings.cleanup_request_model(),
                             input,
                             settings.cleanup_credential(),
-                            &[],
                             None,
                             Some(&request_snapshot.policy),
-                            Some(&settings.language),
                             Some(&request_snapshot.profile),
                             Some(&request_prepared.intent),
                             request_prepared.pairs_hint.as_deref(),
@@ -541,8 +540,6 @@ mod tests {
                         "fixture",
                         "hello",
                         "fixture-key",
-                        &[],
-                        None,
                         None,
                         None,
                         None,

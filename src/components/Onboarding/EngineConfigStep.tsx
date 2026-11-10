@@ -10,7 +10,7 @@ import { ValidationStatus } from "./ValidationStatus";
 import { iconProps, iconPropsSm } from "../../lib/icons";
 import { useI18n } from "../../lib/i18n";
 import { asrLanguageDescription } from "../../lib/engineWizard";
-import { asrModelProfile, isProviderId, providerById, providersFor, type DashscopeRegion, type ProviderId } from "../../lib/providers";
+import { asrModelProfile, isProviderId, isRetiredOnDeviceModel, onDeviceMemoryCompatibilityCopy, providerById, providersFor, type DashscopeRegion, type ProviderId } from "../../lib/providers";
 import type { OnDeviceModelStatus } from "../../types/settings";
 
 function deviceStateCopy(state: string, t: (key: string) => string): string {
@@ -105,6 +105,7 @@ export function EngineConfigStep({
   const provider = providerById(asrProvider);
   const modelOptions = provider?.asrModels ?? [];
   const selectedOnDeviceModel = onDeviceModels.find((model) => model.id === asrModel);
+  const deviceMemoryIssue = onDeviceMemoryCompatibilityCopy(selectedOnDeviceModel?.memory_compatibility_error, t);
   const modelLoadInProgress = onDeviceModels.some((model) => model.runtime_status === "loading");
   const hasSupportedDeviceModel = onDeviceModels.some((model) => model.id !== "sensevoice-small" && model.platform_supported);
   const providerOptions = Array.from(new Set<ProviderId>([
@@ -309,17 +310,12 @@ export function EngineConfigStep({
         {onDevice ? (
           <div className="border-t border-border py-4">
             <ModelCard model={selectedOnDeviceModel}>
-            {(asrModel === "qwen3-asr-1.7b" || asrModel === "cohere-transcribe-2b") && (
-              <div role="note" className="mt-2 space-y-0.5 text-xs leading-5 text-warning-ink">
-                <p>{t("许可未审查")}</p>
-                <p>{t("参考官方模型卡声明 Apache-2.0；此固定 MLX 转换产物许可未审查。")}</p>
-              </div>
-            )}
             <p className="mt-1 text-xs leading-relaxed text-secondary">
               {selectedOnDeviceModel
                 ? `${deviceStateCopy(selectedOnDeviceModel.state, t)} · ${deviceRuntimeCopy(selectedOnDeviceModel.runtime_status, t)}`
                 : t("正在读取本机模型状态…")}
             </p>
+            {deviceMemoryIssue && <p role="note" className="mt-1 text-xs text-warning-ink">{deviceMemoryIssue}</p>}
             {selectedOnDeviceModel?.state === "downloading" && (
               <p className="mt-1 text-xs text-tertiary">{formatBytes(selectedOnDeviceModel.downloaded_bytes)} / {formatBytes(selectedOnDeviceModel.bytes)}</p>
             )}
@@ -346,10 +342,10 @@ export function EngineConfigStep({
               )}
               {selectedOnDeviceModel?.state === "downloading" ? (
                 <button type="button" aria-busy={onDeviceActionId === asrModel} disabled={onDeviceActionId === asrModel} onClick={() => onDeviceAction(asrModel, "cancel")} className={`${compactButtonClass} w-44 max-w-full`}>{t(onDeviceActionId === asrModel ? "正在取消…" : "取消下载")}</button>
-              ) : selectedOnDeviceModel?.state !== "ready" ? (
+              ) : selectedOnDeviceModel?.state !== "ready" && !isRetiredOnDeviceModel(asrModel) ? (
                 <button
                   type="button"
-                  disabled={onDeviceActionId === asrModel || selectedOnDeviceModel?.platform_supported === false || !selectedOnDeviceModel}
+                  disabled={onDeviceActionId === asrModel || selectedOnDeviceModel?.platform_supported === false || Boolean(deviceMemoryIssue) || !selectedOnDeviceModel}
                   aria-busy={onDeviceActionId === asrModel}
                   onClick={() => onDeviceAction(asrModel, "download")}
                   className={`${compactButtonClass} w-44 max-w-full`}

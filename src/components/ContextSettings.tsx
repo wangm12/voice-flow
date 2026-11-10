@@ -283,7 +283,6 @@ export function ContextSettings({
   onWritingModesChange,
   automationOnly = false,
   saveFailure,
-  combined = false,
   onOpenPermissions,
   onOpenMappings,
   onOpenDictionary,
@@ -310,7 +309,6 @@ export function ContextSettings({
   onWritingModesChange?: (writingModes: WritingMode[]) => void;
   automationOnly?: boolean;
   saveFailure?: SettingsSaveFailure | null;
-  combined?: boolean;
   onOpenPermissions?: () => void;
   onOpenMappings?: () => void;
   onOpenDictionary?: () => void;
@@ -334,7 +332,7 @@ export function ContextSettings({
   onAccurateAsrBaseUrlChange?: (url: string) => void;
 }) {
   const { t } = useI18n();
-  const draftKey = automationOnly && !combined ? "smart" : "writing";
+  const draftKey = automationOnly ? "smart" : "writing";
   const [snapshot, setSnapshot] = useState<ContextSnapshot | null>(null);
   const [mappings, setMappings] = useState<ContextMapping[]>([]);
   const [applications, setApplications] = useState<ApplicationOption[]>([]);
@@ -928,13 +926,13 @@ export function ContextSettings({
   return (
     <SettingsShell>
       <SettingsPageHeader
-        title={t(automationOnly || combined ? "智能整理" : "语气")}
-        description={t(combined ? "根据当前 App、输入框和你说的内容整理文字，也可以编辑 Prompt 和 App / 网站规则。" : automationOnly ? "根据当前 App、输入框和你说的内容，自动选择合适的 Prompt 和输出格式。" : "编辑语气 Prompt，并为 App 或网站指定固定语气。")}
-        saveHint={t(automationOnly && !combined ? "更改自动保存" : "更改需保存；草稿在本窗口切页保留。")}
+        title={t(automationOnly ? "智能整理" : "语气")}
+        description={t(automationOnly ? "根据当前 App、输入框和你说的内容，自动选择合适的 Prompt 和输出格式。" : "编辑语气 Prompt，并为 App 或网站指定固定语气。")}
+        saveHint={t(automationOnly ? "更改自动保存" : "更改需保存；草稿在本窗口切页保留。")}
       />
       {initializationError && <SettingsAlert>{initializationError}</SettingsAlert>}
       {errorScope === null && error && <SettingsAlert>{error}</SettingsAlert>}
-      {(automationOnly || combined) && (
+      {automationOnly && (
         <>
           <SettingsGroup title={t("App 上下文")} description={t("决定 VoiceFlow 是否根据当前 App 和输入框自动适配。")}>
             <SettingsRow title={t("App 上下文适配")} description={<>{t("根据你当前使用的 App 和输入框自动选择合适的 Prompt。")}{inlineError(errorScope === "context" ? error : null)}</>} icon={<ScanSearch size={17} strokeWidth={1.7} aria-hidden="true" />}>
@@ -1001,7 +999,7 @@ export function ContextSettings({
               </Select>
             </SettingsRow>}
           </SettingsGroup>
-      {(automationOnly || combined) && <ContextLesson onOpenPermissions={onOpenPermissions ? () => openGuideDestination("permissions") : undefined} onOpenMappings={onOpenMappings ? () => openGuideDestination("mappings") : undefined} />}
+      {automationOnly && <ContextLesson onOpenPermissions={onOpenPermissions ? () => openGuideDestination("permissions") : undefined} onOpenMappings={onOpenMappings ? () => openGuideDestination("mappings") : undefined} />}
           <SettingsDisclosure title={t("高级整理设置")} description={t("临时场景、精确转写和视觉模型。授权选项保持独立。")} error={advancedError}>
             {inlineError(advancedError)}
             <div className="divide-y divide-border">
@@ -1091,8 +1089,8 @@ export function ContextSettings({
         </>
       )}
 
-      {(!automationOnly || combined) && <>
-      <SettingsGroup variant="surface" title={t("语气与预览")} description={t("编辑与试跑不会切换当前听写语气。更改需保存。")}>
+      {!automationOnly && <>
+      <SettingsGroup title={t("语气与预览")} description={t("编辑与试跑不会切换当前听写语气。更改需保存。")}>
         <div className="px-5 py-4">
           <label className="block text-xs text-secondary">
             {t("编辑哪种语气")}
@@ -1135,7 +1133,7 @@ export function ContextSettings({
       </SettingsDisclosure>
 
       <SceneLesson onOpenDictionary={onOpenDictionary ? () => openGuideDestination("dictionary") : undefined} />
-      <SettingsGroup variant="surface" title={t("App / 网站映射")} description={t("可组合 App、可执行文件、网站、路径和输入框条件；所有已选条件必须同时匹配。")}>
+      <SettingsGroup title={t("App / 网站映射")} description={t("可组合 App、可执行文件、网站、路径和输入框条件；所有已选条件必须同时匹配。")}>
         <div className="vf-mapping-form space-y-4 px-5 py-4">
           <div className="flex flex-wrap items-end gap-2">
             <label className="min-w-0 flex-1 text-xs text-secondary">{t("选择 App（可选）")}
@@ -1262,7 +1260,7 @@ export function ContextSettings({
           {hasStyleExamples && !styleExamplesApproved && (
             <p className="text-xs leading-5 text-warning-ink">{t("风格示例会保留，但在你单独批准前不会进入整理服务请求。")}</p>
           )}
-          {!combined && <ContextLesson onOpenPermissions={onOpenPermissions ? () => openGuideDestination("permissions") : undefined} />}
+          <ContextLesson onOpenPermissions={onOpenPermissions ? () => openGuideDestination("permissions") : undefined} />
           <div className="vf-mapping-permissions">
             <div className="py-3">
               <p className="text-sm font-medium text-primary">{t("自动文字来源权限")}</p>

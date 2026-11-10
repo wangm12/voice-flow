@@ -11,6 +11,9 @@ private enum ModelID: String, Equatable {
     case qwen06 = "qwen3-asr-0.6b"
     case qwen17 = "qwen3-asr-1.7b"
     case cohere2 = "cohere-transcribe-2b"
+    case parakeetV3 = "parakeet-tdt-0.6b-v3-8bit"
+    case fireRedASR2 = "firered-asr2-aed-mlx"
+    case funASRNano = "fun-asr-nano-2512-mlx"
 
     var revision: String {
         switch self {
@@ -20,6 +23,65 @@ private enum ModelID: String, Equatable {
             return "e1f6c266914abc5a46e8756e02580f834a6cf8a7"
         case .cohere2:
             return "06bbe0d853a93cbbf7c1f40cffccd4c5481459ef"
+        case .parakeetV3:
+            return "b56210e2fad422736810524963c24b5e2a1985ab"
+        case .fireRedASR2:
+            return "f3212eacfa49b851130b97c63653c8e06ee09bdb"
+        case .funASRNano:
+            return "a7bc96fceaafce39ed6748e0c0fa9a9508b67f86"
+        }
+    }
+}
+
+enum ChunkBoundaryTextJoiner {
+    static func join(_ parts: [String]) -> String {
+        parts.reduce(into: "") { joined, part in
+            guard let previous = joined.last, let next = part.first else {
+                joined.append(contentsOf: part)
+                return
+            }
+            if shouldInsertSpace(after: previous, before: next) {
+                joined.append(" ")
+            }
+            joined.append(contentsOf: part)
+        }
+    }
+
+    private static func shouldInsertSpace(after previous: Character, before next: Character) -> Bool {
+        guard !previous.isWhitespace, !next.isWhitespace else { return false }
+        if isOpeningPunctuation(previous) || isClosingPunctuation(next) {
+            return false
+        }
+        if isCJK(previous) && isPunctuation(next) {
+            return false
+        }
+        if isCJK(next) && (isCJK(previous) || isPunctuation(previous)) {
+            return false
+        }
+        return true
+    }
+
+    private static func isOpeningPunctuation(_ character: Character) -> Bool {
+        "([{（［｛〈《「『【〔“‘".contains(character)
+    }
+
+    private static func isClosingPunctuation(_ character: Character) -> Bool {
+        ")]}）］｝〉》」』】〕”’.,!?;:%，。！？；：、".contains(character)
+    }
+
+    private static func isPunctuation(_ character: Character) -> Bool {
+        guard let scalar = character.unicodeScalars.first else { return false }
+        return CharacterSet.punctuationCharacters.contains(scalar)
+    }
+
+    private static func isCJK(_ character: Character) -> Bool {
+        character.unicodeScalars.contains { scalar in
+            switch scalar.value {
+            case 0x3400...0x4DBF, 0x4E00...0x9FFF, 0xF900...0xFAFF, 0x20000...0x2FFFF:
+                return true
+            default:
+                return false
+            }
         }
     }
 }
@@ -27,10 +89,15 @@ private enum ModelID: String, Equatable {
 private enum LoadedModel {
     case qwen(ModelID, Qwen3ASRModel)
     case cohere(ModelID, CohereTranscribeModel)
+    case parakeet(ModelID, ParakeetModel)
+    case fireRedASR2(ModelID, FireRedASR2Model)
+    case funASRNano(ModelID, FunASRNanoModel)
 
     var id: ModelID {
         switch self {
-        case .qwen(let id, _), .cohere(let id, _): return id
+        case .qwen(let id, _), .cohere(let id, _), .parakeet(let id, _), .fireRedASR2(let id, _),
+             .funASRNano(let id, _):
+            return id
         }
     }
 }
@@ -300,6 +367,15 @@ actor ASRModelRuntime: ASRRuntimeHandling {
             case .cohere2:
                 let loaded = try CohereTranscribeModel.fromDirectory(modelDirectory)
                 loadedModel = .cohere(model, loaded)
+            case .parakeetV3:
+                let loaded = try ParakeetModel.fromDirectory(modelDirectory)
+                loadedModel = .parakeet(model, loaded)
+            case .fireRedASR2:
+                let loaded = try FireRedASR2Model.fromDirectory(modelDirectory)
+                loadedModel = .fireRedASR2(model, loaded)
+            case .funASRNano:
+                let loaded = try await FunASRNanoModel.fromModelDirectory(modelDirectory)
+                loadedModel = .funASRNano(model, loaded)
             }
             do {
                 loadedAttestation = try attestLoadedModel()
@@ -537,6 +613,75 @@ actor ASRModelRuntime: ASRRuntimeHandling {
                     mayHaveReachedGenerationLimit: effectiveTokenLimit == 0
                         || result.generationTokens >= max(0, effectiveTokenLimit - 1)
                 )
+            case .parakeet(_, let model):
+                let parameters = STTGenerateParameters(
+                    maxTokens: tokenLimit,
+                    temperature: 0,
+                    topP: 1,
+                    topK: 0,
+                    verbose: false,
+                    language: nil,
+                    chunkDuration: 1_200,
+                    minChunkDuration: 1
+                )
+                try cancellation.check()
+                let result = model.generate(audio: chunkAudio, generationParameters: parameters)
+                try cancellation.check()
+                output = GeneratedChunk(
+                    text: result.text,
+                    language: nil,
+                    generationTokens: result.generationTokens,
+                    mayHaveReachedGenerationLimit: false
+                )
+            case .fireRedASR2(_, let model):
+                let parameters = STTGenerateParameters(
+                    maxTokens: tokenLimit,
+                    temperature: 0,
+                    topP: 1,
+                    topK: 0,
+                    verbose: false,
+                    language: nil,
+                    chunkDuration: 1_200,
+                    minChunkDuration: 1
+                )
+                try cancellation.check()
+                let result = model.generate(audio: chunkAudio, generationParameters: parameters)
+                try cancellation.check()
+                output = GeneratedChunk(
+                    text: result.text,
+                    language: nil,
+                    generationTokens: result.generationTokens,
+                    mayHaveReachedGenerationLimit: result.generationTokens >= tokenLimit
+                )
+            case .funASRNano(_, let model):
+                let parameters = STTGenerateParameters(
+                    maxTokens: tokenLimit,
+                    temperature: 0,
+                    topP: 1,
+                    topK: 0,
+                    verbose: false,
+                    language: language,
+                    chunkDuration: 1_200,
+                    minChunkDuration: 1,
+                    repetitionPenalty: 1,
+                    repetitionContextSize: 0
+                )
+                try cancellation.check()
+                let result = model.generate(
+                    audio: chunkAudio,
+                    generationParameters: parameters,
+                    hotwords: [],
+                    context: nil,
+                    itn: true,
+                    prefillStepSize: 2_048
+                )
+                try cancellation.check()
+                output = GeneratedChunk(
+                    text: result.text,
+                    language: nil,
+                    generationTokens: result.generationTokens,
+                    mayHaveReachedGenerationLimit: result.generationTokens >= tokenLimit
+                )
             }
 
             generationTokens += output.generationTokens
@@ -569,14 +714,21 @@ actor ASRModelRuntime: ASRRuntimeHandling {
             budgetExhausted = true
         }
 
-        let separator = joinedTextSeparator(for: loaded.id, language: language, detectedLanguages: detectedLanguages)
         // Do not expose a partial transcript as if it were a complete result.
-        let text = budgetExhausted ? "" : textParts.joined(separator: separator)
+        let text = budgetExhausted
+            ? ""
+            : joinedTextParts(
+                textParts,
+                for: loaded.id,
+                language: language,
+                detectedLanguages: detectedLanguages
+            )
         guard text.utf8.count <= Self.maximumTranscriptionBytes else {
             throw RequestFailure.responseTooLarge
         }
 
-        let detectedLanguage = loaded.id == .cohere2 || language != nil || detectedLanguages.count != 1
+        let canReportDetectedLanguage = loaded.id == .qwen06 || loaded.id == .qwen17
+        let detectedLanguage = !canReportDetectedLanguage || language != nil || detectedLanguages.count != 1
             ? nil
             : detectedLanguages.first
         return TranscriptionResult(
@@ -590,14 +742,25 @@ actor ASRModelRuntime: ASRRuntimeHandling {
         )
     }
 
-    private func joinedTextSeparator(for model: ModelID, language: String?, detectedLanguages: [String]) -> String {
+    private func joinedTextSeparator(language: String?, detectedLanguages: [String]) -> String {
         if language == "zh" || (language == nil && detectedLanguages == ["Chinese"]) {
             return ""
         }
-        if model == .cohere2 && language == "zh" {
-            return ""
-        }
         return " "
+    }
+
+    private func joinedTextParts(
+        _ parts: [String],
+        for model: ModelID,
+        language: String?,
+        detectedLanguages: [String]
+    ) -> String {
+        if model == .fireRedASR2 || (model == .funASRNano && language == nil) {
+            return ChunkBoundaryTextJoiner.join(parts)
+        }
+        return parts.joined(
+            separator: joinedTextSeparator(language: language, detectedLanguages: detectedLanguages)
+        )
     }
 
     private func validatedLanguage(_ raw: String?, for model: ModelID) throws -> String? {
@@ -607,6 +770,18 @@ actor ASRModelRuntime: ASRRuntimeHandling {
                 throw RequestFailure.unsupportedLanguage
             }
             return normalized
+        }
+        if model == .parakeetV3 || model == .fireRedASR2 {
+            guard normalized == nil || normalized == "auto" else {
+                throw RequestFailure.unsupportedLanguage
+            }
+            return nil
+        }
+        if model == .funASRNano {
+            guard normalized == nil || normalized == "auto" || normalized == "zh" || normalized == "en" else {
+                throw RequestFailure.unsupportedLanguage
+            }
+            return normalized == "auto" ? nil : normalized
         }
         guard normalized == nil || normalized == "auto" || normalized == "zh" || normalized == "en" else {
             throw RequestFailure.unsupportedLanguage
@@ -716,6 +891,9 @@ actor ASRModelRuntime: ASRRuntimeHandling {
         switch loadedModel {
         case .qwen(_, let model): parameters = model.parameters().flattened()
         case .cohere(_, let model): parameters = model.parameters().flattened()
+        case .parakeet(_, let model): parameters = model.parameters().flattened()
+        case .fireRedASR2(_, let model): parameters = model.parameters().flattened()
+        case .funASRNano(_, let model): parameters = model.parameters().flattened()
         }
         guard !parameters.isEmpty, parameters.count <= 100_000 else {
             throw AttestationFailure.parameters
@@ -768,8 +946,25 @@ actor ASRModelRuntime: ASRRuntimeHandling {
             loadedImages: images,
             parameterLayoutSHA256: SHA256.hash(data: layoutData).map { String(format: "%02x", $0) }.joined(),
             parameterCount: parameters.count, parameterDtypes: dtypes,
-            decoderRecipe: "voiceflow-mlx-decoder-v1:chunks30s/min1s;temperature0;context-empty;qwen-repetition1.05/window32;inner-chunk1200s;cohere-topP1/topK0/vad-nil;ordered-trim-language-join"
+            decoderRecipe: Self.decoderRecipe(for: loadedModel.id)
         )
+    }
+
+    private static func decoderRecipe(for model: ModelID) -> String {
+        let modelRecipe: String
+        switch model {
+        case .qwen06, .qwen17:
+            modelRecipe = "qwen-repetition1.05/window32"
+        case .cohere2:
+            modelRecipe = "cohere-topP1/topK0/vad-nil"
+        case .parakeetV3:
+            modelRecipe = "parakeet-bfloat16;language-auto-only"
+        case .fireRedASR2:
+            modelRecipe = "firered-beam3/softmax1.25/length0.6/eos1.0;language-auto-only;chunk-boundary-aware-join-v1"
+        case .funASRNano:
+            modelRecipe = "funasr-itn-true/hotwords-empty/context-empty;topP1/topK0/repetition1/window0/prefill2048;auto-chunk-boundary-aware-join-v1"
+        }
+        return "voiceflow-mlx-decoder-v1:chunks30s/min1s;temperature0;context-empty;\(modelRecipe);inner-chunk1200s;ordered-trim-language-join"
     }
 
     private func loadedImageUUIDs() throws -> [String] {

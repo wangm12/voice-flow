@@ -152,7 +152,6 @@ pub(crate) enum ClipboardGuardOperationV1 {
         baseline: RegisteredOwnedPasteBaselineV1,
         final_sample: RegisteredOwnedPasteFinalSampleV1,
         edit_response_received: bool,
-        undo_ticket_released: bool,
         observation_ticket_released: bool,
         owner_joined: bool,
         child_restore: RemoteProbeChildRestoreV1,
@@ -317,7 +316,6 @@ pub(crate) struct RegisteredOwnedPasteBaselineV1 {
     pub(crate) utf16_length: usize,
     pub(crate) selection_start: usize,
     pub(crate) selection_length: usize,
-    pub(crate) undo_ticket_released: bool,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -482,7 +480,6 @@ pub(crate) struct RegisteredOwnedPasteSessionParentReportV1 {
     pub(crate) child_baseline: RegisteredOwnedPasteBaselineV1,
     pub(crate) child_final_sample: RegisteredOwnedPasteFinalSampleV1,
     pub(crate) child_edit_response_received: bool,
-    pub(crate) child_undo_ticket_released: bool,
     pub(crate) child_observation_ticket_released: bool,
     pub(crate) child_owner_joined: bool,
     pub(crate) child_result: RegisteredOwnedPasteChildResultKindV1,
@@ -546,7 +543,6 @@ impl RegisteredOwnedPasteSessionParentReportV1 {
             child_baseline: registered_owned_paste_baseline_unknown(),
             child_final_sample: registered_owned_paste_final_sample_unknown(),
             child_edit_response_received: false,
-            child_undo_ticket_released: false,
             child_observation_ticket_released: false,
             child_owner_joined: false,
             child_result: RegisteredOwnedPasteChildResultKindV1::OwnerUnknown,
@@ -582,7 +578,6 @@ fn registered_owned_paste_baseline_unknown() -> RegisteredOwnedPasteBaselineV1 {
         utf16_length: 0,
         selection_start: 0,
         selection_length: 0,
-        undo_ticket_released: false,
     }
 }
 
@@ -3310,7 +3305,6 @@ fn registered_owned_paste_confirmation_matches(
         && baseline.utf16_length == 14
         && baseline.selection_start == 14
         && baseline.selection_length == 0
-        && baseline.undo_ticket_released
 }
 
 #[cfg(all(target_os = "macos", feature = "research-harness"))]
@@ -3637,7 +3631,6 @@ fn registered_owned_paste_session_protocol(
                 baseline,
                 final_sample,
                 edit_response_received,
-                undo_ticket_released,
                 observation_ticket_released,
                 owner_joined,
                 child_restore,
@@ -3653,7 +3646,6 @@ fn registered_owned_paste_session_protocol(
                 report.child_baseline = baseline;
                 report.child_final_sample = final_sample;
                 report.child_edit_response_received = edit_response_received;
-                report.child_undo_ticket_released = undo_ticket_released;
                 report.child_observation_ticket_released = observation_ticket_released;
                 report.child_owner_joined = owner_joined;
                 report.child_restore = child_restore;
@@ -3661,7 +3653,6 @@ fn registered_owned_paste_session_protocol(
                     && edit_response_received
                     && report.parent_edit_attempt_count == 1
                     && report.parent_edit_result.state == RegisteredOwnedPasteEditStateV1::Observed
-                    && undo_ticket_released
                     && observation_ticket_released
                     && owner_joined
                     && shortcut_sent

@@ -1,0 +1,7 @@
+# S1-mini MLX model notice
+
+The pinned source is [`mlx-community/S1-mini-MLX-4bit`](https://huggingface.co/mlx-community/S1-mini-MLX-4bit/tree/5cbd7aec3401144f88a331d385c40b65fd2548eb), revision `5cbd7aec3401144f88a331d385c40b65fd2548eb`. Its model card identifies `superwhisper/s1-mini` as the base, marks the license as `other` / `s1-mini-license`, and lists English. The README says the MLX affine 4-bit conversion used `mlx-lm` 0.31.3 and preserves the original tokenizer, chat template, generation configuration, documentation, and license; it does not pin the BF16 input revision.
+
+The exact pinned repository [`LICENSE`](LICENSE) identifies S1-mini as a derivative of Qwen3-0.6B, Copyright 2024 Alibaba Cloud, under Apache License 2.0 with an additional naming term. That term requires any use, distribution, or integration, including in a derivative work or product, to retain the original name **“S1-mini” by “Superwhisper”** with that exact capitalization, regardless of another product name. No separate `NOTICE` file exists in the pinned MLX repository.
+
+Use the exact publisher name **S1-mini by Superwhisper** wherever this model is named. The Rust candidate descriptor is reserved for test-only use and remains nonselectable until the constrained prompt, English language and script screening, native control format, and original-text fallback pass end-to-end checks. It is not release-qualified or importable, and this notice does not establish product availability.

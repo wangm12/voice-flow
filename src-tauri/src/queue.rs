@@ -442,42 +442,6 @@ impl<E: std::fmt::Display> std::fmt::Display for ExecuteError<E> {
 
 impl<E: std::error::Error + 'static> std::error::Error for ExecuteError<E> {}
 
-#[cfg(test)]
-pub async fn execute_with_retry<F, Fut, T, E>(
-    gate: &RequestGate,
-    kind: RequestKind,
-    operation: F,
-) -> Result<T, ExecuteError<E>>
-where
-    F: FnMut() -> Fut,
-    Fut: Future<Output = Result<T, E>>,
-    E: RetryError,
-{
-    execute_with_retry_cancelled(gate, kind, operation, CancellationToken::new()).await
-}
-
-#[cfg(test)]
-pub async fn execute_with_retry_cancelled<F, Fut, T, E>(
-    gate: &RequestGate,
-    kind: RequestKind,
-    operation: F,
-    cancellation: CancellationToken,
-) -> Result<T, ExecuteError<E>>
-where
-    F: FnMut() -> Fut,
-    Fut: Future<Output = Result<T, E>>,
-    E: RetryError,
-{
-    execute_with_retry_scoped_cancelled(
-        gate,
-        kind,
-        &RequestScope::default(),
-        operation,
-        cancellation,
-    )
-    .await
-}
-
 pub async fn execute_with_retry_scoped_cancelled<F, Fut, T, E>(
     gate: &RequestGate,
     kind: RequestKind,
@@ -1625,9 +1589,10 @@ mod tests {
         cancellation.cancel();
         let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let called_in_operation = called.clone();
-        let result = execute_with_retry_cancelled(
+        let result = execute_with_retry_scoped_cancelled(
             &gate,
             RequestKind::Asr,
+            &RequestScope::default(),
             move || {
                 let called = called_in_operation.clone();
                 async move {
@@ -1645,9 +1610,13 @@ mod tests {
     #[tokio::test]
     async fn non_cancelled_retry_api_returns_a_typed_operation_error() {
         let gate = RequestGate::new(None);
-        let result = execute_with_retry(&gate, RequestKind::Asr, || async {
-            Err::<(), _>(TestError)
-        })
+        let result = execute_with_retry_scoped_cancelled(
+            &gate,
+            RequestKind::Asr,
+            &RequestScope::default(),
+            || async { Err::<(), _>(TestError) },
+            CancellationToken::new(),
+        )
         .await;
         assert!(matches!(result, Err(ExecuteError::Operation(TestError))));
     }

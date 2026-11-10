@@ -27,14 +27,14 @@ pub enum EngineProvider {
     Anthropic,
     #[serde(rename = "ollama")]
     Ollama,
-    #[serde(rename = "lmstudio")]
-    LmStudio,
     #[serde(rename = "local_whisper")]
     LocalWhisper,
     #[serde(rename = "on_device")]
     OnDevice,
     #[serde(rename = "on_device_mlx")]
     OnDeviceMlx,
+    #[serde(rename = "on_device_llama_cpp")]
+    OnDeviceLlamaCpp,
     #[serde(rename = "custom")]
     Custom,
 }
@@ -47,9 +47,9 @@ pub enum ProviderProtocol {
     AssemblyAi,
     QwenMessageWebSocket,
     Anthropic,
-    LmStudioNative,
     OnDeviceLocal,
     OnDeviceMlxCleanup,
+    OnDeviceLlamaCppCleanup,
 }
 
 impl EngineProvider {
@@ -66,10 +66,10 @@ impl EngineProvider {
         Self::DeepSeek,
         Self::Anthropic,
         Self::Ollama,
-        Self::LmStudio,
         Self::LocalWhisper,
         Self::OnDevice,
         Self::OnDeviceMlx,
+        Self::OnDeviceLlamaCpp,
         Self::Custom,
     ];
 
@@ -87,10 +87,10 @@ impl EngineProvider {
             Self::DeepSeek => "deepseek",
             Self::Anthropic => "anthropic",
             Self::Ollama => "ollama",
-            Self::LmStudio => "lmstudio",
             Self::LocalWhisper => "local_whisper",
             Self::OnDevice => "on_device",
             Self::OnDeviceMlx => "on_device_mlx",
+            Self::OnDeviceLlamaCpp => "on_device_llama_cpp",
             Self::Custom => "custom",
         }
     }
@@ -136,15 +136,15 @@ impl EngineProvider {
                 | Self::DeepSeek
                 | Self::Anthropic
                 | Self::Ollama
-                | Self::LmStudio
                 | Self::OnDeviceMlx
+                | Self::OnDeviceLlamaCpp
                 | Self::Custom
         )
     }
 
     /// Native local cleanup providers expose text generation only.
     pub fn has_vision(self) -> bool {
-        self.has_llm() && !matches!(self, Self::LmStudio | Self::OnDeviceMlx)
+        self.has_llm() && !matches!(self, Self::OnDeviceMlx | Self::OnDeviceLlamaCpp)
     }
 
     pub fn has_http_asr(self) -> bool {
@@ -155,10 +155,10 @@ impl EngineProvider {
         matches!(
             self,
             Self::Ollama
-                | Self::LmStudio
                 | Self::LocalWhisper
                 | Self::OnDevice
                 | Self::OnDeviceMlx
+                | Self::OnDeviceLlamaCpp
                 | Self::Custom
         )
     }
@@ -170,9 +170,9 @@ impl EngineProvider {
             Self::AssemblyAi => ProviderProtocol::AssemblyAi,
             Self::DashScope => ProviderProtocol::QwenMessageWebSocket,
             Self::Anthropic => ProviderProtocol::Anthropic,
-            Self::LmStudio => ProviderProtocol::LmStudioNative,
             Self::OnDevice => ProviderProtocol::OnDeviceLocal,
             Self::OnDeviceMlx => ProviderProtocol::OnDeviceMlxCleanup,
+            Self::OnDeviceLlamaCpp => ProviderProtocol::OnDeviceLlamaCppCleanup,
             _ => ProviderProtocol::OpenAiCompat,
         }
     }
@@ -191,10 +191,10 @@ impl EngineProvider {
             Self::DeepSeek => "https://api.deepseek.com",
             Self::Anthropic => "https://api.anthropic.com",
             Self::Ollama => "http://127.0.0.1:11434/v1",
-            Self::LmStudio => crate::lmstudio_local::DEFAULT_BASE_URL,
             Self::LocalWhisper => "http://127.0.0.1:9000/v1",
             Self::OnDevice => "",
             Self::OnDeviceMlx => "",
+            Self::OnDeviceLlamaCpp => "",
             Self::Custom => "",
         }
     }
@@ -225,8 +225,8 @@ impl EngineProvider {
             Self::DeepSeek => "deepseek-chat",
             Self::Anthropic => "claude-sonnet-4-5",
             Self::Ollama => "qwen3.5:4b",
-            Self::LmStudio => crate::lmstudio_local::MODEL_VARIANT,
             Self::OnDeviceMlx => crate::modelstore::MODEL_ID,
+            Self::OnDeviceLlamaCpp => crate::gguf_cleanup_store::QWEN_35_2B_ID,
             Self::Custom => "",
             _ => "",
         }
@@ -246,10 +246,10 @@ impl EngineProvider {
             Self::DeepSeek => "provider_deepseek",
             Self::Anthropic => "provider_anthropic",
             Self::Ollama => "provider_ollama",
-            Self::LmStudio => "provider_lmstudio",
             Self::LocalWhisper => "provider_local_whisper",
             Self::OnDevice => "provider_on_device",
             Self::OnDeviceMlx => "provider_on_device_mlx",
+            Self::OnDeviceLlamaCpp => "provider_on_device_llama_cpp",
             Self::Custom => "provider_custom",
         }
     }
@@ -340,7 +340,12 @@ pub fn resolve_asr_endpoint(provider: EngineProvider, base: &str) -> Option<Stri
 }
 
 pub fn resolve_llm_endpoint(provider: EngineProvider, base: &str) -> String {
-    if !provider.has_llm() || provider.protocol() == ProviderProtocol::OnDeviceMlxCleanup {
+    if !provider.has_llm()
+        || matches!(
+            provider.protocol(),
+            ProviderProtocol::OnDeviceMlxCleanup | ProviderProtocol::OnDeviceLlamaCppCleanup
+        )
+    {
         return String::new();
     }
     let fallback = provider.default_base_url();
@@ -349,9 +354,6 @@ pub fn resolve_llm_endpoint(provider: EngineProvider, base: &str) -> String {
     } else {
         base.trim()
     };
-    if provider == EngineProvider::LmStudio {
-        return crate::lmstudio_local::chat_endpoint(base);
-    }
     match provider.protocol() {
         ProviderProtocol::Anthropic => {
             if base.contains("/messages") {
@@ -483,12 +485,7 @@ mod tests {
         assert_eq!(provider.as_str(), "on_device");
         assert_eq!(EngineProvider::parse("on_device"), Some(provider));
         assert_eq!(EngineProvider::ALL.len(), 17);
-        assert!(EngineProvider::LmStudio.has_llm());
-        assert!(!EngineProvider::LmStudio.has_vision());
-        assert_eq!(
-            EngineProvider::LmStudio.default_llm_model(),
-            crate::lmstudio_local::MODEL_VARIANT
-        );
+        assert_eq!(EngineProvider::parse("lmstudio"), None);
         assert!(EngineProvider::Groq.has_http_asr());
         assert!(EngineProvider::LocalWhisper.has_http_asr());
         assert!(EngineProvider::Custom.has_http_asr());
@@ -506,6 +503,28 @@ mod tests {
         assert_eq!(provider.default_llm_model(), crate::modelstore::MODEL_ID);
         assert_eq!(provider.as_str(), "on_device_mlx");
         assert_eq!(EngineProvider::parse("on_device_mlx"), Some(provider));
+        assert_eq!(resolve_llm_endpoint(provider, ""), "");
+    }
+
+    #[test]
+    fn on_device_llama_cpp_is_keyless_local_text_cleanup_only() {
+        let provider = EngineProvider::OnDeviceLlamaCpp;
+        assert!(!provider.has_asr());
+        assert!(provider.has_llm());
+        assert!(!provider.has_vision());
+        assert!(provider.allows_empty_key());
+        assert_eq!(
+            provider.protocol(),
+            ProviderProtocol::OnDeviceLlamaCppCleanup
+        );
+        assert_eq!(provider.default_base_url(), "");
+        assert_eq!(
+            provider.default_llm_model(),
+            crate::gguf_cleanup_store::QWEN_35_2B_ID
+        );
+        assert_eq!(provider.as_str(), "on_device_llama_cpp");
+        assert_eq!(EngineProvider::parse("on_device_llama_cpp"), Some(provider));
+        assert_eq!(EngineProvider::ALL.len(), 17);
         assert_eq!(resolve_llm_endpoint(provider, ""), "");
     }
 

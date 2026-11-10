@@ -158,7 +158,7 @@ impl LocalReplayIdentity {
             .loaded_attestation
             .as_ref()
             .ok_or("local_loaded_attestation_missing")?;
-        if !loaded.complete() {
+        if !loaded.complete(&model.model_id) {
             return Err("local_loaded_attestation_incomplete");
         }
         if runtime.events_truncated {
@@ -191,7 +191,7 @@ impl LocalReplayIdentity {
         }
     }
     fn complete(&self) -> bool {
-        self.loaded.complete()
+        self.loaded.complete(&self.model_id)
             && !self.files.is_empty()
             && self.files.len() <= 64
             && validation::digest(&self.production_marker_sha256)
@@ -1767,7 +1767,7 @@ mod tests {
             metal_sha256:BTreeMap::from([("mlx.metallib".into(),"2".repeat(64)),("mlx-swift_Cmlx.bundle/Contents/Resources/default.metallib".into(),"2".repeat(64))]),
             loaded_images:vec!["/declared/runtime|00000000-0000-0000-0000-000000000001".into()],
             parameter_layout_sha256:"3".repeat(64), parameter_count:2, parameter_dtypes:BTreeMap::from([("bfloat16".into(),2)]),
-            decoder_recipe:"voiceflow-mlx-decoder-v1:chunks30s/min1s;temperature0;context-empty;qwen-repetition1.05/window32;inner-chunk1200s;cohere-topP1/topK0/vad-nil;ordered-trim-language-join".into(),
+            decoder_recipe:"voiceflow-mlx-decoder-v1:chunks30s/min1s;temperature0;context-empty;qwen-repetition1.05/window32;inner-chunk1200s;ordered-trim-language-join".into(),
         };
         row.local_model = Some(serde_json::from_value(serde_json::json!({
             "model_id":model,"repository":"fixture","revision":revision,"precision_label":"declared label is not loaded evidence","loaded_precision":null,
@@ -2101,6 +2101,26 @@ mod tests {
             .as_mut()
             .unwrap()
             .parameter_layout_sha256 = "a".repeat(64);
+        assert_eq!(
+            plan.decide(&inputs, &row, CacheStage::Asr, None)
+                .err()
+                .unwrap()
+                .code,
+            "local_resume_identity_mismatch"
+        );
+        row = report.cases[0].clone();
+        row.local_runtime
+            .as_mut()
+            .unwrap()
+            .loaded_attestation
+            .as_mut()
+            .unwrap()
+            .decoder_recipe = concat!(
+            "voiceflow-mlx-decoder-v1:chunks30s/min1s;temperature0;context-empty;",
+            "qwen-repetition1.05/window32;inner-chunk1200s;cohere-topP1/topK0/vad-nil;",
+            "ordered-trim-language-join",
+        )
+        .into();
         assert_eq!(
             plan.decide(&inputs, &row, CacheStage::Asr, None)
                 .err()

@@ -5,7 +5,6 @@ import {
   dashscopeEndpointForRegion,
   dashscopeRegionFromEndpoint,
   inferProviderFromHost,
-  isKnownModel,
   isLoopbackUrl,
   isProviderId,
   providerById,
@@ -13,8 +12,6 @@ import {
   type DashscopeRegion,
   type ProviderId,
 } from "./providers";
-
-export type EngineProvider = ProviderId;
 
 export type EngineDraft = {
   asrProvider: ProviderId;
@@ -35,24 +32,9 @@ export type EngineDraft = {
 export const DEFAULT_ASR_MODEL = defaultModel("groq", "asr");
 export const DEFAULT_CLEANUP_MODEL = defaultModel("groq", "llm");
 
-export const GROQ_ASR_MODELS = providerById("groq")?.asrModels ?? [];
-export const GROQ_CLEANUP_MODELS = providerById("groq")?.llmModels ?? [];
-
 export function providerOf(value?: string | null, url?: string): ProviderId {
   if (isProviderId(value)) return value;
   return inferProviderFromHost(url ?? "") ?? "groq";
-}
-
-export function inferProvider(value: string | undefined, url: string | undefined): ProviderId {
-  return providerOf(value, url);
-}
-
-export function isGroqAsrModel(model: string): boolean {
-  return isKnownModel("groq", "asr", model);
-}
-
-export function isGroqCleanupModel(model: string): boolean {
-  return isKnownModel("groq", "llm", model);
 }
 
 export function hostnameOf(url: string, provider: ProviderId): string {
@@ -129,9 +111,9 @@ export function hasProviderSecret(
   onDeviceReady = false,
 ): boolean {
   if (id === "on_device") return onDeviceReady;
-  // Native MLX cleanup has no server URL or API key. Model readiness is
-  // checked independently by the model-store/runtime boundary.
-  if (id === "on_device_mlx") return true;
+  // Native local cleanup routes have no server URL or API key. Model readiness
+  // is checked independently by their model-store/runtime boundaries.
+  if (id === "on_device_mlx" || id === "on_device_llama_cpp") return true;
   if (draft.providerKeys[id]?.trim()) return true;
   if (id === "custom") {
     const nextUrl = draft.customBaseUrl.trim();
@@ -283,16 +265,6 @@ export function maskSecret(value: string): string {
   if (!key) return "";
   const tail = Array.from(key).slice(-5).join("");
   return `••••${tail}`;
-}
-
-export function modelLabel(model: string): string {
-  for (const provider of ["groq", "openai", "deepgram", "siliconflow", "fireworks", "mistral", "soniox", "assemblyai", "dashscope", "deepseek", "anthropic", "lmstudio"] as const) {
-    const definition = providerById(provider);
-    const match = [...(definition?.asrModels ?? []), ...(definition?.llmModels ?? [])]
-      .find((option) => option.value === model);
-    if (match) return match.label;
-  }
-  return model;
 }
 
 export function asrLanguageDescription(

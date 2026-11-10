@@ -395,7 +395,7 @@ describe("ContextSettings", () => {
   });
 
   it("shows the current app and family from the live snapshot", async () => {
-    render(<ContextSettings combined />);
+    render(<ContextSettings automationOnly />);
 
     expect(await screen.findByText("Cursor · 通用")).toBeInTheDocument();
     expect(screen.getByText("来源: 自动回退")).toBeInTheDocument();
@@ -418,7 +418,7 @@ describe("ContextSettings", () => {
       source_permissions: {},
       enabled: true,
     }];
-    render(<ContextSettings combined />);
+    render(<ContextSettings automationOnly />);
 
     expect(await screen.findByText("Chrome · Gmail work mail · 邮件")).toBeInTheDocument();
     expect(screen.getByText("来源: 用户映射")).toBeInTheDocument();

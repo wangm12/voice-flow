@@ -157,8 +157,6 @@ export const dictionaryLearningAuditTranslations: Record<string, string> = {
   "该调用失败": "This call failed",
   "该调用已完成": "This call completed",
   "读取一致性": "Read consistency",
-  "读取的值不符合筛选": "Read values did not pass the filter",
-  "读取的值符合筛选": "Read values passed the filter",
   "较旧的审查回执已忽略，请手动刷新。": "An older audit receipt was ignored. Refresh manually.",
   "输出词形匹配标记（不是替换凭据）": "Output surface match (not replacement evidence)",
   "达到候选容量": "Candidate capacity reached",

@@ -1159,8 +1159,6 @@ async fn observed_cleanup(
                 "fixture-model",
                 "Keep API v1.",
                 "synthetic-fixture-key",
-                &[],
-                None,
                 None,
                 None,
                 None,
@@ -1687,7 +1685,7 @@ async fn cancelled_response_owner_and_missing_old_completion_fact_remain_unconfi
     let capture = crate::observations::FixtureCapture::new(true);
     let endpoint = server.url.clone();
     capture.scope(async {
-        let pending=crate::llm::cleanup_with_model_and_limits_and_language_and_profile_and_intent(&endpoint,"fixture-model","Keep API v1.","synthetic-fixture-key",&[],None,None,None,None,None,None,crate::llm::CleanupEffort::Standard,None);
+        let pending=crate::llm::cleanup_with_model_and_limits_and_language_and_profile_and_intent(&endpoint,"fixture-model","Keep API v1.","synthetic-fixture-key",None,None,None,None,None,crate::llm::CleanupEffort::Standard,None);
         tokio::pin!(pending);
         tokio::select! {
             response=&mut pending => panic!("fixture responded before controlled cancellation: {response:?}"),
@@ -1837,8 +1835,6 @@ async fn vf14_anthropic_content_shape_reaches_raw_quality_without_partial_accept
                         "fixture-model",
                         "hello",
                         "synthetic-fixture-key",
-                        &[],
-                        None,
                         None,
                         None,
                         None,
@@ -1959,8 +1955,6 @@ async fn vf14_anthropic_capacity_and_dropped_response_do_not_confirm_protocol() 
                 "fixture-model",
                 "hello",
                 "synthetic-fixture-key",
-                &[],
-                None,
                 None,
                 None,
                 None,
@@ -1995,8 +1989,6 @@ async fn vf14_anthropic_capacity_and_dropped_response_do_not_confirm_protocol() 
                 "fixture-model",
                 "hello",
                 "synthetic-fixture-key",
-                &[],
-                None,
                 None,
                 None,
                 None,

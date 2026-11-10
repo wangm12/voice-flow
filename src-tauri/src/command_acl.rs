@@ -51,12 +51,20 @@ pub(crate) const COMMANDS: &[&str] = &[
     "retry_dictation",
     "probe_engine_draft",
     "get_local_cleanup_status",
-    "get_lmstudio_cleanup_status",
     "get_cleanup_model_store_status",
     "import_cleanup_model",
     "download_cleanup_model",
     "cancel_cleanup_model_store_operation",
     "delete_cleanup_model_store",
+    "list_mlx_cleanup_models",
+    "download_mlx_cleanup_model",
+    "verify_mlx_cleanup_model",
+    "cancel_mlx_cleanup_model_download",
+    "delete_mlx_cleanup_model",
+    "list_local_cleanup_models",
+    "download_local_cleanup_model",
+    "cancel_local_cleanup_model_download",
+    "delete_local_cleanup_model",
     "list_on_device_models",
     "download_on_device_model",
     "cancel_on_device_download",
@@ -68,7 +76,6 @@ pub(crate) const COMMANDS: &[&str] = &[
     "save_history_revision",
     "get_history_revisions",
     "reclean_history",
-    "undo_last_delivery",
     "confirm_selected_action_preview",
     "copy_selected_action_preview",
     "cancel_selected_action_preview",
@@ -157,12 +164,20 @@ mod tests {
         "retry_dictation",
         "probe_engine_draft",
         "get_local_cleanup_status",
-        "get_lmstudio_cleanup_status",
         "get_cleanup_model_store_status",
         "import_cleanup_model",
         "download_cleanup_model",
         "cancel_cleanup_model_store_operation",
         "delete_cleanup_model_store",
+        "list_mlx_cleanup_models",
+        "download_mlx_cleanup_model",
+        "verify_mlx_cleanup_model",
+        "cancel_mlx_cleanup_model_download",
+        "delete_mlx_cleanup_model",
+        "list_local_cleanup_models",
+        "download_local_cleanup_model",
+        "cancel_local_cleanup_model_download",
+        "delete_local_cleanup_model",
         "list_on_device_models",
         "download_on_device_model",
         "cancel_on_device_download",
@@ -174,7 +189,6 @@ mod tests {
         "save_history_revision",
         "get_history_revisions",
         "reclean_history",
-        "undo_last_delivery",
         "confirm_selected_action_preview",
         "copy_selected_action_preview",
         "cancel_selected_action_preview",
@@ -335,7 +349,7 @@ mod tests {
         assert_eq!(ip, expected_i);
         let ms: BTreeSet<_> = MAIN.iter().copied().collect();
         let is: BTreeSet<_> = ISLAND.iter().copied().collect();
-        assert_eq!(ms.len(), 90);
+        assert_eq!(ms.len(), 97);
         assert_eq!(is.len(), 14);
         assert_eq!(
             ms.intersection(&is).copied().collect::<BTreeSet<_>>(),
@@ -345,12 +359,21 @@ mod tests {
             ms.union(&is).copied().collect::<BTreeSet<_>>(),
             COMMANDS.iter().copied().collect()
         );
-        assert_eq!(ms.union(&is).count(), 102);
+        assert_eq!(ms.union(&is).count(), 109);
         for c in [
             "clear_all_data",
             "update_settings_patch",
             "export_history",
             "export_gold_corpus",
+            "list_local_cleanup_models",
+            "download_local_cleanup_model",
+            "cancel_local_cleanup_model_download",
+            "delete_local_cleanup_model",
+            "list_mlx_cleanup_models",
+            "download_mlx_cleanup_model",
+            "verify_mlx_cleanup_model",
+            "cancel_mlx_cleanup_model_download",
+            "delete_mlx_cleanup_model",
         ] {
             assert!(!is.contains(c));
         }
@@ -362,7 +385,7 @@ mod tests {
         let app = acl["__app-acl__"]["permissions"]
             .as_object()
             .expect("generated app permissions");
-        assert_eq!(app.len(), 204);
+        assert_eq!(app.len(), 218);
         for c in COMMANDS {
             let allow = &app[&format!("allow-{}", c.replace('_', "-"))]["commands"];
             let deny = &app[&format!("deny-{}", c.replace('_', "-"))]["commands"];

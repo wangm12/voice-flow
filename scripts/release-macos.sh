@@ -276,7 +276,9 @@ verify_production_entry_and_native_strings() {
   fi
   local sidecar="$app/Contents/Resources/voiceflow-mlx-sidecar"
   local swift_runtime="$app/Contents/Resources/libswiftCompatibilitySpan.dylib"
-  for candidate in "$main" "$sidecar" "$swift_runtime"; do
+  local llama_server="$app/Contents/Resources/llama-runtime/bin/llama-server"
+  local llama_identity="$app/Contents/Resources/llama-runtime/BUILD-IDENTITY.json"
+  for candidate in "$main" "$sidecar" "$swift_runtime" "$llama_server" "$llama_identity"; do
     if [[ ! -f "$candidate" || ! -r "$candidate" ]]; then
       echo "Required production native binary is missing or unreadable: $candidate" >&2
       return 1
@@ -349,7 +351,7 @@ verify_production_entry_and_native_strings() {
       native_binaries+=("$candidate")
     fi
   done <"$files_file"
-  for candidate in "$main" "$sidecar" "$swift_runtime"; do
+  for candidate in "$main" "$sidecar" "$swift_runtime" "$llama_server"; do
     local found=0 binary
     for binary in "${native_binaries[@]}"; do
       [[ "$binary" == "$candidate" ]] && found=1
@@ -517,6 +519,8 @@ verify_developer_id_app "$bundle"
 verify_production_entry_and_native_strings "$bundle" "${work_dir}/production-entry-prezip"
 if [[ "$requires_apple_silicon_resources" == "1" ]]; then
   sidecar="$bundle/Contents/Resources/voiceflow-mlx-sidecar"
+  llama_server="$bundle/Contents/Resources/llama-runtime/bin/llama-server"
+  llama_identity="$bundle/Contents/Resources/llama-runtime/BUILD-IDENTITY.json"
   colocated_metallib="$bundle/Contents/Resources/mlx.metallib"
   metallib="$bundle/Contents/Resources/mlx-swift_Cmlx.bundle/Contents/Resources/default.metallib"
   if [[ ! -x "$sidecar" || ! -s "$colocated_metallib" || ! -s "$metallib" ]] \
@@ -528,6 +532,11 @@ if [[ "$requires_apple_silicon_resources" == "1" ]]; then
     echo "The Apple silicon MLX sidecar signature is invalid." >&2
     exit 1
   }
+  python3 "$ROOT/src-tauri/llama-runtime/scripts/verify-runtime-identity.py" \
+    --runtime-dir "$bundle/Contents/Resources/llama-runtime" \
+    --expected-signing-mode developer_id \
+    --expected-authority "$signing_identity" \
+    --expected-team-id "$team_id"
   models_root="${work_dir}/empty-models"
   audio_root="${work_dir}/empty-audio"
   mkdir -p "$models_root" "$audio_root"

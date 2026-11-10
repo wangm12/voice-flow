@@ -78,8 +78,6 @@ impl PasteError {
 /// when no matching key is found.
 #[cfg(target_os = "macos")]
 const COMMAND_PASTE_KEYCODE: u16 = 0x09;
-#[cfg(target_os = "macos")]
-const COMMAND_UNDO_KEYCODE: u16 = 0x06;
 const POST_PASTE_READBACK_DELAY_MS: u64 = 250;
 const POST_PASTE_READBACK_POLL_DELAYS_MS: [u64; 10] = [0, 75, 75, 75, 75, 150, 200, 300, 400, 450];
 pub(crate) const MAX_FULL_RANGE_READBACK_UTF16: usize = 65_536;
@@ -225,12 +223,6 @@ fn map_enigo_connection_error(error: NewConError) -> PasteError {
 
 pub fn should_post_shortcut_to_pid(expected_pid: i32, own_pid: i32) -> bool {
     expected_pid > 0 && expected_pid != own_pid
-}
-
-#[cfg(target_os = "macos")]
-fn send_command_shortcut(keycode: u16) -> Result<(), PasteError> {
-    let shortcut = prepare_command_shortcut(keycode)?;
-    send_prepared_command_shortcut(shortcut, None, &mut || {})
 }
 
 #[cfg(target_os = "macos")]
@@ -406,26 +398,6 @@ const PASTE_CONSUME_SETTLE: Duration = Duration::from_millis(40);
 
 /// VoiceInk-style pause after activating the recorded app/window.
 const DELIVERY_FOCUS_SETTLE: Duration = Duration::from_millis(120);
-
-#[cfg(target_os = "macos")]
-fn simulate_undo() -> Result<(), PasteError> {
-    send_command_shortcut(COMMAND_UNDO_KEYCODE)
-}
-
-#[cfg(not(target_os = "macos"))]
-fn simulate_undo() -> Result<(), PasteError> {
-    let mut enigo = Enigo::new(&Settings::default()).map_err(map_enigo_connection_error)?;
-    enigo
-        .key(PRIMARY_MODIFIER, Direction::Press)
-        .map_err(|error| PasteError::Input(error.to_string()))?;
-    enigo
-        .key(Key::Unicode('z'), Direction::Click)
-        .map_err(|error| PasteError::Input(error.to_string()))?;
-    enigo
-        .key(PRIMARY_MODIFIER, Direction::Release)
-        .map_err(|error| PasteError::Input(error.to_string()))?;
-    Ok(())
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TextActionSourceKind {
@@ -2853,9 +2825,6 @@ pub(crate) enum FocusedFieldReadError {
 
 // AX objects remain on the thread that captured them. Tickets carry channels
 // across workers; only the original owner thread dereferences the native ref.
-type AnchorOperation<A> = Box<
-    dyn FnOnce(&A, &CancellationToken, std::time::Instant) -> Result<&'static str, String> + Send,
->;
 type FocusedFieldReadOperation<A> = Box<
     dyn FnOnce(
             &A,
@@ -2867,13 +2836,6 @@ type FocusedFieldReadOperation<A> = Box<
         + Send,
 >;
 
-struct UndoAnchorRequest<A> {
-    operation: AnchorOperation<A>,
-    cancellation: CancellationToken,
-    deadline: std::time::Instant,
-    reply: std::sync::mpsc::Sender<Result<&'static str, String>>,
-}
-
 struct FocusedFieldReadRequest<A> {
     operation: FocusedFieldReadOperation<A>,
     cancellation: CancellationToken,
@@ -2884,18 +2846,9 @@ struct FocusedFieldReadRequest<A> {
 }
 
 enum AnchorRequest<A> {
-    Undo(UndoAnchorRequest<A>),
     Read(FocusedFieldReadRequest<A>),
-    ReleaseUndo {
-        ticket_id: u64,
-    },
     ReleaseObservation {
         ticket_id: u64,
-    },
-    #[cfg(all(target_os = "macos", feature = "research-harness"))]
-    ReleaseUndoAndWait {
-        ticket_id: u64,
-        reply: std::sync::mpsc::Sender<Result<(), AnchorOwnerCloseError>>,
     },
     #[cfg(all(target_os = "macos", feature = "research-harness"))]
     ReleaseObservationAndWait {
@@ -3026,33 +2979,6 @@ impl AnchorOwnerCompletion {
     }
 }
 
-struct AnchorTicketInner<A> {
-    id: u64,
-    sender: std::sync::mpsc::SyncSender<AnchorRequest<A>>,
-    expires_at: std::time::Instant,
-    #[cfg(all(target_os = "macos", feature = "research-harness"))]
-    explicitly_released: std::sync::atomic::AtomicBool,
-}
-
-impl<A> Drop for AnchorTicketInner<A> {
-    fn drop(&mut self) {
-        #[cfg(all(target_os = "macos", feature = "research-harness"))]
-        if self
-            .explicitly_released
-            .load(std::sync::atomic::Ordering::Acquire)
-        {
-            return;
-        }
-        let _ = self
-            .sender
-            .try_send(AnchorRequest::ReleaseUndo { ticket_id: self.id });
-    }
-}
-
-pub(crate) struct AnchorTicket<A> {
-    inner: std::sync::Arc<AnchorTicketInner<A>>,
-}
-
 struct LearningObservationTicketInner {
     id: u64,
     sender: std::sync::mpsc::SyncSender<AnchorRequest<FocusedFieldAnchor>>,
@@ -3097,122 +3023,6 @@ impl PartialEq for LearningObservationTicket {
 
 impl Eq for LearningObservationTicket {}
 
-impl<A> Clone for AnchorTicket<A> {
-    fn clone(&self) -> Self {
-        Self {
-            inner: std::sync::Arc::clone(&self.inner),
-        }
-    }
-}
-impl<A> std::fmt::Debug for AnchorTicket<A> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Do not expose native field identities or values in diagnostics.
-        f.write_str("AnchorTicket")
-    }
-}
-impl<A> PartialEq for AnchorTicket<A> {
-    fn eq(&self, other: &Self) -> bool {
-        self.inner.id == other.inner.id
-    }
-}
-impl<A> Eq for AnchorTicket<A> {}
-
-impl<A: 'static> AnchorTicket<A> {
-    fn retain(anchor: A, lifetime: Duration) -> (Self, AnchorLease<A>) {
-        let id = NEXT_ANCHOR_TICKET_ID.fetch_add(1, Ordering::Relaxed);
-        let undo_expires_at = std::time::Instant::now() + lifetime;
-        let (sender, requests) = std::sync::mpsc::sync_channel::<AnchorRequest<A>>(1);
-        let ticket = Self {
-            inner: std::sync::Arc::new(AnchorTicketInner {
-                id,
-                sender,
-                expires_at: undo_expires_at,
-                #[cfg(all(target_os = "macos", feature = "research-harness"))]
-                explicitly_released: std::sync::atomic::AtomicBool::new(false),
-            }),
-        };
-        (
-            ticket,
-            AnchorLease {
-                id,
-                anchor,
-                requests,
-                undo_expires_at: Some(undo_expires_at),
-                observation_expires_at: None,
-            },
-        )
-    }
-
-    pub(crate) fn expires_at(&self) -> std::time::Instant {
-        self.inner.expires_at
-    }
-
-    #[cfg(all(target_os = "macos", feature = "research-harness"))]
-    pub(crate) fn release_and_wait_until(
-        &self,
-        deadline: std::time::Instant,
-    ) -> Result<(), AnchorOwnerCloseError> {
-        let result = release_anchor_grant_and_wait(
-            &self.inner.sender,
-            |reply| AnchorRequest::ReleaseUndoAndWait {
-                ticket_id: self.inner.id,
-                reply,
-            },
-            deadline,
-        );
-        if result.is_ok() {
-            self.inner
-                .explicitly_released
-                .store(true, std::sync::atomic::Ordering::Release);
-        }
-        result
-    }
-
-    pub(crate) fn run(
-        &self,
-        operation: impl FnOnce(&A, &CancellationToken, std::time::Instant) -> Result<&'static str, String>
-            + Send
-            + 'static,
-    ) -> Result<&'static str, String> {
-        self.run_with_timeout(operation, Duration::from_secs(1))
-    }
-
-    fn run_with_timeout(
-        &self,
-        operation: impl FnOnce(&A, &CancellationToken, std::time::Instant) -> Result<&'static str, String>
-            + Send
-            + 'static,
-        timeout: Duration,
-    ) -> Result<&'static str, String> {
-        let deadline = self
-            .inner
-            .expires_at
-            .min(std::time::Instant::now() + timeout);
-        let cancellation = CancellationToken::new();
-        let (reply, receiver) = std::sync::mpsc::channel();
-        if self
-            .inner
-            .sender
-            .try_send(AnchorRequest::Undo(UndoAnchorRequest {
-                operation: Box::new(operation),
-                cancellation: cancellation.clone(),
-                deadline,
-                reply,
-            }))
-            .is_err()
-        {
-            return Ok("stale_target");
-        }
-        match receiver.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())) {
-            Ok(result) => result,
-            Err(_) => {
-                cancellation.cancel();
-                Ok("stale_target")
-            }
-        }
-    }
-}
-
 #[cfg(all(target_os = "macos", feature = "research-harness"))]
 fn release_anchor_grant_and_wait<A>(
     sender: &std::sync::mpsc::SyncSender<AnchorRequest<A>>,
@@ -3242,35 +3052,19 @@ fn release_anchor_grant_and_wait<A>(
     }
 }
 
-impl AnchorTicket<FocusedFieldAnchor> {
-    fn retain_with_learning_observation(
+impl LearningObservationTicket {
+    fn retain(
         anchor: FocusedFieldAnchor,
-        undo_lifetime: Duration,
         observation_lifetime: Duration,
         observation_started_at: std::time::Instant,
         #[cfg(all(target_os = "macos", feature = "research-harness"))] research_guard: Option<
             RegisteredResearchPasteGuard,
         >,
-    ) -> (
-        Self,
-        LearningObservationTicket,
-        AnchorLease<FocusedFieldAnchor>,
-    ) {
+    ) -> (Self, AnchorLease<FocusedFieldAnchor>) {
         let id = NEXT_ANCHOR_TICKET_ID.fetch_add(1, Ordering::Relaxed);
-        let now = std::time::Instant::now();
-        let undo_expires_at = now + undo_lifetime;
         let observation_expires_at = observation_started_at + observation_lifetime;
         let (sender, requests) =
             std::sync::mpsc::sync_channel::<AnchorRequest<FocusedFieldAnchor>>(3);
-        let undo_ticket = Self {
-            inner: std::sync::Arc::new(AnchorTicketInner {
-                id,
-                sender: sender.clone(),
-                expires_at: undo_expires_at,
-                #[cfg(all(target_os = "macos", feature = "research-harness"))]
-                explicitly_released: std::sync::atomic::AtomicBool::new(false),
-            }),
-        };
         let observation_ticket = LearningObservationTicket {
             inner: std::sync::Arc::new(LearningObservationTicketInner {
                 id,
@@ -3286,30 +3080,25 @@ impl AnchorTicket<FocusedFieldAnchor> {
             id,
             anchor,
             requests,
-            undo_expires_at: Some(undo_expires_at),
             observation_expires_at: Some(observation_expires_at),
         };
-        (undo_ticket, observation_ticket, lease)
+        (observation_ticket, lease)
     }
 }
-
-pub(crate) type UndoFieldTicket = AnchorTicket<FocusedFieldAnchor>;
 
 #[cfg(all(target_os = "macos", feature = "research-harness"))]
 #[derive(Default)]
 struct ResearchPasteTicketHandoff {
     observation_ticket: Option<LearningObservationTicket>,
-    undo_ticket: Option<UndoFieldTicket>,
 }
 
 #[cfg(all(target_os = "macos", feature = "research-harness"))]
 pub(crate) struct RegisteredResearchPasteAttempt {
     pub(crate) attempt: Result<TimedInsertOutcome, PasteError>,
     pub(crate) owner_completion: AnchorOwnerCompletion,
-    /// These are the sole ticket owners for this research attempt. They stay
+    /// This is the sole ticket owner for this research attempt. It stays
     /// available even when post-write resolution returns an error.
     pub(crate) observation_ticket: Option<LearningObservationTicket>,
-    pub(crate) undo_ticket: Option<UndoFieldTicket>,
 }
 
 impl LearningObservationTicket {
@@ -3545,20 +3334,15 @@ struct AnchorLease<A> {
     id: u64,
     anchor: A,
     requests: std::sync::mpsc::Receiver<AnchorRequest<A>>,
-    undo_expires_at: Option<std::time::Instant>,
     observation_expires_at: Option<std::time::Instant>,
 }
 
 impl<A> AnchorLease<A> {
     fn serve<OwnerGuard: Drop>(mut self, mut owner_guard: Option<OwnerGuard>) {
-        // Both privileges share one owner thread and retained native anchor,
-        // but keep their own absolute deadlines. A learning read can never
-        // extend the single-use Undo window, and dropping it closes only reads.
+        // The retained native anchor serves bounded learning reads until its
+        // absolute observation deadline or an explicit release.
         loop {
             let now = std::time::Instant::now();
-            if self.undo_expires_at.is_some_and(|expiry| now >= expiry) {
-                self.undo_expires_at = None;
-            }
             if self
                 .observation_expires_at
                 .is_some_and(|expiry| now >= expiry)
@@ -3566,29 +3350,15 @@ impl<A> AnchorLease<A> {
                 self.observation_expires_at = None;
                 drop(owner_guard.take());
             }
-            let next_expiry = match (self.undo_expires_at, self.observation_expires_at) {
-                (Some(undo), Some(observe)) => Some(undo.min(observe)),
-                (Some(undo), None) => Some(undo),
-                (None, Some(observe)) => Some(observe),
-                (None, None) => None,
-            };
-            let Some(next_expiry) = next_expiry else {
+            let Some(next_expiry) = self.observation_expires_at else {
                 return;
             };
-            if now >= next_expiry {
-                return;
-            }
             let request = match self.requests.recv_timeout(next_expiry - now) {
                 Ok(request) => request,
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
             };
             match request {
-                AnchorRequest::ReleaseUndo { ticket_id } => {
-                    if ticket_id == self.id {
-                        self.undo_expires_at = None;
-                    }
-                }
                 AnchorRequest::ReleaseObservation { ticket_id } => {
                     if ticket_id == self.id {
                         self.observation_expires_at = None;
@@ -3598,52 +3368,17 @@ impl<A> AnchorLease<A> {
                     }
                 }
                 #[cfg(all(target_os = "macos", feature = "research-harness"))]
-                AnchorRequest::ReleaseUndoAndWait { ticket_id, reply } => {
-                    if ticket_id == self.id {
-                        self.undo_expires_at = None;
-                        let _ = reply.send(Ok(()));
-                    } else {
-                        let _ = reply.send(Err(AnchorOwnerCloseError::OwnerFailed));
-                    }
-                }
-                #[cfg(all(target_os = "macos", feature = "research-harness"))]
                 AnchorRequest::ReleaseObservationAndWait { ticket_id, reply } => {
                     if ticket_id == self.id {
                         self.observation_expires_at = None;
                         // This ACK follows any in-flight AX read and dropping
                         // the observation owner guard; it does not mean the
-                        // separate Undo grant or the owner loop has closed.
+                        // owner loop has closed.
                         drop(owner_guard.take());
                         let _ = reply.send(Ok(()));
                     } else {
                         let _ = reply.send(Err(AnchorOwnerCloseError::OwnerFailed));
                     }
-                }
-                AnchorRequest::Undo(request) => {
-                    let now = std::time::Instant::now();
-                    let Some(owner_expiry) = self.undo_expires_at else {
-                        let _ = request.reply.send(Ok("stale_target"));
-                        continue;
-                    };
-                    if request.cancellation.is_cancelled()
-                        || now >= request.deadline
-                        || now >= owner_expiry
-                    {
-                        let _ = request.reply.send(Ok("stale_target"));
-                        continue;
-                    }
-                    // Undo is single-use even while the learning read lease
-                    // remains active on this same owner.
-                    self.undo_expires_at = None;
-                    let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                        (request.operation)(
-                            &self.anchor,
-                            &request.cancellation,
-                            request.deadline.min(owner_expiry),
-                        )
-                    }))
-                    .unwrap_or_else(|_| Err("undo anchor worker panicked".into()));
-                    let _ = request.reply.send(result);
                 }
                 AnchorRequest::Read(request) => {
                     let now = std::time::Instant::now();
@@ -3692,7 +3427,7 @@ impl<A> AnchorLease<A> {
 }
 
 /// Construct and retain native anchors entirely on one owner thread. Return
-/// only the Send result before serving its separate bounded Undo/read leases.
+/// only the Send result before serving its bounded learning read lease.
 fn run_delivery_owner<A: 'static, T: Send + 'static>(
     operation: impl FnOnce(&mut Option<AnchorLease<A>>) -> T + Send + 'static,
 ) -> Result<T, String> {
@@ -3715,8 +3450,6 @@ fn run_delivery_owner<A: 'static, T: Send + 'static>(
                 .as_ref()
                 .is_none_or(|lease| lease.observation_expires_at.is_none())
             {
-                // Undo can outlive the learning read grant. It must not keep
-                // the research learning pipeline open on its own.
                 drop(owner_learning_task.take());
             }
             if result_sender.send(result).is_err() {
@@ -3840,21 +3573,20 @@ pub(crate) fn run_research_main_queue_dispatch_probe() -> Result<bool, String> {
 pub struct InsertOutcome {
     /// The platform shortcut was posted, or a safe AX insert was applied.
     pub shortcut_sent: bool,
-    /// True only if Cmd+V was posted. AX value sets are often not on the
-    /// target undo stack, so a 3s Cmd+Z must never be armed for that path.
+    /// True only if Cmd+V was posted rather than a safe AX value set.
     pub used_keyboard_paste: bool,
     /// Best-effort proof that the focused field now contains the delivered text.
     /// Cmd+V or AX set alone cannot prove that the target application accepted it.
     pub verified: bool,
     /// Which readback proof authorized the result. Full-range proof confirms
-    /// delivery but intentionally does not arm Undo or dictionary learning.
+    /// delivery but intentionally does not arm dictionary learning.
     pub(crate) verification: Option<PasteVerificationFact>,
     /// In-memory fingerprint of the complete focused input value immediately
-    /// after a verified paste. Undo uses this to avoid undoing later user edits.
+    /// after a verified paste. Binding the learning read lease requires the
+    /// retained field to still hold this value.
     pub post_insert_input_fingerprint: Option<u64>,
-    /// Exact delivery-time field identity, kept only in memory for Undo.
+    /// Exact delivery-time field identity, kept only in memory.
     pub(crate) post_insert_target_guard: Option<crate::context::TargetAppGuard>,
-    pub(crate) post_insert_field_ticket: Option<UndoFieldTicket>,
     /// Checked UTF-16 delivery coordinates from the original paste/readback owner.
     pub(crate) confirmed_insertion: Option<ConfirmedInsertionV1>,
     /// Repeated read capability for the same anchor, with a separate 12s cap.
@@ -3874,10 +3606,6 @@ impl std::fmt::Debug for InsertOutcome {
             .field(
                 "post_insert_input_fingerprint",
                 &self.post_insert_input_fingerprint,
-            )
-            .field(
-                "undo_field_captured",
-                &self.post_insert_field_ticket.is_some(),
             )
             .field("confirmed_insertion", &self.confirmed_insertion.is_some())
             .field(
@@ -4353,7 +4081,6 @@ pub(crate) fn build_insert_outcome(
         verification: Some(verification),
         post_insert_input_fingerprint,
         post_insert_target_guard: None,
-        post_insert_field_ticket: None,
         confirmed_insertion: None,
         learning_observation_ticket: None,
         value_after,
@@ -4368,7 +4095,6 @@ fn build_verified_ax_outcome(value_after: String) -> InsertOutcome {
         verification: Some(PasteVerificationFact::Verified),
         post_insert_input_fingerprint: Some(selection_fingerprint(&value_after)),
         post_insert_target_guard: None,
-        post_insert_field_ticket: None,
         confirmed_insertion: None,
         learning_observation_ticket: None,
         value_after: Some(value_after),
@@ -5391,7 +5117,8 @@ mod macos_pasteboard {
             let association = commit
                 .generation
                 .filter(|generation| {
-                    commit.restored
+                    crate::research_trace::ACTIVE
+                        && commit.restored
                         && self.change_count.checked_add(1) == Some(proof.change_count)
                         && proof.change_count.checked_add(1) == Some(*generation)
                 })
@@ -9435,7 +9162,6 @@ pub(crate) fn insert_registered_research_owned_paste_remote(
             attempt: Err(PasteError::TargetUnavailable),
             owner_completion: AnchorOwnerCompletion::not_started(),
             observation_ticket: None,
-            undo_ticket: None,
         };
     }
     let effects = match DeliveryEffects::research_registered_owned_remote(remote) {
@@ -9445,7 +9171,6 @@ pub(crate) fn insert_registered_research_owned_paste_remote(
                 attempt: Err(error),
                 owner_completion: AnchorOwnerCompletion::not_started(),
                 observation_ticket: None,
-                undo_ticket: None,
             };
         }
     };
@@ -9490,7 +9215,6 @@ fn insert_registered_research_owned_paste_with_effects(
             attempt: Err(PasteError::TargetUnavailable),
             owner_completion: AnchorOwnerCompletion::not_started(),
             observation_ticket: None,
-            undo_ticket: None,
         };
     }
     if let Err(error) = registered_research_permission(&cancellation, expires_at) {
@@ -9498,7 +9222,6 @@ fn insert_registered_research_owned_paste_with_effects(
             attempt: Err(error),
             owner_completion: AnchorOwnerCompletion::not_started(),
             observation_ticket: None,
-            undo_ticket: None,
         };
     }
 
@@ -9508,47 +9231,48 @@ fn insert_registered_research_owned_paste_with_effects(
     let owner_cancellation = cancellation.clone();
     let ticket_handoff = std::sync::Arc::new(Mutex::new(ResearchPasteTicketHandoff::default()));
     let owner_ticket_handoff = std::sync::Arc::clone(&ticket_handoff);
-    let (owner_result, owner_completion) = run_delivery_owner_with_completion(move |undo_lease| {
-        let initial_target = capture_registered_research_target(
-            &host_identity_for_owner,
-            &expected_bundle_id,
-            &expected_window_title,
-            &expected_control_identifier,
-            &owner_cancellation,
-            expires_at,
-        )?;
-        let research_guard = RegisteredResearchPasteGuard {
-            host_identity: host_identity_for_owner.clone(),
-            expected_bundle_id: expected_bundle_id.clone(),
-            expected_window_title: expected_window_title.clone(),
-            expected_control_identifier: expected_control_identifier.clone(),
-            expires_at,
-            cancellation: owner_cancellation.clone(),
-            initial_target,
-        };
-        let before_guard = research_guard.clone();
-        let after_guard = research_guard.clone();
-        let readback_guard = research_guard.clone();
-        insert_with_post_verify_timed_on_owner(
-            &owner_effects,
-            &text,
-            true,
-            owner_cancellation,
-            DeliveryPolicy {
-                before: move || before_guard.check(),
-                after: move || after_guard.check(),
-                readback: Some(std::sync::Arc::new(move || readback_guard.check())),
-                recovery: RecoveryIntent::NoImplicitCopy,
-            },
-            undo_lease,
-            TimedInsertOwnerMetadata {
-                expected_pid: host_identity_for_owner.pid,
-                trace_handle: None,
-                research_guard: Some(research_guard),
-                ticket_handoff: Some(owner_ticket_handoff),
-            },
-        )
-    });
+    let (owner_result, owner_completion) =
+        run_delivery_owner_with_completion(move |anchor_lease| {
+            let initial_target = capture_registered_research_target(
+                &host_identity_for_owner,
+                &expected_bundle_id,
+                &expected_window_title,
+                &expected_control_identifier,
+                &owner_cancellation,
+                expires_at,
+            )?;
+            let research_guard = RegisteredResearchPasteGuard {
+                host_identity: host_identity_for_owner.clone(),
+                expected_bundle_id: expected_bundle_id.clone(),
+                expected_window_title: expected_window_title.clone(),
+                expected_control_identifier: expected_control_identifier.clone(),
+                expires_at,
+                cancellation: owner_cancellation.clone(),
+                initial_target,
+            };
+            let before_guard = research_guard.clone();
+            let after_guard = research_guard.clone();
+            let readback_guard = research_guard.clone();
+            insert_with_post_verify_timed_on_owner(
+                &owner_effects,
+                &text,
+                true,
+                owner_cancellation,
+                DeliveryPolicy {
+                    before: move || before_guard.check(),
+                    after: move || after_guard.check(),
+                    readback: Some(std::sync::Arc::new(move || readback_guard.check())),
+                    recovery: RecoveryIntent::NoImplicitCopy,
+                },
+                anchor_lease,
+                TimedInsertOwnerMetadata {
+                    expected_pid: host_identity_for_owner.pid,
+                    trace_handle: None,
+                    research_guard: Some(research_guard),
+                    ticket_handoff: Some(owner_ticket_handoff),
+                },
+            )
+        });
     let attempt = match owner_result {
         Ok(attempt) => attempt,
         Err(error) => Err(PasteError::Input(error)),
@@ -9560,7 +9284,6 @@ fn insert_registered_research_owned_paste_with_effects(
         attempt,
         owner_completion,
         observation_ticket: ticket_handoff.observation_ticket.take(),
-        undo_ticket: ticket_handoff.undo_ticket.take(),
     }
 }
 
@@ -9577,14 +9300,14 @@ pub(crate) fn insert_with_post_verify_timed_effects(
     trace: Option<crate::metrics::TraceHandle>,
 ) -> Result<TimedInsertOutcome, PasteError> {
     let text = text.to_owned();
-    run_delivery_owner(move |undo_lease| {
+    run_delivery_owner(move |anchor_lease| {
         insert_with_post_verify_timed_on_owner(
             &effects,
             &text,
             accessibility,
             cancellation,
             policy,
-            undo_lease,
+            anchor_lease,
             TimedInsertOwnerMetadata {
                 expected_pid,
                 trace_handle: trace,
@@ -9616,7 +9339,7 @@ fn insert_with_post_verify_timed_on_owner(
         impl Fn() -> Result<(), PasteError> + Send + Sync + 'static,
         impl Fn() -> Result<(), PasteError> + Send + Sync + 'static,
     >,
-    undo_lease: &mut Option<AnchorLease<FocusedFieldAnchor>>,
+    anchor_lease: &mut Option<AnchorLease<FocusedFieldAnchor>>,
     metadata: TimedInsertOwnerMetadata,
 ) -> Result<TimedInsertOutcome, PasteError> {
     let TimedInsertOwnerMetadata {
@@ -9694,7 +9417,7 @@ fn insert_with_post_verify_timed_on_owner(
                     expected_pid,
                     &clipboard_snapshot,
                     trace,
-                    undo_lease,
+                    anchor_lease,
                     trace_handle.clone(),
                     #[cfg(all(target_os = "macos", feature = "research-harness"))]
                     research_guard.as_ref(),
@@ -9913,7 +9636,7 @@ fn insert_with_post_verify_timed_inner(
     expected_pid: i32,
     clipboard_snapshot: &ClipboardSnapshot,
     trace: &mut DeliveryTrace,
-    undo_lease: &mut Option<AnchorLease<FocusedFieldAnchor>>,
+    anchor_lease: &mut Option<AnchorLease<FocusedFieldAnchor>>,
     trace_handle: Option<crate::metrics::TraceHandle>,
     #[cfg(all(target_os = "macos", feature = "research-harness"))] research_guard: Option<
         &RegisteredResearchPasteGuard,
@@ -10311,9 +10034,9 @@ fn insert_with_post_verify_timed_inner(
                 );
                 trace.paste_verification = Some(verification);
                 let mut outcome = build_insert_outcome(true, readback.value_after, verification);
-                // Bind Undo to the field that accepted Cmd+V, not the field focused
-                // when recording started. The original AX anchor brackets the probe
-                // so moving focus during readback cannot arm a different field.
+                // Bind learning reads to the field that accepted Cmd+V, not the field
+                // focused when recording started. The original AX anchor brackets the
+                // probe so moving focus during readback cannot arm a different field.
                 if outcome.verification == Some(PasteVerificationFact::Verified) {
                     if let Some(anchor) = focus_anchor.as_ref().filter(|a| a.is_current_focus()) {
                         #[cfg(all(target_os = "macos", feature = "research-harness"))]
@@ -10355,100 +10078,52 @@ fn insert_with_post_verify_timed_inner(
                                     )
                                 });
                             // Move the exact original AX reference into the owner
-                            // loop; never recapture focus. The short single-use
-                            // Undo ticket and repeated read capability have
-                            // separate absolute deadlines.
-                            if let Some(original_anchor) = focus_anchor.take() {
-                                let (ticket, observation, lease) = if let Some(mut confirmed) =
-                                    confirmed
-                                {
-                                    #[cfg(all(target_os = "macos", feature = "research-harness"))]
-                                    let (undo_lifetime, observation_lifetime) = if let Some(guard) =
-                                        research_guard
-                                    {
-                                        let observation_remaining = guard
-                                            .expires_at
-                                            .saturating_duration_since(confirmed.created_at);
-                                        let undo_remaining = guard
-                                            .expires_at
-                                            .saturating_duration_since(std::time::Instant::now());
-                                        (
-                                            Duration::from_secs(3).min(undo_remaining),
-                                            Duration::from_secs(12).min(observation_remaining),
+                            // loop; never recapture focus.
+                            if let Some((mut confirmed, original_anchor)) =
+                                confirmed.zip(focus_anchor.take())
+                            {
+                                #[cfg(all(target_os = "macos", feature = "research-harness"))]
+                                let observation_lifetime =
+                                    research_guard.map_or(Duration::from_secs(12), |guard| {
+                                        Duration::from_secs(12).min(
+                                            guard
+                                                .expires_at
+                                                .saturating_duration_since(confirmed.created_at),
                                         )
-                                    } else {
-                                        (Duration::from_secs(3), Duration::from_secs(12))
-                                    };
-                                    #[cfg(not(all(
-                                        target_os = "macos",
-                                        feature = "research-harness"
-                                    )))]
-                                    let (undo_lifetime, observation_lifetime) =
-                                        (Duration::from_secs(3), Duration::from_secs(12));
-                                    let (undo, observation, lease) =
-                                        AnchorTicket::retain_with_learning_observation(
-                                            original_anchor,
-                                            undo_lifetime,
-                                            observation_lifetime,
-                                            confirmed.created_at,
-                                            #[cfg(all(
-                                                target_os = "macos",
-                                                feature = "research-harness"
-                                            ))]
-                                            research_guard.cloned(),
-                                        );
-                                    confirmed.anchor_owner_id = observation.inner.id;
-                                    outcome.confirmed_insertion = Some(confirmed);
-                                    (undo, Some(observation), lease)
-                                } else {
-                                    let undo_lifetime = {
-                                        #[cfg(all(
-                                            target_os = "macos",
-                                            feature = "research-harness"
-                                        ))]
-                                        {
-                                            research_guard.map_or(Duration::from_secs(3), |guard| {
-                                                Duration::from_secs(3).min(
-                                                    guard.expires_at.saturating_duration_since(
-                                                        std::time::Instant::now(),
-                                                    ),
-                                                )
-                                            })
-                                        }
-                                        #[cfg(not(all(
-                                            target_os = "macos",
-                                            feature = "research-harness"
-                                        )))]
-                                        {
-                                            Duration::from_secs(3)
-                                        }
-                                    };
-                                    let (undo, lease) =
-                                        AnchorTicket::retain(original_anchor, undo_lifetime);
-                                    (undo, None, lease)
-                                };
-                                outcome.post_insert_target_guard = Some(guard);
+                                    });
+                                #[cfg(not(all(
+                                    target_os = "macos",
+                                    feature = "research-harness"
+                                )))]
+                                let observation_lifetime = Duration::from_secs(12);
+                                let (observation, lease) = LearningObservationTicket::retain(
+                                    original_anchor,
+                                    observation_lifetime,
+                                    confirmed.created_at,
+                                    #[cfg(all(target_os = "macos", feature = "research-harness"))]
+                                    research_guard.cloned(),
+                                );
+                                confirmed.anchor_owner_id = observation.inner.id;
+                                outcome.confirmed_insertion = Some(confirmed);
                                 #[cfg(all(target_os = "macos", feature = "research-harness"))]
                                 if let Some(handoff) = ticket_handoff.as_ref() {
-                                    let mut handoff = handoff
+                                    handoff
                                         .lock()
-                                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                                    handoff.undo_ticket = Some(ticket);
-                                    handoff.observation_ticket = observation;
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                        .observation_ticket = Some(observation);
                                 } else {
-                                    outcome.post_insert_field_ticket = Some(ticket);
-                                    outcome.learning_observation_ticket = observation;
+                                    outcome.learning_observation_ticket = Some(observation);
                                 }
                                 #[cfg(not(all(
                                     target_os = "macos",
                                     feature = "research-harness"
                                 )))]
                                 {
-                                    outcome.post_insert_field_ticket = Some(ticket);
-                                    outcome.learning_observation_ticket = observation;
+                                    outcome.learning_observation_ticket = Some(observation);
                                 }
-                                *undo_lease = Some(lease);
+                                *anchor_lease = Some(lease);
                             }
+                            outcome.post_insert_target_guard = Some(guard);
                         }
                     }
                 }
@@ -10711,32 +10386,6 @@ fn raise_target_window(pid: i32, window_id: Option<u64>) {
     {
         let _ = (pid, window_id);
     }
-}
-
-/// Final fail-closed gate shared by the real AX ticket and regression harness.
-/// The callback is the retained AX anchor's CFEqual focus check in production.
-pub(crate) fn run_guarded_undo(
-    cancellation: &CancellationToken,
-    deadline: std::time::Instant,
-    same_field: impl FnOnce() -> bool,
-    submit: impl FnOnce() -> Result<(), PasteError>,
-) -> Result<&'static str, String> {
-    if !same_field() || cancellation.is_cancelled() || std::time::Instant::now() >= deadline {
-        return Ok("stale_target");
-    }
-    submit().map_err(|error| error.to_string())?;
-    Ok("success")
-}
-
-/// Undo is deliberately a separate primitive from paste. Callers must verify
-/// the target immediately before invoking it; this function only performs the
-/// platform shortcut after the permission check.
-pub fn undo(accessibility: bool) -> Result<(), PasteError> {
-    if !accessibility {
-        return Err(PasteError::Accessibility);
-    }
-    std::panic::catch_unwind(AssertUnwindSafe(simulate_undo))
-        .unwrap_or_else(|_| Err(PasteError::Input("undo worker panicked".into())))
 }
 
 #[cfg(test)]
@@ -11751,7 +11400,6 @@ mod tests {
         assert!(outcome.verified);
         assert!(outcome.value_after.is_none());
         assert!(outcome.post_insert_input_fingerprint.is_none());
-        assert!(outcome.post_insert_field_ticket.is_none());
     }
 
     #[test]
@@ -12078,131 +11726,6 @@ mod tests {
         );
     }
 
-    struct TestAnchor {
-        identity: u64,
-        // Mirror AX's !Send ownership rather than testing a freely movable object.
-        _owner_local: std::rc::Rc<()>,
-        owner_thread: std::thread::ThreadId,
-        current: Arc<AtomicU64>,
-        released: std::sync::mpsc::Sender<()>,
-    }
-    impl Drop for TestAnchor {
-        fn drop(&mut self) {
-            assert_eq!(self.owner_thread, std::thread::current().id());
-            let _ = self.released.send(());
-        }
-    }
-
-    fn test_anchor_ticket(
-        lifetime: Duration,
-    ) -> (
-        AnchorTicket<TestAnchor>,
-        Arc<AtomicU64>,
-        std::sync::mpsc::Receiver<()>,
-    ) {
-        let current = Arc::new(AtomicU64::new(1));
-        let native_current = current.clone();
-        let (released, receiver) = std::sync::mpsc::channel();
-        let ticket = run_delivery_owner(move |slot| {
-            let anchor = TestAnchor {
-                identity: 1,
-                _owner_local: std::rc::Rc::new(()),
-                owner_thread: std::thread::current().id(),
-                current: native_current,
-                released,
-            };
-            let (ticket, lease) = AnchorTicket::retain(anchor, lifetime);
-            *slot = Some(lease);
-            ticket
-        })
-        .unwrap();
-        (ticket, current, receiver)
-    }
-
-    #[test]
-    fn retained_owner_consumes_one_undo_then_keeps_serving_the_read_ticket() {
-        let id = NEXT_ANCHOR_TICKET_ID.fetch_add(1, Ordering::Relaxed);
-        let now = std::time::Instant::now();
-        let deadline = now + Duration::from_secs(2);
-        let (sender, requests) = std::sync::mpsc::sync_channel(4);
-        let lease = AnchorLease {
-            id,
-            anchor: (),
-            requests,
-            undo_expires_at: Some(deadline),
-            observation_expires_at: Some(deadline),
-        };
-        let undo_calls = Arc::new(AtomicU64::new(0));
-        let read_calls = Arc::new(AtomicU64::new(0));
-
-        let (first_reply, first_result) = std::sync::mpsc::channel();
-        let first_calls = Arc::clone(&undo_calls);
-        sender
-            .send(AnchorRequest::Undo(UndoAnchorRequest {
-                operation: Box::new(move |_, _, _| {
-                    first_calls.fetch_add(1, Ordering::Relaxed);
-                    Ok("success")
-                }),
-                cancellation: CancellationToken::new(),
-                deadline,
-                reply: first_reply,
-            }))
-            .unwrap();
-
-        let (second_reply, second_result) = std::sync::mpsc::channel();
-        let second_calls = Arc::clone(&undo_calls);
-        sender
-            .send(AnchorRequest::Undo(UndoAnchorRequest {
-                operation: Box::new(move |_, _, _| {
-                    second_calls.fetch_add(1, Ordering::Relaxed);
-                    Ok("success")
-                }),
-                cancellation: CancellationToken::new(),
-                deadline,
-                reply: second_reply,
-            }))
-            .unwrap();
-
-        let (read_reply, read_result) = std::sync::mpsc::channel();
-        let observed_reads = Arc::clone(&read_calls);
-        sender
-            .send(AnchorRequest::Read(FocusedFieldReadRequest {
-                operation: Box::new(move |_, _, _, _, _| {
-                    observed_reads.fetch_add(1, Ordering::Relaxed);
-                    Ok(FocusedFieldReadSampleV1 {
-                        value: Some("retained field".into()),
-                        selection_range_utf16: Some((4, 0)),
-                        focus_matches: Some(true),
-                    })
-                }),
-                cancellation: CancellationToken::new(),
-                deadline,
-                observer_epoch: Arc::new(AtomicU64::new(9)),
-                expected_epoch: 9,
-                reply: read_reply,
-            }))
-            .unwrap();
-        sender
-            .send(AnchorRequest::ReleaseObservation { ticket_id: id })
-            .unwrap();
-
-        let owner = thread::spawn(move || lease.serve(None::<crate::research_trace::LearningTask>));
-        owner.join().unwrap();
-
-        assert_eq!(first_result.recv().unwrap(), Ok("success"));
-        assert_eq!(second_result.recv().unwrap(), Ok("stale_target"));
-        assert_eq!(
-            read_result.recv().unwrap(),
-            Ok(FocusedFieldReadSampleV1 {
-                value: Some("retained field".into()),
-                selection_range_utf16: Some((4, 0)),
-                focus_matches: Some(true),
-            })
-        );
-        assert_eq!(undo_calls.load(Ordering::Relaxed), 1);
-        assert_eq!(read_calls.load(Ordering::Relaxed), 1);
-    }
-
     #[test]
     fn owner_rejects_a_queued_read_after_its_epoch_changes() {
         let id = NEXT_ANCHOR_TICKET_ID.fetch_add(1, Ordering::Relaxed);
@@ -12212,7 +11735,6 @@ mod tests {
             id,
             anchor: (),
             requests,
-            undo_expires_at: None,
             observation_expires_at: Some(deadline),
         };
         let observer_epoch = Arc::new(AtomicU64::new(9));
@@ -12303,53 +11825,6 @@ mod tests {
         }
     }
 
-    struct DropSignal(std::sync::mpsc::Sender<()>);
-
-    impl Drop for DropSignal {
-        fn drop(&mut self) {
-            let _ = self.0.send(());
-        }
-    }
-
-    #[test]
-    fn read_guard_expires_independently_while_undo_remains_available() {
-        let id = NEXT_ANCHOR_TICKET_ID.fetch_add(1, Ordering::Relaxed);
-        let now = std::time::Instant::now();
-        let undo_deadline = now + Duration::from_secs(2);
-        let (sender, requests) = std::sync::mpsc::sync_channel(1);
-        let lease = AnchorLease {
-            id,
-            anchor: (),
-            requests,
-            undo_expires_at: Some(undo_deadline),
-            observation_expires_at: Some(now + Duration::from_millis(100)),
-        };
-        let (guard_dropped, guard_dropped_receiver) = std::sync::mpsc::channel();
-        let (owner_exited, owner_exited_receiver) = std::sync::mpsc::channel();
-        let owner = thread::spawn(move || {
-            lease.serve(Some(DropSignal(guard_dropped)));
-            owner_exited.send(()).unwrap();
-        });
-
-        guard_dropped_receiver
-            .recv_timeout(Duration::from_secs(1))
-            .unwrap();
-        let (undo_reply, undo_result) = std::sync::mpsc::channel();
-        sender
-            .send(AnchorRequest::Undo(UndoAnchorRequest {
-                operation: Box::new(|_, _, _| Ok("success")),
-                cancellation: CancellationToken::new(),
-                deadline: undo_deadline,
-                reply: undo_reply,
-            }))
-            .unwrap();
-        assert_eq!(undo_result.recv().unwrap(), Ok("success"));
-        owner_exited_receiver
-            .recv_timeout(Duration::from_secs(1))
-            .unwrap();
-        owner.join().unwrap();
-    }
-
     #[test]
     fn observation_owner_guard_waits_for_an_inflight_read_to_return() {
         let id = NEXT_ANCHOR_TICKET_ID.fetch_add(1, Ordering::Relaxed);
@@ -12359,7 +11834,6 @@ mod tests {
             id,
             anchor: (),
             requests,
-            undo_expires_at: None,
             observation_expires_at: Some(deadline),
         };
         let (read_started, read_started_receiver) = std::sync::mpsc::channel();
@@ -12413,167 +11887,6 @@ mod tests {
             .unwrap();
         owner.join().unwrap();
         assert_eq!(owner_guard_drops.load(Ordering::Relaxed), 1);
-    }
-
-    #[test]
-    fn undo_anchor_ticket_releases_on_last_drop_without_join() {
-        let (ticket, _, released) = test_anchor_ticket(Duration::from_secs(3));
-        let second_owner = ticket.clone();
-        drop(ticket);
-        assert!(released.try_recv().is_err());
-        drop(second_owner);
-        released.recv_timeout(Duration::from_secs(1)).unwrap();
-    }
-
-    #[test]
-    fn undo_anchor_ticket_expires_and_rejects_later_requests() {
-        let (ticket, _, released) = test_anchor_ticket(Duration::from_millis(30));
-        released.recv_timeout(Duration::from_secs(1)).unwrap();
-        assert_eq!(
-            ticket.run(|_, _, _| panic!("expired anchor must not run")),
-            Ok("stale_target")
-        );
-    }
-
-    #[test]
-    fn undo_anchor_ticket_rejects_replacement_field_with_identical_value() {
-        let (ticket, current, released) = test_anchor_ticket(Duration::from_secs(3));
-        // Same app, rectangle and text may describe a different AX element.
-        // The retained anchor's actual identity must still agree with focus.
-        current.store(2, Ordering::Release);
-        let submissions = Arc::new(AtomicU64::new(0));
-        let worker_submissions = submissions.clone();
-        assert_eq!(
-            ticket.run(move |anchor, cancellation, deadline| {
-                run_guarded_undo(
-                    cancellation,
-                    deadline,
-                    || anchor.identity == anchor.current.load(Ordering::Acquire),
-                    || {
-                        worker_submissions.fetch_add(1, Ordering::Relaxed);
-                        Ok(())
-                    },
-                )
-            }),
-            Ok("stale_target")
-        );
-        assert_eq!(submissions.load(Ordering::Relaxed), 0);
-        released.recv_timeout(Duration::from_secs(1)).unwrap();
-    }
-
-    #[test]
-    fn undo_original_owner_rejects_capture_period_aba_with_same_value_and_geometry() {
-        let current = Arc::new(AtomicU64::new(1));
-        let native_current = current.clone();
-        let captures = Arc::new(AtomicU64::new(0));
-        let native_captures = captures.clone();
-        let (released, release_receiver) = std::sync::mpsc::channel();
-        let ticket = run_delivery_owner(move |slot| {
-            native_captures.fetch_add(1, Ordering::Relaxed);
-            let original = TestAnchor {
-                identity: native_current.load(Ordering::Acquire),
-                _owner_local: std::rc::Rc::new(()),
-                owner_thread: std::thread::current().id(),
-                current: native_current.clone(),
-                released,
-            };
-            assert_eq!(original.identity, 1); // A accepted the paste/readback.
-                                              // A -> B while the old implementation would recapture focus.
-                                              // Both controls have exactly the same text/geometry metadata.
-            native_current.store(2, Ordering::Release);
-            assert_ne!(original.identity, native_current.load(Ordering::Acquire));
-            // Return to A so the old original-anchor post-check would pass.
-            native_current.store(1, Ordering::Release);
-            assert_eq!(original.identity, native_current.load(Ordering::Acquire));
-            let (ticket, lease) = AnchorTicket::retain(original, Duration::from_secs(3));
-            *slot = Some(lease);
-            ticket
-        })
-        .unwrap();
-        // Switch to B before Undo. A recaptured B ticket would wrongly allow it.
-        current.store(2, Ordering::Release);
-        let submissions = Arc::new(AtomicU64::new(0));
-        let native_submissions = submissions.clone();
-        assert_eq!(
-            ticket.run(move |anchor, cancellation, deadline| {
-                assert_eq!(anchor.identity, 1);
-                assert_eq!(anchor.owner_thread, std::thread::current().id());
-                run_guarded_undo(
-                    cancellation,
-                    deadline,
-                    || anchor.identity == anchor.current.load(Ordering::Acquire),
-                    || {
-                        native_submissions.fetch_add(1, Ordering::Relaxed);
-                        Ok(())
-                    },
-                )
-            }),
-            Ok("stale_target")
-        );
-        assert_eq!(captures.load(Ordering::Relaxed), 1);
-        assert_eq!(submissions.load(Ordering::Relaxed), 0);
-        release_receiver
-            .recv_timeout(Duration::from_secs(1))
-            .unwrap();
-    }
-
-    #[test]
-    fn undo_anchor_ticket_submits_once_for_the_retained_field() {
-        let (ticket, _, released) = test_anchor_ticket(Duration::from_secs(3));
-        let submissions = Arc::new(AtomicU64::new(0));
-        let worker_submissions = submissions.clone();
-        assert_eq!(
-            ticket.run(move |anchor, cancellation, deadline| {
-                run_guarded_undo(
-                    cancellation,
-                    deadline,
-                    || anchor.identity == anchor.current.load(Ordering::Acquire),
-                    || {
-                        worker_submissions.fetch_add(1, Ordering::Relaxed);
-                        Ok(())
-                    },
-                )
-            }),
-            Ok("success")
-        );
-        released.recv_timeout(Duration::from_secs(1)).unwrap();
-        assert_eq!(submissions.load(Ordering::Relaxed), 1);
-        assert_eq!(
-            ticket.run(|_, _, _| panic!("consumed native anchor must not be reused")),
-            Ok("stale_target")
-        );
-    }
-
-    #[test]
-    fn undo_anchor_ticket_timeout_cancels_work_before_submission() {
-        let (ticket, _, released) = test_anchor_ticket(Duration::from_secs(3));
-        let (started, start_receiver) = std::sync::mpsc::channel();
-        let submissions = Arc::new(AtomicU64::new(0));
-        let worker_submissions = submissions.clone();
-        assert_eq!(
-            ticket.run_with_timeout(
-                move |_, cancellation, deadline| {
-                    started.send(()).unwrap();
-                    while !cancellation.is_cancelled() && std::time::Instant::now() < deadline {
-                        thread::yield_now();
-                    }
-                    run_guarded_undo(
-                        cancellation,
-                        deadline,
-                        || true,
-                        || {
-                            worker_submissions.fetch_add(1, Ordering::Relaxed);
-                            Ok(())
-                        },
-                    )
-                },
-                Duration::from_millis(40)
-            ),
-            Ok("stale_target")
-        );
-        start_receiver.recv_timeout(Duration::from_secs(1)).unwrap();
-        released.recv_timeout(Duration::from_secs(1)).unwrap();
-        assert_eq!(submissions.load(Ordering::Relaxed), 0);
     }
 
     struct FakeClipboardRestore {
@@ -14071,14 +13384,6 @@ mod registered_research_paste_contract_tests {
         let id = NEXT_ANCHOR_TICKET_ID.fetch_add(1, Ordering::Relaxed);
         let expires_at = Instant::now() + Duration::from_secs(3);
         let (sender, requests) = mpsc::sync_channel(3);
-        let ticket = AnchorTicket {
-            inner: std::sync::Arc::new(AnchorTicketInner {
-                id,
-                sender,
-                expires_at,
-                explicitly_released: std::sync::atomic::AtomicBool::new(false),
-            }),
-        };
         let (dropped, drop_receiver) = mpsc::channel();
         let (guard_entered, guard_entered_receiver) = mpsc::channel();
         let (resume, resume_receiver) = mpsc::channel();
@@ -14094,21 +13399,31 @@ mod registered_research_paste_contract_tests {
                 id,
                 anchor,
                 requests,
-                undo_expires_at: Some(expires_at),
-                observation_expires_at: None,
+                observation_expires_at: Some(expires_at),
             };
-            lease.serve(Some(BlockingOwnerGuard {
+            lease.serve(None::<crate::research_trace::LearningTask>);
+            drop(BlockingOwnerGuard {
                 entered: guard_entered,
                 resume: resume_receiver,
-            }));
+            });
             let _ = terminal_sender.send(AnchorOwnerTerminal::Closed);
         });
         let mut completion = AnchorOwnerCompletion::started(terminal_receiver, owner_thread);
         let deadline = Instant::now() + Duration::from_secs(3);
-        assert_eq!(ticket.release_and_wait_until(deadline), Ok(()));
+        assert_eq!(
+            release_anchor_grant_and_wait(
+                &sender,
+                |reply| AnchorRequest::ReleaseObservationAndWait {
+                    ticket_id: id,
+                    reply,
+                },
+                deadline,
+            ),
+            Ok(())
+        );
         guard_entered_receiver
             .recv_timeout(Duration::from_secs(1))
-            .expect("release ACK is emitted before the owner guard is dropped");
+            .expect("release ACK is emitted before the owner thread settles");
         assert_eq!(
             completion.wait_closed_until(Instant::now() + Duration::from_millis(10)),
             Err(AnchorOwnerCloseError::UnknownPending)

@@ -124,6 +124,9 @@ export type OnDeviceModelStatus = {
   platform_supported: boolean;
   runtime_status: string;
   loaded: boolean;
+  download_available?: boolean;
+  language_note?: string;
+  memory_compatibility_error?: string | null;
 };
 
 export type CleanupModelStatus = {
@@ -144,13 +147,60 @@ export type CleanupModelStatus = {
   platform_supported?: boolean | null;
 };
 
+export type LocalCleanupModelStatus = {
+  id: string;
+  label: string;
+  repository: string;
+  revision: string;
+  sha256: string | null;
+  bytes: number;
+  state: "missing" | "downloading" | "installed" | "corrupt" | string;
+  operation: "download" | "delete" | string | null;
+  bytes_done: number;
+  bytes_total: number;
+  error: string | null;
+  last_operation: string | null;
+  last_operation_error: string | null;
+  managed: boolean;
+  partial_managed?: boolean;
+  verified: boolean;
+  download_available?: boolean;
+  downloadable?: boolean;
+  selectable?: boolean;
+  compatible: boolean;
+  compatibility_error: string | null;
+};
+
+export type MlxCleanupModelStatus = {
+  id: string;
+  label: string;
+  repository: string;
+  revision: string;
+  bytes: number;
+  language: string;
+  state: "missing" | "downloading" | "canceling" | "installed" | "ready" | "corrupt" | "deleting" | "error" | string;
+  operation: "download" | "verify" | "delete" | string | null;
+  bytes_done: number;
+  bytes_total: number;
+  error: string | null;
+  last_operation: string | null;
+  last_operation_error: string | null;
+  managed: boolean;
+  partial_managed: boolean;
+  verified: boolean;
+  qualified: boolean;
+  download_available?: boolean;
+  downloadable: boolean;
+  selectable: boolean;
+  compatible: boolean;
+  compatibility_error: string | null;
+};
+
 export type LocalCleanupStatus = {
   available: boolean;
   status: string;
   message: string;
   model: string;
-  instance_id?: string;
-  local_source_confirmed?: boolean | null;
 };
 
 export type SaveSettings = (

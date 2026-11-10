@@ -639,20 +639,22 @@ async fn open_socket_and_config(
     if let Some(hints) = language_hints(options.language.as_deref()) {
         config["language_hints"] = json!(hints);
     }
-    let mut facts = crate::observations::ResolvedRequest::new(
-        "soniox_token_stream",
-        endpoint,
-        SONIOX_MODEL,
-        SONIOX_MODEL,
-    );
-    for (field, value) in config.as_object().unwrap() {
-        if field != "api_key" {
-            facts
-                .fields_constructed
-                .insert(field.clone(), value.clone());
+    if crate::observations::enabled() {
+        let mut facts = crate::observations::ResolvedRequest::new(
+            "soniox_token_stream",
+            endpoint,
+            SONIOX_MODEL,
+            SONIOX_MODEL,
+        );
+        for (field, value) in config.as_object().unwrap() {
+            if field != "api_key" {
+                facts
+                    .fields_constructed
+                    .insert(field.clone(), value.clone());
+            }
         }
+        crate::observations::asr_request(facts);
     }
-    crate::observations::asr_request(facts);
     let config_result = tokio::select! {
         biased;
         _ = policy_cancellation.cancelled() => return Err(cancelled_failure(0)),

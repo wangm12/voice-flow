@@ -1,5 +1,4 @@
 //! Phase 2 one-shot window capture + on-device OCR. Images stay in memory.
-#![allow(dead_code)]
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -103,10 +102,12 @@ pub fn capture_for_vision(window_id: Option<u64>) -> Result<MemoryImage, Capture
     capture_locked_window(window_id)
 }
 
+#[cfg(test)]
 pub fn vision_capture_count() -> usize {
     VISION_CAPTURE_COUNT.load(Ordering::SeqCst)
 }
 
+#[cfg(test)]
 pub fn reset_vision_capture_count() {
     VISION_CAPTURE_COUNT.store(0, Ordering::SeqCst);
 }

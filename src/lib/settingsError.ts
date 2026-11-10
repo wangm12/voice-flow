@@ -30,6 +30,9 @@ export function friendlySettingsError(
   const normalized = message.toLowerCase();
   const dictionaryMessage = friendlyDictionaryLearningError(reason, translate);
   if (dictionaryMessage) return dictionaryMessage;
+  if (normalized === "retired_on_device_asr_model") {
+    return translate("Cohere Transcribe 2B 已停止提供新选择；已有保存配置可以继续保留。");
+  }
   if (normalized.includes("translation hotkey")) {
     return translate(normalized.includes("conflicts") ? "翻译快捷键与其他快捷键冲突，请选择不同的组合键。" : "翻译快捷键需要有效的组合键，请重新设置。");
   }

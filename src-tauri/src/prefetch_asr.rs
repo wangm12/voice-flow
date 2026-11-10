@@ -146,34 +146,6 @@ pub struct PrefetchedWarmup {
     pub transcript: asr::Transcript,
 }
 
-const HUD_PARTIAL_MAX_CHARS: usize = 280;
-
-/// Concatenate completed non-warmup chunk transcripts for HUD display.
-/// Index order, space-separated, trimmed, capped at 280 chars with ellipsis.
-pub fn hud_partial_text(transcripts: &HashMap<AudioChunkIdentity, PrefetchedTranscript>) -> String {
-    let mut completed: Vec<&PrefetchedTranscript> = transcripts.values().collect();
-    completed.sort_by_key(|entry| entry.chunk_index);
-    let joined = completed
-        .into_iter()
-        .map(|entry| entry.transcript.text.trim())
-        .filter(|text| !text.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ");
-    cap_hud_partial(&joined)
-}
-
-fn cap_hud_partial(text: &str) -> String {
-    let char_count = text.chars().count();
-    if char_count <= HUD_PARTIAL_MAX_CHARS {
-        return text.to_owned();
-    }
-    const ELLIPSIS: &str = "...";
-    let keep = HUD_PARTIAL_MAX_CHARS.saturating_sub(ELLIPSIS.chars().count());
-    let mut truncated: String = text.chars().take(keep).collect();
-    truncated.push_str(ELLIPSIS);
-    truncated
-}
-
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct PrefetchAsrResult {
     /// Session-scoped provenance for every result in this container.
@@ -243,14 +215,10 @@ impl PrefetchInbox {
     }
 }
 
-pub type HudPartialEmit = Arc<dyn Fn(u64, String) + Send + Sync>;
-
 pub struct PrefetchSessionConfig {
     pub metrics: metrics::Metrics,
     pub metric_group: metrics::MetricGroup,
     pub cancellation: CancellationToken,
-    pub hud_partial: Option<HudPartialEmit>,
-    pub session_generation: u64,
     pub session_binding: PrefetchSessionBinding,
     pub request_identity: PrefetchRequestIdentity,
     pub quota_scope: queue::RequestScope,
@@ -287,8 +255,6 @@ impl PrefetchAsrSession {
             metrics,
             metric_group,
             cancellation,
-            hud_partial,
-            session_generation,
             session_binding,
             request_identity,
             quota_scope,
@@ -380,13 +346,6 @@ impl PrefetchAsrSession {
                                         transcript,
                                     },
                                 );
-                                let text = hud_partial_text(&results.transcripts);
-                                drop(results);
-                                if let Some(emit) = &hud_partial {
-                                    if !text.is_empty() {
-                                        emit(session_generation, text);
-                                    }
-                                }
                             }
                         }
                     }
@@ -528,53 +487,6 @@ mod tests {
         assert_eq!(result, completed);
     }
 
-    #[test]
-    fn hud_partial_text_joins_completed_chunks_in_index_order() {
-        let transcripts = HashMap::from([
-            prefetched(2, "  two  "),
-            prefetched(0, "one"),
-            prefetched(5, ""),
-            prefetched(1, "  "),
-        ]);
-
-        assert_eq!(hud_partial_text(&transcripts), "one two");
-    }
-
-    #[test]
-    fn hud_partial_text_caps_at_280_chars_with_ellipsis() {
-        let long = "x".repeat(300);
-        let transcripts = HashMap::from([prefetched(0, &long)]);
-        let text = hud_partial_text(&transcripts);
-
-        assert_eq!(text.chars().count(), 280);
-        assert!(text.ends_with("..."));
-        assert_eq!(text.chars().take(277).collect::<String>(), "x".repeat(277));
-    }
-
-    #[test]
-    fn hud_partial_text_does_not_include_warmup_and_is_display_only() {
-        let result = PrefetchAsrResult {
-            session_binding: None,
-            warmup: Some(PrefetchedWarmup {
-                request_identity: test_request_identity(),
-                sample_identity: sample_chunk(0).identity,
-                transcript: transcript("warmup must stay silent"),
-            }),
-            transcripts: HashMap::from([prefetched(1, "visible")]),
-        };
-
-        assert_eq!(hud_partial_text(&result.transcripts), "visible");
-        assert_eq!(
-            result
-                .warmup
-                .as_ref()
-                .map(|warmup| warmup.transcript.text.as_str()),
-            Some("warmup must stay silent")
-        );
-    }
-
-    type HudEvents = Arc<Mutex<Vec<(u64, String)>>>;
-
     struct ScriptedAsr {
         replies: Mutex<std::collections::VecDeque<Result<String, asr::AsrError>>>,
     }
@@ -626,36 +538,6 @@ mod tests {
         }
     }
 
-    fn spawn_with_hud(
-        provider: Arc<dyn asr::AsrProvider>,
-        hud: HudEvents,
-        generation: u64,
-    ) -> (PrefetchInbox, PrefetchAsrSession) {
-        let (inbox, receiver) = PrefetchAsrSession::channel();
-        let session = PrefetchAsrSession::spawn(
-            receiver,
-            inbox.clone(),
-            Arc::new(queue::RequestGate::new(None)),
-            provider,
-            asr::AsrOptions::default(),
-            PrefetchSessionConfig {
-                metrics: metrics::Metrics::default(),
-                metric_group: metrics::MetricGroup::unknown("prefetch"),
-                session_binding: PrefetchSessionBinding::test_default(),
-                cancellation: CancellationToken::new(),
-                hud_partial: Some(Arc::new(move |generation, text| {
-                    hud.lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .push((generation, text));
-                })),
-                session_generation: generation,
-                request_identity: test_request_identity(),
-                quota_scope: queue::RequestScope::new("mock", None, "mock-model", ""),
-            },
-        );
-        (inbox, session)
-    }
-
     fn spawn_silent(provider: Arc<dyn asr::AsrProvider>) -> (PrefetchInbox, PrefetchAsrSession) {
         let (inbox, receiver) = PrefetchAsrSession::channel();
         let session = PrefetchAsrSession::spawn(
@@ -669,8 +551,6 @@ mod tests {
                 metric_group: metrics::MetricGroup::unknown("prefetch"),
                 session_binding: PrefetchSessionBinding::test_default(),
                 cancellation: CancellationToken::new(),
-                hud_partial: None,
-                session_generation: 1,
                 request_identity: test_request_identity(),
                 quota_scope: queue::RequestScope::new("mock", None, "mock-model", ""),
             },
@@ -697,39 +577,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn successful_non_warmup_chunks_emit_concatenated_hud_partials() {
-        let hud: HudEvents = Arc::new(Mutex::new(Vec::new()));
-        let (inbox, session) =
-            spawn_with_hud(ScriptedAsr::ok(&[" later", "hello "]), Arc::clone(&hud), 7);
-
-        assert!(inbox.try_send(PrefetchMessage::Chunk(sample_chunk(1))));
-        assert!(inbox.try_send(PrefetchMessage::Chunk(sample_chunk(0))));
-        let result = session.finish(Duration::from_secs(2)).await;
-
-        assert_eq!(
-            result
-                .transcripts
-                .values()
-                .map(|entry| (entry.chunk_index, entry.transcript.text.as_str()))
-                .collect::<HashMap<_, _>>(),
-            HashMap::from([(0, "hello "), (1, " later")])
-        );
-        assert_eq!(
-            hud.lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .as_slice(),
-            &[(7, "later".to_owned()), (7, "hello later".to_owned())]
-        );
-    }
-
-    #[tokio::test]
-    async fn warmup_and_prefetch_failure_stay_silent_on_the_hud() {
-        let warmup_hud: HudEvents = Arc::new(Mutex::new(Vec::new()));
-        let (warmup_inbox, warmup_session) = spawn_with_hud(
-            ScriptedAsr::ok(&["warmup only"]),
-            Arc::clone(&warmup_hud),
-            3,
-        );
+    async fn warmup_and_prefetch_failure_stay_out_of_indexed_results() {
+        let (warmup_inbox, warmup_session) = spawn_silent(ScriptedAsr::ok(&["warmup only"]));
         assert!(warmup_inbox.try_send(PrefetchMessage::Warmup(sample_chunk(0))));
         let warmup_result = warmup_session.finish(Duration::from_secs(2)).await;
         assert_eq!(
@@ -739,20 +588,11 @@ mod tests {
                 .map(|warmup| warmup.transcript.text.as_str()),
             Some("warmup only")
         );
-        assert!(warmup_hud
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .is_empty());
+        assert!(warmup_result.transcripts.is_empty());
 
-        let fail_hud: HudEvents = Arc::new(Mutex::new(Vec::new()));
-        let (fail_inbox, fail_session) =
-            spawn_with_hud(ScriptedAsr::err(), Arc::clone(&fail_hud), 4);
+        let (fail_inbox, fail_session) = spawn_silent(ScriptedAsr::err());
         assert!(fail_inbox.try_send(PrefetchMessage::Chunk(sample_chunk(0))));
         let fail_result = fail_session.finish(Duration::from_secs(2)).await;
         assert!(fail_result.transcripts.is_empty());
-        assert!(fail_hud
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .is_empty());
     }
 }

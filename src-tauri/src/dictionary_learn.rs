@@ -1158,26 +1158,32 @@ pub(crate) async fn remove_dictionary_word(
 }
 
 #[tauri::command]
-pub(crate) fn list_learn_pairs(
+pub(crate) async fn list_learn_pairs(
     app: tauri::AppHandle,
 ) -> Result<Vec<store::LearnPairRecord>, String> {
     let dir = app
         .path()
         .app_data_dir()
         .map_err(|error| error.to_string())?;
-    let rows = store::list_learn_pairs(&dir).map_err(|error| error.to_string())?;
-    Ok(pairs_for_dictionary_settings(rows))
+    crate::run_blocking_command(move || {
+        let rows = store::list_learn_pairs(&dir).map_err(|error| error.to_string())?;
+        Ok(pairs_for_dictionary_settings(rows))
+    })
+    .await
 }
 
 #[tauri::command]
-pub(crate) fn list_learned_term_usage(
+pub(crate) async fn list_learned_term_usage(
     app: tauri::AppHandle,
 ) -> Result<Vec<store::LearnedTermUsage>, String> {
     let dir = app
         .path()
         .app_data_dir()
         .map_err(|error| error.to_string())?;
-    store::list_learned_term_usage(&dir).map_err(|error| error.to_string())
+    crate::run_blocking_command(move || {
+        store::list_learned_term_usage(&dir).map_err(|error| error.to_string())
+    })
+    .await
 }
 
 pub(crate) fn pairs_for_dictionary_settings(
@@ -1538,6 +1544,7 @@ pub(crate) async fn undo_learn_pair(
     audit.result(result)
 }
 
+#[cfg(any(test, feature = "research-harness"))]
 pub(crate) fn should_remove_dictionary_entry_after_undo(
     row: &store::LearnPairRecord,
     rows: &[store::LearnPairRecord],
@@ -1547,6 +1554,7 @@ pub(crate) fn should_remove_dictionary_entry_after_undo(
         && !has_other_live_promoted_pair(rows, &row.pair_key, &row.after_surface)
 }
 
+#[cfg(any(test, feature = "research-harness"))]
 fn has_other_live_promoted_pair(
     rows: &[store::LearnPairRecord],
     removed_key: &str,
@@ -1638,17 +1646,20 @@ async fn restore_mapping_learn(
 }
 
 #[tauri::command]
-pub(crate) fn list_pinned_terms(app: tauri::AppHandle) -> Result<Vec<String>, String> {
+pub(crate) async fn list_pinned_terms(app: tauri::AppHandle) -> Result<Vec<String>, String> {
     let dir = app
         .path()
         .app_data_dir()
         .map_err(|error| error.to_string())?;
-    let rows = store::list_learn_pairs(&dir).map_err(|error| error.to_string())?;
-    Ok(rows
-        .into_iter()
-        .filter(|row| row.pinned && row.is_live_promoted())
-        .map(|row| row.after_surface)
-        .collect())
+    crate::run_blocking_command(move || {
+        let rows = store::list_learn_pairs(&dir).map_err(|error| error.to_string())?;
+        Ok(rows
+            .into_iter()
+            .filter(|row| row.pinned && row.is_live_promoted())
+            .map(|row| row.after_surface)
+            .collect())
+    })
+    .await
 }
 
 #[tauri::command]
@@ -1669,14 +1680,17 @@ pub(crate) async fn pin_dictionary_term(
 }
 
 #[tauri::command]
-pub(crate) fn list_style_drafts(
+pub(crate) async fn list_style_drafts(
     app: tauri::AppHandle,
 ) -> Result<Vec<store::StyleDraftRecord>, String> {
     let dir = app
         .path()
         .app_data_dir()
         .map_err(|error| error.to_string())?;
-    store::list_style_drafts(&dir).map_err(|error| error.to_string())
+    crate::run_blocking_command(move || {
+        store::list_style_drafts(&dir).map_err(|error| error.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
@@ -4736,27 +4750,22 @@ pub(crate) fn maybe_observe_after_paste(
     let mut audit = AuditAttempt::observation(app, verified, expected_observer_epoch);
     let Some(confirmed_insertion) = confirmed_insertion else {
         audit.skip("unverified");
-        crate::learning_research::registration(false, "unverified");
         return;
     };
     let Some(observation_ticket) = observation_ticket else {
         audit.skip("read_owner_unavailable");
-        crate::learning_research::registration(false, "read_owner_unavailable");
         return;
     };
     if !confirmed_insertion.is_bound_to(&observation_ticket) {
         audit.skip("delivery_owner_mismatch");
-        crate::learning_research::registration(false, "delivery_owner_mismatch");
         return;
     }
     if std::time::Instant::now() >= observation_ticket.expires_at() {
         audit.skip("read_lease_expired");
-        crate::learning_research::registration(false, "read_lease_expired");
         return;
     }
     if target_guard.secure_input || confirmed_insertion.target_identity.secure_input {
         audit.skip("secure");
-        crate::learning_research::registration(false, "secure");
         return;
     }
     let fixture = crate::learning_research::consent();
@@ -4765,12 +4774,10 @@ pub(crate) fn maybe_observe_after_paste(
         .is_some_and(|consent| !consent.observer_enabled)
     {
         audit.skip("no_grant");
-        crate::learning_research::registration(false, "no_grant");
         return;
     }
     let Some(baseline) = post_insert_field.filter(|value| !value.is_empty()) else {
         audit.skip("unreadable");
-        crate::learning_research::registration(false, "unreadable");
         return;
     };
     let inserted_text_utf16_length = u32::try_from(inserted_text.encode_utf16().count()).ok();
@@ -4808,7 +4815,6 @@ pub(crate) fn maybe_observe_after_paste(
         .is_some()
     {
         audit.skip("delivery_fact_mismatch");
-        crate::learning_research::registration(false, "delivery_fact_mismatch");
         return;
     }
     if fixture
@@ -4816,7 +4822,6 @@ pub(crate) fn maybe_observe_after_paste(
         .is_some_and(|consent| consent.post_insert_field != baseline)
     {
         audit.skip("fixture_baseline_mismatch");
-        crate::learning_research::registration(false, "fixture_baseline_mismatch");
         return;
     }
     if inserted_segment_for_observation(
@@ -4828,7 +4833,6 @@ pub(crate) fn maybe_observe_after_paste(
     .is_none()
     {
         audit.skip("ambiguous_inserted_range");
-        crate::learning_research::registration(false, "ambiguous_inserted_range");
         return;
     }
     let observer_epoch = Arc::clone(&state.learning_observer_epoch);
@@ -4845,13 +4849,11 @@ pub(crate) fn maybe_observe_after_paste(
         originating_session_is_current,
     ) {
         audit.skip("stale_or_cancelled");
-        crate::learning_research::registration(false, "stale_or_cancelled");
         return;
     }
     let settings = lock_recover(&state.settings).clone();
     if !settings.dictionary_learn_enabled || !settings.context_enabled {
         audit.skip("no_grant");
-        crate::learning_research::registration(false, "no_grant");
         return;
     }
     let expected_context = recording_context.cloned();
@@ -4860,14 +4862,12 @@ pub(crate) fn maybe_observe_after_paste(
         target_guard.browser_host.as_deref(),
     ) {
         audit.skip("protected_target");
-        crate::learning_research::registration(false, "protected_target");
         return;
     }
     let Some(mapping) = recording_context.and_then(|snapshot| {
         lexicon::mapping_for_profile(&settings.context_mappings, &snapshot.profile.id)
     }) else {
         audit.skip("no_mapping");
-        crate::learning_research::registration(false, "no_mapping");
         return;
     };
     if !mapping.enabled
@@ -4875,7 +4875,6 @@ pub(crate) fn maybe_observe_after_paste(
         || !(mapping.source_permissions.ax_text || settings.local_edit_learning_enabled)
     {
         audit.skip("ax_or_learning_not_allowed");
-        crate::learning_research::registration(false, "ax_or_learning_not_allowed");
         return;
     }
     if !crate::lexicon::scene_allows_learn(
@@ -4887,7 +4886,6 @@ pub(crate) fn maybe_observe_after_paste(
         target_guard.browser_host.as_deref(),
     ) {
         audit.skip("scene_not_allowed");
-        crate::learning_research::registration(false, "scene_not_allowed");
         return;
     }
     let scope = recording_context.map(scope_from_snapshot);
@@ -4915,7 +4913,6 @@ pub(crate) fn maybe_observe_after_paste(
             || !crate::research_trace::allowed()
         {
             audit.skip("stale_or_cancelled");
-            crate::learning_research::registration(false, "stale_or_cancelled");
             return;
         }
         if expected_context
@@ -4923,7 +4920,6 @@ pub(crate) fn maybe_observe_after_paste(
             .is_none_or(|snapshot| !crate::context_target_is_current(snapshot, &settings_for_check))
         {
             audit.skip("target_changed");
-            crate::learning_research::registration(false, "target_changed");
             return;
         }
         let read_target = || {
@@ -4938,12 +4934,10 @@ pub(crate) fn maybe_observe_after_paste(
             .is_some()
         {
             audit.skip("target_changed");
-            crate::learning_research::registration(false, "target_changed");
             return;
         }
         if std::time::Instant::now() >= observation_deadline {
             audit.skip("read_lease_expired");
-            crate::learning_research::registration(false, "read_lease_expired");
             return;
         }
         audit.registered();

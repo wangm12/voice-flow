@@ -4,7 +4,6 @@ pub mod filter;
 pub mod gain;
 pub mod models;
 pub mod profile;
-pub mod supervisor;
 pub mod wav;
 pub mod wire;
 

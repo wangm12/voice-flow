@@ -8,10 +8,6 @@ export const voicePillRecoveryWidth = 320;
 export const voicePillRecoveryHeight = 116;
 export const voicePillLearnToastHeight = 48;
 
-export function integerRetrySeconds(value: number | null | undefined): number | null {
-  return value != null && Number.isFinite(value) && value > 0 ? Math.ceil(value) : null;
-}
-
 export const selectedActionCaptionLabels: Record<string, string> = {
   waiting_for_selection: "等待选中文本",
   listening: "正在听取操作",

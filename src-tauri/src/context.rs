@@ -319,7 +319,7 @@ pub struct ContextState {
 }
 
 impl ContextState {
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn new(enabled: bool, browser_access_enabled: bool, mappings: Vec<AppMapping>) -> Self {
         Self::new_with_modes(
             enabled,
@@ -750,7 +750,7 @@ pub fn validate_writing_modes(modes: &[WritingMode]) -> Result<(), String> {
 
 /// Apply a temporary writing-policy override without changing the real target
 /// identity used by the fail-closed delivery guard.
-#[allow(dead_code)]
+#[cfg(test)]
 pub fn apply_manual_override(snapshot: &mut ContextSnapshot, family: Option<ContextFamily>) {
     apply_manual_override_with_modes(snapshot, family, &builtin_writing_modes());
 }
@@ -2136,17 +2136,6 @@ pub fn is_browser_application(bundle_id: Option<&str>) -> bool {
 #[cfg(test)]
 pub fn target_matches(guard: &TargetAppGuard, current: &TargetAppGuard) -> bool {
     target_mismatch_reason(guard, current).is_none()
-}
-
-/// Relaxed focus check for operations that only require the same app/window.
-/// Delivery intentionally permits the focused control to move within the
-/// recorded window; learning and selection capture use
-/// `same_field_mismatch_reason` instead.
-pub fn focus_mismatch_reason(
-    guard: &TargetAppGuard,
-    current: &TargetAppGuard,
-) -> Option<&'static str> {
-    target_mismatch_for_pre_paste(guard, current)
 }
 
 /// Strict check for reading or observing one focused editable field.

@@ -214,16 +214,6 @@ pub fn encode_wav(samples: &[f32]) -> Result<Vec<u8>, String> {
     Ok(bytes.into_inner())
 }
 
-#[cfg(test)]
-fn merge_transcripts(chunks: Vec<(usize, String)>) -> String {
-    merge_transcripts_with_windows(
-        chunks
-            .into_iter()
-            .map(|(index, text)| (index, text, 0.0, 0.0))
-            .collect(),
-    )
-}
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct TimedWord {
     pub text: String,
@@ -271,45 +261,6 @@ pub fn merge_transcripts_with_timing(mut chunks: Vec<TimedTranscriptChunk>) -> S
             .unwrap_or(&chunk.text);
         result = append_remainder(&result, remainder);
         previous = Some(chunk);
-    }
-    result
-}
-
-/// Window timestamps alone cannot identify where speech occurred inside each
-/// window, so repeated text is retained when word timings are unavailable.
-#[cfg(test)]
-fn merge_transcripts_with_windows(mut chunks: Vec<(usize, String, f32, f32)>) -> String {
-    chunks.sort_by_key(|chunk| chunk.0);
-    let mut result = String::new();
-    for (_, text, _start, _end) in chunks {
-        if !text.trim().is_empty() {
-            if result.is_empty() {
-                result.push_str(&text);
-            } else {
-                result = append_remainder(&result, &text);
-            }
-        }
-    }
-    result
-}
-
-/// This legacy helper has no positional metadata. Keep repeated wording rather
-/// than estimating how many words fit into an overlap duration.
-#[cfg(test)]
-fn merge_transcripts_with_overlap_secs(
-    mut chunks: Vec<(usize, String)>,
-    _overlap_secs: f32,
-) -> String {
-    chunks.sort_by_key(|chunk| chunk.0);
-    let mut result = String::new();
-    for (_, text) in chunks {
-        if !text.trim().is_empty() {
-            if result.is_empty() {
-                result.push_str(&text);
-            } else {
-                result = append_remainder(&result, &text);
-            }
-        }
     }
     result
 }
@@ -746,12 +697,21 @@ mod tests {
         );
     }
 
+    fn merge_untimed(chunks: &[(usize, &str, f32, f32)]) -> String {
+        merge_transcripts_with_timing(
+            chunks
+                .iter()
+                .map(|(index, text, start, end)| timed_chunk(*index, text, *start, *end, &[]))
+                .collect(),
+        )
+    }
+
     #[test]
     fn missing_or_untrustworthy_word_positions_keep_repeated_text() {
         assert_eq!(
-            merge_transcripts_with_windows(vec![
-                (0, "We are ready.".into(), 0.0, 30.0),
-                (1, "We are ready.".into(), 29.5, 60.0),
+            merge_untimed(&[
+                (0, "We are ready.", 0.0, 30.0),
+                (1, "We are ready.", 29.5, 60.0),
             ],),
             "We are ready. We are ready.",
             "overlapping audio windows alone do not reveal where speech occurred"
@@ -787,25 +747,19 @@ mod tests {
     #[test]
     fn chinese_without_word_alignment_keeps_repeated_referents() {
         assert_eq!(
-            merge_transcripts_with_overlap_secs(
-                vec![
-                    (0, "这是一个测试内容".into()),
-                    (1, "一个测试内容继续".into())
-                ],
-                1.0,
-            ),
+            merge_untimed(&[
+                (0, "这是一个测试内容", 0.0, 30.0),
+                (1, "一个测试内容继续", 29.0, 60.0)
+            ]),
             "这是一个测试内容一个测试内容继续",
             "without aligned word timing, overlapping character strings remain"
         );
         assert_eq!(
-            merge_transcripts(vec![(0, "你好".into()), (1, "世界".into())]),
+            merge_untimed(&[(0, "你好", 0.0, 30.0), (1, "世界", 30.0, 60.0)]),
             "你好世界"
         );
         assert_eq!(
-            merge_transcripts_with_overlap_secs(
-                vec![(0, "这是一个测试".into()), (1, "测试内容".into())],
-                1.5,
-            ),
+            merge_untimed(&[(0, "这是一个测试", 0.0, 30.0), (1, "测试内容", 28.5, 60.0)]),
             "这是一个测试测试内容",
             "a short repeated referent stays when overlap is ambiguous"
         );
@@ -814,10 +768,10 @@ mod tests {
     #[test]
     fn merge_skips_failed_chunks_without_placeholder_text() {
         assert_eq!(
-            merge_transcripts(vec![(0, "hello world".into()), (2, "and done".into())]),
+            merge_untimed(&[(0, "hello world", 0.0, 30.0), (2, "and done", 60.0, 90.0)]),
             "hello world and done"
         );
-        let merged = merge_transcripts(vec![(0, "你好".into()), (1, "世界".into())]);
+        let merged = merge_untimed(&[(0, "你好", 0.0, 30.0), (1, "世界", 30.0, 60.0)]);
         assert!(!merged.contains("识别失败"));
         assert!(!merged.contains('['));
     }
@@ -825,14 +779,14 @@ mod tests {
     #[test]
     fn merge_keeps_mixed_script_boundaries_readable() {
         assert_eq!(
-            merge_transcripts(vec![(0, "部署到".into()), (1, "v2 --dry-run".into())]),
+            merge_untimed(&[(0, "部署到", 0.0, 30.0), (1, "v2 --dry-run", 30.0, 60.0)]),
             "部署到 v2 --dry-run"
         );
         assert_eq!(
-            merge_transcripts_with_overlap_secs(
-                vec![(0, "hello 世界项目".into()), (1, "世界项目 today".into())],
-                1.0,
-            ),
+            merge_untimed(&[
+                (0, "hello 世界项目", 0.0, 30.0),
+                (1, "世界项目 today", 29.0, 60.0)
+            ]),
             "hello 世界项目世界项目 today"
         );
     }
@@ -840,33 +794,25 @@ mod tests {
     #[test]
     fn window_only_and_multiline_merges_preserve_repeated_layout() {
         assert_eq!(
-            merge_transcripts_with_windows(vec![
-                (0, "we are deploying".into(), 0.0, 35.0),
-                (
-                    1,
-                    "we are deploying\n  --dry-run\n  --fast".into(),
-                    33.5,
-                    50.0
-                ),
+            merge_untimed(&[
+                (0, "we are deploying", 0.0, 35.0),
+                (1, "we are deploying\n  --dry-run\n  --fast", 33.5, 50.0),
             ]),
             "we are deploying we are deploying\n  --dry-run\n  --fast"
         );
         assert_eq!(
-            merge_transcripts_with_windows(vec![
-                (0, "repeat this phrase".into(), 0.0, 35.0),
-                (1, "repeat this phrase again".into(), 35.0, 50.0),
+            merge_untimed(&[
+                (0, "repeat this phrase", 0.0, 35.0),
+                (1, "repeat this phrase again", 35.0, 50.0),
             ]),
             "repeat this phrase repeat this phrase again",
             "chunks without actual audio overlap retain repeated speech"
         );
         assert_eq!(
-            merge_transcripts_with_overlap_secs(
-                vec![
-                    (0, "first line\nsecond line".into()),
-                    (1, "first line\nsecond line\n  code".into())
-                ],
-                1.5,
-            ),
+            merge_untimed(&[
+                (0, "first line\nsecond line", 0.0, 30.0),
+                (1, "first line\nsecond line\n  code", 28.5, 60.0)
+            ]),
             "first line\nsecond line first line\nsecond line\n  code",
             "multiline repeated text is left intact"
         );

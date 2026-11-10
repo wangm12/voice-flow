@@ -51,9 +51,7 @@ RUST_FILES = {
     'unic-ucd-version': ['LICENSE-APACHE', 'LICENSE-MIT', 'COPYRIGHT.md'],
 }
 NPM_FILES = {
-    '@tauri-apps/plugin-clipboard-manager': ['LICENSE_APACHE-2.0', 'LICENSE_MIT'],
     '@tauri-apps/plugin-dialog': ['LICENSE_APACHE-2.0', 'LICENSE_MIT'],
-    '@tauri-apps/plugin-global-shortcut': ['LICENSE_APACHE-2.0', 'LICENSE_MIT'],
     'react-remove-scroll-bar': ['LICENSE'],
 }
 OBJC2_MIT_ONLY = {'objc2', 'block2', 'objc2-foundation', 'objc2-encode'}

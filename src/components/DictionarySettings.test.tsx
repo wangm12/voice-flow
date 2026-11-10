@@ -125,8 +125,8 @@ describe("DictionarySettings", () => {
     fireEvent.click(screen.getByRole("button", { name: "添加" }));
 
     await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("add_dictionary_entries", { words: ["VoiceFlow"] }));
-    expect(input).toHaveValue("");
     expect(await screen.findByText("已有词条已登记为手动词条。")).toBeInTheDocument();
+    expect(input).toHaveValue("");
   });
 
   it("imports an existing learned word as manual ownership even when the dictionary is full", async () => {

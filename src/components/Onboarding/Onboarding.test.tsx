@@ -1,5 +1,5 @@
 import { selectOption } from "../../test/selectOption";
-import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
 import { I18nProvider } from "../../lib/i18n";
@@ -306,23 +306,25 @@ describe("Onboarding", () => {
     ["cohere-transcribe-2b", "missing", "runtime_ready", false],
     ["cohere-transcribe-2b", "ready", "runtime_ready", false],
     ["cohere-transcribe-2b", "ready", "loaded", true],
-  ] as const)("shows the unreviewed conversion notice on the configured %s card in %s/%s", async (id, state, runtime_status, loaded) => {
+  ] as const)("does not show a license warning on the configured %s card in %s/%s", async (id, state, runtime_status, loaded) => {
     const settings = { ...baseSettings, asr_provider: "on_device", asr_model: id, language: id === "cohere-transcribe-2b" ? "en" : "auto" };
     fixtureSettings = settings;
     mockBackend(async (command) => {
-      if (command === "list_on_device_models") return [{ id, label: id, state, inference_ready: state === "ready", platform_supported: true, runtime_status, loaded, downloaded_bytes: state === "ready" ? 100 : 0, bytes: 100 }];
+      if (command === "list_on_device_models") return [{ id, label: id, state, inference_ready: state === "ready", platform_supported: true, runtime_status, loaded, downloaded_bytes: state === "ready" ? 100 : 0, bytes: 100, download_available: id === "qwen3-asr-1.7b" }];
       if (command === "check_permissions") return { microphone: true, microphone_status: "authorized", accessibility: false };
       return undefined;
     });
     render(<I18nProvider initialLanguage="en"><Onboarding settings={settings} onFinish={vi.fn()} onSkipToSettings={vi.fn()} /></I18nProvider>);
     await openEngineStep("en");
-    const notice = await screen.findByRole("note");
-    expect(within(notice).getByText("License unreviewed")).toBeInTheDocument();
-    expect(within(notice).getByText("The official model card declares Apache-2.0; the license for this fixed MLX conversion remains unreviewed.")).toBeInTheDocument();
+    expect(screen.queryByText("License unreviewed")).not.toBeInTheDocument();
+    expect(screen.queryByText("The official model card declares Apache-2.0; the license for this fixed MLX conversion remains unreviewed.")).not.toBeInTheDocument();
+    if (id === "qwen3-asr-1.7b" && state === "missing") {
+      expect(screen.getByRole("button", { name: "Download model" })).toBeEnabled();
+    }
     expect(invokeMock).not.toHaveBeenCalledWith("download_on_device_model", expect.anything());
   });
 
-  it("shows no target notice on the configured 0.6B model card", async () => {
+  it("does not show a license warning on the configured 0.6B model card", async () => {
     const settings = { ...baseSettings, asr_provider: "on_device", asr_model: "qwen3-asr-0.6b", language: "auto" };
     fixtureSettings = settings;
     mockBackend(async (command) => {

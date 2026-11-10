@@ -284,11 +284,6 @@
   text-align: left;
 }
 
-.voice-pill--recovery {
-  padding: 6px 10px;
-  justify-content: flex-start;
-}
-
 
 
 
@@ -424,14 +419,9 @@
 
 .voice-pill--degraded,
 .voice-pill--error,
-.voice-pill--unverified,
-.voice-pill--unverified.voice-pill--neutral-readback {
+.voice-pill--unverified {
   border-color: var(--voice-hud-border);
   background: linear-gradient(180deg, var(--voice-hud-top), var(--voice-hud-bottom));
-}
-
-.voice-pill.voice-pill--gradient-ring {
-  border-color: var(--voice-hud-border);
 }
 
 .voice-pill__indicator {
@@ -674,8 +664,7 @@
   overflow: hidden;
 }
 
-.voice-pill--expanded,
-.voice-pill--recovery {
+.voice-pill--expanded {
   flex-direction: row;
   align-items: center;
   justify-content: flex-start;

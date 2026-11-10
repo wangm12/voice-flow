@@ -32,8 +32,8 @@ progress.md
 task_plan.md
 .superpowers/
 
-# Accidental local artifacts
-:-
+# Python bytecode
+__pycache__/
 
 # Local signing material and staged DMGs
 .build/

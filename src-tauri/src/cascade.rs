@@ -1,8 +1,4 @@
-//! Accurate-ASR cascade gate, timed Accurate shot, and winner selection.
-#![allow(dead_code)]
-
-use crate::asr::{AsrOptions, AsrProvider};
-use std::time::Duration;
+//! Accurate-ASR cascade gate and winner selection.
 
 pub struct CascadeInput {
     pub accurate_asr_configured: bool,
@@ -84,16 +80,6 @@ pub fn winning_text<'a>(
     }
 }
 
-pub fn cleanup_winner_once<T>(
-    primary: Option<&str>,
-    accurate: Result<Option<CascadeTranscript>, CascadeTimeout>,
-    cleanup: impl FnOnce(&str) -> T,
-) -> Option<T> {
-    let accurate_text = accurate.as_ref().ok().and_then(|text| text.clone());
-    let winner = pick_winner(primary, accurate);
-    winning_text(winner, primary, accurate_text.as_ref()).map(cleanup)
-}
-
 pub fn hallucination_bag_hit(text: &str) -> bool {
     let trimmed = text.trim();
     if trimmed.is_empty() {
@@ -105,27 +91,6 @@ pub fn hallucination_bag_hit(text: &str) -> bool {
     trimmed
         .split_inclusive(['.', '!', '?', '。', '！', '？', '\n'])
         .any(|sentence| crate::spoken_revision::is_hallucination_text(sentence.trim()))
-}
-
-fn usable_accurate_transcript(transcript: &crate::asr::Transcript) -> Option<CascadeTranscript> {
-    (!transcript.text.trim().is_empty()).then(|| CascadeTranscript {
-        text: transcript.text.clone(),
-        asr_text: transcript.original_text().to_owned(),
-        provider_cleaned_candidate: transcript.provider_cleaned_candidate.clone(),
-    })
-}
-
-pub async fn accurate_shot(
-    provider: &dyn AsrProvider,
-    audio: Vec<u8>,
-    options: AsrOptions,
-    timeout: Duration,
-) -> Result<Option<CascadeTranscript>, CascadeTimeout> {
-    match tokio::time::timeout(timeout, provider.transcribe_batch(audio, options)).await {
-        Err(_) => Err(CascadeTimeout),
-        Ok(Ok(transcript)) => Ok(usable_accurate_transcript(&transcript)),
-        Ok(Err(_)) => Ok(None),
-    }
 }
 
 pub fn cascade_input_for(
@@ -287,100 +252,6 @@ mod tests {
         assert!(input.mixed_cjk_english);
         assert!(input.hallucination_hit);
         assert!(should_run_accurate(&input));
-    }
-
-    #[test]
-    fn cleanup_runs_once_on_winner_not_the_draft() {
-        let mut calls = 0usize;
-        let cleaned = cleanup_winner_once(
-            Some("primary draft"),
-            Ok(Some(candidate("accurate winner"))),
-            |text| {
-                calls += 1;
-                format!("cleaned:{text}")
-            },
-        );
-        assert_eq!(cleaned.as_deref(), Some("cleaned:accurate winner"));
-        assert_eq!(calls, 1);
-    }
-
-    fn mock_transcript(text: &str) -> crate::asr::Transcript {
-        crate::asr::Transcript {
-            text: text.to_owned(),
-            asr_text: Some(text.to_owned()),
-            provider_cleaned_candidate: None,
-            language: None,
-            confidence: None,
-            segments: Vec::new(),
-            words: Vec::new(),
-            tokens: Vec::new(),
-            limits: crate::asr::RateLimits::default(),
-        }
-    }
-
-    #[tokio::test]
-    async fn accurate_shot_timeout_keeps_timeout_error() {
-        let provider = crate::asr::MockAsrProvider::new(
-            Ok(mock_transcript("too late")),
-            std::time::Duration::from_millis(80),
-        );
-        let result = accurate_shot(
-            &provider,
-            b"wav".to_vec(),
-            crate::asr::AsrOptions::default(),
-            std::time::Duration::from_millis(10),
-        )
-        .await;
-        assert_eq!(result, Err(CascadeTimeout));
-        assert_eq!(provider.calls(), 1);
-    }
-
-    #[tokio::test]
-    async fn accurate_shot_preserves_provider_text_and_rejects_empty() {
-        let ok = crate::asr::MockAsrProvider::new(
-            Ok(mock_transcript("晓雯在写 Python")),
-            std::time::Duration::ZERO,
-        );
-        assert_eq!(
-            accurate_shot(
-                &ok,
-                b"wav".to_vec(),
-                crate::asr::AsrOptions::default(),
-                std::time::Duration::from_millis(50),
-            )
-            .await,
-            Ok(Some(candidate("晓雯在写 Python")))
-        );
-
-        let empty = crate::asr::MockAsrProvider::new(
-            Err(crate::asr::AsrError::EmptyResult),
-            std::time::Duration::ZERO,
-        );
-        assert_eq!(
-            accurate_shot(
-                &empty,
-                b"wav".to_vec(),
-                crate::asr::AsrOptions::default(),
-                std::time::Duration::from_millis(50),
-            )
-            .await,
-            Ok(None)
-        );
-
-        let outro = crate::asr::MockAsrProvider::new(
-            Ok(mock_transcript("Thanks for watching the show.")),
-            std::time::Duration::ZERO,
-        );
-        assert_eq!(
-            accurate_shot(
-                &outro,
-                b"wav".to_vec(),
-                crate::asr::AsrOptions::default(),
-                std::time::Duration::from_millis(50),
-            )
-            .await,
-            Ok(Some(candidate("Thanks for watching the show.")))
-        );
     }
 
     #[tokio::test]

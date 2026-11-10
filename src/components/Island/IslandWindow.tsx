@@ -8,8 +8,7 @@ import { DictationCompletionStatus } from "./DictationCompletionStatus";
 import type { VoicePillAction } from "./VoicePill";
 import type { HudDestination } from "./hudPresentation";
 import { hudStageTimerKey, shouldHideOnConfirmedPaste } from "./hudOrb";
-import { integerRetrySeconds, voicePillLearnToastHeight } from "./voicePillTokens";
-import { WAVEFORM_BAR_COUNT } from "./VoiceWaveform";
+import { voicePillLearnToastHeight } from "./voicePillTokens";
 import { useReducedMotionPreference } from "./springs";
 import { formatHudContextLabel, formatHudContextSource, formatHudIntensityLabel, formatHudTranslationLabel, type HudContextSource } from "../../lib/hudContextLabel";
 import { useI18n } from "../../lib/i18n";
@@ -27,8 +26,6 @@ type HudState = {
   quietCompletion: boolean;
   phase: ProcessingPhase;
   phaseConfirmed: boolean;
-  retryAfterSecs: number | null;
-  undoAvailable: boolean;
   contextApp: string | null;
   contextStyle: string | null;
   contextLabel: string | null;
@@ -253,6 +250,8 @@ export function hudTranslationFromEvent(nextState: string, current: string | nul
   return nextState === "starting" ? null : current;
 }
 
+const WAVEFORM_BAR_COUNT = 8;
+
 function emptyWaveform(): number[] {
   return Array.from({ length: WAVEFORM_BAR_COUNT }, () => 0);
 }
@@ -375,8 +374,6 @@ export function IslandWindow() {
     quietCompletion: false,
     phase: "idle",
     phaseConfirmed: false,
-    retryAfterSecs: null,
-    undoAvailable: false,
     contextApp: null,
     contextStyle: null,
     contextLabel: null,
@@ -622,8 +619,6 @@ export function IslandWindow() {
             historyRecovery: nextHistoryRecovery,
             phase,
             phaseConfirmed,
-            retryAfterSecs: integerRetrySeconds(event.payload.retry_after_secs),
-            undoAvailable: event.payload.undo_available ?? false,
             contextApp: context.contextApp,
             contextStyle: context.contextStyle,
             contextLabel: context.contextLabel,
@@ -661,8 +656,6 @@ export function IslandWindow() {
             && current.recordingTargetIcon === nextHud.recordingTargetIcon
             && current.phase === nextHud.phase
             && current.phaseConfirmed === nextHud.phaseConfirmed
-            && current.retryAfterSecs === nextHud.retryAfterSecs
-            && current.undoAvailable === nextHud.undoAvailable
             && current.contextApp === nextHud.contextApp
             && current.contextStyle === nextHud.contextStyle
             && current.contextLabel === nextHud.contextLabel
@@ -695,8 +688,6 @@ export function IslandWindow() {
           quietCompletion: true,
           phase: "idle",
           phaseConfirmed: false,
-          retryAfterSecs: null,
-          undoAvailable: false,
           contextApp: null,
           contextStyle: null,
           contextLabel: null,
@@ -927,13 +918,12 @@ export function IslandWindow() {
           audioCapture: eventGeneration > current.sessionGeneration ? null : current.audioCapture,
           state: "recording_limited",
           phase: "idle",
-          retryAfterSecs: null,
           fallbackReason: null,
           waveformLevels: emptyWaveform(),
           lastAudioLevelAtMs: null,
         });
     });
-    register<{ retry_after_secs: number; session_generation?: number }>("quota://rate_limited", (event) => {
+    register<{ session_generation?: number }>("quota://rate_limited", (event) => {
       const eventGeneration = event.payload.session_generation;
       if (!acceptsSessionGeneration(hudRef.current.sessionGeneration, eventGeneration)
         || !acceptsSessionGeneration(recoveryGenerationRef.current, eventGeneration)
@@ -950,7 +940,6 @@ export function IslandWindow() {
           audioCapture: eventGeneration > current.sessionGeneration ? null : current.audioCapture,
           state: "rate_limited",
           phase: "waiting_retry",
-          retryAfterSecs: integerRetrySeconds(event.payload.retry_after_secs),
           fallbackReason: null,
           waveformLevels: emptyWaveform(),
           lastAudioLevelAtMs: null,
@@ -1325,8 +1314,6 @@ export function IslandWindow() {
         stageElapsedMs={stageElapsedMs}
         clockNowMs={clockNowMs}
         lastAudioLevelAtMs={hud.lastAudioLevelAtMs}
-        retryAfterSecs={hud.retryAfterSecs}
-        undoAvailable={hud.undoAvailable}
         contextLabel={formatHudTranslationLabel(hud.translationTargetLanguage, t) ?? formatHudIntensityLabel(hud.contextApp, hud.cleanupIntensity, t) ?? formatHudContextLabel(hud.contextApp, hud.contextStyle, hud.contextLabel, t)}
         contextSourceLabel={formatHudContextSource(hud.contextSource, t)}
         fallbackReason={hud.fallbackReason}
@@ -1401,4 +1388,4 @@ export function IslandWindow() {
   );
 }
 
-type DictationStatePayload = { recording_mode?: string | null; recording_hotkey?: string | null; recording_target_icon?: string | null; translation_target_language?: string | null; state: DictationState; session_generation?: number; phase?: ProcessingPhase; phase_confirmed?: boolean; retry_after_secs?: number; cleanup_status?: string | null; undo_available?: boolean; context_id?: string; context_app?: string | null; context_style?: string | null; context_label?: string; context_source?: ContextSourcePayload | null; cleanup_intensity?: "off" | "light" | "standard" | "heavy" | null; delivery_method?: string; fallback_reason?: string | null };
+type DictationStatePayload = { recording_mode?: string | null; recording_hotkey?: string | null; recording_target_icon?: string | null; translation_target_language?: string | null; state: DictationState; session_generation?: number; phase?: ProcessingPhase; phase_confirmed?: boolean; cleanup_status?: string | null; context_id?: string; context_app?: string | null; context_style?: string | null; context_label?: string; context_source?: ContextSourcePayload | null; cleanup_intensity?: "off" | "light" | "standard" | "heavy" | null; delivery_method?: string; fallback_reason?: string | null };

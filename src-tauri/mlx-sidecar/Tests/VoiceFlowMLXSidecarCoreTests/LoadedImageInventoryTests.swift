@@ -99,7 +99,7 @@ final class LoadedImageInventoryTests: XCTestCase {
             parameterLayoutSHA256: String(repeating: "d", count: 64),
             parameterCount: 1,
             parameterDtypes: ["float32": 1],
-            decoderRecipe: "voiceflow-mlx-decoder-v1:chunks30s/min1s;temperature0;context-empty;qwen-repetition1.05/window32;inner-chunk1200s;cohere-topP1/topK0/vad-nil;ordered-trim-language-join"
+            decoderRecipe: "voiceflow-mlx-decoder-v1:chunks30s/min1s;temperature0;context-empty;qwen-repetition1.05/window32;inner-chunk1200s;ordered-trim-language-join"
         )
         let request = SidecarRequest(
             protocolVersion: sidecarProtocolVersion,

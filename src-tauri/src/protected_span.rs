@@ -564,34 +564,6 @@ pub(crate) fn validated_layout_views(source: &str, candidate: &str) -> Option<(S
     Some((source_view, candidate_view))
 }
 
-/// Returns candidate body byte ranges only when every code body from the
-/// original source has an exact, ordered, distinct binding in this candidate.
-/// The ranges are private consumer evidence, never source waiver offsets.
-pub(crate) fn validated_candidate_code_body_ranges(
-    source: &str,
-    candidate: &str,
-) -> Option<Vec<std::ops::Range<usize>>> {
-    let source_payloads = code_literal_payloads(source);
-    if source_payloads.is_empty() {
-        return Some(Vec::new());
-    }
-    if source == candidate {
-        return Some(
-            code_literal_payloads(candidate)
-                .into_iter()
-                .map(|literal| literal.body_range)
-                .collect(),
-        );
-    }
-    let plan = bind_literals(source, candidate).ok()?;
-    Some(
-        plan.bindings
-            .into_iter()
-            .map(|binding| binding.candidate_body)
-            .collect(),
-    )
-}
-
 /// Return the exact source and candidate code regions only after the same
 /// source-bound literal owner has matched every body to one ordered candidate
 /// occurrence. The candidate range covers its retained wrapper when present,

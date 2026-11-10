@@ -1,6 +1,4 @@
 export const onboardingGuideTranslations: Record<string, string> = {
-  "离开前请保存需要保留的语气或 App 规则。继续会放弃本页未保存输入。": "Save any tone or app rule you want to keep before leaving. Continuing discards unsaved input on this page.",
-  "放弃修改并前往": "Discard changes and continue",
   "说明可随时重看；关闭不会修改设置，也不表示功能已经验证。": "You can reopen this guide anytime. Closing it does not change settings or verify the feature.",
   "收起说明": "Collapse guide",
   "知道了": "Got it",

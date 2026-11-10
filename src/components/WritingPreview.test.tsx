@@ -118,7 +118,7 @@ describe("WritingPreview", () => {
       text: "I will send the report.", status: "model", elapsed_ms: 12,
       provider_candidate: "um, I will send the report",
       model_candidate: "I will send the report",
-      cleanup_transformations: ["strip_internal_cleanup_metadata", "restore_spoken_layout"],
+      cleanup_transformations: ["restore_spoken_layout", "restore_prepared_preamble"],
       provider_error: null, final_guard_rejected: false,
     } });
     render(<WritingPreview mode={mode} compareSaved={false} />);
@@ -129,8 +129,8 @@ describe("WritingPreview", () => {
     expect(screen.getByText("共享整理器接受稿（最终保真检查前）")).toBeInTheDocument();
     expect(screen.getByText("I will send the report", { exact: true })).toBeInTheDocument();
     fireEvent.click(screen.getByText("共享整理转换"));
-    expect(screen.getByText("清理整理元数据")).toBeInTheDocument();
     expect(screen.getByText("恢复口述结构")).toBeInTheDocument();
+    expect(screen.getByText("其他共享整理转换")).toBeInTheDocument();
   });
 
   it("identifies a final-output candidate separately from a provider rejection", async () => {

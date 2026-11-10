@@ -8,11 +8,25 @@ use std::sync::{Mutex, OnceLock};
 const CAP_NUMERATOR: u128 = 4;
 const CAP_DENOMINATOR: u128 = 5;
 const ASR_COLD_RESERVE_BYTES: u64 = 2_415_919_104;
+// Provisional ASR reserves use pinned checkpoint size plus peak-work headroom.
+// They are conservative admission floors, not measured memory requirements.
+const QWEN_ASR_17_RESERVE_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+const PARAKEET_ASR_8BIT_RESERVE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+const FIRERED_ASR2_AED_RESERVE_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+const FUN_ASR_NANO_2512_RESERVE_BYTES: u64 = 5 * 1024 * 1024 * 1024;
+const COHERE_TRANSCRIBE_RESERVE_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 const CLEANUP_COLD_RESERVE_BYTES: u64 = 27_648_851_968;
 const ASR_MODEL_ID: &str = "qwen3-asr-0.6b";
 const ASR_MODEL_REVISION: &str = "eae2b51f96265328f1e7beced788adb0e4536f92";
 const CLEANUP_MODEL_ID: &str = "qwen3_8_27b_mlx_6bit";
 const CLEANUP_MODEL_REVISION: &str = "05f38c1f39e2f39619653616fe8e96a5d676358e";
+// Provisional peak-work reservations for the first three pinned GGUF artifacts.
+// These are deliberately conservative admission guards, not G0 or hardware
+// support claims; each shipped helper/model revision still needs its own field
+// measurement before a calibrated budget is reported.
+const QWEN_35_2B_RESERVE_BYTES: u64 = 3 * 1024 * 1024 * 1024;
+const QWEN_35_4B_RESERVE_BYTES: u64 = 5 * 1024 * 1024 * 1024;
+const GEMMA_4_E4B_IT_RESERVE_BYTES: u64 = 7 * 1024 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct OwnedChildIdentity {
@@ -80,6 +94,12 @@ struct PendingLoad {
     identity: OwnedChildIdentity,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingRootLoad {
+    root: PathBuf,
+    target_bytes: u64,
+}
+
 #[derive(Clone)]
 struct ChildRecord {
     identity: OwnedChildIdentity,
@@ -135,6 +155,7 @@ struct Registry {
     next_nonce: u64,
     epochs: HashMap<PathBuf, u64>,
     children: HashMap<u64, ChildRecord>,
+    root_loads: HashMap<u64, PendingRootLoad>,
 }
 
 fn snapshot_still_current(
@@ -281,7 +302,7 @@ impl ChildRegistration {
         kind: LoadKind,
     ) -> Result<PendingLoadReservation, MemoryUnavailableReason> {
         let reserve = cold_reserve(model_id, model_revision, kind)?;
-        let (epoch, records) = {
+        let (epoch, records, pending_root_bytes) = {
             let registry = registry().lock().unwrap_or_else(|p| p.into_inner());
             let own = registry
                 .children
@@ -302,7 +323,13 @@ impl ChildRegistration {
                 .filter(|(_, record)| record.models_root == root)
                 .map(|(key, record)| (*key, record.clone()))
                 .collect::<Vec<_>>();
-            (epoch, records)
+            let pending_root_bytes = registry
+                .root_loads
+                .values()
+                .filter(|load| load.root == root)
+                .try_fold(0u64, |total, load| total.checked_add(load.target_bytes))
+                .ok_or(MemoryUnavailableReason::ArithmeticOverflow)?;
+            (epoch, records, pending_root_bytes)
         };
         let own_sampler = records
             .iter()
@@ -322,7 +349,7 @@ impl ChildRegistration {
             .physical_memory()
             .ok_or(MemoryUnavailableReason::UnknownPhysicalMemory)?;
         let mut sampled = Vec::with_capacity(records.len());
-        let mut total = 0u64;
+        let mut total = pending_root_bytes;
         let mut own_footprint = None;
         for (key, record) in records {
             let footprint = record.sampler.footprint(&record.identity);
@@ -461,6 +488,151 @@ pub(crate) struct PendingLoadReservation {
     nonce: u64,
     identity: OwnedChildIdentity,
 }
+
+/// Reserve a model's cold-start budget before spawning a helper that loads its
+/// weights during process startup. The reservation participates in the same
+/// root epoch as registered child loads and remains held until the caller has
+/// observed the helper ready or confirmed that it exited.
+pub(crate) struct RootLoadReservation {
+    root: PathBuf,
+    nonce: Option<u64>,
+}
+
+impl RootLoadReservation {
+    pub(crate) fn admit(
+        models_root: &Path,
+        model_id: &str,
+        model_revision: &str,
+        kind: LoadKind,
+    ) -> Result<Self, MemoryUnavailableReason> {
+        let reserve = cold_reserve(model_id, model_revision, kind)?;
+        let root = normalized_root(models_root);
+        let (epoch, records, pending_root_bytes) = {
+            let registry = registry().lock().unwrap_or_else(|p| p.into_inner());
+            let epoch = registry.epochs.get(&root).copied().unwrap_or_default();
+            if epoch == u64::MAX {
+                return Err(MemoryUnavailableReason::ArithmeticOverflow);
+            }
+            let records = registry
+                .children
+                .iter()
+                .filter(|(_, record)| record.models_root == root)
+                .map(|(key, record)| (*key, record.clone()))
+                .collect::<Vec<_>>();
+            let pending_root_bytes = registry
+                .root_loads
+                .values()
+                .filter(|load| load.root == root)
+                .try_fold(0u64, |total, load| total.checked_add(load.target_bytes))
+                .ok_or(MemoryUnavailableReason::ArithmeticOverflow)?;
+            (epoch, records, pending_root_bytes)
+        };
+        let sampler = records
+            .first()
+            .map(|(_, record)| Arc::clone(&record.sampler))
+            .unwrap_or_else(default_sampler);
+        let pressure = sampler.pressure();
+        match pressure {
+            HostMemoryPressure::Critical => return Err(MemoryUnavailableReason::CriticalPressure),
+            HostMemoryPressure::Unknown => return Err(MemoryUnavailableReason::UnknownPressure),
+            HostMemoryPressure::Warning if kind == LoadKind::Cleanup => {
+                return Err(MemoryUnavailableReason::PressureNotNormal)
+            }
+            _ => {}
+        }
+        let physical = sampler
+            .physical_memory()
+            .ok_or(MemoryUnavailableReason::UnknownPhysicalMemory)?;
+        let mut total = pending_root_bytes;
+        let mut sampled = Vec::with_capacity(records.len());
+        for (key, record) in records {
+            let footprint = record.sampler.footprint(&record.identity);
+            let bytes = match footprint {
+                FootprintSample::Observed(bytes) => bytes,
+                FootprintSample::Unknown => {
+                    return Err(MemoryUnavailableReason::UnknownChildFootprint)
+                }
+                FootprintSample::IdentityMismatch => {
+                    return Err(MemoryUnavailableReason::ChildIdentityChanged)
+                }
+            };
+            let pending_target =
+                record
+                    .pending_loads
+                    .iter()
+                    .try_fold(None, |max: Option<u64>, pending| {
+                        let target = pending
+                            .target_bytes
+                            .ok_or(MemoryUnavailableReason::UnknownChildFootprint)?;
+                        Ok::<_, MemoryUnavailableReason>(Some(
+                            max.map_or(target, |current| current.max(target)),
+                        ))
+                    })?;
+            total = total
+                .checked_add(pending_target.map_or(bytes, |target| bytes.max(target)))
+                .ok_or(MemoryUnavailableReason::ArithmeticOverflow)?;
+            sampled.push((key, record.identity));
+        }
+        let projected = total
+            .checked_add(reserve)
+            .ok_or(MemoryUnavailableReason::ArithmeticOverflow)?;
+        let cap = memory_cap_bytes(physical).ok_or(MemoryUnavailableReason::ArithmeticOverflow)?;
+        if projected > cap {
+            return Err(MemoryUnavailableReason::BudgetExceeded);
+        }
+
+        let mut registry = registry().lock().unwrap_or_else(|p| p.into_inner());
+        let sampled_identities = sampled
+            .iter()
+            .map(|(key, identity)| (*key, identity.clone()))
+            .collect::<Vec<_>>();
+        if !snapshot_still_current(&registry, &root, epoch, &sampled_identities) {
+            return Err(MemoryUnavailableReason::SnapshotChanged);
+        }
+        let next_epoch =
+            next_root_epoch(&registry, &root).ok_or(MemoryUnavailableReason::ArithmeticOverflow)?;
+        let next_nonce = registry
+            .next_nonce
+            .checked_add(1)
+            .ok_or(MemoryUnavailableReason::ArithmeticOverflow)?;
+        registry.next_nonce = next_nonce.max(1);
+        let nonce = registry.next_nonce;
+        registry.root_loads.insert(
+            nonce,
+            PendingRootLoad {
+                root: root.clone(),
+                target_bytes: reserve,
+            },
+        );
+        registry.epochs.insert(root.clone(), next_epoch);
+        Ok(Self {
+            root,
+            nonce: Some(nonce),
+        })
+    }
+
+    pub(crate) fn settle(mut self) {
+        self.release();
+    }
+
+    fn release(&mut self) {
+        let Some(nonce) = self.nonce.take() else {
+            return;
+        };
+        let mut registry = registry().lock().unwrap_or_else(|p| p.into_inner());
+        if registry.root_loads.remove(&nonce).is_some() {
+            let next_epoch = next_root_epoch(&registry, &self.root).unwrap_or(u64::MAX);
+            registry.epochs.insert(self.root.clone(), next_epoch);
+        }
+    }
+}
+
+impl Drop for RootLoadReservation {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
 impl PendingLoadReservation {
     pub(crate) fn settle(self) {
         let mut registry = registry().lock().unwrap_or_else(|p| p.into_inner());
@@ -507,11 +679,74 @@ pub(crate) fn owned_children_for_root(
 
 fn cold_reserve(id: &str, revision: &str, kind: LoadKind) -> Result<u64, MemoryUnavailableReason> {
     match (kind, id, revision) {
-        (LoadKind::Asr, ASR_MODEL_ID, ASR_MODEL_REVISION) => Ok(ASR_COLD_RESERVE_BYTES),
+        (LoadKind::Asr, id, revision) => {
+            let model = crate::ondevice_models::mlx_model(id)
+                .filter(|model| model.revision == revision)
+                .ok_or(MemoryUnavailableReason::UncalibratedModel)?;
+            match model.id {
+                ASR_MODEL_ID if model.revision == ASR_MODEL_REVISION => Ok(ASR_COLD_RESERVE_BYTES),
+                crate::ondevice_models::QWEN_ASR_17_ID => Ok(QWEN_ASR_17_RESERVE_BYTES),
+                crate::ondevice_models::PARAKEET_ASR_8BIT_ID => Ok(PARAKEET_ASR_8BIT_RESERVE_BYTES),
+                crate::ondevice_models::FIRERED_ASR2_AED_ID => Ok(FIRERED_ASR2_AED_RESERVE_BYTES),
+                crate::ondevice_models::FUN_ASR_NANO_2512_ID => Ok(FUN_ASR_NANO_2512_RESERVE_BYTES),
+                crate::ondevice_models::COHERE_TRANSCRIBE_ID => Ok(COHERE_TRANSCRIBE_RESERVE_BYTES),
+                _ => Err(MemoryUnavailableReason::UncalibratedModel),
+            }
+        }
         (LoadKind::Cleanup, CLEANUP_MODEL_ID, CLEANUP_MODEL_REVISION) => {
             Ok(CLEANUP_COLD_RESERVE_BYTES)
         }
-        _ => Err(MemoryUnavailableReason::UncalibratedModel),
+        (LoadKind::Cleanup, id, revision) => {
+            if let Some(model) = crate::modelstore::mlx_model(id) {
+                if model.revision != revision {
+                    return Err(MemoryUnavailableReason::UncalibratedModel);
+                }
+                if model.development_reserve_bytes > 0 {
+                    return Ok(model.development_reserve_bytes);
+                }
+                return Err(MemoryUnavailableReason::UncalibratedModel);
+            }
+            let manifest = crate::gguf_cleanup_store::model(id)
+                .filter(|manifest| manifest.revision == revision)
+                .ok_or(MemoryUnavailableReason::UncalibratedModel)?;
+            match manifest.id {
+                crate::gguf_cleanup_store::QWEN_35_2B_ID => Ok(QWEN_35_2B_RESERVE_BYTES),
+                crate::gguf_cleanup_store::QWEN_35_4B_ID => Ok(QWEN_35_4B_RESERVE_BYTES),
+                crate::gguf_cleanup_store::GEMMA_4_E4B_IT_ID => Ok(GEMMA_4_E4B_IT_RESERVE_BYTES),
+                _ => Err(MemoryUnavailableReason::UncalibratedModel),
+            }
+        }
+    }
+}
+
+pub(crate) fn static_model_memory_compatibility(
+    id: &str,
+    revision: &str,
+) -> Result<(), MemoryUnavailableReason> {
+    let reserve = cold_reserve(id, revision, LoadKind::Cleanup)?;
+    static_reserve_memory_compatibility(reserve, physical_memory_bytes())
+}
+
+pub(crate) fn static_asr_memory_compatibility(
+    id: &str,
+    revision: &str,
+) -> Result<(), MemoryUnavailableReason> {
+    let reserve = cold_reserve(id, revision, LoadKind::Asr)?;
+    static_reserve_memory_compatibility(reserve, physical_memory_bytes())
+}
+
+fn static_reserve_memory_compatibility(
+    reserve: u64,
+    physical: Option<u64>,
+) -> Result<(), MemoryUnavailableReason> {
+    // Catalog/download eligibility uses total physical capacity only. Runtime
+    // admissions separately account for transient pressure and child footprints.
+    let physical = physical.ok_or(MemoryUnavailableReason::UnknownPhysicalMemory)?;
+    let cap = memory_cap_bytes(physical).ok_or(MemoryUnavailableReason::ArithmeticOverflow)?;
+    if reserve > cap {
+        Err(MemoryUnavailableReason::BudgetExceeded)
+    } else {
+        Ok(())
     }
 }
 
@@ -586,6 +821,12 @@ pub(crate) fn physical_memory_bytes() -> Option<u64> {
 #[cfg(all(not(target_os = "macos"), not(test)))]
 pub(crate) fn physical_memory_bytes() -> Option<u64> {
     None
+}
+#[cfg(test)]
+pub(crate) fn physical_memory_bytes() -> Option<u64> {
+    // Keep settings compatibility fixtures aligned with the default test
+    // admission sampler; production always queries the host.
+    Some(64 * 1024 * 1024 * 1024)
 }
 
 #[cfg(target_os = "macos")]
@@ -1290,6 +1531,29 @@ mod tests {
         assert_eq!(decode_physical_memory(Some((0, 8))), None);
         assert_eq!(decode_physical_memory(Some((32, 4))), None);
         assert_eq!(decode_physical_memory(None), None);
+    }
+
+    #[test]
+    fn qwen17_and_firered_use_ten_gib_reserve_under_static_asr_cap() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        for id in [
+            crate::ondevice_models::QWEN_ASR_17_ID,
+            crate::ondevice_models::FIRERED_ASR2_AED_ID,
+        ] {
+            let manifest = crate::ondevice_models::mlx_model(id)
+                .expect("the ASR model is present in the pinned manifest");
+            let reserve = cold_reserve(id, manifest.revision, LoadKind::Asr)
+                .expect("the manifest has a model-specific ASR reserve");
+            assert_eq!(reserve, 10 * GIB);
+            assert_eq!(
+                static_reserve_memory_compatibility(reserve, Some(12 * GIB)),
+                Err(MemoryUnavailableReason::BudgetExceeded)
+            );
+            assert_eq!(
+                static_reserve_memory_compatibility(reserve, Some(16 * GIB)),
+                Ok(())
+            );
+        }
     }
     #[test]
     fn roots_are_isolated_and_retiring_children_remain_registered_until_wait() {

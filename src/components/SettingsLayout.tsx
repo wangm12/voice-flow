@@ -25,14 +25,14 @@ export function SettingsPageHeader({ title, description, actions, saveHint }: Se
   );
 }
 
-export function SettingsGroup({ title, description, children, variant = "surface" }: { title: string; description?: string; children: ReactNode; variant?: "plain" | "surface" }) {
+export function SettingsGroup({ title, description, children }: { title: string; description?: string; children: ReactNode }) {
   return (
-    <section className={`vf-settings-group vf-settings-group--${variant} mt-6`}>
+    <section className="vf-settings-group mt-6">
       <div className="vf-settings-group-heading mb-2 flex flex-wrap items-baseline justify-between gap-2">
         <h2 className="text-base font-medium leading-6 text-primary">{title}</h2>
         {description && <p className="max-w-prose text-xs leading-[18px] text-secondary">{description}</p>}
       </div>
-      <div className={`vf-settings-group-body divide-y divide-border ${variant === "surface" ? "rounded-2xl border border-border bg-card" : ""}`}>
+      <div className="vf-settings-group-body divide-y divide-border rounded-2xl border border-border bg-card">
         {children}
       </div>
     </section>

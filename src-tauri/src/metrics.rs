@@ -20,9 +20,6 @@ const MAX_LABEL_CHARS: usize = 64;
 pub enum MetricKind {
     PrefetchAsr,
     FinalAsr,
-    /// Compatibility alias for callers that have not been migrated yet.
-    #[allow(dead_code, reason = "Retained for the existing internal metrics API.")]
-    Asr,
     Cleanup,
     Validation,
     Paste,
@@ -35,10 +32,6 @@ pub enum MetricKind {
 }
 
 /// Coarse, content-free stage boundaries used by the shared dictation trace.
-#[allow(
-    dead_code,
-    reason = "Consumed by the follow-on ASR and cleanup trace instrumentation."
-)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Stage {
@@ -54,14 +47,9 @@ pub enum Stage {
     FinalGuard,
     Paste,
     TargetConfirmation,
-    LmStudioStatusProbe,
 }
 
 /// The single coarse class assigned from observed session facts by trace owners.
-#[allow(
-    dead_code,
-    reason = "Consumed by the follow-on trace classification owners."
-)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DictationClass {
@@ -76,10 +64,6 @@ pub enum DictationClass {
 
 /// Process-local trace payload. Stage offsets and durations are milliseconds
 /// from the owning host monotonic clock; child-process clocks are not mixed in.
-#[allow(
-    dead_code,
-    reason = "Consumed by the follow-on ASR and cleanup trace instrumentation."
-)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DictationTrace {
     pub session_generation: u64,
@@ -685,7 +669,6 @@ impl Metrics {
                 push_sample(&mut samples.final_asr, millis);
                 push_sample(&mut samples.asr, millis);
             }
-            MetricKind::Asr => push_sample(&mut samples.asr, millis),
             MetricKind::Cleanup => push_sample(&mut samples.cleanup, millis),
             MetricKind::Paste => push_sample(&mut samples.paste, millis),
             MetricKind::HistoryJournal => push_sample(&mut samples.history_journal, millis),
@@ -1057,14 +1040,6 @@ pub struct LatencyTimer {
 }
 
 impl LatencyTimer {
-    #[allow(
-        dead_code,
-        reason = "Retained for existing internal callers and compatibility."
-    )]
-    pub fn finish(mut self) {
-        self.record();
-    }
-
     fn record(&mut self) {
         if self.finished {
             return;
@@ -1221,22 +1196,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn lmstudio_status_probe_stage_has_strict_snake_case_wire_name() {
-        let encoded = serde_json::to_string(&Stage::LmStudioStatusProbe).unwrap();
-        assert_eq!(encoded, "\"lm_studio_status_probe\"");
-        assert_eq!(
-            serde_json::from_str::<Stage>(&encoded).unwrap(),
-            Stage::LmStudioStatusProbe
-        );
-        assert!(serde_json::from_str::<Stage>("\"lmstudio_status_probe\"").is_err());
-    }
-
-    #[test]
     fn reports_percentiles_and_keeps_samples_bounded() {
         let metrics = Metrics::default();
         for _ in 0..(MAX_SAMPLES_PER_STAGE + 10) {
             metrics.observe(
-                MetricKind::Asr,
+                MetricKind::FinalAsr,
                 &MetricGroup::unknown("dictation"),
                 Duration::from_millis(10),
             );
@@ -1254,13 +1218,6 @@ mod tests {
             let _timer = metrics.timer(MetricKind::Paste);
         }
         assert_eq!(metrics.snapshot().paste.sample_count, 1);
-    }
-
-    #[test]
-    fn stop_to_insert_timer_is_reported_once_when_finished_explicitly() {
-        let metrics = Metrics::default();
-        metrics.timer(MetricKind::StopToInsert).finish();
-        assert_eq!(metrics.snapshot().stop_to_insert.sample_count, 1);
     }
 
     #[test]

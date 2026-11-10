@@ -5,8 +5,8 @@ use crate::{
     asr, asr_request_snapshot_for_options_with_metrics, chrono_like_id, chunker,
     cleanup_failure_status, clipboard_text_for_snippets, context, finalize_text_for_scene, lexicon,
     llm, local_cleanup_or_raw_for_resolved_scene, lock_recover, metrics, paste, queue,
-    release_operation, snippets, store, try_claim_operation, AppState, CleanupDecision,
-    FinalizationContext, OperationLease, CLEANUP_STATUS_AI_SUCCESS,
+    release_operation, run_blocking_command, snippets, store, try_claim_operation, AppState,
+    CleanupDecision, FinalizationContext, OperationLease, CLEANUP_STATUS_AI_SUCCESS,
     CLEANUP_STATUS_CRITICAL_MEMORY_PRESSURE, CLEANUP_STATUS_LOCAL_MEMORY_UNAVAILABLE,
     CLEANUP_STATUS_LOCAL_ONLY, CLEANUP_STATUS_PRESERVATION_GUARD, CLEANUP_STATUS_SNIPPET_BYPASS,
 };
@@ -88,46 +88,57 @@ fn ensure_history_processing_current(
 }
 
 #[tauri::command]
-pub(crate) fn get_history(
+pub(crate) async fn get_history(
     app: tauri::AppHandle,
     before_id: Option<i64>,
     limit: Option<i64>,
     query: Option<String>,
 ) -> Result<store::HistoryPage, String> {
     let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
-    store::get_history_page(&dir, limit.unwrap_or(50), before_id, query.as_deref())
-        .map_err(|e| e.to_string())
+    run_blocking_command(move || {
+        store::get_history_page(&dir, limit.unwrap_or(50), before_id, query.as_deref())
+            .map_err(|e| e.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
-pub(crate) fn export_history(app: tauri::AppHandle) -> Result<String, String> {
+pub(crate) async fn export_history(app: tauri::AppHandle) -> Result<String, String> {
     let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
-    let json = store::export_history_json(&dir).map_err(|e| e.to_string())?;
     let downloads = app.path().download_dir().map_err(|e| e.to_string())?;
-    std::fs::create_dir_all(&downloads).map_err(|e| e.to_string())?;
-    let path = downloads.join(format!("voiceflow-history-{}.json", chrono_like_id()));
-    store::write_export_file(&path, &json).map_err(|e| e.to_string())?;
-    Ok(path.to_string_lossy().into_owned())
+    run_blocking_command(move || {
+        let json = store::export_history_json(&dir).map_err(|e| e.to_string())?;
+        std::fs::create_dir_all(&downloads).map_err(|e| e.to_string())?;
+        let path = downloads.join(format!("voiceflow-history-{}.json", chrono_like_id()));
+        store::write_export_file(&path, &json).map_err(|e| e.to_string())?;
+        Ok(path.to_string_lossy().into_owned())
+    })
+    .await
 }
 
 #[tauri::command]
-pub(crate) fn export_gold_corpus(
+pub(crate) async fn export_gold_corpus(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<String, String> {
     let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
     let downloads = app.path().download_dir().map_err(|e| e.to_string())?;
-    std::fs::create_dir_all(&downloads).map_err(|e| e.to_string())?;
     let language = lock_recover(&state.settings).language.clone();
-    let exported =
-        store::export_gold_corpus(&dir, &downloads, &language).map_err(|e| e.to_string())?;
-    Ok(exported.directory)
+    run_blocking_command(move || {
+        std::fs::create_dir_all(&downloads).map_err(|e| e.to_string())?;
+        let exported =
+            store::export_gold_corpus(&dir, &downloads, &language).map_err(|e| e.to_string())?;
+        Ok(exported.directory)
+    })
+    .await
 }
 
 #[tauri::command]
-pub(crate) fn repaste_history(id: i64, app: tauri::AppHandle) -> Result<(), String> {
+pub(crate) async fn repaste_history(id: i64, app: tauri::AppHandle) -> Result<(), String> {
     let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
-    let text = store::history_text(&dir, id).map_err(|e| e.to_string())?;
+    let text =
+        run_blocking_command(move || store::history_text(&dir, id).map_err(|e| e.to_string()))
+            .await?;
     if text.trim().is_empty() {
         return Err("这条历史记录没有可恢复的文字".into());
     }
@@ -250,12 +261,13 @@ pub(crate) async fn save_history_revision(
 }
 
 #[tauri::command]
-pub(crate) fn get_history_revisions(
+pub(crate) async fn get_history_revisions(
     id: i64,
     app: tauri::AppHandle,
 ) -> Result<Vec<store::HistoryRevision>, String> {
     let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
-    store::get_history_revisions(&dir, id).map_err(|e| e.to_string())
+    run_blocking_command(move || store::get_history_revisions(&dir, id).map_err(|e| e.to_string()))
+        .await
 }
 
 fn reclean_delivery_after_finalization(
@@ -498,7 +510,6 @@ pub(crate) async fn reclean_history(
                     .then(|| current_settings.custom_cleanup_parameters.clone());
                 let prepared_text = prepared_text.clone();
                 let pairs_hint = pairs_hint.clone();
-                let language = settings.language.clone();
                 let intent = intent.clone();
                 let policy_base = policy_base.clone();
                 let profile_id = profile_id.clone();
@@ -511,17 +522,16 @@ pub(crate) async fn reclean_history(
                     let result = crate::with_cleanup_warmup_model_demand(
                         app_state,
                         cleanup_provider,
-                        llm::cleanup_with_provider_and_native_runtime_and_intent_and_source(
+                        llm::cleanup_with_provider_and_local_runtimes_and_intent_and_source(
                             cleanup_provider,
                             &app_state.mlx_cleanup_runtime,
+                            Some(&app_state.llama_cleanup_runtime),
                             &cleanup_endpoint,
                             &cleanup_model,
                             &prepared_text,
                             &cleanup_key,
-                            &[],
                             None,
                             Some(&attempt_policy),
-                            Some(language.as_str()),
                             None,
                             Some(&intent),
                             pairs_hint.as_deref(),
@@ -854,14 +864,18 @@ pub(crate) async fn reclean_history(
 }
 
 #[tauri::command]
-pub(crate) fn delete_history(
+pub(crate) async fn delete_history(
     id: i64,
     app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    let _operation = claim_history_mutation(&app, &state)?;
+    let operation = claim_history_mutation(&app, &state)?;
     let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
-    store::delete_history(&dir, id).map_err(|e| e.to_string())
+    run_blocking_command(move || {
+        let _operation = operation;
+        store::delete_history(&dir, id).map_err(|e| e.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
@@ -1375,7 +1389,6 @@ async fn retry_dictation_inner(
                         let cleanup_input = cleanup_input.clone();
                         let source_transcript = source_transcript.clone();
                         let pairs_hint = pairs_hint.clone();
-                        let language = settings.language.clone();
                         let intent = intent.clone();
                         let policy_base = policy_base.clone();
                         let profile_id = profile_id.clone();
@@ -1383,17 +1396,16 @@ async fn retry_dictation_inner(
                             let result = crate::with_cleanup_warmup_model_demand(
                                 app_state,
                                 cleanup_provider,
-                                llm::cleanup_with_provider_and_native_runtime_and_intent_and_source(
+                                llm::cleanup_with_provider_and_local_runtimes_and_intent_and_source(
                                     cleanup_provider,
                                     &app_state.mlx_cleanup_runtime,
+                                    Some(&app_state.llama_cleanup_runtime),
                                     &cleanup_endpoint,
                                     &cleanup_model,
                                     &cleanup_input,
                                     &cleanup_key,
-                                    &[],
                                     None,
                                     Some(&attempt_policy),
-                                    Some(language.as_str()),
                                     None,
                                     Some(&intent),
                                     pairs_hint.as_deref(),

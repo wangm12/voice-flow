@@ -2,8 +2,9 @@ import { closeSelect, openSelect, selectOption } from "../../test/selectOption";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { useState } from "react";
-import type { Settings } from "../../types/settings";
+import type { LocalCleanupModelStatus, MlxCleanupModelStatus, Settings } from "../../types/settings";
 import type { JsonObject } from "../../lib/customCleanupParameters";
 import { I18nProvider, useI18n } from "../../lib/i18n";
 import { PROVIDERS } from "../../lib/providers";
@@ -59,6 +60,46 @@ const customJsonSaveCases: Array<{ label: string; parameters: JsonObject; source
     source: '{\n  "max_tokens": 2048,\n  "temperature": 0.2\n}',
   },
 ];
+
+const localCleanupCatalog: LocalCleanupModelStatus[] = [
+  {
+    id: "qwen3.5-2b", label: "Qwen3.5 2B · Q4_K_M", repository: "lmstudio-community/Qwen3.5-2B-GGUF",
+    revision: "rev-qwen2b", sha256: "sha-qwen2b", bytes: 1_270_808_032, state: "missing", operation: null,
+    bytes_done: 0, bytes_total: 0, error: null, last_operation: null, last_operation_error: null,
+    managed: false, verified: false, compatible: true, compatibility_error: null,
+  },
+  {
+    id: "qwen3.5-4b", label: "Qwen3.5 4B · Q4_K_M", repository: "lmstudio-community/Qwen3.5-4B-GGUF",
+    revision: "rev-qwen4b", sha256: "sha-qwen4b", bytes: 2_707_513_696, state: "missing", operation: null,
+    bytes_done: 0, bytes_total: 0, error: null, last_operation: null, last_operation_error: null,
+    managed: false, verified: false, compatible: true, compatibility_error: null,
+  },
+  {
+    id: "gemma-4-e4b-it", label: "Gemma 4 E4B IT · Q4_0", repository: "ggml-org/gemma-4-E4B-it-GGUF",
+    revision: "rev-gemma", sha256: "sha-gemma", bytes: 4_590_807_392, state: "missing", operation: null,
+    bytes_done: 0, bytes_total: 0, error: null, last_operation: null, last_operation_error: null,
+    managed: false, verified: false, compatible: true, compatibility_error: null,
+  },
+];
+
+function localCleanupModels(overrides: Partial<LocalCleanupModelStatus>[] = []) {
+  return localCleanupCatalog.map((model, index) => ({ ...model, ...overrides[index] }));
+}
+
+const mlxCleanupCatalog: MlxCleanupModelStatus[] = [
+  {
+    id: "qwen3_5_2b_mlx_4bit", label: "Qwen3.5 2B · MLX 4-bit", repository: "mlx-community/Qwen3.5-2B-4bit",
+    revision: "rev-qwen-mlx-2b", bytes: 2_000_000_000,
+    language: "Multilingual; product language coverage pending verification",
+    state: "missing", operation: null, bytes_done: 0, bytes_total: 0, error: null,
+    last_operation: null, last_operation_error: null, managed: false, partial_managed: false,
+    verified: false, qualified: false, download_available: true, downloadable: true, selectable: false, compatible: true, compatibility_error: null,
+  },
+];
+
+function mlxCleanupModels(overrides: Partial<MlxCleanupModelStatus>[] = []) {
+  return mlxCleanupCatalog.map((model, index) => ({ ...model, ...overrides[index] }));
+}
 
 const enginePages: ReadonlyArray<{ id: EnginePage; label: "服务配置" | "API Key" | "本地模型" | "高级设置" }> = [
   { id: "service", label: "服务配置" },
@@ -166,6 +207,7 @@ describe("EngineSettings form", () => {
   afterEach(() => {
     cleanup();
     vi.mocked(invoke).mockReset();
+    vi.mocked(listen).mockReset().mockResolvedValue(() => undefined);
     vi.useRealTimers();
   });
 
@@ -185,7 +227,8 @@ describe("EngineSettings form", () => {
     expect(within(cleanupMenu).queryByRole("option", { name: "Deepgram" })).not.toBeInTheDocument();
     expect(within(cleanupMenu).queryByRole("option", { name: "Local Whisper" })).not.toBeInTheDocument();
     expect(within(cleanupMenu).getByRole("option", { name: "DeepSeek" })).toBeInTheDocument();
-    expect(within(cleanupMenu).getByRole("option", { name: "LM Studio" })).toBeInTheDocument();
+    expect(within(cleanupMenu).getByRole("option", { name: "VoiceFlow llama.cpp" })).toHaveAttribute("aria-disabled", "true");
+    expect(within(cleanupMenu).queryByRole("option", { name: "LM Studio" })).not.toBeInTheDocument();
     expect(within(cleanupMenu).queryByRole("option", { name: "本机模型" })).not.toBeInTheDocument();
     closeSelect(cleanupMenu);
   });
@@ -252,7 +295,7 @@ describe("EngineSettings form", () => {
     renderEngine();
     activatePage("API Key", { expandCredentialRows: false });
     const rows = Array.from(credentialPanel().querySelectorAll<HTMLElement>("[data-provider]"));
-    const keyCapableProviders = PROVIDERS.filter(({ id }) => !["on_device", "on_device_mlx", "lmstudio"].includes(id));
+    const keyCapableProviders = PROVIDERS.filter(({ id }) => !["on_device", "on_device_mlx", "on_device_llama_cpp"].includes(id));
     expect(rows.map((row) => row.dataset.provider)).toEqual(expect.arrayContaining(keyCapableProviders.map(({ id }) => id)));
     expect(rows).toHaveLength(keyCapableProviders.length);
     expect(new Set(rows.map((row) => row.dataset.provider)).size).toBe(rows.length);
@@ -266,7 +309,7 @@ describe("EngineSettings form", () => {
     expect(credentialPanel().querySelector("[data-provider=custom]")).toBeInTheDocument();
     expect(credentialPanel().querySelector("[data-provider=on_device]")).not.toBeInTheDocument();
     expect(credentialPanel().querySelector("[data-provider=on_device_mlx]")).not.toBeInTheDocument();
-    expect(credentialPanel().querySelector("[data-provider=lmstudio]")).not.toBeInTheDocument();
+    expect(credentialPanel().querySelector("[data-provider=on_device_llama_cpp]")).not.toBeInTheDocument();
     expect(within(credentialPanel()).queryByText("管理其他服务")).not.toBeInTheDocument();
   });
 
@@ -929,34 +972,6 @@ describe("EngineSettings form", () => {
     expect(retry).toBeEnabled();
     fireEvent.click(retry);
     await waitFor(() => expect(invoke).toHaveBeenCalledWith("download_on_device_model", { id: "qwen3-asr-0.6b" }));
-  });
-
-  it("keeps LM Studio an explicit native local cleanup choice and checks instance facts", async () => {
-    const commitEngine = vi.fn();
-    vi.mocked(invoke).mockImplementation(async (command) => {
-      if (command === "list_on_device_models") return [{ id: "qwen3-asr-0.6b", state: "ready", inference_ready: true }];
-      if (command === "get_lmstudio_cleanup_status") {
-        return {
-          available: true,
-          status: "ready_local_instance",
-          message: "LM Studio CLI and native model metadata match.",
-          model: "qwen/qwen3.8-27b@6bit",
-          instance_id: "voiceflow-cleanup",
-          local_source_confirmed: true,
-        };
-      }
-      return undefined;
-    });
-    renderEngine({ asr_provider: "on_device", asr_model: "qwen3-asr-0.6b" }, { commitEngine });
-    selectOption(screen.getByRole("combobox", { name: "整理服务" }), "lmstudio");
-    expect(screen.getByRole("combobox", { name: "AI 文字整理模型" })).toHaveValue("qwen/qwen3.8-27b@6bit");
-    expect(screen.queryByLabelText("LM Studio API Key")).not.toBeInTheDocument();
-    activatePage("高级设置");
-    openAdvancedConnections();
-    fireEvent.click(screen.getByRole("button", { name: "检查本机 LM Studio" }));
-    await waitFor(() => expect(invoke).toHaveBeenCalledWith("get_lmstudio_cleanup_status"));
-    expect(await within(advancedPanel()).findByRole("status")).toHaveTextContent("本机 LM Studio 实例可用 · ready_local_instance");
-    expect(commitEngine).not.toHaveBeenCalled();
   });
 
   it("explains local MLX cleanup and puts download before import for an unmanaged model", async () => {
@@ -1834,16 +1849,16 @@ describe("EngineSettings form", () => {
   });
 
   it.each([
-    ["qwen3-asr-1.7b", "missing", "runtime_ready", false],
     ["qwen3-asr-1.7b", "ready", "runtime_ready", false],
     ["qwen3-asr-1.7b", "ready", "loaded", true],
-    ["cohere-transcribe-2b", "missing", "runtime_ready", false],
     ["cohere-transcribe-2b", "ready", "runtime_ready", false],
     ["cohere-transcribe-2b", "ready", "loaded", true],
-  ] as const)("shows the unreviewed conversion notice for %s in %s/%s", async (id, state, runtime_status, loaded) => {
+    ["cohere-transcribe-2b", "corrupt", "runtime_ready", false],
+  ] as const)("keeps existing %s files (%s/%s) deletable without a license warning", async (id, state, runtime_status, loaded) => {
     vi.mocked(invoke).mockImplementation(async (command) => command === "list_on_device_models" ? [{
       id, label: id, state, inference_ready: state === "ready", platform_supported: true,
       runtime_status, loaded, downloaded_bytes: state === "ready" ? 100 : 0, bytes: 100,
+      download_available: id === "qwen3-asr-1.7b",
       sha256: null, revision: null, file_count: 1,
     }] : undefined);
     renderEngine({ asr_provider: "on_device", asr_model: "qwen3-asr-0.6b" }, {}, "en");
@@ -1851,26 +1866,31 @@ describe("EngineSettings form", () => {
     await within(modelsPanel()).findByText(id);
     const row = within(modelsPanel()).getByText(id).closest<HTMLElement>("[data-model-row]");
     expect(row).not.toBeNull();
-    expect(within(row!).getByText("License unreviewed")).toBeVisible();
+    expect(within(row!).queryByText("License unreviewed")).not.toBeInTheDocument();
+    expect(within(row!).queryByText("The official model card declares Apache-2.0; the license for this fixed MLX conversion remains unreviewed.")).not.toBeInTheDocument();
+    expect(within(row!).getByRole("button", { name: `Delete model: ${id}` })).toBeEnabled();
+    expect(within(row!).queryByRole("button", { name: /Download model|Download again/ })).not.toBeInTheDocument();
     if (id === "cohere-transcribe-2b") {
       expect(within(row!).getByText("Choose Chinese or English. Automatic language detection is not supported.")).toBeVisible();
       expect(within(row!).getAllByText("Choose Chinese or English. Automatic language detection is not supported.")).toHaveLength(1);
     }
     fireEvent.click(within(row!).getByText("Technical details"));
-    expect(within(row!).getByText("The official model card declares Apache-2.0; the license for this fixed MLX conversion remains unreviewed.")).toBeVisible();
+    expect(within(row!).queryByText("The official model card declares Apache-2.0; the license for this fixed MLX conversion remains unreviewed.")).not.toBeInTheDocument();
   });
 
-  it("keeps both target notices visible while a different model is selected", async () => {
+  it("offers Qwen3-ASR 1.7B for download and hides retired local models with no files", async () => {
     vi.mocked(invoke).mockImplementation(async (command) => command === "list_on_device_models" ? [
       { id: "qwen3-asr-0.6b", label: "Qwen3 ASR 0.6B", state: "ready", inference_ready: true, platform_supported: true, runtime_status: "runtime_ready", loaded: false, downloaded_bytes: 100, bytes: 100 },
-      { id: "qwen3-asr-1.7b", label: "Qwen3 ASR 1.7B", state: "missing", inference_ready: false, platform_supported: true, runtime_status: "runtime_ready", loaded: false, downloaded_bytes: 0, bytes: 100 },
-      { id: "cohere-transcribe-2b", label: "Cohere Transcribe 2B", state: "missing", inference_ready: false, platform_supported: true, runtime_status: "runtime_ready", loaded: false, downloaded_bytes: 0, bytes: 100 },
+      { id: "qwen3-asr-1.7b", label: "Qwen3 ASR 1.7B", state: "missing", inference_ready: false, platform_supported: true, runtime_status: "runtime_ready", loaded: false, downloaded_bytes: 0, bytes: 100, download_available: true },
+      { id: "cohere-transcribe-2b", label: "Cohere Transcribe 2B", state: "missing", inference_ready: false, platform_supported: true, runtime_status: "runtime_ready", loaded: false, downloaded_bytes: 0, bytes: 100, download_available: false },
     ] : undefined);
     renderEngine({ asr_provider: "on_device", asr_model: "qwen3-asr-0.6b" }, {}, "en");
     activatePage("Local models");
-    expect(await within(modelsPanel()).findAllByText("License unreviewed")).toHaveLength(2);
-    const selectedRow = within(modelsPanel()).getByText("Qwen3 ASR 0.6B").closest("[data-model-row]");
-    expect(selectedRow).not.toHaveTextContent("License unreviewed");
+    await within(modelsPanel()).findByText("Qwen3 ASR 0.6B");
+    const qwen17 = within(modelsPanel()).getByText("Qwen3 ASR 1.7B").closest<HTMLElement>("[data-model-row]")!;
+    expect(within(qwen17).getByRole("button", { name: "Download model" })).toBeEnabled();
+    expect(within(modelsPanel()).queryByText("Cohere Transcribe 2B")).not.toBeInTheDocument();
+    expect(within(modelsPanel()).queryByText("License unreviewed")).not.toBeInTheDocument();
   });
 
   it("distinguishes the saved local ASR model from a pending model choice", async () => {
@@ -1878,20 +1898,20 @@ describe("EngineSettings form", () => {
       { id: "qwen3-asr-0.6b", label: "Qwen3 ASR 0.6B", state: "ready", inference_ready: true, platform_supported: true, runtime_status: "runtime_ready", loaded: false, downloaded_bytes: 100, bytes: 100 },
       { id: "qwen3-asr-1.7b", label: "Qwen3 ASR 1.7B", state: "ready", inference_ready: true, platform_supported: true, runtime_status: "runtime_ready", loaded: false, downloaded_bytes: 200, bytes: 200 },
     ] : undefined);
-    renderEngine({ asr_provider: "on_device", asr_model: "qwen3-asr-0.6b", cleanup_enabled: false });
+    renderEngine({ asr_provider: "on_device", asr_model: "qwen3-asr-1.7b", cleanup_enabled: false });
     activatePage("本地模型");
 
     const panel = modelsPanel();
-    await within(panel).findByText("Qwen3 ASR 0.6B");
-    const savedRow = within(panel).getByText("Qwen3 ASR 0.6B").closest<HTMLElement>("[data-model-row]");
+    await within(panel).findByText("Qwen3 ASR 1.7B");
+    const savedRow = within(panel).getByText("Qwen3 ASR 1.7B").closest<HTMLElement>("[data-model-row]");
     expect(savedRow).not.toBeNull();
     expect(within(savedRow!).getByText("服务配置已选")).toBeVisible();
     expect(within(panel).queryByText(/当前草稿|未选择/)).not.toBeInTheDocument();
 
     activatePage("服务配置");
-    selectOption(screen.getByRole("combobox", { name: "ASR 模型" }), "qwen3-asr-1.7b");
+    selectOption(screen.getByRole("combobox", { name: "ASR 模型" }), "qwen3-asr-0.6b");
     activatePage("本地模型");
-    const pendingRow = within(panel).getByText("Qwen3 ASR 1.7B").closest<HTMLElement>("[data-model-row]");
+    const pendingRow = within(panel).getByText("Qwen3 ASR 0.6B").closest<HTMLElement>("[data-model-row]");
     expect(pendingRow).not.toBeNull();
     expect(within(pendingRow!).getByText("待应用")).toBeVisible();
     expect(within(savedRow!).getByText("服务配置已选")).toBeVisible();
@@ -1974,12 +1994,504 @@ describe("EngineSettings form", () => {
     expect(within(panel).queryByText(/当前草稿|未选择/)).not.toBeInTheDocument();
     fireEvent.click(within(panel).getByText("旧版文件管理"));
     expect(within(panel).getByText("SenseVoice Small")).toBeVisible();
+    const legacyRow = within(panel).getByText("SenseVoice Small").closest<HTMLElement>("[data-model-row]")!;
+    expect(within(legacyRow).getByRole("button", { name: "删除模型: SenseVoice Small" })).toBeEnabled();
+    expect(within(legacyRow).queryByRole("button", { name: /下载模型|重新下载/ })).not.toBeInTheDocument();
     expect(await within(panel).findByText("Qwen 3.8 27B")).toBeVisible();
     for (const group of groups) {
       expect(group.querySelectorAll(".vf-settings-group-body")).toHaveLength(1);
       expect(group.querySelector(".vf-settings-group-body section")).not.toBeInTheDocument();
       expect(group.querySelector(".vf-settings-group-body div.rounded-md.border, .vf-settings-group-body div.rounded-xl.border, .vf-settings-group-body div.rounded-lg.bg-elevated, .vf-settings-group-body div.bg-card\\/35")).not.toBeInTheDocument();
     }
+  });
+
+  it("hides legacy SenseVoice management once no files remain and it is not selected", async () => {
+    vi.mocked(invoke).mockImplementation(async (command) => command === "list_on_device_models" ? [
+      { id: "qwen3-asr-0.6b", label: "Qwen3 ASR 0.6B", state: "ready", inference_ready: true, platform_supported: true, runtime_status: "runtime_ready", loaded: false, downloaded_bytes: 100, bytes: 100 },
+      { id: "sensevoice-small", label: "SenseVoice Small", state: "missing", inference_ready: false, runtime_status: "legacy_no_runtime", loaded: false, downloaded_bytes: 0, bytes: 100 },
+    ] : undefined);
+    renderEngine({ asr_provider: "on_device", asr_model: "qwen3-asr-0.6b" });
+    activatePage("本地模型");
+    await within(modelsPanel()).findByText("Qwen3 ASR 0.6B");
+    expect(within(modelsPanel()).queryByText("旧版文件管理")).not.toBeInTheDocument();
+    expect(within(modelsPanel()).queryByText("SenseVoice Small")).not.toBeInTheDocument();
+  });
+
+  it("lists installed local cleanup models with their pinned sizes and compatibility reasons", async () => {
+    const models = localCleanupModels([
+      { state: "installed", managed: true, verified: true, compatible: false, compatibility_error: "uncalibrated_memory" },
+      { state: "installed", managed: true, verified: true, compatible: true },
+      { state: "installed", managed: true, verified: true, compatible: true },
+    ]);
+    vi.mocked(invoke).mockImplementation(async (command) => command === "list_local_cleanup_models"
+      ? models
+      : command === "list_on_device_models" ? [] : undefined);
+    renderEngine();
+    activatePage("本地模型");
+
+    const panel = modelsPanel();
+    const qwen2 = await within(panel).findByText("Qwen3.5 2B · Q4_K_M");
+    const qwen4 = within(panel).getByText("Qwen3.5 4B · Q4_K_M");
+    const gemma = within(panel).getByText("Gemma 4 E4B IT · Q4_0");
+    const qwen2Row = qwen2.closest<HTMLElement>("[data-model-row]")!;
+    const qwen4Row = qwen4.closest<HTMLElement>("[data-model-row]")!;
+    const gemmaRow = gemma.closest<HTMLElement>("[data-model-row]")!;
+
+    expect(within(qwen2Row).getByText("1.2 GB · 已下载并校验")).toBeVisible();
+    expect(within(qwen2Row).getByText("此模型的最低内存档尚未完成验证。")).toBeVisible();
+    expect(within(qwen4Row).getByText("2.5 GB · 已下载并校验")).toBeVisible();
+    expect(within(gemmaRow).getByText("4.3 GB · 已下载并校验")).toBeVisible();
+    expect(within(gemmaRow).queryByText("通用整理 · 适用语言和模式按模型分别验收。")).not.toBeInTheDocument();
+    fireEvent.click(within(gemmaRow).getByText("技术信息"));
+    expect(within(gemmaRow).queryByText("逐款验收中；当前尚无已验证语言或模式列表。")).not.toBeInTheDocument();
+    expect(within(gemmaRow).getByText(/Apple M1 · 16 GB；待实机验证/)).toBeVisible();
+    expect(within(gemmaRow).getByText(/该模型最低支持档尚待实机验收；兼容状态按本机检查结果显示。/)).toBeVisible();
+    for (const row of [qwen2Row, qwen4Row, gemmaRow]) {
+      expect(within(row).queryByRole("button", { name: "下载模型" })).not.toBeInTheDocument();
+    }
+  });
+
+  it("keeps download progress and cancellation scoped to one model without selecting it", async () => {
+    let currentModels = localCleanupModels();
+    vi.mocked(invoke).mockImplementation(async (command, args) => {
+      if (command === "list_on_device_models") return [];
+      if (command === "list_local_cleanup_models") return currentModels;
+      if (command === "download_local_cleanup_model") {
+        expect(args).toEqual({ id: "qwen3.5-2b" });
+        currentModels = currentModels.map((model) => model.id === "qwen3.5-2b"
+          ? { ...model, state: "downloading", operation: "download", managed: true, partial_managed: true, bytes_done: 65_536, bytes_total: model.bytes }
+          : model);
+        return undefined;
+      }
+      if (command === "cancel_local_cleanup_model_download") {
+        expect(args).toEqual({ id: "qwen3.5-2b" });
+        currentModels = currentModels.map((model) => model.id === "qwen3.5-2b"
+          ? { ...model, state: "missing", operation: null, partial_managed: false, bytes_done: 0, bytes_total: 0, last_operation: "download", last_operation_error: "download cancelled" }
+          : model);
+        return true;
+      }
+      return undefined;
+    });
+    const commitEngine = vi.fn();
+    renderEngine({}, { commitEngine });
+    activatePage("本地模型");
+
+    const panel = modelsPanel();
+    const qwen2Row = (await within(panel).findByText("Qwen3.5 2B · Q4_K_M")).closest<HTMLElement>("[data-model-row]")!;
+    fireEvent.click(within(qwen2Row).getByRole("button", { name: "下载模型" }));
+    expect(await within(qwen2Row).findByRole("progressbar", { name: "模型下载进度: Qwen3.5 2B · Q4_K_M" })).toBeVisible();
+    expect(within(qwen2Row).getByText("64.0 KB / 1.2 GB")).toBeVisible();
+    expect(within(qwen2Row).getByRole("button", { name: "取消下载" })).toBeEnabled();
+    expect(within(qwen2Row).queryByRole("button", { name: /删除模型|清理未完成文件/ })).not.toBeInTheDocument();
+    expect(within(panel).getByText("Qwen3.5 4B · Q4_K_M").closest("[data-model-row]")).toHaveTextContent("2.5 GB · 尚未下载");
+
+    fireEvent.click(within(qwen2Row).getByRole("button", { name: "取消下载" }));
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("cancel_local_cleanup_model_download", { id: "qwen3.5-2b" }));
+    await waitFor(() => expect(within(qwen2Row).getByText("1.2 GB · 尚未下载 · 已取消")).toBeVisible());
+    activatePage("服务配置");
+    expect(screen.getByRole("combobox", { name: "整理服务" })).toHaveValue("openai");
+    expect(screen.queryByRole("button", { name: "保存并使用" })).not.toBeInTheDocument();
+    expect(commitEngine).not.toHaveBeenCalled();
+  });
+
+  it("offers only installed verified compatible llama.cpp cleanup models and saves an explicit choice", async () => {
+    const models = localCleanupModels([
+      { state: "installed", managed: true, verified: true, compatible: true, bytes_total: localCleanupCatalog[0].bytes },
+      { state: "installed", managed: true, verified: false, compatible: true, bytes_total: localCleanupCatalog[1].bytes },
+      { state: "missing", managed: false, partial_managed: true, verified: false, compatible: true, bytes_done: 262_144, bytes_total: localCleanupCatalog[2].bytes },
+    ]);
+    vi.mocked(invoke).mockImplementation(async (command) => command === "list_local_cleanup_models"
+      ? models
+      : command === "list_on_device_models" ? [] : undefined);
+    const commitEngine = vi.fn();
+    renderEngine({}, { commitEngine });
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("list_local_cleanup_models"));
+    selectOption(screen.getByRole("combobox", { name: "整理服务" }), "on_device_llama_cpp");
+
+    const cleanupActions = screen.getByRole("button", { name: "管理模型" }).parentElement!;
+    expect(within(cleanupActions).queryByRole("button", { name: "管理凭据" })).not.toBeInTheDocument();
+    expect(within(cleanupActions).getByRole("button", { name: "管理模型" })).toBeVisible();
+    const modelSelector = screen.getByRole("combobox", { name: "AI 文字整理模型" });
+    const menu = await openSelect(modelSelector);
+    expect(within(menu).getByRole("option", { name: "Qwen3.5 2B · Q4_K_M · 1.2 GB" })).toBeInTheDocument();
+    expect(within(menu).queryByRole("option", { name: /Qwen3.5 4B/ })).not.toBeInTheDocument();
+    expect(within(menu).queryByRole("option", { name: /Gemma 4 E4B/ })).not.toBeInTheDocument();
+    closeSelect(menu);
+    selectOption(modelSelector, "qwen3.5-2b");
+    expect(screen.getByRole("button", { name: "保存并使用" })).toBeEnabled();
+    fireEvent.click(screen.getByRole("button", { name: "保存并使用" }));
+    await waitFor(() => expect(commitEngine).toHaveBeenCalledWith(expect.objectContaining({
+      cleanup_provider: "on_device_llama_cpp",
+      cleanup_model: "qwen3.5-2b",
+    })));
+  });
+
+  it("requires an explicit model choice when only one verified local cleanup model is available", async () => {
+    const models = localCleanupModels([
+      { state: "installed", managed: true, verified: true, compatible: true, bytes_total: localCleanupCatalog[0].bytes },
+      {},
+      {},
+    ]);
+    vi.mocked(invoke).mockImplementation(async (command) => command === "list_local_cleanup_models"
+      ? models
+      : command === "list_on_device_models" ? [] : undefined);
+    const commitEngine = vi.fn();
+    renderEngine({}, { commitEngine });
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("list_local_cleanup_models"));
+    selectOption(screen.getByRole("combobox", { name: "整理服务" }), "on_device_llama_cpp");
+
+    const modelSelector = screen.getByRole("combobox", { name: "AI 文字整理模型" });
+    expect(modelSelector).toHaveTextContent("请选择已下载并验证的模型");
+    const menu = await openSelect(modelSelector);
+    expect(within(menu).getAllByRole("option", { name: "Qwen3.5 2B · Q4_K_M · 1.2 GB" })).toHaveLength(1);
+    closeSelect(menu);
+
+    selectOption(modelSelector, "qwen3.5-2b");
+    expect(modelSelector).toHaveTextContent("Qwen3.5 2B · Q4_K_M · 1.2 GB");
+    expect(screen.getByRole("button", { name: "保存并使用" })).toBeEnabled();
+    fireEvent.click(screen.getByRole("button", { name: "保存并使用" }));
+    await waitFor(() => expect(commitEngine).toHaveBeenCalledWith(expect.objectContaining({
+      cleanup_provider: "on_device_llama_cpp",
+      cleanup_model: "qwen3.5-2b",
+    })));
+  });
+
+  it("shows partial download bytes and lets the user clean interrupted files", async () => {
+    let currentModels = localCleanupModels([
+      {},
+      {},
+      { partial_managed: true, bytes_done: 262_144, bytes_total: localCleanupCatalog[2].bytes },
+    ]);
+    vi.mocked(invoke).mockImplementation(async (command, args) => {
+      if (command === "list_on_device_models") return [];
+      if (command === "list_local_cleanup_models") return currentModels;
+      if (command === "delete_local_cleanup_model") {
+        expect(args).toEqual({ id: "gemma-4-e4b-it" });
+        currentModels = currentModels.map((model) => model.id === "gemma-4-e4b-it"
+          ? { ...model, partial_managed: false, bytes_done: 0 }
+          : model);
+      }
+      return undefined;
+    });
+    renderEngine();
+    activatePage("本地模型");
+
+    const panel = modelsPanel();
+    const row = (await within(panel).findByText("Gemma 4 E4B IT · Q4_0")).closest<HTMLElement>("[data-model-row]")!;
+    expect(within(row).getByText("256.0 KB / 4.3 GB · 下载未完成")).toBeVisible();
+    expect(within(row).getByText("下载已中断；可以重新下载或清理部分文件。")).toBeVisible();
+    expect(within(row).getByRole("button", { name: "下载模型" })).toBeEnabled();
+    fireEvent.click(within(row).getByRole("button", { name: "清理未完成文件: Gemma 4 E4B IT · Q4_0" }));
+
+    const dialog = screen.getByRole("dialog");
+    expect(within(dialog).getByRole("heading", { name: "清理未完成模型文件" })).toBeVisible();
+    expect(within(dialog).getByRole("button", { name: "清理文件" })).toBeVisible();
+    fireEvent.click(within(dialog).getByRole("button", { name: "清理文件" }));
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("delete_local_cleanup_model", { id: "gemma-4-e4b-it" }));
+    await waitFor(() => expect(within(row).queryByRole("button", { name: /清理未完成文件/ })).not.toBeInTheDocument());
+  });
+
+  it("prevents deleting a selected model and keeps deletion errors on the affected model", async () => {
+    const models = localCleanupModels([
+      { state: "installed", managed: true, verified: true, compatible: true, bytes_total: localCleanupCatalog[0].bytes },
+      { state: "installed", managed: true, verified: true, compatible: true, bytes_total: localCleanupCatalog[1].bytes },
+      {},
+    ]);
+    vi.mocked(invoke).mockImplementation(async (command, args) => {
+      if (command === "list_on_device_models") return [];
+      if (command === "list_local_cleanup_models") return models;
+      if (command === "delete_local_cleanup_model") {
+        if ((args as { id: string }).id === "qwen3.5-4b") throw new Error("disk deletion failed");
+      }
+      return undefined;
+    });
+    renderEngine({ cleanup_provider: "on_device_llama_cpp", cleanup_model: "qwen3.5-2b" });
+    activatePage("本地模型");
+
+    const panel = modelsPanel();
+    const qwen2Row = (await within(panel).findByText("Qwen3.5 2B · Q4_K_M")).closest<HTMLElement>("[data-model-row]")!;
+    const qwen4Row = within(panel).getByText("Qwen3.5 4B · Q4_K_M").closest<HTMLElement>("[data-model-row]")!;
+    expect(within(qwen2Row).getByRole("button", { name: "删除模型: Qwen3.5 2B · Q4_K_M" })).toBeDisabled();
+
+    fireEvent.click(within(qwen4Row).getByRole("button", { name: "删除模型: Qwen3.5 4B · Q4_K_M" }));
+    const dialog = screen.getByRole("dialog");
+    fireEvent.click(within(dialog).getByRole("button", { name: "删除模型" }));
+    expect(await within(qwen4Row).findByRole("alert")).toHaveTextContent("删除模型失败: disk deletion failed");
+    expect(within(qwen2Row).queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it("keeps native MLX models separate from GGUF and follows backend download eligibility", async () => {
+    let currentModels = mlxCleanupModels();
+    const commitEngine = vi.fn();
+    vi.mocked(invoke).mockImplementation(async (command, args) => {
+      if (command === "list_on_device_models") return [];
+      if (command === "list_local_cleanup_models") return localCleanupModels([
+        { state: "installed", managed: true, verified: true, compatible: true },
+      ]);
+      if (command === "list_mlx_cleanup_models") return currentModels;
+      if (command === "get_cleanup_model_store_status") return {
+        id: "qwen3_8_27b_mlx_6bit", label: "Qwen 3.8 27B · MLX 6-bit", repository: "lmstudio-community/Qwen3.8-27B-MLX-6bit",
+        revision: "rev-27b", state: "missing", operation: null, source_kind: null,
+        bytes_done: 0, bytes_total: 22_804_836_386, error: null, last_operation: null, last_operation_error: null,
+        managed: false, partial_managed: false, platform_supported: true,
+      };
+      if (command === "download_mlx_cleanup_model") {
+        expect(args).toEqual({ id: "qwen3_5_2b_mlx_4bit" });
+        currentModels = currentModels.map((model) => model.id === "qwen3_5_2b_mlx_4bit"
+          ? { ...model, state: "downloading", operation: "download", managed: true, partial_managed: true, bytes_done: 65_536, bytes_total: model.bytes }
+          : model);
+      }
+      if (command === "cancel_mlx_cleanup_model_download") {
+        expect(args).toEqual({ id: "qwen3_5_2b_mlx_4bit" });
+        currentModels = currentModels.map((model) => model.id === "qwen3_5_2b_mlx_4bit"
+          ? { ...model, state: "missing", operation: null, partial_managed: false, bytes_done: 0, bytes_total: 0, last_operation: "download", last_operation_error: "download cancelled" }
+          : model);
+        return true;
+      }
+      return undefined;
+    });
+    renderEngine({}, { commitEngine });
+    activatePage("本地模型");
+
+    const panel = modelsPanel();
+    expect(within(panel).getByRole("heading", { name: "本机文字整理" })).toBeVisible();
+    await within(panel).findByText("Qwen3.5 2B · Q4_K_M");
+    expect(within(panel).getByText("Qwen3.5 2B · Q4_K_M")).toBeVisible();
+    expect(await within(panel).findByText("Qwen 3.8 27B")).toBeVisible();
+    const ggufRow = within(panel).getByText("Qwen3.5 2B · Q4_K_M").closest<HTMLElement>("[data-model-row]")!;
+    expect(within(ggufRow).queryByRole("button", { name: "下载模型" })).not.toBeInTheDocument();
+    const row = within(panel).getByText("Qwen3.5 2B · MLX 4-bit").closest<HTMLElement>("[data-model-row]")!;
+    expect(row).not.toHaveTextContent("多语言；产品语言覆盖尚待验证");
+    expect(row).not.toHaveTextContent("尚未通过发布验收");
+    expect(row).not.toHaveTextContent("此模型尚未完成发布验收；当前状态不代表已验证的整理质量。");
+    expect(row).not.toHaveTextContent("此模型尚未完成完整整理质量评测；文件校验不代表质量评测通过。");
+    expect(within(row).getByRole("button", { name: "下载模型" })).toBeEnabled();
+
+    fireEvent.click(within(row).getByRole("button", { name: "下载模型" }));
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("download_mlx_cleanup_model", { id: "qwen3_5_2b_mlx_4bit" }));
+    expect(await within(row).findByRole("progressbar", { name: "模型下载进度: Qwen3.5 2B · MLX 4-bit" })).toBeVisible();
+    expect(within(row).getByText("64.0 KB / 1.9 GB")).toBeVisible();
+    fireEvent.click(within(row).getByRole("button", { name: "取消下载" }));
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("cancel_mlx_cleanup_model_download", { id: "qwen3_5_2b_mlx_4bit" }));
+    await waitFor(() => expect(within(row).getByText("1.9 GB · 尚未下载 · 已取消")).toBeVisible());
+    activatePage("服务配置");
+    expect(screen.getByRole("combobox", { name: "整理服务" })).toHaveValue("openai");
+    expect(commitEngine).not.toHaveBeenCalled();
+  });
+
+  it("updates the matching native MLX row from the status event", async () => {
+    let statusHandler: ((event: { payload: MlxCleanupModelStatus }) => void) | undefined;
+    vi.mocked(listen).mockImplementation(async (event, handler) => {
+      if (event === "mlx-cleanup-model://status") {
+        statusHandler = handler as unknown as (event: { payload: MlxCleanupModelStatus }) => void;
+      }
+      return () => undefined;
+    });
+    const model = mlxCleanupModels()[0];
+    vi.mocked(invoke).mockImplementation(async (command) => {
+      if (command === "list_on_device_models") return [];
+      if (command === "list_mlx_cleanup_models") return [model];
+      return undefined;
+    });
+    renderEngine();
+    activatePage("本地模型");
+
+    const row = (await within(modelsPanel()).findByText(model.label)).closest<HTMLElement>("[data-model-row]")!;
+    expect(statusHandler).toBeDefined();
+    act(() => statusHandler?.({ payload: {
+      ...model, state: "downloading", operation: "download", managed: true, partial_managed: true,
+      bytes_done: 65_536, bytes_total: model.bytes,
+    } }));
+    expect(await within(row).findByRole("progressbar", { name: `模型下载进度: ${model.label}` })).toBeVisible();
+    expect(within(row).getByRole("button", { name: "取消下载" })).toBeEnabled();
+  });
+
+  it("verifies installed MLX files with indeterminate progress and applies completed status events", async () => {
+    let statusHandler: ((event: { payload: MlxCleanupModelStatus }) => void) | undefined;
+    vi.mocked(listen).mockImplementation(async (event, handler) => {
+      if (event === "mlx-cleanup-model://status") {
+        statusHandler = handler as unknown as (event: { payload: MlxCleanupModelStatus }) => void;
+      }
+      return () => undefined;
+    });
+    const failedModel: MlxCleanupModelStatus = {
+      ...mlxCleanupCatalog[0], id: "qwen3_5_4b_mlx_4bit", label: "Qwen3.5 4B · MLX 4-bit",
+      state: "installed", managed: true, partial_managed: false, downloadable: false, verified: false, selectable: false,
+    };
+    let currentModels = [
+      { ...mlxCleanupCatalog[0], state: "installed", managed: true, partial_managed: false, downloadable: false },
+      failedModel,
+    ];
+    vi.mocked(invoke).mockImplementation(async (command, args) => {
+      if (command === "list_on_device_models") return [];
+      if (command === "list_mlx_cleanup_models") return currentModels;
+      if (command === "verify_mlx_cleanup_model") {
+        expect(args).toEqual({ id: "qwen3_5_2b_mlx_4bit" });
+        currentModels = currentModels.map((model) => model.id === "qwen3_5_2b_mlx_4bit"
+          ? { ...model, state: "installed", operation: "verify", bytes_done: 0, bytes_total: model.bytes }
+          : model);
+      }
+      return undefined;
+    });
+    renderEngine();
+    activatePage("本地模型");
+
+    const panel = modelsPanel();
+    const row = (await within(panel).findByText("Qwen3.5 2B · MLX 4-bit")).closest<HTMLElement>("[data-model-row]")!;
+    expect(within(row).getByRole("button", { name: "校验模型" })).toBeEnabled();
+    expect(within(row).queryByRole("button", { name: "下载模型" })).not.toBeInTheDocument();
+    fireEvent.click(within(row).getByRole("button", { name: "校验模型" }));
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("verify_mlx_cleanup_model", { id: "qwen3_5_2b_mlx_4bit" }));
+    const verificationProgress = await within(row).findByRole("progressbar", { name: "模型校验进度: Qwen3.5 2B · MLX 4-bit" });
+    expect(verificationProgress).toBeVisible();
+    expect(verificationProgress).not.toHaveAttribute("max");
+    expect(verificationProgress).not.toHaveAttribute("value");
+    expect(within(row).getByRole("button", { name: "正在校验…" })).toBeDisabled();
+
+    expect(statusHandler).toBeDefined();
+    act(() => statusHandler?.({ payload: {
+      ...currentModels[0], state: "ready", operation: null, verified: true, selectable: true,
+      bytes_done: currentModels[0].bytes, bytes_total: currentModels[0].bytes,
+    } }));
+    expect(await within(row).findByText("可用于服务配置")).toBeVisible();
+    expect(within(row).queryByRole("button", { name: "校验模型" })).not.toBeInTheDocument();
+
+    const failedRow = within(panel).getByText(failedModel.label).closest<HTMLElement>("[data-model-row]")!;
+    act(() => statusHandler?.({ payload: {
+      ...failedModel, state: "corrupt", operation: null, error: "pinned file hash mismatch", verified: false, selectable: false,
+    } }));
+    await waitFor(() => expect(failedRow).toHaveTextContent("文件校验失败"));
+    expect(within(failedRow).getByRole("alert")).toHaveTextContent("pinned file hash mismatch");
+
+    activatePage("服务配置");
+    selectOption(screen.getByRole("combobox", { name: "整理服务" }), "on_device_mlx");
+    const modelSelector = screen.getByRole("combobox", { name: "AI 文字整理模型" });
+    const menu = await openSelect(modelSelector);
+    expect(within(menu).getByRole("option", { name: "Qwen3.5 2B · MLX 4-bit · 1.9 GB" })).toBeInTheDocument();
+    expect(within(menu).queryByRole("option", { name: /Qwen3\.5 4B · MLX/ })).not.toBeInTheDocument();
+  });
+
+  it("offers a backend-selectable developer MLX model and saves it without release qualification", async () => {
+    const models = mlxCleanupModels([{
+      state: "ready", managed: true, verified: true, qualified: false, downloadable: false,
+      selectable: true, compatible: true, bytes_done: mlxCleanupCatalog[0].bytes, bytes_total: mlxCleanupCatalog[0].bytes,
+    }]);
+    const commitEngine = vi.fn();
+    vi.mocked(invoke).mockImplementation(async (command) => {
+      if (command === "list_on_device_models") return [];
+      if (command === "list_mlx_cleanup_models") return models;
+      if (command === "get_cleanup_model_store_status") return { platform_supported: false, managed: false, state: "missing", operation: null };
+      return undefined;
+    });
+    renderEngine({}, { commitEngine });
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("list_mlx_cleanup_models"));
+    selectOption(screen.getByRole("combobox", { name: "整理服务" }), "on_device_mlx");
+
+    const modelSelector = screen.getByRole("combobox", { name: "AI 文字整理模型" });
+    const menu = await openSelect(modelSelector);
+    expect(within(menu).getByRole("option", { name: "Qwen3.5 2B · MLX 4-bit · 1.9 GB" })).toBeInTheDocument();
+    closeSelect(menu);
+    selectOption(modelSelector, "qwen3_5_2b_mlx_4bit");
+    expect(screen.getByRole("button", { name: "保存并使用" })).toBeEnabled();
+    activatePage("本地模型");
+    const row = within(modelsPanel()).getByText("Qwen3.5 2B · MLX 4-bit").closest<HTMLElement>("[data-model-row]")!;
+    expect(within(row).queryByText("尚未通过发布验收")).not.toBeInTheDocument();
+    expect(within(row).getByText("可用于服务配置")).toBeVisible();
+    expect(within(row).queryByText("此模型尚未完成发布验收；当前状态不代表已验证的整理质量。")).not.toBeInTheDocument();
+    activatePage("服务配置");
+    fireEvent.click(screen.getByRole("button", { name: "保存并使用" }));
+    await waitFor(() => expect(commitEngine).toHaveBeenCalledWith(expect.objectContaining({
+      cleanup_provider: "on_device_mlx",
+      cleanup_model: "qwen3_5_2b_mlx_4bit",
+    })));
+  });
+
+  it("focuses the selected MLX candidate from Manage and the blocked Save action", async () => {
+    const model = mlxCleanupModels([{
+      state: "installed", managed: true, verified: false, qualified: false, downloadable: false,
+      selectable: false, compatible: true, bytes_done: 0, bytes_total: mlxCleanupCatalog[0].bytes,
+    }]);
+    vi.mocked(invoke).mockImplementation(async (command) => {
+      if (command === "list_on_device_models") return [];
+      if (command === "list_mlx_cleanup_models") return model;
+      return undefined;
+    });
+    renderEngine({
+      cleanup_enabled: false,
+      cleanup_provider: "on_device_mlx",
+      cleanup_model: "qwen3_5_2b_mlx_4bit",
+    });
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("list_mlx_cleanup_models"));
+    fireEvent.click(screen.getByRole("switch", { name: "AI 文字整理" }));
+
+    const blockedSave = screen.getByText("请先安装并验证 VoiceFlow MLX 整理模型。").parentElement!;
+    fireEvent.click(within(blockedSave).getByRole("button", { name: "管理模型" }));
+    await waitFor(() => expect(document.activeElement).toHaveAttribute("id", "mlx-cleanup-model-qwen3_5_2b_mlx_4bit"));
+  });
+
+  it("focuses the MLX catalog fallback when the saved model is absent", async () => {
+    vi.mocked(invoke).mockImplementation(async (command) => {
+      if (command === "list_on_device_models") return [];
+      if (command === "list_mlx_cleanup_models") return [];
+      return undefined;
+    });
+    renderEngine({ cleanup_provider: "on_device_mlx", cleanup_model: "qwen3_5_2b_mlx_4bit" });
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("list_mlx_cleanup_models"));
+    fireEvent.click(within(servicePanel()).getAllByRole("button", { name: "管理模型" })[0]);
+    await waitFor(() => expect(document.activeElement).toHaveAttribute("id", "local-mlx-cleanup-models"));
+  });
+
+  it("keeps the legacy 27B Manage model focus target", async () => {
+    vi.mocked(invoke).mockImplementation(async (command) => {
+      if (command === "list_on_device_models") return [];
+      if (command === "get_cleanup_model_store_status") return {
+        id: "qwen3_8_27b_mlx_6bit", label: "Qwen 3.8 27B · MLX 6-bit",
+        repository: "lmstudio-community/Qwen3.8-27B-MLX-6bit", revision: "rev-27b",
+        state: "missing", operation: null, source_kind: null, bytes_done: 0, bytes_total: 22_804_836_386,
+        error: null, last_operation: null, last_operation_error: null, managed: false, partial_managed: false,
+        platform_supported: true,
+      };
+      return undefined;
+    });
+    renderEngine({ cleanup_provider: "on_device_mlx", cleanup_model: "qwen3_8_27b_mlx_6bit" });
+    fireEvent.click(within(servicePanel()).getAllByRole("button", { name: "管理模型" })[0]);
+    await waitFor(() => expect(document.activeElement).toHaveAttribute("id", "local-cleanup-model"));
+  });
+
+  it("protects deletion only for the saved active native MLX model", async () => {
+    const secondModel: MlxCleanupModelStatus = {
+      ...mlxCleanupCatalog[0], id: "qwen3_5_4b_mlx_4bit", label: "Qwen3.5 4B · MLX 4-bit", bytes: 3_000_000_000,
+      state: "installed", operation: null, managed: true, verified: true, qualified: false,
+      downloadable: false, selectable: true, bytes_done: 3_000_000_000, bytes_total: 3_000_000_000,
+    };
+    let currentModels = [
+      { ...mlxCleanupCatalog[0], state: "installed", managed: true, verified: true, selectable: true, downloadable: false, bytes_done: mlxCleanupCatalog[0].bytes, bytes_total: mlxCleanupCatalog[0].bytes },
+      secondModel,
+    ];
+    vi.mocked(invoke).mockImplementation(async (command, args) => {
+      if (command === "list_on_device_models") return [];
+      if (command === "list_mlx_cleanup_models") return currentModels;
+      if (command === "delete_mlx_cleanup_model") {
+        expect(args).toEqual({ id: "qwen3_5_4b_mlx_4bit" });
+        currentModels = currentModels.filter((model) => model.id !== "qwen3_5_4b_mlx_4bit");
+      }
+      return undefined;
+    });
+    renderEngine({ cleanup_provider: "on_device_mlx", cleanup_model: "qwen3_5_2b_mlx_4bit" });
+    activatePage("本地模型");
+
+    const panel = modelsPanel();
+    const activeRow = (await within(panel).findByText("Qwen3.5 2B · MLX 4-bit")).closest<HTMLElement>("[data-model-row]")!;
+    const otherRow = within(panel).getByText("Qwen3.5 4B · MLX 4-bit").closest<HTMLElement>("[data-model-row]")!;
+    expect(within(activeRow).getByRole("button", { name: "删除模型: Qwen3.5 2B · MLX 4-bit" })).toBeDisabled();
+    expect(within(otherRow).getByRole("button", { name: "删除模型: Qwen3.5 4B · MLX 4-bit" })).toBeEnabled();
+
+    fireEvent.click(within(otherRow).getByRole("button", { name: "删除模型: Qwen3.5 4B · MLX 4-bit" }));
+    const dialog = screen.getByRole("dialog");
+    fireEvent.click(within(dialog).getByRole("button", { name: "删除模型" }));
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("delete_mlx_cleanup_model", { id: "qwen3_5_4b_mlx_4bit" }));
+    await waitFor(() => expect(within(panel).queryByText("Qwen3.5 4B · MLX 4-bit")).not.toBeInTheDocument());
+    expect(within(panel).getByText("Qwen3.5 2B · MLX 4-bit")).toBeVisible();
   });
 
   it("does not mark the saved VoiceFlow MLX cleanup route blocked in strict offline mode", () => {

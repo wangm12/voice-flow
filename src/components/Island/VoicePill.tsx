@@ -203,8 +203,6 @@ export const VoicePill = memo(function VoicePill({
   clockNowMs?: number;
   lastAudioLevelAtMs?: number | null;
   sessionGeneration?: number;
-  retryAfterSecs?: number | null;
-  undoAvailable?: boolean;
   contextLabel: string | null;
   contextSourceLabel?: string | null;
   fallbackReason?: string | null;

@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 #[cfg(any(test, feature = "evaluation"))]
 use std::future::Future;
+#[cfg(any(test, feature = "evaluation"))]
 use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -260,25 +261,88 @@ pub struct LoadedAttestation {
 }
 impl LoadedAttestation {
     #[cfg(any(test, feature = "evaluation"))]
-    pub(crate) fn complete(&self) -> bool {
+    pub(crate) fn complete(&self, model_id: &str) -> bool {
         let digest = |s: &str| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit());
-        self.schema_version == 1 && digest(&self.executable_sha256)
+        use crate::ondevice_models::{
+            COHERE_TRANSCRIBE_ID, FIRERED_ASR2_AED_ID, FUN_ASR_NANO_2512_ID, PARAKEET_ASR_8BIT_ID,
+            QWEN_ASR_06_ID, QWEN_ASR_17_ID,
+        };
+
+        let legacy_recipe = concat!(
+            "voiceflow-mlx-decoder-v1:chunks30s/min1s;temperature0;context-empty;",
+            "qwen-repetition1.05/window32;inner-chunk1200s;cohere-topP1/topK0/vad-nil;",
+            "ordered-trim-language-join",
+        );
+        let qwen_recipe = concat!(
+            "voiceflow-mlx-decoder-v1:chunks30s/min1s;temperature0;context-empty;",
+            "qwen-repetition1.05/window32;inner-chunk1200s;ordered-trim-language-join",
+        );
+        let legacy_recipe_supported = matches!(
+            model_id,
+            QWEN_ASR_06_ID | QWEN_ASR_17_ID | COHERE_TRANSCRIBE_ID
+        );
+        let current_recipe = match model_id {
+            QWEN_ASR_06_ID | QWEN_ASR_17_ID => Some(qwen_recipe),
+            COHERE_TRANSCRIBE_ID => Some(concat!(
+                "voiceflow-mlx-decoder-v1:chunks30s/min1s;temperature0;context-empty;",
+                "cohere-topP1/topK0/vad-nil;inner-chunk1200s;ordered-trim-language-join",
+            )),
+            PARAKEET_ASR_8BIT_ID => Some(concat!(
+                "voiceflow-mlx-decoder-v1:chunks30s/min1s;temperature0;context-empty;",
+                "parakeet-bfloat16;language-auto-only;inner-chunk1200s;ordered-trim-language-join",
+            )),
+            FIRERED_ASR2_AED_ID => Some(concat!(
+                "voiceflow-mlx-decoder-v1:chunks30s/min1s;temperature0;context-empty;",
+                "firered-beam3/softmax1.25/length0.6/eos1.0;language-auto-only;",
+                "chunk-boundary-aware-join-v1;inner-chunk1200s;ordered-trim-language-join",
+            )),
+            FUN_ASR_NANO_2512_ID => Some(concat!(
+                "voiceflow-mlx-decoder-v1:chunks30s/min1s;temperature0;context-empty;",
+                "funasr-itn-true/hotwords-empty/context-empty;topP1/topK0/repetition1/window0/prefill2048;",
+                "auto-chunk-boundary-aware-join-v1;inner-chunk1200s;ordered-trim-language-join",
+            )),
+            _ => None,
+        };
+        let decoder_recipe_matches = current_recipe
+            .is_some_and(|expected| self.decoder_recipe == expected)
+            || (legacy_recipe_supported && self.decoder_recipe == legacy_recipe);
+        self.schema_version == 1
+            && digest(&self.executable_sha256)
             && digest(&self.parameter_layout_sha256)
-            && self.parameter_count > 0 && self.parameter_count <= 100_000
-            && !self.parameter_dtypes.is_empty() && self.parameter_dtypes.len() <= 16
-            && self.parameter_dtypes.values().try_fold(0usize, |a, b| a.checked_add(*b)) == Some(self.parameter_count)
-            && self.parameter_dtypes.iter().all(|(k,v)| !k.is_empty() && k.len() <= 32 && *v > 0)
+            && self.parameter_count > 0
+            && self.parameter_count <= 100_000
+            && !self.parameter_dtypes.is_empty()
+            && self.parameter_dtypes.len() <= 16
+            && self
+                .parameter_dtypes
+                .values()
+                .try_fold(0usize, |a, b| a.checked_add(*b))
+                == Some(self.parameter_count)
+            && self
+                .parameter_dtypes
+                .iter()
+                .all(|(k, v)| !k.is_empty() && k.len() <= 32 && *v > 0)
             && self.metal_sha256.len() == 2
-            && ["mlx.metallib", "mlx-swift_Cmlx.bundle/Contents/Resources/default.metallib"].iter().all(|k| self.metal_sha256.get(*k).is_some_and(|v| digest(v)))
-            && !self.loaded_images.is_empty() && self.loaded_images.len() <= 4096
+            && [
+                "mlx.metallib",
+                "mlx-swift_Cmlx.bundle/Contents/Resources/default.metallib",
+            ]
+            .iter()
+            .all(|k| self.metal_sha256.get(*k).is_some_and(|v| digest(v)))
+            && !self.loaded_images.is_empty()
+            && self.loaded_images.len() <= 4096
             && self.loaded_images.windows(2).all(|p| p[0] < p[1])
-            && self.loaded_images.iter().all(|s| s.len() <= 8192 && s.rsplit_once('|').is_some_and(|(name,uuid)| !name.is_empty() && uuid.len() == 36))
+            && self.loaded_images.iter().all(|s| {
+                s.len() <= 8192
+                    && s.rsplit_once('|')
+                        .is_some_and(|(name, uuid)| !name.is_empty() && uuid.len() == 36)
+            })
             && self
                 .loaded_images
                 .iter()
                 .try_fold(0usize, |total, image| total.checked_add(image.len()))
                 .is_some_and(|total| total <= 256 * 1024)
-            && self.decoder_recipe == "voiceflow-mlx-decoder-v1:chunks30s/min1s;temperature0;context-empty;qwen-repetition1.05/window32;inner-chunk1200s;cohere-topP1/topK0/vad-nil;ordered-trim-language-join"
+            && decoder_recipe_matches
     }
 }
 pub(crate) fn local_attestation(
@@ -402,11 +466,13 @@ pub(crate) struct ObservationRecord {
     pub cleanup_request: Option<ResolvedRequest>,
     pub cleanup: Option<CleanupObservation>,
 }
+#[cfg(any(test, feature = "evaluation"))]
 #[derive(Clone)]
 pub(crate) struct FixtureCapture {
     record: Arc<Mutex<ObservationRecord>>,
     capture_reply: bool,
 }
+#[cfg(any(test, feature = "evaluation"))]
 tokio::task_local! { static CAPTURE: FixtureCapture; }
 #[cfg(any(test, feature = "evaluation"))]
 impl FixtureCapture {
@@ -441,9 +507,11 @@ impl FixtureCapture {
             })
     }
 }
+#[cfg(any(test, feature = "evaluation"))]
 pub(crate) fn enabled() -> bool {
     CAPTURE.try_with(|_| true).unwrap_or(false)
 }
+#[cfg(any(test, feature = "evaluation"))]
 fn observe(update: impl FnOnce(&mut ObservationRecord, bool)) {
     let _ = CAPTURE.try_with(|capture| {
         if let Ok(mut record) = capture.record.lock() {
@@ -451,6 +519,15 @@ fn observe(update: impl FnOnce(&mut ObservationRecord, bool)) {
         }
     });
 }
+/// Only test and evaluation builds can open a capture scope.
+#[cfg(not(any(test, feature = "evaluation")))]
+#[inline(always)]
+pub(crate) fn enabled() -> bool {
+    false
+}
+#[cfg(not(any(test, feature = "evaluation")))]
+#[inline(always)]
+fn observe(_update: impl FnOnce(&mut ObservationRecord, bool)) {}
 pub(crate) fn requested_asr_model(model: &str) {
     observe(|record, _| record.requested_asr_model = Some(model.into()));
 }
@@ -532,9 +609,14 @@ pub(crate) fn asr_failure(terminal: &str, reason: &str) {
 #[cfg(test)]
 mod loaded_attestation_image_bounds_tests {
     use super::LoadedAttestation;
+    use crate::ondevice_models::QWEN_ASR_06_ID;
     use std::collections::BTreeMap;
 
     const DECODER_RECIPE: &str = concat!(
+        "voiceflow-mlx-decoder-v1:chunks30s/min1s;temperature0;context-empty;",
+        "qwen-repetition1.05/window32;inner-chunk1200s;ordered-trim-language-join",
+    );
+    const LEGACY_DECODER_RECIPE: &str = concat!(
         "voiceflow-mlx-decoder-v1:chunks30s/min1s;temperature0;context-empty;",
         "qwen-repetition1.05/window32;inner-chunk1200s;cohere-topP1/topK0/vad-nil;",
         "ordered-trim-language-join",
@@ -546,6 +628,13 @@ mod loaded_attestation_image_bounds_tests {
     }
 
     fn attestation(loaded_images: Vec<String>) -> LoadedAttestation {
+        attestation_with_recipe(loaded_images, DECODER_RECIPE)
+    }
+
+    fn attestation_with_recipe(
+        loaded_images: Vec<String>,
+        decoder_recipe: &str,
+    ) -> LoadedAttestation {
         LoadedAttestation {
             schema_version: 1,
             executable_sha256: "a".repeat(64),
@@ -560,40 +649,101 @@ mod loaded_attestation_image_bounds_tests {
             parameter_layout_sha256: "d".repeat(64),
             parameter_count: 1,
             parameter_dtypes: BTreeMap::from([("float32".into(), 1)]),
-            decoder_recipe: DECODER_RECIPE.into(),
+            decoder_recipe: decoder_recipe.into(),
         }
+    }
+
+    #[test]
+    fn decoder_recipe_is_bound_to_the_loaded_model_and_legacy_is_scoped() {
+        use crate::ondevice_models::{
+            COHERE_TRANSCRIBE_ID, FIRERED_ASR2_AED_ID, FUN_ASR_NANO_2512_ID, PARAKEET_ASR_8BIT_ID,
+            QWEN_ASR_06_ID, QWEN_ASR_17_ID,
+        };
+
+        let current_recipes = [
+            (QWEN_ASR_06_ID, DECODER_RECIPE),
+            (QWEN_ASR_17_ID, DECODER_RECIPE),
+            (
+                COHERE_TRANSCRIBE_ID,
+                concat!(
+                    "voiceflow-mlx-decoder-v1:chunks30s/min1s;temperature0;context-empty;",
+                    "cohere-topP1/topK0/vad-nil;inner-chunk1200s;ordered-trim-language-join",
+                ),
+            ),
+            (
+                PARAKEET_ASR_8BIT_ID,
+                concat!(
+                    "voiceflow-mlx-decoder-v1:chunks30s/min1s;temperature0;context-empty;",
+                    "parakeet-bfloat16;language-auto-only;inner-chunk1200s;ordered-trim-language-join",
+                ),
+            ),
+            (
+                FIRERED_ASR2_AED_ID,
+                concat!(
+                    "voiceflow-mlx-decoder-v1:chunks30s/min1s;temperature0;context-empty;",
+                    "firered-beam3/softmax1.25/length0.6/eos1.0;language-auto-only;",
+                    "chunk-boundary-aware-join-v1;inner-chunk1200s;ordered-trim-language-join",
+                ),
+            ),
+            (
+                FUN_ASR_NANO_2512_ID,
+                concat!(
+                    "voiceflow-mlx-decoder-v1:chunks30s/min1s;temperature0;context-empty;",
+                    "funasr-itn-true/hotwords-empty/context-empty;topP1/topK0/repetition1/window0/prefill2048;",
+                    "auto-chunk-boundary-aware-join-v1;inner-chunk1200s;ordered-trim-language-join",
+                ),
+            ),
+        ];
+        for (model_id, recipe) in current_recipes {
+            assert!(attestation_with_recipe(vec![image(0)], recipe).complete(model_id));
+        }
+        assert!(
+            !attestation_with_recipe(vec![image(0)], DECODER_RECIPE).complete(COHERE_TRANSCRIBE_ID)
+        );
+        assert!(
+            attestation_with_recipe(vec![image(0)], LEGACY_DECODER_RECIPE).complete(QWEN_ASR_06_ID)
+        );
+        assert!(
+            attestation_with_recipe(vec![image(0)], LEGACY_DECODER_RECIPE)
+                .complete(COHERE_TRANSCRIBE_ID)
+        );
+        assert!(
+            !attestation_with_recipe(vec![image(0)], LEGACY_DECODER_RECIPE)
+                .complete(FIRERED_ASR2_AED_ID)
+        );
+        assert!(!attestation_with_recipe(vec![image(0)], DECODER_RECIPE).complete("unknown"));
     }
 
     #[test]
     fn complete_inventory_above_old_limit_is_preserved() {
         let images = (0..1_145).map(image).collect::<Vec<_>>();
         let original = attestation(images.clone());
-        assert!(original.complete());
+        assert!(original.complete(QWEN_ASR_06_ID));
         let encoded = serde_json::to_vec(&original).unwrap();
         let decoded: LoadedAttestation = serde_json::from_slice(&encoded).unwrap();
         assert_eq!(decoded.loaded_images, images);
-        assert!(decoded.complete());
+        assert!(decoded.complete(QWEN_ASR_06_ID));
     }
 
     #[test]
     fn count_limit_accepts_4096_and_rejects_4097() {
-        assert!(attestation((0..4_096).map(image).collect()).complete());
-        assert!(!attestation((0..4_097).map(image).collect()).complete());
+        assert!(attestation((0..4_096).map(image).collect()).complete(QWEN_ASR_06_ID));
+        assert!(!attestation((0..4_097).map(image).collect()).complete(QWEN_ASR_06_ID));
     }
 
     #[test]
     fn utf8_entry_and_total_byte_limits_are_inclusive_and_fail_closed() {
         let exact_entry = format!("{}|{UUID}", "x".repeat(8_155));
         assert_eq!(exact_entry.len(), 8_192);
-        assert!(attestation(vec![exact_entry]).complete());
+        assert!(attestation(vec![exact_entry]).complete(QWEN_ASR_06_ID));
 
         let over_entry = format!("{}|{UUID}", "x".repeat(8_156));
         assert_eq!(over_entry.len(), 8_193);
-        assert!(!attestation(vec![over_entry]).complete());
+        assert!(!attestation(vec![over_entry]).complete(QWEN_ASR_06_ID));
 
         let multibyte_over_entry = format!("{}|{UUID}", "é".repeat(4_078));
         assert_eq!(multibyte_over_entry.len(), 8_193);
-        assert!(!attestation(vec![multibyte_over_entry]).complete());
+        assert!(!attestation(vec![multibyte_over_entry]).complete(QWEN_ASR_06_ID));
 
         let exact_total = (0..32)
             .map(|index| format!("{:02}{}|{UUID}", index, "a".repeat(8_153)))
@@ -603,15 +753,15 @@ mod loaded_attestation_image_bounds_tests {
             exact_total.iter().map(String::len).sum::<usize>(),
             256 * 1024
         );
-        assert!(attestation(exact_total.clone()).complete());
+        assert!(attestation(exact_total.clone()).complete(QWEN_ASR_06_ID));
         let mut over_total = exact_total;
         over_total.push(format!("32|{UUID}"));
-        assert!(!attestation(over_total).complete());
+        assert!(!attestation(over_total).complete(QWEN_ASR_06_ID));
     }
 
     #[test]
     fn malformed_image_identity_stays_rejected() {
-        assert!(!attestation(vec!["/dyld/image-without-uuid".into()]).complete());
-        assert!(!attestation(vec!["/dyld/image|short".into()]).complete());
+        assert!(!attestation(vec!["/dyld/image-without-uuid".into()]).complete(QWEN_ASR_06_ID));
+        assert!(!attestation(vec!["/dyld/image|short".into()]).complete(QWEN_ASR_06_ID));
     }
 }

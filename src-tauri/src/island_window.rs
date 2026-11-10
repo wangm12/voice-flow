@@ -16,7 +16,6 @@ static ISLAND_PANEL_WARM: AtomicBool = AtomicBool::new(false);
 static ISLAND_VISIBLE: AtomicBool = AtomicBool::new(false);
 static ISLAND_RECONCILE_SCHEDULED: AtomicBool = AtomicBool::new(false);
 static ISLAND_DESIRED_VISIBLE: AtomicBool = AtomicBool::new(false);
-static ISLAND_HAS_PARTIAL: AtomicBool = AtomicBool::new(false);
 static ISLAND_HAS_WIDE_CAPTION: AtomicBool = AtomicBool::new(false);
 static ISLAND_WIDE_APPLIED: AtomicBool = AtomicBool::new(false);
 static ISLAND_HAS_WARNING_CAPTION: AtomicBool = AtomicBool::new(false);
@@ -342,14 +341,9 @@ fn resign_island_key_window(window: &WebviewWindow) {
     }
 }
 
-/// Expand the transparent island surface while HUD partials or long status
-/// captions are visible, then shrink it again so idle does not keep a wide
-/// hit target in WindowServer.
-pub fn set_has_partial(app: &AppHandle, has_partial: bool) {
-    ISLAND_HAS_PARTIAL.store(has_partial, Ordering::Release);
-    apply_island_size(app);
-}
-
+/// Expand the transparent island surface while long status captions are
+/// visible, then shrink it again so idle does not keep a wide hit target in
+/// WindowServer.
 pub fn set_has_wide_caption(app: &AppHandle, wide: bool) {
     ISLAND_HAS_WIDE_CAPTION.store(wide, Ordering::Release);
     apply_island_size(app);
@@ -361,7 +355,7 @@ pub fn set_has_warning_caption(app: &AppHandle, warning: bool) {
 }
 
 fn island_should_expand() -> bool {
-    ISLAND_HAS_PARTIAL.load(Ordering::Acquire) || ISLAND_HAS_WIDE_CAPTION.load(Ordering::Acquire)
+    ISLAND_HAS_WIDE_CAPTION.load(Ordering::Acquire)
 }
 
 fn island_window_size(

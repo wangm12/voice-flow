@@ -1318,6 +1318,7 @@ private enum CleanupFailure: Error, Sendable {
   case incompleteGeneration
   case responseTooLarge
   case inputTooLarge(CleanupTokenBudgetFacts)
+  case specializedInputTooLarge
 
   var response: SidecarFailure {
     switch self {
@@ -1368,6 +1369,11 @@ private enum CleanupFailure: Error, Sendable {
         requestedOutputTokens: facts.requestedOutputTokens,
         requestedTotalTokens: facts.requestedTotalTokens,
         maxTotalTokens: facts.maxTotalTokens
+      )
+    case .specializedInputTooLarge:
+      SidecarFailure(
+        code: "model_input_too_large",
+        message: "S1-mini by Superwhisper accepts transcript prompts up to roughly 1,000 tokens."
       )
     }
   }
@@ -1597,13 +1603,177 @@ enum CleanupResponseSizeGuard {
   }
 }
 
-/// Cleanup has its own process and model slot so loading or cancelling this
-/// large language model cannot replace or terminate the ASR sidecar.
-public actor CleanupSidecarServer {
-  private static let modelID = "qwen3_8_27b_mlx_6bit"
-  private static let modelRevision = "05f38c1f39e2f39619653616fe8e96a5d676358e"
-  private static let modelManifestSHA256 =
+enum CleanupPromptContract: Equatable, Sendable {
+  case standardChat
+  case s1Mini
+}
+
+struct CleanupModelRoute: Equatable, Sendable {
+  let modelId: String
+  let revision: String
+  let promptRecipe: String
+  let promptContract: CleanupPromptContract
+  let prefixCacheManifestSHA256: String?
+  let maximumPromptTokens: Int?
+  let maximumGenerationTokens: Int?
+
+  var usesPinnedPrefixCache: Bool { prefixCacheManifestSHA256 != nil }
+
+  static let qwen38TwentySevenBManifestSHA256 =
     "f67d38ec1261b4d693cee8c006d2c56007e6919a290508266705ba4f571c9ed2"
+  static let qwen38TwentySevenB = Self(
+    modelId: "qwen3_8_27b_mlx_6bit",
+    revision: "05f38c1f39e2f39619653616fe8e96a5d676358e",
+    promptRecipe: "voiceflow-qwen35-prefix-v2",
+    promptContract: .standardChat,
+    prefixCacheManifestSHA256: qwen38TwentySevenBManifestSHA256,
+    maximumPromptTokens: nil,
+    maximumGenerationTokens: nil
+  )
+  static let qwen35TwoB = Self(
+    modelId: "qwen3_5_2b_mlx_4bit",
+    revision: "93760be4f1f69842a46bc13dbdc0f19e291392a3",
+    promptRecipe: "voiceflow-qwen35-chat-cleanup-v1",
+    promptContract: .standardChat,
+    prefixCacheManifestSHA256: nil,
+    maximumPromptTokens: nil,
+    maximumGenerationTokens: nil
+  )
+  static let qwen35FourB = Self(
+    modelId: "qwen3_5_4b_mlx_4bit",
+    revision: "32f3e8ecf65426fc3306969496342d504bfa13f3",
+    promptRecipe: "voiceflow-qwen35-chat-cleanup-v1",
+    promptContract: .standardChat,
+    prefixCacheManifestSHA256: nil,
+    maximumPromptTokens: nil,
+    maximumGenerationTokens: nil
+  )
+  static let qwen35NineB = Self(
+    modelId: "qwen3_5_9b_mlx_4bit",
+    revision: "938d8919941c6e7efd3c7150eff7fe9d12afa631",
+    promptRecipe: "voiceflow-qwen35-chat-cleanup-v1",
+    promptContract: .standardChat,
+    prefixCacheManifestSHA256: nil,
+    maximumPromptTokens: nil,
+    maximumGenerationTokens: nil
+  )
+
+  static let gemma4E2b = Self(
+    modelId: "gemma_4_e2b_it_mlx_4bit",
+    revision: "75a479632d6a594ea323942b883cdbc1bdd97a14",
+    promptRecipe: "voiceflow-gemma4-chat-cleanup-v1",
+    promptContract: .standardChat,
+    prefixCacheManifestSHA256: nil,
+    maximumPromptTokens: nil,
+    maximumGenerationTokens: nil
+  )
+  static let gemma4E4b = Self(
+    modelId: "gemma_4_e4b_it_mlx_4bit",
+    revision: "da76496efe4486235e6e0aa9315203e27b957bcd",
+    promptRecipe: "voiceflow-gemma4-chat-cleanup-v1",
+    promptContract: .standardChat,
+    prefixCacheManifestSHA256: nil,
+    maximumPromptTokens: nil,
+    maximumGenerationTokens: nil
+  )
+  static let ministral3ThreeB = Self(
+    modelId: "ministral_3_3b_instruct_mlx_4bit",
+    revision: "a962dcb09eee4169c890e544c9eb938f1113fdee",
+    promptRecipe: "voiceflow-ministral3-chat-cleanup-v1",
+    promptContract: .standardChat,
+    prefixCacheManifestSHA256: nil,
+    maximumPromptTokens: nil,
+    maximumGenerationTokens: nil
+  )
+  static let s1Mini = Self(
+    modelId: "superwhisper_s1_mini_mlx_4bit",
+    revision: "5cbd7aec3401144f88a331d385c40b65fd2548eb",
+    promptRecipe: CleanupS1MiniPromptContract.promptRecipe,
+    promptContract: .s1Mini,
+    prefixCacheManifestSHA256: nil,
+    maximumPromptTokens: 1_000,
+    maximumGenerationTokens: 1_024
+  )
+
+  /// Runtime pin allowlist only; the Rust catalogue controls product availability.
+  static let supported: [Self] = [
+    qwen38TwentySevenB,
+    qwen35TwoB,
+    qwen35FourB,
+    qwen35NineB,
+    gemma4E2b,
+    gemma4E4b,
+    ministral3ThreeB,
+    s1Mini,
+  ]
+}
+
+enum CleanupS1MiniPromptContract {
+  static let systemPrompt =
+    "You are a text normalizer for speech-to-text transcripts. The input begins with a control line specifying the styling, structure, and context settings; clean the transcript to match those settings and output only the cleaned text."
+  static let promptRecipe = "voiceflow-s1-mini-control-v1"
+
+  private static let supportedControlLines: Set<String> = {
+    let stylings = ["casual", "semi-casual", "semi-formal", "formal"]
+    let structures = ["prose", "lists"]
+    let contexts = ["general", "email"]
+    return Set(
+      stylings.flatMap { styling in
+        structures.flatMap { structure in
+          contexts.map { context in
+            "[Styling: \(styling)] [Structure: \(structure)] [Context: \(context)]"
+          }
+        }
+      }
+    )
+  }()
+
+  static func accepts(language: String?, messages: [SidecarChatMessage]) -> Bool {
+    guard language == "en",
+      messages.count == 2,
+      messages[0].role == "system",
+      messages[0].content == systemPrompt,
+      messages[1].role == "user",
+      let newline = messages[1].content.firstIndex(of: "\n")
+    else {
+      return false
+    }
+
+    let controlLine = String(messages[1].content[..<newline])
+    guard supportedControlLines.contains(controlLine) else { return false }
+    let transcript = messages[1].content[messages[1].content.index(after: newline)...]
+    guard !transcript.isEmpty else { return false }
+
+    // Any non-ASCII codepoint makes the route fall back. This deliberately
+    // rejects accented English too, keeping mixed-script input off S1-mini.
+    return transcript.utf8.allSatisfy { $0 < 0x80 }
+  }
+}
+
+enum CleanupModelRouteLookup: Equatable, Sendable {
+  case unsupportedModel
+  case revisionMismatch
+  case supported(CleanupModelRoute)
+}
+
+enum CleanupModelRouteCatalog {
+  static func lookup(modelId: String?, revision: String?) -> CleanupModelRouteLookup {
+    guard let modelId,
+      let route = CleanupModelRoute.supported.first(where: { $0.modelId == modelId })
+    else {
+      return .unsupportedModel
+    }
+    guard route.revision == revision else { return .revisionMismatch }
+    return .supported(route)
+  }
+}
+
+/// Cleanup has its own process and model slot so loading or cancelling this
+/// language model cannot replace or terminate the ASR sidecar.
+public actor CleanupSidecarServer {
+  private static let modelID = CleanupModelRoute.qwen38TwentySevenB.modelId
+  private static let modelRevision = CleanupModelRoute.qwen38TwentySevenB.revision
+  private static let modelManifestSHA256 = CleanupModelRoute.qwen38TwentySevenBManifestSHA256
   private static let maximumInputBytes = 1_048_576
   private static let maximumResponseBytes = SidecarIO.maximumCleanupResponsePayloadBytes
   private static let maximumMessageBytes = 512 * 1_024
@@ -1614,6 +1784,7 @@ public actor CleanupSidecarServer {
   private let promptPrefixCache: PromptPrefixCache
   private let memoryPressure: @Sendable () -> CleanupMemoryPressureLevel
   private var modelContainer: ModelContainer?
+  private var loadedModelRoute: CleanupModelRoute?
   private var shouldQuit = false
   private var activeOperation: CleanupActiveOperation?
   private var activeWaiters: [CheckedContinuation<Void, Never>] = []
@@ -1764,6 +1935,21 @@ public actor CleanupSidecarServer {
       writeResponse(response(request, status: "error", failure: .invalidRequest))
       return
     }
+    guard
+      case .supported(let route) = CleanupModelRouteCatalog.lookup(
+        modelId: request.modelId,
+        revision: request.modelVersion
+      ),
+      loadedModelRoute == route,
+      modelContainer != nil
+    else {
+      writeResponse(response(request, status: "error", failure: .modelNotLoaded))
+      return
+    }
+    guard !(route.promptContract == .s1Mini && request.op == "warmup") else {
+      writeResponse(response(request, status: "error", failure: .invalidRequest))
+      return
+    }
     let id = UUID().uuidString
     let lifetime = CleanupGenerationLifetime()
     let taskPriority: TaskPriority = request.op == "warmup" ? .utility : .userInitiated
@@ -1792,7 +1978,13 @@ public actor CleanupSidecarServer {
       writeResponse(response(request, status: "error", failure: .invalidRequest))
       return
     }
-    switch active.acceptCancel(request, modelId: Self.modelID, modelRevision: Self.modelRevision) {
+    guard let modelId = active.request.modelId,
+      let modelRevision = active.request.modelVersion
+    else {
+      writeResponse(response(request, status: "error", failure: .invalidRequest))
+      return
+    }
+    switch active.acceptCancel(request, modelId: modelId, modelRevision: modelRevision) {
     case .accepted:
       return
     case .duplicate:
@@ -1813,7 +2005,8 @@ public actor CleanupSidecarServer {
     await active.settleWorker()
     guard let current = activeOperation, current.id == id else { return }
     let settlement = current.commitTerminal()
-    let terminal = settlement.cancelled
+    let terminal =
+      settlement.cancelled
       ? response(current.request, status: "cancelled")
       : result
     writeResponse(terminal)
@@ -1829,8 +2022,11 @@ public actor CleanupSidecarServer {
   private func waitForActiveOperation() async {
     guard activeOperation != nil else { return }
     await withCheckedContinuation { continuation in
-      if activeOperation == nil { continuation.resume() }
-      else { activeWaiters.append(continuation) }
+      if activeOperation == nil {
+        continuation.resume()
+      } else {
+        activeWaiters.append(continuation)
+      }
     }
   }
 
@@ -1851,14 +2047,20 @@ public actor CleanupSidecarServer {
     guard memoryPressure() != .critical else {
       return response(request, status: "error", failure: .criticalMemoryPressure)
     }
-    guard request.modelId == Self.modelID else {
+    let route: CleanupModelRoute
+    switch CleanupModelRouteCatalog.lookup(
+      modelId: request.modelId,
+      revision: request.modelVersion
+    ) {
+    case .unsupportedModel:
       return response(request, status: "error", failure: .invalidModel)
-    }
-    guard request.modelVersion == Self.modelRevision else {
+    case .revisionMismatch:
       return response(request, status: "error", failure: .versionMismatch)
+    case .supported(let supportedRoute):
+      route = supportedRoute
     }
     guard let rawPath = request.modelDirectory,
-      let directory = validatedModelDirectory(rawPath)
+      let directory = validatedModelDirectory(rawPath, route: route)
     else {
       return response(request, status: "error", failure: .modelUnavailable)
     }
@@ -1871,6 +2073,7 @@ public actor CleanupSidecarServer {
         from: directory,
         using: #huggingFaceTokenizerLoader()
       )
+      loadedModelRoute = route
       return response(request, status: "loaded")
     } catch {
       releaseModel()
@@ -1886,9 +2089,10 @@ public actor CleanupSidecarServer {
     guard memoryPressure() != .critical else {
       return response(request, status: "error", failure: .criticalMemoryPressure)
     }
-    guard modelContainer != nil,
-      request.modelId == Self.modelID,
-      request.modelVersion == Self.modelRevision
+    guard let loadedModelRoute,
+      loadedModelRoute.modelId == request.modelId,
+      loadedModelRoute.revision == request.modelVersion,
+      modelContainer != nil
     else {
       return response(request, status: "error", failure: .modelNotLoaded)
     }
@@ -1901,8 +2105,17 @@ public actor CleanupSidecarServer {
       }),
       let maxTokens = request.maxOutputTokens,
       maxTokens > 0,
-      maxTokens <= Self.maximumOutputTokens
+      maxTokens
+        <= min(
+          Self.maximumOutputTokens,
+          loadedModelRoute.maximumGenerationTokens ?? Self.maximumOutputTokens
+        )
     else {
+      return response(request, status: "error", failure: .invalidRequest)
+    }
+    if loadedModelRoute.promptContract == .s1Mini,
+      !CleanupS1MiniPromptContract.accepts(language: request.language, messages: messages)
+    {
       return response(request, status: "error", failure: .invalidRequest)
     }
     guard !lifetime.isCancelled else { return response(request, status: "cancelled") }
@@ -1972,6 +2185,16 @@ public actor CleanupSidecarServer {
         )
       )
       let preparedPromptTokenCount = prepared.text.tokens.size
+      if let maximumPromptTokens = loadedModelRoute.maximumPromptTokens,
+        preparedPromptTokenCount > maximumPromptTokens
+      {
+        return response(
+          request,
+          status: "error",
+          failure: .specializedInputTooLarge,
+          cleanupDiagnostics: runtimeDiagnostics()
+        )
+      }
       if let facts = CleanupTokenBudget.overBudget(
         promptTokens: preparedPromptTokenCount,
         requestedOutputTokens: maxTokens
@@ -2192,8 +2415,10 @@ public actor CleanupSidecarServer {
       return response(request, status: "error", failure: .criticalMemoryPressure)
     }
     guard let modelContainer,
-      request.modelId == Self.modelID,
-      request.modelVersion == Self.modelRevision
+      let loadedModelRoute,
+      loadedModelRoute.promptContract != .s1Mini,
+      loadedModelRoute.modelId == request.modelId,
+      loadedModelRoute.revision == request.modelVersion
     else {
       return response(request, status: "error", failure: .modelNotLoaded)
     }
@@ -2385,13 +2610,19 @@ public actor CleanupSidecarServer {
     }
   }
 
-  private func validatedModelDirectory(_ rawPath: String) -> URL? {
+  private func validatedModelDirectory(_ rawPath: String, route: CleanupModelRoute) -> URL? {
     guard rawPath.utf8.count <= 4_096, rawPath.hasPrefix("/"), validDirectory(modelsRoot) else {
       return nil
     }
     let directory = URL(fileURLWithPath: rawPath, isDirectory: true).standardizedFileURL
     let prefix = modelsRoot.path.hasSuffix("/") ? modelsRoot.path : modelsRoot.path + "/"
+    let expectedDirectory =
+      modelsRoot
+      .appendingPathComponent("cleanup", isDirectory: true)
+      .appendingPathComponent(route.modelId, isDirectory: true)
+      .standardizedFileURL
     guard directory.path.hasPrefix(prefix),
+      directory.path == expectedDirectory.path,
       directory.resolvingSymlinksInPath().path == directory.path,
       validDirectory(directory), containsNoLinks(directory)
     else { return nil }
@@ -2429,6 +2660,7 @@ public actor CleanupSidecarServer {
 
   private func releaseModel() {
     modelContainer = nil
+    loadedModelRoute = nil
     promptPrefixCache.clearResident()
     Memory.clearCache()
   }
@@ -2443,6 +2675,13 @@ public actor CleanupSidecarServer {
     maxOutputTokens: Int
   ) async -> PromptCacheCandidateResult {
     var probeTimings = PromptCacheCandidateProbeTimings()
+    guard loadedModelRoute?.usesPinnedPrefixCache == true else {
+      return PromptCacheCandidateResult(
+        candidate: nil,
+        reason: "model_cache_disabled",
+        probeTimings: probeTimings
+      )
+    }
     guard let byteCount = request.stablePrefixUserBytes,
       let stableUserPrefix = PromptPrefixBoundary.utf8Prefix(user, byteCount: byteCount)
     else {
@@ -2604,8 +2843,8 @@ public actor CleanupSidecarServer {
       request: request,
       status: status,
       platformSupported: Self.platformSupported,
-      loadedModelId: modelContainer == nil ? nil : Self.modelID,
-      loadedModelVersion: modelContainer == nil ? nil : Self.modelRevision,
+      loadedModelId: modelContainer == nil ? nil : loadedModelRoute?.modelId,
+      loadedModelVersion: modelContainer == nil ? nil : loadedModelRoute?.revision,
       cleanupResult: cleanupResult,
       warmupResult: warmupResult,
       cleanupDiagnostics: cleanupDiagnostics,

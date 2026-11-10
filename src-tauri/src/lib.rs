@@ -30,6 +30,7 @@ pub(crate) mod edit_attribution;
 mod engine;
 #[cfg(any(test, feature = "evaluation"))]
 pub mod evaluation;
+mod gguf_cleanup_store;
 mod groq;
 mod history_commands;
 mod hotkey;
@@ -41,10 +42,11 @@ mod keychain;
 mod learning_clipboard_guard;
 mod learning_research;
 mod lexicon;
+mod llama_cleanup_runtime;
 mod llm;
-mod lmstudio_local;
 mod metrics;
 mod microphone_check;
+mod mlx_cleanup_catalog_data;
 mod mlx_cleanup_runtime;
 mod mlx_diagnostics;
 mod model_resources;
@@ -66,6 +68,10 @@ mod prefetch_asr;
 mod protected_span;
 mod providers;
 mod queue;
+#[cfg(any(test, all(feature = "research-harness", target_os = "macos")))]
+mod research_trace;
+#[cfg(not(any(test, all(feature = "research-harness", target_os = "macos"))))]
+#[path = "research_trace_inert.rs"]
 mod research_trace;
 mod screen_action;
 mod screen_text;
@@ -94,6 +100,10 @@ use delivery_settlement::{
 use dictation::release_operation_lease;
 use dictation::{DictationManager, OperationLease, Phase, RecorderBackend, StopClaim};
 use futures_util::{Stream, StreamExt};
+pub(crate) use mlx_cleanup_catalog_data::MISTRAL3_CANDIDATES as MINISTRAL_MLX_CLEANUP_CANDIDATES;
+pub(crate) use mlx_cleanup_catalog_data::MODELS as GEMMA_MLX_CLEANUP_MODELS;
+#[cfg(test)]
+pub(crate) use mlx_cleanup_catalog_data::S1_CANDIDATES as S1_MINI_MLX_CLEANUP_CANDIDATES;
 use selected_action::{
     clear_selected_action, clear_selected_preview, selected_preview_completion_is_current,
     SelectedActionPreview, SelectedActionSession,
@@ -109,6 +119,16 @@ fn lock_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Tauri runs synchronous commands on the main thread, so commands that do
+/// SQLite or file I/O are async and run that work on the blocking pool.
+async fn run_blocking_command<T: Send + 'static>(
+    operation: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    tauri::async_runtime::spawn_blocking(operation)
+        .await
+        .map_err(|error| error.to_string())?
 }
 
 async fn begin_text_action(
@@ -1233,18 +1253,6 @@ fn dictation_has_asr_credential(settings: &store::Settings, models_root: &std::p
         || asr_allows_empty_credential(settings, models_root)
 }
 
-#[derive(Debug, Clone)]
-struct UndoTransaction {
-    session_generation: u64,
-    created_at: std::time::Instant,
-    expires_at: std::time::Instant,
-    target_guard: context::TargetAppGuard,
-    delivery_method: String,
-    post_insert_input_fingerprint: u64,
-    field_ticket: Option<paste::UndoFieldTicket>,
-    consumed: bool,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TextActionIdentity {
     pub(crate) transaction_id: String,
@@ -1298,6 +1306,7 @@ pub(crate) struct AppState {
     /// Effective language resolved by the Island WebView for its persistent
     /// status label/value. It never participates in settlement evidence.
     delivery_status_uses_chinese: Arc<AtomicBool>,
+    #[cfg(any(test, all(feature = "research-harness", target_os = "macos")))]
     research_trace: Mutex<research_trace::Owner>,
     dictionary_learning_audit: Mutex<dictionary_learning_audit::Owner>,
     /// The recorder performs blocking I/O (cpal stream setup/teardown with
@@ -1313,7 +1322,6 @@ pub(crate) struct AppState {
     text_action_control: Mutex<Option<TextActionControl>>,
     text_action_sequence: AtomicU64,
     exit_state: AtomicU8,
-    undo: Mutex<Option<UndoTransaction>>,
     operation_lease: Mutex<OperationLease>,
     audio_recovery_ticket: Mutex<Option<AudioRecoveryTicket>>,
     audio_recovery_sequence: AtomicU64,
@@ -1321,7 +1329,10 @@ pub(crate) struct AppState {
     history_recovery_sequence: AtomicU64,
     models_root: std::path::PathBuf,
     cleanup_model_store: modelstore::Manager,
+    mlx_cleanup_catalog: modelstore::MlxCatalogManager,
     mlx_cleanup_runtime: Arc<mlx_cleanup_runtime::Runtime>,
+    gguf_cleanup_store: gguf_cleanup_store::Manager,
+    llama_cleanup_runtime: Arc<llama_cleanup_runtime::Runtime>,
     cleanup_warmup_enabled: bool,
     cleanup_model_generation: AtomicU64,
     cleanup_warmup: cleanup_warmup::Coordinator<CleanupWarmupKey>,
@@ -1400,8 +1411,11 @@ struct ActiveSonioxStream {
 impl Drop for AppState {
     fn drop(&mut self) {
         self.downloads.cancel_all();
+        self.gguf_cleanup_store.cancel_all_downloads();
+        self.mlx_cleanup_catalog.cancel_all_downloads();
         ondevice_runtime::shared_runtime(&self.models_root).begin_shutdown();
         self.mlx_cleanup_runtime.begin_shutdown();
+        self.llama_cleanup_runtime.begin_shutdown();
     }
 }
 
@@ -1412,10 +1426,18 @@ impl AppState {
         models_root: std::path::PathBuf,
     ) -> Self {
         let cleanup_model_store = modelstore::Manager::new();
+        let mlx_cleanup_catalog = modelstore::MlxCatalogManager::new();
+        let gguf_cleanup_store = gguf_cleanup_store::Manager::default();
+        let llama_cleanup_runtime = Arc::new(llama_cleanup_runtime::Runtime::new_for_verification(
+            models_root.clone(),
+            gguf_cleanup_store.clone(),
+            PathBuf::from("/tmp/voiceflow-test-llama-runtime-unavailable"),
+        ));
         Self {
             manager: Mutex::new(DictationManager::new()),
             delivery_settlements: Arc::new(DeliverySettlementRegistry::default()),
             delivery_status_uses_chinese: Arc::new(AtomicBool::new(false)),
+            #[cfg(any(test, all(feature = "research-harness", target_os = "macos")))]
             research_trace: Mutex::new(research_trace::Owner::default()),
             dictionary_learning_audit: Mutex::new(dictionary_learning_audit::Owner::new(false)),
             recorder: Arc::new(Mutex::new(Box::new(audio::Recorder::new()))),
@@ -1428,7 +1450,6 @@ impl AppState {
             text_action_control: Mutex::new(None),
             text_action_sequence: AtomicU64::new(0),
             exit_state: AtomicU8::new(0),
-            undo: Mutex::new(None),
             operation_lease: Mutex::new(OperationLease::Idle),
             audio_recovery_ticket: Mutex::new(None),
             audio_recovery_sequence: AtomicU64::new(0),
@@ -1436,9 +1457,16 @@ impl AppState {
             history_recovery_sequence: AtomicU64::new(0),
             models_root: models_root.clone(),
             cleanup_model_store: cleanup_model_store.clone(),
-            mlx_cleanup_runtime: Arc::new(mlx_cleanup_runtime::Runtime::new_for_demand_test(
-                models_root,
-            )),
+            mlx_cleanup_catalog: mlx_cleanup_catalog.clone(),
+            mlx_cleanup_runtime: Arc::new(
+                mlx_cleanup_runtime::Runtime::new_for_demand_test_with_catalog(
+                    models_root.clone(),
+                    cleanup_model_store.clone(),
+                    mlx_cleanup_catalog,
+                ),
+            ),
+            gguf_cleanup_store,
+            llama_cleanup_runtime,
             cleanup_warmup_enabled: false,
             cleanup_model_generation: AtomicU64::new(0),
             cleanup_warmup: cleanup_warmup::Coordinator::default(),
@@ -1485,12 +1513,15 @@ fn begin_application_exit(app: &tauri::AppHandle, state: &AppState, exit_code: i
     permission_guide::close_all(app);
     audio::configure_warm(app.clone(), false, String::new());
     state.downloads.cancel_all();
+    state.gguf_cleanup_store.cancel_all_downloads();
+    state.mlx_cleanup_catalog.cancel_all_downloads();
     network_policy::cancel_cloud_requests();
     lock_recover(&state.manager).cancellation.cancel();
     cancel_active_text_action(state);
     let models_root = state.models_root.clone();
     ondevice_runtime::shared_runtime(&models_root).begin_shutdown();
     state.mlx_cleanup_runtime.begin_shutdown();
+    state.llama_cleanup_runtime.begin_shutdown();
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         let state = app.state::<AppState>();
@@ -1502,15 +1533,55 @@ fn begin_application_exit(app: &tauri::AppHandle, state: &AppState, exit_code: i
         let asr_settled = ondevice_runtime::shutdown_for_root_with_status(&models_root)
             .await
             .is_ok();
+        let downloads_settled = state.gguf_cleanup_store.shutdown_downloads().await;
+        let mlx_downloads_settled = state.mlx_cleanup_catalog.shutdown_downloads().await;
         let cleanup_settled = state.mlx_cleanup_runtime.shutdown().await;
-        if !asr_settled || !cleanup_settled {
-            log::warn!("MLX runtime shutdown is still unsettled; retaining diagnostics writer and App ownership");
+        let llama_cleanup_settled = state.llama_cleanup_runtime.shutdown().await;
+        if !asr_settled
+            || !downloads_settled
+            || !mlx_downloads_settled
+            || !cleanup_settled
+            || !llama_cleanup_settled
+        {
+            log::warn!("A local model runtime shutdown is still unsettled; retaining diagnostics writer and App ownership until Quit is requested again");
+            state
+                .exit_state
+                .store(EXIT_SHUTDOWN_UNSETTLED, Ordering::Release);
             return;
         }
         mlx_diagnostics::shutdown_writer().await;
         state.exit_state.store(2, Ordering::Release);
         app.exit(exit_code);
     });
+}
+
+/// `exit_state` after a graceful exit attempt could not prove that the MLX
+/// children exited. Any non-zero state still blocks new work.
+const EXIT_SHUTDOWN_UNSETTLED: u8 = 3;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExitRequestAction {
+    Proceed,
+    BeginGracefulExit,
+    AwaitGracefulExit,
+    ForceExit,
+}
+
+fn exit_request_action(exit_state: u8) -> ExitRequestAction {
+    match exit_state {
+        0 => ExitRequestAction::BeginGracefulExit,
+        2 => ExitRequestAction::Proceed,
+        EXIT_SHUTDOWN_UNSETTLED => ExitRequestAction::ForceExit,
+        _ => ExitRequestAction::AwaitGracefulExit,
+    }
+}
+
+fn force_application_exit(app: &tauri::AppHandle, state: &AppState, exit_code: i32) {
+    log::warn!("Quit requested again after unsettled MLX runtime shutdown; forcing exit");
+    ondevice_runtime::shared_runtime(&state.models_root).kill_active_child();
+    ondevice_runtime::cleanup_private_audio_for_root(&state.models_root);
+    state.exit_state.store(2, Ordering::Release);
+    app.exit(exit_code);
 }
 
 fn signal_application_exit_started(
@@ -2376,37 +2447,22 @@ pub(crate) fn guard_final_output_with_reason(
         .structure_safe_source
         .or(context.layout_source)
         .unwrap_or(source);
-    if context.structure_safe_source.is_some()
-        && !cleanup_structure_guard::preserves_structure_safe(layout_source, candidate)
-    {
-        return (
-            source.to_owned(),
-            Some(llm::GuardReason::Layout),
-            Some(candidate.to_owned()),
-        );
-    }
-    let candidate = if context.operation == llm::CleanupOperation::Cleanup
-        && context.structure_safe_source.is_none()
-    {
-        spoken_layout::restore_if_flattened(layout_source, candidate)
-    } else {
-        candidate.to_owned()
+    let candidate = match llm::guard_cleanup_candidate(
+        layout_source,
+        candidate,
+        Some(context.operation),
+        context.structure_safe_source.is_some(),
+        llm::GuardBoundary::FinalOutput,
+    ) {
+        Ok(candidate) => candidate,
+        Err(rejection) => {
+            return (
+                source.to_owned(),
+                Some(rejection.reason),
+                Some(rejection.candidate),
+            )
+        }
     };
-    if context.operation == llm::CleanupOperation::Cleanup
-        && !spoken_layout::preserves_required_layout(layout_source, &candidate)
-    {
-        return (
-            source.to_owned(),
-            Some(llm::GuardReason::Layout),
-            Some(candidate),
-        );
-    }
-    let reason = llm::final_output_guard_reason(layout_source, &candidate, Some(context.operation));
-    let guarded = llm::guard_final_output(layout_source, &candidate, Some(context.operation));
-    let rejected = guarded != candidate;
-    if rejected {
-        return (source.to_owned(), reason, Some(candidate));
-    }
     if context.operation == llm::CleanupOperation::Cleanup
         && context.promoted_pair_protections.iter().any(|pair| {
             let source_after_count =
@@ -2424,7 +2480,7 @@ pub(crate) fn guard_final_output_with_reason(
             Some(candidate),
         );
     }
-    (guarded, None, None)
+    (candidate, None, None)
 }
 
 fn cleanup_failure_status(raw: &str, final_text: &str) -> &'static str {
@@ -2465,17 +2521,6 @@ fn fallback_for_cleanup_plan(
     } else {
         local_cleanup_or_raw_for_resolved_scene(canonical_source, scene)
     }
-}
-
-#[expect(
-    dead_code,
-    reason = "cleanup_code_fingerprint uses this function signature as a stable source-boundary marker"
-)]
-fn scene_allows_automatic_lexicon(
-    family: context::ContextFamily,
-    input_kind: context::FocusKind,
-) -> bool {
-    ResolvedCleanupScene::observed(family, input_kind).allows_automatic_lexicon()
 }
 
 fn cleanup_policy_for(
@@ -3257,8 +3302,8 @@ fn cleanup_provider_credentials_available(settings: &store::Settings) -> bool {
     use crate::engine::EngineProvider;
 
     match settings.cleanup_provider {
-        EngineProvider::OnDeviceMlx => true,
-        EngineProvider::Ollama | EngineProvider::LmStudio => {
+        EngineProvider::OnDeviceMlx | EngineProvider::OnDeviceLlamaCpp => true,
+        EngineProvider::Ollama => {
             let base = settings.resolved_provider_base(settings.cleanup_provider);
             let loopback = crate::providers::is_loopback_url(&base);
             (!settings.strict_offline_enabled || loopback)
@@ -3528,19 +3573,6 @@ fn emit_hud_partial(app: &tauri::AppHandle, session_generation: u64, text: &str)
             "text": text,
         }),
     );
-    let has_partial = app
-        .try_state::<AppState>()
-        .map(|state| {
-            let manager = lock_recover(&state.manager);
-            hud_partial_expands_window(
-                text,
-                manager.phase,
-                session_generation,
-                manager.session_generation,
-            )
-        })
-        .unwrap_or(false);
-    island_window::set_has_partial(app, has_partial);
 }
 
 fn attach_recording_gesture(app: &tauri::AppHandle, phase: &str, payload: &mut serde_json::Value) {
@@ -3572,15 +3604,6 @@ fn attach_recording_gesture(app: &tauri::AppHandle, phase: &str, payload: &mut s
     };
     payload["recording_mode"] = serde_json::json!(mode);
     payload["recording_hotkey"] = serde_json::json!(binding);
-}
-
-fn hud_partial_expands_window(
-    _text: &str,
-    _phase: Phase,
-    _event_generation: u64,
-    _current_generation: u64,
-) -> bool {
-    false
 }
 
 fn hud_caption_expands_window(state: &str, fallback_reason: Option<&str>) -> bool {
@@ -3897,7 +3920,6 @@ fn state_payload_with_delivery_and_input_device(
     payload["cleanup_status"] = cleanup_status
         .map(serde_json::Value::from)
         .unwrap_or(serde_json::Value::Null);
-    payload["undo_available"] = serde_json::json!(undo_available_from_app(app, state));
     if let Some(input_device) = input_device {
         payload["input_device"] = serde_json::Value::from(input_device);
     }
@@ -3964,34 +3986,6 @@ fn context_source_payload(
         "label": label,
         "matched_rule_label": matched_rule_label,
     })
-}
-
-fn undo_available_from_app(app: &tauri::AppHandle, hud_state: &str) -> bool {
-    let Some(app_state) = app.try_state::<AppState>() else {
-        return false;
-    };
-    let undo = lock_recover(&app_state.undo).clone();
-    let generation = lock_recover(&app_state.manager).session_generation;
-    undo_available_for_hud(
-        hud_state,
-        undo.as_ref(),
-        generation,
-        std::time::Instant::now(),
-    )
-}
-
-/// Preserve transaction availability in the payload for the backend undo command.
-/// The HUD has no delivery-undo control; only dictionary learning exposes undo.
-/// Inferring from `delivery_method == "paste"` is wrong: verified AX inserts
-/// also report method `"paste"` but never call `arm_undo_transaction`.
-fn undo_available_for_hud(
-    hud_state: &str,
-    undo: Option<&UndoTransaction>,
-    current_generation: u64,
-    now: std::time::Instant,
-) -> bool {
-    matches!(hud_state, "done" | "degraded")
-        && undo.is_some_and(|tx| undo_preflight(tx, current_generation, now) == "available")
 }
 
 #[allow(
@@ -6161,8 +6155,6 @@ async fn start_claimed_inner(
                     "batch_prefetch",
                 ),
                 cancellation: prefetch_cancellation,
-                hud_partial: None,
-                session_generation,
                 session_binding: prefetch_asr::PrefetchSessionBinding::new(
                     active_generation,
                     configuration_generation,
@@ -8112,196 +8104,6 @@ async fn copy_text(
     })
 }
 
-fn arm_undo_transaction(
-    state: &AppState,
-    session_generation: u64,
-    target_guard: Option<&context::TargetAppGuard>,
-    post_insert_input_fingerprint: Option<u64>,
-    field_ticket: Option<&paste::UndoFieldTicket>,
-    delivery_method: &str,
-    used_keyboard_paste: bool,
-) {
-    let mut undo = lock_recover(&state.undo);
-    // A new delivery supersedes the previous undo target even if this delivery
-    // cannot safely arm a replacement (AX edits or unreadable fields).
-    *undo = None;
-    if !used_keyboard_paste || delivery_method != "paste" {
-        return;
-    }
-    let Some(post_insert_input_fingerprint) = post_insert_input_fingerprint else {
-        return;
-    };
-    let Some(target_guard) = target_guard
-        .filter(|guard| context::same_field_mismatch_reason(guard, guard, false).is_none())
-    else {
-        return;
-    };
-    let Some(field_ticket) = field_ticket else {
-        return;
-    };
-    let now = std::time::Instant::now();
-    *undo = Some(UndoTransaction {
-        session_generation,
-        created_at: now,
-        expires_at: field_ticket
-            .expires_at()
-            .min(now + std::time::Duration::from_secs(3)),
-        target_guard: target_guard.clone(),
-        delivery_method: delivery_method.to_owned(),
-        post_insert_input_fingerprint,
-        field_ticket: Some(field_ticket.clone()),
-        consumed: false,
-    });
-}
-
-fn undo_preflight(
-    transaction: &UndoTransaction,
-    current_generation: u64,
-    now: std::time::Instant,
-) -> &'static str {
-    if transaction.delivery_method != "paste" || now < transaction.created_at {
-        "not_available"
-    } else if transaction.consumed {
-        "already_consumed"
-    } else if now >= transaction.expires_at {
-        "expired"
-    } else if current_generation != transaction.session_generation {
-        "stale_target"
-    } else {
-        "available"
-    }
-}
-
-fn undo_delivery_preflight(
-    transaction: &UndoTransaction,
-    current_generation: u64,
-    now: std::time::Instant,
-    current_target: &context::TargetAppGuard,
-    current_input_fingerprint: Option<u64>,
-) -> &'static str {
-    let status = undo_preflight(transaction, current_generation, now);
-    if status != "available" {
-        return status;
-    }
-    if context::same_field_mismatch_reason(&transaction.target_guard, current_target, false)
-        .is_some()
-        || current_input_fingerprint != Some(transaction.post_insert_input_fingerprint)
-    {
-        "stale_target"
-    } else {
-        "available"
-    }
-}
-
-#[tauri::command]
-async fn undo_last_delivery(
-    app: tauri::AppHandle,
-    state: State<'_, AppState>,
-) -> Result<String, String> {
-    let generation = lock_recover(&state.manager).session_generation;
-    let now = std::time::Instant::now();
-    let transaction = {
-        let mut undo = state
-            .undo
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let Some(transaction) = undo.as_mut() else {
-            return Ok("not_available".into());
-        };
-        match undo_preflight(transaction, generation, now) {
-            "already_consumed" => return Ok("already_consumed".into()),
-            "expired" => {
-                transaction.consumed = true;
-                return Ok("expired".into());
-            }
-            "stale_target" => {
-                transaction.consumed = true;
-                return Ok("stale_target".into());
-            }
-            "not_available" => return Ok("not_available".into()),
-            "available" => {}
-            _ => unreachable!(),
-        }
-        let transaction = transaction.clone();
-        // Claim the transaction before doing the blocking target probe so a
-        // double click cannot send two undo shortcuts.
-        if let Some(current) = undo.as_mut() {
-            current.consumed = true;
-        }
-        transaction
-    };
-
-    let Some(field_ticket) = transaction.field_ticket.clone() else {
-        return Ok("not_available".into());
-    };
-    let worker_app = app.clone();
-    let status = research_trace::spawn_blocking(move || {
-        field_ticket.run(move |anchor, cancellation, deadline| {
-            let state = worker_app.state::<AppState>();
-            let current_target = context::probe_focus_guard();
-            let fingerprint = anchor
-                .read_value()
-                .as_deref()
-                .map(paste::selection_fingerprint);
-            let status = undo_delivery_preflight(
-                &transaction,
-                lock_recover(&state.manager).session_generation,
-                std::time::Instant::now(),
-                &current_target,
-                fingerprint,
-            );
-            if status != "available" || !anchor.is_current_focus() {
-                return Ok(if status == "available" {
-                    "stale_target"
-                } else {
-                    status
-                });
-            }
-            let accessibility = permissions::check().accessibility;
-            // The delivery-time AX anchor never leaves this ticket thread.
-            // Hold the generation lock only for final checks and submission,
-            // preventing a new session claim immediately before Cmd+Z.
-            let current_target = context::probe_focus_guard();
-            let manager = lock_recover(&state.manager);
-            let fingerprint = anchor
-                .read_value()
-                .as_deref()
-                .map(paste::selection_fingerprint);
-            let status = undo_delivery_preflight(
-                &transaction,
-                manager.session_generation,
-                std::time::Instant::now(),
-                &current_target,
-                fingerprint,
-            );
-            if status != "available" {
-                return Ok(status);
-            }
-            let result = paste::run_guarded_undo(
-                cancellation,
-                deadline,
-                || anchor.is_current_focus(),
-                || {
-                    dictionary_learn::invalidate_learning_observers(&state.learning_observer_epoch);
-                    paste::undo(accessibility)
-                },
-            );
-            drop(manager);
-            result
-        })
-    })
-    .await
-    .map_err(|error| format!("undo worker failed: {error}"))??;
-    if status != "success" {
-        return Ok(status.into());
-    }
-    let _ = app.emit(
-        "dictation://undo",
-        serde_json::json!({ "status": "success" }),
-    );
-    Ok("success".into())
-}
-
 fn completion_hud_dwell_ms(phase: &str) -> u64 {
     match phase {
         "copied" | "unverified" | "error" => 6_000,
@@ -8540,7 +8342,7 @@ async fn stop_claimed_inner(
                 return Ok(());
             }
             if message == audio::AudioError::EmptyRecording.to_string() {
-                cancel_soniox_stream(state, session_generation);
+                cancel_soniox_stream(state, recording_generation);
                 fail_for_generation(
                     app,
                     state,
@@ -8577,7 +8379,7 @@ async fn stop_claimed_inner(
             spool.request_finish(audio::SpoolDisposition::Completed);
         }
         cancel_prefetch_asr(state);
-        cancel_soniox_stream(state, session_generation);
+        cancel_soniox_stream(state, recording_generation);
         let became_idle = {
             let _gate = state.hotkey_gate.lock().await;
             let mut manager = lock_recover(&state.manager);
@@ -8671,7 +8473,7 @@ async fn stop_claimed_inner(
             // the gate so a waiting start cannot interleave with teardown.
             drop(m);
             drop(lease);
-            cancel_soniox_stream(state, session_generation);
+            cancel_soniox_stream(state, recording_generation);
             sync_modifier_hotkey_phase(Phase::Idle);
             hotkey::unregister_cancel(app);
             emit_state_for_generation(app, "idle", idle_generation);
@@ -9595,9 +9397,10 @@ async fn process_selected_action(
                 with_cleanup_warmup_model_demand(
                     state,
                     settings.cleanup_provider,
-                    llm::text_action_with_provider_and_native_runtime(
+                    llm::text_action_with_provider_and_local_runtimes(
                         settings.cleanup_provider,
                         &state.mlx_cleanup_runtime,
+                        Some(&state.llama_cleanup_runtime),
                         &cleanup_endpoint,
                         &cleanup_model,
                         &plan_for_request,
@@ -11034,17 +10837,16 @@ async fn process_short(
                                 let result = with_cleanup_warmup_model_demand(
                                 state,
                                 settings.cleanup_provider,
-                                llm::cleanup_with_provider_and_native_runtime_and_intent_and_source_traced(
+                                llm::cleanup_with_provider_and_local_runtimes_and_intent_and_source_traced(
                                     settings.cleanup_provider,
                                     &state.mlx_cleanup_runtime,
+                                    Some(&state.llama_cleanup_runtime),
                                     &cleanup_endpoint,
                                     &cleanup_model,
                                     &provider_cleanup_input,
                                     &cleanup_key,
-                                    &[],
                                     None,
                                     Some(&cleanup_policy),
-                                    Some(settings.language.as_str()),
                                     cleanup_profile_for(recording_context),
                                     Some(&provider_cleanup_intent),
                                     pairs_hint.as_deref(),
@@ -11055,6 +10857,7 @@ async fn process_short(
                                     (settings.cleanup_provider
                                         == providers::EngineProvider::Custom)
                                     .then_some(&settings.custom_cleanup_parameters),
+                                    (settings.language == "en").then_some("en"),
                                     cleanup_trace_handle.as_ref(),
                                 ),
                             )
@@ -11563,15 +11366,6 @@ async fn process_short(
                     let result =
                         delivery_result_for_paste(outcome.verified, delivery_diagnostic.as_ref());
                     paste_unconfirmed = !outcome.verified;
-                    arm_undo_transaction(
-                        state,
-                        session_generation,
-                        outcome.post_insert_target_guard.as_ref(),
-                        outcome.post_insert_input_fingerprint,
-                        outcome.post_insert_field_ticket.as_ref(),
-                        result.method.as_str(),
-                        outcome.used_keyboard_paste,
-                    );
                     (
                         outcome.verified,
                         result.fallback_reason,
@@ -13857,17 +13651,16 @@ async fn process_long(
                     let result = with_cleanup_warmup_model_demand(
                         state,
                         settings.cleanup_provider,
-                        llm::cleanup_with_provider_and_native_runtime_and_intent_and_source_traced(
+                        llm::cleanup_with_provider_and_local_runtimes_and_intent_and_source_traced(
                             settings.cleanup_provider,
                             &state.mlx_cleanup_runtime,
+                            Some(&state.llama_cleanup_runtime),
                             &cleanup_endpoint,
                             &cleanup_model,
                             &provider_cleanup_input,
                             &cleanup_key,
-                            &[],
                             None,
                             Some(&cleanup_policy),
-                            Some(settings.language.as_str()),
                             cleanup_profile_for(recording_context),
                             Some(&provider_cleanup_intent),
                             pairs_hint.as_deref(),
@@ -13879,6 +13672,7 @@ async fn process_long(
                             None,
                             (settings.cleanup_provider == providers::EngineProvider::Custom)
                                 .then_some(&settings.custom_cleanup_parameters),
+                            (settings.language == "en").then_some("en"),
                             cleanup_trace_handle.as_ref(),
                         ),
                     )
@@ -14404,15 +14198,6 @@ async fn process_long(
                     }
                     let result =
                         delivery_result_for_paste(outcome.verified, delivery_diagnostic.as_ref());
-                    arm_undo_transaction(
-                        state,
-                        session_generation,
-                        outcome.post_insert_target_guard.as_ref(),
-                        outcome.post_insert_input_fingerprint,
-                        outcome.post_insert_field_ticket.as_ref(),
-                        result.method.as_str(),
-                        outcome.used_keyboard_paste,
-                    );
                     delivered_via_paste = outcome.verified;
                     paste_unconfirmed = !outcome.verified;
                     delivery_method = result.method.as_str();
@@ -16588,8 +16373,8 @@ pub(crate) fn cleanup_route_for_resolved_scene(
         && !matches!(
             settings.cleanup_provider,
             crate::engine::EngineProvider::Ollama
-                | crate::engine::EngineProvider::LmStudio
                 | crate::engine::EngineProvider::OnDeviceMlx
+                | crate::engine::EngineProvider::OnDeviceLlamaCpp
         )
     {
         return lexicon::CleanupRoute::LocalOnly;
@@ -18017,6 +17802,19 @@ async fn apply_binding_settings(
         .validate_binding_changes(&previous)
         .and_then(|_| settings.validate_configuration())
         .map_err(|error| error.to_string());
+    validation.as_ref().map_err(Clone::clone)?;
+    validate_new_ondevice_asr_selection(&previous, &settings)?;
+    validate_new_gguf_cleanup_selection(state, &previous, &settings)?;
+    validate_new_mlx_cleanup_selection(state, &previous, &settings)?;
+    if gguf_route_needs_retirement(&previous, &settings) {
+        state.llama_cleanup_runtime.unload(None).await?;
+    }
+    if mlx_route_needs_retirement(&previous, &settings) {
+        state
+            .mlx_cleanup_runtime
+            .unload_model(Some(&previous.cleanup_model))
+            .await?;
+    }
     let changing_bindings = bindings_changed(&previous, &settings);
     if !restoring_capture && changing_bindings {
         ensure_bindings_editable(state)?;
@@ -18195,6 +17993,18 @@ async fn apply_settings(
         settings
             .validate_configuration()
             .map_err(|error| error.to_string())?;
+    }
+    validate_new_ondevice_asr_selection(&prev, &settings)?;
+    validate_new_gguf_cleanup_selection(state, &prev, &settings)?;
+    validate_new_mlx_cleanup_selection(state, &prev, &settings)?;
+    if gguf_route_needs_retirement(&prev, &settings) {
+        state.llama_cleanup_runtime.unload(None).await?;
+    }
+    if mlx_route_needs_retirement(&prev, &settings) {
+        state
+            .mlx_cleanup_runtime
+            .unload_model(Some(&prev.cleanup_model))
+            .await?;
     }
     if custom_key_cleared {
         store::clear_custom_credentials_before_host_change(&dir)
@@ -19143,8 +18953,12 @@ async fn remove_provider_key(
         && settings.cleanup_credential().trim().is_empty()
     {
         let cleanup_base = settings.resolved_provider_base(parsed);
-        let local_keyless = parsed == crate::providers::EngineProvider::OnDeviceMlx
-            || parsed.allows_empty_key() && crate::providers::is_loopback_url(&cleanup_base);
+        let local_keyless = matches!(
+            parsed,
+            crate::providers::EngineProvider::OnDeviceMlx
+                | crate::providers::EngineProvider::OnDeviceLlamaCpp
+        ) || parsed.allows_empty_key()
+            && crate::providers::is_loopback_url(&cleanup_base);
         if !local_keyless {
             settings.cleanup_enabled = false;
         }
@@ -19223,11 +19037,14 @@ async fn probe_engine_draft(
         == crate::providers::EngineProvider::OnDeviceMlx
         && draft.probe_stage != engine::ProbeScope::Asr
         && (draft.cleanup_enabled || draft.probe_stage == engine::ProbeScope::Cleanup);
-    let result =
-        engine::probe_engine_draft_with_cleanup_demand(&draft, &stored, &state.models_root, || {
-            probes_native_cleanup.then(|| begin_cleanup_model_demand(&state))
-        })
-        .await;
+    let result = engine::probe_engine_draft_with_cleanup_demand_and_gguf_runtime(
+        &draft,
+        &stored,
+        &state.models_root,
+        Some(&state.llama_cleanup_runtime),
+        || probes_native_cleanup.then(|| begin_cleanup_model_demand(&state)),
+    )
+    .await;
     Ok(result)
 }
 
@@ -19237,15 +19054,6 @@ async fn get_local_cleanup_status(
 ) -> Result<ollama_local::LocalCleanupStatus, String> {
     let settings = lock_recover(&state.settings).clone();
     Ok(ollama_local::status(&settings.ollama_base_url, ollama_local::MODEL).await)
-}
-
-#[tauri::command]
-async fn get_lmstudio_cleanup_status() -> Result<lmstudio_local::CleanupStatus, String> {
-    Ok(lmstudio_local::status(
-        lmstudio_local::DEFAULT_BASE_URL,
-        lmstudio_local::MODEL_VARIANT,
-    )
-    .await)
 }
 
 #[derive(serde::Serialize)]
@@ -19259,6 +19067,7 @@ struct CleanupModelStoreRuntimeStatus {
 
 const CLEANUP_MODEL_PLATFORM_UNSUPPORTED: &str =
     "VoiceFlow MLX cleanup requires Apple Silicon and macOS 14 or later.";
+const MLX_CLEANUP_MODEL_STATUS_EVENT: &str = "mlx-cleanup-model://status";
 
 fn cleanup_model_platform_supported() -> bool {
     crate::ondevice_asr::platform_supported()
@@ -19364,6 +19173,323 @@ async fn delete_cleanup_model_store(
         schedule_startup_cleanup_warmup(&app, false);
     }
     result
+}
+
+fn mlx_cleanup_model_compatibility_error(model: &modelstore::MlxCleanupModel) -> Option<String> {
+    if !cleanup_model_platform_supported() {
+        return Some("unsupported_platform".to_owned());
+    }
+    crate::model_resources::static_model_memory_compatibility(model.id, model.revision)
+        .err()
+        .map(|reason| match reason {
+            crate::model_resources::MemoryUnavailableReason::BudgetExceeded => {
+                "insufficient_memory"
+            }
+            crate::model_resources::MemoryUnavailableReason::UnknownPhysicalMemory => {
+                "memory_unknown"
+            }
+            _ => "memory_unavailable",
+        })
+        .map(str::to_owned)
+}
+
+#[tauri::command]
+fn list_mlx_cleanup_models(
+    state: State<'_, AppState>,
+) -> Result<Vec<modelstore::MlxCleanupModelStatus>, String> {
+    Ok(state
+        .mlx_cleanup_catalog
+        .statuses(&state.models_root, |model| {
+            mlx_cleanup_model_compatibility_error(model)
+        }))
+}
+
+#[tauri::command]
+fn download_mlx_cleanup_model(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<(), String> {
+    if state.exit_state.load(Ordering::Acquire) != 0 {
+        return Err("VoiceFlow is shutting down.".into());
+    }
+    let model = modelstore::mlx_model(&id)
+        .ok_or_else(|| "unsupported local MLX cleanup model".to_owned())?;
+    let compatibility_error = mlx_cleanup_model_compatibility_error(model);
+    state.mlx_cleanup_catalog.start_background_download(
+        state.models_root.clone(),
+        &id,
+        compatibility_error,
+        move |status| {
+            let _ = app.emit(MLX_CLEANUP_MODEL_STATUS_EVENT, status);
+        },
+    )
+}
+
+#[tauri::command]
+fn verify_mlx_cleanup_model(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<(), String> {
+    if state.exit_state.load(Ordering::Acquire) != 0 {
+        return Err("VoiceFlow is shutting down.".into());
+    }
+    let model = modelstore::mlx_model(&id)
+        .ok_or_else(|| "unsupported local MLX cleanup model".to_owned())?;
+    let compatibility_error = mlx_cleanup_model_compatibility_error(model);
+    state.mlx_cleanup_catalog.start_background_verification(
+        state.models_root.clone(),
+        &id,
+        compatibility_error,
+        move |status| {
+            let _ = app.emit(MLX_CLEANUP_MODEL_STATUS_EVENT, status);
+        },
+    )
+}
+
+#[tauri::command]
+fn cancel_mlx_cleanup_model_download(
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<bool, String> {
+    if state.exit_state.load(Ordering::Acquire) != 0 {
+        return Ok(false);
+    }
+    state.mlx_cleanup_catalog.cancel_download(&id)
+}
+
+#[tauri::command]
+async fn delete_mlx_cleanup_model(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    if state.exit_state.load(Ordering::Acquire) != 0 {
+        return Err("VoiceFlow is shutting down.".into());
+    }
+    if modelstore::mlx_model(&id).is_none() {
+        return Err("unsupported local MLX cleanup model".into());
+    }
+    let _settings_gate = state.settings_gate.lock().await;
+    let settings = lock_recover(&state.settings).clone();
+    if settings.cleanup_enabled
+        && settings.cleanup_provider == crate::providers::EngineProvider::OnDeviceMlx
+        && settings.cleanup_model == id
+    {
+        return Err("local_cleanup_model_is_active".into());
+    }
+    invalidate_cleanup_warmup_for_model_transition(&state);
+    let runtime = Arc::clone(&state.mlx_cleanup_runtime);
+    let unload_id = id.clone();
+    state
+        .mlx_cleanup_catalog
+        .delete_with_unload(state.models_root.clone(), &id, move || async move {
+            runtime.unload_model(Some(&unload_id)).await
+        })
+        .await
+}
+
+fn local_cleanup_compatibility_error(state: &AppState) -> Option<&'static str> {
+    llama_cleanup_runtime::compatibility_error(state.llama_cleanup_runtime.helper_path())
+}
+
+fn validate_new_ondevice_asr_selection(
+    previous: &store::Settings,
+    next: &store::Settings,
+) -> Result<(), String> {
+    let retired_model_selected = next.asr_provider == crate::providers::EngineProvider::OnDevice
+        && crate::ondevice_models::mlx_model_download_retired(&next.asr_model);
+    let same_saved_route = previous.asr_provider == crate::providers::EngineProvider::OnDevice
+        && previous.asr_model == next.asr_model;
+    if retired_model_selected && !same_saved_route {
+        return Err("retired_on_device_asr_model".to_owned());
+    }
+    Ok(())
+}
+
+fn gguf_model_compatibility_error(
+    state: &AppState,
+    manifest: &gguf_cleanup_store::ModelManifest,
+) -> Option<&'static str> {
+    local_cleanup_compatibility_error(state).or_else(|| {
+        crate::model_resources::static_model_memory_compatibility(manifest.id, manifest.revision)
+            .err()
+            .map(|reason| match reason {
+                crate::model_resources::MemoryUnavailableReason::BudgetExceeded => {
+                    "insufficient_memory"
+                }
+                crate::model_resources::MemoryUnavailableReason::UnknownPhysicalMemory => {
+                    "memory_unknown"
+                }
+                _ => "memory_unavailable",
+            })
+    })
+}
+
+fn validate_new_gguf_cleanup_selection(
+    state: &AppState,
+    previous: &store::Settings,
+    next: &store::Settings,
+) -> Result<(), String> {
+    let newly_active = next.cleanup_enabled
+        && next.cleanup_provider == crate::providers::EngineProvider::OnDeviceLlamaCpp
+        && (!previous.cleanup_enabled
+            || previous.cleanup_provider != next.cleanup_provider
+            || previous.cleanup_model != next.cleanup_model);
+    if !newly_active {
+        return Ok(());
+    }
+    let manifest = gguf_cleanup_store::model(&next.cleanup_model)
+        .ok_or_else(|| "unsupported local cleanup model".to_owned())?;
+    let verified = state
+        .gguf_cleanup_store
+        .resolve_ready(&state.models_root, manifest.id)
+        .map_err(|_| "selected local cleanup model is missing or not verified".to_owned())?;
+    if let Some(error) = gguf_model_compatibility_error(state, manifest) {
+        return Err(error.to_owned());
+    }
+    let saved_route = previous.cleanup_provider
+        == crate::providers::EngineProvider::OnDeviceLlamaCpp
+        && previous.cleanup_model == next.cleanup_model;
+    if !saved_route && !gguf_cleanup_store::is_user_available_model(manifest.id) {
+        return Err("local GGUF cleanup model is not available for new selection".to_owned());
+    }
+    drop(verified);
+    Ok(())
+}
+
+fn is_active_gguf_cleanup_model(settings: &store::Settings, id: &str) -> bool {
+    settings.cleanup_enabled
+        && settings.cleanup_provider == crate::providers::EngineProvider::OnDeviceLlamaCpp
+        && settings.cleanup_model == id
+}
+
+fn gguf_route_needs_retirement(previous: &store::Settings, next: &store::Settings) -> bool {
+    previous.cleanup_provider == crate::providers::EngineProvider::OnDeviceLlamaCpp
+        && (previous.cleanup_provider != next.cleanup_provider
+            || previous.cleanup_model != next.cleanup_model
+            || (previous.cleanup_enabled && !next.cleanup_enabled))
+}
+
+fn validate_new_mlx_cleanup_selection(
+    state: &AppState,
+    previous: &store::Settings,
+    next: &store::Settings,
+) -> Result<(), String> {
+    let newly_active = next.cleanup_enabled
+        && next.cleanup_provider == crate::providers::EngineProvider::OnDeviceMlx
+        && (!previous.cleanup_enabled
+            || previous.cleanup_provider != next.cleanup_provider
+            || previous.cleanup_model != next.cleanup_model);
+    if !newly_active || next.cleanup_model == modelstore::MODEL_ID {
+        return Ok(());
+    }
+    let model = modelstore::mlx_model(&next.cleanup_model)
+        .ok_or_else(|| "unsupported local MLX cleanup model".to_owned())?;
+    let compatibility_error = mlx_cleanup_model_compatibility_error(model);
+    let status =
+        state
+            .mlx_cleanup_catalog
+            .status(&state.models_root, model.id, compatibility_error)?;
+    if !status.compatible {
+        return Err(status
+            .compatibility_error
+            .unwrap_or_else(|| "local MLX cleanup model is incompatible".to_owned()));
+    }
+    let saved_route = previous.cleanup_provider == crate::providers::EngineProvider::OnDeviceMlx
+        && previous.cleanup_model == next.cleanup_model;
+    if !saved_route && !modelstore::is_user_available_mlx_cleanup_model(model.id) {
+        return Err("local MLX cleanup model is not available for new selection".to_owned());
+    }
+    let verified = state
+        .mlx_cleanup_catalog
+        .resolve_ready(&state.models_root, model.id)
+        .map_err(|_| "selected local MLX cleanup model is missing or not verified".to_owned())?;
+    drop(verified);
+    Ok(())
+}
+
+fn mlx_route_needs_retirement(previous: &store::Settings, next: &store::Settings) -> bool {
+    previous.cleanup_provider == crate::providers::EngineProvider::OnDeviceMlx
+        && (previous.cleanup_provider != next.cleanup_provider
+            || previous.cleanup_model != next.cleanup_model
+            || (previous.cleanup_enabled && !next.cleanup_enabled))
+}
+
+#[tauri::command]
+fn list_local_cleanup_models(
+    state: State<'_, AppState>,
+) -> Result<Vec<gguf_cleanup_store::ModelStatus>, String> {
+    Ok(gguf_cleanup_store::MODELS
+        .iter()
+        .map(|manifest| {
+            let compatibility_error = gguf_model_compatibility_error(&state, manifest);
+            state.gguf_cleanup_store.status(
+                &state.models_root,
+                manifest.id,
+                compatibility_error.is_none(),
+                compatibility_error,
+            )
+        })
+        .collect())
+}
+
+#[tauri::command]
+fn download_local_cleanup_model(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<(), String> {
+    if state.exit_state.load(Ordering::Acquire) != 0 {
+        return Err("VoiceFlow is shutting down.".into());
+    }
+    let manifest = gguf_cleanup_store::model(&id)
+        .ok_or_else(|| "unsupported local cleanup model".to_owned())?;
+    if !gguf_cleanup_store::is_user_available_model(manifest.id) {
+        return Err("this local cleanup model is not available for new downloads".to_owned());
+    }
+    let compatibility_error = gguf_model_compatibility_error(&state, manifest);
+    let compatible = compatibility_error.is_none();
+    state.gguf_cleanup_store.start_background_download(
+        state.models_root.clone(),
+        id,
+        compatible,
+        compatibility_error.map(str::to_owned),
+        move |status| {
+            let _ = app.emit(gguf_cleanup_store::DOWNLOAD_EVENT, status);
+        },
+    )
+}
+
+#[tauri::command]
+fn cancel_local_cleanup_model_download(
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<bool, String> {
+    if state.exit_state.load(Ordering::Acquire) != 0 {
+        return Ok(false);
+    }
+    state.gguf_cleanup_store.cancel(&id)
+}
+
+#[tauri::command]
+async fn delete_local_cleanup_model(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    if state.exit_state.load(Ordering::Acquire) != 0 {
+        return Err("VoiceFlow is shutting down.".into());
+    }
+    if gguf_cleanup_store::model(&id).is_none() {
+        return Err("unsupported local cleanup model".into());
+    }
+    let _settings_gate = state.settings_gate.lock().await;
+    let settings = lock_recover(&state.settings).clone();
+    if is_active_gguf_cleanup_model(&settings, &id) {
+        return Err("local_cleanup_model_is_active".into());
+    }
+    let runtime = Arc::clone(&state.llama_cleanup_runtime);
+    let unload_id = id.clone();
+    state
+        .gguf_cleanup_store
+        .delete_with_unload(state.models_root.clone(), &id, move || async move {
+            runtime.unload(Some(&unload_id)).await
+        })
+        .await
 }
 
 #[tauri::command]
@@ -19835,8 +19961,17 @@ pub fn run(cli_args: cli::CliArgs) {
             }
             let models_root = dir.join("models");
             let cleanup_model_store = modelstore::shared_manager();
+            let mlx_cleanup_catalog = modelstore::shared_catalog_manager();
             let mlx_cleanup_runtime =
                 mlx_cleanup_runtime::shared_runtime(&models_root, cleanup_model_store.clone());
+            let gguf_cleanup_store = gguf_cleanup_store::Manager::default();
+            let resource_dir = app.path().resource_dir().map_err(|e| e.to_string())?;
+            let llama_helper = llama_cleanup_runtime::resolve_server_executable(&resource_dir);
+            let llama_cleanup_runtime = llama_cleanup_runtime::shared_runtime(
+                &models_root,
+                gguf_cleanup_store.clone(),
+                &llama_helper,
+            );
             let owned_replay_requested = matches!(
                 &owned_wav_replay_invocation,
                 cli::OwnedWavReplayInvocation::Replay { .. }
@@ -19847,6 +19982,7 @@ pub fn run(cli_args: cli::CliArgs) {
                 delivery_status_uses_chinese: Arc::new(AtomicBool::new(
                     settings.ui_language == "zh",
                 )),
+                #[cfg(any(test, all(feature = "research-harness", target_os = "macos")))]
                 research_trace: Mutex::new(research_trace::Owner::default()),
                 dictionary_learning_audit: Mutex::new(dictionary_learning_audit::Owner::new(
                     research_mode,
@@ -19861,7 +19997,6 @@ pub fn run(cli_args: cli::CliArgs) {
                 text_action_control: Mutex::new(None),
                 text_action_sequence: AtomicU64::new(0),
                 exit_state: AtomicU8::new(0),
-                undo: Mutex::new(None),
                 operation_lease: Mutex::new(OperationLease::Idle),
                 audio_recovery_ticket: Mutex::new(None),
                 audio_recovery_sequence: AtomicU64::new(0),
@@ -19869,7 +20004,10 @@ pub fn run(cli_args: cli::CliArgs) {
                 history_recovery_sequence: AtomicU64::new(0),
                 models_root,
                 cleanup_model_store,
+                mlx_cleanup_catalog,
                 mlx_cleanup_runtime,
+                gguf_cleanup_store,
+                llama_cleanup_runtime,
                 cleanup_warmup_enabled: !(research_mode || owned_replay_requested),
                 cleanup_model_generation: AtomicU64::new(0),
                 cleanup_warmup: cleanup_warmup::Coordinator::default(),
@@ -20234,12 +20372,20 @@ pub fn run(cli_args: cli::CliArgs) {
             history_commands::retry_dictation,
             probe_engine_draft,
             get_local_cleanup_status,
-            get_lmstudio_cleanup_status,
             get_cleanup_model_store_status,
             import_cleanup_model,
             download_cleanup_model,
             cancel_cleanup_model_store_operation,
             delete_cleanup_model_store,
+            list_mlx_cleanup_models,
+            download_mlx_cleanup_model,
+            verify_mlx_cleanup_model,
+            cancel_mlx_cleanup_model_download,
+            delete_mlx_cleanup_model,
+            list_local_cleanup_models,
+            download_local_cleanup_model,
+            cancel_local_cleanup_model_download,
+            delete_local_cleanup_model,
             list_on_device_models,
             download_on_device_model,
             cancel_on_device_download,
@@ -20251,7 +20397,6 @@ pub fn run(cli_args: cli::CliArgs) {
             history_commands::save_history_revision,
             history_commands::get_history_revisions,
             history_commands::reclean_history,
-            undo_last_delivery,
             selected_action::confirm_selected_action_preview,
             selected_action::copy_selected_action_preview,
             selected_action::cancel_selected_action_preview,
@@ -20291,19 +20436,28 @@ pub fn run(cli_args: cli::CliArgs) {
         .run(|app, event| match event {
             tauri::RunEvent::ExitRequested { code, api, .. } => {
                 let state = app.state::<AppState>();
-                if state.exit_state.load(Ordering::Acquire) == 2 {
-                    return;
+                match exit_request_action(state.exit_state.load(Ordering::Acquire)) {
+                    ExitRequestAction::Proceed => {}
+                    ExitRequestAction::BeginGracefulExit => {
+                        api.prevent_exit();
+                        begin_application_exit(app, &state, code.unwrap_or(0));
+                    }
+                    ExitRequestAction::AwaitGracefulExit => api.prevent_exit(),
+                    ExitRequestAction::ForceExit => {
+                        api.prevent_exit();
+                        force_application_exit(app, &state, code.unwrap_or(0));
+                    }
                 }
-                api.prevent_exit();
-                begin_application_exit(app, &state, code.unwrap_or(0));
             }
             tauri::RunEvent::Exit => {
                 let state = app.state::<AppState>();
                 if state.exit_state.load(Ordering::Acquire) != 2 {
                     state.downloads.cancel_all();
+                    state.gguf_cleanup_store.cancel_all_downloads();
                     network_policy::cancel_cloud_requests();
                     ondevice_runtime::shared_runtime(&state.models_root).begin_shutdown();
                     state.mlx_cleanup_runtime.begin_shutdown();
+                    state.llama_cleanup_runtime.begin_shutdown();
                     ondevice_runtime::cleanup_private_audio_for_root(&state.models_root);
                 }
             }
@@ -20321,6 +20475,87 @@ pub fn run(cli_args: cli::CliArgs) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn retired_ondevice_asr_route_may_be_preserved_but_not_newly_selected() {
+        let retired_id = crate::ondevice_models::COHERE_TRANSCRIBE_ID;
+        let previous = crate::store::Settings::default();
+        let next = crate::store::Settings {
+            asr_provider: crate::providers::EngineProvider::OnDevice,
+            asr_model: retired_id.to_owned(),
+            ..previous.clone()
+        };
+        assert_eq!(
+            super::validate_new_ondevice_asr_selection(&previous, &next).unwrap_err(),
+            "retired_on_device_asr_model"
+        );
+
+        let saved_route = next.clone();
+        let edited_preferences = crate::store::Settings {
+            ui_language: "en".to_owned(),
+            ..saved_route.clone()
+        };
+        assert!(
+            super::validate_new_ondevice_asr_selection(&saved_route, &edited_preferences).is_ok()
+        );
+
+        let switched_away = crate::store::Settings {
+            asr_provider: crate::providers::EngineProvider::Groq,
+            ..edited_preferences
+        };
+        assert!(super::validate_new_ondevice_asr_selection(&saved_route, &switched_away).is_ok());
+    }
+
+    #[test]
+    fn new_gguf_route_cannot_be_saved_before_model_is_verified() {
+        let root = std::env::temp_dir().join(format!(
+            "vf-gguf-settings-validation-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let previous = crate::store::Settings {
+            cleanup_enabled: false,
+            cleanup_provider: crate::providers::EngineProvider::Groq,
+            ..crate::store::Settings::default()
+        };
+        let state =
+            super::AppState::new_dictionary_regression_fixture(previous.clone(), root.clone());
+        let mut next = previous.clone();
+        next.cleanup_enabled = true;
+        next.cleanup_provider = crate::providers::EngineProvider::OnDeviceLlamaCpp;
+        next.cleanup_model = crate::gguf_cleanup_store::QWEN_35_2B_ID.to_owned();
+
+        assert_eq!(
+            super::validate_new_gguf_cleanup_selection(&state, &previous, &next).unwrap_err(),
+            "selected local cleanup model is missing or not verified"
+        );
+        drop(state);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn disabling_cleanup_allows_delete_of_the_stale_selected_gguf_model() {
+        let settings = crate::store::Settings {
+            cleanup_enabled: true,
+            cleanup_provider: crate::providers::EngineProvider::OnDeviceLlamaCpp,
+            cleanup_model: crate::gguf_cleanup_store::QWEN_35_2B_ID.to_owned(),
+            ..crate::store::Settings::default()
+        };
+        assert!(super::is_active_gguf_cleanup_model(
+            &settings,
+            crate::gguf_cleanup_store::QWEN_35_2B_ID
+        ));
+
+        let settings = crate::store::Settings {
+            cleanup_enabled: false,
+            ..settings
+        };
+        assert!(!super::is_active_gguf_cleanup_model(
+            &settings,
+            crate::gguf_cleanup_store::QWEN_35_2B_ID
+        ));
+    }
+
     #[test]
     fn release_policy_ignores_persisted_always_on_microphone() {
         for (persisted, release, expected) in [
@@ -20416,6 +20651,30 @@ mod tests {
             &exit_state,
             &manager
         ));
+    }
+
+    #[test]
+    fn quit_after_unsettled_mlx_shutdown_forces_exit_instead_of_hanging() {
+        use super::{exit_request_action, ExitRequestAction, EXIT_SHUTDOWN_UNSETTLED};
+
+        assert_eq!(exit_request_action(0), ExitRequestAction::BeginGracefulExit);
+        assert_eq!(exit_request_action(1), ExitRequestAction::AwaitGracefulExit);
+        assert_eq!(exit_request_action(2), ExitRequestAction::Proceed);
+        assert_eq!(
+            exit_request_action(EXIT_SHUTDOWN_UNSETTLED),
+            ExitRequestAction::ForceExit
+        );
+
+        let manager = crate::modelstore::Manager::new();
+        let exit_state = std::sync::atomic::AtomicU8::new(EXIT_SHUTDOWN_UNSETTLED);
+        assert!(!super::signal_application_exit_started(
+            &exit_state,
+            &manager
+        ));
+        assert_eq!(
+            exit_state.load(std::sync::atomic::Ordering::Acquire),
+            EXIT_SHUTDOWN_UNSETTLED
+        );
     }
 
     #[test]
@@ -21148,8 +21407,8 @@ mod tests {
         processing_phase_publication_is_current, processing_watchdog_delay,
         read_dictionary_file_contents, recording_publication_is_current, should_chunk_recording,
         should_spawn_prefetch_asr, stop_transition_is_current, target_guard_mismatch_with_retry,
-        undo_available_for_hud, undo_preflight, AsrBackend, CleanupDecision, DictationManager,
-        OperationLease, Phase, UndoTransaction, MAX_DICTIONARY_FILE_BYTES,
+        AsrBackend, CleanupDecision, DictationManager, OperationLease, Phase,
+        MAX_DICTIONARY_FILE_BYTES,
     };
     use crate::asr::AsrProvider;
     use crate::paste;
@@ -22418,10 +22677,8 @@ mod tests {
             &settings.cleanup_request_model(),
             &prepared.text,
             settings.cleanup_credential(),
-            &settings.dictionary,
             None,
             None,
-            Some(&settings.language),
             None,
             Some(&prepared.intent),
             prepared.pairs_hint.as_deref(),
@@ -22598,9 +22855,7 @@ mod tests {
                     asr::AsrError::ContextAuthorizationChanged => "context_changed",
                     asr::AsrError::Unauthorized(_) => "unauthorized",
                     asr::AsrError::RateLimited(_) => "rate_limited",
-                    asr::AsrError::Server(_) | asr::AsrError::RetryableServer { .. } => {
-                        "server_error"
-                    }
+                    asr::AsrError::RetryableServer { .. } => "server_error",
                     asr::AsrError::EmptyResult => "empty_result",
                     asr::AsrError::OnDeviceModelMissing(_)
                     | asr::AsrError::OnDeviceInferenceUnavailable(_)
@@ -22664,10 +22919,8 @@ mod tests {
                 CLEANUP_MODEL,
                 &prepared.text,
                 key,
-                &settings.dictionary,
                 None,
                 None,
-                Some(&settings.language),
                 None,
                 Some(&prepared.intent),
                 prepared.pairs_hint.as_deref(),
@@ -23158,10 +23411,8 @@ mod tests {
             &model,
             &prepared.intent.content,
             "synthetic-key",
-            &settings.dictionary,
             None,
             Some(&policy),
-            Some("auto"),
             Some(&snapshot.profile),
             Some(&prepared.intent),
             prepared.pairs_hint.as_deref(),
@@ -23180,11 +23431,16 @@ mod tests {
             .as_str()
             .expect("cleanup user prompt");
         assert_eq!(request["model"].as_str(), Some(model.as_str()));
-        assert!(user.contains("<TASK_INSTRUCTIONS>\n"));
-        assert!(user.contains("不要发明列表或 ## 标题。"));
-        assert!(user.contains(&format!(
-            "<TRANSCRIPT>\n{}\n</TRANSCRIPT>",
-            prepared.intent.content
+        let system = request["messages"][0]["content"]
+            .as_str()
+            .expect("cleanup system prompt");
+        assert!(system.contains(
+            "OUTPUT_ADD_ON:\nKeep the developer prompt/composer presentation established by local preparation."
+        ));
+        assert!(system.contains("Do not generate code, headings, or additional instructions."));
+        assert!(user.contains(&crate::cleanup_prompt::frame_reference(
+            crate::cleanup_prompt::ReferenceField::Transcript,
+            &prepared.intent.content,
         )));
         assert!(user.contains("lookup_value(user_id)"));
         assert!(user.contains("--dry-run"));
@@ -23731,34 +23987,6 @@ mod tests {
     }
 
     #[test]
-    fn hud_partial_never_expands_the_window() {
-        assert!(!super::hud_partial_expands_window(
-            "你好世界",
-            Phase::Recording,
-            4,
-            4
-        ));
-        assert!(!super::hud_partial_expands_window(
-            "hello",
-            Phase::Processing,
-            4,
-            4
-        ));
-        assert!(!super::hud_partial_expands_window(
-            "你好世界",
-            Phase::Idle,
-            4,
-            4
-        ));
-        assert!(!super::hud_partial_expands_window(
-            "",
-            Phase::Recording,
-            4,
-            4
-        ));
-    }
-
-    #[test]
     fn context_preview_refreshes_when_accessibility_changes() {
         assert!(!super::should_refresh_context_preview(
             true,
@@ -24202,6 +24430,76 @@ mod tests {
     }
 
     #[test]
+    fn stop_and_cancel_claims_remove_the_recording_soniox_stream() {
+        fn register_stream(state: &super::AppState, recording_generation: u64) {
+            *super::lock_recover(&state.active_soniox_stream) = Some(super::ActiveSonioxStream {
+                recording_generation,
+                configuration_generation: 0,
+                session: None,
+                options: crate::soniox::SonioxStreamOptions {
+                    api_key: String::new(),
+                    language: None,
+                },
+                diagnostics: crate::metrics::AsrRequestDiagnostics::new(
+                    state.metrics.clone(),
+                    crate::metrics::MetricGroup::new(
+                        "soniox",
+                        asr::SONIOX_MODEL,
+                        "realtime_stream",
+                    ),
+                ),
+            });
+        }
+        fn recording_state(name: &str) -> (super::AppState, u64, CancellationToken) {
+            let state = super::AppState::new_dictionary_regression_fixture(
+                store::Settings::default(),
+                std::path::PathBuf::from(name),
+            );
+            let (generation, stream_cancellation) = {
+                let mut manager = super::lock_recover(&state.manager);
+                let mut lease = OperationLease::Idle;
+                let generation = super::dictation::claim_start_manager(&mut manager, &mut lease)
+                    .expect("start claim");
+                // The live start path derives the Soniox token during Starting.
+                let stream_cancellation = manager.cancellation.child_token();
+                assert!(super::dictation::enter_recording(
+                    &mut manager,
+                    context::ContextSnapshot::general()
+                )
+                .is_none());
+                (generation, stream_cancellation)
+            };
+            register_stream(&state, generation);
+            (state, generation, stream_cancellation)
+        }
+
+        let (state, generation, _) = recording_state("soniox-stop-stream-fixture");
+        let stop = super::dictation::claim_stop_manager(&mut super::lock_recover(&state.manager))
+            .expect("stop claim");
+        assert_ne!(stop.session_generation, generation);
+        assert_eq!(stop.recording_generation, generation);
+        super::cancel_soniox_stream(&state, stop.recording_generation);
+        assert!(super::lock_recover(&state.active_soniox_stream).is_none());
+
+        register_stream(&state, generation);
+        let stopping_cancel = super::dictation::claim_cancel(&state);
+        assert_eq!(stopping_cancel.phase, Phase::Stopping);
+        assert_eq!(stopping_cancel.recording_generation, generation);
+        super::cancel_soniox_stream(&state, stopping_cancel.recording_generation);
+        assert!(super::lock_recover(&state.active_soniox_stream).is_none());
+
+        let (state, generation, stream_cancellation) =
+            recording_state("soniox-cancel-stream-fixture");
+        let recording_cancel = super::dictation::claim_cancel(&state);
+        assert_eq!(recording_cancel.phase, Phase::Recording);
+        assert_ne!(recording_cancel.generation, generation);
+        assert_eq!(recording_cancel.recording_generation, generation);
+        assert!(stream_cancellation.is_cancelled());
+        super::cancel_soniox_stream(&state, recording_cancel.recording_generation);
+        assert!(super::lock_recover(&state.active_soniox_stream).is_none());
+    }
+
+    #[test]
     fn audio_limit_requires_matching_generation() {
         let mut lease = OperationLease::Idle;
         let mut manager = DictationManager::new();
@@ -24618,38 +24916,6 @@ mod tests {
 
         crate::dictionary_learn::invalidate_learning_observers(&epoch);
         assert_ne!(epoch.load(Ordering::Acquire), observer_epoch);
-    }
-
-    #[test]
-    fn guarded_undo_invalidates_learning_only_after_final_authorization() {
-        let epoch = std::sync::atomic::AtomicU64::new(0);
-        let cancellation = CancellationToken::new();
-        let status = paste::run_guarded_undo(
-            &cancellation,
-            std::time::Instant::now() + std::time::Duration::from_secs(1),
-            || true,
-            || {
-                crate::dictionary_learn::invalidate_learning_observers(&epoch);
-                Ok(())
-            },
-        )
-        .unwrap();
-        assert_eq!(status, "success");
-        assert_eq!(epoch.load(Ordering::Acquire), 1);
-
-        let before_stale_attempt = epoch.load(Ordering::Acquire);
-        let stale = paste::run_guarded_undo(
-            &cancellation,
-            std::time::Instant::now() + std::time::Duration::from_secs(1),
-            || false,
-            || {
-                crate::dictionary_learn::invalidate_learning_observers(&epoch);
-                Ok(())
-            },
-        )
-        .unwrap();
-        assert_eq!(stale, "stale_target");
-        assert_eq!(epoch.load(Ordering::Acquire), before_stale_attempt);
     }
 
     #[test]
@@ -26294,125 +26560,6 @@ mod tests {
         assert!((payload["progress"].as_f64().unwrap() - 0.46).abs() < 1e-6);
     }
 
-    fn sample_undo_transaction(now: Instant) -> UndoTransaction {
-        UndoTransaction {
-            session_generation: 4,
-            created_at: now,
-            expires_at: now + std::time::Duration::from_secs(3),
-            target_guard: context::TargetAppGuard {
-                pid: 1,
-                bundle_id: Some("com.example.editor".into()),
-                browser_host: None,
-                browser_target_token: None,
-                browser_tab_token: None,
-                window_token: None,
-                window_id: Some(10),
-                window_identity_ambiguous: false,
-                input_token: Some(20),
-                secure_input: false,
-            },
-            delivery_method: "paste".into(),
-            post_insert_input_fingerprint: 1,
-            field_ticket: None,
-            consumed: false,
-        }
-    }
-
-    #[test]
-    fn undo_available_matches_armed_unexpired_transaction_not_paste_method() {
-        let now = Instant::now();
-        let armed = sample_undo_transaction(now);
-
-        assert!(undo_available_for_hud("done", Some(&armed), 4, now));
-        assert!(undo_available_for_hud("degraded", Some(&armed), 4, now));
-        // Verified AX reports method "paste" / state "done" but never arms undo.
-        assert!(!undo_available_for_hud("done", None, 4, now));
-        assert!(!undo_available_for_hud("degraded", None, 4, now));
-        assert!(!undo_available_for_hud("unverified", Some(&armed), 4, now));
-        assert!(!undo_available_for_hud("copied", Some(&armed), 4, now));
-        assert!(!undo_available_for_hud(
-            "done",
-            Some(&armed),
-            4,
-            now + std::time::Duration::from_secs(3)
-        ));
-        assert!(!undo_available_for_hud("done", Some(&armed), 5, now));
-        let consumed = UndoTransaction {
-            consumed: true,
-            ..armed.clone()
-        };
-        assert!(!undo_available_for_hud("done", Some(&consumed), 4, now));
-    }
-
-    #[test]
-    fn undo_preflight_rejects_expired_stale_and_consumed_transactions() {
-        let now = Instant::now();
-        let transaction = sample_undo_transaction(now);
-        assert_eq!(undo_preflight(&transaction, 4, now), "available");
-        assert_eq!(
-            undo_preflight(&transaction, 4, now + std::time::Duration::from_secs(3)),
-            "expired"
-        );
-        assert_eq!(undo_preflight(&transaction, 5, now), "stale_target");
-
-        let consumed = UndoTransaction {
-            consumed: true,
-            ..transaction
-        };
-        assert_eq!(undo_preflight(&consumed, 4, now), "already_consumed");
-    }
-
-    #[test]
-    fn undo_delivery_preflight_requires_delivery_field_and_unchanged_value() {
-        let now = Instant::now();
-        let transaction = sample_undo_transaction(now);
-        let delivered_field = transaction.target_guard.clone();
-        assert_eq!(
-            super::undo_delivery_preflight(&transaction, 4, now, &delivered_field, Some(1)),
-            "available"
-        );
-        let mut recording_start_field = delivered_field.clone();
-        recording_start_field.input_token = Some(19);
-        assert_eq!(
-            super::undo_delivery_preflight(&transaction, 4, now, &recording_start_field, Some(1)),
-            "stale_target"
-        );
-        let mut unknown_field = delivered_field.clone();
-        unknown_field.input_token = None;
-        assert_eq!(
-            super::undo_delivery_preflight(&transaction, 4, now, &unknown_field, Some(1)),
-            "stale_target"
-        );
-        let mut different_window = delivered_field.clone();
-        different_window.window_id = Some(11);
-        assert_eq!(
-            super::undo_delivery_preflight(&transaction, 4, now, &different_window, Some(1)),
-            "stale_target"
-        );
-        assert_eq!(
-            super::undo_delivery_preflight(&transaction, 4, now, &delivered_field, Some(2)),
-            "stale_target"
-        );
-        assert_eq!(
-            super::undo_delivery_preflight(&transaction, 4, now, &delivered_field, None),
-            "stale_target"
-        );
-        assert_eq!(
-            super::undo_delivery_preflight(&transaction, 5, now, &delivered_field, Some(1)),
-            "stale_target"
-        );
-        assert_eq!(
-            super::undo_delivery_preflight(
-                &transaction,
-                4,
-                now + std::time::Duration::from_secs(3),
-                &delivered_field,
-                Some(1)
-            ),
-            "expired"
-        );
-    }
-
     #[test]
     fn cleanup_failure_preserves_raw_transcript_and_marks_degraded() {
         let result = finalize_text(
@@ -26562,6 +26709,58 @@ mod tests {
     }
 
     #[test]
+    fn protected_token_rejection_keeps_its_reason_code_at_both_guard_boundaries() {
+        let source = "部署到 v2，然后运行 npm test";
+        let candidate = "部署到 v3，然后运行 npm test。";
+        let intent = llm::CleanupIntent::implicit(source);
+        let Err(llm::LlmError::CleanupRejected(provider)) =
+            llm::accept_cleanup_reply_with_facts(candidate.to_owned(), &intent)
+        else {
+            panic!("a changed version token is rejected at the provider boundary");
+        };
+        assert_eq!(provider.reason, llm::GuardReason::ProtectedToken);
+        assert_eq!(provider.candidate, candidate);
+        assert_eq!(
+            provider.stage.storage_code(provider.reason),
+            "provider_protected_token_changed"
+        );
+
+        let context = |structure_safe_source| super::FinalizationContext {
+            scene: super::ResolvedCleanupScene::observed(
+                context::ContextFamily::General,
+                context::FocusKind::Editable,
+            ),
+            operation: llm::CleanupOperation::Cleanup,
+            revision_source: None,
+            prepared_transcript: None,
+            revision_authorizations: &[],
+            promoted_pair_protections: &[],
+            list_revision_proof: None,
+            structure_safe_source,
+            output_projection_list_revision_proof: None,
+            layout_source: None,
+            exact_fallback: false,
+        };
+        let (text, reason, rejected) =
+            super::guard_final_output_with_reason(source, candidate, context(None));
+        assert_eq!(text, source);
+        assert_eq!(reason, Some(llm::GuardReason::ProtectedToken));
+        assert_eq!(rejected.as_deref(), Some(candidate));
+        assert_eq!(
+            llm::CleanupRejectionStage::FinalOutput.storage_code(llm::GuardReason::ProtectedToken),
+            "final_protected_token_changed"
+        );
+
+        let (_, structure_safe_reason, _) =
+            super::guard_final_output_with_reason(source, candidate, context(Some(source)));
+        assert_eq!(
+            structure_safe_reason,
+            Some(llm::GuardReason::Layout),
+            "the structure-safe gate still reports its own layout reason first"
+        );
+    }
+
+    #[test]
     fn final_guard_after_accepted_provider_reply_keeps_candidate_and_transform_provenance() {
         let revision_source = "流程是什么？具体，呃，测试不对不对，帮我看一下软件具体测试什么。第一个是准确性。第二个是稳定性。";
         let prepared = super::prepare_cleanup_transcript_for_scene(
@@ -26577,13 +26776,10 @@ mod tests {
         let source = prepared.text.as_str();
         assert_ne!(source, revision_source);
         let intent = prepared.intent.clone();
-        let provider_payload = format!("{}\nEffort: standard", prepared.text);
+        let provider_payload = prepared.text.replace('\n', " ");
         let accepted = llm::accept_cleanup_reply_with_facts(provider_payload.clone(), &intent)
-            .expect("the fake provider reply is accepted and metadata is stripped");
-        assert_eq!(
-            accepted.transformations,
-            vec!["strip_internal_cleanup_metadata"]
-        );
+            .expect("the fake provider reply is accepted and its flattened layout restored");
+        assert_eq!(accepted.transformations, vec!["restore_spoken_layout"]);
         let rejected = super::finalize_text_for_scene(
             source,
             CleanupDecision::Provider(accepted.accepted_text.clone()),
@@ -26660,7 +26856,7 @@ mod tests {
             serde_json::from_str(&store::export_history_json(&root).unwrap()).unwrap();
         assert_eq!(
             export[0]["cleanup_transformations"],
-            serde_json::json!(["strip_internal_cleanup_metadata"])
+            serde_json::json!(["restore_spoken_layout"])
         );
         drop(owner);
         store::clear_all_data(&root).unwrap();
@@ -27885,10 +28081,10 @@ mod tests {
         assert_eq!(steps[1].variant, "general_implicit_live");
         assert!(steps[0].prompt.messages[1]
             .1
-            .starts_with("Intent: operation=\"cleanup\" source=\"selected_text\""));
-        assert!(steps[0].prompt.messages[1]
+            .starts_with("Authorized operation: \"cleanup\"\n"));
+        assert!(steps[0].prompt.messages[0]
             .1
-            .contains("artifact_kind: developer_prompt_or_text"));
+            .contains("EDIT_BUDGET:\nAdd or correct clear sentence punctuation and remove only"));
         for step in &steps {
             assert_eq!(step.prompt.messages.len(), 2);
             assert_eq!(step.prompt.messages[0].0, "system");
@@ -27914,7 +28110,7 @@ mod tests {
             Some("cleanup_disabled")
         );
         settings.cleanup_enabled = true;
-        settings.cleanup_provider = crate::providers::EngineProvider::LmStudio;
+        settings.cleanup_provider = crate::providers::EngineProvider::Ollama;
         assert_eq!(
             super::StartupWarmupSettings::from_settings(&settings).skip_reason(),
             Some("provider_not_native")
@@ -28012,15 +28208,15 @@ mod tests {
             &settings, &context
         ));
 
-        let lmstudio = store::Settings {
+        let ollama = store::Settings {
             output_mode: "translation".into(),
-            cleanup_provider: EngineProvider::LmStudio,
-            cleanup_model: crate::lmstudio_local::MODEL_VARIANT.into(),
+            cleanup_provider: EngineProvider::Ollama,
+            ollama_base_url: EngineProvider::Ollama.default_base_url().into(),
             cleanup_api_key: String::new(),
             ..store::Settings::default()
         };
         assert!(super::translation_cleanup_route_available(
-            &lmstudio, &context
+            &ollama, &context
         ));
 
         let key_required = store::Settings {
@@ -28127,7 +28323,7 @@ mod tests {
             let policy = super::cleanup_policy_for(&settings, &snapshot);
             let (output, _) = llm::cleanup_with_model_and_limits_and_language_and_profile_and_intent(
                 &endpoint, &settings.cleanup_request_model(), &prepared.intent.content,
-                "test-key", &[], None, Some(&policy), Some("auto"),
+                "test-key", None, Some(&policy),
                 Some(&snapshot.profile), Some(&prepared.intent), prepared.pairs_hint.as_deref(),
                 effort, None,
             ).await.expect("synthetic provider translation");
@@ -28135,9 +28331,15 @@ mod tests {
                 &request.await.expect("captured provider request"),
             ).unwrap();
             let user = request["messages"][1]["content"].as_str().unwrap();
-            assert!(user.contains("operation=\"translate\""));
-            assert!(user.contains("target_language: en"));
-            assert!(!user.contains("Keep the transcript language."));
+            let system = request["messages"][0]["content"].as_str().unwrap();
+            assert!(user.starts_with("Authorized operation: \"translate\"\n"));
+            assert!(user.contains(&crate::cleanup_prompt::frame_reference(
+                crate::cleanup_prompt::ReferenceField::TranslationTarget,
+                "en",
+            )));
+            assert!(system.contains(
+                "OUTPUT_ADD_ON:\nUse only the existing authorized translation operation"
+            ));
             let (final_text, rejected) = super::guard_final_output_for_scene(
                 &prepared.intent.content,
                 &output,
@@ -28202,7 +28404,7 @@ mod tests {
             super::cleanup_route_for(&settings, Some(&snapshot), &prepared.intent),
             lexicon::CleanupRoute::LocalOnly
         );
-        settings.cleanup_provider = providers::EngineProvider::LmStudio;
+        settings.cleanup_provider = providers::EngineProvider::Ollama;
         assert_eq!(
             super::cleanup_route_for(&settings, Some(&snapshot), &prepared.intent),
             lexicon::CleanupRoute::Provider(llm::CleanupEffort::Light)
@@ -28827,10 +29029,8 @@ mod tests {
                 "openai/gpt-oss-20b",
                 &prepared.text,
                 key,
-                &[],
                 None,
                 Some(&policy),
-                Some("auto"),
                 None,
                 Some(&prepared.intent),
                 prepared.pairs_hint.as_deref(),

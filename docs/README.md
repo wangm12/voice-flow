@@ -7,9 +7,9 @@
 | 文档 | 内容 |
 | --- | --- |
 | [README.md](../README.md) | 快速开始、日常用法、开发与发布入口 |
-| [THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md) | MLX sidecar 的上游 LICENSE/NOTICE、Swift 参考文本、Handy 组件及固定本地模型的来源说明 |
+| [THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md) | MLX sidecar 与 llama.cpp runtime 的上游 LICENSE/NOTICE、Swift 参考文本、Handy 组件及固定本地模型的来源说明 |
 | [privacy.md](privacy.md) | 数据流、本地保留、Keychain、删除 |
-| [end-to-end-workflows.md](end-to-end-workflows.md) | 首次配置 / 本机麦克风自检 / 词典反馈 / batch 预取 / Soniox 实时流与恢复 / AssemblyAI Dictation + raw Sync / Qwen Audio Message / 口述 / 长录音与完整音频恢复 / 六类选中文本操作 / 手动看屏幕 / PromptOrCode 与 Code 中的请求边界 / 后端交付撤销命令 |
+| [end-to-end-workflows.md](end-to-end-workflows.md) | 首次配置 / 本机麦克风自检 / 词典反馈 / batch 预取 / Soniox 实时流与恢复 / AssemblyAI Dictation + raw Sync / Qwen Audio Message / 口述 / 长录音与完整音频恢复 / 六类选中文本操作 / 手动看屏幕 / PromptOrCode 与 Code 中的请求边界 |
 | [cleanup-evaluation.md](cleanup-evaluation.md) | 确定性本地整理评测、test-only 编辑归因裁判、feature-gated WAV evaluator、strict corpus/recipe/negative 契约、显式 SHA 候选重放、当前执行范围与可选 live provider 协议（不代表 runtime/E2E 验收） |
 | [public-corpus-preparation.md](public-corpus-preparation.md) | 显式有界公共语料下载、ASCEND 待审候选、独立人工标签导入和 YODAS 元数据准备 |
 | [asr-cleanup-later-and-wont.md](asr-cleanup-later-and-wont.md) | 以后再做 / 明确不做 |
@@ -28,6 +28,7 @@
 | --- | --- |
 | [Chatterfly 改进计划](chatterfly-improvement-plan-2026-10-26.md) | 尚未关闭的分阶段改进、验证协议、成功门槛与回退条件 |
 | [Cleanup 与纠错学习 harness 改进计划](cleanup-learning-harness-plan-2026-11-05.md) | 尚未关闭的编辑观察、归因、作用域规则、晋升/召回、prompt 消融与学习 episode 门槛 |
+| [本地模型扩充计划](local-model-expansion-plan-2026-11-09.md) | Parakeet V3 托管下载、Fun-ASR-Nano 等中文 ASR 候选、Qwen 4B／Gemma E4B 与 MLX 27B 对照 |
 
 ## 设计参考（归档，不作为实现规范）
 

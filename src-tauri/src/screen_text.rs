@@ -1,6 +1,5 @@
 //! Phase 1 screen-text context. Live Accessibility fills a fixture; titles,
 //! PIDs, and raw URLs never enter the extract payload.
-#![allow(dead_code)]
 
 use crate::context::{ContextFamily, FocusKind, TargetAppGuard};
 use std::time::Duration;
@@ -10,7 +9,6 @@ pub const MAX_CHARS: usize = 2000;
 pub const MAX_SELECTED_CHARS: usize = 800;
 pub const MAX_NEARBY_CHARS: usize = 400;
 pub const MAX_NEARBY_ITEMS: usize = 2;
-#[allow(dead_code)]
 pub const EXTRACT_TIMEOUT: Duration = Duration::from_millis(350);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -73,7 +71,6 @@ pub struct ScreenTextContext {
 }
 
 impl ScreenTextContext {
-    #[allow(dead_code)]
     pub fn proper_noun_count(&self) -> usize {
         self.evidence
             .items
@@ -202,7 +199,6 @@ impl ScreenTextContext {
         })
     }
 
-    #[allow(dead_code)]
     pub fn is_thin(&self) -> bool {
         self.usable_chars() < 20
     }
@@ -390,11 +386,7 @@ pub fn extract_from_fixture(fix: &AxWindowFixture) -> ScreenTextContext {
 
     match fix.family {
         ContextFamily::PersonalChat | ContextFamily::WorkChat | ContextFamily::SocialMedia => {
-            if fix.focus_kind == FocusKind::Search {
-                if let Some(selected) = &fix.selected_text {
-                    push_evidence(&mut items, ContextEvidenceKind::SelectedText, selected);
-                }
-            } else if fix.focus_kind == FocusKind::Chat {
+            if fix.focus_kind == FocusKind::Chat {
                 if let Some(name) = fix.counterpart.as_deref() {
                     push_evidence(&mut items, ContextEvidenceKind::Term, name);
                 }
@@ -475,20 +467,6 @@ where
     }
 }
 
-pub fn screen_context_for_session(
-    family: ContextFamily,
-    result: Result<ScreenTextContext, impl std::fmt::Display>,
-) -> ScreenTextContext {
-    match result {
-        Ok(ctx) => ctx,
-        Err(_) => ScreenTextContext {
-            family,
-            source: ScreenTextSource::Ax,
-            ..ScreenTextContext::default()
-        },
-    }
-}
-
 pub fn extract_live(
     family: ContextFamily,
     focus_kind: FocusKind,
@@ -502,33 +480,6 @@ pub fn extract_live(
     });
     ctx.family = family;
     ctx
-}
-
-pub fn extract_live_for_session(
-    family: ContextFamily,
-    focus_kind: FocusKind,
-    guard: &crate::context::TargetAppGuard,
-    session_generation: u64,
-) -> ScreenTextContext {
-    let mut ctx = extract_live(family, focus_kind, guard);
-    ctx.bind_to(guard, session_generation);
-    ctx
-}
-
-pub fn resolve_screen_at_stop(
-    expected: &crate::context::TargetAppGuard,
-    live: &crate::context::TargetAppGuard,
-    _family: ContextFamily,
-    session_generation: u64,
-    extract: impl FnOnce() -> ScreenTextContext,
-) -> Option<ScreenTextContext> {
-    if crate::context::focus_mismatch_reason(expected, live).is_some() {
-        return None;
-    }
-    let mut ctx = extract();
-    ctx.evidence.session_generation = Some(session_generation);
-    ctx.bind_to(expected, session_generation);
-    Some(ctx)
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1331,43 +1282,6 @@ mod tests {
     }
 
     #[test]
-    fn stale_lock_drops_screen_text() {
-        let expected = crate::context::TargetAppGuard {
-            pid: 1,
-            bundle_id: Some("com.example.a".into()),
-            browser_host: None,
-            browser_target_token: None,
-            browser_tab_token: None,
-            window_token: Some(1),
-            window_id: Some(1),
-            window_identity_ambiguous: false,
-            input_token: Some(1),
-            secure_input: false,
-        };
-        let mut live = expected.clone();
-        live.pid = 2;
-        live.bundle_id = Some("com.example.b".into());
-        let dropped =
-            resolve_screen_at_stop(&expected, &live, ContextFamily::PersonalChat, 1, || {
-                ScreenTextContext {
-                    evidence: ContextEvidence {
-                        items: vec![ContextEvidenceItem {
-                            source: ContextEvidenceSource::Ax,
-                            kind: ContextEvidenceKind::Term,
-                            value: "晓雯".into(),
-                            confidence_milli: None,
-                            truncated: false,
-                        }],
-                        ..ContextEvidence::default()
-                    },
-                    family: ContextFamily::PersonalChat,
-                    ..ScreenTextContext::default()
-                }
-            });
-        assert!(dropped.is_none());
-    }
-
-    #[test]
     fn extract_live_timeout_returns_empty_not_error() {
         let ctx = extract_with_reader(|| {
             std::thread::sleep(Duration::from_millis(400));
@@ -1375,14 +1289,6 @@ mod tests {
         });
         assert!(content_is_empty(&ctx));
     }
-
-    #[test]
-    fn extractor_error_does_not_fail_session() {
-        let ctx = screen_context_for_session(ContextFamily::PersonalChat, Err("ax denied"));
-        assert!(content_is_empty(&ctx));
-        assert_eq!(ctx.family, ContextFamily::PersonalChat);
-    }
-
     fn test_guard(bundle: &str, host: Option<&str>) -> crate::context::TargetAppGuard {
         crate::context::TargetAppGuard {
             pid: 42,

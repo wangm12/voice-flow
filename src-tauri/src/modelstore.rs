@@ -8,6 +8,7 @@ use crate::mlx_diagnostics::{self, EventName, Severity, Target};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
@@ -22,6 +23,7 @@ pub const REPOSITORY: &str = "lmstudio-community/Qwen3.8-27B-MLX-6bit";
 pub const REVISION: &str = "05f38c1f39e2f39619653616fe8e96a5d676358e";
 pub const MANIFEST_SHA256: &str =
     "f67d38ec1261b4d693cee8c006d2c56007e6919a290508266705ba4f571c9ed2";
+#[cfg(test)]
 pub const MODEL_BYTES: u64 = 22_804_836_386;
 const INSTALLED_MANIFEST: &str = ".voiceflow-cleanup-model.json";
 const STAGING_DIR: &str = ".qwen3-8-27b-mlx-6bit.partial";
@@ -29,6 +31,7 @@ const DURABLE_CACHE_DIR: &str = ".voiceflow-mlx-cache";
 const DURABLE_PROOF_FILE: &str = "model-verification.json";
 const DURABLE_PROOF_SCHEMA: u32 = 1;
 const MAX_DURABLE_PROOF_BYTES: u64 = 64 * 1024;
+const STATUS_INTERVAL: Duration = Duration::from_millis(250);
 static DURABLE_PROOF_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,6 +119,299 @@ pub const MODEL_FILES: &[ModelFile] = &[
     },
 ];
 
+/// A locally pinned MLX cleanup model. Download availability is curated
+/// separately from release qualification so a model can be available before
+/// its full quality evaluation is complete.
+#[derive(Debug, Clone, Copy)]
+pub struct MlxCleanupModel {
+    pub id: &'static str,
+    pub label: &'static str,
+    pub repository: &'static str,
+    pub revision: &'static str,
+    pub manifest_sha256: &'static str,
+    pub files: &'static [ModelFile],
+    pub language: &'static str,
+    pub recipe: &'static str,
+    pub development_reserve_bytes: u64,
+    pub release_qualified: bool,
+    pub importable: bool,
+}
+
+pub const QWEN_35_2B_MLX_ID: &str = "qwen3_5_2b_mlx_4bit";
+pub const QWEN_35_2B_MLX_REVISION: &str = "93760be4f1f69842a46bc13dbdc0f19e291392a3";
+pub const QWEN_35_4B_MLX_ID: &str = "qwen3_5_4b_mlx_4bit";
+pub const QWEN_35_4B_MLX_REVISION: &str = "32f3e8ecf65426fc3306969496342d504bfa13f3";
+pub const QWEN_35_9B_MLX_ID: &str = "qwen3_5_9b_mlx_4bit";
+pub const QWEN_35_9B_MLX_REVISION: &str = "938d8919941c6e7efd3c7150eff7fe9d12afa631";
+pub const QWEN_35_CLEANUP_RECIPE: &str = "voiceflow-qwen35-chat-cleanup-v1";
+pub const GEMMA_4_E2B_IT_MLX_ID: &str = "gemma_4_e2b_it_mlx_4bit";
+pub const GEMMA_4_E4B_IT_MLX_ID: &str = "gemma_4_e4b_it_mlx_4bit";
+pub const GEMMA_4_CLEANUP_RECIPE: &str = "voiceflow-gemma4-chat-cleanup-v1";
+pub const MINISTRAL_3_3B_INSTRUCT_MLX_ID: &str = "ministral_3_3b_instruct_mlx_4bit";
+pub const MINISTRAL_3_CLEANUP_RECIPE: &str = "voiceflow-ministral3-chat-cleanup-v1";
+pub const S1_MINI_MLX_ID: &str = "superwhisper_s1_mini_mlx_4bit";
+pub const S1_MINI_CLEANUP_RECIPE: &str = "voiceflow-s1-mini-control-v1";
+
+/// The five MLX models exposed for new local cleanup downloads and selection.
+/// Keep `release_qualified` independent: curated availability does not claim
+/// that cleanup quality has passed the release evaluation.
+pub const USER_AVAILABLE_MLX_CLEANUP_MODEL_IDS: &[&str] = &[
+    MODEL_ID,
+    QWEN_35_2B_MLX_ID,
+    QWEN_35_4B_MLX_ID,
+    GEMMA_4_E4B_IT_MLX_ID,
+    MINISTRAL_3_3B_INSTRUCT_MLX_ID,
+];
+
+pub fn is_user_available_mlx_cleanup_model(id: &str) -> bool {
+    USER_AVAILABLE_MLX_CLEANUP_MODEL_IDS.contains(&id)
+}
+
+const QWEN_35_2B_MLX_FILES: &[ModelFile] = &[
+    ModelFile {
+        path: "chat_template.jinja",
+        bytes: 7_755,
+        sha256: "273d8e0e683b885071fb17e08d71e5f2a5ddfb5309756181681de4f5a1822d80",
+    },
+    ModelFile {
+        path: "config.json",
+        bytes: 3_113,
+        sha256: "beb7fc5a6e0405fe332821cf1a8ef7b69bb390a8c8933171647de5579debf949",
+    },
+    ModelFile {
+        path: "model.safetensors",
+        bytes: 1_722_271_785,
+        sha256: "713fe7e5d3c3965f7106b0d0ee17615f7869c23c8d327996df8c1196fbcf07d5",
+    },
+    ModelFile {
+        path: "model.safetensors.index.json",
+        bytes: 81_722,
+        sha256: "8294c05cca7d53a6c33e3db2b379539bd296d054e0b689711b16b6ac93c7e49d",
+    },
+    ModelFile {
+        path: "preprocessor_config.json",
+        bytes: 390,
+        sha256: "27225450ac9c6529872ee1924fcb0962ff5634834f817040f444118116f4e516",
+    },
+    ModelFile {
+        path: "processor_config.json",
+        bytes: 1_300,
+        sha256: "14932921ca485d458a04dafd8069fbb0a4505622a48208d19ed247115801385b",
+    },
+    ModelFile {
+        path: "tokenizer.json",
+        bytes: 19_989_343,
+        sha256: "87a7830d63fcf43bf241c3c5242e96e62dd3fdc29224ca26fed8ea333db72de4",
+    },
+    ModelFile {
+        path: "tokenizer_config.json",
+        bytes: 1_139,
+        sha256: "e98f1901ac6f0adff67b1d540bfa0c36ac1a0cf59eb72ed78146ef89aafa1182",
+    },
+    ModelFile {
+        path: "video_preprocessor_config.json",
+        bytes: 385,
+        sha256: "7768af27c1fafa9cc9011c1dc20067e03f8915e03b63504550e11d5066986d13",
+    },
+    ModelFile {
+        path: "vocab.json",
+        bytes: 6_722_759,
+        sha256: "ce99b4cb2983d118806ce0a8b777a35b093e2000a503ebde25853284c9dfa003",
+    },
+];
+
+const QWEN_35_4B_MLX_FILES: &[ModelFile] = &[
+    ModelFile {
+        path: "chat_template.jinja",
+        bytes: 7_756,
+        sha256: "a4aee8afcf2e0711942cf848899be66016f8d14a889ff9ede07bca099c28f715",
+    },
+    ModelFile {
+        path: "config.json",
+        bytes: 3_366,
+        sha256: "f3efc81b2ea8d96a45301037d3ccccbcccdef44a961845c87f286aaddbc6eaaa",
+    },
+    ModelFile {
+        path: "model.safetensors",
+        bytes: 3_034_300_695,
+        sha256: "5fb9acd0246866381cf8c5c354c6db1019f6498eec4ccb4f5edcc71ffeacb2db",
+    },
+    ModelFile {
+        path: "model.safetensors.index.json",
+        bytes: 101_944,
+        sha256: "52e534c41f7b97708329c85f762e5882bf48bd5955a422c6ae74eba321e6048a",
+    },
+    ModelFile {
+        path: "preprocessor_config.json",
+        bytes: 390,
+        sha256: "27225450ac9c6529872ee1924fcb0962ff5634834f817040f444118116f4e516",
+    },
+    ModelFile {
+        path: "processor_config.json",
+        bytes: 1_300,
+        sha256: "14932921ca485d458a04dafd8069fbb0a4505622a48208d19ed247115801385b",
+    },
+    ModelFile {
+        path: "tokenizer.json",
+        bytes: 19_989_343,
+        sha256: "87a7830d63fcf43bf241c3c5242e96e62dd3fdc29224ca26fed8ea333db72de4",
+    },
+    ModelFile {
+        path: "tokenizer_config.json",
+        bytes: 1_139,
+        sha256: "e98f1901ac6f0adff67b1d540bfa0c36ac1a0cf59eb72ed78146ef89aafa1182",
+    },
+    ModelFile {
+        path: "video_preprocessor_config.json",
+        bytes: 385,
+        sha256: "7768af27c1fafa9cc9011c1dc20067e03f8915e03b63504550e11d5066986d13",
+    },
+    ModelFile {
+        path: "vocab.json",
+        bytes: 6_722_759,
+        sha256: "ce99b4cb2983d118806ce0a8b777a35b093e2000a503ebde25853284c9dfa003",
+    },
+];
+
+const QWEN_35_9B_MLX_FILES: &[ModelFile] = &[
+    ModelFile {
+        path: "chat_template.jinja",
+        bytes: 7_756,
+        sha256: "a4aee8afcf2e0711942cf848899be66016f8d14a889ff9ede07bca099c28f715",
+    },
+    ModelFile {
+        path: "config.json",
+        bytes: 3_331,
+        sha256: "a96942cb6a8a1d3f1d17514d81a1925d04362a6a3233b389d13012211baaa9f8",
+    },
+    ModelFile {
+        path: "model-00001-of-00002.safetensors",
+        bytes: 5_349_771_222,
+        sha256: "a68b87558c6ef43f74c2bd63ce7e9092ceddc3101f3def0030774bae5f42aadd",
+    },
+    ModelFile {
+        path: "model-00002-of-00002.safetensors",
+        bytes: 600_449_850,
+        sha256: "b0a770bf8469c7f3f18756a0e0283f1c1174344a83e059a4e483f6af4907352d",
+    },
+    ModelFile {
+        path: "model.safetensors.index.json",
+        bytes: 123_592,
+        sha256: "dd023913fb87cfdae27fb11dcf695117c925833796ccac3c64117d6652d8ff1e",
+    },
+    ModelFile {
+        path: "preprocessor_config.json",
+        bytes: 390,
+        sha256: "27225450ac9c6529872ee1924fcb0962ff5634834f817040f444118116f4e516",
+    },
+    ModelFile {
+        path: "processor_config.json",
+        bytes: 1_300,
+        sha256: "14932921ca485d458a04dafd8069fbb0a4505622a48208d19ed247115801385b",
+    },
+    ModelFile {
+        path: "tokenizer.json",
+        bytes: 19_989_343,
+        sha256: "87a7830d63fcf43bf241c3c5242e96e62dd3fdc29224ca26fed8ea333db72de4",
+    },
+    ModelFile {
+        path: "tokenizer_config.json",
+        bytes: 1_139,
+        sha256: "e98f1901ac6f0adff67b1d540bfa0c36ac1a0cf59eb72ed78146ef89aafa1182",
+    },
+    ModelFile {
+        path: "video_preprocessor_config.json",
+        bytes: 385,
+        sha256: "7768af27c1fafa9cc9011c1dc20067e03f8915e03b63504550e11d5066986d13",
+    },
+    ModelFile {
+        path: "vocab.json",
+        bytes: 6_722_759,
+        sha256: "ce99b4cb2983d118806ce0a8b777a35b093e2000a503ebde25853284c9dfa003",
+    },
+];
+
+pub static LEGACY_QWEN_38_MODEL: MlxCleanupModel = MlxCleanupModel {
+    id: MODEL_ID,
+    label: MODEL_LABEL,
+    repository: REPOSITORY,
+    revision: REVISION,
+    manifest_sha256: MANIFEST_SHA256,
+    files: MODEL_FILES,
+    language: "Multilingual",
+    recipe: "voiceflow-qwen38-chat-cleanup-v1",
+    development_reserve_bytes: 0,
+    release_qualified: true,
+    importable: true,
+};
+
+pub static QWEN35_MLX_CLEANUP_MODELS: &[MlxCleanupModel] = &[
+    MlxCleanupModel {
+        id: QWEN_35_2B_MLX_ID,
+        label: "Qwen3.5 2B · MLX 4-bit",
+        repository: "mlx-community/Qwen3.5-2B-MLX-4bit",
+        revision: QWEN_35_2B_MLX_REVISION,
+        manifest_sha256: "d889464330fc5091ed4398905b5f09a39ac28a15300555dae2ab6b0d5b38e242",
+        files: QWEN_35_2B_MLX_FILES,
+        language: "Multilingual; product language coverage pending verification",
+        recipe: QWEN_35_CLEANUP_RECIPE,
+        development_reserve_bytes: 6 * 1024 * 1024 * 1024,
+        release_qualified: false,
+        importable: false,
+    },
+    MlxCleanupModel {
+        id: QWEN_35_4B_MLX_ID,
+        label: "Qwen3.5 4B · MLX 4-bit",
+        repository: "mlx-community/Qwen3.5-4B-MLX-4bit",
+        revision: QWEN_35_4B_MLX_REVISION,
+        manifest_sha256: "18393f839aade07b606c1f3b50d32314dfd5363b034f1d5f7735b1fc6104b5f6",
+        files: QWEN_35_4B_MLX_FILES,
+        language: "Multilingual; product language coverage pending verification",
+        recipe: QWEN_35_CLEANUP_RECIPE,
+        development_reserve_bytes: 8 * 1024 * 1024 * 1024,
+        release_qualified: false,
+        importable: false,
+    },
+    MlxCleanupModel {
+        id: QWEN_35_9B_MLX_ID,
+        label: "Qwen3.5 9B · MLX 4-bit",
+        repository: "mlx-community/Qwen3.5-9B-MLX-4bit",
+        revision: QWEN_35_9B_MLX_REVISION,
+        manifest_sha256: "9aa0cac83df1d4f1fb154eeecef2735051badd49cdeed925feacd0327d6db848",
+        files: QWEN_35_9B_MLX_FILES,
+        language: "Multilingual; product language coverage pending verification",
+        recipe: QWEN_35_CLEANUP_RECIPE,
+        development_reserve_bytes: 12 * 1024 * 1024 * 1024,
+        release_qualified: false,
+        importable: false,
+    },
+];
+
+fn model_total_bytes(model: &MlxCleanupModel) -> u64 {
+    model
+        .files
+        .iter()
+        .fold(0u64, |total, file| total.saturating_add(file.bytes))
+}
+
+pub fn mlx_model(id: &str) -> Option<&'static MlxCleanupModel> {
+    all_mlx_cleanup_models().find(|model| model.id == id)
+}
+
+pub fn is_supported_mlx_model(id: &str) -> bool {
+    mlx_model(id).is_some()
+}
+
+fn all_mlx_cleanup_models() -> impl Iterator<Item = &'static MlxCleanupModel> {
+    let models = QWEN35_MLX_CLEANUP_MODELS
+        .iter()
+        .chain(crate::GEMMA_MLX_CLEANUP_MODELS.iter())
+        .chain(crate::MINISTRAL_MLX_CLEANUP_CANDIDATES.iter());
+    #[cfg(test)]
+    let models = models.chain(crate::S1_MINI_MLX_CLEANUP_CANDIDATES.iter());
+    models
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CleanupModelStatus {
     pub id: String,
@@ -136,16 +432,20 @@ pub struct CleanupModelStatus {
 
 impl CleanupModelStatus {
     fn initial() -> Self {
+        Self::initial_for(&LEGACY_QWEN_38_MODEL)
+    }
+
+    fn initial_for(model: &MlxCleanupModel) -> Self {
         Self {
-            id: MODEL_ID.to_owned(),
-            label: MODEL_LABEL.to_owned(),
-            repository: REPOSITORY.to_owned(),
-            revision: REVISION.to_owned(),
+            id: model.id.to_owned(),
+            label: model.label.to_owned(),
+            repository: model.repository.to_owned(),
+            revision: model.revision.to_owned(),
             state: "missing".to_owned(),
             operation: None,
             source_kind: None,
             bytes_done: 0,
-            bytes_total: MODEL_BYTES,
+            bytes_total: model_total_bytes(model),
             error: None,
             last_operation: None,
             last_operation_error: None,
@@ -155,11 +455,44 @@ impl CleanupModelStatus {
     }
 }
 
-#[derive(Clone, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MlxCleanupModelStatus {
+    pub id: String,
+    pub label: String,
+    pub repository: String,
+    pub revision: String,
+    pub bytes: u64,
+    pub language: String,
+    pub state: String,
+    pub operation: Option<String>,
+    pub bytes_done: u64,
+    pub bytes_total: u64,
+    pub error: Option<String>,
+    pub last_operation: Option<String>,
+    pub last_operation_error: Option<String>,
+    pub managed: bool,
+    pub partial_managed: bool,
+    pub verified: bool,
+    pub qualified: bool,
+    pub download_available: bool,
+    pub downloadable: bool,
+    pub selectable: bool,
+    pub compatible: bool,
+    pub compatibility_error: Option<String>,
+}
+
+#[derive(Clone)]
 pub struct Manager {
     inner: Arc<Mutex<ManagerInner>>,
     leases: Arc<AtomicUsize>,
     revision: tokio::sync::watch::Sender<u64>,
+    model: &'static MlxCleanupModel,
+}
+
+impl Default for Manager {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Manager {
@@ -174,6 +507,16 @@ impl Manager {
 
     pub(crate) fn notify_application_exit(&self) {
         self.notify_revision();
+    }
+
+    fn binding(&self) -> DurableProofBinding<'static> {
+        DurableProofBinding {
+            model_id: self.model.id,
+            repository: self.model.repository,
+            revision: self.model.revision,
+            manifest_sha256: self.model.manifest_sha256,
+            files: self.model.files,
+        }
     }
 }
 
@@ -332,6 +675,7 @@ struct DurableProofBinding<'a> {
     files: &'a [ModelFile],
 }
 
+#[cfg(test)]
 fn production_durable_proof_binding() -> DurableProofBinding<'static> {
     DurableProofBinding {
         model_id: MODEL_ID,
@@ -531,9 +875,13 @@ fn tiny_test_durable_proof_binding() -> DurableProofBinding<'static> {
 
 impl Manager {
     pub fn new() -> Self {
+        Self::new_for_model(&LEGACY_QWEN_38_MODEL)
+    }
+
+    fn new_for_model(model: &'static MlxCleanupModel) -> Self {
         Self {
             inner: Arc::new(Mutex::new(ManagerInner {
-                status: CleanupModelStatus::initial(),
+                status: CleanupModelStatus::initial_for(model),
                 job: None,
                 generation: 0,
                 deleting: false,
@@ -544,6 +892,7 @@ impl Manager {
             })),
             leases: Arc::new(AtomicUsize::new(0)),
             revision: tokio::sync::watch::channel(0).0,
+            model,
         }
     }
 
@@ -556,6 +905,10 @@ impl Manager {
         self.inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn download_active(&self) -> bool {
+        self.lock().status.operation.as_deref() == Some("download")
     }
 
     pub fn status(&self, models_root: &Path) -> CleanupModelStatus {
@@ -578,16 +931,32 @@ impl Manager {
         };
         status.last_operation = last_operation;
         status.last_operation_error = last_operation_error;
-        match read_installed_inventory(&managed_dir(models_root)) {
+        let managed = managed_dir_for(models_root, self.model.id);
+        let staging = staging_dir_for(models_root, self.model.id);
+        match read_installed_inventory_with_binding(&managed, self.binding()) {
             Ok(Some(files)) => {
                 status.managed = true;
-                status.partial_managed = path_entry_exists(&staging_dir(models_root));
-                status.bytes_done = MODEL_BYTES;
-                let canonical_root = canonical_or_absolute(&managed_dir(models_root));
+                status.partial_managed = path_entry_exists(&staging);
+                status.bytes_done = model_total_bytes(self.model);
+                let canonical_root = canonical_or_absolute(&managed);
                 let trusted = self.lock().trusted.clone().filter(|inventory| {
                     inventory.root == canonical_root && inventory.files == files
                 });
-                status.state = if trusted.is_some() {
+                let durably_verified = trusted.is_none()
+                    && read_durable_proof_for(models_root, self.binding())
+                        .proof
+                        .as_ref()
+                        .and_then(|proof| {
+                            verified_files_from_durable_proof(
+                                proof,
+                                models_root,
+                                &managed,
+                                self.binding(),
+                            )
+                        })
+                        .as_ref()
+                        == Some(&files);
+                status.state = if trusted.is_some() || durably_verified {
                     "ready"
                 } else {
                     "installed"
@@ -597,9 +966,9 @@ impl Manager {
             }
             Ok(None) => {
                 status.managed = false;
-                status.partial_managed = path_entry_exists(&staging_dir(models_root));
+                status.partial_managed = path_entry_exists(&staging);
                 status.bytes_done = if status.partial_managed {
-                    partial_bytes(&staging_dir(models_root))
+                    partial_bytes(&staging)
                 } else {
                     0
                 };
@@ -612,11 +981,18 @@ impl Manager {
                 status.error = None;
             }
             Err(error) => {
-                status.managed = path_entry_exists(&managed_dir(models_root));
-                status.partial_managed = path_entry_exists(&staging_dir(models_root));
+                status.managed = path_entry_exists(&managed);
+                status.partial_managed = path_entry_exists(&staging);
                 status.state = "invalid".to_owned();
                 status.error = Some(error);
             }
+        }
+        if status.state == "installed"
+            && status.last_operation.as_deref() == Some("verify")
+            && status.last_operation_error.is_some()
+        {
+            status.state = "invalid".to_owned();
+            status.error = status.last_operation_error.clone();
         }
         status
     }
@@ -651,11 +1027,7 @@ impl Manager {
         models_root: &Path,
         trace: Option<VerificationTrace<'_>>,
     ) -> Result<(ResolvedCleanupModel, InventoryVerification), String> {
-        self.resolve_ready_inner_with_binding(
-            models_root,
-            trace,
-            production_durable_proof_binding(),
-        )
+        self.resolve_ready_inner_with_binding(models_root, trace, self.binding(), None)
     }
 
     fn resolve_ready_inner_with_binding(
@@ -663,16 +1035,21 @@ impl Manager {
         models_root: &Path,
         trace: Option<VerificationTrace<'_>>,
         binding: DurableProofBinding<'static>,
+        verification_generation: Option<u64>,
     ) -> Result<(ResolvedCleanupModel, InventoryVerification), String> {
         let verification_started = Instant::now();
-        let directory = managed_dir(models_root);
+        let directory = managed_dir_for(models_root, binding.model_id);
         let root = canonical_or_absolute(&directory);
         let lease = {
             let inner = self.lock();
+            let owns_verification = verification_generation.is_some_and(|generation| {
+                inner.status.operation.as_deref() == Some("verify")
+                    && inner.generation == generation
+            });
             if inner.deleting {
                 return Err("cleanup model is being deleted".to_owned());
             }
-            if inner.job.is_some() {
+            if inner.job.is_some() || (inner.status.operation.is_some() && !owns_verification) {
                 return Err("cleanup model storage operation is still running".to_owned());
             }
             self.leases.fetch_add(1, Ordering::AcqRel);
@@ -682,7 +1059,7 @@ impl Manager {
         };
         let cached = self.lock().trusted.clone();
         let mut progress = VerificationProgress::default();
-        let durable = read_durable_proof(models_root);
+        let durable = read_durable_proof_for(models_root, binding);
         let (verified, cache, mut cache_reason, write_durable_proof) = if let Some(proof) =
             durable.proof.as_ref()
         {
@@ -740,7 +1117,7 @@ impl Manager {
             )
         };
         if write_durable_proof
-            && write_durable_proof_record(models_root, &directory, &verified, binding).is_err()
+            && write_durable_proof_record_for(models_root, &directory, &verified, binding).is_err()
         {
             // A cache write failure is only a future cache miss. The model has
             // already passed the full verifier (or the same-process verifier).
@@ -748,7 +1125,14 @@ impl Manager {
         }
         {
             let mut inner = self.lock();
-            if inner.deleting || inner.job.is_some() {
+            let owns_verification = verification_generation.is_some_and(|generation| {
+                inner.status.operation.as_deref() == Some("verify")
+                    && inner.generation == generation
+            });
+            if inner.deleting
+                || inner.job.is_some()
+                || (inner.status.operation.is_some() && !owns_verification)
+            {
                 return Err("cleanup model changed while it was being verified".to_owned());
             }
             inner.trusted = Some(TrustedInventory {
@@ -785,6 +1169,9 @@ impl Manager {
     }
 
     pub fn start_import(&self, models_root: PathBuf, selected_dir: PathBuf) -> Result<(), String> {
+        if !self.model.importable {
+            return Err("import is not supported for this local cleanup model".to_owned());
+        }
         let selected_meta = fs::symlink_metadata(&selected_dir)
             .map_err(|error| format!("cannot open selected model folder: {error}"))?;
         if selected_meta.file_type().is_symlink() || !selected_meta.is_dir() {
@@ -792,8 +1179,8 @@ impl Manager {
         }
         let selected = fs::canonicalize(&selected_dir)
             .map_err(|error| format!("cannot open selected model folder: {error}"))?;
-        let managed = canonical_or_absolute(&managed_dir(&models_root));
-        let staging = canonical_or_absolute(&staging_dir(&models_root));
+        let managed = canonical_or_absolute(&managed_dir_for(&models_root, self.model.id));
+        let staging = canonical_or_absolute(&staging_dir_for(&models_root, self.model.id));
         if paths_overlap(&selected, &managed) || paths_overlap(&selected, &staging) {
             return Err("the selected folder overlaps VoiceFlow model storage; choose the original model folder".to_owned());
         }
@@ -811,17 +1198,76 @@ impl Manager {
         let (generation, cancel, bytes_done) =
             self.begin_operation(&models_root, "downloading", "download")?;
         let manager = self.clone();
+        let model = self.model;
         tauri::async_runtime::spawn(async move {
-            let result = download_model(&models_root, &cancel, &bytes_done).await;
+            let result = download_model_for(&models_root, model, &cancel, &bytes_done).await;
             manager.finish_operation(generation, result.as_ref().err().cloned(), result.ok());
         });
         Ok(())
     }
 
+    pub fn start_verification(&self, models_root: PathBuf) -> Result<(), String> {
+        let current = self.status(&models_root);
+        if current.state != "installed" || !current.managed {
+            return Err("local cleanup model is not awaiting verification".to_owned());
+        }
+        let generation = {
+            let mut inner = self.lock();
+            if inner.deleting || inner.job.is_some() || inner.status.operation.is_some() {
+                return Err("cleanup model storage is busy".to_owned());
+            }
+            if self.leases.load(Ordering::Acquire) != 0 {
+                return Err("cleanup model is in use; unload it before verification".to_owned());
+            }
+            inner.generation = inner.generation.wrapping_add(1);
+            let generation = inner.generation;
+            inner.status.state = "installed".to_owned();
+            inner.status.operation = Some("verify".to_owned());
+            inner.status.bytes_done = 0;
+            inner.status.bytes_total = model_total_bytes(self.model);
+            inner.status.error = None;
+            inner.status_root_for_commit = None;
+            inner.last_operation = None;
+            inner.last_operation_error = None;
+            inner.status.last_operation = None;
+            inner.status.last_operation_error = None;
+            generation
+        };
+        self.notify_revision();
+        let manager = self.clone();
+        tauri::async_runtime::spawn(async move {
+            let root = models_root.clone();
+            let worker = manager.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                worker
+                    .resolve_ready_inner_with_binding(
+                        &root,
+                        None,
+                        worker.binding(),
+                        Some(generation),
+                    )
+                    .map(|(model, _)| model)
+            })
+            .await
+            .map_err(|error| format!("model verification worker failed: {error}"))
+            .and_then(|result| result);
+            manager.finish_verification(generation, result);
+        });
+        Ok(())
+    }
+
     pub fn cancel(&self) -> bool {
-        let inner = self.lock();
+        let mut inner = self.lock();
+        if self.model.id != MODEL_ID && inner.status.operation.as_deref() != Some("download") {
+            return false;
+        }
         if let Some(job) = &inner.job {
             job.cancel.cancel();
+            if self.model.id != MODEL_ID {
+                inner.status.state = "canceling".to_owned();
+            }
+            drop(inner);
+            self.notify_revision();
             return true;
         }
         false
@@ -838,7 +1284,7 @@ impl Manager {
     {
         {
             let mut inner = self.lock();
-            if inner.job.is_some() || inner.deleting {
+            if inner.job.is_some() || inner.deleting || inner.status.operation.is_some() {
                 return Err("cleanup model storage is busy".to_owned());
             }
             inner.deleting = true;
@@ -862,11 +1308,13 @@ impl Manager {
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        let directory = managed_dir(&models_root);
-        let result = validate_model_parent(&models_root)
+        let directory = managed_dir_for(&models_root, self.model.id);
+        let staging = staging_dir_for(&models_root, self.model.id);
+        let cache = durable_cache_dir_for(&models_root, self.model.id);
+        let result = validate_model_parent_from_managed(&directory)
             .and_then(|()| remove_path(&directory))
-            .and_then(|()| remove_path(&staging_dir(&models_root)))
-            .and_then(|()| remove_path(&durable_cache_dir(&models_root)));
+            .and_then(|()| remove_path(&staging))
+            .and_then(|()| remove_path(&cache));
         match result {
             Ok(()) => {
                 let mut inner = self.lock();
@@ -875,7 +1323,7 @@ impl Manager {
                 inner.last_operation = Some("delete".to_owned());
                 inner.last_operation_error = None;
                 inner.status_root_for_commit = None;
-                inner.status = CleanupModelStatus::initial();
+                inner.status = CleanupModelStatus::initial_for(self.model);
                 inner.status.last_operation = inner.last_operation.clone();
                 drop(inner);
                 self.notify_revision();
@@ -895,7 +1343,7 @@ impl Manager {
         operation: &str,
     ) -> Result<(u64, CancellationToken, Arc<AtomicU64>), String> {
         let mut inner = self.lock();
-        if inner.deleting || inner.job.is_some() {
+        if inner.deleting || inner.job.is_some() || inner.status.operation.is_some() {
             return Err("cleanup model storage is busy".to_owned());
         }
         if self.leases.load(Ordering::Acquire) != 0 {
@@ -903,7 +1351,8 @@ impl Manager {
                 "cleanup model is in use; unload it before importing or downloading".to_owned(),
             );
         }
-        if path_entry_exists(&managed_dir(models_root)) {
+        let managed = managed_dir_for(models_root, self.model.id);
+        if path_entry_exists(&managed) {
             return Err(
                 "a managed model folder already exists; delete it before replacing or repairing"
                     .to_owned(),
@@ -918,12 +1367,12 @@ impl Manager {
             cancel: cancel.clone(),
             bytes_done: Arc::clone(&bytes_done),
         });
-        inner.status = CleanupModelStatus::initial();
+        inner.status = CleanupModelStatus::initial_for(self.model);
         inner.status.state = state.to_owned();
         inner.status.operation = Some(operation.to_owned());
         inner.status.bytes_done = 0;
         inner.status.error = None;
-        inner.status_root_for_commit = Some(managed_dir(models_root));
+        inner.status_root_for_commit = Some(managed);
         inner.last_operation = None;
         inner.last_operation_error = None;
         inner.status.last_operation = None;
@@ -967,7 +1416,7 @@ impl Manager {
             });
             inner.status.state = "ready".to_owned();
             inner.status.managed = true;
-            inner.status.bytes_done = MODEL_BYTES;
+            inner.status.bytes_done = model_total_bytes(self.model);
             inner.status.source_kind = Some(match inner.status.operation.as_deref() {
                 Some("import") => "import".to_owned(),
                 _ => "download".to_owned(),
@@ -997,6 +1446,36 @@ impl Manager {
         self.notify_revision();
     }
 
+    fn finish_verification(&self, generation: u64, result: Result<ResolvedCleanupModel, String>) {
+        let mut inner = self.lock();
+        if inner.status.operation.as_deref() != Some("verify") || inner.generation != generation {
+            return;
+        }
+        inner.status.operation = None;
+        inner.last_operation = Some("verify".to_owned());
+        inner.status.last_operation = inner.last_operation.clone();
+        match result {
+            Ok(model) => {
+                drop(model);
+                inner.status.state = "ready".to_owned();
+                inner.status.managed = true;
+                inner.status.bytes_done = model_total_bytes(self.model);
+                inner.status.error = None;
+                inner.last_operation_error = None;
+                inner.status.last_operation_error = None;
+            }
+            Err(error) => {
+                inner.status.state = "invalid".to_owned();
+                inner.status.bytes_done = 0;
+                inner.status.error = Some(error.clone());
+                inner.last_operation_error = Some(error.clone());
+                inner.status.last_operation_error = Some(error);
+            }
+        }
+        drop(inner);
+        self.notify_revision();
+    }
+
     fn finish_delete(&self, error: Option<String>) {
         let mut inner = self.lock();
         inner.deleting = false;
@@ -1008,6 +1487,250 @@ impl Manager {
         inner.status.error = None;
         drop(inner);
         self.notify_revision();
+    }
+}
+
+#[derive(Clone, Default)]
+pub struct MlxCatalogManager {
+    managers: Arc<HashMap<&'static str, Manager>>,
+}
+
+impl MlxCatalogManager {
+    pub fn new() -> Self {
+        let managers = all_mlx_cleanup_models()
+            .map(|model| (model.id, Manager::new_for_model(model)))
+            .collect();
+        Self {
+            managers: Arc::new(managers),
+        }
+    }
+
+    pub fn model(&self, id: &str) -> Option<&'static MlxCleanupModel> {
+        all_mlx_cleanup_models().find(|model| model.id == id)
+    }
+
+    pub(crate) fn manager(&self, id: &str) -> Result<Manager, String> {
+        self.managers
+            .get(id)
+            .cloned()
+            .ok_or_else(|| "unsupported local MLX cleanup model".to_owned())
+    }
+
+    pub fn statuses(
+        &self,
+        models_root: &Path,
+        mut compatibility_error: impl FnMut(&MlxCleanupModel) -> Option<String>,
+    ) -> Vec<MlxCleanupModelStatus> {
+        all_mlx_cleanup_models()
+            .filter_map(|model| {
+                let manager = self.managers.get(model.id)?;
+                Some(catalog_model_status(
+                    manager,
+                    model,
+                    models_root,
+                    compatibility_error(model),
+                ))
+            })
+            .collect()
+    }
+
+    pub fn status(
+        &self,
+        models_root: &Path,
+        id: &str,
+        compatibility_error: Option<String>,
+    ) -> Result<MlxCleanupModelStatus, String> {
+        let model = self
+            .model(id)
+            .ok_or_else(|| "unsupported local MLX cleanup model".to_owned())?;
+        let manager = self.manager(id)?;
+        Ok(catalog_model_status(
+            &manager,
+            model,
+            models_root,
+            compatibility_error,
+        ))
+    }
+
+    pub fn start_background_download<E>(
+        &self,
+        models_root: PathBuf,
+        id: &str,
+        compatibility_error: Option<String>,
+        emit: E,
+    ) -> Result<(), String>
+    where
+        E: Fn(MlxCleanupModelStatus) + Send + Sync + 'static,
+    {
+        let model = self
+            .model(id)
+            .ok_or_else(|| "unsupported local MLX cleanup model".to_owned())?;
+        if compatibility_error.is_some() {
+            return Err("the selected MLX cleanup model is incompatible with this Mac".into());
+        }
+        if !is_user_available_mlx_cleanup_model(model.id) {
+            return Err("this local MLX cleanup model is not available for new downloads".into());
+        }
+        let manager = self.manager(id)?;
+        manager.start_download(models_root.clone())?;
+        let manager_for_task = manager.clone();
+        let model_root = models_root.clone();
+        let emit = Arc::new(emit);
+        let poll_emit = Arc::clone(&emit);
+        let poll_error = compatibility_error.clone();
+        tauri::async_runtime::spawn(async move {
+            let mut interval = tokio::time::interval(STATUS_INTERVAL);
+            loop {
+                let status =
+                    catalog_model_status(&manager_for_task, model, &model_root, poll_error.clone());
+                let active = status.operation.as_deref() == Some("download");
+                poll_emit(status);
+                if !active {
+                    break;
+                }
+                interval.tick().await;
+            }
+        });
+        let status = catalog_model_status(&manager, model, &models_root, compatibility_error);
+        (emit)(status);
+        Ok(())
+    }
+
+    pub fn start_background_verification<E>(
+        &self,
+        models_root: PathBuf,
+        id: &str,
+        compatibility_error: Option<String>,
+        emit: E,
+    ) -> Result<(), String>
+    where
+        E: Fn(MlxCleanupModelStatus) + Send + Sync + 'static,
+    {
+        let model = self
+            .model(id)
+            .ok_or_else(|| "unsupported local MLX cleanup model".to_owned())?;
+        let manager = self.manager(id)?;
+        let mut revisions = manager.subscribe_revision();
+        manager.start_verification(models_root.clone())?;
+        let emit = Arc::new(emit);
+        let status =
+            catalog_model_status(&manager, model, &models_root, compatibility_error.clone());
+        (emit)(status);
+        let manager_for_task = manager.clone();
+        let model_root = models_root.clone();
+        tauri::async_runtime::spawn(async move {
+            loop {
+                if revisions.changed().await.is_err() {
+                    break;
+                }
+                let status = catalog_model_status(
+                    &manager_for_task,
+                    model,
+                    &model_root,
+                    compatibility_error.clone(),
+                );
+                if status.operation.as_deref() != Some("verify") {
+                    (emit)(status);
+                    break;
+                }
+            }
+        });
+        Ok(())
+    }
+
+    pub fn cancel_download(&self, id: &str) -> Result<bool, String> {
+        Ok(self.manager(id)?.cancel())
+    }
+
+    pub fn cancel_all_downloads(&self) {
+        for manager in self.managers.values() {
+            manager.cancel();
+        }
+    }
+
+    pub async fn shutdown_downloads(&self) -> bool {
+        self.cancel_all_downloads();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(12);
+        loop {
+            if self
+                .managers
+                .values()
+                .all(|manager| !manager.download_active())
+            {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    pub(crate) fn resolve_ready(
+        &self,
+        models_root: &Path,
+        id: &str,
+    ) -> Result<ResolvedCleanupModel, String> {
+        self.manager(id)?
+            .resolve_ready_inner(models_root, None)
+            .map(|(model, _)| model)
+    }
+
+    pub async fn delete_with_unload<F, Fut>(
+        &self,
+        models_root: PathBuf,
+        id: &str,
+        unload: F,
+    ) -> Result<(), String>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<(), String>>,
+    {
+        self.manager(id)?
+            .delete_with_unload(models_root, unload)
+            .await
+    }
+}
+
+fn catalog_model_status(
+    manager: &Manager,
+    model: &MlxCleanupModel,
+    models_root: &Path,
+    compatibility_error: Option<String>,
+) -> MlxCleanupModelStatus {
+    let stored = manager.status(models_root);
+    let download_available = is_user_available_mlx_cleanup_model(model.id);
+    let compatible = compatibility_error.is_none();
+    let verified = stored.state == "ready";
+    let state = match stored.state.as_str() {
+        "partial" | "cancelled" => "missing".to_owned(),
+        "invalid" => "corrupt".to_owned(),
+        other => other.to_owned(),
+    };
+    let active = stored.operation.is_some();
+    MlxCleanupModelStatus {
+        id: model.id.to_owned(),
+        label: model.label.to_owned(),
+        repository: model.repository.to_owned(),
+        revision: model.revision.to_owned(),
+        bytes: model_total_bytes(model),
+        language: model.language.to_owned(),
+        state,
+        operation: stored.operation,
+        bytes_done: stored.bytes_done,
+        bytes_total: model_total_bytes(model),
+        error: stored.error,
+        last_operation: stored.last_operation,
+        last_operation_error: stored.last_operation_error,
+        managed: stored.managed,
+        partial_managed: stored.partial_managed,
+        verified,
+        qualified: model.release_qualified,
+        download_available,
+        downloadable: download_available && compatible && !stored.managed && !active,
+        selectable: download_available && compatible && verified,
+        compatible,
+        compatibility_error,
     }
 }
 
@@ -1027,19 +1750,47 @@ impl Default for ManagerInner {
 }
 
 fn managed_dir(models_root: &Path) -> PathBuf {
-    models_root.join("cleanup").join(MODEL_ID)
+    managed_dir_for(models_root, MODEL_ID)
+}
+
+fn managed_dir_for(models_root: &Path, model_id: &str) -> PathBuf {
+    models_root.join("cleanup").join(model_id)
 }
 
 fn staging_dir(models_root: &Path) -> PathBuf {
-    models_root.join("cleanup").join(STAGING_DIR)
+    staging_dir_for(models_root, MODEL_ID)
 }
 
+fn staging_dir_for(models_root: &Path, model_id: &str) -> PathBuf {
+    let name = if model_id == MODEL_ID {
+        STAGING_DIR.to_owned()
+    } else {
+        format!(".{model_id}.partial")
+    };
+    models_root.join("cleanup").join(name)
+}
+
+#[cfg(test)]
 fn durable_cache_dir(models_root: &Path) -> PathBuf {
-    models_root.join("cleanup").join(DURABLE_CACHE_DIR)
+    durable_cache_dir_for(models_root, MODEL_ID)
 }
 
+fn durable_cache_dir_for(models_root: &Path, model_id: &str) -> PathBuf {
+    let cache = models_root.join("cleanup").join(DURABLE_CACHE_DIR);
+    if model_id == MODEL_ID {
+        cache
+    } else {
+        cache.join(model_id)
+    }
+}
+
+#[cfg(test)]
 fn durable_proof_path(models_root: &Path) -> PathBuf {
     durable_cache_dir(models_root).join(DURABLE_PROOF_FILE)
+}
+
+fn durable_proof_path_for(models_root: &Path, model_id: &str) -> PathBuf {
+    durable_cache_dir_for(models_root, model_id).join(DURABLE_PROOF_FILE)
 }
 
 fn paths_overlap(left: &Path, right: &Path) -> bool {
@@ -1301,10 +2052,18 @@ struct DurableProofRead {
     reason: &'static str,
 }
 
+#[cfg(test)]
 fn read_durable_proof(models_root: &Path) -> DurableProofRead {
+    read_durable_proof_for(models_root, production_durable_proof_binding())
+}
+
+fn read_durable_proof_for(
+    models_root: &Path,
+    binding: DurableProofBinding<'_>,
+) -> DurableProofRead {
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = models_root;
+        let _ = (models_root, binding);
         return DurableProofRead {
             proof: None,
             reason: "durable_cache_target_unsupported",
@@ -1312,8 +2071,8 @@ fn read_durable_proof(models_root: &Path) -> DurableProofRead {
     }
     #[cfg(target_os = "macos")]
     {
-        let cache_dir = durable_cache_dir(models_root);
-        let path = durable_proof_path(models_root);
+        let cache_dir = durable_cache_dir_for(models_root, binding.model_id);
+        let path = durable_proof_path_for(models_root, binding.model_id);
         let directory = match fs::symlink_metadata(&cache_dir) {
             Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => metadata,
             Ok(_) => {
@@ -1489,7 +2248,17 @@ fn verified_files_from_durable_proof(
     }
 }
 
+#[cfg(test)]
 fn write_durable_proof_record(
+    models_root: &Path,
+    directory: &Path,
+    files: &[VerifiedFile],
+    binding: DurableProofBinding<'_>,
+) -> Result<(), String> {
+    write_durable_proof_record_for(models_root, directory, files, binding)
+}
+
+fn write_durable_proof_record_for(
     models_root: &Path,
     directory: &Path,
     files: &[VerifiedFile],
@@ -1505,7 +2274,7 @@ fn write_durable_proof_record(
         if files.len() != binding.files.len() {
             return Err("verified model inventory is incomplete".to_owned());
         }
-        let cache_dir = durable_cache_dir(models_root);
+        let cache_dir = durable_cache_dir_for(models_root, binding.model_id);
         ensure_private_dir(&cache_dir)?;
         let directory_identity = durable_file_identity(directory)?;
         let manifest_path = directory.join(INSTALLED_MANIFEST);
@@ -1575,7 +2344,7 @@ fn write_durable_proof_record(
         if bytes.len() > MAX_DURABLE_PROOF_BYTES as usize {
             return Err("durable model proof exceeds its size bound".to_owned());
         }
-        let proof_path = durable_proof_path(models_root);
+        let proof_path = durable_proof_path_for(models_root, binding.model_id);
         atomic_write_private(&proof_path, &bytes)?;
 
         // The proof lives outside the managed model directory. Read the bound
@@ -1711,6 +2480,9 @@ fn verify_directory_against_binding(
     }
     if validate_pinned_metadata {
         validate_model_metadata(directory)?;
+    } else {
+        validate_catalog_model_metadata(directory, binding.model_id, expected_files)?;
+        validate_catalog_directory_inventory(directory, expected_files, true)?;
     }
     Ok(verified)
 }
@@ -1752,10 +2524,6 @@ fn sha256_backend_facts() -> (&'static str, Option<bool>) {
     }
 }
 
-fn read_installed_inventory(directory: &Path) -> Result<Option<Vec<VerifiedFile>>, String> {
-    read_installed_inventory_with_binding(directory, production_durable_proof_binding())
-}
-
 fn read_installed_inventory_with_binding(
     directory: &Path,
     binding: DurableProofBinding<'_>,
@@ -1780,6 +2548,9 @@ fn read_installed_inventory_with_binding(
         return Err("installed cleanup model manifest does not match the pinned model".to_owned());
     }
     validate_safetensors_inventory(directory, binding.files)?;
+    if binding.model_id != MODEL_ID {
+        validate_catalog_directory_inventory(directory, binding.files, true)?;
+    }
     for (actual, expected) in manifest.files.iter().zip(binding.files) {
         if actual.path != expected.path
             || actual.bytes != expected.bytes
@@ -1910,6 +2681,734 @@ fn write_installed_manifest(
     Ok(files)
 }
 
+fn write_installed_manifest_for(
+    directory: &Path,
+    files: Vec<VerifiedFile>,
+    binding: DurableProofBinding<'_>,
+) -> Result<Vec<VerifiedFile>, String> {
+    if files.len() != binding.files.len() {
+        return Err("model inventory is incomplete".to_owned());
+    }
+    for (actual, expected) in files.iter().zip(binding.files) {
+        if actual.path != expected.path
+            || actual.bytes != expected.bytes
+            || actual.sha256 != expected.sha256
+        {
+            return Err("model inventory does not match the pinned files".to_owned());
+        }
+        if file_identity(&directory.join(expected.path))? != actual.identity {
+            return Err(format!(
+                "model file changed before manifest commit: {}",
+                expected.path
+            ));
+        }
+    }
+    validate_catalog_model_metadata(directory, binding.model_id, binding.files)?;
+    validate_catalog_directory_inventory(directory, binding.files, false)?;
+    let manifest = InstalledManifest {
+        schema_version: 1,
+        id: binding.model_id.to_owned(),
+        repository: binding.repository.to_owned(),
+        revision: binding.revision.to_owned(),
+        manifest_sha256: binding.manifest_sha256.to_owned(),
+        files: files.clone(),
+    };
+    let bytes = serde_json::to_vec(&manifest).map_err(|error| error.to_string())?;
+    write_atomic(&directory.join(INSTALLED_MANIFEST), &bytes)?;
+    Ok(files)
+}
+
+fn validate_catalog_model_metadata(
+    directory: &Path,
+    model_id: &str,
+    expected_files: &[ModelFile],
+) -> Result<(), String> {
+    match model_id {
+        GEMMA_4_E2B_IT_MLX_ID | GEMMA_4_E4B_IT_MLX_ID => {
+            validate_gemma4_catalog_model_metadata(directory, model_id, expected_files)
+        }
+        MINISTRAL_3_3B_INSTRUCT_MLX_ID => {
+            validate_ministral3_catalog_model_metadata(directory, expected_files)
+        }
+        S1_MINI_MLX_ID => validate_s1_mini_catalog_model_metadata(directory, expected_files),
+        _ => validate_qwen35_catalog_model_metadata(directory, model_id, expected_files),
+    }
+}
+
+fn validate_s1_mini_catalog_model_metadata(
+    directory: &Path,
+    expected_files: &[ModelFile],
+) -> Result<(), String> {
+    const EXPECTED_WEIGHT_BYTES: u64 = 335_450_548;
+    const EXPECTED_INDEX_TOTAL_SIZE: u64 = 335_372_288;
+    const EXPECTED_TENSORS: usize = 704;
+    const EXPECTED_PATHS: &[&str] = &[
+        "chat_template.jinja",
+        "config.json",
+        "generation_config.json",
+        "model.safetensors",
+        "model.safetensors.index.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+    ];
+
+    let config: serde_json::Value = serde_json::from_slice(
+        &fs::read(directory.join("config.json")).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+    let config_matches = config.get("model_type").and_then(serde_json::Value::as_str)
+        == Some("qwen3")
+        && config
+            .get("architectures")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|values| values.first())
+            .and_then(serde_json::Value::as_str)
+            == Some("Qwen3ForCausalLM")
+        && config
+            .pointer("/quantization_config/bits")
+            .and_then(serde_json::Value::as_u64)
+            == Some(4)
+        && config
+            .pointer("/quantization_config/group_size")
+            .and_then(serde_json::Value::as_u64)
+            == Some(64)
+        && config
+            .pointer("/quantization_config/mode")
+            .and_then(serde_json::Value::as_str)
+            == Some("affine")
+        && config
+            .pointer("/num_hidden_layers")
+            .and_then(serde_json::Value::as_u64)
+            == Some(28)
+        && config
+            .pointer("/hidden_size")
+            .and_then(serde_json::Value::as_u64)
+            == Some(1_024)
+        && config
+            .pointer("/intermediate_size")
+            .and_then(serde_json::Value::as_u64)
+            == Some(3_072)
+        && config
+            .pointer("/num_attention_heads")
+            .and_then(serde_json::Value::as_u64)
+            == Some(16)
+        && config
+            .pointer("/num_key_value_heads")
+            .and_then(serde_json::Value::as_u64)
+            == Some(8)
+        && config
+            .pointer("/head_dim")
+            .and_then(serde_json::Value::as_u64)
+            == Some(128)
+        && config
+            .pointer("/vocab_size")
+            .and_then(serde_json::Value::as_u64)
+            == Some(151_936)
+        && config
+            .pointer("/tie_word_embeddings")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+    if !config_matches {
+        return Err("model config is not the pinned S1-mini Qwen3 4-bit layout".to_owned());
+    }
+
+    let generation_config: serde_json::Value = serde_json::from_slice(
+        &fs::read(directory.join("generation_config.json")).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+    if generation_config
+        .get("bos_token_id")
+        .and_then(serde_json::Value::as_u64)
+        != Some(151_643)
+        || generation_config
+            .get("eos_token_id")
+            .and_then(serde_json::Value::as_array)
+            .is_none_or(|tokens| {
+                tokens.len() != 2
+                    || tokens[0].as_u64() != Some(151_645)
+                    || tokens[1].as_u64() != Some(151_643)
+            })
+    {
+        return Err("generation config does not match the pinned S1-mini tokens".to_owned());
+    }
+
+    if expected_files.len() != EXPECTED_PATHS.len()
+        || expected_files
+            .iter()
+            .map(|file| file.path)
+            .ne(EXPECTED_PATHS.iter().copied())
+    {
+        return Err("model files do not match the pinned S1-mini inventory".to_owned());
+    }
+    let weight = expected_files
+        .iter()
+        .find(|file| file.path == "model.safetensors")
+        .ok_or_else(|| "pinned S1-mini model weight is missing".to_owned())?;
+    if weight.bytes != EXPECTED_WEIGHT_BYTES {
+        return Err("model weight does not match the pinned S1-mini size".to_owned());
+    }
+    let header = read_safetensors_header_inventory(&directory.join(weight.path))?;
+    let expected_dtype_counts = HashMap::from([("BF16".to_owned(), 507), ("U32".to_owned(), 197)]);
+    if header.tensor_count != EXPECTED_TENSORS
+        || header.prefix_counts.len() != 1
+        || header.prefix_counts.get("model") != Some(&EXPECTED_TENSORS)
+        || header.dtype_counts != expected_dtype_counts
+    {
+        return Err("safetensors header does not match the pinned S1-mini tensor inventory".into());
+    }
+
+    let index: serde_json::Value = serde_json::from_slice(
+        &fs::read(directory.join("model.safetensors.index.json"))
+            .map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+    let weight_map_matches = index
+        .get("weight_map")
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|weights| {
+            weights.len() == EXPECTED_TENSORS
+                && weights.keys().all(|name| name.starts_with("model."))
+                && weights
+                    .values()
+                    .all(|name| name.as_str() == Some("model.safetensors"))
+        });
+    if index
+        .pointer("/metadata/total_size")
+        .and_then(serde_json::Value::as_u64)
+        != Some(EXPECTED_INDEX_TOTAL_SIZE)
+        || !weight_map_matches
+    {
+        return Err("model index does not match the pinned S1-mini tensor inventory".to_owned());
+    }
+    Ok(())
+}
+
+fn validate_qwen35_catalog_model_metadata(
+    directory: &Path,
+    model_id: &str,
+    expected_files: &[ModelFile],
+) -> Result<(), String> {
+    let (expected_layers, expected_hidden, expected_weight_bytes, expected_tensor_count) =
+        match model_id {
+            QWEN_35_2B_MLX_ID => (24, 2_048, 1_722_149_056, 991),
+            QWEN_35_4B_MLX_ID => (32, 2_560, 3_034_147_328, 1_221),
+            QWEN_35_9B_MLX_ID => (32, 4_096, 5_950_062_560, 1_260),
+            _ => {
+                return Err(
+                    "no model-layout verifier is registered for this local cleanup model"
+                        .to_owned(),
+                );
+            }
+        };
+    let config: serde_json::Value = serde_json::from_slice(
+        &fs::read(directory.join("config.json")).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+    if config.get("model_type").and_then(serde_json::Value::as_str) != Some("qwen3_5")
+        || config
+            .get("architectures")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|values| values.first())
+            .and_then(serde_json::Value::as_str)
+            != Some("Qwen3_5ForConditionalGeneration")
+        || config
+            .pointer("/quantization_config/bits")
+            .and_then(serde_json::Value::as_u64)
+            != Some(4)
+        || config
+            .pointer("/quantization_config/group_size")
+            .and_then(serde_json::Value::as_u64)
+            != Some(64)
+        || config
+            .pointer("/quantization_config/mode")
+            .and_then(serde_json::Value::as_str)
+            != Some("affine")
+        || config
+            .pointer("/text_config/num_hidden_layers")
+            .and_then(serde_json::Value::as_u64)
+            != Some(expected_layers)
+        || config
+            .pointer("/text_config/hidden_size")
+            .and_then(serde_json::Value::as_u64)
+            != Some(expected_hidden)
+        || config
+            .pointer("/text_config/vocab_size")
+            .and_then(serde_json::Value::as_u64)
+            != Some(248_320)
+    {
+        return Err(format!(
+            "model config is not the pinned {model_id} MLX 4-bit layout"
+        ));
+    }
+    let index: serde_json::Value = serde_json::from_slice(
+        &fs::read(directory.join("model.safetensors.index.json"))
+            .map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+    let expected_shards = expected_files
+        .iter()
+        .filter(|file| file.path.ends_with(".safetensors"))
+        .map(|file| file.path)
+        .collect::<Vec<_>>();
+    let weight_map_matches = index
+        .get("weight_map")
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|weights| {
+            weights.len() == expected_tensor_count
+                && weights.values().all(|name| {
+                    name.as_str()
+                        .is_some_and(|name| expected_shards.contains(&name))
+                })
+                && expected_shards
+                    .iter()
+                    .all(|shard| weights.values().any(|name| name.as_str() == Some(*shard)))
+        });
+    if index
+        .pointer("/metadata/total_size")
+        .and_then(serde_json::Value::as_u64)
+        != Some(expected_weight_bytes)
+        || !weight_map_matches
+    {
+        return Err(format!(
+            "model shard index does not match the pinned {model_id} tensor inventory"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_gemma4_catalog_model_metadata(
+    directory: &Path,
+    model_id: &str,
+    expected_files: &[ModelFile],
+) -> Result<(), String> {
+    let (
+        expected_layers,
+        expected_hidden,
+        expected_heads,
+        expected_kv_heads,
+        expected_sliding_layers,
+        expected_weight_bytes,
+        expected_tensors,
+        indexed,
+    ) = match model_id {
+        GEMMA_4_E2B_IT_MLX_ID => (35, 1_536, 8, 1, 28, 2_623_906_147, 1_094, true),
+        GEMMA_4_E4B_IT_MLX_ID => (42, 2_560, 8, 2, 35, 4_198_925_844, 1_355, false),
+        _ => {
+            return Err("no Gemma 4 model-layout verifier is registered".to_owned());
+        }
+    };
+    let config: serde_json::Value = serde_json::from_slice(
+        &fs::read(directory.join("config.json")).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+    let expected_eos = [1_u64, 106, 50];
+    let eos_matches = |value: Option<&serde_json::Value>| {
+        value
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|values| {
+                values
+                    .iter()
+                    .filter_map(serde_json::Value::as_u64)
+                    .eq(expected_eos)
+            })
+    };
+    let layers = config
+        .pointer("/text_config/layer_types")
+        .and_then(serde_json::Value::as_array);
+    let layer_types_match = layers.is_some_and(|layers| {
+        layers.len() == expected_layers
+            && layers
+                .iter()
+                .all(|layer| matches!(layer.as_str(), Some("full_attention" | "sliding_attention")))
+            && layers
+                .iter()
+                .filter(|layer| layer.as_str() == Some("sliding_attention"))
+                .count()
+                == expected_sliding_layers
+    });
+    let config_matches = config.get("model_type").and_then(serde_json::Value::as_str)
+        == Some("gemma4")
+        && config
+            .get("architectures")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|values| values.first())
+            .and_then(serde_json::Value::as_str)
+            == Some("Gemma4ForConditionalGeneration")
+        && config
+            .pointer("/text_config/model_type")
+            .and_then(serde_json::Value::as_str)
+            == Some("gemma4_text")
+        && config
+            .pointer("/quantization_config/bits")
+            .and_then(serde_json::Value::as_u64)
+            == Some(4)
+        && config
+            .pointer("/quantization_config/group_size")
+            .and_then(serde_json::Value::as_u64)
+            == Some(64)
+        && config
+            .pointer("/quantization_config/mode")
+            .and_then(serde_json::Value::as_str)
+            == Some("affine")
+        && config
+            .pointer("/text_config/num_hidden_layers")
+            .and_then(serde_json::Value::as_u64)
+            == Some(expected_layers as u64)
+        && config
+            .pointer("/text_config/hidden_size")
+            .and_then(serde_json::Value::as_u64)
+            == Some(expected_hidden)
+        && config
+            .pointer("/text_config/vocab_size")
+            .and_then(serde_json::Value::as_u64)
+            == Some(262_144)
+        && config
+            .pointer("/text_config/head_dim")
+            .and_then(serde_json::Value::as_u64)
+            == Some(256)
+        && config
+            .pointer("/text_config/num_attention_heads")
+            .and_then(serde_json::Value::as_u64)
+            == Some(expected_heads)
+        && config
+            .pointer("/text_config/num_key_value_heads")
+            .and_then(serde_json::Value::as_u64)
+            == Some(expected_kv_heads)
+        && eos_matches(config.get("eos_token_id"))
+        && layer_types_match;
+    if !config_matches {
+        return Err(format!(
+            "model config is not the pinned {model_id} Gemma 4 MLX 4-bit layout"
+        ));
+    }
+
+    let generation_config: serde_json::Value = serde_json::from_slice(
+        &fs::read(directory.join("generation_config.json")).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+    if !eos_matches(generation_config.get("eos_token_id")) {
+        return Err(format!(
+            "generation config does not match the pinned {model_id} EOS token list"
+        ));
+    }
+
+    let weight_file = expected_files
+        .iter()
+        .filter(|file| file.path.ends_with(".safetensors"))
+        .collect::<Vec<_>>();
+    if weight_file.len() != 1
+        || weight_file[0].path != "model.safetensors"
+        || weight_file[0].bytes != expected_weight_bytes
+        || expected_files
+            .iter()
+            .any(|file| file.path.ends_with(".safetensors.index.json"))
+            != indexed
+    {
+        return Err(format!(
+            "model files do not match the pinned {model_id} single-file layout"
+        ));
+    }
+
+    let header = read_safetensors_header_inventory(&directory.join(weight_file[0].path))?;
+    if header.tensor_count != expected_tensors
+        || header.prefix_counts.len() != 1
+        || header.prefix_counts.get("language_model.model") != Some(&expected_tensors)
+    {
+        return Err(format!(
+            "safetensors header does not match the pinned {model_id} text tensor inventory"
+        ));
+    }
+
+    if indexed {
+        let index: serde_json::Value = serde_json::from_slice(
+            &fs::read(directory.join("model.safetensors.index.json"))
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+        let weight_map_matches = index
+            .get("weight_map")
+            .and_then(serde_json::Value::as_object)
+            .is_some_and(|weights| {
+                weights.len() == expected_tensors
+                    && weights
+                        .keys()
+                        .all(|name| name.starts_with("language_model.model."))
+                    && weights
+                        .values()
+                        .all(|name| name.as_str() == Some("model.safetensors"))
+            });
+        if index
+            .pointer("/metadata/total_size")
+            .and_then(serde_json::Value::as_u64)
+            != Some(2_623_765_062)
+            || !weight_map_matches
+        {
+            return Err(format!(
+                "model index does not match the pinned {model_id} text tensor inventory"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_ministral3_catalog_model_metadata(
+    directory: &Path,
+    expected_files: &[ModelFile],
+) -> Result<(), String> {
+    const EXPECTED_WEIGHT_BYTES: u64 = 2_745_210_934;
+    const EXPECTED_INDEX_BYTES: u64 = 2_745_100_288;
+    const EXPECTED_TENSORS: usize = 830;
+    const EXPECTED_PATHS: &[&str] = &[
+        "chat_template.jinja",
+        "config.json",
+        "generation_config.json",
+        "model.safetensors",
+        "model.safetensors.index.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+    ];
+    let config: serde_json::Value = serde_json::from_slice(
+        &fs::read(directory.join("config.json")).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+    let config_matches = config.get("model_type").and_then(serde_json::Value::as_str)
+        == Some("mistral3")
+        && config
+            .get("architectures")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|values| values.first())
+            .and_then(serde_json::Value::as_str)
+            == Some("Mistral3ForConditionalGeneration")
+        && config
+            .pointer("/quantization_config/bits")
+            .and_then(serde_json::Value::as_u64)
+            == Some(4)
+        && config
+            .pointer("/quantization_config/group_size")
+            .and_then(serde_json::Value::as_u64)
+            == Some(64)
+        && config
+            .pointer("/quantization_config/mode")
+            .and_then(serde_json::Value::as_str)
+            == Some("affine")
+        && config
+            .pointer("/text_config/model_type")
+            .and_then(serde_json::Value::as_str)
+            == Some("ministral3")
+        && config
+            .pointer("/text_config/num_hidden_layers")
+            .and_then(serde_json::Value::as_u64)
+            == Some(26)
+        && config
+            .pointer("/text_config/hidden_size")
+            .and_then(serde_json::Value::as_u64)
+            == Some(3_072)
+        && config
+            .pointer("/text_config/intermediate_size")
+            .and_then(serde_json::Value::as_u64)
+            == Some(9_216)
+        && config
+            .pointer("/text_config/vocab_size")
+            .and_then(serde_json::Value::as_u64)
+            == Some(131_072)
+        && config
+            .pointer("/text_config/head_dim")
+            .and_then(serde_json::Value::as_u64)
+            == Some(128)
+        && config
+            .pointer("/text_config/num_attention_heads")
+            .and_then(serde_json::Value::as_u64)
+            == Some(32)
+        && config
+            .pointer("/text_config/num_key_value_heads")
+            .and_then(serde_json::Value::as_u64)
+            == Some(8)
+        && config
+            .pointer("/text_config/tie_word_embeddings")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        && config.pointer("/text_config/layer_types").is_none();
+    if !config_matches {
+        return Err(
+            "model config is not the pinned Ministral 3 MLX 4-bit multimodal layout".to_owned(),
+        );
+    }
+
+    let generation_config: serde_json::Value = serde_json::from_slice(
+        &fs::read(directory.join("generation_config.json")).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+    if generation_config
+        .get("bos_token_id")
+        .and_then(serde_json::Value::as_u64)
+        != Some(1)
+        || generation_config
+            .get("eos_token_id")
+            .and_then(serde_json::Value::as_u64)
+            != Some(2)
+    {
+        return Err("generation config does not match the pinned Ministral 3 tokens".to_owned());
+    }
+
+    let weight_file = expected_files
+        .iter()
+        .filter(|file| file.path.ends_with(".safetensors"))
+        .collect::<Vec<_>>();
+    if weight_file.len() != 1
+        || weight_file[0].path != "model.safetensors"
+        || weight_file[0].bytes != EXPECTED_WEIGHT_BYTES
+        || expected_files.len() != EXPECTED_PATHS.len()
+        || expected_files
+            .iter()
+            .map(|file| file.path)
+            .ne(EXPECTED_PATHS.iter().copied())
+    {
+        return Err("model files do not match the pinned Ministral 3 layout".to_owned());
+    }
+
+    let header = read_safetensors_header_inventory(&directory.join(weight_file[0].path))?;
+    let expected_prefix_counts = HashMap::from([
+        ("language_model.model".to_owned(), 602),
+        ("vision_tower".to_owned(), 218),
+        ("multi_modal_projector".to_owned(), 10),
+    ]);
+    let expected_dtype_counts = HashMap::from([("BF16".to_owned(), 644), ("U32".to_owned(), 186)]);
+    if header.tensor_count != EXPECTED_TENSORS
+        || header.prefix_counts != expected_prefix_counts
+        || header.dtype_counts != expected_dtype_counts
+    {
+        return Err(
+            "safetensors header does not match the pinned Ministral 3 tensor inventory".to_owned(),
+        );
+    }
+
+    let index: serde_json::Value = serde_json::from_slice(
+        &fs::read(directory.join("model.safetensors.index.json"))
+            .map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+    let weight_map_matches = index
+        .get("weight_map")
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|weights| {
+            let mut prefixes = HashMap::new();
+            for (name, value) in weights {
+                if value.as_str() != Some("model.safetensors") {
+                    return false;
+                }
+                *prefixes
+                    .entry(safetensors_tensor_prefix(name).to_owned())
+                    .or_insert(0) += 1;
+            }
+            weights.len() == EXPECTED_TENSORS && prefixes == expected_prefix_counts
+        });
+    if index
+        .pointer("/metadata/total_size")
+        .and_then(serde_json::Value::as_u64)
+        != Some(EXPECTED_INDEX_BYTES)
+        || !weight_map_matches
+    {
+        return Err(
+            "model index does not match the pinned Ministral 3 tensor inventory".to_owned(),
+        );
+    }
+    Ok(())
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct SafetensorsHeaderInventory {
+    tensor_count: usize,
+    prefix_counts: HashMap<String, usize>,
+    dtype_counts: HashMap<String, usize>,
+}
+
+fn read_safetensors_header_inventory(path: &Path) -> Result<SafetensorsHeaderInventory, String> {
+    const MAX_HEADER_BYTES: u64 = 16 * 1024 * 1024;
+    let mut file = File::open(path).map_err(|error| error.to_string())?;
+    let file_bytes = file.metadata().map_err(|error| error.to_string())?.len();
+    let mut length_bytes = [0_u8; 8];
+    file.read_exact(&mut length_bytes)
+        .map_err(|error| format!("cannot read safetensors header length: {error}"))?;
+    let header_bytes = u64::from_le_bytes(length_bytes);
+    if header_bytes == 0
+        || header_bytes > MAX_HEADER_BYTES
+        || header_bytes > file_bytes.saturating_sub(8)
+    {
+        return Err("safetensors header length is invalid".to_owned());
+    }
+    let mut header = vec![0_u8; header_bytes as usize];
+    file.read_exact(&mut header)
+        .map_err(|error| format!("cannot read safetensors header: {error}"))?;
+    let value: serde_json::Value = serde_json::from_slice(&header)
+        .map_err(|error| format!("safetensors header is not valid JSON: {error}"))?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| "safetensors header must be an object".to_owned())?;
+    let mut inventory = SafetensorsHeaderInventory::default();
+    for (name, tensor) in object
+        .iter()
+        .filter(|(name, _)| name.as_str() != "__metadata__")
+    {
+        let tensor = tensor
+            .as_object()
+            .ok_or_else(|| "safetensors tensor header must be an object".to_owned())?;
+        let dtype = tensor
+            .get("dtype")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "safetensors tensor header must include a dtype".to_owned())?;
+        let data_offsets = tensor
+            .get("data_offsets")
+            .and_then(serde_json::Value::as_array)
+            .filter(|offsets| offsets.len() == 2)
+            .and_then(|offsets| Some((offsets[0].as_u64()?, offsets[1].as_u64()?)))
+            .ok_or_else(|| "safetensors tensor header must include data offsets".to_owned())?;
+        if data_offsets.0 > data_offsets.1 {
+            return Err("safetensors tensor offsets are invalid".to_owned());
+        }
+        let prefix = safetensors_tensor_prefix(name);
+        inventory.tensor_count += 1;
+        *inventory
+            .prefix_counts
+            .entry(prefix.to_owned())
+            .or_default() += 1;
+        *inventory.dtype_counts.entry(dtype.to_owned()).or_default() += 1;
+    }
+    Ok(inventory)
+}
+
+fn safetensors_tensor_prefix(name: &str) -> &str {
+    if name.starts_with("language_model.model.") {
+        "language_model.model"
+    } else {
+        name.split('.').next().unwrap_or(name)
+    }
+}
+
+fn validate_catalog_directory_inventory(
+    directory: &Path,
+    expected_files: &[ModelFile],
+    allow_manifest: bool,
+) -> Result<(), String> {
+    for entry in fs::read_dir(directory).map_err(|error| error.to_string())? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let name = entry.file_name();
+        let path = entry.path();
+        let is_manifest = allow_manifest && name == INSTALLED_MANIFEST;
+        if !is_manifest
+            && !expected_files
+                .iter()
+                .any(|file| Path::new(file.path).file_name() == Some(name.as_os_str()))
+        {
+            return Err("installed local model contains an unlisted file".to_owned());
+        }
+        let metadata = fs::symlink_metadata(&path).map_err(|error| error.to_string())?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err("installed local model contains a non-file entry".to_owned());
+        }
+    }
+    Ok(())
+}
+
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let parent = path
         .parent()
@@ -2035,13 +3534,21 @@ unsafe extern "C" {
     ) -> i32;
 }
 
-async fn download_model(
+async fn download_model_for(
     models_root: &Path,
+    model: &'static MlxCleanupModel,
     cancel: &CancellationToken,
     bytes_done: &AtomicU64,
 ) -> Result<Vec<VerifiedFile>, String> {
     ensure_model_parent(models_root)?;
-    let staging = staging_dir(models_root);
+    let binding = DurableProofBinding {
+        model_id: model.id,
+        repository: model.repository,
+        revision: model.revision,
+        manifest_sha256: model.manifest_sha256,
+        files: model.files,
+    };
+    let staging = staging_dir_for(models_root, model.id);
     ensure_private_dir(&staging)?;
     let client = reqwest::Client::builder()
         .https_only(true)
@@ -2052,16 +3559,32 @@ async fn download_model(
 
     let files = download_files(
         &client,
-        MODEL_FILES,
+        model.files,
         &staging,
-        |path| format!("https://huggingface.co/{REPOSITORY}/resolve/{REVISION}/{path}"),
+        |path| {
+            format!(
+                "https://huggingface.co/{}/resolve/{}/{}",
+                binding.repository, binding.revision, path
+            )
+        },
         cancel,
         bytes_done,
     )
     .await?;
-    let files = write_installed_manifest(&staging, files)?;
+    let files = if model.id == MODEL_ID {
+        write_installed_manifest(&staging, files)?
+    } else {
+        write_installed_manifest_for(&staging, files, binding)?
+    };
     ensure_operation_not_cancelled(cancel, "download")?;
-    commit_directory(&staging, &managed_dir(models_root))?;
+    let managed = managed_dir_for(models_root, model.id);
+    commit_directory(&staging, &managed)?;
+    // The download path has already SHA-256-verified each pinned asset and
+    // rechecked its identity while writing the installed manifest. Publish
+    // the durable identity proof now so the freshly installed model remains
+    // selectable after an app restart. A failed advisory write remains a
+    // proof miss; runtime resolution still performs full verification.
+    let _ = write_durable_proof_record_for(models_root, &managed, &files, binding);
     Ok(files)
 }
 
@@ -2225,10 +3748,6 @@ fn ensure_model_parent(models_root: &Path) -> Result<(), String> {
     ensure_private_dir(&models_root.join("cleanup"))
 }
 
-fn validate_model_parent(models_root: &Path) -> Result<(), String> {
-    validate_model_parent_from_managed(&managed_dir(models_root))
-}
-
 fn validate_model_parent_from_managed(directory: &Path) -> Result<(), String> {
     let parent = directory
         .parent()
@@ -2291,6 +3810,11 @@ pub fn shared_manager() -> Manager {
     MANAGER.get_or_init(Manager::new).clone()
 }
 
+pub fn shared_catalog_manager() -> MlxCatalogManager {
+    static MANAGER: std::sync::OnceLock<MlxCatalogManager> = std::sync::OnceLock::new();
+    MANAGER.get_or_init(MlxCatalogManager::new).clone()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2317,6 +3841,303 @@ mod tests {
         ))
     }
 
+    fn write_gemma_metadata_fixture(directory: &Path, model_id: &str, non_text_tensor: bool) {
+        let (layers, hidden, kv_heads, sliding_layers, tensor_count, indexed) = match model_id {
+            GEMMA_4_E2B_IT_MLX_ID => (35, 1_536, 1, 28, 1_094, true),
+            GEMMA_4_E4B_IT_MLX_ID => (42, 2_560, 2, 35, 1_355, false),
+            _ => panic!("unexpected Gemma fixture ID: {model_id}"),
+        };
+        let layer_types = (0..layers)
+            .map(|index| {
+                if index < layers - sliding_layers {
+                    "full_attention"
+                } else {
+                    "sliding_attention"
+                }
+            })
+            .collect::<Vec<_>>();
+        let config = serde_json::json!({
+            "architectures": ["Gemma4ForConditionalGeneration"],
+            "model_type": "gemma4",
+            "eos_token_id": [1, 106, 50],
+            "quantization_config": {"group_size": 64, "bits": 4, "mode": "affine"},
+            "text_config": {
+                "model_type": "gemma4_text",
+                "num_hidden_layers": layers,
+                "hidden_size": hidden,
+                "vocab_size": 262144,
+                "head_dim": 256,
+                "num_attention_heads": 8,
+                "num_key_value_heads": kv_heads,
+                "layer_types": layer_types
+            }
+        });
+        fs::write(
+            directory.join("config.json"),
+            serde_json::to_vec(&config).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            directory.join("generation_config.json"),
+            br#"{"eos_token_id":[1,106,50]}"#,
+        )
+        .unwrap();
+
+        let mut header = serde_json::Map::new();
+        for index in 0..tensor_count {
+            let name = if non_text_tensor && index + 1 == tensor_count {
+                "vision_model.encoder.layers.0.weight".to_owned()
+            } else {
+                format!("language_model.model.tensor_{index}")
+            };
+            header.insert(
+                name,
+                serde_json::json!({
+                    "dtype": "U8",
+                    "shape": [1],
+                    "data_offsets": [0, 1]
+                }),
+            );
+        }
+        let header_bytes = serde_json::to_vec(&serde_json::Value::Object(header)).unwrap();
+        let mut safetensors = File::create(directory.join("model.safetensors")).unwrap();
+        safetensors
+            .write_all(&(header_bytes.len() as u64).to_le_bytes())
+            .unwrap();
+        safetensors.write_all(&header_bytes).unwrap();
+
+        if indexed {
+            let mut weight_map = serde_json::Map::new();
+            for index in 0..tensor_count {
+                weight_map.insert(
+                    format!("language_model.model.tensor_{index}"),
+                    serde_json::Value::String("model.safetensors".to_owned()),
+                );
+            }
+            let index = serde_json::json!({
+                "metadata": {"total_size": 2_623_765_062_u64},
+                "weight_map": weight_map
+            });
+            fs::write(
+                directory.join("model.safetensors.index.json"),
+                serde_json::to_vec(&index).unwrap(),
+            )
+            .unwrap();
+        }
+    }
+
+    fn write_ministral3_metadata_fixture(directory: &Path, non_text_tensor: bool) {
+        let config = serde_json::json!({
+            "architectures": ["Mistral3ForConditionalGeneration"],
+            "model_type": "mistral3",
+            "quantization_config": {"bits": 4, "group_size": 64, "mode": "affine"},
+            "text_config": {
+                "model_type": "ministral3",
+                "num_hidden_layers": 26,
+                "hidden_size": 3072,
+                "intermediate_size": 9216,
+                "vocab_size": 131072,
+                "head_dim": 128,
+                "num_attention_heads": 32,
+                "num_key_value_heads": 8,
+                "tie_word_embeddings": true
+            }
+        });
+        fs::write(
+            directory.join("config.json"),
+            serde_json::to_vec(&config).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            directory.join("generation_config.json"),
+            br#"{"bos_token_id":1,"eos_token_id":2}"#,
+        )
+        .unwrap();
+
+        let mut tensors = Vec::with_capacity(830);
+        for index in 0..602 {
+            tensors.push((format!("language_model.model.tensor_{index}"), "BF16"));
+        }
+        for index in 0..218 {
+            let name = if non_text_tensor && index == 0 {
+                "audio_tower.tensor_0".to_owned()
+            } else {
+                format!("vision_tower.tensor_{index}")
+            };
+            let dtype = if index < 42 { "BF16" } else { "U32" };
+            tensors.push((name, dtype));
+        }
+        for index in 0..10 {
+            tensors.push((format!("multi_modal_projector.tensor_{index}"), "U32"));
+        }
+
+        let mut header = serde_json::Map::new();
+        let mut weight_map = serde_json::Map::new();
+        for (name, dtype) in tensors {
+            header.insert(
+                name.clone(),
+                serde_json::json!({
+                    "dtype": dtype,
+                    "shape": [0],
+                    "data_offsets": [0, 0]
+                }),
+            );
+            weight_map.insert(
+                name,
+                serde_json::Value::String("model.safetensors".to_owned()),
+            );
+        }
+        let header_bytes = serde_json::to_vec(&serde_json::Value::Object(header)).unwrap();
+        let mut safetensors = File::create(directory.join("model.safetensors")).unwrap();
+        safetensors
+            .write_all(&(header_bytes.len() as u64).to_le_bytes())
+            .unwrap();
+        safetensors.write_all(&header_bytes).unwrap();
+        let index = serde_json::json!({
+            "metadata": {"total_size": 2_745_100_288_u64},
+            "weight_map": weight_map
+        });
+        fs::write(
+            directory.join("model.safetensors.index.json"),
+            serde_json::to_vec(&index).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn write_s1_mini_metadata_fixture(directory: &Path, bad_tensor_prefix: bool) {
+        let config = serde_json::json!({
+            "architectures": ["Qwen3ForCausalLM"],
+            "model_type": "qwen3",
+            "quantization_config": {"bits": 4, "group_size": 64, "mode": "affine"},
+            "num_hidden_layers": 28,
+            "hidden_size": 1024,
+            "intermediate_size": 3072,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 8,
+            "head_dim": 128,
+            "vocab_size": 151936,
+            "tie_word_embeddings": true
+        });
+        fs::write(
+            directory.join("config.json"),
+            serde_json::to_vec(&config).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            directory.join("generation_config.json"),
+            br#"{"bos_token_id":151643,"eos_token_id":[151645,151643]}"#,
+        )
+        .unwrap();
+
+        let mut header = serde_json::Map::new();
+        let mut weight_map = serde_json::Map::new();
+        for index in 0..704 {
+            let name = if bad_tensor_prefix && index == 703 {
+                "vision_model.encoder.weight".to_owned()
+            } else {
+                format!("model.tensor_{index}")
+            };
+            let dtype = if index < 507 { "BF16" } else { "U32" };
+            header.insert(
+                name.clone(),
+                serde_json::json!({
+                    "dtype": dtype,
+                    "shape": [0],
+                    "data_offsets": [0, 0]
+                }),
+            );
+            weight_map.insert(
+                name,
+                serde_json::Value::String("model.safetensors".to_owned()),
+            );
+        }
+        let header_bytes = serde_json::to_vec(&serde_json::Value::Object(header)).unwrap();
+        let mut safetensors = File::create(directory.join("model.safetensors")).unwrap();
+        safetensors
+            .write_all(&(header_bytes.len() as u64).to_le_bytes())
+            .unwrap();
+        safetensors.write_all(&header_bytes).unwrap();
+        let index = serde_json::json!({
+            "metadata": {"total_size": 335_372_288_u64},
+            "weight_map": weight_map
+        });
+        fs::write(
+            directory.join("model.safetensors.index.json"),
+            serde_json::to_vec(&index).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn gemma_metadata_verifier_accepts_pinned_text_layouts_and_rejects_bad_metadata() {
+        for model_id in [GEMMA_4_E2B_IT_MLX_ID, GEMMA_4_E4B_IT_MLX_ID] {
+            let root = unused_root();
+            fs::create_dir_all(&root).unwrap();
+            let model = mlx_model(model_id).expect("Gemma candidate is registered");
+            write_gemma_metadata_fixture(&root, model_id, false);
+            validate_catalog_model_metadata(&root, model_id, model.files)
+                .expect("pinned Gemma metadata and text tensor inventory validate");
+
+            if model_id == GEMMA_4_E2B_IT_MLX_ID {
+                fs::write(
+                    root.join("generation_config.json"),
+                    br#"{"eos_token_id":[1,106]}"#,
+                )
+                .unwrap();
+                assert!(
+                    validate_catalog_model_metadata(&root, model_id, model.files)
+                        .expect_err("truncated EOS metadata is rejected")
+                        .contains("EOS token list")
+                );
+            } else {
+                write_gemma_metadata_fixture(&root, model_id, true);
+                assert!(
+                    validate_catalog_model_metadata(&root, model_id, model.files)
+                        .expect_err("a vision tensor in the text-only artifact is rejected")
+                        .contains("text tensor inventory")
+                );
+            }
+            remove_path(&root).unwrap();
+        }
+    }
+
+    #[test]
+    fn ministral3_metadata_verifier_matches_multimodal_header_and_index() {
+        let root = unused_root();
+        fs::create_dir_all(&root).unwrap();
+        let model = mlx_model(MINISTRAL_3_3B_INSTRUCT_MLX_ID)
+            .expect("verified Ministral 3 candidate is registered");
+        write_ministral3_metadata_fixture(&root, false);
+        validate_catalog_model_metadata(&root, model.id, model.files)
+            .expect("pinned Ministral 3 config, index, and header validate");
+
+        write_ministral3_metadata_fixture(&root, true);
+        assert!(
+            validate_catalog_model_metadata(&root, model.id, model.files)
+                .expect_err("a tensor outside the pinned model roots is rejected")
+                .contains("tensor inventory")
+        );
+        remove_path(&root).unwrap();
+    }
+
+    #[test]
+    fn s1_mini_metadata_verifier_matches_pinned_qwen3_layout() {
+        let root = unused_root();
+        fs::create_dir_all(&root).unwrap();
+        let model = mlx_model(S1_MINI_MLX_ID).expect("test-only S1 candidate is registered");
+        write_s1_mini_metadata_fixture(&root, false);
+        validate_catalog_model_metadata(&root, model.id, model.files)
+            .expect("pinned S1-mini config, index, and header validate");
+
+        write_s1_mini_metadata_fixture(&root, true);
+        assert!(
+            validate_catalog_model_metadata(&root, model.id, model.files)
+                .expect_err("a non-model tensor prefix is rejected")
+                .contains("tensor inventory")
+        );
+        remove_path(&root).unwrap();
+    }
+
     #[test]
     fn trusted_cache_rejects_unlisted_safetensors_without_rehashing_before_rejection() {
         let root = unused_root();
@@ -2326,7 +4147,7 @@ mod tests {
             .expect("seed a real tiny installed inventory");
 
         let (_, first) = manager
-            .resolve_ready_inner_with_binding(&root, None, binding)
+            .resolve_ready_inner_with_binding(&root, None, binding, None)
             .expect("cold verification should establish this manager's trusted cache");
         assert_eq!(first.cache, "miss");
         assert_eq!(first.hashed_files, TINY_RUNTIME_FILES.len());
@@ -2334,7 +4155,7 @@ mod tests {
 
         remove_path(&durable_proof_path(&root)).expect("remove only this fixture's durable proof");
         let (_, second) = manager
-            .resolve_ready_inner_with_binding(&root, None, binding)
+            .resolve_ready_inner_with_binding(&root, None, binding, None)
             .expect("same-manager trusted hit should work without durable proof");
         assert_eq!(second.cache, "hit");
         assert_eq!(second.cache_reason, "trusted_file_identity_match");
@@ -2354,7 +4175,7 @@ mod tests {
             read_durable_proof(&root).proof.is_none(),
             "third resolve must exercise the trusted cache with no durable proof"
         );
-        let third = manager.resolve_ready_inner_with_binding(&root, None, binding);
+        let third = manager.resolve_ready_inner_with_binding(&root, None, binding, None);
         assert!(
             third
                 .as_ref()
@@ -2612,7 +4433,7 @@ mod tests {
         // A fresh manager intentionally has no in-memory trusted inventory.
         let manager = Manager::new();
         assert!(manager.lock().trusted.is_none());
-        let proof = read_durable_proof(root);
+        let proof = read_durable_proof_for(root, tiny_proof_binding());
         verified_files_from_durable_proof(
             proof.proof.as_ref()?,
             root,
@@ -2717,7 +4538,10 @@ mod tests {
         let other_root = root.join("different-root");
         fs::create_dir_all(&other_root).unwrap();
         assert!(verified_files_from_durable_proof(
-            read_durable_proof(&root).proof.as_ref().unwrap(),
+            read_durable_proof_for(&root, tiny_proof_binding())
+                .proof
+                .as_ref()
+                .unwrap(),
             &other_root,
             &directory,
             tiny_proof_binding(),
@@ -2731,14 +4555,14 @@ mod tests {
         fs::remove_dir_all(&root).unwrap();
 
         let (root, directory, _) = seed_tiny_durable_proof();
-        let proof_path = durable_proof_path(&root);
+        let proof_path = durable_proof_path_for(&root, tiny_proof_binding().model_id);
         let mut proof: DurableVerificationProof =
             serde_json::from_slice(&fs::read(&proof_path).unwrap()).unwrap();
         proof.schema_version += 1;
         fs::write(&proof_path, serde_json::to_vec(&proof).unwrap()).unwrap();
         fs::set_permissions(&proof_path, fs::Permissions::from_mode(0o600)).unwrap();
         assert_eq!(
-            read_durable_proof(&root).reason,
+            read_durable_proof_for(&root, tiny_proof_binding()).reason,
             "durable_proof_schema_changed"
         );
         assert!(tiny_durable_proof_hit(&root, &directory).is_none());

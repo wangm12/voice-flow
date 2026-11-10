@@ -17,7 +17,10 @@ pub(crate) const QWEN_CHAT_BASE: &str = "https://dashscope.aliyuncs.com/compatib
 
 pub(crate) const QWEN_ASR_BASE: &str = "https://dashscope.aliyuncs.com/compatible-mode/v1";
 
-pub(crate) const REQUEST_BUILDER_REVISION: &str = "live-cleanup-request-v2";
+/// Bump when request building or the `lib.rs` preparation, routing, policy
+/// translation or finalizer (or the grouped live-test finalizer) changes:
+/// `cleanup_code_fingerprint` hashes only whole dedicated modules.
+pub(crate) const REQUEST_BUILDER_REVISION: &str = "live-cleanup-request-v3";
 
 pub(crate) const RATE_LIMIT_RETRIES_PER_CASE: usize = 1;
 
@@ -631,7 +634,6 @@ pub(crate) fn cleanup_candidate_request_facts(
         &model,
         prepared.intent(),
         &llm::CleanupPromptContext {
-            dictionary: &[],
             context: None,
             policy: Some(&policy),
             profile: Some(&prepared.snapshot.profile),
@@ -858,10 +860,8 @@ pub(crate) async fn run_cleanup_candidate(
                                 &model,
                                 &prepared.intent().content,
                                 &key,
-                                &[],
                                 None,
                                 Some(&policy),
-                                Some("auto"),
                                 Some(&prepared.snapshot.profile),
                                 Some(prepared.intent()),
                                 prepared.pairs_hint(),
@@ -879,7 +879,6 @@ pub(crate) async fn run_cleanup_candidate(
                                 &mut capability,
                                 prepared.intent(),
                                 &llm::CleanupPromptContext {
-                                    dictionary: &[],
                                     context: None,
                                     policy: Some(&policy),
                                     profile: Some(&prepared.snapshot.profile),
@@ -1343,52 +1342,10 @@ pub(crate) fn stable_fingerprint(parts: &[&[u8]]) -> String {
 }
 
 pub(crate) fn cleanup_code_fingerprint() -> String {
-    let lib = include_str!("../lib.rs");
-    let corpus_eval = include_str!("../cleanup_corpus.rs");
     let sources: &[(&[u8], &[u8])] = &[
         (
             b"request_builder_revision",
             REQUEST_BUILDER_REVISION.as_bytes(),
-        ),
-        (
-            b"finalizer_context_and_guards",
-            source_between(
-                lib,
-                "pub(crate) struct FinalizationContext<'a> {",
-                "fn scene_allows_automatic_lexicon(",
-            )
-            .as_bytes(),
-        ),
-        (
-            b"scene_cleanup_policy_translation",
-            source_between(
-                lib,
-                "fn scene_allows_automatic_lexicon(",
-                "fn delivery_fallback_reason(",
-            )
-            .as_bytes(),
-        ),
-        (
-            b"preparation_functions",
-            source_between(
-                lib,
-                "pub(crate) fn load_learn_pairs(",
-                "fn asr_prompt_for_snapshot(",
-            )
-            .as_bytes(),
-        ),
-        (
-            b"cleanup_routing",
-            source_between(lib, "fn cleanup_route_for(", "fn abort_processing_manager(").as_bytes(),
-        ),
-        (
-            b"grouped_finalizer",
-            source_between(
-                corpus_eval,
-                "pub(super) fn finalize(",
-                "fn context_snapshot(",
-            )
-            .as_bytes(),
         ),
         (
             b"evaluation/legacy.rs",
@@ -1441,17 +1398,6 @@ pub(crate) fn cleanup_code_fingerprint() -> String {
     stable_fingerprint(&parts)
 }
 
-pub(crate) fn source_between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
-    let start_index = source
-        .find(start)
-        .unwrap_or_else(|| panic!("missing cleanup fingerprint section {start}"));
-    let content = &source[start_index..];
-    let end_index = content
-        .find(end)
-        .unwrap_or_else(|| panic!("missing cleanup fingerprint boundary {end}"));
-    &content[..end_index]
-}
-
 pub(crate) fn cleanup_request_fingerprint(
     candidate: &CleanupCandidate,
     case: &EvalCase,
@@ -1479,7 +1425,8 @@ pub(crate) fn cleanup_request_fingerprint(
         profile: &prepared.snapshot.profile,
         policy: context.policy,
         effort: context.effort.map(crate::llm::CleanupEffort::as_label),
-        fixed_options: "dictionary=[];context=None;language=auto;visible_context=None;temperature=0;max_completion_tokens=4096;stream=true",
+        fixed_options:
+            "context=None;visible_context=None;temperature=0;max_completion_tokens=4096;stream=true",
     };
     let bytes = serde_json::to_vec(&identity).expect("serialize cleanup request identity");
     stable_fingerprint(&[&bytes])
@@ -2041,7 +1988,6 @@ pub(crate) fn classify_asr_error(error: &AsrError) -> (&'static str, Option<u16>
         AsrError::RetryableServer { message, .. } => {
             ("server_error", parse_http_status(message), true)
         }
-        AsrError::Server(message) => ("server_error", parse_http_status(message), true),
         AsrError::EmptyResult => ("no_speech", None, false),
         AsrError::ContextAuthorizationChanged => ("context_authorization_changed", None, true),
         AsrError::OnDeviceModelMissing(_) => ("on_device_model_missing", None, true),
@@ -2270,21 +2216,23 @@ mod tests {
 
     #[test]
     fn native_local_failure_keeps_typed_reason_without_inventing_http_status() {
-        let input_error =
-            crate::llm::map_lmstudio_error(crate::lmstudio_local::LocalError::InputTooLarge {
-                input_bytes: 4097,
-                max_bytes: 4096,
-            });
+        use crate::mlx_cleanup_runtime::RuntimeError;
+
+        let input_error = crate::llm::map_on_device_mlx_error(RuntimeError::InputTooLarge {
+            prompt_tokens: 4097,
+            requested_output_tokens: 1,
+            requested_total_tokens: Some(4098),
+            max_total_tokens: 4096,
+        });
         assert_eq!(
             classify_llm_error(&input_error),
             ("local_native_input_too_large", None, false, true)
         );
 
-        let unreachable =
-            crate::llm::map_lmstudio_error(crate::lmstudio_local::LocalError::Unreachable);
+        let missing = crate::llm::map_on_device_mlx_error(RuntimeError::ModelUnavailable);
         assert_eq!(
-            classify_llm_error(&unreachable),
-            ("local_native_unreachable", None, false, true)
+            classify_llm_error(&missing),
+            ("local_native_model_missing", None, false, true)
         );
     }
 

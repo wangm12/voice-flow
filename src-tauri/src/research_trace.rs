@@ -1,8 +1,8 @@
 //! Explicit fixture-only instrumentation. Normal launches have no lease or sink.
 //! Events are facts supplied by their existing production owners, never probes.
-#[cfg(any(test, all(feature = "research-harness", target_os = "macos")))]
+//! Compiled only for tests and macOS `research-harness` builds; every other
+//! build uses the inert `research_trace_inert.rs` with the same signatures.
 use crate::dictation;
-#[cfg(any(test, all(feature = "research-harness", target_os = "macos")))]
 use crate::learning_research::LearningStage;
 use crate::{lock_recover, AppState};
 use serde::{Deserialize, Serialize};
@@ -10,16 +10,14 @@ use std::cell::RefCell;
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
-#[cfg(any(test, all(feature = "research-harness", target_os = "macos")))]
 use std::time::Duration;
 use std::time::Instant;
 use tauri::Manager;
 
-#[cfg(any(test, all(feature = "research-harness", target_os = "macos")))]
+pub(crate) const ACTIVE: bool = true;
 const CAPACITY: usize = 256;
 #[cfg(all(feature = "research-harness", target_os = "macos"))]
 const MAX_COMMAND_BYTES: usize = 8192;
-#[cfg(any(test, all(feature = "research-harness", target_os = "macos")))]
 const TRANSPORT_SECONDS: u64 = 1200;
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -44,7 +42,6 @@ pub(crate) struct ResearchRunLease {
     pub learning: Option<crate::learning_research::LearningConsent>,
 }
 impl ResearchRunLease {
-    #[cfg(any(test, all(feature = "research-harness", target_os = "macos")))]
     fn validate(&self) -> Result<(), &'static str> {
         for id in [&self.run_id, &self.case_id, &self.job_id] {
             crate::onboarding::validate_id(id).map_err(|_| "invalid_uuid")?;
@@ -65,7 +62,6 @@ impl ResearchRunLease {
 #[derive(Serialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub(crate) enum Fact {
-    #[cfg(any(test, all(feature = "research-harness", target_os = "macos")))]
     SessionStarted {
         trigger_source: &'static str,
     },
@@ -152,7 +148,6 @@ pub(crate) struct FinalClipboardAssociation {
     pub source: &'static str,
 }
 #[derive(Serialize)]
-#[cfg(any(test, all(feature = "research-harness", target_os = "macos")))]
 struct FinalClipboardBoundary {
     artifact_type: &'static str,
     schema_version: u32,
@@ -175,7 +170,6 @@ struct FinalClipboardBoundary {
 struct Inner {
     lease: ResearchRunLease,
     expires: Instant,
-    #[cfg(any(test, all(feature = "research-harness", target_os = "macos")))]
     expires_monotonic_ns: u64,
     config_generation: u64,
     recording_generation: AtomicU64,
@@ -202,7 +196,6 @@ struct Inner {
     outcome: Mutex<&'static str>,
     audio_session: Mutex<Option<String>>,
     tx: mpsc::SyncSender<Event>,
-    #[cfg(any(test, all(feature = "research-harness", target_os = "macos")))]
     rx: Mutex<mpsc::Receiver<Event>>,
 }
 #[derive(Clone)]
@@ -215,12 +208,10 @@ pub(crate) struct Owner {
 }
 
 impl Trace {
-    #[cfg(any(test, all(feature = "research-harness", target_os = "macos")))]
     fn new(lease: ResearchRunLease, config_generation: u64) -> Self {
         let (tx, rx) = mpsc::sync_channel(CAPACITY);
         Self(Arc::new(Inner {
             expires: Instant::now() + Duration::from_millis(lease.ttl_ms),
-            #[cfg(any(test, all(feature = "research-harness", target_os = "macos")))]
             expires_monotonic_ns: monotonic_ns().saturating_add(lease.ttl_ms * 1_000_000),
             lease,
             config_generation,
@@ -248,7 +239,6 @@ impl Trace {
             outcome: Mutex::new("failed"),
             audio_session: Mutex::new(None),
             tx,
-            #[cfg(any(test, all(feature = "research-harness", target_os = "macos")))]
             rx: Mutex::new(rx),
         }))
     }
@@ -282,7 +272,6 @@ impl Trace {
             self.0.dropped.fetch_add(1, Ordering::Relaxed);
         }
     }
-    #[cfg(any(test, all(feature = "research-harness", target_os = "macos")))]
     pub(crate) fn bind(&self, recording_generation: u64) {
         self.0
             .recording_generation
@@ -431,7 +420,6 @@ impl Trace {
         // A later temporary write clears this association rather than rebinding.
         *lock_recover(&self.0.final_clipboard_association) = Some(association);
     }
-    #[cfg(any(test, all(feature = "research-harness", target_os = "macos")))]
     fn final_clipboard_boundary(&self, observed: u64) -> Option<FinalClipboardBoundary> {
         // Reuse the actual lifecycle owner gate. No timer is terminal evidence;
         // expiry only denies a stale boundary. No clipboard query happens here.
@@ -469,14 +457,12 @@ impl Trace {
             provider_termination: "unknown",
         })
     }
-    #[cfg(any(test, all(feature = "research-harness", target_os = "macos")))]
     fn locally_releasable(&self) -> bool {
         self.0.terminal_emitted.load(Ordering::Acquire)
             && self.0.writers.load(Ordering::Acquire) == 0
             && self.0.learning_tasks.load(Ordering::Acquire) == 0
             && (lock_recover(&self.0.audio_session).is_none() || self.capture_is_closed())
     }
-    #[cfg(any(test, all(feature = "research-harness", target_os = "macos")))]
     fn final_clipboard_read_allowed(&self) -> bool {
         self.0.terminal_emitted.load(Ordering::Acquire)
             && self.0.capture_closed.load(Ordering::Acquire)

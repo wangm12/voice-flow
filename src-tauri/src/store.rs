@@ -1,9 +1,5 @@
 #[cfg(test)]
 use crate::queue::QuotaView;
-use chacha20poly1305::{
-    aead::{Aead, AeadCore, KeyInit, OsRng, Payload},
-    XChaCha20Poly1305, XNonce,
-};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
@@ -17,7 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-pub const SETTINGS_SCHEMA_VERSION: u32 = 26;
+pub const SETTINGS_SCHEMA_VERSION: u32 = 27;
 const HISTORY_SCHEMA_VERSION: i32 = 19;
 // Migration rollback copies contain historical text, so they have a finite
 // lifetime even when the user elects to keep the live history forever.
@@ -1538,6 +1534,27 @@ fn current_settings_schema_version() -> u32 {
     SETTINGS_SCHEMA_VERSION
 }
 
+/// Wire value and model ID of the cleanup route retired in schema 27.
+const RETIRED_LMSTUDIO_CLEANUP_PROVIDER: &str = "lmstudio";
+const RETIRED_LMSTUDIO_CLEANUP_MODEL: &str = "qwen/qwen3.8-27b@6bit";
+
+/// A saved LM Studio selection reads as the bundled MLX route, which runs the
+/// same Qwen 3.8 27B MLX 6-bit model locally; `normalize` repairs its model ID.
+fn deserialize_cleanup_provider<'de, D>(
+    deserializer: D,
+) -> Result<crate::engine::EngineProvider, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    if value == RETIRED_LMSTUDIO_CLEANUP_PROVIDER {
+        return Ok(crate::engine::EngineProvider::OnDeviceMlx);
+    }
+    crate::engine::EngineProvider::deserialize(
+        serde::de::value::StringDeserializer::<D::Error>::new(value),
+    )
+}
+
 fn default_writing_modes() -> Vec<crate::context::WritingMode> {
     crate::context::builtin_writing_modes()
 }
@@ -1703,7 +1720,7 @@ pub struct Settings {
     pub vision_model: String,
     #[serde(default = "default_cleanup_model")]
     pub cleanup_model: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_cleanup_provider")]
     pub cleanup_provider: crate::engine::EngineProvider,
     #[serde(default)]
     pub cleanup_base_url: String,
@@ -2162,7 +2179,7 @@ impl Settings {
             // Before schema 7, a new install was silently stored as Chinese.
             // Preserve an explicit choice for onboarded users, but let an
             // unfinished setup follow the operating system language.
-            if !self.onboarded && self.ui_language == "zh" {
+            if self.schema_version < 7 && !self.onboarded && self.ui_language == "zh" {
                 self.ui_language = default_ui_language();
             }
             if self.schema_version < 9 && self.selected_action_hotkey.trim().is_empty() {
@@ -2225,6 +2242,14 @@ impl Settings {
                 for mapping in &mut self.context_mappings {
                     mapping.source_permissions.local_ocr = true;
                 }
+            }
+            if self.schema_version < 27
+                && self.cleanup_provider == crate::engine::EngineProvider::OnDeviceMlx
+                && self.cleanup_model.trim() == RETIRED_LMSTUDIO_CLEANUP_MODEL
+            {
+                // Retired LM Studio selections, and older MLX selections that
+                // stored the LM Studio variant, keep the same model locally.
+                self.cleanup_model = crate::modelstore::MODEL_ID.to_owned();
             }
             self.schema_version = SETTINGS_SCHEMA_VERSION;
         }
@@ -2435,10 +2460,7 @@ impl Settings {
             if !crate::llm::is_supported_model(&self.cleanup_model) {
                 self.cleanup_model = default_cleanup_model();
             }
-        } else if (self.cleanup_provider == crate::engine::EngineProvider::OnDeviceMlx
-            && self.cleanup_model.trim() == crate::lmstudio_local::MODEL_VARIANT)
-            || self.cleanup_model.trim().is_empty()
-        {
+        } else if self.cleanup_model.trim().is_empty() {
             self.cleanup_model = self.cleanup_provider.default_llm_model().to_owned();
         }
         if self.ollama_base_url.trim().is_empty() {
@@ -2615,6 +2637,16 @@ impl Settings {
         if self.cleanup_provider.is_groq() {
             if !crate::llm::is_supported_model(&self.cleanup_model) {
                 anyhow::bail!("unsupported cleanup model");
+            }
+        } else if self.cleanup_provider == crate::engine::EngineProvider::OnDeviceMlx {
+            if self.cleanup_model != crate::modelstore::MODEL_ID
+                && !crate::modelstore::is_supported_mlx_model(&self.cleanup_model)
+            {
+                anyhow::bail!("unsupported local MLX cleanup model");
+            }
+        } else if self.cleanup_provider == crate::engine::EngineProvider::OnDeviceLlamaCpp {
+            if !crate::gguf_cleanup_store::is_supported_model(&self.cleanup_model) {
+                anyhow::bail!("unsupported local cleanup model");
             }
         } else if self.cleanup_model.trim().is_empty() {
             anyhow::bail!("自定义整理需要填写模型名。");
@@ -2862,8 +2894,11 @@ impl Settings {
         } else {
             self.provider_secret(provider)
         };
-        let empty_ok = provider == crate::engine::EngineProvider::OnDeviceMlx
-            || provider.allows_empty_key() && crate::providers::is_loopback_url(&url);
+        let empty_ok = matches!(
+            provider,
+            crate::engine::EngineProvider::OnDeviceMlx
+                | crate::engine::EngineProvider::OnDeviceLlamaCpp
+        ) || provider.allows_empty_key() && crate::providers::is_loopback_url(&url);
         if key.is_empty() && !empty_ok {
             if !check_readiness || !self.onboarded {
                 return Ok(());
@@ -3230,11 +3265,6 @@ impl Settings {
     pub fn cleanup_endpoint(&self) -> String {
         if self.cleanup_provider == crate::engine::EngineProvider::Ollama {
             return crate::ollama_local::chat_endpoint(&self.ollama_base_url);
-        }
-        if self.cleanup_provider == crate::engine::EngineProvider::LmStudio {
-            return crate::lmstudio_local::chat_endpoint(
-                crate::engine::EngineProvider::LmStudio.default_base_url(),
-            );
         }
         crate::providers::resolve_llm_endpoint(
             self.cleanup_provider,
@@ -3684,9 +3714,9 @@ pub const MAX_SPOOL_BYTES: u64 = 256 * 1024 * 1024;
 pub const MAX_GOLD_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const SPOOL_MANIFEST_VERSION: u32 = 1;
 const AUDIO_SAMPLE_RATE: usize = 16_000;
+/// Prefix of the retired app-layer spool encryption envelope. Such files are
+/// rejected instead of being returned as audio.
 const SPOOL_ENVELOPE_MAGIC: &[u8; 8] = b"VFSPOOL1";
-const SPOOL_ENVELOPE_VERSION: u8 = 1;
-const SPOOL_ENVELOPE_HEADER_LEN: usize = SPOOL_ENVELOPE_MAGIC.len() + 1 + 24;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SpoolChunkManifest {
@@ -3874,81 +3904,8 @@ fn spool_size_walk(path: &Path) -> anyhow::Result<u64> {
     Ok(total)
 }
 
-fn spool_encryption_enabled() -> bool {
-    cfg!(feature = "encrypted-spool")
-        && std::env::var("VOICEFLOW_ENCRYPT_SPOOL")
-            .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
-}
-
-fn history_encryption_key_for_write() -> anyhow::Result<[u8; 32]> {
-    if let Some(key) = crate::keychain::get_history_key().map_err(anyhow::Error::msg)? {
-        return key
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("stored history key must be exactly 32 bytes"));
-    }
-
-    // Generate the key only after encryption has been explicitly enabled.
-    // If the credential store cannot persist it, the verification read below
-    // fails and no plaintext fallback is allowed.
-    let generated = XChaCha20Poly1305::generate_key(&mut OsRng);
-    crate::keychain::set_history_key(Some(generated.as_slice())).map_err(anyhow::Error::msg)?;
-    crate::keychain::get_history_key()
-        .map_err(anyhow::Error::msg)?
-        .ok_or_else(|| anyhow::anyhow!("history encryption key is unavailable"))?
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("stored history key must be exactly 32 bytes"))
-}
-
-fn cipher_for_key(key: &[u8]) -> anyhow::Result<XChaCha20Poly1305> {
-    XChaCha20Poly1305::new_from_slice(key)
-        .map_err(|_| anyhow::anyhow!("history encryption key must be exactly 32 bytes"))
-}
-
-fn encrypt_spool_bytes(bytes: &[u8], key: &[u8]) -> anyhow::Result<Vec<u8>> {
-    let cipher = cipher_for_key(key)?;
-    let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
-    let mut header = Vec::with_capacity(SPOOL_ENVELOPE_HEADER_LEN);
-    header.extend_from_slice(SPOOL_ENVELOPE_MAGIC);
-    header.push(SPOOL_ENVELOPE_VERSION);
-    header.extend_from_slice(nonce.as_slice());
-    let ciphertext = cipher
-        .encrypt(
-            &nonce,
-            Payload {
-                msg: bytes,
-                aad: &header,
-            },
-        )
-        .map_err(|_| anyhow::anyhow!("failed to encrypt audio spool"))?;
-    header.extend_from_slice(&ciphertext);
-    Ok(header)
-}
-
-fn decrypt_spool_bytes(bytes: &[u8], key: &[u8]) -> anyhow::Result<Vec<u8>> {
-    if bytes.len() < SPOOL_ENVELOPE_HEADER_LEN
-        || &bytes[..SPOOL_ENVELOPE_MAGIC.len()] != SPOOL_ENVELOPE_MAGIC
-        || bytes[SPOOL_ENVELOPE_MAGIC.len()] != SPOOL_ENVELOPE_VERSION
-    {
-        anyhow::bail!("unsupported audio spool envelope");
-    }
-    let header = &bytes[..SPOOL_ENVELOPE_HEADER_LEN];
-    let nonce =
-        XNonce::from_slice(&header[SPOOL_ENVELOPE_MAGIC.len() + 1..SPOOL_ENVELOPE_HEADER_LEN]);
-    cipher_for_key(key)?
-        .decrypt(
-            nonce,
-            Payload {
-                msg: &bytes[SPOOL_ENVELOPE_HEADER_LEN..],
-                aad: header,
-            },
-        )
-        .map_err(|_| anyhow::anyhow!("failed to decrypt audio spool"))
-}
-
-/// Read a recovery artifact. Plaintext artifacts from older versions remain
-/// readable; encrypted artifacts require the history key and are never
-/// returned as ciphertext.
+/// Read a recovery artifact. Artifacts written by the retired encrypted-spool
+/// build are rejected rather than returned as ciphertext.
 pub fn read_spool_file(path: &Path) -> anyhow::Result<Vec<u8>> {
     let Some(key) = spool_session_key_for_artifact(path) else {
         let bytes = fs::read(path)?;
@@ -3962,12 +3919,7 @@ pub fn read_spool_file(path: &Path) -> anyhow::Result<Vec<u8>> {
     let lease = reserve_spool_session_path(&key, false, spool_lease_kind_for_artifact(path, &key))?;
     let _commit = try_spool_io_commit_audio_session(&lease)?;
     let bytes = fs::read(path)?;
-    if bytes.starts_with(SPOOL_ENVELOPE_MAGIC) {
-        let key = crate::keychain::get_history_key()
-            .map_err(anyhow::Error::msg)?
-            .ok_or_else(|| anyhow::anyhow!("history encryption key is unavailable"))?;
-        return decrypt_spool_bytes(&bytes, &key);
-    }
+    reject_retired_spool_envelope(&bytes)?;
     drop(lease);
     Ok(bytes)
 }
@@ -3990,32 +3942,21 @@ pub fn read_spool_file_limited(path: &Path, max_plaintext_bytes: usize) -> anyho
         .as_ref()
         .map(try_spool_io_commit_audio_session)
         .transpose()?;
-    let stored_limit = max_plaintext_bytes.saturating_add(SPOOL_ENVELOPE_HEADER_LEN);
     let file = File::open(path)?;
-    if file.metadata()?.len() > stored_limit as u64 {
+    if file.metadata()?.len() > max_plaintext_bytes as u64 {
         anyhow::bail!("audio retry artifact exceeds the bounded read size");
     }
     let mut bytes = Vec::new();
-    file.take(stored_limit.saturating_add(1) as u64)
+    file.take(max_plaintext_bytes.saturating_add(1) as u64)
         .read_to_end(&mut bytes)?;
-    if bytes.len() > stored_limit {
+    if bytes.len() > max_plaintext_bytes {
         anyhow::bail!("audio retry artifact exceeds the bounded read size");
     }
-    let plaintext = if bytes.starts_with(SPOOL_ENVELOPE_MAGIC) {
-        if key.is_none() {
-            anyhow::bail!("invalid spool file path");
-        }
-        let encryption_key = crate::keychain::get_history_key()
-            .map_err(anyhow::Error::msg)?
-            .ok_or_else(|| anyhow::anyhow!("history encryption key is unavailable"))?;
-        decrypt_spool_bytes(&bytes, &encryption_key)?
-    } else {
-        bytes
-    };
-    if plaintext.len() > max_plaintext_bytes {
-        anyhow::bail!("audio retry artifact exceeds the bounded read size");
+    if bytes.starts_with(SPOOL_ENVELOPE_MAGIC) && key.is_none() {
+        anyhow::bail!("invalid spool file path");
     }
-    Ok(plaintext)
+    reject_retired_spool_envelope(&bytes)?;
+    Ok(bytes)
 }
 
 pub(crate) fn read_audio_spool_file(
@@ -4027,13 +3968,15 @@ pub(crate) fn read_audio_spool_file(
     }
     let _commit = try_spool_io_commit_audio_session(lease)?;
     let bytes = fs::read(path)?;
-    if bytes.starts_with(SPOOL_ENVELOPE_MAGIC) {
-        let key = crate::keychain::get_history_key()
-            .map_err(anyhow::Error::msg)?
-            .ok_or_else(|| anyhow::anyhow!("history encryption key is unavailable"))?;
-        return decrypt_spool_bytes(&bytes, &key);
-    }
+    reject_retired_spool_envelope(&bytes)?;
     Ok(bytes)
+}
+
+fn reject_retired_spool_envelope(bytes: &[u8]) -> anyhow::Result<()> {
+    if bytes.starts_with(SPOOL_ENVELOPE_MAGIC) {
+        anyhow::bail!("encrypted audio spool artifacts are no longer supported");
+    }
+    Ok(())
 }
 
 /// Persist a retry/recovery audio file without exposing paths outside the
@@ -4053,7 +3996,7 @@ pub fn write_spool_file(dir: &Path, relative: &Path, bytes: &[u8]) -> anyhow::Re
     if !spool_lease_can_write(&lease) {
         anyhow::bail!("spool session deletion is pending");
     }
-    write_spool_file_encrypted(dir, relative, bytes, Some(&lease))
+    write_spool_file_internal(dir, relative, bytes, Some(&lease))
 }
 
 /// Persist a chunk for the one audio worker that owns the session lease.
@@ -4072,7 +4015,7 @@ pub(crate) fn write_audio_spool_file(
     {
         anyhow::bail!("audio spool lease does not own the requested path");
     }
-    write_spool_file_encrypted(dir, relative, bytes, Some(lease))
+    write_spool_file_internal(dir, relative, bytes, Some(lease))
 }
 
 /// Commit one PCM chunk and its manifest interval under a single derived
@@ -4106,21 +4049,7 @@ pub(crate) fn write_audio_spool_chunk_with_samples(
         anyhow::bail!("invalid recovery chunk sample interval");
     }
     let _commit = try_spool_io_commit_audio_session(lease)?;
-    let encryption_enabled = spool_encryption_enabled();
-    let encryption_key = if encryption_enabled {
-        Some(history_encryption_key_for_write()?)
-    } else {
-        None
-    };
-    let stored_bytes = if encryption_enabled {
-        let key = encryption_key
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("history encryption key is unavailable"))?;
-        encrypt_spool_bytes(bytes, key)?
-    } else {
-        bytes.to_vec()
-    };
-    let path = write_spool_file_after_admission(&spool_root, &target, &stored_bytes, Some(lease))?;
+    let path = write_spool_file_after_admission(&spool_root, &target, bytes, Some(lease))?;
     record_spool_chunk_inner(
         session_dir,
         index,
@@ -4179,34 +4108,10 @@ fn spool_lease_kind_for_artifact(path: &Path, owner_path: &Path) -> SpoolLeaseKi
     }
 }
 
-fn write_spool_file_encrypted(
-    dir: &Path,
-    relative: &Path,
-    bytes: &[u8],
-    owner: Option<&AudioSpoolSessionLease>,
-) -> anyhow::Result<PathBuf> {
-    let encryption_enabled = spool_encryption_enabled();
-    let encryption_key = if encryption_enabled {
-        Some(history_encryption_key_for_write()?)
-    } else {
-        None
-    };
-    write_spool_file_internal(
-        dir,
-        relative,
-        bytes,
-        encryption_enabled,
-        encryption_key.as_ref().map(|key| key.as_slice()),
-        owner,
-    )
-}
-
 fn write_spool_file_internal(
     dir: &Path,
     relative: &Path,
     bytes: &[u8],
-    encryption_enabled: bool,
-    encryption_key: Option<&[u8]>,
     owner: Option<&AudioSpoolSessionLease>,
 ) -> anyhow::Result<PathBuf> {
     if relative.as_os_str().is_empty()
@@ -4236,14 +4141,7 @@ fn write_spool_file_internal(
     } else {
         try_spool_io_commit_scope(dir, SpoolIoScope::RecoverySpool)?
     };
-    let stored_bytes = if encryption_enabled {
-        let key = encryption_key
-            .ok_or_else(|| anyhow::anyhow!("history encryption key is unavailable"))?;
-        encrypt_spool_bytes(bytes, key)?
-    } else {
-        bytes.to_vec()
-    };
-    write_spool_file_after_admission(&root, &path, &stored_bytes, owner)
+    write_spool_file_after_admission(&root, &path, bytes, owner)
 }
 
 fn write_spool_file_after_admission(
@@ -4284,31 +4182,17 @@ pub fn write_gold_file(dir: &Path, file_name: &str, bytes: &[u8]) -> anyhow::Res
     {
         anyhow::bail!("invalid gold audio path");
     }
-    let encryption_enabled = spool_encryption_enabled();
-    let encryption_key = if encryption_enabled {
-        Some(history_encryption_key_for_write()?)
-    } else {
-        None
-    };
     let root = gold_root(dir);
     let path = root.join(relative);
     let lease = reserve_spool_session_path(&path, false, SpoolLeaseKind::Artifact)?;
     let _commit = try_spool_io_commit_scope(dir, SpoolIoScope::GoldAudio)?;
-    let stored_bytes = if encryption_enabled {
-        let key = encryption_key
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("history encryption key is unavailable"))?;
-        encrypt_spool_bytes(bytes, key)?
-    } else {
-        bytes.to_vec()
-    };
     let current = spool_size(&root)?;
     let existing = fs::symlink_metadata(&path)
         .map(|metadata| metadata.len())
         .unwrap_or(0);
     if current
         .saturating_sub(existing)
-        .saturating_add(stored_bytes.len() as u64)
+        .saturating_add(bytes.len() as u64)
         > MAX_GOLD_BYTES
     {
         anyhow::bail!("gold audio quota exceeded");
@@ -4317,7 +4201,7 @@ pub fn write_gold_file(dir: &Path, file_name: &str, bytes: &[u8]) -> anyhow::Res
     if !spool_lease_can_write(&lease) {
         anyhow::bail!("gold audio deletion is pending");
     }
-    write_atomic_bytes(&path, &stored_bytes)?;
+    write_atomic_bytes(&path, bytes)?;
     Ok(path)
 }
 
@@ -12171,6 +12055,27 @@ mod tests {
     }
 
     #[test]
+    fn unfinished_setup_keeps_explicit_chinese_after_later_schema_bumps() {
+        let mut current = Settings {
+            schema_version: 25,
+            onboarded: false,
+            ui_language: "zh".into(),
+            ..Settings::default()
+        };
+        current.normalize();
+        assert_eq!(current.ui_language, "zh");
+
+        let mut legacy = Settings {
+            schema_version: 6,
+            onboarded: false,
+            ui_language: "zh".into(),
+            ..Settings::default()
+        };
+        legacy.normalize();
+        assert_eq!(legacy.ui_language, "system");
+    }
+
+    #[test]
     fn deprecated_single_modifier_bindings_remain_visible_after_migration() {
         let mut settings = Settings {
             selected_action_hotkey: "Shift".into(),
@@ -13070,22 +12975,66 @@ mod tests {
     }
 
     #[test]
-    fn on_device_mlx_normalizes_only_its_legacy_lmstudio_model_id() {
-        let mut native = Settings {
-            cleanup_provider: crate::engine::EngineProvider::OnDeviceMlx,
-            cleanup_model: crate::lmstudio_local::MODEL_VARIANT.into(),
-            ..Settings::default()
-        };
-        native.normalize();
-        assert_eq!(native.cleanup_model, crate::modelstore::MODEL_ID);
+    fn schema_27_moves_retired_lmstudio_cleanup_to_the_bundled_mlx_route() {
+        let dir = temp_dir("retired-lmstudio-cleanup");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("settings.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": 26,
+                "cleanup_enabled": true,
+                "cleanup_provider": "lmstudio",
+                "cleanup_model": "qwen/qwen3.8-27b@6bit",
+                "strict_offline_enabled": true,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let backend = FakeCredentialBackend::default();
 
-        let mut lmstudio = Settings {
-            cleanup_provider: crate::engine::EngineProvider::LmStudio,
-            cleanup_model: crate::lmstudio_local::MODEL_VARIANT.into(),
+        let (settings, needs_persist) = load_settings_with_backend(&dir, &backend);
+
+        assert!(needs_persist);
+        assert_eq!(settings.schema_version, SETTINGS_SCHEMA_VERSION);
+        assert_eq!(
+            settings.cleanup_provider,
+            crate::engine::EngineProvider::OnDeviceMlx
+        );
+        assert_eq!(settings.cleanup_model, crate::modelstore::MODEL_ID);
+        assert!(settings.cleanup_enabled);
+        assert!(settings.strict_offline_enabled);
+        assert!(dir.join("settings.json.pre-migration.bak").exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn schema_27_repairs_only_pre_migration_mlx_selections_of_the_lmstudio_model() {
+        let mut legacy = Settings {
+            schema_version: 26,
+            cleanup_provider: crate::engine::EngineProvider::OnDeviceMlx,
+            cleanup_model: RETIRED_LMSTUDIO_CLEANUP_MODEL.into(),
             ..Settings::default()
         };
-        lmstudio.normalize();
-        assert_eq!(lmstudio.cleanup_model, crate::lmstudio_local::MODEL_VARIANT);
+        legacy.normalize();
+        assert_eq!(legacy.cleanup_model, crate::modelstore::MODEL_ID);
+
+        let mut ollama = Settings {
+            schema_version: 26,
+            cleanup_provider: crate::engine::EngineProvider::Ollama,
+            cleanup_model: RETIRED_LMSTUDIO_CLEANUP_MODEL.into(),
+            ..Settings::default()
+        };
+        ollama.normalize();
+        assert_eq!(ollama.cleanup_model, RETIRED_LMSTUDIO_CLEANUP_MODEL);
+
+        assert!(
+            serde_json::from_value::<crate::engine::EngineProvider>(serde_json::json!("lmstudio"))
+                .is_err()
+        );
+        assert!(serde_json::from_value::<Settings>(serde_json::json!({
+            "cleanup_provider": "not_a_provider"
+        }))
+        .is_err());
     }
 
     #[test]
@@ -14320,60 +14269,26 @@ mod tests {
     }
 
     #[test]
-    fn encrypted_spool_round_trip_and_plaintext_compatibility() {
-        let key = [7_u8; 32];
-        let plaintext = b"audio bytes";
-        let encrypted = encrypt_spool_bytes(plaintext, &key).unwrap();
-        assert_ne!(encrypted, plaintext);
-        assert_eq!(decrypt_spool_bytes(&encrypted, &key).unwrap(), plaintext);
-
-        let dir = temp_dir("plaintext-compatibility");
-        let path = dir.join("legacy.wav");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(&path, plaintext).unwrap();
-        assert_eq!(read_spool_file(&path).unwrap(), plaintext);
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn encrypted_spool_requires_a_key_for_write_and_read() {
-        let dir = temp_dir("encrypted-missing-key");
-        let result = write_spool_file_internal(
-            &dir,
-            Path::new("missing-key.wav"),
-            b"secret audio",
-            true,
-            None,
-            None,
-        );
-        assert!(result.is_err());
-        assert!(!dir.join("spool/missing-key.wav").exists());
-
-        let path = dir.join("encrypted.wav");
-        let encrypted = encrypt_spool_bytes(b"secret audio", &[9_u8; 32]).unwrap();
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(&path, encrypted).unwrap();
-        assert!(read_spool_file(&path).is_err());
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn recovery_wav_uses_the_encrypted_spool_envelope_when_enabled() {
-        let dir = temp_dir("encrypted-recovery");
+    fn spool_writes_plaintext_and_rejects_retired_encrypted_envelopes() {
+        let dir = temp_dir("plaintext-spool");
         let wav = b"RIFF recovery";
-        write_spool_file_internal(
-            &dir,
-            Path::new("session/recovery.wav"),
-            wav,
-            true,
-            Some(&[3_u8; 32]),
-            None,
-        )
-        .unwrap();
-        let on_disk = std::fs::read(dir.join("spool/session/recovery.wav")).unwrap();
-        assert!(on_disk.starts_with(SPOOL_ENVELOPE_MAGIC));
-        assert_ne!(on_disk.as_slice(), wav);
-        assert_eq!(decrypt_spool_bytes(&on_disk, &[3_u8; 32]).unwrap(), wav);
+        write_spool_file_internal(&dir, Path::new("session/recovery.wav"), wav, None).unwrap();
+        let on_disk = dir.join("spool/session/recovery.wav");
+        assert_eq!(std::fs::read(&on_disk).unwrap(), wav);
+        assert_eq!(read_spool_file(&on_disk).unwrap(), wav);
+
+        let legacy = dir.join("legacy.wav");
+        std::fs::write(&legacy, wav).unwrap();
+        assert_eq!(read_spool_file(&legacy).unwrap(), wav);
+
+        let mut envelope = SPOOL_ENVELOPE_MAGIC.to_vec();
+        envelope.extend_from_slice(b"ciphertext");
+        let managed = dir.join("spool/session/encrypted.wav");
+        std::fs::write(&managed, &envelope).unwrap();
+        assert!(read_spool_file(&managed).is_err());
+        assert!(read_spool_file_limited(&managed, 1024).is_err());
+        std::fs::write(&legacy, &envelope).unwrap();
+        assert!(read_spool_file(&legacy).is_err());
         let _ = std::fs::remove_dir_all(dir);
     }
 

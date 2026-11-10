@@ -444,6 +444,7 @@ impl AuditAttempt {
             }
         });
     }
+    /// Also emits the fixture-learning registration rejection for `reason`.
     pub fn skip(&mut self, reason: &'static str) {
         self.update(|a| {
             if let Fact::PostPasteAttempt {
@@ -469,6 +470,7 @@ impl AuditAttempt {
             };
         });
         self.finished = true;
+        crate::learning_research::registration(false, reason);
     }
     pub fn observed(&mut self, result: &'static str) {
         self.update(|a| {
@@ -777,7 +779,7 @@ impl Write for CountWriter {
     }
 }
 #[tauri::command]
-pub(crate) fn get_dictionary_learning_audit(
+pub(crate) async fn get_dictionary_learning_audit(
     app: tauri::AppHandle,
 ) -> Result<LearningAuditSnapshotV1, LearningAuditReadErrorV1> {
     let state = app.state::<AppState>();
@@ -792,18 +794,25 @@ pub(crate) fn get_dictionary_learning_audit(
         .map_err(|_| LearningAuditReadErrorV1::Code {
             code: "app_data_unavailable",
         })?;
-    let rows = store::list_learn_pairs_for_audit(&dir).map_err(|e| match e {
-        store::AuditPairReadError::Capacity { resource, limit } => {
-            LearningAuditReadErrorV1::Capacity {
-                code: "pair_projection_capacity",
-                resource,
-                limit: limit.to_string(),
-            }
-        }
-        store::AuditPairReadError::Store => LearningAuditReadErrorV1::Code {
-            code: "pair_store_unavailable",
-        },
-    })?;
+    let rows =
+        tauri::async_runtime::spawn_blocking(move || store::list_learn_pairs_for_audit(&dir))
+            .await
+            .unwrap_or_else(|error| {
+                log::warn!("learning audit pair read task failed: {error}");
+                Err(store::AuditPairReadError::Store)
+            })
+            .map_err(|e| match e {
+                store::AuditPairReadError::Capacity { resource, limit } => {
+                    LearningAuditReadErrorV1::Capacity {
+                        code: "pair_projection_capacity",
+                        resource,
+                        limit: limit.to_string(),
+                    }
+                }
+                store::AuditPairReadError::Store => LearningAuditReadErrorV1::Code {
+                    code: "pair_store_unavailable",
+                },
+            })?;
     let pairs = {
         let settings = lock_recover(&state.settings);
         let owner = lock_recover(&state.dictionary_learning_audit);

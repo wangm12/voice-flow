@@ -1,7 +1,0 @@
-# Minimal local-only runtime for the pinned REAL-TSE WeSep causal checkpoint.
-# The Python/Torch stack is the same private discovery environment used by the
-# Nomo smoke; install into an isolated venv with private caches.
-numpy==2.2.6
-torch==2.11.0
-torchaudio==2.11.0
-PyYAML==6.0.2

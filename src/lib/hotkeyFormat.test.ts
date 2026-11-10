@@ -9,13 +9,11 @@ import {
   isModifierOnlyHotkey,
   isSafeCapturedHotkey,
   sanitizeTauriHotkey,
-  toTauriHotkey,
   toTanStackHotkey,
 } from "./hotkeyFormat";
 
 describe("hotkey formatting", () => {
-  it("round-trips common modifier combinations", () => {
-    expect(toTauriHotkey("Mod+Shift+Space")).toBe("CmdOrControl+Shift+Space");
+  it("formats common modifier combinations", () => {
     expect(toTanStackHotkey("CmdOrControl+Shift+Space")).toBe("Mod+Shift+Space");
     const display = formatHotkeyDisplay("CmdOrControl+Shift+Space");
     expect(display).toMatch(/⌘|Ctrl/);
@@ -38,8 +36,6 @@ describe("hotkey formatting", () => {
   });
 
   it("keeps the slash shortcut canonical internally but symbolic in the UI", () => {
-    expect(toTauriHotkey("Mod+Shift+/"))
-      .toBe("CmdOrControl+Shift+Slash");
     expect(toTanStackHotkey("CmdOrControl+Shift+Slash")).toBe("Mod+Shift+/");
     expect(formatHotkeyDisplay("CmdOrControl+Shift+Slash")).toContain("/");
     expect(formatHotkeyDisplay("CmdOrControl+Shift+Slash")).not.toContain("Slash");
@@ -83,7 +79,6 @@ describe("hotkey formatting", () => {
     for (const alias of ["Command", "Super", "Meta", "CmdOrControl"]) {
       expect(toTanStackHotkey(`${alias}+Shift+V`)).toBe("Mod+Shift+V");
       expect(formatHotkeyDisplay(`${alias}+Shift+V`)).toMatch(/⌘|Ctrl/);
-      expect(toTauriHotkey(`${alias}+Shift+V`)).toBe("CmdOrControl+Shift+V");
     }
   });
 

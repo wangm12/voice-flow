@@ -1,6 +1,6 @@
 # VoiceFlow Context & Delivery E2E Verification Checklist
 
-更新时间：2026-09-26（当前边界见 §18；自动化数字以本次测试为准）
+更新时间：2026-09-26（当前边界见 §17；自动化数字以本次测试为准）
 
 这份 checklist 用于验证 VoiceFlow 的全部上下文来源、Prompt policy、目标保护、交付方式和 History 结果。它覆盖自动化测试和真实 macOS 外部 App 测试。
 
@@ -8,19 +8,19 @@
 
 | Context / capability | 当前状态 | 验收方式 |
 | --- | --- | --- |
-| Native App context | 已实现；真实 App 验收待做 | resolver fixtures + §18 native matrix |
+| Native App context | 已实现；真实 App 验收待做 | resolver fixtures + §17 native matrix |
 | Window context | 已实现 | target guard + 真实多窗口切换 |
-| Focused input context | 已实现；外部 App 字段验收待做 | AX target guard + positive field cues；IDE/GitHub app-aware rules；§18 |
-| Browser domain context | 已实现；真实 Browser E2E 待做 | browser resolver + §18 native matrix |
+| Focused input context | 已实现；外部 App 字段验收待做 | AX target guard + positive field cues；IDE/GitHub app-aware rules；§17 |
+| Browser domain context | 已实现；真实 Browser E2E 待做 | browser resolver + §17 native matrix |
 | Active Browser Tab context | 已实现 | tab token/window guard + 真实 Tab 切换 |
 | User App mapping | 已实现 | Settings + resolver + 真实 App |
 | Writing mode | 已实现 | Prompt policy + cleanup corpus |
 | Manual context override | 已实现 | policy override + target guard |
 | Selected text context | 已实现 | preview-first + 真实选区 |
 | Clipboard safety context | 已实现 | clipboard sentinel + cancellation/fallback |
-| Text / image context | 已实现（逐 App grants + 有界 AX / 本机 OCR / 云端回退 + 独立看屏幕热键） | 新 grants 默认 off；自动云端图像需具体 App + 独立文字 permission；§18 |
+| Text / image context | 已实现（逐 App grants + 有界 AX / 本机 OCR / 云端回退 + 独立看屏幕热键） | 新 grants 默认 off；自动云端图像需具体 App + 独立文字 permission；§17 |
 
-自动窗口图像可在具体 App 规则明确允许 cloud vision、provider text use 和屏幕录制权限后，作为 AX / OCR 不足时的一图回退。独立看屏幕热键仍是单独的用户动作；两条路径都不会截整屏。区域框选仍未做（§18.1 保持未实现）。会议录音、Spark、生图仍然不做。
+自动窗口图像可在具体 App 规则明确允许 cloud vision、provider text use 和屏幕录制权限后，作为 AX / OCR 不足时的一图回退。独立看屏幕热键仍是单独的用户动作；两条路径都不会截整屏。区域框选仍未做（§17.1 保持未实现）。会议录音、Spark、生图仍然不做。
 
 IDE、GitHub issue/review 和搜索框只按当前 focused editable field 的正向 AX 线索分类。缺少字段线索时保留 `Unknown` 或通用分类；窗口标题、应用名或网站域名不能单独把任意字段改成 chat / prompt。
 
@@ -69,7 +69,7 @@ IDE、GitHub issue/review 和搜索框只按当前 focused editable field 的正
 - [ ] 运行与改动模块对应的 Rust tests
 - [ ] 运行与改动组件对应的 frontend tests
 - [ ] 改动 Prompt / context / delivery 时运行对应 corpus 或 resolver tests
-- [ ] 改动 paste / target guard / Undo 时运行全部 paste/lib safety tests
+- [ ] 改动 paste / target guard 时运行全部 paste/lib safety tests
 - [ ] 改动 History / store 时运行 migration/revision/history tests
 
 ### 3.3 变更后完整验证
@@ -238,11 +238,8 @@ IDE、GitHub issue/review 和搜索框只按当前 focused editable field 的正
 - [ ] ASR 期间切换 Window
 - [ ] cleanup 期间切换 Window
 - [ ] delivery 前切换 Window
-- [ ] Undo 前切换 Window
 - [ ] Window 变化时不写入旧 Window
 - [ ] 无法确认 Window 时 Clipboard fallback
-- [ ] Undo 目标变化时返回 stale_target
-- [ ] 不发送盲目 Cmd+Z
 
 ### 7.2 Browser Tab
 
@@ -252,11 +249,9 @@ IDE、GitHub issue/review 和搜索框只按当前 focused editable field 的正
 - [ ] ASR 期间切换 Tab
 - [ ] cleanup 期间切换 Tab
 - [ ] delivery 前切换 Tab
-- [ ] Undo 前切换 Tab
 - [ ] Tab 未变化时继续交付
 - [ ] Tab 变化时 stale_target 或 Clipboard fallback
 - [ ] 绝不写入错误 Tab
-- [ ] Undo 不对新 Tab 发送 Cmd+Z
 - [ ] 同 URL Tab 也能通过 token 区分
 
 ## 8. Focused Input Context
@@ -286,7 +281,6 @@ IDE、GitHub issue/review 和搜索框只按当前 focused editable field 的正
 - [ ] 输入框变化时 fail-closed
 - [ ] 不写入错误控件
 - [ ] AX 无法验证时显示 unverified 或 Clipboard fallback
-- [ ] unverified 不提供 Undo
 
 ## 9. App Mapping Context
 
@@ -450,7 +444,6 @@ Custom writing mode：
 - [ ] 原 Browser Tab 仍一致时替换成功
 - [ ] 原 selection 仍一致时替换成功
 - [ ] verified paste 才显示 done
-- [ ] unverified paste 不显示 Undo
 
 ### 14.4 Preview target changed
 
@@ -520,28 +513,7 @@ Clipboard 不是 LLM context，而是 delivery safety context。
 - [ ] fallback reason 正确
 - [ ] 没有写错 App / Window / Tab
 
-## 17. Backend Undo Context Safety
-
-当前 HUD 没有交付 Undo 按钮。以下条目核对保留的 `undo_last_delivery` 后端命令，使用隔离测试入口或后端测试；词典学习提示的「撤销」单独验证。
-
-- [ ] verified paste 后 3 秒内调用 Undo 命令
-- [ ] 超过 3 秒调用 Undo 命令
-- [ ] 插入后继续编辑再调用 Undo 命令
-- [ ] 插入后切换 App 再调用 Undo 命令
-- [ ] 插入后切换 Window 再调用 Undo 命令
-- [ ] 插入后切换 Browser Tab 再调用 Undo 命令
-- [ ] 同窗口切换到文字、描述和几何位置均相同的另一输入框，Undo 返回 stale_target
-- [ ] 粘贴读回期间快速 A → B → A，再切到 B 调用 Undo 命令；不能撤销 B
-- [ ] 连续插入两次后调用 Undo 命令
-- [ ] 连续两次调用 Undo 命令
-- [ ] unverified paste 没有有效 Undo 事务
-
-预期：
-
-    目标未变化 + focused input 未变化 → 允许 Undo
-    目标变化或用户继续编辑 → stale_target，不发送 Cmd+Z
-
-## 18. Context Sources and Screen Images
+## 17. Context Sources and Screen Images
 
 ### Current behavior and permissions
 
@@ -578,11 +550,11 @@ Native E2E checklist:
 - [ ] Verify `style_examples_approved` off/on and learning disabled/enabled with synthetic drafts; no unapproved pair enters provider requests.
 - [ ] Keep manual selected-text and manual look-at-screen tests separate from automatic context grants.
 
-### 18.1 Image selection
+### 17.1 Image selection
 
 Region selection / crop UI is not implemented. The supported image scope is one current window; there is no full-screen capture or selected-region path.
 
-## 19. History 与 Context 结果
+## 18. History 与 Context 结果
 
 - [ ] 成功记录保存 raw text 和 final text
 - [ ] History 保存正确 cleanup status
@@ -591,13 +563,13 @@ Region selection / crop UI is not implemented. The supported image scope is one 
 - [ ] History 保存正确 fallback reason
 - [ ] AI 失败后显示 degraded，而不是普通 done
 - [ ] history-only 显示 history / Archive indicator
-- [ ] unverified 显示 warning，不显示 Undo
+- [ ] unverified 显示 warning
 - [ ] raw text 重新整理不会覆盖旧 revision
 - [ ] revision diff 能看到 raw → final 的变化
 - [ ] History re-clean 不污染 dictation HUD
 - [ ] History retry 不会写入当前 App
 
-## 20. 自动化验证记录
+## 19. 自动化验证记录
 
 当前自动化门禁（不要抄旧数字，跑完再勾）：
 
@@ -619,7 +591,7 @@ Region selection / crop UI is not implemented. The supported image scope is one 
     npm run build
     git diff --check
 
-## 21. 最终通过标准
+## 20. 最终通过标准
 
 一个 context 测试只有同时满足以下条件才算通过：
 
@@ -634,7 +606,6 @@ Region selection / crop UI is not implemented. The supported image scope is one 
 - [ ] History 状态正确
 - [ ] 没有泄露 raw URL、PID、Window title 或 Clipboard
 - [ ] App / Window / Tab 切换不会误写
-- [ ] Undo 不会撤销用户后续编辑
 
 真实 macOS 外部 App、Browser Tab、Accessibility、输入框写入、Clipboard 和当前默认整理模型质量评测完成前，不能把产品标记为 prod-ready.
 
@@ -643,7 +614,7 @@ Region selection / crop UI is not implemented. The supported image scope is one 
 - [ ] 「编辑哪种语气」只选择编辑对象；试跑旁标明当前草稿或已保存配置。在「语气」输入脱敏样例：默认无请求；点击试跑才处理，未保存修改会对比 saved / draft，模型、本地-only、provider fallback 和 guard fallback 分别标记。关闭或修改 Prompt / 样例后，迟到结果不会出现，也没有 History / App 写入。
 - [ ] 录音与输出里设置翻译快捷键和目标语言；全局输出保持原模式。按它启动时 HUD 显示目标语言，结束后普通热键恢复原模式。取消 / 启动失败不留下翻译模式；用另一枚键结束现有录音不切换模式，松开非启动键不结束按住录音。
 - [ ] 翻译键与主键 / 选中操作 / 看屏幕 / 跳过整理键的别名冲突被拒绝，Backspace / Delete 清空、Esc 保留。主键变更或注册失败后所有辅助热键可继续使用；设置翻译键不修改全局按法。
-- [ ] 当前场景整理关闭、路由不可用或需要密钥的 provider 缺少凭据时，翻译键在采集前报错；On Device MLX 和 loopback LM Studio / Ollama 可走无密钥本机路由。严格离线不发云请求。provider 失败和保护拒绝继续显示现有回退状态，不标成已翻译成功。
+- [ ] 当前场景整理关闭、路由不可用或需要密钥的 provider 缺少凭据时，翻译键在采集前报错；On Device MLX 和 loopback Ollama 可走无密钥本机路由。严格离线不发云请求。provider 失败和保护拒绝继续显示现有回退状态，不标成已翻译成功。
 - [ ] 翻译键直接口述正文，无「翻译成……」前缀也按固定目标处理；轻量 / 标准 / 重度与长短录音共享 Translate 授权，正文提及其他语言不切换目标。AssemblyAI 用 raw Sync 后的共同整理翻译。
 
 以下项目需在实际 macOS 应用包上手工执行；单元测试不能替代这些结论。

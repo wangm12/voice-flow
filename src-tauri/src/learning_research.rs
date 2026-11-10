@@ -1,5 +1,6 @@
 //! Fixture-selected learning observations. No ordinary launch retains a record.
 //! Text authority is declared in the lease; receipts identify fixtures, not text.
+#[cfg(any(test, feature = "research-harness"))]
 use crate::{research_trace, store};
 use serde::{Deserialize, Serialize};
 #[cfg(test)]
@@ -20,19 +21,33 @@ use std::cell::RefCell;
 #[cfg(any(test, feature = "research-harness"))]
 use std::path::{Path, PathBuf};
 
+#[cfg(any(test, feature = "research-harness"))]
 const LEARNING_EPISODE_SCHEMA_V2: u8 = 2;
+#[cfg(any(test, feature = "research-harness"))]
 const LEARNING_ARM_SCHEMA_V2: u8 = 2;
+#[cfg(any(test, feature = "research-harness"))]
 const LEARNING_TEXT_MAX_BYTES: usize = 1024;
+#[cfg(any(test, feature = "research-harness"))]
 const LEARNING_OUTPUT_MAX_BYTES: usize = 1024;
+#[cfg(any(test, feature = "research-harness"))]
 const LEARNING_TERMS_MAX: usize = 8;
+#[cfg(any(test, feature = "research-harness"))]
 const LEARNING_OPERATIONS_MAX: usize = 8;
+#[cfg(any(test, feature = "research-harness"))]
 const LEARNING_EDIT_STATES_MAX: usize = 6;
+#[cfg(any(test, feature = "research-harness"))]
 const LEARNING_FOLLOWUPS_MAX: usize = 2;
+#[cfg(any(test, feature = "research-harness"))]
 const LEARNING_WAV_OPERATIONS_MAX: usize = 1;
+#[cfg(any(test, feature = "research-harness"))]
 const LEARNING_WAV_MAX_BYTES: usize = 30_000_000;
+#[cfg(any(test, feature = "research-harness"))]
 const LEARNING_LEASE_MIN_MS: u64 = 1_000;
+#[cfg(any(test, feature = "research-harness"))]
 const LEARNING_LEASE_MAX_MS: u64 = 1_200_000;
+#[cfg(feature = "research-harness")]
 const LEARNING_STDIN_MAX_BYTES: usize = 8_192;
+#[cfg(feature = "research-harness")]
 const LEARNING_REQUEST_MAX: usize = 256;
 
 #[cfg(any(test, feature = "research-harness"))]
@@ -5202,7 +5217,6 @@ pub(crate) fn execute_registered_owned_paste_session_child(
     let cancellation: CancellationToken = input.cancellation.clone();
     let mut owner_completion;
     let mut observation_ticket;
-    let mut undo_ticket;
     let paste_attempt;
     let mut paste_shortcut_sent = false;
     let mut paste_verified = false;
@@ -5215,7 +5229,6 @@ pub(crate) fn execute_registered_owned_paste_session_child(
         utf16_length: 0,
         selection_start: 0,
         selection_length: 0,
-        undo_ticket_released: false,
     };
     let mut final_sample = RegisteredOwnedPasteFinalSampleV1 {
         state: RegisteredOwnedPasteFinalSampleStateV1::NotRun,
@@ -5236,7 +5249,6 @@ pub(crate) fn execute_registered_owned_paste_session_child(
         programmatic_edit_receipt_sha256: [0; 32],
     };
     let mut edit_response_received = false;
-    let mut undo_ticket_released = false;
     let mut observation_ticket_released = false;
 
     let invalid_context = input.remote.plan_id != authority.plan_id
@@ -5264,7 +5276,6 @@ pub(crate) fn execute_registered_owned_paste_session_child(
     paste_attempt = handoff.attempt;
     owner_completion = handoff.owner_completion;
     observation_ticket = handoff.observation_ticket;
-    undo_ticket = handoff.undo_ticket;
 
     let confirmed = paste_attempt
         .as_ref()
@@ -5272,8 +5283,7 @@ pub(crate) fn execute_registered_owned_paste_session_child(
         .and_then(|timed| timed.outcome.confirmed_insertion.as_ref());
     if let Ok(timed) = &paste_attempt {
         paste_shortcut_sent = timed.outcome.shortcut_sent;
-        let handoff_tickets_are_unique = timed.outcome.learning_observation_ticket.is_none()
-            && timed.outcome.post_insert_field_ticket.is_none();
+        let handoff_tickets_are_unique = timed.outcome.learning_observation_ticket.is_none();
         let confirmed_is_bound = confirmed
             .zip(observation_ticket.as_ref())
             .is_some_and(|(confirmed, ticket)| confirmed.is_bound_to(ticket));
@@ -5367,7 +5377,6 @@ pub(crate) fn execute_registered_owned_paste_session_child(
                                 utf16_length: actual_utf16_length,
                                 selection_start,
                                 selection_length,
-                                undo_ticket_released: false,
                             };
                         }
                     }
@@ -5378,17 +5387,10 @@ pub(crate) fn execute_registered_owned_paste_session_child(
 
     let ticket_release_deadline =
         std::cmp::min(input.expires_at, Instant::now() + Duration::from_secs(5));
-    if let Some(ticket) = undo_ticket.take() {
-        undo_ticket_released = ticket
-            .release_and_wait_until(ticket_release_deadline)
-            .is_ok();
-    }
-    baseline.undo_ticket_released = undo_ticket_released;
 
     let write_id = remote.client.registered_write_id();
     if paste_verified
         && baseline_matches
-        && undo_ticket_released
         && confirmation_dto.is_some()
         && write_id.is_some()
         && Instant::now() < input.expires_at
@@ -5466,7 +5468,7 @@ pub(crate) fn execute_registered_owned_paste_session_child(
 
     let mut result_kind = if !paste_verified {
         RegisteredOwnedPasteChildResultKindV1::PasteRejected
-    } else if !baseline_matches || !undo_ticket_released {
+    } else if !baseline_matches {
         RegisteredOwnedPasteChildResultKindV1::BaselineMismatch
     } else if !edit_response_received
         || edit_result.state != RegisteredOwnedPasteEditStateV1::Observed
@@ -5496,7 +5498,6 @@ pub(crate) fn execute_registered_owned_paste_session_child(
                 baseline,
                 final_sample,
                 edit_response_received,
-                undo_ticket_released,
                 observation_ticket_released,
                 owner_joined,
                 child_restore,
@@ -5831,7 +5832,6 @@ fn learning_asr_error_details(
         ),
         AsrError::Unauthorized(detail) => ("unauthorized", detail.as_str()),
         AsrError::RateLimited(detail) => ("rate_limited", detail.as_str()),
-        AsrError::Server(detail) => ("server", detail.as_str()),
         AsrError::RetryableServer { message, .. } => ("retryable_server", message.as_str()),
         AsrError::EmptyResult => ("empty_result", "empty speech result"),
         AsrError::OnDeviceModelMissing(detail) => ("model_missing", detail.as_str()),
@@ -6369,6 +6369,7 @@ impl LearningConsent {
             .iter()
             .find(|term| term.before == before && term.after == after)
     }
+    #[cfg(any(test, all(feature = "research-harness", target_os = "macos")))]
     pub(crate) fn settings_match(&self, settings: &store::Settings) -> bool {
         settings.snippets.is_empty()
             && !settings.browser_access_enabled
@@ -6411,16 +6412,20 @@ impl LearningConsent {
 pub(crate) enum LearningStage {
     #[cfg(any(test, all(feature = "research-harness", target_os = "macos")))]
     SelectedState,
+    #[cfg(any(test, feature = "research-harness"))]
     SelectedPairRead,
+    #[cfg(any(test, feature = "research-harness"))]
     ObserverRegistration,
     Observation,
     Classification,
     CandidateStore,
+    #[cfg(any(test, feature = "research-harness"))]
     StyleCandidateStore,
     StoreGuard,
     Persistence,
     SettingsPersistence,
     StyleStore,
+    #[cfg(any(test, feature = "research-harness"))]
     LocalPrepareUsage,
     #[cfg(any(test, all(feature = "research-harness", target_os = "macos")))]
     UndoDelete,
@@ -6485,18 +6490,51 @@ impl LearningRecordV1 {
         }
     }
 }
+/// Default builds have no consent source (no scoped fixture, no trace lease),
+/// so the production hooks are inline no-ops there.
+#[cfg(not(any(test, feature = "research-harness")))]
+mod inert_hooks {
+    use super::{LearningConsent, LearningRecordV1, LearningStage};
+    #[inline(always)]
+    pub(crate) fn consent() -> Option<LearningConsent> {
+        None
+    }
+    #[inline(always)]
+    pub(crate) fn emit(_record: LearningRecordV1) {}
+    #[inline(always)]
+    pub(crate) fn registration(_eligible: bool, _reason: &'static str) {}
+    #[inline(always)]
+    pub(crate) fn stage(_stage: LearningStage, _reason: &'static str) {}
+    #[inline(always)]
+    pub(crate) fn pair_allowed(_before: &str, _after: &str) -> bool {
+        true
+    }
+    #[inline(always)]
+    pub(crate) fn style_candidate(_hits: u32, _threshold: u32, _kind: &'static str) {}
+    #[inline(always)]
+    pub(crate) fn usage(_terms: &[String], _hint: bool) {}
+    #[inline(always)]
+    pub(crate) fn selected_pairs(_dir: &std::path::Path) -> Vec<crate::store::LearnPairRecord> {
+        Vec::new()
+    }
+}
+#[cfg(not(any(test, feature = "research-harness")))]
+pub(crate) use inert_hooks::*;
+
+#[cfg(any(test, feature = "research-harness"))]
 pub(crate) fn consent() -> Option<LearningConsent> {
-    #[cfg(any(test, feature = "research-harness"))]
     if let Some(consent) = SCOPED_CONSENT.with(|slot| slot.borrow().clone()) {
         return Some(consent);
     }
     research_trace::current()?.learning_consent().cloned()
 }
+#[cfg(any(test, feature = "research-harness"))]
 pub(crate) fn emit(record: LearningRecordV1) {
     research_trace::emit(research_trace::Fact::LearningRecord {
         record: Box::new(record),
     });
 }
+#[cfg(any(test, feature = "research-harness"))]
 pub(crate) fn registration(eligible: bool, reason: &'static str) {
     if let Some(consent) = consent() {
         let mut record =
@@ -6505,14 +6543,17 @@ pub(crate) fn registration(eligible: bool, reason: &'static str) {
         emit(record);
     }
 }
+#[cfg(any(test, feature = "research-harness"))]
 pub(crate) fn stage(stage: LearningStage, reason: &'static str) {
     if let Some(consent) = consent() {
         emit(LearningRecordV1::new(&consent, stage, reason));
     }
 }
+#[cfg(any(test, feature = "research-harness"))]
 pub(crate) fn pair_allowed(before: &str, after: &str) -> bool {
     consent().is_none_or(|consent| consent.term(before, after).is_some())
 }
+#[cfg(any(test, feature = "research-harness"))]
 pub(crate) fn style_candidate(hits: u32, threshold: u32, kind: &'static str) {
     if let Some(consent) = consent() {
         let mut record = LearningRecordV1::new(&consent, LearningStage::StyleCandidateStore, kind);
@@ -6523,6 +6564,7 @@ pub(crate) fn style_candidate(hits: u32, threshold: u32, kind: &'static str) {
         emit(record);
     }
 }
+#[cfg(any(test, feature = "research-harness"))]
 pub(crate) fn usage(terms: &[String], hint: bool) {
     let Some(consent) = consent() else {
         return;
@@ -6544,6 +6586,7 @@ pub(crate) fn usage(terms: &[String], hint: bool) {
         emit(record);
     }
 }
+#[cfg(any(test, feature = "research-harness"))]
 fn row_within_bounds(row: &store::LearnPairRecord) -> bool {
     row.pair_key.len() <= 1024
         && row.before_surface.len() <= 256
@@ -6582,6 +6625,7 @@ fn learning_pair_state(row: &store::LearnPairRecord) -> &'static str {
     }
 }
 
+#[cfg(any(test, feature = "research-harness"))]
 pub(crate) fn selected_pairs(dir: &std::path::Path) -> Vec<store::LearnPairRecord> {
     let Some(consent) = consent() else {
         return Vec::new();

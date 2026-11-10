@@ -31,6 +31,8 @@ pub struct OnDeviceModelInfo {
     pub bytes: u64,
     pub file_count: usize,
     pub platform_supported: bool,
+    pub download_available: bool,
+    pub language_note: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -49,6 +51,10 @@ pub struct OnDeviceModelStatus {
     pub platform_supported: bool,
     pub runtime_status: String,
     pub loaded: bool,
+    pub download_available: bool,
+    pub language_note: String,
+    /// Static physical-memory compatibility only; runtime pressure is separate.
+    pub memory_compatibility_error: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -99,10 +105,16 @@ impl AsrProvider for OnDeviceAsrProvider {
                     None,
                 );
             }
-            let language = options
-                .language
-                .as_deref()
-                .filter(|language| *language != "auto");
+            let language = if manifest
+                .is_some_and(|model| model.language_policy == MlxLanguagePolicy::AutoOnly)
+            {
+                None
+            } else {
+                options
+                    .language
+                    .as_deref()
+                    .filter(|language| *language != "auto")
+            };
             crate::ondevice_runtime::shared_runtime(&models_root)
                 .transcribe(
                     &asr_model,
@@ -140,14 +152,18 @@ impl AsrProvider for OnDeviceAsrProvider {
             protocol: crate::asr::AsrProtocol::OnDevice,
             audio_input: crate::asr::AsrAudioInput::LocalSamples,
             response_format: crate::asr::AsrResponseFormat::NativeTranscript,
-            language_support: if mlx_model(&self.asr_model)
-                .is_some_and(|model| model.language_policy == MlxLanguagePolicy::AutoOrExplicit)
-            {
-                crate::asr::AsrLanguageSupport::AutoDetectOrFixedLanguage
-            } else if is_mlx_model(&self.asr_model) {
-                crate::asr::AsrLanguageSupport::OptionalFixedLanguage
-            } else {
-                crate::asr::AsrLanguageSupport::AutoDetectOnly
+            language_support: match mlx_model(&self.asr_model).map(|model| model.language_policy) {
+                Some(MlxLanguagePolicy::AutoOnly) => crate::asr::AsrLanguageSupport::AutoDetectOnly,
+                Some(MlxLanguagePolicy::AutoOrExplicit) => {
+                    crate::asr::AsrLanguageSupport::AutoDetectOrFixedLanguage
+                }
+                Some(MlxLanguagePolicy::ExplicitChineseOrEnglish) => {
+                    crate::asr::AsrLanguageSupport::OptionalFixedLanguage
+                }
+                None if is_mlx_model(&self.asr_model) => {
+                    crate::asr::AsrLanguageSupport::OptionalFixedLanguage
+                }
+                None => crate::asr::AsrLanguageSupport::AutoDetectOnly,
             },
             context_support: crate::asr::AsrContextSupport::None,
             confidence_support: crate::asr::AsrConfidenceSupport::None,
@@ -250,6 +266,8 @@ pub fn list_models(models_root: &Path) -> Vec<OnDeviceModelInfo> {
         bytes: crate::ondevice_models::SENSEVOICE_ARCHIVE_BYTES,
         file_count: 2,
         platform_supported: false,
+        download_available: false,
+        language_note: "Retained legacy files; not offered for new downloads.".to_owned(),
     }];
     models.extend(MLX_MODELS.iter().map(|manifest| OnDeviceModelInfo {
         id: manifest.id.to_owned(),
@@ -260,6 +278,8 @@ pub fn list_models(models_root: &Path) -> Vec<OnDeviceModelInfo> {
         bytes: manifest.bytes,
         file_count: manifest.files.len(),
         platform_supported: platform_supported(),
+        download_available: manifest.download_available,
+        language_note: manifest.language_note.to_owned(),
     }));
     models
 }
@@ -340,6 +360,27 @@ struct InstalledModelFile {
     sha256: String,
 }
 
+fn manifest_parent_directories_are_safe(model_dir: &Path, relative_file: &str) -> bool {
+    let path = Path::new(relative_file);
+    if path.is_absolute() {
+        return false;
+    }
+    let mut components = path.components().peekable();
+    let mut current = model_dir.to_path_buf();
+    while let Some(std::path::Component::Normal(component)) = components.next() {
+        current.push(component);
+        if components.peek().is_some() {
+            let Ok(metadata) = std::fs::symlink_metadata(&current) else {
+                return false;
+            };
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 fn mlx_model_state(
     models_root: &Path,
     manifest: &crate::ondevice_models::MlxModelManifest,
@@ -382,6 +423,9 @@ fn mlx_model_state(
         let Some(actual) = marker.files.iter().find(|file| file.path == expected.path) else {
             return OnDeviceModelState::Corrupt;
         };
+        if !manifest_parent_directories_are_safe(&dir, expected.path) {
+            return OnDeviceModelState::Corrupt;
+        }
         let path = dir.join(expected.path);
         let Ok(metadata) = std::fs::symlink_metadata(&path) else {
             return OnDeviceModelState::Corrupt;

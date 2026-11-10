@@ -207,9 +207,6 @@ pub enum AsrError {
     Unauthorized(String),
     #[error("rate limited{0}")]
     RateLimited(String),
-    #[error("server error: {0}")]
-    #[allow(dead_code, reason = "Kept for non-HTTP provider compatibility.")]
-    Server(String),
     #[error("server error: {message}")]
     RetryableServer {
         message: String,
@@ -691,7 +688,6 @@ pub trait AsrProvider: Send + Sync {
     }
 }
 #[derive(Debug, Deserialize, Clone, PartialEq)]
-#[allow(dead_code)]
 pub struct Segment {
     pub text: String,
     pub start: Option<f32>,
@@ -700,7 +696,6 @@ pub struct Segment {
     pub no_speech_prob: Option<f32>,
 }
 #[derive(Debug, Deserialize, Clone, PartialEq)]
-#[allow(dead_code)]
 pub struct Word {
     pub word: String,
     pub start: Option<f32>,
@@ -723,7 +718,6 @@ pub struct AsrToken {
     pub end: Option<f32>,
 }
 #[derive(Debug, Deserialize, Clone, PartialEq)]
-#[allow(dead_code)]
 pub struct Transcript {
     pub text: String,
     /// Provider response text before local confidence filtering or text cleanup.
@@ -751,14 +745,6 @@ pub struct Transcript {
 impl Transcript {
     pub fn original_text(&self) -> &str {
         self.asr_text.as_deref().unwrap_or(&self.text)
-    }
-
-    #[allow(
-        dead_code,
-        reason = "Provider-specific adapters may consume this accessor later."
-    )]
-    pub fn provider_candidate(&self) -> Option<&str> {
-        self.provider_cleaned_candidate.as_deref()
     }
 }
 
@@ -1270,7 +1256,6 @@ fn status_error_with_detail(
             message: detail.to_owned(),
             retry_after,
         },
-        AsrError::Server(_) => AsrError::Server(detail.to_owned()),
         AsrError::Other(_) => AsrError::Other(detail.to_owned()),
         other => other,
     })
@@ -1319,7 +1304,7 @@ fn asr_failure_reason(error: &AsrError) -> &'static str {
         AsrError::ContextAuthorizationChanged => "asr_authorization_changed",
         AsrError::Unauthorized(_) => "asr_unauthorized",
         AsrError::RateLimited(_) => "asr_rate_limited",
-        AsrError::Server(_) | AsrError::RetryableServer { .. } => "asr_server_failure",
+        AsrError::RetryableServer { .. } => "asr_server_failure",
         AsrError::EmptyResult => "asr_empty_result",
         AsrError::OnDeviceModelMissing(_) => "asr_model_missing",
         AsrError::OnDeviceInferenceUnavailable(_) => "asr_inference_unavailable",
@@ -1408,8 +1393,11 @@ async fn transcribe_qwen_chat(
 ) -> Result<Transcript, AsrError> {
     let url = resolve_qwen_chat_completions_url(endpoint);
     let body = build_qwen_chat_body(&wav, language, prompt, keywords, model)?;
-    let facts = qwen_chat_request_facts(&url, &body, language, prompt, keywords, model);
-    observations::asr_request(facts);
+    if observations::enabled() {
+        observations::asr_request(qwen_chat_request_facts(
+            &url, &body, language, prompt, keywords, model,
+        ));
+    }
     let client = http_client()?;
     let response = client
         .post(&url)
@@ -2208,34 +2196,36 @@ async fn transcribe_assemblyai(
     } else {
         config.insert("timestamps".into(), serde_json::json!(true));
     }
-    let mut facts = ResolvedRequest::new(
-        if dictation {
-            "assembly_fused_dictation"
-        } else {
-            "assembly_raw_sync"
-        },
-        endpoint,
-        if dictation {
-            "provider_default"
-        } else {
-            ASSEMBLYAI_SYNC_MODEL
-        },
-        if dictation {
-            "provider_default"
-        } else {
-            ASSEMBLYAI_SYNC_MODEL
-        },
-    );
-    facts
-        .fields_constructed
-        .insert("config".into(), serde_json::Value::Object(config.clone()));
-    if !dictation {
-        facts.fields_constructed.insert(
-            "X-AAI-Model".into(),
-            serde_json::json!(ASSEMBLYAI_SYNC_MODEL),
+    if observations::enabled() {
+        let mut facts = ResolvedRequest::new(
+            if dictation {
+                "assembly_fused_dictation"
+            } else {
+                "assembly_raw_sync"
+            },
+            endpoint,
+            if dictation {
+                "provider_default"
+            } else {
+                ASSEMBLYAI_SYNC_MODEL
+            },
+            if dictation {
+                "provider_default"
+            } else {
+                ASSEMBLYAI_SYNC_MODEL
+            },
         );
+        facts
+            .fields_constructed
+            .insert("config".into(), serde_json::Value::Object(config.clone()));
+        if !dictation {
+            facts.fields_constructed.insert(
+                "X-AAI-Model".into(),
+                serde_json::json!(ASSEMBLYAI_SYNC_MODEL),
+            );
+        }
+        observations::asr_request(facts);
     }
-    observations::asr_request(facts);
     let config = serde_json::to_vec(&serde_json::Value::Object(config))
         .map_err(|_| AsrError::Other("ASR request configuration could not be encoded".into()))?;
     let config_part = Part::bytes(config)
@@ -2510,25 +2500,33 @@ async fn transcribe_deepgram(
         append_query_parameter(&mut url, "detect_language", "true");
     }
     append_deepgram_context(&mut url, model, prompt, keywords);
-    let mut facts = ResolvedRequest::new("deepgram_listen", &url, model, resolve_asr_model(model));
-    if let Ok(parsed_url) = reqwest::Url::parse(&url) {
-        for (field, value) in parsed_url.query_pairs() {
-            if !matches!(
-                field.as_ref(),
-                "smart_format" | "model" | "language" | "detect_language" | "keyterm" | "keywords"
-            ) {
-                continue;
-            }
-            let values = facts
-                .fields_constructed
-                .entry(field.into_owned())
-                .or_insert_with(|| serde_json::json!([]));
-            if let Some(values) = values.as_array_mut() {
-                values.push(serde_json::json!(value));
+    if observations::enabled() {
+        let mut facts =
+            ResolvedRequest::new("deepgram_listen", &url, model, resolve_asr_model(model));
+        if let Ok(parsed_url) = reqwest::Url::parse(&url) {
+            for (field, value) in parsed_url.query_pairs() {
+                if !matches!(
+                    field.as_ref(),
+                    "smart_format"
+                        | "model"
+                        | "language"
+                        | "detect_language"
+                        | "keyterm"
+                        | "keywords"
+                ) {
+                    continue;
+                }
+                let values = facts
+                    .fields_constructed
+                    .entry(field.into_owned())
+                    .or_insert_with(|| serde_json::json!([]));
+                if let Some(values) = values.as_array_mut() {
+                    values.push(serde_json::json!(value));
+                }
             }
         }
+        observations::asr_request(facts);
     }
-    observations::asr_request(facts);
     let client = http_client()?;
     let response = client
         .post(&url)
@@ -2762,7 +2760,6 @@ impl crate::queue::RetryError for AsrError {
             Self::Network(_) | Self::Timeout | Self::ContextAuthorizationChanged => {
                 crate::queue::RetryClass::Network
             }
-            Self::Server(_) => crate::queue::RetryClass::Server { retry_after: None },
             Self::RetryableServer { retry_after, .. } => crate::queue::RetryClass::Server {
                 retry_after: crate::queue::bounded_retry_after(retry_after.as_deref()),
             },

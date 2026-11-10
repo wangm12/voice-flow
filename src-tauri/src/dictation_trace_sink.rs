@@ -876,7 +876,7 @@ mod tests {
                 total_ms: 9,
                 stages: vec![(
                     if timestamp_ms == now - 99 {
-                        Stage::LmStudioStatusProbe
+                        Stage::TargetConfirmation
                     } else {
                         Stage::QueueWait
                     },
@@ -964,7 +964,7 @@ mod tests {
                     .0
             })
             .collect::<Vec<_>>();
-        assert!(retained_stages.contains(&Stage::LmStudioStatusProbe));
+        assert!(retained_stages.contains(&Stage::TargetConfirmation));
         assert!(retained_stages.contains(&Stage::QueueWait));
         let crash_temp = path.parent().unwrap().join(".dictation-trace-crashed.tmp");
         fs::write(&crash_temp, b"uncommitted sentinel\n").unwrap();

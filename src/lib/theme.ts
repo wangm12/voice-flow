@@ -63,8 +63,6 @@ export const inputClass = `vf-input ${radius.control} ${controlSize.input} min-w
 
 export const tagClass = `${radius.pill} inline-flex h-7 items-center gap-1.5 px-2.5 text-xs font-medium`;
 
-export const linkButtonClass = `${colors.accent.text} transition-opacity duration-150 hover:underline underline-offset-4 ${focusRingClass}`;
-
 export function validationMessage(status: string, translate: (source: string) => string = (source) => source): string {
   switch (status) {
     case "valid":
@@ -82,10 +80,4 @@ export function validationMessage(status: string, translate: (source: string) =>
     default:
       return translate("验证失败，请重试");
   }
-}
-
-export function validationTone(status: string): string {
-  if (status === "valid") return colors.semantic.success;
-  if (status === "invalid") return colors.semantic.error;
-  return colors.semantic.warning;
 }

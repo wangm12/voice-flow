@@ -270,6 +270,10 @@ pub(crate) struct DictationManager {
     pub(crate) phase: Phase,
     pub(crate) started: std::time::Instant,
     pub(crate) session_generation: u64,
+    /// Generation assigned when the current live recording started.
+    /// Recording-time resources such as the Soniox stream stay keyed by it
+    /// while the manager generation advances through stop and cancellation.
+    pub(crate) recording_generation: u64,
     /// Clipboard-writer ownership stays bound to the recording identity even
     /// when the manager generation advances through stop and cancellation.
     pub(crate) delivery_settlement: Option<std::sync::Arc<DeliverySettlementOwner>>,
@@ -295,6 +299,7 @@ impl DictationManager {
             phase: Phase::Idle,
             started: std::time::Instant::now(),
             session_generation: 0,
+            recording_generation: 0,
             delivery_settlement: None,
             cancellation: CancellationToken::new(),
             recording_context: None,
@@ -511,6 +516,7 @@ pub(crate) fn claim_start_manager(
     manager.research_trace = None;
     manager.phase = Phase::Starting;
     manager.session_generation = manager.session_generation.wrapping_add(1);
+    manager.recording_generation = manager.session_generation;
     manager.delivery_settlement =
         Some(DeliverySettlementOwner::new(DictationTransactionId::fresh()));
     manager.cancellation = CancellationToken::new();
@@ -847,7 +853,11 @@ pub(crate) fn enter_recording(
 ) -> Option<StopClaim> {
     manager.started = std::time::Instant::now();
     manager.phase = Phase::Recording;
-    manager.cancellation = CancellationToken::new();
+    // The Soniox stream started during Starting holds a child of this token,
+    // so keep it unless it was already cancelled.
+    if manager.cancellation.is_cancelled() {
+        manager.cancellation = CancellationToken::new();
+    }
     manager.recording_context = Some(recording_context);
     if !manager.stop_when_recording {
         return None;
@@ -1010,6 +1020,9 @@ fn clear_hotkey_session(manager: &mut DictationManager) {
 pub(crate) struct CancelClaim {
     pub(crate) phase: Phase,
     pub(crate) generation: u64,
+    /// Start generation of the cancelled recording; see
+    /// `DictationManager::recording_generation`.
+    pub(crate) recording_generation: u64,
     pub(crate) delivery_settlement: Option<std::sync::Arc<DeliverySettlementOwner>>,
     pub(crate) had_action: bool,
     pub(crate) text_action: Option<crate::TextActionIdentity>,
@@ -1029,6 +1042,7 @@ fn claim_cancel_for_interrupt_manager(manager: &mut DictationManager) -> Option<
     Some(CancelClaim {
         phase,
         generation: manager.session_generation,
+        recording_generation: manager.recording_generation,
         delivery_settlement,
         had_action: false,
         text_action: None,
@@ -1099,6 +1113,7 @@ fn claim_cancel_for_text_action(
     CancelClaim {
         phase,
         generation: manager.session_generation,
+        recording_generation: manager.recording_generation,
         delivery_settlement,
         had_action,
         text_action,
@@ -1290,7 +1305,7 @@ pub(crate) async fn execute_cancel_claim(
         }
         Phase::Recording => {
             cancel_prefetch_asr(state);
-            cancel_soniox_stream(state, claim.generation);
+            cancel_soniox_stream(state, claim.recording_generation);
             cancel_audio(state, app.clone()).await;
             finish_cancel_claim(
                 app,
@@ -1303,7 +1318,7 @@ pub(crate) async fn execute_cancel_claim(
         }
         Phase::Stopping => {
             cancel_prefetch_asr(state);
-            cancel_soniox_stream(state, claim.generation);
+            cancel_soniox_stream(state, claim.recording_generation);
             finish_cancel_claim(
                 app,
                 state,
@@ -1643,6 +1658,7 @@ fn claim_gesture(
                 EntryClaim::Cancel(CancelClaim {
                     phase: manager.phase,
                     generation: manager.session_generation,
+                    recording_generation: manager.recording_generation,
                     delivery_settlement: manager.delivery_settlement.clone(),
                     had_action: false,
                     text_action: None,
@@ -2448,6 +2464,7 @@ mod tests {
         CancelClaim {
             phase,
             generation: manager.session_generation,
+            recording_generation: manager.recording_generation,
             delivery_settlement,
             had_action: had_action || phase != Phase::Idle,
             text_action: None,

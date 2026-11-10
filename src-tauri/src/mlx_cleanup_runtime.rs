@@ -97,6 +97,7 @@ pub enum RuntimeError {
         requested_total_tokens: Option<usize>,
         max_total_tokens: usize,
     },
+    SpecializedInputTooLarge,
     Timeout,
     Cancelled,
     StartupWarmupYielded {
@@ -136,6 +137,9 @@ impl std::fmt::Display for RuntimeError {
             Self::ModelNotLoaded => "The local cleanup model is not loaded.",
             Self::InputTooLarge { .. } => {
                 "The local cleanup prompt and requested output exceed the token budget."
+            }
+            Self::SpecializedInputTooLarge => {
+                "S1-mini by Superwhisper accepts transcript prompts up to roughly 1,000 tokens."
             }
             Self::Timeout => "Local MLX cleanup timed out.",
             Self::Cancelled => "Local MLX cleanup was cancelled.",
@@ -260,6 +264,8 @@ struct Request {
     request_id: String,
     session_id: Option<String>,
     model_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    language: Option<String>,
     op: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     model_id: Option<String>,
@@ -274,14 +280,25 @@ struct Request {
 }
 
 impl Request {
+    #[cfg(test)]
     fn cancel(request_id: String, session_id: Option<String>) -> Self {
+        Self::cancel_for(MODEL_ID, MODEL_REVISION, request_id, session_id)
+    }
+
+    fn cancel_for(
+        model_id: &str,
+        model_revision: &str,
+        request_id: String,
+        session_id: Option<String>,
+    ) -> Self {
         Self {
             protocol_version: PROTOCOL_VERSION,
             request_id,
             session_id,
-            model_version: Some(MODEL_REVISION.to_owned()),
+            model_version: Some(model_revision.to_owned()),
+            language: None,
             op: "cancel".to_owned(),
-            model_id: Some(MODEL_ID.to_owned()),
+            model_id: Some(model_id.to_owned()),
             model_directory: None,
             messages: None,
             max_output_tokens: None,
@@ -289,19 +306,60 @@ impl Request {
         }
     }
 
+    #[cfg(test)]
     fn cleanup(
         request_id: String,
         session_id: Option<String>,
         messages: Vec<(String, String)>,
         stable_prefix_user_bytes: Option<usize>,
     ) -> Self {
+        Self::cleanup_for(
+            MODEL_ID,
+            MODEL_REVISION,
+            request_id,
+            session_id,
+            messages,
+            stable_prefix_user_bytes,
+        )
+    }
+
+    #[cfg(test)]
+    fn cleanup_for(
+        model_id: &str,
+        model_revision: &str,
+        request_id: String,
+        session_id: Option<String>,
+        messages: Vec<(String, String)>,
+        stable_prefix_user_bytes: Option<usize>,
+    ) -> Self {
+        Self::cleanup_for_with_language(
+            model_id,
+            model_revision,
+            request_id,
+            session_id,
+            messages,
+            stable_prefix_user_bytes,
+            None,
+        )
+    }
+
+    fn cleanup_for_with_language(
+        model_id: &str,
+        model_revision: &str,
+        request_id: String,
+        session_id: Option<String>,
+        messages: Vec<(String, String)>,
+        stable_prefix_user_bytes: Option<usize>,
+        language: Option<String>,
+    ) -> Self {
         Self {
             protocol_version: PROTOCOL_VERSION,
             request_id,
             session_id,
-            model_version: Some(MODEL_REVISION.to_owned()),
+            model_version: Some(model_revision.to_owned()),
+            language,
             op: "cleanup".to_owned(),
-            model_id: Some(MODEL_ID.to_owned()),
+            model_id: Some(model_id.to_owned()),
             model_directory: None,
             messages: Some(
                 messages
@@ -311,6 +369,27 @@ impl Request {
             ),
             max_output_tokens: Some(MAX_OUTPUT_TOKENS),
             stable_prefix_user_bytes,
+        }
+    }
+
+    fn unload_for(
+        model_id: &str,
+        model_revision: &str,
+        request_id: String,
+        session_id: Option<String>,
+    ) -> Self {
+        Self {
+            protocol_version: PROTOCOL_VERSION,
+            request_id,
+            session_id,
+            model_version: Some(model_revision.to_owned()),
+            language: None,
+            op: "unload".to_owned(),
+            model_id: Some(model_id.to_owned()),
+            model_directory: None,
+            messages: None,
+            max_output_tokens: None,
+            stable_prefix_user_bytes: None,
         }
     }
 
@@ -325,6 +404,7 @@ impl Request {
             request_id,
             session_id,
             model_version: Some(MODEL_REVISION.to_owned()),
+            language: None,
             op: "warmup".to_owned(),
             model_id: Some(MODEL_ID.to_owned()),
             model_directory: None,
@@ -594,6 +674,7 @@ impl Drop for ProcessOwner {
 pub struct Runtime {
     models_root: PathBuf,
     manager: Manager,
+    catalog: modelstore::MlxCatalogManager,
     sequence: AtomicU64,
     child_sequence: AtomicU64,
     shutting_down: Arc<AtomicBool>,
@@ -655,10 +736,29 @@ impl Runtime {
         Self::new(models_root, Manager::new())
     }
 
+    #[cfg(test)]
+    pub(crate) fn new_for_demand_test_with_catalog(
+        models_root: PathBuf,
+        manager: Manager,
+        catalog: modelstore::MlxCatalogManager,
+    ) -> Self {
+        Self::new_with_catalog(models_root, manager, catalog)
+    }
+
+    #[cfg(test)]
     fn new(models_root: PathBuf, manager: Manager) -> Self {
+        Self::new_with_catalog(models_root, manager, modelstore::MlxCatalogManager::new())
+    }
+
+    fn new_with_catalog(
+        models_root: PathBuf,
+        manager: Manager,
+        catalog: modelstore::MlxCatalogManager,
+    ) -> Self {
         Self {
             models_root,
             manager,
+            catalog,
             sequence: AtomicU64::new(0),
             child_sequence: AtomicU64::new(0),
             shutting_down: Arc::new(AtomicBool::new(false)),
@@ -803,29 +903,39 @@ impl Runtime {
         }
     }
 
-    pub async fn complete(
+    pub async fn complete_model(
         &self,
+        model_id: &str,
         messages: Vec<(String, String)>,
     ) -> Result<Completion, RuntimeError> {
-        self.complete_with_source_history(messages, None).await
-    }
-
-    pub(crate) async fn complete_with_source_history(
-        &self,
-        messages: Vec<(String, String)>,
-        source_history_id: Option<i64>,
-    ) -> Result<Completion, RuntimeError> {
-        self.complete_with_source_history_and_prefix(messages, source_history_id, None)
+        self.complete_model_with_source_history(model_id, messages, None)
             .await
     }
 
-    pub(crate) async fn complete_with_source_history_and_prefix(
+    pub(crate) async fn complete_model_with_source_history(
         &self,
+        model_id: &str,
+        messages: Vec<(String, String)>,
+        source_history_id: Option<i64>,
+    ) -> Result<Completion, RuntimeError> {
+        self.complete_model_with_source_history_and_prefix(
+            model_id,
+            messages,
+            source_history_id,
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn complete_model_with_source_history_and_prefix(
+        &self,
+        model_id: &str,
         messages: Vec<(String, String)>,
         source_history_id: Option<i64>,
         stable_prefix_user_bytes: Option<usize>,
     ) -> Result<Completion, RuntimeError> {
-        self.complete_with_source_history_and_prefix_traced(
+        self.complete_model_with_source_history_and_prefix_traced(
+            model_id,
             messages,
             source_history_id,
             stable_prefix_user_bytes,
@@ -834,6 +944,7 @@ impl Runtime {
         .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn complete_with_source_history_and_prefix_traced(
         &self,
         messages: Vec<(String, String)>,
@@ -841,6 +952,60 @@ impl Runtime {
         stable_prefix_user_bytes: Option<usize>,
         trace: Option<crate::metrics::TraceHandle>,
     ) -> Result<Completion, RuntimeError> {
+        self.complete_model_with_source_history_and_prefix_traced(
+            MODEL_ID,
+            messages,
+            source_history_id,
+            stable_prefix_user_bytes,
+            trace,
+        )
+        .await
+    }
+
+    pub(crate) async fn complete_model_with_source_history_and_prefix_traced(
+        &self,
+        model_id: &str,
+        messages: Vec<(String, String)>,
+        source_history_id: Option<i64>,
+        stable_prefix_user_bytes: Option<usize>,
+        trace: Option<crate::metrics::TraceHandle>,
+    ) -> Result<Completion, RuntimeError> {
+        self.complete_model_with_source_language_and_history_and_prefix_traced(
+            model_id,
+            messages,
+            source_history_id,
+            stable_prefix_user_bytes,
+            None,
+            trace,
+        )
+        .await
+    }
+
+    pub(crate) async fn complete_model_with_source_language_and_history_and_prefix_traced(
+        &self,
+        model_id: &str,
+        messages: Vec<(String, String)>,
+        source_history_id: Option<i64>,
+        stable_prefix_user_bytes: Option<usize>,
+        source_language: Option<&str>,
+        trace: Option<crate::metrics::TraceHandle>,
+    ) -> Result<Completion, RuntimeError> {
+        // The pinned catalog and verified inventory establish whether the
+        // runtime can load a model. Curated availability controls new
+        // downloads and settings selection; release-quality qualification is
+        // a separate status and does not block saved legacy routes.
+        if model_id != MODEL_ID && self.catalog.model(model_id).is_none() {
+            return Err(RuntimeError::ModelMismatch);
+        }
+        if source_language.is_some_and(|language| {
+            model_id != crate::modelstore::S1_MINI_MLX_ID || language != "en"
+        }) || (model_id == crate::modelstore::S1_MINI_MLX_ID && source_language != Some("en"))
+        {
+            return Err(RuntimeError::ModelMismatch);
+        }
+        let stable_prefix_user_bytes = (model_id == MODEL_ID)
+            .then_some(stable_prefix_user_bytes)
+            .flatten();
         let request_id = self.next_id();
         let session_generation = trace
             .as_ref()
@@ -869,8 +1034,10 @@ impl Runtime {
         let result = match tokio::time::timeout(
             OPERATION_TIMEOUT,
             self.complete_bounded(
+                model_id.to_owned(),
                 messages,
                 stable_prefix_user_bytes,
+                source_language.map(str::to_owned),
                 started,
                 request_id,
                 source_history_id,
@@ -1022,8 +1189,10 @@ impl Runtime {
         let result = match tokio::time::timeout(
             OPERATION_TIMEOUT,
             self.complete_bounded(
+                MODEL_ID.to_owned(),
                 messages,
                 stable_prefix_user_bytes,
+                None,
                 started,
                 request_id.clone(),
                 "none".to_owned(),
@@ -1228,8 +1397,10 @@ impl Runtime {
     )]
     async fn complete_bounded(
         &self,
+        model_id: String,
         messages: Vec<(String, String)>,
         stable_prefix_user_bytes: Option<usize>,
+        source_language: Option<String>,
         request_started: Instant,
         request_id: String,
         source_history_id: String,
@@ -1334,6 +1505,7 @@ impl Runtime {
 
         let model_timing = match self
             .ensure_model_loaded(
+                &model_id,
                 &mut session,
                 &request_id,
                 child_generation,
@@ -1444,12 +1616,18 @@ impl Runtime {
         );
         let session_id = Some(self.next_id());
         let request = match operation {
-            RuntimeOperation::Cleanup => Request::cleanup(
-                request_id.clone(),
-                session_id,
-                messages,
-                stable_prefix_user_bytes,
-            ),
+            RuntimeOperation::Cleanup => {
+                let revision = self.model_revision(&model_id)?;
+                Request::cleanup_for_with_language(
+                    &model_id,
+                    revision,
+                    request_id.clone(),
+                    session_id,
+                    messages,
+                    stable_prefix_user_bytes,
+                    source_language,
+                )
+            }
             RuntimeOperation::StartupWarmup => Request::startup_warmup(
                 request_id.clone(),
                 session_id,
@@ -1463,7 +1641,12 @@ impl Runtime {
             .process
             .cancel
             .clone();
-        let cancel_request = Request::cancel(self.next_id(), request.session_id.clone());
+        let cancel_request = Request::cancel_for(
+            request.model_id.as_deref().unwrap_or(MODEL_ID),
+            request.model_version.as_deref().unwrap_or(MODEL_REVISION),
+            self.next_id(),
+            request.session_id.clone(),
+        );
         let caller_cancel = CancellationToken::new();
         let mut request_guard =
             CancelGenerationOnDrop::new(caller_cancel.clone(), Arc::clone(&self.phase));
@@ -1732,10 +1915,11 @@ impl Runtime {
         .elapsed_ms(generation_exchange_started.elapsed().as_secs_f64() * 1_000.0)
         .response_status(&response.status)
         .emit();
+        let expected_model_revision = self.model_revision(&model_id)?;
         let cleanup_model_identity_mismatch = operation == RuntimeOperation::Cleanup
             && response.status == "completed"
-            && (response.loaded_model_id.as_deref() != Some(MODEL_ID)
-                || response.loaded_model_version.as_deref() != Some(MODEL_REVISION));
+            && (response.loaded_model_id.as_deref() != Some(model_id.as_str())
+                || response.loaded_model_version.as_deref() != Some(expected_model_revision));
         if !response_matches(&caller_request, &response)
             || response.platform_supported != Some(true)
             || cleanup_model_identity_mismatch
@@ -1827,8 +2011,8 @@ impl Runtime {
             terminal_event.emit();
             let pre_generation_budget_rejection =
                 matches!(&error, RuntimeError::InputTooLarge { .. })
-                    && response.loaded_model_id.as_deref() == Some(MODEL_ID)
-                    && response.loaded_model_version.as_deref() == Some(MODEL_REVISION);
+                    && response.loaded_model_id.as_deref() == Some(model_id.as_str())
+                    && response.loaded_model_version.as_deref() == Some(expected_model_revision);
             let safe_to_reuse_session = pre_generation_budget_rejection
                 || response.error.as_ref().is_some_and(|failure| {
                     matches!(
@@ -1836,8 +2020,9 @@ impl Runtime {
                         "generation_incomplete" | "response_too_large" | "invalid_request"
                     ) || (operation == RuntimeOperation::StartupWarmup
                         && failure.code == "warmup_incomplete"
-                        && response.loaded_model_id.as_deref() == Some(MODEL_ID)
-                        && response.loaded_model_version.as_deref() == Some(MODEL_REVISION))
+                        && response.loaded_model_id.as_deref() == Some(model_id.as_str())
+                        && response.loaded_model_version.as_deref()
+                            == Some(expected_model_revision))
                 });
             if !safe_to_reuse_session {
                 let close = self.retire_session(&mut session, CHILD_EXIT_TIMEOUT).await;
@@ -1864,8 +2049,8 @@ impl Runtime {
             );
             return Err(error);
         }
-        if response.loaded_model_id.as_deref() != Some(MODEL_ID)
-            || response.loaded_model_version.as_deref() != Some(MODEL_REVISION)
+        if response.loaded_model_id.as_deref() != Some(model_id.as_str())
+            || response.loaded_model_version.as_deref() != Some(expected_model_revision)
         {
             let close = self.retire_session(&mut session, CHILD_EXIT_TIMEOUT).await;
             operation_guard.disarm();
@@ -2134,14 +2319,19 @@ impl Runtime {
     }
 
     pub async fn unload(&self) -> Result<(), String> {
-        let result = tokio::time::timeout(OPERATION_TIMEOUT, self.unload_bounded()).await;
+        self.unload_model(None).await
+    }
+
+    pub async fn unload_model(&self, model_id: Option<&str>) -> Result<(), String> {
+        let model_id = model_id.map(str::to_owned);
+        let result = tokio::time::timeout(OPERATION_TIMEOUT, self.unload_bounded(model_id)).await;
         match result {
             Ok(result) => result,
             Err(_) => Err(RuntimeError::Timeout.to_string()),
         }
     }
 
-    async fn unload_bounded(&self) -> Result<(), String> {
+    async fn unload_bounded(&self, model_id: Option<String>) -> Result<(), String> {
         let cleanup_gate = Arc::clone(cleanup_operation_gate());
         let cleanup_guard = tokio::time::timeout(CHILD_EXIT_TIMEOUT, cleanup_gate.lock_owned())
             .await
@@ -2168,22 +2358,22 @@ impl Runtime {
             self.phase.store(PHASE_STOPPING, Ordering::Release);
             return Err(RuntimeError::RetainedPending.to_string());
         }
-        if existing.model.is_none() {
+        let Some(loaded_model) = existing.model.clone() else {
             self.phase.store(PHASE_NOT_LOADED, Ordering::Release);
             return Ok(());
-        }
-        let request = Request {
-            protocol_version: PROTOCOL_VERSION,
-            request_id: self.next_id(),
-            session_id: Some(self.next_id()),
-            model_version: Some(MODEL_REVISION.to_owned()),
-            op: "unload".to_owned(),
-            model_id: Some(MODEL_ID.to_owned()),
-            model_directory: None,
-            messages: None,
-            max_output_tokens: None,
-            stable_prefix_user_bytes: None,
         };
+        if model_id
+            .as_deref()
+            .is_some_and(|id| id != loaded_model.id())
+        {
+            return Ok(());
+        }
+        let request = Request::unload_for(
+            loaded_model.id(),
+            loaded_model.revision(),
+            self.next_id(),
+            Some(self.next_id()),
+        );
         let token = session
             .as_ref()
             .expect("session exists")
@@ -2500,6 +2690,7 @@ impl Runtime {
             request_id: self.next_id(),
             session_id: None,
             model_version: None,
+            language: None,
             op: "hello".to_owned(),
             model_id: None,
             model_directory: None,
@@ -2562,21 +2753,39 @@ impl Runtime {
         Ok(())
     }
 
+    fn model_revision(&self, model_id: &str) -> Result<&'static str, RuntimeError> {
+        if model_id == MODEL_ID {
+            return Ok(MODEL_REVISION);
+        }
+        self.catalog
+            .model(model_id)
+            .map(|model| model.revision)
+            .ok_or(RuntimeError::ModelMismatch)
+    }
+
     async fn ensure_model_loaded(
         &self,
+        model_id: &str,
         session: &mut Option<ChildSession>,
         request_id: &str,
         child_generation: u64,
         session_generation: Option<u64>,
         trace: Option<crate::metrics::TraceHandle>,
     ) -> Result<Option<ModelLoadTiming>, RuntimeError> {
+        let model_descriptor = if model_id == MODEL_ID {
+            &modelstore::LEGACY_QWEN_38_MODEL
+        } else {
+            self.catalog
+                .model(model_id)
+                .ok_or(RuntimeError::ModelMismatch)?
+        };
         if session
             .as_ref()
             .and_then(|child| child.model.as_ref())
             .is_some_and(|model| {
-                model.id() == MODEL_ID
-                    && model.revision() == MODEL_REVISION
-                    && model.manifest_sha256() == modelstore::MANIFEST_SHA256
+                model.id() == model_descriptor.id
+                    && model.revision() == model_descriptor.revision
+                    && model.manifest_sha256() == model_descriptor.manifest_sha256
             })
         {
             self.phase.store(PHASE_READY, Ordering::Release);
@@ -2590,9 +2799,67 @@ impl Runtime {
                 .emit();
             return Ok(None);
         }
+        if let Some(loaded_model) = session
+            .as_ref()
+            .and_then(|child| child.model.as_ref())
+            .cloned()
+        {
+            let unload = Request::unload_for(
+                loaded_model.id(),
+                loaded_model.revision(),
+                self.next_id(),
+                Some(self.next_id()),
+            );
+            let response = match exchange(
+                session.as_mut().ok_or(RuntimeError::SidecarMissing)?,
+                &unload,
+                MODEL_LOAD_TIMEOUT,
+            )
+            .await
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    let close = self.retire_session(session, CHILD_EXIT_TIMEOUT).await;
+                    if let Err(close_error) = close {
+                        self.phase.store(PHASE_STOPPING, Ordering::Release);
+                        return Err(error_after_child_retirement(error, close_error));
+                    }
+                    self.phase.store(PHASE_NOT_LOADED, Ordering::Release);
+                    return Err(error);
+                }
+            };
+            if !response_matches(&unload, &response)
+                || response.status != "unloaded"
+                || response.loaded_model_id.is_some()
+                || response.loaded_model_version.is_some()
+            {
+                let close = self.retire_session(session, CHILD_EXIT_TIMEOUT).await;
+                if let Err(close_error) = close {
+                    self.phase.store(PHASE_STOPPING, Ordering::Release);
+                    return Err(close_error);
+                }
+                self.phase.store(PHASE_NOT_LOADED, Ordering::Release);
+                return Err(RuntimeError::InvalidResponse);
+            }
+            let child = session.as_mut().ok_or(RuntimeError::SidecarMissing)?;
+            child.model = None;
+            child
+                .process
+                .lease_slot
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take();
+            self.model_resident.store(false, Ordering::Release);
+        }
         self.phase.store(PHASE_LOADING, Ordering::Release);
         let validation_started = Instant::now();
-        let manager = self.manager.clone();
+        let manager = if model_id == MODEL_ID {
+            self.manager.clone()
+        } else {
+            self.catalog
+                .manager(model_id)
+                .map_err(|_| RuntimeError::ModelMismatch)?
+        };
         let root = self.models_root.clone();
         let trace_request_id = request_id.to_owned();
         #[cfg(test)]
@@ -2683,14 +2950,14 @@ impl Runtime {
         let inventory_file_count_valid = if self.test_tiny_model {
             model.files().len() == 2
         } else {
-            model.files().len() == modelstore::MODEL_FILES.len()
+            model.files().len() == model_descriptor.files.len()
         };
         #[cfg(not(test))]
-        let inventory_file_count_valid = model.files().len() == modelstore::MODEL_FILES.len();
-        if model.id() != MODEL_ID
-            || model.repository() != modelstore::REPOSITORY
-            || model.revision() != MODEL_REVISION
-            || model.manifest_sha256() != modelstore::MANIFEST_SHA256
+        let inventory_file_count_valid = model.files().len() == model_descriptor.files.len();
+        if model.id() != model_descriptor.id
+            || model.repository() != model_descriptor.repository
+            || model.revision() != model_descriptor.revision
+            || model.manifest_sha256() != model_descriptor.manifest_sha256
             || !inventory_file_count_valid
         {
             return Err(RuntimeError::ModelUnavailable);
@@ -2704,6 +2971,7 @@ impl Runtime {
             request_id: self.next_id(),
             session_id: Some(self.next_id()),
             model_version: Some(model.revision().to_owned()),
+            language: None,
             op: "load".to_owned(),
             model_id: Some(model.id().to_owned()),
             model_directory: Some(directory.to_string_lossy().into_owned()),
@@ -2716,8 +2984,8 @@ impl Runtime {
             .process
             .registration
             .admit_cold_load(
-                MODEL_ID,
-                MODEL_REVISION,
+                model.id(),
+                model.revision(),
                 crate::model_resources::LoadKind::Cleanup,
             )
             .map_err(|reason| {
@@ -2747,7 +3015,7 @@ impl Runtime {
             .session_generation(session_generation)
             .child_generation(child_generation)
             .phase("dispatched")
-            .model_identity(MODEL_ID, MODEL_REVISION)
+            .model_identity(model.id(), model.revision())
             .reused_model(false, false, true)
             .emit();
         let exchange_result = exchange(
@@ -2773,8 +3041,8 @@ impl Runtime {
             load_reservation,
             &request,
             &response,
-            MODEL_ID,
-            MODEL_REVISION,
+            model.id(),
+            model.revision(),
         );
         if let Some(span) = &mut model_load_span {
             span.finish();
@@ -2783,8 +3051,8 @@ impl Runtime {
         request_guard.disarm();
         if !response_matches(&request, &response)
             || response.status != "loaded"
-            || response.loaded_model_id.as_deref() != Some(MODEL_ID)
-            || response.loaded_model_version.as_deref() != Some(MODEL_REVISION)
+            || response.loaded_model_id.as_deref() != Some(model.id())
+            || response.loaded_model_version.as_deref() != Some(model.revision())
         {
             let error = map_sidecar_error(response.error.as_ref());
             mlx_diagnostics::event(EventName::CleanupModelLoad, Severity::Warn, Target::Runtime)
@@ -3133,6 +3401,7 @@ fn runtime_error_code(error: &RuntimeError) -> &'static str {
         RuntimeError::MemoryUnavailable(_) => "local_memory_unavailable",
         RuntimeError::ModelNotLoaded => "model_not_loaded",
         RuntimeError::InputTooLarge { .. } => "input_too_large",
+        RuntimeError::SpecializedInputTooLarge => "model_input_too_large",
         RuntimeError::Timeout => "timeout",
         RuntimeError::Cancelled => "cancelled",
         RuntimeError::StartupWarmupYielded { .. } => "startup_warmup_yielded",
@@ -3152,6 +3421,7 @@ fn runtime_error_stage(error: &RuntimeError) -> &'static str {
         RuntimeError::CriticalMemoryPressure => "model_admission",
         RuntimeError::MemoryUnavailable(_) => "model_admission",
         RuntimeError::InputTooLarge { .. } => "prompt_admission",
+        RuntimeError::SpecializedInputTooLarge => "model_input_admission",
         RuntimeError::Timeout => "timeout",
         RuntimeError::Cancelled => "cancellation",
         RuntimeError::StartupWarmupYielded { .. } => "foreground_demand",
@@ -3166,7 +3436,7 @@ fn runtime_error_outcome(error: &RuntimeError) -> &'static str {
         RuntimeError::Cancelled => "cancelled",
         RuntimeError::StartupWarmupYielded { .. } => "yielded",
         RuntimeError::Timeout => "timeout",
-        RuntimeError::InputTooLarge { .. } => "rejected",
+        RuntimeError::InputTooLarge { .. } | RuntimeError::SpecializedInputTooLarge => "rejected",
         _ => "failed",
     }
 }
@@ -3201,8 +3471,14 @@ fn completed_response_is_safe_to_reuse(request: &Request, response: &Response) -
     response_matches(request, response)
         && response.status == "completed"
         && response.platform_supported == Some(true)
-        && response.loaded_model_id.as_deref() == Some(MODEL_ID)
-        && response.loaded_model_version.as_deref() == Some(MODEL_REVISION)
+        && request
+            .model_id
+            .as_deref()
+            .is_some_and(|model_id| response.loaded_model_id.as_deref() == Some(model_id))
+        && request
+            .model_version
+            .as_deref()
+            .is_some_and(|revision| response.loaded_model_version.as_deref() == Some(revision))
 }
 
 async fn settle_unclaimed_response(
@@ -3384,19 +3660,28 @@ fn valid_cancel_pair(
     terminal: &Response,
     acknowledgement: &Response,
 ) -> bool {
+    let expected_model_id = original_request.model_id.as_deref();
+    let expected_model_version = original_request.model_version.as_deref();
     response_matches(original_request, terminal)
+        && expected_model_id.is_some()
+        && expected_model_version.is_some()
+        && cancel_request.op == "cancel"
+        && cancel_request.protocol_version == original_request.protocol_version
+        && cancel_request.session_id == original_request.session_id
+        && cancel_request.model_id.as_deref() == expected_model_id
+        && cancel_request.model_version.as_deref() == expected_model_version
         && terminal.status == "cancelled"
         && terminal.platform_supported == Some(true)
-        && terminal.loaded_model_id.as_deref() == Some(MODEL_ID)
-        && terminal.loaded_model_version.as_deref() == Some(MODEL_REVISION)
+        && terminal.loaded_model_id.as_deref() == expected_model_id
+        && terminal.loaded_model_version.as_deref() == expected_model_version
         && terminal.cleanup_result.is_none()
         && terminal.warmup_result.is_none()
         && terminal.error.is_none()
         && response_matches(cancel_request, acknowledgement)
         && acknowledgement.status == "cancelled"
         && acknowledgement.platform_supported == Some(true)
-        && acknowledgement.loaded_model_id.as_deref() == Some(MODEL_ID)
-        && acknowledgement.loaded_model_version.as_deref() == Some(MODEL_REVISION)
+        && acknowledgement.loaded_model_id.as_deref() == expected_model_id
+        && acknowledgement.loaded_model_version.as_deref() == expected_model_version
         && acknowledgement.cleanup_result.is_none()
         && acknowledgement.warmup_result.is_none()
         && acknowledgement.error.is_none()
@@ -3604,6 +3889,7 @@ fn map_sidecar_error(failure: Option<&SidecarFailure>) -> RuntimeError {
         };
     }
     match failure.map(|failure| failure.code.as_str()) {
+        Some("model_input_too_large") => RuntimeError::SpecializedInputTooLarge,
         Some("unsupported_platform") => RuntimeError::UnsupportedPlatform,
         Some("model_unavailable" | "invalid_model" | "model_version_mismatch") => {
             RuntimeError::ModelUnavailable
@@ -3687,7 +3973,13 @@ pub fn shared_runtime(models_root: &Path, manager: Manager) -> Arc<Runtime> {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     map.entry(key.clone())
-        .or_insert_with(|| Arc::new(Runtime::new(key, manager)))
+        .or_insert_with(|| {
+            Arc::new(Runtime::new_with_catalog(
+                key,
+                manager,
+                modelstore::shared_catalog_manager(),
+            ))
+        })
         .clone()
 }
 
@@ -4163,8 +4455,8 @@ mod tests {
         assert_ne!(original.request_id, cancel.request_id);
         let terminal_base = serde_json::json!({
             "protocol_version": PROTOCOL_VERSION,
-            "request_id": original.request_id,
-            "session_id": original.session_id,
+            "request_id": &original.request_id,
+            "session_id": &original.session_id,
             "model_version": MODEL_REVISION,
             "op": "cleanup",
             "status": "cancelled",
@@ -4177,8 +4469,8 @@ mod tests {
         });
         let acknowledgement_base = serde_json::json!({
             "protocol_version": PROTOCOL_VERSION,
-            "request_id": cancel.request_id,
-            "session_id": cancel.session_id,
+            "request_id": &cancel.request_id,
+            "session_id": &cancel.session_id,
             "model_version": MODEL_REVISION,
             "op": "cancel",
             "status": "cancelled",
@@ -4263,6 +4555,101 @@ mod tests {
         let mut malformed_acknowledgement = acknowledgement_base;
         malformed_acknowledgement["warmup_result"] = serde_json::json!({"status": "evaluated"});
         assert!(serde_json::from_value::<Response>(malformed_acknowledgement).is_err());
+    }
+
+    #[test]
+    fn candidate_cancel_and_unclaimed_completion_use_the_requested_model_identity() {
+        let original = Request::cleanup_for(
+            modelstore::QWEN_35_2B_MLX_ID,
+            modelstore::QWEN_35_2B_MLX_REVISION,
+            "synthetic-candidate-cleanup".to_owned(),
+            Some("synthetic-candidate-session".to_owned()),
+            vec![
+                ("system".to_owned(), "synthetic prompt".to_owned()),
+                ("user".to_owned(), "synthetic input".to_owned()),
+            ],
+            None,
+        );
+        let cancel = Request::cancel_for(
+            modelstore::QWEN_35_2B_MLX_ID,
+            modelstore::QWEN_35_2B_MLX_REVISION,
+            "synthetic-candidate-cancel".to_owned(),
+            original.session_id.clone(),
+        );
+        let terminal: Response = serde_json::from_value(serde_json::json!({
+            "protocol_version": PROTOCOL_VERSION,
+            "request_id": &original.request_id,
+            "session_id": &original.session_id,
+            "model_version": modelstore::QWEN_35_2B_MLX_REVISION,
+            "op": "cleanup",
+            "status": "cancelled",
+            "platform_supported": true,
+            "loaded_model_id": modelstore::QWEN_35_2B_MLX_ID,
+            "loaded_model_version": modelstore::QWEN_35_2B_MLX_REVISION
+        }))
+        .expect("candidate terminal response");
+        let acknowledgement: Response = serde_json::from_value(serde_json::json!({
+            "protocol_version": PROTOCOL_VERSION,
+            "request_id": cancel.request_id,
+            "session_id": cancel.session_id,
+            "model_version": modelstore::QWEN_35_2B_MLX_REVISION,
+            "op": "cancel",
+            "status": "cancelled",
+            "platform_supported": true,
+            "loaded_model_id": modelstore::QWEN_35_2B_MLX_ID,
+            "loaded_model_version": modelstore::QWEN_35_2B_MLX_REVISION
+        }))
+        .expect("candidate cancel acknowledgement");
+        assert!(valid_cancel_pair(
+            &original,
+            &cancel,
+            &terminal,
+            &acknowledgement
+        ));
+
+        let completed: Response = serde_json::from_value(serde_json::json!({
+            "protocol_version": PROTOCOL_VERSION,
+            "request_id": original.request_id,
+            "session_id": original.session_id,
+            "model_version": modelstore::QWEN_35_2B_MLX_REVISION,
+            "op": "cleanup",
+            "status": "completed",
+            "platform_supported": true,
+            "loaded_model_id": modelstore::QWEN_35_2B_MLX_ID,
+            "loaded_model_version": modelstore::QWEN_35_2B_MLX_REVISION
+        }))
+        .expect("candidate completed response");
+        assert!(completed_response_is_safe_to_reuse(&original, &completed));
+    }
+
+    #[test]
+    fn cleanup_request_serializes_source_language_only_when_explicitly_supplied() {
+        let messages = vec![
+            ("system".to_owned(), "system prompt".to_owned()),
+            ("user".to_owned(), "[Styling: semi-casual] body".to_owned()),
+        ];
+        let request = Request::cleanup_for_with_language(
+            modelstore::S1_MINI_MLX_ID,
+            "5cbd7aec3401144f88a331d385c40b65fd2548eb",
+            "synthetic-s1-cleanup".to_owned(),
+            Some("synthetic-s1-session".to_owned()),
+            messages.clone(),
+            None,
+            Some("en".to_owned()),
+        );
+        let encoded = serde_json::to_value(request).expect("serialize S1 cleanup request");
+        assert_eq!(encoded["language"], "en");
+
+        let ordinary = Request::cleanup_for(
+            modelstore::QWEN_35_2B_MLX_ID,
+            modelstore::QWEN_35_2B_MLX_REVISION,
+            "synthetic-qwen-cleanup".to_owned(),
+            Some("synthetic-qwen-session".to_owned()),
+            messages,
+            None,
+        );
+        let ordinary = serde_json::to_value(ordinary).expect("serialize ordinary cleanup request");
+        assert!(ordinary.get("language").is_none());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -5411,8 +5798,6 @@ for line in sys.stdin:
                         &runtime,
                         crate::providers::EngineProvider::OnDeviceMlx.default_llm_model(),
                         &asr_transcript,
-                        &[],
-                        None,
                         None,
                         None,
                         None,
@@ -7634,8 +8019,7 @@ for line in sys.stdin:
                         crate::llm::cleanup_with_on_device_mlx_runtime_and_intent_and_source(
                             &runtime,
                             crate::providers::EngineProvider::OnDeviceMlx.default_llm_model(),
-                            "synthetic dictation N",
-                            &[], None, None, None, None, None, None,
+                            "synthetic dictation N", None, None, None, None, None,
                             crate::llm::CleanupEffort::Standard,
                             None, None, None,
                             Some(&trace_n),
@@ -7664,8 +8048,7 @@ for line in sys.stdin:
                         crate::llm::cleanup_with_on_device_mlx_runtime_and_intent_and_source(
                             &runtime,
                             crate::providers::EngineProvider::OnDeviceMlx.default_llm_model(),
-                            "synthetic dictation N plus one",
-                            &[], None, None, None, None, None, None,
+                            "synthetic dictation N plus one", None, None, None, None, None,
                             crate::llm::CleanupEffort::Standard,
                             None, None, None,
                             Some(&trace_n1),
@@ -7933,6 +8316,16 @@ for line in sys.stdin:
     }
 
     #[test]
+    fn s1_specialized_token_limit_uses_no_general_token_budget_facts() {
+        let failure: SidecarFailure = serde_json::from_str(r#"{"code":"model_input_too_large"}"#)
+            .expect("S1 returns its dedicated model-specific cap without token estimates");
+        assert!(matches!(
+            map_sidecar_error(Some(&failure)),
+            RuntimeError::SpecializedInputTooLarge
+        ));
+    }
+
+    #[test]
     fn malformed_or_non_exceeding_token_budget_facts_are_not_trusted() {
         for json in [
             r#"{"code":"input_too_large","prompt_tokens":6145,"requested_output_tokens":2048,"requested_total_tokens":8193,"max_total_tokens":4096}"#,
@@ -8048,6 +8441,7 @@ for line in sys.stdin:
             request_id: "load-request".into(),
             session_id: Some("load-session".into()),
             model_version: Some(MODEL_REVISION.into()),
+            language: None,
             op: "load".into(),
             model_id: Some(MODEL_ID.into()),
             model_directory: Some("/fixture/model".into()),
@@ -8205,5 +8599,313 @@ for line in sys.stdin:
                 "{name} pending reservation"
             );
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires a pinned native cleanup model fixture and staged MLX sidecar"]
+    async fn mlx_cleanup_model_catalog_restart_settings_and_native_cleanup_smoke() {
+        let models_root = std::env::var_os("VOICEFLOW_MLX_RUST_SMOKE_MODELS_ROOT")
+            .map(PathBuf::from)
+            .expect("set VOICEFLOW_MLX_RUST_SMOKE_MODELS_ROOT to the isolated fixture");
+        let selected_model_id = std::env::var("VOICEFLOW_MLX_CATALOG_SMOKE_MODEL_ID")
+            .unwrap_or_else(|_| modelstore::QWEN_35_2B_MLX_ID.to_owned());
+        let model_id = selected_model_id.as_str();
+        let staging = models_root
+            .join("cleanup")
+            .join(format!(".{model_id}.partial"));
+        let catalog = modelstore::MlxCatalogManager::new();
+        let expected_revision = catalog
+            .model(model_id)
+            .expect("selected model appears in the Rust catalog")
+            .revision;
+        let initial = catalog
+            .status(&models_root, model_id, None)
+            .expect("selected pinned model appears in the Rust catalog");
+        match initial.state.as_str() {
+            "missing" => {
+                if initial.partial_managed {
+                    assert!(staging.is_dir(), "preseeded stage is a real directory");
+                }
+                catalog
+                    .start_background_download(models_root.clone(), model_id, None, |_| {})
+                    .expect("download or validate and commit pinned assets");
+            }
+            "installed" => {
+                catalog
+                    .start_background_verification(models_root.clone(), model_id, None, |_| {})
+                    .expect("explicitly verify an installed model without a proof");
+            }
+            "ready" => {}
+            other => panic!("unexpected initial model catalog state: {other}"),
+        }
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(600);
+        loop {
+            let status = catalog
+                .status(&models_root, model_id, None)
+                .expect("read selected model catalog status");
+            if status.operation.is_none() {
+                assert_eq!(
+                    status.state, "ready",
+                    "preseeded model install must finish verified: {:?}",
+                    status.error
+                );
+                assert!(status.managed && status.verified);
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "model install did not finish; last state {:?}, error {:?}",
+                status.state,
+                status.error
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        // A newly constructed catalog represents an app restart. It must
+        // recover readiness from the durable identity proof written at commit.
+        let restarted_catalog = modelstore::MlxCatalogManager::new();
+        let restarted = restarted_catalog
+            .status(&models_root, model_id, None)
+            .expect("read status after catalog restart");
+        assert_eq!(restarted.state, "ready");
+        assert!(restarted.selectable && restarted.verified && restarted.managed);
+        assert!(
+            !restarted.qualified,
+            "debug qualification is not release qualification"
+        );
+        let restarted_manager = restarted_catalog
+            .manager(model_id)
+            .expect("construct restarted catalog manager");
+        let (resolved, inventory) = restarted_manager
+            .resolve_ready_for_runtime(&models_root, "rust-smoke-restart", 1, None)
+            .expect("restart proof resolves the exact pinned inventory");
+        assert_eq!(resolved.id(), model_id);
+        assert_eq!(resolved.revision(), expected_revision);
+        assert_eq!(inventory.cache, "hit");
+        assert_eq!(inventory.hashed_files, 0);
+        assert_eq!(inventory.hashed_bytes, 0);
+        drop(resolved);
+
+        // Exercise the same structural settings save/load contract used by
+        // the service configuration UI without invoking credential stores.
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock is after the Unix epoch")
+            .as_nanos();
+        let settings_dir = std::env::temp_dir().join(format!(
+            "voiceflow-mlx-rust-smoke-settings-{}-{stamp}",
+            std::process::id()
+        ));
+        let smoke_language = if model_id == modelstore::S1_MINI_MLX_ID {
+            "en".to_owned()
+        } else {
+            crate::store::Settings::default().language
+        };
+        let settings = crate::store::Settings {
+            cleanup_enabled: true,
+            cleanup_provider: crate::engine::EngineProvider::OnDeviceMlx,
+            cleanup_model: model_id.to_owned(),
+            language: smoke_language,
+            ..crate::store::Settings::default()
+        };
+        settings
+            .validate_configuration()
+            .expect("selected model settings are structurally valid");
+        crate::store::save_configuration(&settings_dir, &settings)
+            .expect("persist explicit native MLX selection");
+        let settings_bytes = std::fs::read(settings_dir.join("settings.json"))
+            .expect("read the persisted settings fixture without credential access");
+        let loaded_settings: crate::store::Settings =
+            serde_json::from_slice(&settings_bytes).expect("decode the persisted settings fixture");
+        loaded_settings
+            .validate_configuration()
+            .expect("persisted model selection remains structurally valid");
+        assert_eq!(
+            loaded_settings.cleanup_provider,
+            crate::engine::EngineProvider::OnDeviceMlx
+        );
+        assert_eq!(loaded_settings.cleanup_model, model_id);
+        assert!(loaded_settings.cleanup_enabled);
+        std::fs::remove_dir_all(&settings_dir).expect("remove isolated settings fixture");
+
+        if std::env::var("VOICEFLOW_MLX_RUST_SMOKE_INSTALL_ONLY").as_deref() == Ok("1") {
+            return;
+        }
+
+        let sidecar = std::env::var_os("VOICEFLOW_MLX_SIDECAR_PATH")
+            .map(PathBuf::from)
+            .expect("set VOICEFLOW_MLX_SIDECAR_PATH to the staged sidecar executable");
+        assert!(
+            sidecar.is_file(),
+            "staged sidecar must exist: {}",
+            sidecar.display()
+        );
+        let runtime = Runtime::new_with_catalog(models_root, Manager::new(), restarted_catalog);
+        let transcript = "Please text Alice Chen: keep our appointment on November 10 at 2:30 PM. Do not move it to 3:30 PM.";
+        let result = if model_id == modelstore::S1_MINI_MLX_ID {
+            let auto_settings = crate::store::Settings {
+                language: "auto".to_owned(),
+                ..settings.clone()
+            };
+            let auto_language = (auto_settings.language == "en").then_some("en");
+            let auto_intent = crate::llm::CleanupIntent::implicit(transcript);
+            let auto_rejected =
+                crate::llm::cleanup_with_provider_and_native_runtime_and_intent_and_source_traced(
+                    crate::providers::EngineProvider::OnDeviceMlx,
+                    &runtime,
+                    "",
+                    model_id,
+                    transcript,
+                    "",
+                    None,
+                    None,
+                    None,
+                    Some(&auto_intent),
+                    None,
+                    crate::llm::CleanupEffort::Light,
+                    None,
+                    Some(transcript),
+                    None,
+                    None,
+                    auto_language,
+                    None,
+                )
+                .await;
+            assert!(auto_rejected.is_err(), "auto language must stay local");
+            assert_eq!(runtime.status().state, "not_loaded");
+
+            let non_ascii = "Please text José about the appointment.";
+            let non_ascii_intent = crate::llm::CleanupIntent::implicit(non_ascii);
+            let non_ascii_rejected =
+                crate::llm::cleanup_with_provider_and_native_runtime_and_intent_and_source_traced(
+                    crate::providers::EngineProvider::OnDeviceMlx,
+                    &runtime,
+                    "",
+                    model_id,
+                    non_ascii,
+                    "",
+                    None,
+                    None,
+                    None,
+                    Some(&non_ascii_intent),
+                    None,
+                    crate::llm::CleanupEffort::Light,
+                    None,
+                    Some(non_ascii),
+                    None,
+                    None,
+                    Some("en"),
+                    None,
+                )
+                .await;
+            assert!(
+                non_ascii_rejected.is_err(),
+                "non-ASCII source must stay local"
+            );
+            assert_eq!(runtime.status().state, "not_loaded");
+
+            let unsupported_policy = crate::context::ContextPolicy {
+                output_mode: Some("translation".to_owned()),
+                ..crate::context::ContextPolicy::default()
+            };
+            let unsupported_intent = crate::llm::CleanupIntent::implicit(transcript);
+            let unsupported_rejected =
+                crate::llm::cleanup_with_provider_and_native_runtime_and_intent_and_source_traced(
+                    crate::providers::EngineProvider::OnDeviceMlx,
+                    &runtime,
+                    "",
+                    model_id,
+                    transcript,
+                    "",
+                    None,
+                    Some(&unsupported_policy),
+                    None,
+                    Some(&unsupported_intent),
+                    None,
+                    crate::llm::CleanupEffort::Light,
+                    None,
+                    Some(transcript),
+                    None,
+                    None,
+                    Some("en"),
+                    None,
+                )
+                .await;
+            assert!(
+                unsupported_rejected.is_err(),
+                "unsupported output mode must stay local"
+            );
+            assert_eq!(runtime.status().state, "not_loaded");
+
+            let intent = crate::llm::CleanupIntent::implicit(transcript);
+            crate::llm::cleanup_with_provider_and_native_runtime_and_intent_and_source_traced(
+                crate::providers::EngineProvider::OnDeviceMlx,
+                &runtime,
+                "",
+                model_id,
+                transcript,
+                "",
+                None,
+                None,
+                None,
+                Some(&intent),
+                None,
+                crate::llm::CleanupEffort::Light,
+                None,
+                Some(transcript),
+                None,
+                None,
+                (settings.language == "en").then_some("en"),
+                None,
+            )
+            .await
+        } else {
+            crate::llm::cleanup_with_on_device_mlx_runtime_and_intent_and_source(
+                &runtime,
+                model_id,
+                transcript,
+                None,
+                None,
+                None,
+                None,
+                None,
+                crate::llm::CleanupEffort::Light,
+                None,
+                Some(transcript),
+                None,
+                None,
+            )
+            .await
+        };
+        let shutdown = runtime.shutdown().await;
+        assert!(shutdown, "the real MLX child must stop cleanly");
+        let (reply, _) = result.expect("real Qwen2B cleanup returns an accepted reply");
+        let output = reply.accepted_text;
+        let folded = output.to_lowercase();
+        assert!(folded.contains("alice chen"), "name was lost: {output:?}");
+        assert!(
+            folded.contains("november 10") || folded.contains("11/10"),
+            "date was changed: {output:?}"
+        );
+        assert!(
+            folded.contains("2:30"),
+            "requested time was lost: {output:?}"
+        );
+        assert!(folded.contains("3:30"), "negated time was lost: {output:?}");
+        assert!(
+            [
+                "do not",
+                "don't",
+                " not ",
+                "rather than",
+                "instead of",
+                "avoid"
+            ]
+            .iter()
+            .any(|marker| format!(" {folded} ").contains(marker)),
+            "negation was lost: {output:?}"
+        );
     }
 }

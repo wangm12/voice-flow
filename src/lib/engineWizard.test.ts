@@ -117,6 +117,21 @@ describe("engine wizard rules", () => {
     ).toBe(false);
   });
 
+  it("keeps bundled llama.cpp cleanup keyless and persists the explicit model choice", () => {
+    const switched = switchProvider(emptyDraft(), "cleanup", "on_device_llama_cpp");
+    expect(switched.cleanupModel).toBe("");
+    expect(hasProviderSecret("on_device_llama_cpp", switched, groqConnected)).toBe(true);
+    expect(step2Ready(switched, groqConnected)).toBe(false);
+
+    const selected = { ...switched, cleanupModel: "qwen3.5-2b" };
+    expect(step2Ready(selected, groqConnected)).toBe(true);
+    expect(persistPatch(selected, groqConnected)).toMatchObject({
+      cleanup_provider: "on_device_llama_cpp",
+      cleanup_model: "qwen3.5-2b",
+    });
+    expect(probePayload(selected, groqConnected).cleanup_base_url).toBe("");
+  });
+
   it("does not reuse a saved Custom key when the shared host changes", () => {
     const settings = {
       ...groqConnected,

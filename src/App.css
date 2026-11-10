@@ -185,8 +185,26 @@
 }
 
 .settings-scrollbar {
-  scrollbar-color: rgb(128 128 128 / 0.45) transparent;
-  scrollbar-width: thin;
+  scrollbar-gutter: stable;
+}
+
+@media not (forced-colors: active) {
+  .settings-scrollbar::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+
+  .settings-scrollbar::-webkit-scrollbar-thumb {
+    border: 2px solid transparent;
+    border-radius: 999px;
+    background-clip: padding-box;
+    background-color: var(--settings-scrollbar-thumb, transparent);
+  }
+
+  .settings-scrollbar::-webkit-scrollbar-thumb:hover,
+  .settings-scrollbar::-webkit-scrollbar-thumb:active {
+    background-color: var(--color-primary);
+  }
 }
 
 .history-list--windowed {
@@ -238,7 +256,6 @@
   margin-bottom: calc(0px - var(--space-page));
   padding-bottom: 0;
 }
-.vf-settings-scroll-pane { scrollbar-gutter: stable; }
 .vf-engine-settings {
   display: flex;
   min-width: 0;
@@ -258,7 +275,6 @@
   .vf-engine-footer { justify-content: stretch; }
   .vf-engine-footer > button { flex: 1 1 100%; }
 }
-.vf-settings-group--plain > .vf-settings-group-body { background: transparent; border: 0; }
 .vf-settings :where(p, label, h1, h2, h3) { overflow-wrap: anywhere; }
 .vf-settings-row-control > div { min-width: 0; max-width: 100%; }
 .vf-select-trigger[data-size="wide"] { width: 220px; }

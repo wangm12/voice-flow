@@ -42,6 +42,6 @@ export default defineConfig(async () => ({
   test: {
     environment: "jsdom",
     setupFiles: resolve(__dirname, "src/test/setup.ts"),
-    exclude: [...configDefaults.exclude, "reference_projects/**"],
+    exclude: [...configDefaults.exclude, "src-tauri/target/llama-runtime/source/tools/ui/**"],
   },
 }));

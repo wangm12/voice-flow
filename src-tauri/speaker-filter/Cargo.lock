@@ -214,7 +214,6 @@ dependencies = [
  "alkove-engine",
  "hex",
  "hound",
- "libc",
  "serde",
  "serde_json",
  "sha2",

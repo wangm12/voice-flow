@@ -4,6 +4,7 @@ import {
   inferProviderFromHost,
   isKnownModel,
   isLoopbackUrl,
+  isRetiredOnDeviceModel,
   PROVIDERS,
   providersFor,
 } from "./providers";
@@ -26,7 +27,7 @@ describe("provider catalog", () => {
       "on_device",
       "custom",
     ]);
-    expect(llm).toEqual(["groq", "openai", "siliconflow", "deepseek", "anthropic", "ollama", "lmstudio", "on_device_mlx", "custom"]);
+    expect(llm).toEqual(["groq", "openai", "siliconflow", "deepseek", "anthropic", "ollama", "on_device_llama_cpp", "on_device_mlx", "custom"]);
     expect(asr).not.toContain("deepseek");
     expect(asr).not.toContain("anthropic");
     expect(llm).not.toContain("deepgram");
@@ -61,16 +62,6 @@ describe("provider catalog", () => {
     expect(providersFor("llm").map((provider) => provider.id)).not.toContain("on_device");
   });
 
-  it("lists LM Studio as an explicit native cleanup provider without host inference", () => {
-    const provider = PROVIDERS.find((item) => item.id === "lmstudio");
-    expect(provider?.protocol).toBe("lmstudio_native");
-    expect(provider?.capabilities).toEqual(["llm"]);
-    expect(provider?.allowsEmptyKey).toBe(true);
-    expect(provider?.defaultLlmModel).toBe("qwen/qwen3.8-27b@6bit");
-    expect(provider?.llmModels[0]?.label).toBe("Qwen 3.8 27B · MLX 6-bit");
-    expect(inferProviderFromHost("http://localhost:1234")).toBeNull();
-  });
-
   it("lists VoiceFlow MLX as a distinct local cleanup provider", () => {
     const provider = PROVIDERS.find((item) => item.id === "on_device_mlx");
     expect(provider?.protocol).toBe("on_device_mlx_local");
@@ -80,6 +71,17 @@ describe("provider catalog", () => {
     expect(provider?.defaultLlmModel).toBe("qwen3_8_27b_mlx_6bit");
     expect(provider?.llmModels[0]?.label).toBe("Qwen 3.8 27B · MLX 6-bit");
     expect(providersFor("asr").map((item) => item.id)).not.toContain("on_device_mlx");
+  });
+
+  it("lists the bundled llama.cpp runtime as a local cleanup provider without a default model", () => {
+    const provider = PROVIDERS.find((item) => item.id === "on_device_llama_cpp");
+    expect(provider?.protocol).toBe("on_device_llama_cpp_local");
+    expect(provider?.capabilities).toEqual(["llm"]);
+    expect(provider?.allowsEmptyKey).toBe(true);
+    expect(provider?.defaultBaseUrl).toBe("");
+    expect(provider?.defaultLlmModel).toBe("");
+    expect(provider?.llmModels).toEqual([]);
+    expect(providersFor("asr").map((item) => item.id)).not.toContain("on_device_llama_cpp");
   });
 
   it("treats loopback hosts as empty-key eligible", () => {
@@ -135,6 +137,15 @@ describe("provider catalog", () => {
     expect(qwen?.label).toBe("Qwen 3.8 27B");
     expect(qwen?.note).toContain("不同构建");
     expect(isKnownModel("groq", "llm", "qwen/qwen3.8-27b")).toBe(true);
+  });
+
+  it("retires uncalibrated and legacy on-device ASR models for new selections and downloads", () => {
+    for (const id of ["qwen3-asr-1.7b", "cohere-transcribe-2b", "sensevoice-small"]) {
+      expect(isKnownModel("on_device", "asr", id)).toBe(true);
+      expect(isRetiredOnDeviceModel(id)).toBe(true);
+    }
+    expect(isRetiredOnDeviceModel("qwen3-asr-0.6b")).toBe(false);
+    expect(defaultModel("on_device", "asr")).toBe("qwen3-asr-0.6b");
   });
 
   it("retires Groq Distil-Whisper for new selections while keeping saved IDs valid", () => {

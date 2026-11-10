@@ -2,10 +2,9 @@
 
 use crate::dictation::{self, OperationLease, Phase};
 use crate::{
-    arm_undo_transaction, context, delivery, emit_selected_action_state, finish_with_delivery,
-    hotkey, lock_recover, paste, permissions, release_operation,
-    start_selected_action_with_feedback, verify_delivery_target, AppState,
-    CLEANUP_STATUS_AI_SUCCESS,
+    context, delivery, emit_selected_action_state, finish_with_delivery, hotkey, lock_recover,
+    paste, permissions, release_operation, start_selected_action_with_feedback,
+    verify_delivery_target, AppState, CLEANUP_STATUS_AI_SUCCESS,
 };
 use tauri::{Manager, State};
 use tokio_util::sync::CancellationToken;
@@ -481,15 +480,6 @@ pub(crate) async fn confirm_selected_action_preview(
     match paste_result {
         Ok(outcome) => {
             let result = delivery::DeliveryResult::from_insert_verified(outcome.verified);
-            arm_undo_transaction(
-                &state,
-                preview.session_generation,
-                outcome.post_insert_target_guard.as_ref(),
-                outcome.post_insert_input_fingerprint,
-                outcome.post_insert_field_ticket.as_ref(),
-                result.method.as_str(),
-                outcome.used_keyboard_paste,
-            );
             if outcome.verified {
                 emit_selected_action_state(
                     &app,

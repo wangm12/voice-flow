@@ -27,6 +27,7 @@ import { DebugSettings } from "./components/settings/DebugSettings";
 import { WhatsNewDialog, type WhatsNewPayload } from "./components/WhatsNewDialog";
 import { SystemSettings } from "./components/settings/SystemSettings";
 import { useSettingsPersistence } from "./hooks/useSettingsPersistence";
+import { useSettingsScrollbar } from "./hooks/useSettingsScrollbar";
 import { resolveUiLanguage, type UiLanguagePreference, useI18n } from "./lib/i18n";
 import { closedLidMicrophoneErrorMessage } from "./lib/deliveryCopy";
 import { friendlySettingsError } from "./lib/settingsError";
@@ -133,6 +134,7 @@ function AppContent() {
   const [routeNavigationRevision, setRouteNavigationRevision] = useState(0);
   const settingsRef = useRef(settings);
   settingsRef.current = settings;
+  const settingsLoaded = settings !== null;
   const viewRef = useRef(view);
   viewRef.current = view;
   const enginePageRef = useRef(enginePage);
@@ -151,6 +153,8 @@ function AppContent() {
     }
   }, []);
   const settingsContentRef = useRef<HTMLElement>(null);
+  const showNavigationScrollbar = useSettingsScrollbar();
+  const showContentScrollbar = useSettingsScrollbar();
   const contextualRouteFocus = useRef(false);
   const navigateView = useCallback((next: View) => {
     if (next === "engine") setEnginePage("service");
@@ -528,7 +532,7 @@ function AppContent() {
   }, [refreshPermissions, showOnboarding, view]);
 
   useEffect(() => {
-    if (!settings || showOnboarding || view !== "system") return;
+    if (!settingsLoaded || showOnboarding || view !== "system") return;
 
     const pollAudioInputDevice = () => {
       if (document.visibilityState === "visible") void refreshAudioInputDevice();
@@ -542,7 +546,7 @@ function AppContent() {
       window.removeEventListener("focus", pollAudioInputDevice);
       document.removeEventListener("visibilitychange", pollAudioInputDevice);
     };
-  }, [refreshAudioInputDevice, settings, showOnboarding, view]);
+  }, [refreshAudioInputDevice, settingsLoaded, showOnboarding, view]);
 
   const reloadHistory = useCallback((query = historyQueryRef.current) => {
     const normalizedQuery = query.trim();
@@ -603,9 +607,9 @@ function AppContent() {
   }, [view]);
 
   useEffect(() => {
-    if (!settings || showOnboarding || view !== "history") return;
+    if (!settingsLoaded || showOnboarding || view !== "history") return;
     reloadHistory();
-  }, [reloadHistory, settings, showOnboarding, view]);
+  }, [reloadHistory, settingsLoaded, showOnboarding, view]);
 
   useEffect(() => {
     let active = true;
@@ -905,13 +909,13 @@ function AppContent() {
   return (
     <main className={`vf-settings relative h-screen overflow-hidden ${colors.bg.base} ${colors.text.primary}`}>
       <div className="vf-settings-frame flex h-full w-full">
-        <aside className={`vf-settings-sidebar flex min-h-0 shrink-0 flex-col border-r ${colors.border} px-3 py-6`}>
-          <div className="flex shrink-0 items-center gap-2.5 px-2">
+        <aside className={`vf-settings-sidebar flex min-h-0 shrink-0 flex-col border-r ${colors.border} py-6`}>
+          <div className="flex shrink-0 items-center gap-2.5 px-5">
             <img src={brandIconSrc} alt="VoiceFlow" className="h-8 w-8 shrink-0" />
             <p className="truncate text-sm font-semibold tracking-tight text-primary" translate="no">VoiceFlow</p>
           </div>
 
-          <nav aria-label={t("设置页面")} className="settings-scrollbar mt-6 min-h-0 flex-1 space-y-6 overflow-y-auto pb-1">
+          <nav aria-label={t("设置页面")} onScroll={showNavigationScrollbar} className="settings-scrollbar mt-6 min-h-0 flex-1 space-y-6 overflow-y-auto px-3 pb-1">
             {(import.meta.env.DEV && settings.debug_mode ? [...navigationGroups, { label: "调试", items: [{ id: "debug" as View, label: "调试设置", icon: Bug }] }] : navigationGroups).map((group) => (
               <div key={group.label}>
                 <h3 className="mb-2 px-3 text-xs font-semibold text-tertiary">{t(group.label)}</h3>
@@ -946,12 +950,12 @@ function AppContent() {
               </div>
             ))}
           </nav>
-          <button type="button" onClick={() => setShowOnboarding(true)} className={`mt-4 w-full shrink-0 ${ghostButtonClass} text-xs`}>
+          <button type="button" onClick={() => setShowOnboarding(true)} className={`mx-3 mt-4 shrink-0 ${ghostButtonClass} text-xs`}>
             {t("重新检查首次设置")}
           </button>
         </aside>
 
-        <section ref={settingsContentRef} className="vf-settings-scroll-pane settings-scrollbar min-h-0 min-w-0 flex-1 overflow-y-auto">
+        <section ref={settingsContentRef} onScroll={showContentScrollbar} className="vf-settings-scroll-pane settings-scrollbar min-h-0 min-w-0 flex-1 overflow-y-auto">
           <div className="vf-page-content min-h-full w-full">
             {saveError && (
               <SettingsAlert onRetry={retryPendingSave} retryLabel={t("重试")}>{t("设置保存失败：")}{saveError}</SettingsAlert>

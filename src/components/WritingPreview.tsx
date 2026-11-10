@@ -210,7 +210,6 @@ function outcomeLabel(result: TrialResult): string {
 
 function cleanupTransformationLabel(transformation: string, t: (value: string) => string): string {
   switch (transformation) {
-    case "strip_internal_cleanup_metadata": return t("清理整理元数据");
     case "restore_spoken_layout": return t("恢复口述结构");
     default: return t("其他共享整理转换");
   }
@@ -230,9 +229,6 @@ function nativeFailureStatusLabel(failure: NativeFailureFacts): string {
     case "reasoning_off_unavailable": return "本机整理实例不支持关闭推理";
     case "remote_instance": return "本机整理拒绝远程实例";
     case "instance_source_unknown": return "本机整理实例来源无法确认";
-    case "cli_unavailable": return "LM Studio 状态命令不可用";
-    case "cli_timeout": return "LM Studio 状态命令超时";
-    case "cli_failed": return "LM Studio 状态命令失败";
     case "invalid_response": return "本机整理回复格式无效";
     case "http_error": return "本机整理服务返回错误";
     case "body_too_large": return "本机整理回复超过允许容量";

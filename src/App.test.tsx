@@ -451,6 +451,7 @@ describe("settings navigation", () => {
     const input = await screen.findByRole("combobox", { name: "输入设备" });
     await waitFor(() => expect(screen.getByText("当前麦克风 · Built-in MacBook Microphone")).toBeInTheDocument());
     selectOption(input, "External USB Microphone");
+    fireEvent.focus(window);
     await waitFor(() => expect(resolveLateCatalog).toBeDefined());
     selectOption(input, "");
     await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("update_settings_patch", {
@@ -1133,5 +1134,48 @@ describe("settings navigation", () => {
       limit: 50,
       query: null,
     });
+  });
+
+  it("keeps loaded History pages when backend settings change", async () => {
+    let settingsHandler: ((event: { payload: typeof settings }) => void) | undefined;
+    listenMock.mockImplementation((event: string, handler: (event: { payload: typeof settings }) => void) => {
+      if (event === "settings://changed") settingsHandler = handler;
+      return Promise.resolve(vi.fn());
+    });
+    const page = (id: number, finalText: string): HistoryItem => ({
+      id,
+      created_at: "2026-11-08 10:00:00",
+      raw_text: finalText,
+      final_text: finalText,
+      duration: 1,
+      status: "ok",
+    });
+    invokeMock.mockImplementation(async (command, args) => {
+      if (command === "get_settings") return settings;
+      if (command === "check_permissions") return { microphone: false, microphone_status: "denied", accessibility: false };
+      if (command === "get_history") {
+        const beforeId = (args as { beforeId?: number } | undefined)?.beforeId;
+        return beforeId === undefined
+          ? { items: [page(20, "Recent page entry")], has_more: true }
+          : { items: [page(10, "Earlier page entry")], has_more: false };
+      }
+      return undefined;
+    });
+
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "历史记录" }));
+    fireEvent.click(await screen.findByRole("button", { name: "加载更早的记录" }));
+    expect(await screen.findByText("Earlier page entry")).toBeInTheDocument();
+    await waitFor(() => expect(settingsHandler).toBeDefined());
+    const historyCalls = () => invokeMock.mock.calls.filter(([command]) => command === "get_history").length;
+    const callsBeforeSettingsChange = historyCalls();
+
+    await act(async () => {
+      settingsHandler?.({ payload: { ...settings, language: "zh" } });
+    });
+
+    expect(historyCalls()).toBe(callsBeforeSettingsChange);
+    expect(screen.getByText("Recent page entry")).toBeInTheDocument();
+    expect(screen.getByText("Earlier page entry")).toBeInTheDocument();
   });
 });

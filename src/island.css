@@ -664,6 +664,57 @@
   overflow: hidden;
 }
 
+/* The native material is visible only after the backend confirms it is ready.
+   Pair its pill tint with the foreground for either system appearance, without
+   sampling the app behind it. The isolated candidate shares this fixture rule. */
+:root[data-hud-appearance="liquid_glass"][data-hud-glass-visible="true"] .voice-pill,
+:root[data-native-glass-poc="true"] .voice-pill {
+  --voice-hud-text: #171717;
+  --voice-hud-muted: #303030;
+  --voice-hud-focus: #171717;
+  --voice-hud-border: rgba(23, 23, 23, 0.16);
+  --voice-glass-veil: rgba(255, 255, 255, 0.6);
+  --voice-glass-control: rgba(0, 0, 0, 0.08);
+  --voice-glass-control-hover: rgba(0, 0, 0, 0.13);
+  background: var(--voice-glass-veil) !important;
+  /* Preserve the one-pixel content inset without drawing a second rim. */
+  border-color: transparent !important;
+  box-shadow: none !important;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root[data-hud-appearance="liquid_glass"][data-hud-glass-visible="true"] .voice-pill,
+  :root[data-native-glass-poc="true"] .voice-pill {
+    --voice-hud-text: #f5f5f5;
+    --voice-hud-muted: #ebebeb;
+    --voice-hud-focus: #f5f5f5;
+    --voice-hud-border: rgba(255, 255, 255, 0.2);
+    --voice-glass-veil: rgba(0, 0, 0, 0.6);
+    --voice-glass-control: rgba(255, 255, 255, 0.14);
+    --voice-glass-control-hover: rgba(255, 255, 255, 0.2);
+  }
+}
+
+:root[data-hud-appearance="liquid_glass"][data-hud-glass-visible="true"] .voice-pill .voice-pill__action,
+:root[data-native-glass-poc="true"] .voice-pill .voice-pill__action {
+  color: var(--voice-hud-text);
+  background: var(--voice-glass-control);
+}
+
+:root[data-hud-appearance="liquid_glass"][data-hud-glass-visible="true"] .voice-pill .voice-pill__action:hover:not(:disabled),
+:root[data-native-glass-poc="true"] .voice-pill .voice-pill__action:hover:not(:disabled) {
+  background: var(--voice-glass-control-hover);
+}
+
+:root[data-hud-appearance="liquid_glass"][data-hud-glass-visible="true"] .voice-pill__beam-layer,
+:root[data-hud-appearance="liquid_glass"][data-hud-glass-visible="true"] .voice-pill__beam-fx,
+:root[data-hud-appearance="liquid_glass"][data-hud-glass-visible="true"] .voice-pill__beam-ghost,
+:root[data-native-glass-poc="true"] .voice-pill__beam-layer,
+:root[data-native-glass-poc="true"] .voice-pill__beam-fx,
+:root[data-native-glass-poc="true"] .voice-pill__beam-ghost {
+  display: none !important;
+}
+
 .voice-pill--expanded {
   flex-direction: row;
   align-items: center;

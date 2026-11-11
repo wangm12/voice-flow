@@ -3,14 +3,14 @@ import { Select } from "../Select";
 import { invoke } from "@tauri-apps/api/core";
 import { FnHotkeyNote } from "../FnHotkeyNote";
 import { useCallback, useEffect, useState } from "react";
-import { ActivationModeSelector } from "../ActivationModeSelector";
 import { HotkeyRecorder } from "../HotkeyRecorder";
 import { SettingsDisclosure, SettingsGroup, SettingsPageHeader, SettingsRow, SettingsShell, type SettingsSaveFailure } from "../SettingsLayout";
 import { Toggle } from "../Toggle";
 import { ContextLesson, SelectedLesson } from "../Onboarding/ContextualLessons";
 import { translationLanguageOptions } from "../../lib/translationLanguages";
+import { ACTIVATION_MODES, recordingInstruction } from "../../lib/activationCopy";
 import { useI18n } from "../../lib/i18n";
-import { isFnOnlyHotkey } from "../../lib/hotkeyFormat";
+import { formatHotkeyDisplay, isFnOnlyHotkey } from "../../lib/hotkeyFormat";
 import { asrLanguageDescription, providerOf } from "../../lib/engineWizard";
 import { asrModelProfile } from "../../lib/providers";
 import { inputClass } from "../../lib/theme";
@@ -54,20 +54,32 @@ export function RecordingSettings({ settings, save, saveFailure, dictationBusy =
           />
         </SettingsRow>
         {settings.hotkey_error && <p role="alert" className="px-5 pb-4 text-xs leading-5 text-error-ink">{t("快捷键注册失败：")}{settings.hotkey_error}。{t("请重新设置一个快捷键。")}</p>}
-        <SettingsRow title={t("录音方式")}>
-          <ActivationModeSelector
+        <SettingsRow
+          title={t("录音方式")}
+          description={(
+            <>
+              {recordingInstruction(settings.activation_mode, formatHotkeyDisplay(settings.hotkey), t)}
+              <span className="mt-1 block text-xs text-tertiary">{t("Esc 取消。")}</span>
+            </>
+          )}
+        >
+          <Select
+            aria-label={t("录音方式")}
             value={settings.activation_mode}
-            hotkey={settings.hotkey}
             disabled={dictationBusy || modeSaving || Object.values(captureBusy).some(Boolean)}
-            onChange={(activation_mode) => {
+            onValueChange={(value) => {
+              if (value !== "tap" && value !== "hold_to_talk") return;
               setModeSaving(true);
               setModeError(null);
-              void invoke("update_settings_patch", { patch: { activation_mode } })
-                .then(() => save({ activation_mode }, { persist: false }))
+              void invoke("update_settings_patch", { patch: { activation_mode: value } })
+                .then(() => save({ activation_mode: value }, { persist: false }))
                 .catch((reason) => setModeError(String(reason)))
                 .finally(() => setModeSaving(false));
             }}
-          />
+            className={`${controlClass} w-40 max-w-full`}
+          >
+            {ACTIVATION_MODES.map((mode) => <option key={mode.id} value={mode.id}>{t(mode.label)}</option>)}
+          </Select>
         </SettingsRow>
         {modeError && <p role="alert" className="px-5 pb-4 text-xs text-error-ink">{modeError}</p>}
         {isFnOnlyHotkey(settings.hotkey) && <div className="px-5 pb-2"><FnHotkeyNote hotkey={settings.hotkey} /></div>}

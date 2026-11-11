@@ -111,4 +111,35 @@ describe("useSettingsPersistence", () => {
     act(() => result.current.persistence.applySettingsSnapshot(initialSettings, oldReadRevision));
     expect(result.current.settings?.input_device).toBe("MacBook Pro Microphone");
   });
+
+  it("persists an immediate preference through the queue without flushing unrelated edits", async () => {
+    const immediateWrite = deferred<void>();
+    const debouncedWrite = deferred<void>();
+    invokeMock
+      .mockImplementationOnce(() => immediateWrite.promise)
+      .mockImplementationOnce(() => debouncedWrite.promise);
+    const { result } = renderHook(() => usePersistenceHarness());
+
+    act(() => {
+      result.current.persistence.save({ input_device: "Mic A" });
+      result.current.persistence.save({ hud_appearance: "liquid_glass" }, { immediate: true });
+    });
+
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledTimes(1));
+    expect(invokeMock).toHaveBeenNthCalledWith(1, "update_settings_patch", {
+      patch: { hud_appearance: "liquid_glass" },
+    });
+    expect(result.current.settings?.hud_appearance).toBe("liquid_glass");
+    expect(result.current.persistence.unsavedFields).toEqual(expect.arrayContaining(["input_device", "hud_appearance"]));
+
+    await act(async () => immediateWrite.resolve());
+    await waitFor(() => expect(result.current.persistence.unsavedFields).toEqual(["input_device"]));
+    await new Promise((resolve) => setTimeout(resolve, 350));
+
+    expect(invokeMock).toHaveBeenNthCalledWith(2, "update_settings_patch", {
+      patch: { input_device: "Mic A" },
+    });
+    await act(async () => debouncedWrite.resolve());
+    await waitFor(() => expect(result.current.persistence.unsavedFields).toEqual([]));
+  });
 });

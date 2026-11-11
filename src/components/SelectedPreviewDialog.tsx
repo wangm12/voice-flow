@@ -313,7 +313,7 @@ export function SelectedPreviewDialog({
         <div className="mt-6 flex flex-none flex-wrap justify-end gap-2">
           <p role="status" aria-live="polite" className="mr-auto flex min-h-9 items-center text-[13px] leading-5 text-secondary">{busy ? t("处理中…") : ""}</p>
           <button type="button" onClick={onCancel} className={secondaryButtonClass}>{t("取消")}</button>
-          <button type="button" onClick={onCopy} aria-busy={busy} disabled={busy || !draft.trim()} className={`${secondaryButtonClass} min-w-32`}>
+          <button type="button" onClick={onCopy} aria-busy={busy} disabled={busy || !draft.trim()} className={secondaryButtonClass}>
             <Copy size={14} aria-hidden="true" />
             {t("只复制")}
           </button>
@@ -322,7 +322,7 @@ export function SelectedPreviewDialog({
             onClick={onConfirm}
             aria-busy={busy}
             disabled={busy || !draft.trim()}
-            className={`${buttonClass} min-w-32`}
+            className={buttonClass}
           >
             <Check size={14} aria-hidden="true" />
             {copyOnly ? t("确认并复制") : t("确认")}

@@ -74,6 +74,9 @@ export function HotkeyRecorder({ value, onChange, disabled = false, captureTarge
     : recorder.phase === "saving" ? t("正在保存快捷键…")
     : recorder.phase === "cancelling" ? t("正在取消…")
     : recorder.captureHint ?? t("按下新的组合快捷键；松开后保存。");
+  const triggerClass = compact
+    ? `${inputClass} vf-hotkey-trigger group inline-flex max-w-full items-center justify-center gap-2 enabled:hover:bg-accent-soft`
+    : `vf-hotkey-trigger group inline-flex min-h-8 max-w-full items-center justify-center gap-2 rounded-full bg-elevated px-3 text-[13px] text-primary transition-colors enabled:hover:bg-accent-soft disabled:cursor-not-allowed disabled:text-disabled-foreground ${focusRingClass}`;
 
   return <div ref={group} role="group" aria-label={t("快捷键录制")} data-capture-busy={recorder.isBusy || undefined} className="w-full"
     onBlur={(event) => {
@@ -86,7 +89,7 @@ export function HotkeyRecorder({ value, onChange, disabled = false, captureTarge
     {!recorder.isBusy ? <div className={`flex items-center gap-1.5 ${compact ? "justify-end" : "justify-start"}`}>
       <button ref={trigger} type="button" disabled={disabled} onClick={begin} aria-label={`${t("更改")}${label}：${displayed}`}
         title={t("点击更改快捷键")}
-        className={`vf-hotkey-trigger group inline-flex min-h-8 max-w-full items-center justify-center gap-2 rounded-full bg-elevated px-3 text-[13px] text-primary transition-colors enabled:hover:bg-accent-soft disabled:cursor-not-allowed disabled:text-disabled-foreground ${focusRingClass}`}>
+        className={triggerClass}>
         <span className="flex flex-wrap items-center gap-1">{parts.length ? parts.map((part, index) => <kbd key={`${part}-${index}`} className="font-sans text-[13px] font-normal">{part}</kbd>) : displayed}</span>
         <Pencil size={12} strokeWidth={1.5} aria-hidden="true" className="shrink-0 text-tertiary opacity-0 group-hover:opacity-100 group-focus-visible:opacity-100" />
       </button>

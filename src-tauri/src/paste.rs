@@ -252,11 +252,11 @@ fn prepare_command_shortcut(keycode: u16) -> Result<PreparedCommandShortcut, Pas
 fn send_prepared_command_shortcut(
     shortcut: PreparedCommandShortcut,
     target_pid: Option<i32>,
-    on_may_have_posted: &mut dyn FnMut(),
+    on_may_have_posted: &mut dyn FnMut() -> Result<(), PasteError>,
 ) -> Result<(), PasteError> {
     // All fallible native event construction is complete before this callback
     // and the first irreversible post.
-    on_may_have_posted();
+    on_may_have_posted()?;
     post_command_event(&shortcut.key_down, target_pid);
     post_command_event(&shortcut.key_up, target_pid);
     Ok(())
@@ -273,14 +273,14 @@ fn send_prepared_command_shortcut_to_registered_pid(
     expected_pid: i32,
     cancellation: &CancellationToken,
     expires_at: std::time::Instant,
-    on_may_have_posted: &mut dyn FnMut(),
+    on_may_have_posted: &mut dyn FnMut() -> Result<(), PasteError>,
 ) -> Result<(), PasteError> {
     let target_pid = registered_post_target_pid(expected_pid, std::process::id() as i32)
         .ok_or(PasteError::TargetChanged)?;
     // The registered research route never falls back to the ambient HID tap.
     // All event construction and target checks completed before this point.
     with_registered_post_permission(cancellation, expires_at, || {
-        on_may_have_posted();
+        on_may_have_posted()?;
         shortcut.key_down.post_to_pid(target_pid);
         shortcut.key_up.post_to_pid(target_pid);
         Ok(())
@@ -302,7 +302,7 @@ fn prepare_command_shortcut(_keycode: u16) -> Result<PreparedCommandShortcut, Pa
 fn simulate_paste(
     expected_pid: i32,
     shortcut: PreparedCommandShortcut,
-    on_may_have_posted: &mut dyn FnMut(),
+    on_may_have_posted: &mut dyn FnMut() -> Result<(), PasteError>,
 ) -> Result<(), PasteError> {
     send_prepared_command_shortcut(shortcut, Some(expected_pid), on_may_have_posted)?;
     thread::sleep(PASTE_CONSUME_SETTLE);
@@ -312,7 +312,7 @@ fn simulate_paste(
 fn simulate_paste_once(
     expected_pid: i32,
     shortcut: PreparedCommandShortcut,
-    on_may_have_posted: &mut dyn FnMut(),
+    on_may_have_posted: &mut dyn FnMut() -> Result<(), PasteError>,
 ) -> Result<(), PasteError> {
     // A posted Cmd+V may have been accepted even when there is no immediate
     // readback. Never send a second shortcut based only on frontmost-app
@@ -327,7 +327,7 @@ fn simulate_paste_once_to_registered_pid(
     shortcut: PreparedCommandShortcut,
     cancellation: &CancellationToken,
     expires_at: std::time::Instant,
-    on_may_have_posted: &mut dyn FnMut(),
+    on_may_have_posted: &mut dyn FnMut() -> Result<(), PasteError>,
 ) -> Result<(), PasteError> {
     send_prepared_command_shortcut_to_registered_pid(
         shortcut,
@@ -344,9 +344,9 @@ fn simulate_paste_once_to_registered_pid(
 fn simulate_paste(
     _expected_pid: i32,
     mut shortcut: PreparedCommandShortcut,
-    on_may_have_posted: &mut dyn FnMut(),
+    on_may_have_posted: &mut dyn FnMut() -> Result<(), PasteError>,
 ) -> Result<(), PasteError> {
-    on_may_have_posted();
+    on_may_have_posted()?;
     shortcut
         .enigo
         .key(PRIMARY_MODIFIER, Direction::Press)
@@ -3428,9 +3428,52 @@ impl<A> AnchorLease<A> {
 
 /// Construct and retain native anchors entirely on one owner thread. Return
 /// only the Send result before serving its bounded learning read lease.
+#[cfg(test)]
 fn run_delivery_owner<A: 'static, T: Send + 'static>(
     operation: impl FnOnce(&mut Option<AnchorLease<A>>) -> T + Send + 'static,
-) -> Result<T, String> {
+) -> Result<T, DeliveryOwnerError> {
+    run_delivery_owner_observed(operation, None)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PasteOwnerLifecycleEvent {
+    Started,
+    StartFailed,
+    OutcomeUnknown,
+}
+
+pub(crate) type PasteOwnerLifecycleObserver =
+    std::sync::Arc<dyn Fn(PasteOwnerLifecycleEvent) + Send + Sync + 'static>;
+pub(crate) type PasteDispatchGate =
+    std::sync::Arc<dyn Fn() -> Result<(), PasteError> + Send + Sync + 'static>;
+
+#[derive(Debug)]
+enum DeliveryOwnerError {
+    StartFailed(std::io::Error),
+    OutcomeUnknown,
+}
+
+fn delivery_owner_error_to_paste_error(
+    error: DeliveryOwnerError,
+    history_recovery_on_start_failure: bool,
+) -> PasteError {
+    match error {
+        DeliveryOwnerError::StartFailed(_) if history_recovery_on_start_failure => {
+            paste_owner_start_failed()
+        }
+        DeliveryOwnerError::StartFailed(error) => {
+            PasteError::Input(format!("paste owner failed: {error}"))
+        }
+        DeliveryOwnerError::OutcomeUnknown => {
+            PasteError::Input("paste owner outcome is unknown".to_owned())
+        }
+    }
+}
+
+fn run_delivery_owner_observed<A: 'static, T: Send + 'static>(
+    operation: impl FnOnce(&mut Option<AnchorLease<A>>) -> T + Send + 'static,
+    observer: Option<PasteOwnerLifecycleObserver>,
+) -> Result<T, DeliveryOwnerError> {
     let (result_sender, result_receiver) = std::sync::mpsc::channel();
     let research_trace = crate::research_trace::current();
     // Acquire before spawning so terminal/quiescence cannot race ahead of the
@@ -3439,9 +3482,13 @@ fn run_delivery_owner<A: 'static, T: Send + 'static>(
         research_trace.clone(),
         crate::research_trace::learning_task,
     );
-    thread::Builder::new()
+    let thread_observer = observer.clone();
+    let spawned = thread::Builder::new()
         .name("voiceflow-paste-owner".into())
         .spawn(move || {
+            if let Some(observer) = thread_observer {
+                observer(PasteOwnerLifecycleEvent::Started);
+            }
             let mut owner_learning_task = Some(owner_learning_task);
             let mut lease = None;
             let result =
@@ -3458,13 +3505,21 @@ fn run_delivery_owner<A: 'static, T: Send + 'static>(
             if let Some(lease) = lease {
                 lease.serve(owner_learning_task.take());
             }
-        })
-        .map_err(|error| format!("paste owner failed: {error}"))?;
+        });
+    if let Err(error) = spawned {
+        if let Some(observer) = observer {
+            observer(PasteOwnerLifecycleEvent::StartFailed);
+        }
+        return Err(DeliveryOwnerError::StartFailed(error));
+    }
     // Paste can already have posted a keyboard event; it must finish before
     // a caller chooses a fallback. Do not detach an in-flight paste on timeout.
-    result_receiver
-        .recv()
-        .map_err(|_| "paste owner ended before readback".to_owned())
+    result_receiver.recv().map_err(|_| {
+        if let Some(observer) = observer {
+            observer(PasteOwnerLifecycleEvent::OutcomeUnknown);
+        }
+        DeliveryOwnerError::OutcomeUnknown
+    })
 }
 
 #[cfg(all(target_os = "macos", feature = "research-harness"))]
@@ -4008,6 +4063,18 @@ impl DeliveryTrace {
     }
 }
 
+fn paste_owner_start_failed() -> PasteError {
+    let trace = DeliveryTrace {
+        stage: "paste_owner_start",
+        ..DeliveryTrace::default()
+    };
+    let diagnostic = trace.diagnostic("delivery_failed", "自动插入失败，文字已保存，可复制");
+    PasteError::Diagnosed {
+        source: Box::new(PasteError::Input("paste owner failed to start".to_owned())),
+        diagnostic: Box::new(diagnostic),
+    }
+}
+
 pub fn selection_fingerprint(text: &str) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -4032,6 +4099,14 @@ fn verify_same_field_target(
 pub(crate) struct PasteAttempt {
     shortcut_sent: bool,
     pub(crate) result: Result<(), PasteError>,
+}
+
+fn notify_shortcut_dispatched(attempt: &PasteAttempt, observer: Option<&PasteDispatchObserver>) {
+    if attempt.shortcut_sent && attempt.result.is_ok() {
+        if let Some(observer) = observer {
+            observer();
+        }
+    }
 }
 
 impl PasteAttempt {
@@ -4128,6 +4203,29 @@ fn run_paste_attempt_with_post_ack_recheck(
     verify_after_authorize: impl Fn() -> Result<(), PasteError>,
     simulate: impl FnOnce(&mut dyn FnMut()) -> Result<(), PasteError>,
 ) -> PasteAttempt {
+    run_paste_attempt_with_dispatch_gate(
+        cancellation,
+        verify_target,
+        authorize_post,
+        verify_after_authorize,
+        None,
+        |mark_may_have_posted| {
+            let mut legacy_mark = || {
+                let _ = mark_may_have_posted();
+            };
+            simulate(&mut legacy_mark)
+        },
+    )
+}
+
+fn run_paste_attempt_with_dispatch_gate(
+    cancellation: &CancellationToken,
+    verify_target: impl Fn() -> Result<(), PasteError>,
+    authorize_post: impl FnOnce() -> Result<(), PasteError>,
+    verify_after_authorize: impl Fn() -> Result<(), PasteError>,
+    dispatch_gate: Option<&PasteDispatchGate>,
+    simulate: impl FnOnce(&mut dyn FnMut() -> Result<(), PasteError>) -> Result<(), PasteError>,
+) -> PasteAttempt {
     if cancellation.is_cancelled() {
         return PasteAttempt::not_sent(PasteError::Cancelled);
     }
@@ -4150,7 +4248,11 @@ fn run_paste_attempt_with_post_ack_recheck(
             return Err(PasteError::Cancelled);
         }
         let mut mark_may_have_posted = || {
+            if let Some(dispatch_gate) = dispatch_gate {
+                dispatch_gate()?;
+            }
             shortcut_attempted.store(true, std::sync::atomic::Ordering::Release);
+            Ok(())
         };
         simulate(&mut mark_may_have_posted)
     }))
@@ -8988,6 +9090,9 @@ pub(crate) enum RecoveryIntent {
 /// queries); `after` runs once after the last read.
 pub(crate) type ReadbackGuard =
     std::sync::Arc<dyn Fn() -> Result<(), PasteError> + Send + Sync + 'static>;
+/// Notifies the owner after the guarded native shortcut returns. The exact
+/// dispatch fact remains uncertain until AX readback confirms the splice.
+pub(crate) type PasteDispatchObserver = std::sync::Arc<dyn Fn() + Send + Sync + 'static>;
 
 pub(crate) struct DeliveryPolicy<Before, After> {
     pub(crate) before: Before,
@@ -8996,6 +9101,11 @@ pub(crate) struct DeliveryPolicy<Before, After> {
     /// `after`, which keeps owned replay, onboarding and other callers as is.
     pub(crate) readback: Option<ReadbackGuard>,
     pub(crate) recovery: RecoveryIntent,
+    /// Linearizes the last cancellable session check immediately before the
+    /// native shortcut post. This is separate from the later HUD observer.
+    pub(crate) dispatch_gate: Option<PasteDispatchGate>,
+    pub(crate) on_shortcut_dispatched: Option<PasteDispatchObserver>,
+    pub(crate) on_owner_lifecycle: Option<PasteOwnerLifecycleObserver>,
 }
 
 /// The shared owner runs the attempt and decides whether its *prewrite* error
@@ -9052,6 +9162,9 @@ pub(crate) fn insert_timed_traced(
     verify_readback: impl Fn() -> Result<(), PasteError> + Send + Sync + 'static,
     expected_pid: i32,
     trace: Option<crate::metrics::TraceHandle>,
+    dispatch_gate: Option<PasteDispatchGate>,
+    on_shortcut_dispatched: Option<PasteDispatchObserver>,
+    on_owner_lifecycle: Option<PasteOwnerLifecycleObserver>,
 ) -> Result<TimedInsertOutcome, PasteError> {
     insert_with_post_verify_timed_traced(
         app,
@@ -9063,6 +9176,9 @@ pub(crate) fn insert_timed_traced(
             after: verify_after,
             readback: Some(std::sync::Arc::new(verify_readback)),
             recovery: RecoveryIntent::PreserveText,
+            dispatch_gate,
+            on_shortcut_dispatched,
+            on_owner_lifecycle,
         },
         expected_pid,
         trace,
@@ -9088,6 +9204,9 @@ pub(crate) fn insert_with_post_verify(
             after: verify_after,
             readback: None,
             recovery: RecoveryIntent::PreserveText,
+            dispatch_gate: None,
+            on_shortcut_dispatched: None,
+            on_owner_lifecycle: None,
         },
         expected_pid,
     )?
@@ -9263,11 +9382,16 @@ fn insert_registered_research_owned_paste_with_effects(
                     after: move || after_guard.check(),
                     readback: Some(std::sync::Arc::new(move || readback_guard.check())),
                     recovery: RecoveryIntent::NoImplicitCopy,
+                    dispatch_gate: None,
+                    on_shortcut_dispatched: None,
+                    on_owner_lifecycle: None,
                 },
                 anchor_lease,
                 TimedInsertOwnerMetadata {
                     expected_pid: host_identity_for_owner.pid,
                     trace_handle: None,
+                    dispatch_gate: None,
+                    on_shortcut_dispatched: None,
                     research_guard: Some(research_guard),
                     ticket_handoff: Some(owner_ticket_handoff),
                 },
@@ -9300,30 +9424,46 @@ pub(crate) fn insert_with_post_verify_timed_effects(
     trace: Option<crate::metrics::TraceHandle>,
 ) -> Result<TimedInsertOutcome, PasteError> {
     let text = text.to_owned();
-    run_delivery_owner(move |anchor_lease| {
-        insert_with_post_verify_timed_on_owner(
-            &effects,
-            &text,
-            accessibility,
-            cancellation,
-            policy,
-            anchor_lease,
-            TimedInsertOwnerMetadata {
-                expected_pid,
-                trace_handle: trace,
-                #[cfg(all(target_os = "macos", feature = "research-harness"))]
-                research_guard: None,
-                #[cfg(all(target_os = "macos", feature = "research-harness"))]
-                ticket_handoff: None,
-            },
-        )
+    let dispatch_gate = policy.dispatch_gate.clone();
+    let on_shortcut_dispatched = policy.on_shortcut_dispatched.clone();
+    let on_owner_lifecycle = policy.on_owner_lifecycle.clone();
+    let history_recovery_on_start_failure = on_owner_lifecycle.is_some();
+    run_delivery_owner_observed(
+        move |anchor_lease| {
+            insert_with_post_verify_timed_on_owner(
+                &effects,
+                &text,
+                accessibility,
+                cancellation,
+                policy,
+                anchor_lease,
+                TimedInsertOwnerMetadata {
+                    expected_pid,
+                    trace_handle: trace,
+                    dispatch_gate,
+                    on_shortcut_dispatched,
+                    #[cfg(all(target_os = "macos", feature = "research-harness"))]
+                    research_guard: None,
+                    #[cfg(all(target_os = "macos", feature = "research-harness"))]
+                    ticket_handoff: None,
+                },
+            )
+        },
+        on_owner_lifecycle,
+    )
+    .unwrap_or_else(|error| {
+        Err(delivery_owner_error_to_paste_error(
+            error,
+            history_recovery_on_start_failure,
+        ))
     })
-    .map_err(PasteError::Input)?
 }
 
 struct TimedInsertOwnerMetadata {
     expected_pid: i32,
     trace_handle: Option<crate::metrics::TraceHandle>,
+    dispatch_gate: Option<PasteDispatchGate>,
+    on_shortcut_dispatched: Option<PasteDispatchObserver>,
     #[cfg(all(target_os = "macos", feature = "research-harness"))]
     research_guard: Option<RegisteredResearchPasteGuard>,
     #[cfg(all(target_os = "macos", feature = "research-harness"))]
@@ -9345,6 +9485,8 @@ fn insert_with_post_verify_timed_on_owner(
     let TimedInsertOwnerMetadata {
         expected_pid,
         trace_handle,
+        dispatch_gate,
+        on_shortcut_dispatched,
         #[cfg(all(target_os = "macos", feature = "research-harness"))]
         research_guard,
         #[cfg(all(target_os = "macos", feature = "research-harness"))]
@@ -9419,6 +9561,8 @@ fn insert_with_post_verify_timed_on_owner(
                     trace,
                     anchor_lease,
                     trace_handle.clone(),
+                    dispatch_gate.clone(),
+                    on_shortcut_dispatched.clone(),
                     #[cfg(all(target_os = "macos", feature = "research-harness"))]
                     research_guard.as_ref(),
                     #[cfg(all(target_os = "macos", feature = "research-harness"))]
@@ -9638,6 +9782,8 @@ fn insert_with_post_verify_timed_inner(
     trace: &mut DeliveryTrace,
     anchor_lease: &mut Option<AnchorLease<FocusedFieldAnchor>>,
     trace_handle: Option<crate::metrics::TraceHandle>,
+    dispatch_gate: Option<PasteDispatchGate>,
+    on_shortcut_dispatched: Option<PasteDispatchObserver>,
     #[cfg(all(target_os = "macos", feature = "research-harness"))] research_guard: Option<
         &RegisteredResearchPasteGuard,
     >,
@@ -9866,7 +10012,7 @@ fn insert_with_post_verify_timed_inner(
             let prepared_shortcut = prepare_command_shortcut(0);
             let attempt = match prepared_shortcut {
                 Err(error) => PasteAttempt::not_sent(error),
-                Ok(prepared_shortcut) => run_paste_attempt_with_post_ack_recheck(
+                Ok(prepared_shortcut) => run_paste_attempt_with_dispatch_gate(
                     &cancellation,
                     verify_target_before_keyboard,
                     || match effects.request_shortcut_post(&clipboard_marker) {
@@ -9897,6 +10043,7 @@ fn insert_with_post_verify_timed_inner(
                         )),
                     },
                     verify_registered_target_after_post_ack,
+                    dispatch_gate.as_ref(),
                     move |mark_may_have_posted| {
                         if !crate::research_trace::allowed() {
                             return Err(PasteError::Cancelled);
@@ -9909,7 +10056,7 @@ fn insert_with_post_verify_timed_inner(
                                 if let Some(research) = crate::research_trace::current() {
                                     research.keyboard();
                                 }
-                                mark_may_have_posted();
+                                mark_may_have_posted()
                             };
                             return simulate_paste_once_to_registered_pid(
                                 expected_pid,
@@ -9930,6 +10077,10 @@ fn insert_with_post_verify_timed_inner(
             drop(latin_layout);
             attempt
         });
+    // Only a completed native send publishes the HUD event. The earlier
+    // dispatch gate already records the conservative may-have-posted fact for
+    // the watchdog before the first irreversible key event.
+    notify_shortcut_dispatched(&attempt, on_shortcut_dispatched.as_ref());
     trace.stage = if attempt.shortcut_sent {
         "keyboard_paste"
     } else {
@@ -11022,6 +11173,124 @@ mod tests {
         );
         timer.finish(crate::metrics::DeliveryOutcome::PasteUnconfirmed, None);
         assert_eq!(trace.snapshot().stages, snapshot.stages);
+    }
+
+    #[test]
+    fn dispatch_observer_reports_only_completed_native_send_before_readback() {
+        let cancellation = CancellationToken::new();
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = std::sync::Arc::clone(&events);
+        let observer: PasteDispatchObserver = std::sync::Arc::new(move || {
+            observed.lock().unwrap().push("dispatched");
+        });
+        let attempt = run_paste_attempt(
+            &cancellation,
+            || Ok(()),
+            || Ok(()),
+            |mark| {
+                mark();
+                Ok(())
+            },
+        );
+        assert!(attempt.shortcut_sent);
+        notify_shortcut_dispatched(&attempt, Some(&observer));
+        let (result, _) = run_traced_confirmation(None, attempt.result, || {
+            events.lock().unwrap().push("readback");
+            Ok::<_, PasteError>(())
+        });
+        assert!(result.is_ok());
+        assert_eq!(*events.lock().unwrap(), ["dispatched", "readback"]);
+
+        events.lock().unwrap().clear();
+        let possibly_sent = run_paste_attempt(
+            &cancellation,
+            || Ok(()),
+            || Ok(()),
+            |mark| {
+                mark();
+                Err(PasteError::Input("post outcome unknown".into()))
+            },
+        );
+        assert!(possibly_sent.shortcut_sent);
+        notify_shortcut_dispatched(&possibly_sent, Some(&observer));
+        let (result, _) = run_traced_confirmation::<(), _>(None, possibly_sent.result, || {
+            panic!("an uncertain post error does not enter AX readback")
+        });
+        assert!(result.is_err());
+        assert!(events.lock().unwrap().is_empty());
+
+        events.lock().unwrap().clear();
+        let not_sent = run_paste_attempt(
+            &cancellation,
+            || Ok(()),
+            || Ok(()),
+            |_| Err(PasteError::Input("failed before post".into())),
+        );
+        assert!(!not_sent.shortcut_sent);
+        notify_shortcut_dispatched(&not_sent, Some(&observer));
+        assert!(events.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn ordinary_paste_owner_start_failure_uses_history_without_any_new_write() {
+        let error = paste_owner_start_failed();
+        let diagnostic = error
+            .delivery_diagnostic()
+            .expect("known owner start failure has delivery facts");
+        assert_eq!(diagnostic.code, "delivery_failed");
+        assert_eq!(diagnostic.stage, "paste_owner_start");
+        assert_eq!(diagnostic.fallback_delivery_method(), "history");
+        assert!(!diagnostic.clipboard_write_attempted);
+        assert!(!diagnostic.keyboard_paste_attempted);
+        assert!(!diagnostic.keyboard_paste_may_have_been_posted);
+    }
+
+    #[test]
+    fn owner_start_failure_and_lost_result_receiver_keep_distinct_delivery_facts() {
+        let start_failure = delivery_owner_error_to_paste_error(
+            DeliveryOwnerError::StartFailed(std::io::Error::other("injected")),
+            true,
+        );
+        assert_eq!(
+            start_failure
+                .delivery_diagnostic()
+                .map(DeliveryDiagnostic::fallback_delivery_method),
+            Some("history")
+        );
+
+        let lost_receiver =
+            delivery_owner_error_to_paste_error(DeliveryOwnerError::OutcomeUnknown, true);
+        assert!(lost_receiver.delivery_diagnostic().is_none());
+        assert!(matches!(lost_receiver, PasteError::Input(_)));
+
+        let non_ordinary_start_failure = delivery_owner_error_to_paste_error(
+            DeliveryOwnerError::StartFailed(std::io::Error::other("injected")),
+            false,
+        );
+        assert!(non_ordinary_start_failure.delivery_diagnostic().is_none());
+    }
+
+    #[test]
+    fn dispatch_gate_rejection_prevents_the_native_post_boundary() {
+        let cancellation = CancellationToken::new();
+        let posts = std::sync::atomic::AtomicUsize::new(0);
+        let rejecting_gate: PasteDispatchGate = std::sync::Arc::new(|| Err(PasteError::Cancelled));
+        let attempt = run_paste_attempt_with_dispatch_gate(
+            &cancellation,
+            || Ok(()),
+            || Ok(()),
+            || Ok(()),
+            Some(&rejecting_gate),
+            |mark| {
+                mark()?;
+                posts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            },
+        );
+
+        assert!(!attempt.shortcut_sent);
+        assert!(matches!(attempt.result, Err(PasteError::Cancelled)));
+        assert_eq!(posts.load(std::sync::atomic::Ordering::Relaxed), 0);
     }
 
     #[test]

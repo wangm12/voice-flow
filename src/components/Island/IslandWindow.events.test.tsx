@@ -433,11 +433,7 @@ describe("IslandWindow HUD partials", () => {
       session_generation: 51,
     } }));
 
-    expect(document.querySelector(".voice-pill-stack")).not.toHaveClass("voice-pill-stack--hidden-now");
-    expect(document.querySelector(".voice-pill__label")).toHaveTextContent("已尝试输入");
-    expect(document.querySelector(".voice-pill__subtitle")).toHaveTextContent("先检查输入框");
-    expect(document.querySelector(".voice-pill")?.getAttribute("aria-label")).not.toContain("历史记录");
-    expect(screen.queryByRole("button", { name: "查看详情" })).not.toBeInTheDocument();
+    expect(document.querySelector(".voice-pill-stack")).toHaveClass("voice-pill-stack--hidden-now");
     expect(document.querySelector(".voice-pill__secondary--recovery")).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "复制听写文字" })).not.toBeInTheDocument();
     expect(document.querySelector(".voice-pill__secondary--details")).not.toBeInTheDocument();
@@ -449,6 +445,33 @@ describe("IslandWindow HUD partials", () => {
     act(() => handlers.get("dictation://history-recovery")!({ payload: { ...ticket, ticket_revision: 2 } }));
     expect(document.querySelector(".voice-pill__secondary--recovery")).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "复制听写文字" })).not.toBeInTheDocument();
+  });
+
+  it("hides at dispatch and keeps the later uncertain ordinary paste quiet when events batch", async () => {
+    await renderHud();
+    await waitFor(() => expect(handlers.has("dictation://paste-dispatched")).toBe(true));
+    const stateEvent = handlers.get("dictation://state")!;
+    act(() => stateEvent({ payload: { state: "recording", session_generation: 52 } }));
+    expect(document.querySelector(".voice-pill-stack")).not.toHaveClass("voice-pill-stack--hidden-now");
+
+    act(() => {
+      stateEvent({ payload: { state: "processing", phase: "delivery", session_generation: 52 } });
+      handlers.get("dictation://paste-dispatched")!({ payload: { session_generation: 52 } });
+    });
+
+    expect(document.querySelector(".voice-pill-stack")).toHaveClass("voice-pill-stack--hidden-now");
+    expect(document.querySelector(".voice-pill-stack")).toHaveAttribute("aria-hidden", "true");
+
+    act(() => stateEvent({ payload: {
+      state: "unverified",
+      delivery_method: "paste_unverified",
+      fallback_reason: "paste_mutation_uncertain",
+      session_generation: 52,
+    } }));
+    expect(document.querySelector(".voice-pill-stack")).toHaveClass("voice-pill-stack--hidden-now");
+    expect(screen.queryByRole("button", { name: /History|历史|复制/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "查看详情" })).not.toBeInTheDocument();
+    expect(invokeMock).not.toHaveBeenCalledWith("copy_history_recovery", expect.anything());
   });
 
   it("opens an exact recovery ticket tray and lets the same details owner collapse it", async () => {
@@ -857,7 +880,9 @@ describe("IslandWindow HUD partials", () => {
     expect(invokeMock).not.toHaveBeenCalledWith("repaste_history", expect.anything());
     expect(invokeMock).not.toHaveBeenCalledWith("retry_dictation", expect.anything());
     expect(invokeMock.mock.calls.every(([command]) =>
-      command === "set_island_details_visible" || command === "get_delivery_settlement_snapshot",
+      command === "set_island_details_visible"
+        || command === "get_delivery_settlement_snapshot"
+        || command === "get_hud_appearance_status",
     )).toBe(true);
   });
 
@@ -914,8 +939,7 @@ describe("IslandWindow HUD partials", () => {
         },
       });
     });
-    expect(document.querySelector(".voice-pill-stack")).not.toHaveClass("voice-pill-stack--hidden-now");
-    expect(document.querySelector(".voice-pill__label")).toHaveTextContent("已尝试输入");
+    expect(document.querySelector(".voice-pill-stack")).toHaveClass("voice-pill-stack--hidden-now");
 
     act(() => {
       stateEvent({ payload: { state: "recording", session_generation: 42 } });

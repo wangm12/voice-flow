@@ -1130,6 +1130,9 @@ pub(crate) async fn run_onboarding_external(
                     crate::paste::DeliveryPolicy {
                         recovery: crate::paste::RecoveryIntent::NoImplicitCopy,
                         readback: None,
+                        dispatch_gate: None,
+                        on_shortcut_dispatched: None,
+                        on_owner_lifecycle: None,
                         before: move || {
                             let state = before_handle.state::<AppState>();
                             if before_cancel.is_cancelled()

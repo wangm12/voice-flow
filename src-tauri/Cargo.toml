@@ -29,6 +29,7 @@ unexpected_cfgs = { level = "allow", check-cfg = ['cfg(cargo_clippy)'] }
 default = []
 evaluation = []
 research-harness = []
+native-glass-poc = []
 
 [dependencies]
 tauri = { version = "2", features = ["macos-private-api", "tray-icon", "image-png"] }
@@ -93,3 +94,8 @@ required-features = ["evaluation"]
 name = "voiceflow-learning-harness"
 path = "src/bin/voiceflow-learning-harness.rs"
 required-features = ["research-harness"]
+
+[[bin]]
+name = "voiceflow-glass-poc"
+path = "src/bin/voiceflow-glass-poc.rs"
+required-features = ["native-glass-poc"]

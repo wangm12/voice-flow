@@ -118,10 +118,12 @@ describe("RecordingSettings", () => {
     nativeHandlers.updateSettingsPatch = () => new Promise<void>((resolve) => { acknowledge = resolve; });
     const save = vi.fn();
     render(<RecordingSettings settings={{ ...settings, api_key_configured: false }} save={save} />);
-    fireEvent.click(screen.getByRole("radio", { name: "点按切换" }));
+    expect(screen.getByText(/按住 .*Space 说话，松开后结束并转成文字/)).toBeVisible();
+    expect(screen.getByText("Esc 取消。")).toBeVisible();
+    selectOption(screen.getByRole("combobox", { name: "录音方式" }), "tap");
     expect(invokeMock).toHaveBeenCalledWith("update_settings_patch", { patch: { activation_mode: "tap" } });
     expect(save).not.toHaveBeenCalled();
-    expect(screen.getByRole("radio", { name: "按住说话" })).toBeChecked();
+    expect(screen.getByRole("combobox", { name: "录音方式" })).toHaveTextContent("按住说话");
     expect(screen.getByRole("button", { name: "recapture-dictation" })).toBeDisabled();
     acknowledge();
     await waitFor(() => expect(save).toHaveBeenCalledWith({ activation_mode: "tap" }, { persist: false }));
@@ -133,17 +135,17 @@ describe("RecordingSettings", () => {
     nativeHandlers.updateSettingsPatch = async () => { throw new Error("write failed"); };
     const save = vi.fn();
     render(<RecordingSettings settings={settings} save={save} />);
-    fireEvent.click(screen.getByRole("radio", { name: "点按切换" }));
+    selectOption(screen.getByRole("combobox", { name: "录音方式" }), "tap");
     expect(invokeMock).toHaveBeenCalledWith("update_settings_patch", { patch: { activation_mode: "tap" } });
     expect(await screen.findByRole("alert")).toHaveTextContent("write failed");
-    expect(screen.getByRole("radio", { name: "按住说话" })).toBeChecked();
+    expect(screen.getByRole("combobox", { name: "录音方式" })).toHaveTextContent("按住说话");
     expect(screen.getByRole("button", { name: "recapture-dictation" })).toBeEnabled();
     expect(save).not.toHaveBeenCalled();
   });
 
   it("blocks binding and mode changes while dictation is busy", () => {
     render(<RecordingSettings settings={settings} save={vi.fn()} dictationBusy />);
-    for (const radio of screen.getAllByRole("radio")) expect(radio).toBeDisabled();
+    expect(screen.getByRole("combobox", { name: "录音方式" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "recapture-dictation" })).toBeDisabled();
   });
 

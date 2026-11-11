@@ -114,6 +114,20 @@ export function useSettingsPersistence({
     }
     publishUnsavedFields();
     pendingPatch.current = { ...pendingPatch.current, ...patch };
+    if (options?.immediate) {
+      const immediatePatch: Partial<Settings> = {};
+      for (const field of Object.keys(patch) as SettingsField[]) {
+        if (!(field in pendingPatch.current)) continue;
+        (immediatePatch as Record<string, unknown>)[field] = pendingPatch.current[field];
+        delete (pendingPatch.current as Record<string, unknown>)[field];
+      }
+      if (Object.keys(pendingPatch.current).length === 0 && saveTimer.current) {
+        window.clearTimeout(saveTimer.current);
+        saveTimer.current = null;
+      }
+      persistPatch(immediatePatch, versionsFor(immediatePatch));
+      return;
+    }
     if (saveTimer.current) window.clearTimeout(saveTimer.current);
     saveTimer.current = window.setTimeout(() => {
       saveTimer.current = null;

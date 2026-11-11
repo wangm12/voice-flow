@@ -3,6 +3,7 @@ pub(crate) const COMMANDS: &[&str] = &[
     "stop_dictation_from_hud",
     "cancel_dictation_from_hud",
     "get_settings",
+    "get_hud_appearance_status",
     "read_provider_credential_from_keychain",
     "cancel_provider_credential_read",
     "get_guide_acknowledgements",
@@ -117,6 +118,7 @@ mod tests {
     use std::collections::BTreeSet;
     const MAIN: &[&str] = &[
         "get_settings",
+        "get_hud_appearance_status",
         "read_provider_credential_from_keychain",
         "cancel_provider_credential_read",
         "get_guide_acknowledgements",
@@ -218,6 +220,7 @@ mod tests {
         "stop_dictation_from_hud",
         "cancel_dictation_from_hud",
         "get_settings",
+        "get_hud_appearance_status",
         "get_delivery_settlement_snapshot",
         "undo_learn_pair",
         "hide_island_if_idle",

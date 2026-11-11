@@ -9,6 +9,7 @@
     "allow-stop-dictation-from-hud",
     "allow-cancel-dictation-from-hud",
     "allow-get-settings",
+    "allow-get-hud-appearance-status",
     "allow-get-delivery-settlement-snapshot",
     "allow-undo-learn-pair",
     "allow-hide-island-if-idle",

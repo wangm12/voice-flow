@@ -7,6 +7,7 @@
   ],
   "permissions": [
     "allow-get-settings",
+    "allow-get-hud-appearance-status",
     "allow-read-provider-credential-from-keychain",
     "allow-cancel-provider-credential-read",
     "allow-get-guide-acknowledgements",

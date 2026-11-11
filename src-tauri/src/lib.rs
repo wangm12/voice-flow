@@ -52,6 +52,9 @@ mod mlx_diagnostics;
 mod model_resources;
 mod modelstore;
 mod modifier_hotkey;
+mod native_glass;
+#[cfg(all(feature = "native-glass-poc", target_os = "macos"))]
+mod native_glass_poc;
 mod network_policy;
 mod notch;
 mod observations;
@@ -98,7 +101,9 @@ use delivery_settlement::{
 };
 #[cfg(test)]
 use dictation::release_operation_lease;
-use dictation::{DictationManager, OperationLease, Phase, RecorderBackend, StopClaim};
+use dictation::{
+    DictationManager, OperationLease, PasteOwnerState, Phase, RecorderBackend, StopClaim,
+};
 use futures_util::{Stream, StreamExt};
 pub(crate) use mlx_cleanup_catalog_data::MISTRAL3_CANDIDATES as MINISTRAL_MLX_CLEANUP_CANDIDATES;
 pub(crate) use mlx_cleanup_catalog_data::MODELS as GEMMA_MLX_CLEANUP_MODELS;
@@ -1910,12 +1915,42 @@ const STOP_CONTEXT_REFRESH_TIMEOUT: std::time::Duration = std::time::Duration::f
 const PROCESSING_WATCHDOG_MIN_SECS: u64 = 5 * 60;
 const PROCESSING_WATCHDOG_MAX_SECS: u64 = 30 * 60;
 const LOCAL_PROCESSING_WATCHDOG_SECS: u64 = 40 * 60;
+const LOCAL_WATCHDOG_PENDING: u8 = 0;
+const LOCAL_WATCHDOG_DISARMED: u8 = 1;
+const LOCAL_WATCHDOG_FIRED: u8 = 2;
 
-struct AbortOnDrop(tokio::task::JoinHandle<()>);
+fn disarm_local_watchdog(state: &AtomicU8) -> bool {
+    state
+        .compare_exchange(
+            LOCAL_WATCHDOG_PENDING,
+            LOCAL_WATCHDOG_DISARMED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_ok()
+}
+
+fn claim_local_watchdog_after_sleep(state: &AtomicU8) -> bool {
+    state
+        .compare_exchange(
+            LOCAL_WATCHDOG_PENDING,
+            LOCAL_WATCHDOG_FIRED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_ok()
+}
+
+struct AbortOnDrop {
+    handle: tokio::task::JoinHandle<()>,
+    state: Arc<AtomicU8>,
+}
 
 impl Drop for AbortOnDrop {
     fn drop(&mut self) {
-        self.0.abort();
+        if disarm_local_watchdog(&self.state) {
+            self.handle.abort();
+        }
     }
 }
 
@@ -3350,6 +3385,132 @@ fn delivery_result_for_paste(
     delivery::DeliveryResult::for_method(method, fallback_reason)
 }
 
+/// Hide the ordinary processing capsule as soon as the guarded paste owner
+/// returns from a shortcut attempt, while retaining the existing processing
+/// and clipboard-writer leases through AX readback and ownership settlement.
+fn publish_paste_dispatched(app: &tauri::AppHandle, session_generation: u64) {
+    let Some(state) = app.try_state::<AppState>() else {
+        return;
+    };
+    // Keep the same operation-lease -> manager lock order as start/cancel
+    // claims, and publish under both locks so an old owner cannot hide a new
+    // recording's HUD.
+    let operation_lease = lock_recover(&state.operation_lease);
+    let mut manager = lock_recover(&state.manager);
+    if *operation_lease != OperationLease::LiveDictation
+        || manager.phase != Phase::Processing
+        || manager.session_generation != session_generation
+        || manager.cancellation.is_cancelled()
+        || manager.onboarding_trial.is_some()
+        || manager.owned_replay_learning_suppressed
+        || manager.paste_owner_state != PasteOwnerState::MayHavePosted
+    {
+        return;
+    }
+    manager.paste_dispatched = true;
+    manager.paste_owner_state = PasteOwnerState::Dispatched;
+    island_window::set_hud_actions_visible(app, false);
+    island_window::clear_details_visible(app);
+    sync_island_mouse(app);
+    island_window::hide_overlay(app);
+    let _ = app.emit_to(
+        "island",
+        "dictation://paste-dispatched",
+        serde_json::json!({ "session_generation": session_generation }),
+    );
+}
+
+fn begin_guarded_paste_owner(app: &tauri::AppHandle, session_generation: u64) -> bool {
+    let Some(state) = app.try_state::<AppState>() else {
+        return false;
+    };
+    let operation_lease = lock_recover(&state.operation_lease);
+    let mut manager = lock_recover(&state.manager);
+    if *operation_lease != OperationLease::LiveDictation
+        || manager.phase != Phase::Processing
+        || manager.session_generation != session_generation
+        || manager.cancellation.is_cancelled()
+        || manager.onboarding_trial.is_some()
+        || manager.owned_replay_learning_suppressed
+    {
+        return false;
+    }
+    manager.paste_owner_state = PasteOwnerState::Starting;
+    true
+}
+
+fn observe_paste_owner_lifecycle(
+    app: &tauri::AppHandle,
+    session_generation: u64,
+    event: paste::PasteOwnerLifecycleEvent,
+) {
+    let Some(state) = app.try_state::<AppState>() else {
+        return;
+    };
+    let mut manager = lock_recover(&state.manager);
+    if manager.phase != Phase::Processing || manager.session_generation != session_generation {
+        return;
+    }
+    manager.paste_owner_state = match event {
+        paste::PasteOwnerLifecycleEvent::Started
+            if manager.paste_owner_state == PasteOwnerState::Starting =>
+        {
+            PasteOwnerState::Started
+        }
+        paste::PasteOwnerLifecycleEvent::StartFailed => PasteOwnerState::StartFailed,
+        paste::PasteOwnerLifecycleEvent::OutcomeUnknown
+            if manager.paste_owner_state != PasteOwnerState::Dispatched =>
+        {
+            PasteOwnerState::OutcomeUnknown
+        }
+        _ => manager.paste_owner_state,
+    };
+}
+
+fn guarded_paste_dispatch_is_current(
+    operation_lease: OperationLease,
+    phase: Phase,
+    current_generation: u64,
+    expected_generation: u64,
+    cancelled: bool,
+    owner_state: PasteOwnerState,
+) -> bool {
+    operation_lease == OperationLease::LiveDictation
+        && phase == Phase::Processing
+        && current_generation == expected_generation
+        && !cancelled
+        && owner_state == PasteOwnerState::Started
+}
+
+/// The final session/cancellation check and `MayHavePosted` transition share
+/// the manager lock with the processing watchdog. If the watchdog wins first,
+/// this gate rejects the keyboard post; if the owner wins first, the watchdog
+/// treats delivery as uncertain and suppresses recovery UI.
+fn authorize_guarded_paste_dispatch(
+    app: &tauri::AppHandle,
+    session_generation: u64,
+) -> Result<(), paste::PasteError> {
+    let Some(state) = app.try_state::<AppState>() else {
+        return Err(paste::PasteError::Cancelled);
+    };
+    let operation_lease = lock_recover(&state.operation_lease);
+    let mut manager = lock_recover(&state.manager);
+    if !guarded_paste_dispatch_is_current(
+        *operation_lease,
+        manager.phase,
+        manager.session_generation,
+        session_generation,
+        manager.cancellation.is_cancelled(),
+        manager.paste_owner_state,
+    ) || manager.onboarding_trial.is_some()
+        || manager.owned_replay_learning_suppressed
+    {
+        return Err(paste::PasteError::Cancelled);
+    }
+    manager.paste_owner_state = PasteOwnerState::MayHavePosted;
+    Ok(())
+}
+
 fn with_traced_final_output<T>(
     trace: Option<&metrics::TraceHandle>,
     operation: impl FnOnce() -> T,
@@ -3789,6 +3950,31 @@ fn emit_state_with_delivery_input_device_for_generation(
     input_device: Option<&str>,
     session_generation: u64,
 ) {
+    emit_state_with_delivery_input_device_for_generation_policy(
+        app,
+        state,
+        context,
+        delivery_method,
+        fallback_reason,
+        cleanup_status,
+        input_device,
+        session_generation,
+        false,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_state_with_delivery_input_device_for_generation_policy(
+    app: &tauri::AppHandle,
+    state: &str,
+    context: Option<&context::ContextSnapshot>,
+    delivery_method: &str,
+    fallback_reason: Option<&str>,
+    cleanup_status: Option<&str>,
+    input_device: Option<&str>,
+    session_generation: u64,
+    quiet_ordinary_paste_outcome: bool,
+) {
     let payload = state_payload_with_delivery_and_input_device(
         app,
         state,
@@ -3801,6 +3987,22 @@ fn emit_state_with_delivery_input_device_for_generation(
     );
     let confirmed_paste =
         state == "done" && delivery_method == "paste" && fallback_reason.is_none();
+    if quiet_ordinary_paste_outcome {
+        if let Some(app_state) = app.try_state::<AppState>() {
+            let manager = lock_recover(&app_state.manager);
+            if manager.phase != Phase::Idle || manager.session_generation != session_generation {
+                return;
+            }
+            island_window::set_hud_actions_visible(app, false);
+            island_window::clear_details_visible(app);
+            sync_island_mouse(app);
+            island_window::set_has_wide_caption(app, false);
+            island_window::set_has_warning_caption(app, false);
+            island_window::hide_overlay(app);
+            let _ = app.emit("dictation://state", payload);
+            return;
+        }
+    }
     island_window::set_hud_actions_visible(app, state != "idle" && !confirmed_paste);
     if state == "idle" || confirmed_paste {
         island_window::clear_details_visible(app);
@@ -7963,6 +8165,26 @@ async fn paste_text(
     };
     let expected_target_owned = expected_target.clone();
     let owned_replay_target = owned_replay_target.cloned();
+    let watchdog_managed_paste = !suppress_learning && owned_replay_target.is_none();
+    if watchdog_managed_paste && !begin_guarded_paste_owner(app, session_generation) {
+        return Err(paste::PasteError::Cancelled);
+    }
+    let dispatch_gate = watchdog_managed_paste.then(|| {
+        let gate_app = app.clone();
+        Arc::new(move || authorize_guarded_paste_dispatch(&gate_app, session_generation))
+            as paste::PasteDispatchGate
+    });
+    let on_owner_lifecycle = watchdog_managed_paste.then(|| {
+        let lifecycle_app = app.clone();
+        Arc::new(move |event| {
+            observe_paste_owner_lifecycle(&lifecycle_app, session_generation, event)
+        }) as paste::PasteOwnerLifecycleObserver
+    });
+    let on_shortcut_dispatched = watchdog_managed_paste.then(|| {
+        let dispatch_app = app.clone();
+        Arc::new(move || publish_paste_dispatched(&dispatch_app, session_generation))
+            as paste::PasteDispatchObserver
+    });
     let delivery_target = owned_replay_target
         .as_ref()
         .map(|binding| binding.target.clone())
@@ -7998,6 +8220,9 @@ async fn paste_text(
                     after: move || verify_owned_replay_window(&after_binding),
                     readback: None,
                     recovery: paste::RecoveryIntent::NoImplicitCopy,
+                    dispatch_gate: None,
+                    on_shortcut_dispatched: None,
+                    on_owner_lifecycle: None,
                 },
                 expected_pid,
                 trace_handle.clone(),
@@ -8028,6 +8253,9 @@ async fn paste_text(
                 verify_readback,
                 restore_pid,
                 trace_handle,
+                dispatch_gate,
+                on_shortcut_dispatched,
+                on_owner_lifecycle,
             )
         }
     })
@@ -8732,11 +8960,16 @@ fn schedule_local_processing_watchdog(
     model: String,
 ) -> AbortOnDrop {
     let app = app.clone();
-    AbortOnDrop(research_trace::tokio_spawn(async move {
+    let watchdog_state = Arc::new(AtomicU8::new(0));
+    let task_state = Arc::clone(&watchdog_state);
+    let handle = research_trace::tokio_spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(
             LOCAL_PROCESSING_WATCHDOG_SECS,
         ))
         .await;
+        if !claim_local_watchdog_after_sleep(&task_state) {
+            return;
+        }
         let state = app.state::<AppState>();
         recover_local_processing_timeout(
             &app,
@@ -8748,7 +8981,11 @@ fn schedule_local_processing_watchdog(
             &format!("on_device:{model}"),
         )
         .await;
-    }))
+    });
+    AbortOnDrop {
+        handle,
+        state: watchdog_state,
+    }
 }
 
 async fn recover_local_processing_timeout(
@@ -8760,12 +8997,33 @@ async fn recover_local_processing_timeout(
     recording_context: &context::ContextSnapshot,
     engine: &str,
 ) {
-    let Some(completion_generation) = ({
+    let Some(claim) = ({
         let mut manager = lock_recover(&state.manager);
         claim_processing_timeout(&mut manager, expected_generation)
     }) else {
         return;
     };
+    let completion_generation = claim.completion_generation;
+    if claim.recovery == ProcessingTimeoutRecovery::QuietPaste {
+        log::error!(
+            "local processing watchdog settled a paste with unknown delivery for session generation {expected_generation}"
+        );
+        sync_modifier_hotkey_phase(Phase::Idle);
+        hotkey::unregister_cancel(app);
+        finish_with_delivery(
+            app,
+            state,
+            "unverified",
+            None,
+            "paste_unverified",
+            Some("paste_shortcut_outcome_unknown"),
+            None,
+            Some(completion_generation),
+            None,
+        )
+        .await;
+        return;
+    }
     let persistence = record_failed_short_asr(
         app,
         failed_short_audio_job_id(expected_generation),
@@ -14609,13 +14867,35 @@ fn processing_aborted(state: &AppState, session_generation: u64) -> bool {
                 .load(Ordering::Acquire)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProcessingTimeoutRecovery {
+    Normal,
+    QuietPaste,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProcessingTimeoutClaim {
+    completion_generation: u64,
+    recovery: ProcessingTimeoutRecovery,
+}
+
 fn claim_processing_timeout(
     manager: &mut DictationManager,
     expected_generation: u64,
-) -> Option<u64> {
+) -> Option<ProcessingTimeoutClaim> {
     if manager.phase != Phase::Processing || manager.session_generation != expected_generation {
         return None;
     }
+    let recovery = if matches!(
+        manager.paste_owner_state,
+        PasteOwnerState::MayHavePosted
+            | PasteOwnerState::Dispatched
+            | PasteOwnerState::OutcomeUnknown
+    ) {
+        ProcessingTimeoutRecovery::QuietPaste
+    } else {
+        ProcessingTimeoutRecovery::Normal
+    };
     manager.cancellation.cancel();
     if let Some(settlement) = &manager.delivery_settlement {
         settlement.seal(DeliveryTerminalOutcome::timed_out());
@@ -14627,7 +14907,10 @@ fn claim_processing_timeout(
     manager.recording_learning_snapshot = None;
     manager.recording_translation_target_language = None;
     manager.session_generation = manager.session_generation.wrapping_add(1);
-    Some(manager.session_generation)
+    Some(ProcessingTimeoutClaim {
+        completion_generation: manager.session_generation,
+        recovery,
+    })
 }
 
 async fn recover_processing_timeout(
@@ -14635,12 +14918,33 @@ async fn recover_processing_timeout(
     state: &AppState,
     expected_generation: u64,
 ) {
-    let Some(completion_generation) = ({
+    let Some(claim) = ({
         let mut manager = lock_recover(&state.manager);
         claim_processing_timeout(&mut manager, expected_generation)
     }) else {
         return;
     };
+    let completion_generation = claim.completion_generation;
+    if claim.recovery == ProcessingTimeoutRecovery::QuietPaste {
+        log::error!(
+            "processing watchdog settled a paste with unknown delivery for session generation {expected_generation}"
+        );
+        sync_modifier_hotkey_phase(Phase::Idle);
+        hotkey::unregister_cancel(app);
+        finish_with_delivery(
+            app,
+            state,
+            "unverified",
+            None,
+            "paste_unverified",
+            Some("paste_shortcut_outcome_unknown"),
+            None,
+            Some(completion_generation),
+            None,
+        )
+        .await;
+        return;
+    }
 
     log::error!("processing watchdog recovered session generation {expected_generation}");
     sync_modifier_hotkey_phase(Phase::Idle);
@@ -14681,6 +14985,23 @@ fn error_completion_is_current(
 ) -> bool {
     (phase == Phase::Processing && current_generation == expected_generation && !cancelled)
         || (phase == Phase::Idle && current_generation == expected_generation)
+}
+
+fn quiet_paste_timeout_completion_is_current(
+    manager: &DictationManager,
+    phase: &str,
+    expected_generation: u64,
+) -> bool {
+    phase == "unverified"
+        && manager.phase == Phase::Idle
+        && manager.session_generation == expected_generation
+        && manager.cancellation.is_cancelled()
+        && matches!(
+            manager.paste_owner_state,
+            PasteOwnerState::MayHavePosted
+                | PasteOwnerState::Dispatched
+                | PasteOwnerState::OutcomeUnknown
+        )
 }
 
 fn stop_transition_is_current(
@@ -16589,6 +16910,12 @@ async fn finish_with_delivery(
                     expected_generation,
                     manager.cancellation.is_cancelled(),
                 )
+            } else if quiet_paste_timeout_completion_is_current(
+                &manager,
+                phase,
+                expected_generation,
+            ) {
+                true
             } else {
                 processing_completion_is_current(
                     manager.phase,
@@ -16644,6 +16971,8 @@ async fn finish_with_delivery(
                     expected_generation,
                     m.cancellation.is_cancelled(),
                 )
+            } else if quiet_paste_timeout_completion_is_current(&m, phase, expected_generation) {
+                true
             } else {
                 processing_completion_is_current(
                     m.phase,
@@ -16666,6 +16995,13 @@ async fn finish_with_delivery(
             lease,
             m.owned_replay_learning_suppressed,
         );
+        let paste_dispatched = m.paste_dispatched;
+        let paste_owner_may_have_posted = matches!(
+            m.paste_owner_state,
+            PasteOwnerState::MayHavePosted
+                | PasteOwnerState::Dispatched
+                | PasteOwnerState::OutcomeUnknown
+        );
         if let Some(trace) = &m.research_trace {
             trace.completion(phase);
             trace.emit(research_trace::Fact::CleanupResolved {
@@ -16684,6 +17020,8 @@ async fn finish_with_delivery(
         m.recording_context = None;
         m.recording_learning_snapshot = None;
         m.recording_translation_target_language = None;
+        m.paste_dispatched = false;
+        m.paste_owner_state = PasteOwnerState::NotStarted;
         let completion_generation = m.session_generation;
         let completed_trial = m.onboarding_trial.clone();
         drop(m);
@@ -16705,25 +17043,21 @@ async fn finish_with_delivery(
         ) {
             emit_progress(app, 1.0);
         }
-        if let Some(context) = context {
-            emit_state_with_delivery(
-                app,
-                phase,
-                Some(context),
-                delivery_method,
-                fallback_reason,
-                cleanup_status,
-            );
-        } else {
-            emit_state_with_delivery(
-                app,
-                phase,
-                None,
-                delivery_method,
-                fallback_reason,
-                cleanup_status,
-            );
-        }
+        let quiet_ordinary_paste_outcome = paste_owner_may_have_posted
+            || (live_dictation
+                && (paste_dispatched
+                    || (phase == "unverified" && delivery_method == "paste_unverified")));
+        emit_state_with_delivery_input_device_for_generation_policy(
+            app,
+            phase,
+            context,
+            delivery_method,
+            fallback_reason,
+            cleanup_status,
+            None,
+            completion_generation,
+            quiet_ordinary_paste_outcome,
+        );
         onboarding::emit_state(
             app,
             state,
@@ -16907,6 +17241,15 @@ fn get_dictation_phase(state: State<'_, AppState>) -> &'static str {
 #[tauri::command]
 fn get_settings(state: State<'_, AppState>) -> store::SettingsView {
     store::SettingsView::from(&*lock_recover(&state.settings))
+}
+
+#[tauri::command]
+fn get_hud_appearance_status(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> native_glass::HudAppearanceStatus {
+    native_glass::publish_material_visibility(&app);
+    native_glass::status(&lock_recover(&state.settings).hud_appearance)
 }
 
 fn same_groq_credential_snapshot(left: &store::Settings, right: &store::Settings) -> bool {
@@ -17692,6 +18035,7 @@ fn settings_patch_requires_service_readiness(
         "language"
         | "ui_language"
         | "theme"
+        | "hud_appearance"
         | "dictionary"
         | "hotkey"
         | "activation_mode"
@@ -18260,6 +18604,16 @@ async fn apply_settings(
     let configuration_changed = commit_settings_snapshot(state, settings.clone());
     drop(binding_edit_guard);
     cancel_invalidated_dictation(&app, state, configuration_changed).await;
+    if prev.hud_appearance != settings.hud_appearance {
+        let status = native_glass::configure_and_publish(&app, &settings.hud_appearance);
+        if let Some(reason) = status.fallback_reason {
+            log::info!(
+                "HUD appearance requested={} effective={} fallback={reason}",
+                status.requested,
+                status.effective
+            );
+        }
+    }
     if cleanup_warmup_configuration_changed {
         schedule_startup_cleanup_warmup(&app, false);
     }
@@ -18692,6 +19046,7 @@ fn validate_settings_patch_fields(
         "language",
         "ui_language",
         "theme",
+        "hud_appearance",
         "dictionary",
         "hotkey",
         "activation_mode",
@@ -20128,6 +20483,21 @@ pub fn run(cli_args: cli::CliArgs) {
             });
             if let Some(window) = app.get_webview_window("island") {
                 island_window::ensure_panel(&window);
+                #[cfg(target_os = "macos")]
+                {
+                    native_glass::capture_webview(&window);
+                    let appearance_status = native_glass::configure_on_main_thread(
+                        &window,
+                        &settings.hud_appearance,
+                        false,
+                    );
+                    if appearance_status.requested == "classic" {
+                        native_glass::prewarm_on_main_thread(&window);
+                    }
+                    native_glass::publish_material_visibility(app.handle());
+                    let _ = app.emit(native_glass::STATUS_EVENT, appearance_status);
+                    native_glass::install_accessibility_observer(app.handle());
+                }
                 let placement = notch::placement_for_cursor_screen(app.handle());
                 let _ = window.set_position(tauri::Position::Physical(tauri::PhysicalPosition {
                     x: placement.x as i32,
@@ -20324,6 +20694,7 @@ pub fn run(cli_args: cli::CliArgs) {
             dictation::stop_dictation_from_hud,
             dictation::cancel_dictation_from_hud,
             get_settings,
+            get_hud_appearance_status,
             read_provider_credential_from_keychain,
             cancel_provider_credential_read,
             get_guide_acknowledgements,
@@ -20471,6 +20842,18 @@ pub fn run(cli_args: cli::CliArgs) {
             }
             _ => {}
         });
+}
+
+#[cfg(feature = "native-glass-poc")]
+#[cfg(target_os = "macos")]
+pub fn run_native_glass_poc() {
+    native_glass_poc::run();
+}
+
+#[cfg(all(feature = "native-glass-poc", not(target_os = "macos")))]
+pub fn run_native_glass_poc() {
+    eprintln!("voiceflow_glass_poc_status=unsupported_platform");
+    std::process::exit(2);
 }
 
 #[cfg(test)]
@@ -21393,22 +21776,24 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(*slots.borrow(), vec!["selected", "screen", "verbatim"]);
     }
-    use super::dictation::reset_starting_manager;
+    use super::dictation::{reset_starting_manager, PasteOwnerState};
     use super::{
         accurate_cascade_allowed, asr_allows_empty_credential, asr_request_snapshot,
         audio_error_is_current, audio_start_error_needs_device_recovery, build_asr_backend,
-        claim_processing_timeout, completion_state, completion_state_for_delivery,
-        completion_state_for_result, context, delivery_fallback_reason,
-        delivery_method_needs_history_recovery, delivery_result_for_paste, details_open_is_current,
-        dictation_has_asr_credential, error_completion_is_current, error_fallback_reason,
-        finalize_text, finalize_text_with_scope, history_delivery_status, hud_accepts_mouse,
-        hud_destination_is_current, hud_destination_route, long_completion_state,
-        process_bounded_chunk_jobs, processing_completion_is_current,
+        claim_local_watchdog_after_sleep, claim_processing_timeout, completion_state,
+        completion_state_for_delivery, completion_state_for_result, context,
+        delivery_fallback_reason, delivery_method_needs_history_recovery,
+        delivery_result_for_paste, details_open_is_current, dictation_has_asr_credential,
+        disarm_local_watchdog, error_completion_is_current, error_fallback_reason, finalize_text,
+        finalize_text_with_scope, guarded_paste_dispatch_is_current, history_delivery_status,
+        hud_accepts_mouse, hud_destination_is_current, hud_destination_route,
+        long_completion_state, process_bounded_chunk_jobs, processing_completion_is_current,
         processing_phase_publication_is_current, processing_watchdog_delay,
-        read_dictionary_file_contents, recording_publication_is_current, should_chunk_recording,
-        should_spawn_prefetch_asr, stop_transition_is_current, target_guard_mismatch_with_retry,
-        AsrBackend, CleanupDecision, DictationManager, OperationLease, Phase,
-        MAX_DICTIONARY_FILE_BYTES,
+        quiet_paste_timeout_completion_is_current, read_dictionary_file_contents,
+        recording_publication_is_current, should_chunk_recording, should_spawn_prefetch_asr,
+        stop_transition_is_current, target_guard_mismatch_with_retry, AsrBackend, CleanupDecision,
+        DictationManager, OperationLease, Phase, ProcessingTimeoutClaim, ProcessingTimeoutRecovery,
+        LOCAL_WATCHDOG_PENDING, MAX_DICTIONARY_FILE_BYTES,
     };
     use crate::asr::AsrProvider;
     use crate::paste;
@@ -21419,7 +21804,7 @@ mod tests {
     use crate::{screen_text, window_capture};
     use futures_util::StreamExt;
     use std::fs;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier, Mutex};
     use std::time::Instant;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -24799,12 +25184,120 @@ mod tests {
         manager.cancellation = cancellation.clone();
         manager.recording_context = Some(context::ContextSnapshot::general());
 
-        assert_eq!(claim_processing_timeout(&mut manager, 7), Some(8));
+        assert_eq!(
+            claim_processing_timeout(&mut manager, 7),
+            Some(ProcessingTimeoutClaim {
+                completion_generation: 8,
+                recovery: ProcessingTimeoutRecovery::Normal,
+            })
+        );
         assert_eq!(manager.phase, Phase::Idle);
         assert_eq!(manager.session_generation, 8);
         assert!(manager.recording_context.is_none());
         assert!(cancellation.is_cancelled());
         assert_eq!(claim_processing_timeout(&mut manager, 7), None);
+    }
+
+    #[test]
+    fn processing_watchdog_quiets_possible_or_unknown_paste_only() {
+        for owner_state in [
+            PasteOwnerState::MayHavePosted,
+            PasteOwnerState::Dispatched,
+            PasteOwnerState::OutcomeUnknown,
+        ] {
+            let mut manager = DictationManager::new();
+            manager.phase = Phase::Processing;
+            manager.session_generation = 31;
+            manager.paste_owner_state = owner_state;
+            let claim = claim_processing_timeout(&mut manager, 31)
+                .expect("current processing generation is claimed");
+            assert_eq!(claim.recovery, ProcessingTimeoutRecovery::QuietPaste);
+            assert_eq!(claim.completion_generation, 32);
+            assert!(manager.cancellation.is_cancelled());
+        }
+
+        let mut manager = DictationManager::new();
+        manager.phase = Phase::Processing;
+        manager.session_generation = 31;
+        manager.paste_owner_state = PasteOwnerState::Started;
+        let claim = claim_processing_timeout(&mut manager, 31)
+            .expect("current predispatch generation is claimed");
+        assert_eq!(claim.recovery, ProcessingTimeoutRecovery::Normal);
+    }
+
+    #[test]
+    fn quiet_timeout_completion_requires_current_idle_uncertain_paste_owner() {
+        let mut manager = DictationManager::new();
+        manager.phase = Phase::Idle;
+        manager.session_generation = 52;
+        manager.cancellation.cancel();
+        manager.paste_owner_state = PasteOwnerState::MayHavePosted;
+        assert!(quiet_paste_timeout_completion_is_current(
+            &manager,
+            "unverified",
+            52,
+        ));
+        assert!(!quiet_paste_timeout_completion_is_current(
+            &manager, "error", 52,
+        ));
+        assert!(!quiet_paste_timeout_completion_is_current(
+            &manager,
+            "unverified",
+            51,
+        ));
+        manager.paste_owner_state = PasteOwnerState::Started;
+        assert!(!quiet_paste_timeout_completion_is_current(
+            &manager,
+            "unverified",
+            52,
+        ));
+    }
+
+    #[test]
+    fn watchdog_claim_before_dispatch_gate_prevents_a_late_native_post() {
+        let mut lease = OperationLease::LiveDictation;
+        let mut manager = DictationManager::new();
+        manager.phase = Phase::Processing;
+        manager.session_generation = 44;
+        manager.paste_owner_state = PasteOwnerState::Started;
+        assert!(guarded_paste_dispatch_is_current(
+            lease,
+            manager.phase,
+            manager.session_generation,
+            44,
+            false,
+            manager.paste_owner_state,
+        ));
+
+        claim_processing_timeout(&mut manager, 44).expect("watchdog wins the manager lock");
+        assert!(!guarded_paste_dispatch_is_current(
+            lease,
+            manager.phase,
+            manager.session_generation,
+            44,
+            manager.cancellation.is_cancelled(),
+            manager.paste_owner_state,
+        ));
+        lease = OperationLease::Idle;
+        assert!(!guarded_paste_dispatch_is_current(
+            lease,
+            manager.phase,
+            manager.session_generation,
+            44,
+            manager.cancellation.is_cancelled(),
+            manager.paste_owner_state,
+        ));
+    }
+
+    #[test]
+    fn local_watchdog_drop_and_recovery_claim_are_mutually_exclusive() {
+        let disarmed = AtomicU8::new(LOCAL_WATCHDOG_PENDING);
+        assert!(disarm_local_watchdog(&disarmed));
+        assert!(!claim_local_watchdog_after_sleep(&disarmed));
+
+        let fired = AtomicU8::new(LOCAL_WATCHDOG_PENDING);
+        assert!(claim_local_watchdog_after_sleep(&fired));
+        assert!(!disarm_local_watchdog(&fired));
     }
 
     #[test]

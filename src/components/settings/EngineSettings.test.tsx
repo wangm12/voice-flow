@@ -475,6 +475,43 @@ describe("EngineSettings form", () => {
     expect(saveButton.parentElement?.className).not.toMatch(/border/);
   });
 
+  it("aligns service routes as SettingsRows and describes their selectors without nested actions", () => {
+    renderEngine();
+    const service = servicePanel();
+    const routeList = service.querySelector<HTMLElement>(".vf-settings-group-body > fieldset > .divide-y");
+    expect(routeList).toHaveClass("divide-y", "divide-border");
+    const rows = Array.from(routeList?.querySelectorAll<HTMLElement>(".vf-service-route-row") ?? []);
+    expect(rows).toHaveLength(2);
+
+    const asrSection = routeList?.querySelector<HTMLElement>(".vf-service-asr-section")!;
+    const asrGuideWrap = asrSection.querySelector<HTMLElement>(".vf-service-asr-guide")!;
+    const asrGuide = asrGuideWrap.querySelector<HTMLElement>(".vf-settings-disclosure")!;
+    expect(asrSection).toContainElement(rows[0]);
+    expect(asrGuideWrap).toHaveClass("px-5");
+    expect(asrGuideWrap).toContainElement(asrGuide);
+    expect(asrGuide).toBeInTheDocument();
+    expect(asrGuide).not.toContainElement(rows[0]);
+    expect(asrSection?.lastElementChild).toBe(asrGuideWrap);
+
+    for (const [index, route] of rows.entries()) {
+      const description = route.querySelector<HTMLElement>(".vf-settings-row-label [id]")!;
+      expect(description).toBeInTheDocument();
+      expect(description.querySelector("button")).not.toBeInTheDocument();
+      const selectorNames = index === 0 ? ["转写服务", "ASR 模型"] : ["整理服务", "AI 文字整理模型"];
+      for (const name of selectorNames) {
+        const selector = within(route).getByRole("combobox", { name });
+        expect(selector).toHaveAttribute("aria-describedby", description.id);
+      }
+    }
+
+    expect(within(rows[0]).getByRole("button", { name: "测试转写" })).toBeVisible();
+    expect(within(rows[0]).getByRole("button", { name: "管理凭据" })).toBeVisible();
+    expect(within(rows[1]).getByRole("button", { name: "测试整理" })).toBeVisible();
+    expect(within(rows[1]).getByRole("switch", { name: "AI 文字整理" })).toBeVisible();
+    expect(within(rows[1]).getByRole("switch", { name: "AI 文字整理" }).parentElement).toHaveClass("vf-service-cleanup-toggle");
+    expect(rows[1].querySelector(".vf-service-route-actions")).not.toContainElement(within(rows[1]).getByRole("switch", { name: "AI 文字整理" }));
+  });
+
   it("uses standard shell spacing on clean pages and flush sizing only with the save rail", () => {
     renderEngine();
     const shell = document.querySelector<HTMLElement>(".vf-settings-shell")!;
@@ -539,7 +576,7 @@ describe("EngineSettings form", () => {
     activatePage("服务配置");
     fireEvent.click(within(servicePanel()).getByRole("button", { name: "测试整理" }));
     await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent("OpenAI Compatible：服务返回错误"));
-    expect(screen.getByText("AI 文字整理").closest("div")).toHaveTextContent("服务返回错误");
+    expect(screen.getByText("AI 文字整理").closest(".vf-service-route-row")).toHaveTextContent("服务返回错误");
     expect(screen.queryByText("密钥无效")).not.toBeInTheDocument();
     expect(invoke).toHaveBeenCalledWith("probe_engine_draft", expect.objectContaining({
       draft: expect.objectContaining({ probe_stage: "cleanup", cleanup_provider: "custom" }),

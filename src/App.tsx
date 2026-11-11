@@ -2,7 +2,7 @@ import "./App.css";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { emit, listen } from "@tauri-apps/api/event";
-import { AudioLines, BookMarked, Bug, CloudCog, Cpu, FileText, History as HistoryIcon, KeyRound, Monitor, PenLine, ShieldCheck, SlidersHorizontal, Sparkles } from "lucide-react";
+import { AudioLines, BookMarked, Bug, CloudCog, Cpu, FileText, History as HistoryIcon, KeyRound, Monitor, PanelsTopLeft, PenLine, ShieldCheck, SlidersHorizontal, Sparkles } from "lucide-react";
 import { History, type HistoryItem } from "./components/History/History";
 import { Onboarding } from "./components/Onboarding/Onboarding";
 import { ContextSettings } from "./components/ContextSettings";
@@ -26,6 +26,7 @@ import { RecordingSettings } from "./components/settings/RecordingSettings";
 import { DebugSettings } from "./components/settings/DebugSettings";
 import { WhatsNewDialog, type WhatsNewPayload } from "./components/WhatsNewDialog";
 import { SystemSettings } from "./components/settings/SystemSettings";
+import { HudAppearanceSettings } from "./components/settings/HudAppearanceSettings";
 import { useSettingsPersistence } from "./hooks/useSettingsPersistence";
 import { useSettingsScrollbar } from "./hooks/useSettingsScrollbar";
 import { resolveUiLanguage, type UiLanguagePreference, useI18n } from "./lib/i18n";
@@ -40,7 +41,7 @@ type HistoryPage = { items: HistoryItem[]; has_more: boolean };
 type RuntimeErrorNotice =
   | { kind: "dictation"; message: string }
   | { kind: "preview_cancel"; message: string; actionSequence: number; transactionId: string };
-type View = "general" | "engine" | "dictionary" | "history" | "smart" | "writing" | "permissions" | "system" | "snippets" | "debug";
+type View = "general" | "engine" | "dictionary" | "history" | "smart" | "writing" | "permissions" | "system" | "hud" | "snippets" | "debug";
 export function recoveryDestinationView(destination: string): View | null {
   if (destination === "history") return "history";
   if (destination === "general") return "general";
@@ -86,6 +87,7 @@ const navigationGroups: { label: string; items: { id: View; label: string; icon:
     label: "核心设置",
     items: [
       { id: "general", label: "录音与输出", icon: AudioLines },
+      { id: "hud", label: "HUD 配置", icon: PanelsTopLeft },
       { id: "smart", label: "智能整理", icon: Sparkles },
       { id: "writing", label: "语气", icon: PenLine },
     ],
@@ -998,6 +1000,7 @@ function AppContent() {
                         : view === "permissions" ? <PermissionsSettings permissions={permissions} checking={permissionsChecking} checkError={permissionsError} onRefresh={refreshPermissions} />
                           : import.meta.env.DEV && view === "debug" ? <DebugSettings settings={settings} save={save} />
                           : view === "system" ? <SystemSettings settings={settings} audioInputDevice={audioInputDevice} audioInputDevices={audioInputDevices} save={save} uncommittedFields={unsavedFields} onUiLanguageChange={changeInterfaceLanguage} />
+                            : view === "hud" ? <HudAppearanceSettings settings={settings} save={save} saving={unsavedFields.includes("hud_appearance") && !saveError} />
                             : view === "engine" ? <EngineSettings settings={settings} page={enginePage} onPageChange={setEnginePage} removeProviderKey={removeProviderKey} commitEngine={commitEngine} readProviderCredential={readProviderCredential} cancelProviderCredentialRead={cancelProviderCredentialRead} />
                               : <RecordingSettings settings={settings} save={save} saveFailure={saveFailure} dictationBusy={dictationBusy} onOpenPermissions={() => openContextualRoute("permissions")} onOpenMappings={() => openContextualRoute("writing")} />}
             </AnimatedContent>

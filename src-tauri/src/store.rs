@@ -1679,6 +1679,8 @@ pub struct Settings {
     pub ui_language: String,
     #[serde(default = "default_theme")]
     pub theme: String,
+    #[serde(default = "default_hud_appearance")]
+    pub hud_appearance: String,
     pub dictionary: Vec<String>,
     #[serde(default = "legacy_dictionary_sources")]
     pub(crate) dictionary_sources: DictionarySources,
@@ -1903,6 +1905,10 @@ fn default_true() -> bool {
     true
 }
 
+pub(crate) fn default_hud_appearance() -> String {
+    "classic".into()
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -1916,6 +1922,7 @@ impl Default for Settings {
             language: "auto".into(),
             ui_language: default_ui_language(),
             theme: default_theme(),
+            hud_appearance: default_hud_appearance(),
             dictionary: Vec::new(),
             dictionary_sources: DictionarySources::default(),
             hotkey: default_hotkey(),
@@ -2265,6 +2272,9 @@ impl Settings {
         }
         if !matches!(self.theme.as_str(), "system" | "light" | "dark") {
             self.theme = default_theme();
+        }
+        if !matches!(self.hud_appearance.as_str(), "classic" | "liquid_glass") {
+            self.hud_appearance = default_hud_appearance();
         }
         if !matches!(
             self.long_output_mode.as_str(),
@@ -3470,6 +3480,7 @@ pub struct SettingsView {
     pub language: String,
     pub ui_language: String,
     pub theme: String,
+    pub hud_appearance: String,
     pub dictionary: Vec<String>,
     pub hotkey: String,
     pub activation_mode: String,
@@ -3584,6 +3595,7 @@ impl From<&Settings> for SettingsView {
             language: settings.language.clone(),
             ui_language: settings.ui_language.clone(),
             theme: settings.theme.clone(),
+            hud_appearance: settings.hud_appearance.clone(),
             dictionary: settings.dictionary.clone(),
             hotkey: settings.hotkey.clone(),
             activation_mode: settings.activation_mode.clone(),

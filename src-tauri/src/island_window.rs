@@ -64,12 +64,26 @@ pub fn show_overlay(app: &AppHandle) {
 
 pub fn hide_overlay(app: &AppHandle) {
     let was_desired = ISLAND_DESIRED_VISIBLE.swap(false, Ordering::AcqRel);
-    if ISLAND_PANEL_WARM.load(Ordering::Acquire)
-        || (!was_desired && !ISLAND_VISIBLE.load(Ordering::Acquire))
-    {
+    if ISLAND_PANEL_WARM.load(Ordering::Acquire) {
+        if was_desired || crate::native_glass::material_is_visible() {
+            schedule_reconcile(app);
+        }
+        return;
+    }
+    if !was_desired && !ISLAND_VISIBLE.load(Ordering::Acquire) {
         return;
     }
     schedule_reconcile(app);
+}
+
+/// The capsule material follows the primary pill and recovery controls. The
+/// independent learning toast can keep the panel visible without drawing a
+/// second, empty glass capsule behind it.
+pub fn hud_should_show_native_material() -> bool {
+    !ISLAND_PASTE_YIELD.load(Ordering::Acquire)
+        && (ISLAND_HUD_ACTIONS.load(Ordering::Acquire)
+            || are_details_visible()
+            || ISLAND_RECOVERY_ACTIONS.load(Ordering::Acquire))
 }
 
 /// The HUD is click-through by default. Active stop/cancel, explicit details,
@@ -156,12 +170,12 @@ pub fn details_owner_generation() -> Option<u64> {
 }
 
 pub fn set_hud_actions_visible(app: &AppHandle, visible: bool) {
-    ISLAND_HUD_ACTIONS.store(visible, Ordering::Release);
+    let changed = ISLAND_HUD_ACTIONS.swap(visible, Ordering::AcqRel) != visible;
     if visible {
         ISLAND_DESIRED_VISIBLE.store(true, Ordering::Release);
     }
     sync_mouse_from_published_state(app);
-    if visible {
+    if visible || changed {
         schedule_reconcile(app);
     }
 }
@@ -181,16 +195,17 @@ pub fn set_details_visible(app: &AppHandle, generation: u64, visible: bool) -> b
     }
     sync_mouse_from_published_state(app);
     apply_island_size(app);
-    if visible {
-        schedule_reconcile(app);
-    }
+    schedule_reconcile(app);
     true
 }
 
 pub fn clear_details_visible(app: &AppHandle) {
-    ISLAND_DETAILS_OWNER.store(0, Ordering::Release);
+    let changed = ISLAND_DETAILS_OWNER.swap(0, Ordering::AcqRel) != 0;
     sync_mouse_from_published_state(app);
     apply_island_size(app);
+    if changed {
+        schedule_reconcile(app);
+    }
 }
 
 fn sync_mouse_from_published_state(app: &AppHandle) {
@@ -243,7 +258,7 @@ fn visibility_reconcile_is_pending(
 }
 
 pub fn set_learn_toast_interactive(app: &AppHandle, interactive: bool) {
-    ISLAND_LEARN_TOAST.store(interactive, Ordering::Release);
+    let changed = ISLAND_LEARN_TOAST.swap(interactive, Ordering::AcqRel) != interactive;
     if interactive {
         ISLAND_DESIRED_VISIBLE.store(true, Ordering::Release);
     }
@@ -257,13 +272,13 @@ pub fn set_learn_toast_interactive(app: &AppHandle, interactive: bool) {
         ),
     );
     apply_island_size(app);
-    if interactive {
+    if interactive || changed {
         schedule_reconcile(app);
     }
 }
 
 pub fn set_recovery_actions_visible(app: &AppHandle, visible: bool) {
-    ISLAND_RECOVERY_ACTIONS.store(visible, Ordering::Release);
+    let changed = ISLAND_RECOVERY_ACTIONS.swap(visible, Ordering::AcqRel) != visible;
     if visible {
         ISLAND_DESIRED_VISIBLE.store(true, Ordering::Release);
     }
@@ -277,7 +292,7 @@ pub fn set_recovery_actions_visible(app: &AppHandle, visible: bool) {
         ),
     );
     apply_island_size(app);
-    if visible {
+    if visible || changed {
         schedule_reconcile(app);
     }
 }
@@ -433,7 +448,7 @@ fn schedule_reconcile(app: &AppHandle) {
     if let Err(error) = window.run_on_main_thread(move || {
         reconcile_on_main(&app);
         ISLAND_RECONCILE_SCHEDULED.store(false, Ordering::Release);
-        if !ISLAND_PANEL_WARM.load(Ordering::Acquire)
+        let panel_visibility_pending = !ISLAND_PANEL_WARM.load(Ordering::Acquire)
             && visibility_reconcile_is_pending(
                 ISLAND_DESIRED_VISIBLE.load(Ordering::Acquire),
                 ISLAND_HUD_ACTIONS.load(Ordering::Acquire),
@@ -441,8 +456,10 @@ fn schedule_reconcile(app: &AppHandle) {
                 ISLAND_LEARN_TOAST.load(Ordering::Acquire),
                 ISLAND_RECOVERY_ACTIONS.load(Ordering::Acquire),
                 ISLAND_VISIBLE.load(Ordering::Acquire),
-            )
-        {
+            );
+        let material_visibility_pending = crate::native_glass::material_is_visible()
+            != crate::native_glass::should_be_material_visible(hud_should_show_native_material());
+        if panel_visibility_pending || material_visibility_pending {
             schedule_reconcile(&app);
         }
     }) {
@@ -466,7 +483,7 @@ fn reconcile_on_main(app: &AppHandle) {
     if should_show {
         show_overlay_on_main(&window, app);
     } else {
-        hide_overlay_on_main(&window);
+        hide_overlay_on_main(&window, app);
     }
 }
 
@@ -479,10 +496,14 @@ fn show_overlay_on_main(window: &tauri::WebviewWindow, app: &AppHandle) {
         // boundary is crossed only once per visible HUD session, never per frame.
         if let Err(error) = window.show() {
             ISLAND_VISIBLE.store(false, Ordering::Release);
+            crate::native_glass::set_hud_visible_on_main(false);
+            crate::native_glass::publish_material_visibility(app);
             log::warn!("failed to show island overlay: {error}");
             return;
         }
     }
+    crate::native_glass::set_hud_visible_on_main(hud_should_show_native_material());
+    crate::native_glass::publish_material_visibility(app);
     // `window.show()` can reorder against the focused settings window. Re-apply
     // the overlay level last so the HUD stays above every other app window.
     raise_overlay_above_all_windows(window, app);
@@ -544,7 +565,9 @@ fn apply_overlay_window_level(window: &tauri::WebviewWindow) {
 }
 
 #[cfg(target_os = "macos")]
-fn hide_overlay_on_main(window: &tauri::WebviewWindow) {
+fn hide_overlay_on_main(window: &tauri::WebviewWindow, app: &AppHandle) {
+    crate::native_glass::set_hud_visible_on_main(false);
+    crate::native_glass::publish_material_visibility(app);
     // Keep the transparent, non-activating panel warm between dictations.
     // Ordering the NSPanel out here forces WindowServer/WebKit to rebuild the
     // overlay surface on the next hotkey press, which is visible as a hitch
@@ -564,7 +587,9 @@ fn hide_overlay_on_main(window: &tauri::WebviewWindow) {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn hide_overlay_on_main(window: &tauri::WebviewWindow) {
+fn hide_overlay_on_main(window: &tauri::WebviewWindow, app: &AppHandle) {
+    crate::native_glass::set_hud_visible_on_main(false);
+    crate::native_glass::publish_material_visibility(app);
     if !ISLAND_VISIBLE.swap(false, Ordering::AcqRel) {
         return;
     }

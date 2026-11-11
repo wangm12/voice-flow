@@ -13,6 +13,7 @@ export type ProviderKeyView = {
 
 export type CredentialReadState = "configured" | "missing" | "unavailable";
 export type ProviderCredentialPurpose = "asr" | "cleanup";
+export type HudAppearance = "classic" | "liquid_glass";
 
 export type ProviderCredentialReadStatus =
   | "session_configured"
@@ -106,6 +107,7 @@ export type Settings = {
   whats_new_last_seen_version?: string;
   debug_mode?: boolean;
   fuzzy_dictionary_enabled?: boolean;
+  hud_appearance?: HudAppearance;
 
 };
 
@@ -205,7 +207,7 @@ export type LocalCleanupStatus = {
 
 export type SaveSettings = (
   patch: Partial<Settings>,
-  options?: { persist?: boolean },
+  options?: { persist?: boolean; immediate?: boolean },
 ) => void;
 
 export type AudioInputDevice = {

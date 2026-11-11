@@ -7,11 +7,14 @@ import { detectSystemLanguage, I18nProvider, resolveUiLanguage, type UiLanguageP
 import "./islandWindow.css";
 import "./island.css";
 
+const nativeGlassPoc = new URLSearchParams(window.location.search).get("native-glass-poc") === "1";
+
 function IslandRoot() {
   const [language, setLanguage] = useState(detectSystemLanguage);
 
   useEffect(() => {
     let active = true;
+    if (nativeGlassPoc) return () => { active = false; };
     void invoke<{ ui_language?: string }>("get_settings")
       .then((settings) => {
         if (active && (settings.ui_language === "system" || settings.ui_language === "zh" || settings.ui_language === "en")) {

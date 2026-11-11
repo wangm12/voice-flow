@@ -288,6 +288,55 @@
 .vf-settings-row-control:has([role="radiogroup"]) { flex-basis: 100%; }
 .vf-settings-row-control [role="radiogroup"] { width: 100%; }
 .vf-service-fields > :is(select, .vf-select-trigger, input) { min-width: 0; }
+.vf-engine-settings .vf-service-route-row > .vf-settings-row-control {
+  flex: 1 1 26rem;
+  min-width: 0;
+  align-items: stretch;
+}
+.vf-engine-settings .vf-service-route-row {
+  align-items: flex-start;
+}
+.vf-engine-settings .vf-service-route-row > .vf-settings-row-label {
+  flex-basis: 15rem;
+}
+.vf-engine-settings .vf-service-route-current {
+  min-width: 0;
+  overflow-wrap: break-word;
+  word-break: normal;
+}
+.vf-engine-settings .vf-service-asr-guide > .vf-settings-disclosure--plain {
+  margin-top: 8px;
+}
+.vf-engine-settings .vf-service-route-controls {
+  display: flex;
+  min-width: 0;
+  width: 100%;
+  flex-direction: column;
+  align-items: stretch;
+  gap: var(--space-tight);
+}
+.vf-engine-settings .vf-service-route-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--space-tight);
+}
+.vf-engine-settings .vf-service-cleanup-toggle {
+  display: flex;
+  min-height: 28px;
+  align-items: center;
+  justify-content: flex-end;
+}
+.vf-engine-settings .vf-service-fields {
+  display: flex;
+  width: 100%;
+  min-width: 0;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: var(--space-tight);
+  margin-top: 0;
+}
 .vf-mapping-form > .vf-settings-row { padding-inline: 0; }
 .vf-inline-disclosure > summary { display: flex; align-items: center; justify-content: space-between; gap: 12px; list-style: none; }
 .vf-inline-disclosure > summary::-webkit-details-marker { display: none; }
@@ -398,6 +447,14 @@
 @container settings (max-width: 559px) {
   .vf-snippet-fields { grid-template-columns: 1fr; }
   .vf-service-fields > :is(select, .vf-select-trigger, input) { width: 100%; }
+  .vf-engine-settings .vf-service-route-row > .vf-settings-row-control {
+    flex-basis: 100%;
+    width: 100%;
+    justify-content: flex-start;
+  }
+  .vf-engine-settings .vf-service-route-actions,
+  .vf-engine-settings .vf-service-fields,
+  .vf-engine-settings .vf-service-cleanup-toggle { justify-content: flex-start; }
   .vf-history-actions { width: 100%; padding-left: 40px; justify-content: flex-end; }
   .vf-settings-row:has(.vf-settings-row-control :is(input:not([type="number"]), select, .vf-select-trigger, textarea, [role="group"])) > .vf-settings-row-label {
     flex-basis: calc(100% - 48px);

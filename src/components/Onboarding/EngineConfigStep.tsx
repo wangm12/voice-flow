@@ -412,18 +412,19 @@ export function EngineConfigStep({
           </div>
         ) : null}
 
-        {error && <p role="alert" className="border-t border-error/20 py-3 text-xs text-error-ink">{error}</p>}
-
-        <p className="flex items-center gap-1.5 border-t border-border py-4 text-xs text-tertiary">
-          <Lock {...iconPropsSm} className="shrink-0" />
-          {onDevice
-            ? t("本机 MLX 模型文件保存在这台 Mac；下载是需要网络的独立操作，运行时能力检查通过后才会标记为可用。")
-            : groq
-              ? t("密钥仅保存在这台 Mac 的钥匙串中；VoiceFlow 不会代存，验证时只发送到 Groq")
-              : soniox
-                ? t("Soniox 密钥只保存在这台 Mac 的钥匙串中；设置不会连接服务，只有开始听写时才会发送音频。")
-                : t("服务商密钥保存在这台 Mac 的钥匙串中；测试音频只发送到当前配置的转写服务。")}
-        </p>
+        <div className="border-t border-border py-4">
+          {error && <p role="alert" className="mb-3 text-xs leading-5 text-error-ink">{error}</p>}
+          <p className="flex items-center gap-1.5 text-xs leading-5 text-tertiary">
+            <Lock {...iconPropsSm} className="shrink-0" />
+            {onDevice
+              ? t("本机 MLX 模型文件保存在这台 Mac；下载是需要网络的独立操作，运行时能力检查通过后才会标记为可用。")
+              : groq
+                ? t("密钥仅保存在这台 Mac 的钥匙串中；VoiceFlow 不会代存，验证时只发送到 Groq")
+                : soniox
+                  ? t("Soniox 密钥只保存在这台 Mac 的钥匙串中；设置不会连接服务，只有开始听写时才会发送音频。")
+                  : t("服务商密钥保存在这台 Mac 的钥匙串中；测试音频只发送到当前配置的转写服务。")}
+          </p>
+        </div>
       </fieldset>
     </div>
   );

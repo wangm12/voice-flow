@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { listen, type EventCallback, type UnlistenFn } from "@tauri-apps/api/event";
+import { emit, listen, type EventCallback, type UnlistenFn } from "@tauri-apps/api/event";
 import { tryItHint } from "../../lib/activationCopy";
 import { formatHotkeyDisplay } from "../../lib/hotkeyFormat";
 import { VoicePill } from "./VoicePill";
@@ -12,6 +12,8 @@ import { voicePillLearnToastHeight } from "./voicePillTokens";
 import { useReducedMotionPreference } from "./springs";
 import { formatHudContextLabel, formatHudContextSource, formatHudIntensityLabel, formatHudTranslationLabel, type HudContextSource } from "../../lib/hudContextLabel";
 import { useI18n } from "../../lib/i18n";
+
+const nativeGlassPoc = new URLSearchParams(window.location.search).get("native-glass-poc") === "1";
 
 type DictationState = "idle" | "starting" | "recording" | "recording_limited" | "processing" | "rate_limited" | "done" | "unverified" | "copied" | "degraded" | "history" | "error";
 type ProcessingPhase = "finalizing_audio" | "asr" | "soniox_recovery" | "cascade_accurate" | "cleanup" | "delivery" | "waiting_retry" | "idle";
@@ -344,6 +346,12 @@ export function selectedActionStateForDictation(
 }
 
 type LearnToast = { pair_key: string; pair_keys?: string[]; before: string; after: string };
+type HudAppearanceStatus = {
+  requested: "classic" | "liquid_glass";
+  effective: "classic" | "liquid_glass";
+  fallback_reason: string | null;
+  pending: boolean;
+};
 
 function LearningHudGlyph() {
   return (
@@ -427,6 +435,7 @@ export function IslandWindow() {
   );
   const [stageElapsedMs, setStageElapsedMs] = useState(0);
   const [clockNowMs, setClockNowMs] = useState(() => Date.now());
+  const pasteDispatchedGenerationRef = useRef(0);
   const audioDisplay = audioCapturePresentation(hud.audioCapture, hud.state, t);
 
   useEffect(() => {
@@ -469,9 +478,12 @@ export function IslandWindow() {
   useEffect(() => {
     let disposed = false;
     const unlisteners = new Set<UnlistenFn>();
+    const registrations: Promise<UnlistenFn>[] = [];
 
     function register<T>(event: string, handler: EventCallback<T>) {
-      void listen<T>(event, handler)
+      const registration = listen<T>(event, handler);
+      registrations.push(registration);
+      void registration
         .then((unlisten) => {
           // A listener can resolve after React has already unmounted this
           // window. Unsubscribe immediately instead of leaking the late
@@ -482,7 +494,8 @@ export function IslandWindow() {
             unlisteners.add(unlisten);
           }
         })
-        .catch(() => {
+        .catch((error) => {
+          if (nativeGlassPoc) console.error("Native glass HUD event registration failed", event, error);
           // A torn-down WebView can reject registration during shutdown. The
           // HUD has no useful recovery action for that transient condition.
         });
@@ -510,6 +523,43 @@ export function IslandWindow() {
       setRecoveryError(null);
     }
 
+    register<{ session_generation?: number }>("dictation://paste-dispatched", (event) => {
+      const eventGeneration = event.payload.session_generation;
+      const renderedGeneration = hudRef.current.sessionGeneration;
+      const admitted = admittedHudStateRef.current;
+      if (!Number.isSafeInteger(eventGeneration)
+        || eventGeneration === undefined
+        || eventGeneration <= 0
+        || eventGeneration !== admitted.sessionGeneration
+        || eventGeneration !== recoveryGenerationRef.current
+        // Rendering can lag a same-generation processing event in a batched
+        // update. The synchronous admission ref decides state; the rendered
+        // value is used only to reject stale generations.
+        || eventGeneration < renderedGeneration
+        || (admitted.state !== "processing" && admitted.state !== "rate_limited")) return;
+      pasteDispatchedGenerationRef.current = eventGeneration;
+      admittedHudStateRef.current = { sessionGeneration: eventGeneration, state: "idle" };
+      hiddenHistoryRecoveryGenerationRef.current = eventGeneration;
+      setHud((value) => value.sessionGeneration !== eventGeneration
+        ? value
+        : {
+          ...value,
+          quietCompletion: true,
+          partialText: null,
+          audioRecovery: null,
+          historyRecovery: null,
+        });
+      setDetailsOwner((value) => value.generation === eventGeneration
+        ? { generation: eventGeneration, open: false }
+        : value);
+      setHudAction((value) => value.generation === eventGeneration
+        ? { generation: eventGeneration, busy: false, error: null }
+        : value);
+      setRecoveryBusy(false);
+      setHistoryCopyBusy(false);
+      setRecoveryError(null);
+    });
+
     register<DictationStatePayload>("dictation://state", (event) => {
         const eventGeneration = event.payload.session_generation;
         if (!acceptsSessionGeneration(0, eventGeneration)) return;
@@ -522,6 +572,7 @@ export function IslandWindow() {
           selectedActionStateRef.current = { sessionGeneration: eventGeneration, state: null };
         }
         if (eventGeneration > recoveryGenerationRef.current) {
+          pasteDispatchedGenerationRef.current = 0;
           recoveryGenerationRef.current = eventGeneration;
           recoveryClearedThroughRef.current = { sessionGeneration: eventGeneration, ticketRevision: 0 };
           latestRecoveryRevisionRef.current = { sessionGeneration: eventGeneration, ticketRevision: 0 };
@@ -544,6 +595,7 @@ export function IslandWindow() {
           && event.payload.delivery_method === "paste_unverified"
           && selectedActionState == null;
         const terminalPasteOutcome = quietSuccessCandidate || uncertainPasteAttempt;
+        const pasteWasDispatched = pasteDispatchedGenerationRef.current === eventGeneration;
         const nextAudioRecovery = eventGeneration > currentHud.sessionGeneration
           ? null
           : currentHud.audioRecovery;
@@ -556,7 +608,9 @@ export function IslandWindow() {
           && currentHud.quietCompletion)
           || (quietSuccessCandidate
             && nextAudioRecovery == null
-            && nextHistoryRecovery == null);
+            && nextHistoryRecovery == null)
+          || pasteWasDispatched
+          || uncertainPasteAttempt;
         admittedHudStateRef.current = {
           sessionGeneration: eventGeneration,
           state: quietCompletion ? "idle" : next,
@@ -591,7 +645,9 @@ export function IslandWindow() {
           const quietCompletion = preserveImmediateHide
             || (quietSuccessCandidate
               && nextAudioRecovery == null
-              && nextHistoryRecovery == null);
+              && nextHistoryRecovery == null)
+            || pasteWasDispatched
+            || uncertainPasteAttempt;
           const displayState = quietCompletion ? "idle" : next;
           const context = hudContextFromEvent(displayState, current, event.payload);
           const contextSource = hudContextSourceFromEvent(
@@ -979,6 +1035,75 @@ export function IslandWindow() {
       setLearnUndoBusy(false);
     });
 
+    if (nativeGlassPoc) {
+      let acknowledgementPending = false;
+      register<{ glass?: string }>("native-glass-poc://ready", (event) => {
+        if (acknowledgementPending) return;
+        acknowledgementPending = true;
+        if (event.payload.glass === "regular") {
+          document.documentElement.dataset.nativeGlassPoc = "true";
+        } else {
+          delete document.documentElement.dataset.nativeGlassPoc;
+        }
+        void Promise.all(registrations)
+          .then(() => {
+            if (disposed) return;
+            return emit("native-glass-poc://frontend-ready", {});
+          })
+          .catch((error) => {
+            console.error("Native glass HUD listeners were not ready", error);
+          });
+      });
+    }
+
+    return () => {
+      disposed = true;
+      for (const unlisten of unlisteners) unlisten();
+      unlisteners.clear();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (nativeGlassPoc) return;
+
+    const root = document.documentElement;
+    root.dataset.hudAppearance = "classic";
+    root.dataset.hudGlassVisible = "false";
+    let disposed = false;
+    let statusRevision = 0;
+    const unlisteners = new Set<UnlistenFn>();
+    const subscribe = <T,>(eventName: string, callback: (payload: T) => void) =>
+      listen<T>(eventName, (event) => callback(event.payload)).then((unlisten) => {
+        if (disposed) unlisten();
+        else unlisteners.add(unlisten);
+        return unlisten;
+      });
+    const statusSubscription = subscribe<HudAppearanceStatus>("hud-appearance://status", (status) => {
+      if (status.effective !== "classic" && status.effective !== "liquid_glass") return;
+      statusRevision += 1;
+      root.dataset.hudAppearance = status.effective;
+      if (status.effective === "classic") root.dataset.hudGlassVisible = "false";
+    });
+    const materialSubscription = subscribe<boolean>("hud-appearance://material-visible", (visible) => {
+      if (typeof visible === "boolean") root.dataset.hudGlassVisible = String(visible);
+    });
+
+    void Promise.all([statusSubscription, materialSubscription])
+      .then(() => {
+        if (disposed) return;
+        const queryRevision = statusRevision;
+        return invoke<HudAppearanceStatus>("get_hud_appearance_status")
+          .then((status) => ({ status, queryRevision }));
+      })
+      .then((result) => {
+        if (!result || disposed || statusRevision !== result.queryRevision) return;
+        const { status } = result;
+        if (status.effective !== "classic" && status.effective !== "liquid_glass") return;
+        root.dataset.hudAppearance = status.effective;
+        if (status.effective === "classic") root.dataset.hudGlassVisible = "false";
+      })
+      .catch(() => undefined);
+
     return () => {
       disposed = true;
       for (const unlisten of unlisteners) unlisten();
@@ -1031,7 +1156,7 @@ export function IslandWindow() {
     && detailsOwner.generation === hud.sessionGeneration
     && !hud.quietCompletion;
   useEffect(() => {
-    if (hud.sessionGeneration === 0) return;
+    if (nativeGlassPoc || hud.sessionGeneration === 0) return;
     void Promise.resolve(invoke("set_island_details_visible", {
       expectedGeneration: detailsOwner.generation,
       visible: detailsOpen,
@@ -1360,7 +1485,7 @@ export function IslandWindow() {
           onDismiss: () => void dismissRecovery(hud.audioRecovery!),
         } : undefined}
       />
-      <DictationCompletionStatus />
+      {!nativeGlassPoc && <DictationCompletionStatus />}
       {learnToast && (
         <div role="status" aria-busy={learnUndoBusy} aria-label={learnUndoError ?? undefined} className="island-learn-toast" style={{ height: voicePillLearnToastHeight }}>
           <span className="island-learn-toast__icon"><LearningHudGlyph /></span>

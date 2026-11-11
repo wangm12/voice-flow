@@ -28,6 +28,20 @@ pub(crate) enum Phase {
     Processing,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum PasteOwnerState {
+    #[default]
+    NotStarted,
+    Starting,
+    Started,
+    /// The owner passed its last watchdog/cancellation gate immediately
+    /// before the native shortcut post. Delivery is now uncertain.
+    MayHavePosted,
+    Dispatched,
+    StartFailed,
+    OutcomeUnknown,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OperationLease {
     Idle,
@@ -283,6 +297,13 @@ pub(crate) struct DictationManager {
     pub(crate) recording_translation_target_language: Option<String>,
     pub(crate) hotkey_session: Option<HotkeySession>,
     pub(crate) recording_source: Option<HotkeySource>,
+    /// The current ordinary dictation has crossed the one-shot keyboard
+    /// dispatch boundary and must keep its primary HUD quiet through readback.
+    pub(crate) paste_dispatched: bool,
+    /// Lifecycle facts for an ordinary guarded paste owner. `MayHavePosted`
+    /// is published before native dispatch and is separate from the later HUD
+    /// notification, which only follows the native send.
+    pub(crate) paste_owner_state: PasteOwnerState,
     pub(crate) onboarding_trial: Option<crate::onboarding::TrialSnapshot>,
     pub(crate) research_trace: Option<crate::research_trace::Trace>,
     pub(crate) stop_when_recording: bool,
@@ -307,6 +328,8 @@ impl DictationManager {
             recording_translation_target_language: None,
             hotkey_session: None,
             recording_source: None,
+            paste_dispatched: false,
+            paste_owner_state: PasteOwnerState::NotStarted,
             onboarding_trial: None,
             research_trace: None,
             stop_when_recording: false,
@@ -512,6 +535,8 @@ pub(crate) fn claim_start_manager(
     manager.owned_replay_learning_suppressed = false;
     manager.owned_replay_target = None;
     manager.owned_replay_source_admission = None;
+    manager.paste_dispatched = false;
+    manager.paste_owner_state = PasteOwnerState::NotStarted;
     manager.onboarding_trial = None;
     manager.research_trace = None;
     manager.phase = Phase::Starting;

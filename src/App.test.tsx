@@ -1049,11 +1049,27 @@ describe("settings navigation", () => {
     expect(trigger).toHaveAttribute("aria-expanded", "false");
   });
 
-  it("lets the user choose activation mode and does not persist empty chunk values", async () => {
+  it("commits the selected recording mode after native acknowledgment and does not persist empty chunk values", async () => {
+    const base = invokeMock.getMockImplementation()!;
+    let acknowledge!: () => void;
+    invokeMock.mockImplementation((command, args, options) => {
+      const patch = (args as { patch?: Record<string, unknown> } | undefined)?.patch;
+      if (command === "update_settings_patch" && patch?.activation_mode === "hold_to_talk") {
+        return new Promise<void>((resolve) => { acknowledge = resolve; });
+      }
+      return base(command, args, options);
+    });
     render(<App />);
 
-    expect(await screen.findByText("点按切换")).toBeInTheDocument();
-    expect(screen.getByRole("radio", { name: /点按切换/ })).toBeChecked();
+    const recordingMode = await screen.findByRole("combobox", { name: "录音方式" });
+    expect(recordingMode).toHaveTextContent("点按切换");
+    selectOption(recordingMode, "hold_to_talk");
+    expect(invokeMock).toHaveBeenCalledWith("update_settings_patch", { patch: { activation_mode: "hold_to_talk" } });
+    expect(recordingMode).toHaveTextContent("点按切换");
+    expect(recordingMode).toBeDisabled();
+    await act(async () => acknowledge());
+    await waitFor(() => expect(recordingMode).toHaveTextContent("按住说话"));
+    expect(recordingMode).toBeEnabled();
 
     invokeMock.mockClear();
     fireEvent.click(screen.getByRole("button", { name: /高级录音设置/ }));

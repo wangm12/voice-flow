@@ -1,15 +1,34 @@
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { EyeOff, LoaderCircle, Mic2, Moon, Sun } from "lucide-react";
-import { SettingsGroup, SettingsPageHeader, SettingsRow, SettingsShell, SettingsStatus } from "../SettingsLayout";
+import { Moon, Sun } from "lucide-react";
+import { SettingsGroup, SettingsPageHeader, SettingsRow, SettingsShell } from "../SettingsLayout";
+import { Select } from "../Select";
+import { VoicePill } from "../Island/VoicePill";
+import { HudGlassPreview } from "./HudGlassPreview";
 import { useI18n } from "../../lib/i18n";
+import { compactButtonClass } from "../../lib/theme";
+import { voicePillWindowHeight, voicePillWindowWidth } from "../Island/voicePillTokens";
 import type { HudAppearance, SaveSettings, Settings } from "../../types/settings";
+import "../../island.css";
 import "./HudAppearanceSettings.css";
 
 type HudPreviewState = "recording" | "processing" | "hidden";
+type HudPreviewSelection = "auto" | HudPreviewState;
 type HudPreviewBackdrop = "light" | "dark";
 type HudFallbackReason = "unsupported_os" | "reduce_transparency" | "native_failure";
+
+const previewStateDurationMs: Record<HudPreviewState, number> = {
+  recording: 3_000,
+  processing: 2_000,
+  hidden: 1_000,
+};
+
+function nextPreviewState(state: HudPreviewState): HudPreviewState {
+  if (state === "recording") return "processing";
+  if (state === "processing") return "hidden";
+  return "recording";
+}
 
 type HudAppearanceStatus = {
   requested: HudAppearance;
@@ -61,98 +80,118 @@ export function HudAppearanceSettings({
   saving: boolean;
 }) {
   const { t } = useI18n();
+  const [previewSelection, setPreviewSelection] = useState<HudPreviewSelection>("auto");
   const [previewState, setPreviewState] = useState<HudPreviewState>("recording");
   const [previewBackdrop, setPreviewBackdrop] = useState<HudPreviewBackdrop>("light");
   const [runtimeStatus, setRuntimeStatus] = useState<HudAppearanceStatus | null>(null);
-  const [runtimeStatusLoading, setRuntimeStatusLoading] = useState(true);
-  const [runtimeStatusUnavailable, setRuntimeStatusUnavailable] = useState(false);
-  const [runtimeStatusUpdatesUnavailable, setRuntimeStatusUpdatesUnavailable] = useState(false);
-  const [statusRetryRevision, setStatusRetryRevision] = useState(0);
+  const [runtimeStatusReadFailed, setRuntimeStatusReadFailed] = useState(false);
   const appearance = settings.hud_appearance ?? "classic";
   const statusRevision = useRef(0);
-  const previousAppearance = useRef(appearance);
+  const refreshStatus = useRef<() => void>(() => {});
   const previousSaving = useRef(saving);
+
+  useEffect(() => {
+    if (previewSelection !== "auto") return;
+
+    let timer: number | undefined;
+    const clearTimer = () => {
+      if (timer !== undefined) {
+        window.clearTimeout(timer);
+        timer = undefined;
+      }
+    };
+    const schedule = () => {
+      clearTimer();
+      if (document.hidden) return;
+      timer = window.setTimeout(
+        () => setPreviewState(nextPreviewState(previewState)),
+        previewStateDurationMs[previewState],
+      );
+    };
+    const handleVisibilityChange = () => {
+      if (document.hidden) {
+        clearTimer();
+      } else {
+        schedule();
+      }
+    };
+
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    schedule();
+
+    return () => {
+      clearTimer();
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+    };
+  }, [previewSelection, previewState]);
 
   useEffect(() => {
     let active = true;
     let unlisten: (() => void) | undefined;
 
-    const publish = (status: HudAppearanceStatus) => {
-      if (!active) return;
-      statusRevision.current += 1;
-      setRuntimeStatus(status);
-      setRuntimeStatusUnavailable(false);
-      setRuntimeStatusLoading(false);
-    };
-
     const refresh = async () => {
       const revision = ++statusRevision.current;
-      setRuntimeStatusLoading(true);
+      setRuntimeStatusReadFailed(false);
       try {
         const result = parseHudAppearanceStatus(await invoke<unknown>("get_hud_appearance_status"));
         if (active && revision === statusRevision.current) {
           setRuntimeStatus(result);
-          setRuntimeStatusUnavailable(false);
-          setRuntimeStatusLoading(false);
+          setRuntimeStatusReadFailed(false);
         }
       } catch {
         if (active && revision === statusRevision.current) {
           setRuntimeStatus(null);
-          setRuntimeStatusUnavailable(true);
-          setRuntimeStatusLoading(false);
+          setRuntimeStatusReadFailed(true);
         }
       }
     };
+    refreshStatus.current = () => { void refresh(); };
 
     void listen<unknown>("hud-appearance://status", (event) => {
       if (!active) return;
       try {
-        publish(parseHudAppearanceStatus(event.payload));
+        const status = parseHudAppearanceStatus(event.payload);
+        statusRevision.current += 1;
+        setRuntimeStatus(status);
+        setRuntimeStatusReadFailed(false);
       } catch {
         statusRevision.current += 1;
         setRuntimeStatus(null);
-        setRuntimeStatusUnavailable(true);
-        setRuntimeStatusLoading(false);
+        setRuntimeStatusReadFailed(true);
       }
     }).then((release) => {
       if (active) {
         unlisten = release;
-        setRuntimeStatusUpdatesUnavailable(false);
       }
       else release();
     }).catch(() => {
-      if (active) setRuntimeStatusUpdatesUnavailable(true);
+      // The one-shot read still provides the current status if event setup fails.
     });
-
-    const onFocus = () => { void refresh(); };
-    const onVisibilityChange = () => {
-      if (document.visibilityState === "visible") void refresh();
-    };
-    window.addEventListener("focus", onFocus);
-    document.addEventListener("visibilitychange", onVisibilityChange);
     void refresh();
 
     return () => {
       active = false;
       unlisten?.();
-      window.removeEventListener("focus", onFocus);
-      document.removeEventListener("visibilitychange", onVisibilityChange);
+      refreshStatus.current = () => {};
     };
-  }, [statusRetryRevision]);
+  }, []);
 
   useEffect(() => {
-    const appearanceChanged = previousAppearance.current !== appearance;
     const saveFinished = previousSaving.current && !saving;
-    previousAppearance.current = appearance;
     previousSaving.current = saving;
-    if ((appearanceChanged && !saving) || saveFinished) {
-      setStatusRetryRevision((revision) => revision + 1);
-    }
-  }, [appearance, saving]);
+    if (saveFinished) refreshStatus.current();
+  }, [saving]);
 
-  const runtimeMatchesSaved = runtimeStatus?.requested === appearance;
-  const runtimeIsFallback = runtimeStatus !== null && !runtimeStatus.pending
+  const runtimeIsFallback = runtimeStatus !== null
+    && runtimeStatus.requested === appearance
+    && !saving
+    && !runtimeStatus.pending
     && (runtimeStatus.fallback_reason !== null || runtimeStatus.effective !== runtimeStatus.requested);
+  const appearanceDescription = runtimeIsFallback && runtimeStatus
+    ? t(fallbackReasonTranslation[runtimeStatus.fallback_reason ?? "native_failure"])
+    : runtimeStatusReadFailed && appearance === "liquid_glass" && !saving
+      ? t("无法读取原生 HUD 状态。")
+      : t("此偏好会应用到原生听写 HUD。");
   const previewLabels: Record<HudPreviewState, string> = {
     recording: t("录音中"),
     processing: t("处理中"),
@@ -167,136 +206,117 @@ export function HudAppearanceSettings({
         saveHint={t("更改会自动保存。")}
       />
 
-      <SettingsGroup title={t("HUD 外观")} description={t("此偏好会应用到原生听写 HUD。") }>
-        <SettingsRow title={t("外观偏好")} description={t("运行时可能因系统能力回退；请查看下方原生状态。") }>
-          <div className="vf-hud-preview-options" role="group" aria-label={t("HUD 外观")}>
+      <SettingsGroup title={t("外观")}>
+        <SettingsRow title={t("外观偏好")} description={appearanceDescription}>
+          <Select
+            aria-label={t("HUD 外观")}
+            value={appearance}
+            onValueChange={(value) => {
+              if (value === "classic" || value === "liquid_glass") {
+                if (appearance !== value) save({ hud_appearance: value }, { immediate: true });
+              }
+            }}
+            className="vf-hud-appearance-select"
+          >
             {(["classic", "liquid_glass"] as const).map((value) => (
-              <button
-                key={value}
-                type="button"
-                className="vf-hud-preview-option"
-                aria-pressed={appearance === value}
-                onClick={() => {
-                  if (appearance !== value) save({ hud_appearance: value }, { immediate: true });
-                }}
-              >
-                {appearanceLabel(value, t)}
-              </button>
+              <option key={value} value={value}>{appearanceLabel(value, t)}</option>
             ))}
-          </div>
+          </Select>
         </SettingsRow>
       </SettingsGroup>
 
       <SettingsGroup
-        title={t("浏览器模拟预览")}
-        description={t("这是设置页中的界面模拟，不操作原生窗口，也不访问麦克风或剪贴板。")}
+        title={t("预览")}
+        description={t("预览使用样例数据，玻璃材质为模拟效果。")}
       >
-        <SettingsRow title={t("模拟背景")} description={t("切换内置浅色和深色样例背景。") }>
-          <div className="vf-hud-preview-options" role="group" aria-label={t("模拟背景")}>
-            <button
-              type="button"
-              className="vf-hud-preview-option"
-              aria-pressed={previewBackdrop === "light"}
-              onClick={() => setPreviewBackdrop("light")}
-            >
-              <Sun size={14} aria-hidden="true" />
-              {t("浅色")}
-            </button>
-            <button
-              type="button"
-              className="vf-hud-preview-option"
-              aria-pressed={previewBackdrop === "dark"}
-              onClick={() => setPreviewBackdrop("dark")}
-            >
-              <Moon size={14} aria-hidden="true" />
-              {t("深色")}
-            </button>
-          </div>
-        </SettingsRow>
-        <SettingsRow title={t("模拟状态")} description={t("状态仅用于此预览。") }>
-          <div className="vf-hud-preview-options" role="group" aria-label={t("模拟状态")}>
-            {(["recording", "processing", "hidden"] as const).map((state) => (
-              <button
-                key={state}
-                type="button"
-                className="vf-hud-preview-option"
-                aria-pressed={previewState === state}
-                onClick={() => setPreviewState(state)}
-              >
-                {state === "recording" && <Mic2 size={14} aria-hidden="true" />}
-                {state === "processing" && <LoaderCircle size={14} aria-hidden="true" />}
-                {state === "hidden" && <EyeOff size={14} aria-hidden="true" />}
-                {previewLabels[state]}
-              </button>
-            ))}
-          </div>
-        </SettingsRow>
-        <SettingsRow className="vf-hud-preview-row" title={t("HUD 预览")} description={`${t("模拟外观：")} ${appearanceLabel(appearance, t)}`}>
-          <div className="vf-hud-preview" data-backdrop={previewBackdrop} data-appearance={appearance}>
-            <div className="vf-hud-preview-document" aria-hidden="true">
-              <div className="vf-hud-preview-document-bar"><span /><span /><span /></div>
-              <div className="vf-hud-preview-document-body">
-                <span className="vf-hud-preview-line vf-hud-preview-line--title" />
-                <span className="vf-hud-preview-line vf-hud-preview-line--wide" />
-                <span className="vf-hud-preview-line vf-hud-preview-line--medium" />
-                <span className="vf-hud-preview-line vf-hud-preview-line--wide" />
-                <span className="vf-hud-preview-line vf-hud-preview-line--short" />
-              </div>
-            </div>
-            {previewState === "hidden" ? (
-              <div className="vf-hud-preview-hidden" role="status" aria-live="polite">
-                <EyeOff size={15} aria-hidden="true" />
-                {t("HUD 已隐藏（模拟）")}
-              </div>
-            ) : (
-              <div className={`vf-hud-preview-pill vf-hud-preview-pill--${appearance}`} role="status" aria-live="polite">
-                <span className={`vf-hud-preview-indicator vf-hud-preview-indicator--${previewState}`} aria-hidden="true">
-                  {previewState === "recording" ? <Mic2 size={15} /> : <LoaderCircle size={15} />}
-                </span>
-                <span>{previewLabels[previewState]}</span>
-                <span className="vf-hud-preview-separator" aria-hidden="true" />
-                <span className="vf-hud-preview-brand">VoiceFlow</span>
-              </div>
-            )}
-          </div>
-        </SettingsRow>
-      </SettingsGroup>
-
-      <SettingsGroup title={t("原生运行状态")} description={t("以下状态由原生 HUD 查询提供，与浏览器模拟预览分开。") }>
-        <SettingsRow title={t("HUD 实际效果")} description={t("显示原生已保存偏好、当前生效外观和系统回退原因。") }>
-          <div className="vf-hud-runtime-status" aria-live="polite">
-            {runtimeStatusLoading && !runtimeStatus && (
-              <SettingsStatus label={t("正在读取原生状态…")} tone="neutral" />
-            )}
-            {runtimeStatusUnavailable && (
-              <div className="vf-hud-runtime-error">
-                <SettingsStatus label={t("无法读取原生 HUD 状态。")} tone="warning" />
-                <button type="button" className="vf-hud-retry" onClick={() => setStatusRetryRevision((revision) => revision + 1)}>
-                  {t("重试")}
+        <SettingsRow
+          className="vf-hud-preview-row"
+          title={t("HUD 预览")}
+          description={`${t("模拟外观：")} ${appearanceLabel(appearance, t)}`}
+        >
+          <div className="vf-hud-preview-content">
+            <div className="vf-hud-preview-toolbar">
+              <div className="vf-hud-backdrop-options" role="group" aria-label={t("模拟背景")}>
+                <button
+                  type="button"
+                  className={`${compactButtonClass} vf-hud-choice`}
+                  aria-pressed={previewBackdrop === "light"}
+                  onClick={() => setPreviewBackdrop("light")}
+                >
+                  <Sun size={14} aria-hidden="true" />
+                  {t("浅色")}
+                </button>
+                <button
+                  type="button"
+                  className={`${compactButtonClass} vf-hud-choice`}
+                  aria-pressed={previewBackdrop === "dark"}
+                  onClick={() => setPreviewBackdrop("dark")}
+                >
+                  <Moon size={14} aria-hidden="true" />
+                  {t("深色")}
                 </button>
               </div>
-            )}
-            {runtimeStatus && (
-              <>
-                {runtimeStatusUpdatesUnavailable && <SettingsStatus label={t("无法接收原生 HUD 状态更新；重新打开此页可刷新。") } tone="warning" />}
-                {saving && <SettingsStatus label={t("设置正在保存…")} tone="neutral" />}
-                {!saving && runtimeMatchesSaved && runtimeStatus.pending && (
-                  <SettingsStatus label={t("原生 HUD 正在应用所选外观…")} tone="neutral" />
-                )}
-                {!saving && !runtimeMatchesSaved && <SettingsStatus label={t("原生状态仍是上次保存的偏好。") } tone="neutral" />}
-                <SettingsStatus
-                  label={`${t("已保存偏好：")} ${appearanceLabel(runtimeStatus.requested, t)}`}
-                  tone="neutral"
-                />
-                <SettingsStatus
-                  label={`${t("当前生效：")} ${appearanceLabel(runtimeStatus.effective, t)}`}
-                  tone={runtimeStatus.pending ? "neutral" : runtimeIsFallback ? "warning" : "success"}
-                />
-                {runtimeStatus.fallback_reason && (
-                  <p className="vf-hud-runtime-reason">{t(fallbackReasonTranslation[runtimeStatus.fallback_reason])}</p>
-                )}
-              </>
-            )}
+              <label className="vf-hud-state-select">
+                <span>{t("模拟状态")}</span>
+                <Select
+                  aria-label={t("模拟状态")}
+                  value={previewSelection}
+                  onValueChange={(value) => {
+                    if (value === "auto") {
+                      setPreviewState("recording");
+                      setPreviewSelection("auto");
+                    } else if (value === "recording" || value === "processing" || value === "hidden") {
+                      setPreviewState(value);
+                      setPreviewSelection(value);
+                    }
+                  }}
+                  className="vf-hud-preview-state-select"
+                >
+                  <option value="auto">{t("自动循环")}</option>
+                  {(["recording", "processing", "hidden"] as const).map((state) => (
+                    <option key={state} value={state}>{previewLabels[state]}</option>
+                  ))}
+                </Select>
+              </label>
+            </div>
+
+            <div className="vf-hud-preview" data-backdrop={previewBackdrop} data-preview-state={previewState}>
+              {previewState === "hidden" ? (
+                <span className="vf-hud-preview-label vf-hud-preview-hidden">
+                  {t("HUD 已隐藏（模拟）")}
+                </span>
+              ) : (
+                <span className="vf-hud-preview-label">{t("模拟")}</span>
+              )}
+              <HudGlassPreview
+                backdrop={previewBackdrop}
+                refract={appearance === "liquid_glass" && (previewSelection === "auto" || previewState !== "hidden")}
+              />
+              <div className="vf-hud-preview-hud" data-appearance={appearance} data-hidden={previewState === "hidden" || undefined}>
+                <div
+                  className="voice-pill-stage vf-hud-preview-stage"
+                  aria-hidden="true"
+                  inert
+                  style={{ width: voicePillWindowWidth, height: voicePillWindowHeight }}
+                >
+                  <VoicePill
+                    state={previewState === "hidden" ? "idle" : previewState}
+                    hideImmediately={previewState === "hidden"}
+                    phase={previewState === "processing" ? "cleanup" : "idle"}
+                    phaseConfirmed={previewState === "processing"}
+                    stageElapsedMs={42_000}
+                    contextLabel={null}
+                    audioStatus={t("预设演示 · 未使用麦克风")}
+                    audioDeviceName={t("演示输入设备")}
+                    audioDeviceSourceLabel={t("预览")}
+                    audioDeviceTitle={t("演示输入设备；未使用麦克风")}
+                    waveformLevels={[]}
+                    lastAudioLevelAtMs={null}
+                    reduced
+                  />
+                </div>
+              </div>
+            </div>
           </div>
         </SettingsRow>
       </SettingsGroup>

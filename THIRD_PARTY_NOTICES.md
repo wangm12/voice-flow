@@ -5,6 +5,36 @@
 - [OpenTypeless](https://github.com/tover0314-w/opentypeless) — MIT. VoiceFlow's context/profile/policy behavior is independently mapped to its own Rust types; no source file is vendored here.
 - [OpenWhispr](https://github.com/OpenWhispr/openwhispr) — MIT. VoiceFlow references its recording and hotkey interaction patterns; it does not copy the Electron UI.
 
+## Vendored glass refraction
+
+VoiceFlow adapts the one-surface WebGL2 rounded-box refraction shader and rendering setup in [`src/components/settings/hud-glasswork/GlassworkRenderer.ts`](src/components/settings/hud-glasswork/GlassworkRenderer.ts) from [Glasswork `refract.js`](https://github.com/kubai087/glasswork/blob/4f0b6744b898b3a9b98fbd913ab24fdb83c53162/refract.js), upstream commit `4f0b6744b898b3a9b98fbd913ab24fdb83c53162` (Copyright © 2026 Kubai087). The locally authored preview scene and React lifecycle code are not upstream Glasswork code. No Glasswork wallpapers, external images, or runtime CDN resources are included.
+
+### Glasswork MIT License
+
+```text
+MIT License
+
+Copyright (c) 2026 Kubai087
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
 ## Application frameworks
 
 [Tauri](https://github.com/tauri-apps/tauri), its [global-shortcut](https://github.com/tauri-apps/tauri-plugin-global-shortcut) and [clipboard-manager](https://github.com/tauri-apps/tauri-plugin-clipboard-manager) plugins, and the JavaScript API are application dependencies. The Rust crate versions are pinned in `src-tauri/Cargo.lock`; the JavaScript API version is pinned in `package-lock.json`. Those lockfiles do not contain license texts.

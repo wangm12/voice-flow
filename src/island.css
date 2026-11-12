@@ -665,10 +665,11 @@
 }
 
 /* The native material is visible only after the backend confirms it is ready.
-   Pair its pill tint with the foreground for either system appearance, without
-   sampling the app behind it. The isolated candidate shares this fixture rule. */
+   The Settings preview shares the foreground tint over a local Glasswork sample;
+   only the AppKit window receives native glass. */
 :root[data-hud-appearance="liquid_glass"][data-hud-glass-visible="true"] .voice-pill,
-:root[data-native-glass-poc="true"] .voice-pill {
+:root[data-native-glass-poc="true"] .voice-pill,
+.vf-hud-preview-hud[data-appearance="liquid_glass"] .voice-pill {
   --voice-hud-text: #171717;
   --voice-hud-muted: #303030;
   --voice-hud-focus: #171717;
@@ -695,14 +696,30 @@
   }
 }
 
+.vf-hud-preview-hud[data-appearance="liquid_glass"] .voice-pill {
+  --voice-glass-veil: rgba(255, 255, 255, 0.38);
+}
+
+.vf-hud-preview[data-backdrop="dark"] .vf-hud-preview-hud[data-appearance="liquid_glass"] .voice-pill {
+  --voice-hud-text: #f5f5f5;
+  --voice-hud-muted: #ebebeb;
+  --voice-hud-focus: #f5f5f5;
+  --voice-hud-border: rgba(255, 255, 255, 0.2);
+  --voice-glass-veil: rgba(34, 36, 40, 0.28);
+  --voice-glass-control: rgba(255, 255, 255, 0.14);
+  --voice-glass-control-hover: rgba(255, 255, 255, 0.2);
+}
+
 :root[data-hud-appearance="liquid_glass"][data-hud-glass-visible="true"] .voice-pill .voice-pill__action,
-:root[data-native-glass-poc="true"] .voice-pill .voice-pill__action {
+:root[data-native-glass-poc="true"] .voice-pill .voice-pill__action,
+.vf-hud-preview-hud[data-appearance="liquid_glass"] .voice-pill .voice-pill__action {
   color: var(--voice-hud-text);
   background: var(--voice-glass-control);
 }
 
 :root[data-hud-appearance="liquid_glass"][data-hud-glass-visible="true"] .voice-pill .voice-pill__action:hover:not(:disabled),
-:root[data-native-glass-poc="true"] .voice-pill .voice-pill__action:hover:not(:disabled) {
+:root[data-native-glass-poc="true"] .voice-pill .voice-pill__action:hover:not(:disabled),
+.vf-hud-preview-hud[data-appearance="liquid_glass"] .voice-pill .voice-pill__action:hover:not(:disabled) {
   background: var(--voice-glass-control-hover);
 }
 
@@ -711,7 +728,10 @@
 :root[data-hud-appearance="liquid_glass"][data-hud-glass-visible="true"] .voice-pill__beam-ghost,
 :root[data-native-glass-poc="true"] .voice-pill__beam-layer,
 :root[data-native-glass-poc="true"] .voice-pill__beam-fx,
-:root[data-native-glass-poc="true"] .voice-pill__beam-ghost {
+:root[data-native-glass-poc="true"] .voice-pill__beam-ghost,
+.vf-hud-preview-hud[data-appearance="liquid_glass"] .voice-pill__beam-layer,
+.vf-hud-preview-hud[data-appearance="liquid_glass"] .voice-pill__beam-fx,
+.vf-hud-preview-hud[data-appearance="liquid_glass"] .voice-pill__beam-ghost {
   display: none !important;
 }
 

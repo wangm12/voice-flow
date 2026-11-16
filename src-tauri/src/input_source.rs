@@ -35,6 +35,53 @@ pub fn should_hop_tis_to_main_queue(on_main_thread: bool) -> bool {
     !on_main_thread
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PassiveLearningInputSource {
+    DirectAsciiKeyboardLayout,
+    Unsupported,
+    Unknown,
+}
+
+/// Classify only a known, direct Apple keyboard layout as suitable for the
+/// passive observer. Input methods, non-ASCII layouts, third-party layouts,
+/// and incomplete TIS facts are deliberately not evidence of a committed edit.
+fn classify_passive_learning_input_source(
+    is_keyboard_layout: Option<bool>,
+    ascii_capable: Option<bool>,
+    source_id: Option<&str>,
+    localized_name: Option<&str>,
+) -> PassiveLearningInputSource {
+    let Some(is_keyboard_layout) = is_keyboard_layout else {
+        return PassiveLearningInputSource::Unknown;
+    };
+    if !is_keyboard_layout {
+        return PassiveLearningInputSource::Unsupported;
+    }
+    let (Some(ascii_capable), Some(source_id)) = (ascii_capable, source_id) else {
+        return PassiveLearningInputSource::Unknown;
+    };
+    if !ascii_capable || !source_id.starts_with("com.apple.keylayout.") {
+        return PassiveLearningInputSource::Unsupported;
+    }
+    if should_switch_input_source(source_id, localized_name.unwrap_or_default()) {
+        return PassiveLearningInputSource::Unsupported;
+    }
+    PassiveLearningInputSource::DirectAsciiKeyboardLayout
+}
+
+pub(crate) fn passive_learning_input_source() -> PassiveLearningInputSource {
+    #[cfg(target_os = "macos")]
+    {
+        macos::passive_learning_input_source()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        // The production observer exists only on macOS. Keep local test and
+        // research paths deterministic without manufacturing a real TIS fact.
+        PassiveLearningInputSource::Unknown
+    }
+}
+
 /// Switch to a Latin layout around `paste` when the current source looks CJK.
 /// `select_latin` must return true only if the source actually changed.
 /// `restore` then runs on the way out, including when `paste` fails.
@@ -104,7 +151,10 @@ impl Drop for RetainedInputSource {
 
 #[cfg(target_os = "macos")]
 mod macos {
-    use super::{should_switch_input_source, AbcLayoutGuard, RetainedInputSource};
+    use super::{
+        classify_passive_learning_input_source, should_switch_input_source, AbcLayoutGuard,
+        PassiveLearningInputSource, RetainedInputSource,
+    };
     use core::ffi::c_void;
     use core_foundation::array::{CFArray, CFArrayRef};
     use core_foundation::base::{CFRelease, CFType, CFTypeRef, TCFType};
@@ -145,6 +195,18 @@ mod macos {
         ) -> CFTypeRef;
         static kTISPropertyInputSourceID: CFStringRef;
         static kTISPropertyLocalizedName: CFStringRef;
+        static kTISPropertyInputSourceType: CFStringRef;
+        static kTISPropertyInputSourceIsASCIICapable: CFStringRef;
+        static kTISTypeKeyboardLayout: CFStringRef;
+    }
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        fn CFEqual(left: CFTypeRef, right: CFTypeRef) -> u8;
+        fn CFGetTypeID(value: CFTypeRef) -> usize;
+        fn CFStringGetTypeID() -> usize;
+        fn CFBooleanGetTypeID() -> usize;
+        fn CFBooleanGetValue(value: CFTypeRef) -> u8;
     }
 
     const ABC_LAYOUT_ID: &str = "com.apple.keylayout.ABC";
@@ -205,6 +267,42 @@ mod macos {
         }
     }
 
+    pub(super) fn passive_learning_input_source() -> PassiveLearningInputSource {
+        on_main_queue(|| {
+            let Some(source) = copy_current_source() else {
+                return PassiveLearningInputSource::Unknown;
+            };
+            let source_type =
+                unsafe { TISGetInputSourceProperty(source.0, kTISPropertyInputSourceType) };
+            let ascii_capable = unsafe {
+                TISGetInputSourceProperty(source.0, kTISPropertyInputSourceIsASCIICapable)
+            };
+            if source_type.is_null() || ascii_capable.is_null() {
+                return PassiveLearningInputSource::Unknown;
+            }
+            if unsafe { CFGetTypeID(source_type) } != unsafe { CFStringGetTypeID() }
+                || unsafe { CFGetTypeID(ascii_capable) } != unsafe { CFBooleanGetTypeID() }
+            {
+                return PassiveLearningInputSource::Unknown;
+            }
+            let keyboard_layout_type = unsafe { kTISTypeKeyboardLayout };
+            if keyboard_layout_type.is_null() {
+                return PassiveLearningInputSource::Unknown;
+            }
+            let is_keyboard_layout =
+                unsafe { CFEqual(source_type, keyboard_layout_type as CFTypeRef) != 0 };
+            let ascii_capable = unsafe { CFBooleanGetValue(ascii_capable) != 0 };
+            let id = source_property(source.0, unsafe { kTISPropertyInputSourceID });
+            let name = source_property(source.0, unsafe { kTISPropertyLocalizedName });
+            classify_passive_learning_input_source(
+                Some(is_keyboard_layout),
+                Some(ascii_capable),
+                id.as_deref(),
+                name.as_deref(),
+            )
+        })
+    }
+
     fn switch_to_latin_if_cjk() -> Option<RetainedInputSource> {
         let current = copy_current_source()?;
         let id =
@@ -244,6 +342,9 @@ mod macos {
         }
         let value = unsafe { TISGetInputSourceProperty(source, key) };
         if value.is_null() {
+            return None;
+        }
+        if unsafe { CFGetTypeID(value) } != unsafe { CFStringGetTypeID() } {
             return None;
         }
         let cf_string = unsafe { CFString::wrap_under_get_rule(value as _) };
@@ -305,10 +406,96 @@ pub(crate) use macos::research_main_queue_probe;
 
 #[cfg(test)]
 mod tests {
-    use super::{should_switch_input_source, test_layout_guard};
+    use super::{
+        classify_passive_learning_input_source, should_switch_input_source, test_layout_guard,
+        PassiveLearningInputSource,
+    };
     use std::panic::AssertUnwindSafe;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
+
+    #[test]
+    fn passive_learning_accepts_only_known_direct_ascii_layouts() {
+        assert_eq!(
+            classify_passive_learning_input_source(
+                Some(true),
+                Some(true),
+                Some("com.apple.keylayout.ABC"),
+                Some("ABC"),
+            ),
+            PassiveLearningInputSource::DirectAsciiKeyboardLayout
+        );
+        assert_eq!(
+            classify_passive_learning_input_source(
+                Some(true),
+                Some(true),
+                Some("com.apple.keylayout.French"),
+                Some("French"),
+            ),
+            PassiveLearningInputSource::DirectAsciiKeyboardLayout
+        );
+    }
+
+    #[test]
+    fn passive_learning_fails_closed_for_ime_cjk_non_ascii_and_unknown_sources() {
+        for (kind, ascii, id, name, expected) in [
+            (
+                Some(false),
+                Some(true),
+                Some("com.apple.inputmethod.SCIM.ITABC"),
+                Some("Pinyin"),
+                PassiveLearningInputSource::Unsupported,
+            ),
+            (
+                Some(true),
+                Some(true),
+                Some("com.apple.keylayout.Kotoeri"),
+                Some("Japanese"),
+                PassiveLearningInputSource::Unsupported,
+            ),
+            (
+                Some(true),
+                Some(false),
+                Some("com.apple.keylayout.NonAscii"),
+                Some("Non-ASCII"),
+                PassiveLearningInputSource::Unsupported,
+            ),
+            (
+                Some(true),
+                Some(true),
+                Some("org.example.keyboard.Custom"),
+                Some("Custom"),
+                PassiveLearningInputSource::Unsupported,
+            ),
+            (
+                None,
+                Some(true),
+                Some("com.apple.keylayout.ABC"),
+                Some("ABC"),
+                PassiveLearningInputSource::Unknown,
+            ),
+            (
+                Some(true),
+                None,
+                Some("com.apple.keylayout.ABC"),
+                Some("ABC"),
+                PassiveLearningInputSource::Unknown,
+            ),
+            (
+                Some(true),
+                Some(true),
+                None,
+                Some("ABC"),
+                PassiveLearningInputSource::Unknown,
+            ),
+        ] {
+            assert_eq!(
+                classify_passive_learning_input_source(kind, ascii, id, name),
+                expected,
+                "source facts should fail closed: {id:?} {name:?}"
+            );
+        }
+    }
 
     #[test]
     fn tis_input_source_calls_hop_off_the_tokio_paste_worker() {

@@ -1,6 +1,11 @@
 //! History read, export, retry, delete, and re-clean IPC commands.
 
+use crate::context::HistoryPreferenceOutputKind;
 use crate::mlx_diagnostics::{self, EventName, Severity, Target};
+use crate::preference_shadow::{
+    self, HistoryEditorCommitV1, HistoryPreferenceDecision, HistoryPreferenceInput,
+    HistoryPreferenceOwner,
+};
 use crate::{
     asr, asr_request_snapshot_for_options_with_metrics, chrono_like_id, chunker,
     cleanup_failure_status, clipboard_text_for_snippets, context, finalize_text_for_scene, lexicon,
@@ -15,7 +20,7 @@ use std::time::Instant;
 use tauri::{Emitter, Manager, State};
 use tokio_util::sync::CancellationToken;
 
-struct HistoryMutationOperationGuard {
+pub(crate) struct HistoryMutationOperationGuard {
     app: tauri::AppHandle,
 }
 
@@ -26,7 +31,7 @@ impl Drop for HistoryMutationOperationGuard {
     }
 }
 
-fn claim_history_mutation(
+pub(crate) fn claim_history_mutation(
     app: &tauri::AppHandle,
     state: &AppState,
 ) -> Result<HistoryMutationOperationGuard, String> {
@@ -213,6 +218,7 @@ pub(crate) async fn save_history_revision(
     id: i64,
     final_text: String,
     revision_reason: Option<String>,
+    editor_commit: Option<HistoryEditorCommitV1>,
     app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<ManualHistorySaveResponse, String> {
@@ -224,6 +230,34 @@ pub(crate) async fn save_history_revision(
     if reason == "manual_edit" {
         let saved = store::save_manual_history_revision(&dir, id, &final_text)
             .map_err(|error| error.to_string())?;
+        if saved.changed {
+            if let (Some(revision_id), Some(origin_id)) =
+                (saved.revision_id, saved.origin_id.clone())
+            {
+                let evidence = manual_history_preference_evidence(
+                    &dir,
+                    id,
+                    revision_id,
+                    &origin_id,
+                    &saved,
+                    &final_text,
+                    editor_commit.as_ref(),
+                );
+                if let Err(error) =
+                    crate::writing_preference_drafts::replace_history_preference_evidence(
+                        &app,
+                        &state,
+                        id,
+                        revision_id,
+                        origin_id,
+                        evidence,
+                    )
+                    .await
+                {
+                    log::warn!("failed to store bounded History preference evidence: {error}");
+                }
+            }
+        }
         let learning = if let Some(revision_id) = saved.revision_id {
             if saved.learning_before_text == final_text {
                 crate::dictionary_learn::ManualHistoryLearningStatus::NotApplicable
@@ -258,6 +292,149 @@ pub(crate) async fn save_history_revision(
             learning: crate::dictionary_learn::ManualHistoryLearningStatus::NotApplicable,
         })
     }
+}
+
+pub(crate) fn manual_history_preference_evidence(
+    dir: &std::path::Path,
+    history_id: i64,
+    revision_id: i64,
+    origin_id: &str,
+    saved: &store::ManualHistorySave,
+    final_text: &str,
+    editor_commit: Option<&HistoryEditorCommitV1>,
+) -> Option<crate::writing_preference_drafts::ManualHistoryPreferenceEvidence> {
+    // Only the first distinct manual revision can contribute. Later saves
+    // replace or invalidate the origin's prior receipt at the call site; they
+    // never turn a previously unsupported mixed edit into a new example.
+    if !saved.first_edit_of_original_delivery {
+        return None;
+    }
+    let source_created_at_ms = saved.source_created_at_ms?;
+    let natural_day = saved.natural_day.as_deref()?;
+    let now_ms = now_epoch_millis();
+    if source_created_at_ms > now_ms
+        || now_ms.saturating_sub(source_created_at_ms) > preference_shadow::WINDOW_MS
+    {
+        return None;
+    }
+    let policy = saved.scene.policy.as_ref();
+    let provenance = policy.and_then(|policy| policy.history_preference_provenance.as_ref());
+    let mapping_id = saved
+        .scene
+        .profile_id
+        .as_deref()
+        .and_then(|profile_id| profile_id.strip_prefix("user."));
+    let mapping_identity = saved.scene.mapping_identity.as_deref();
+    let mapping_revision = provenance.and_then(|value| value.mapping_preference_revision);
+    let task_id = provenance.and_then(|value| value.task_id);
+    let source_metadata_present = mapping_id.is_some()
+        && mapping_identity.is_some()
+        && mapping_revision.is_some()
+        && task_id.is_some();
+    let output_kind = provenance
+        .map(|value| value.output_kind)
+        .unwrap_or(HistoryPreferenceOutputKind::Unknown);
+    let delivery_eligible = history_delivery_supports_weak_preference(
+        &saved.status,
+        saved.delivery_method.as_deref(),
+        saved.fallback_reason.as_deref(),
+    );
+    let asr_text = saved.asr_text.as_deref()?;
+    let history_policy_present = provenance.is_some_and(|value| value.version == 1);
+    let input = HistoryPreferenceInput {
+        owner: HistoryPreferenceOwner::VoiceFlowHistory,
+        delivery_eligible,
+        input_kind: policy
+            .map(|policy| policy.input_kind)
+            .unwrap_or(crate::context::FocusKind::Unknown),
+        transaction_id: Some(origin_id),
+        task_id,
+        task_identity_trusted: history_policy_present && source_metadata_present,
+        mapping_identity_matches: mapping_id.is_some() && mapping_identity.is_some(),
+        mapping_revision_matches: mapping_revision.is_some(),
+        history_policy_present,
+        captured_intent_source: provenance.map(|value| value.intent_source),
+        output_kind,
+        snippet_expanded: provenance.is_some_and(|value| value.snippet_expanded),
+        output_mode: provenance.and_then(|value| value.output_mode.as_deref()),
+        session_skip_llm_cleanup: provenance.and_then(|value| value.session_skip_llm_cleanup),
+        original_prepared_text: Some(saved.raw_text.as_str()),
+        original_asr_text: Some(asr_text),
+        configured_translation_target: policy
+            .and_then(|policy| policy.translation_target_language.as_deref()),
+        before_text: &saved.learning_before_text,
+        after_text: final_text,
+        // Candidate owner verifies the persisted transaction/mapping binding
+        // in its write transaction. This provisional false value lets the
+        // pure classifier cheaply reject unknown edits before any source read.
+        matches_existing_source: Some(false),
+        editor_commit,
+    };
+    let HistoryPreferenceDecision::WeakEvidence { dimension, value } =
+        preference_shadow::classify_history_preference_edit(&input)
+    else {
+        return None;
+    };
+    match store::history_text_matches_existing_source(
+        dir,
+        history_id,
+        revision_id,
+        final_text,
+        dimension,
+        value,
+    ) {
+        Ok(true) => return None,
+        Ok(false) => {}
+        Err(error) => {
+            log::warn!("could not compare History edit with its source: {error}");
+            return None;
+        }
+    }
+    let (Some(mapping_id), Some(mapping_identity), Some(mapping_revision), Some(task_id)) =
+        (mapping_id, mapping_identity, mapping_revision, task_id)
+    else {
+        return None;
+    };
+    let content_fingerprint = preference_shadow::content_fingerprint(asr_text)?;
+    let editor_session_id = editor_commit?.editor_session_id.clone();
+    Some(
+        crate::writing_preference_drafts::ManualHistoryPreferenceEvidence {
+            source_history_id: history_id,
+            source_revision_id: revision_id,
+            origin_id: origin_id.to_owned(),
+            mapping_id: mapping_id.to_owned(),
+            mapping_identity_fingerprint: mapping_identity.to_owned(),
+            mapping_revision,
+            task_id,
+            dimension,
+            value,
+            occurred_at_ms: now_ms,
+            natural_day: natural_day.to_owned(),
+            editor_session_id,
+            content_fingerprint,
+            template_family_fingerprint: preference_shadow::template_family_fingerprint(asr_text),
+        },
+    )
+}
+
+fn now_epoch_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u64::MAX as u128) as u64
+}
+
+pub(crate) fn history_delivery_supports_weak_preference(
+    status: &str,
+    delivery_method: Option<&str>,
+    fallback_reason: Option<&str>,
+) -> bool {
+    fallback_reason.is_none()
+        && matches!(
+            (status, delivery_method),
+            ("ok", Some("paste")) | ("history", Some("history"))
+        )
 }
 
 #[tauri::command]
@@ -394,6 +571,8 @@ fn history_retry_output_projection(
         output_mode_compatible: false,
         multiline_capable: false,
         focus_kind: input_kind,
+        preferred_bullets: false,
+        allow_model_selected_paragraphs: false,
     };
     let resolved = crate::cleanup_output_resolver::resolve_cleanup_projection(facts, source)
         .ok()
@@ -422,12 +601,7 @@ pub(crate) async fn reclean_history(
     let scene = store::history_scene(&dir, id).map_err(|e| e.to_string())?;
     let mut policy = scene.policy.clone().unwrap_or_default();
     apply_current_style_approval(&mut policy, scene.profile_id.as_deref(), &settings);
-    if settings.output_mode != "auto" {
-        policy.output_mode = Some(settings.output_mode.clone());
-    }
-    if settings.output_mode == "translation" {
-        policy.translation_target_language = Some(settings.translation_target_language.clone());
-    }
+    apply_current_history_retry_output_mode(&mut policy, &settings);
     let family = family_from_scene(&scene, &settings.context_mappings);
     let input_kind = policy.input_kind;
     let resolved_scene = crate::ResolvedCleanupScene::observed(family, input_kind)
@@ -461,7 +635,15 @@ pub(crate) async fn reclean_history(
     // cues are not reinterpreted during a History operation.
     prepared.intent = llm::CleanupIntent::selected_text(operation, &prepared.text);
     let prepared_text = prepared.text.clone();
-    let pairs_hint = prepared.pairs_hint.clone();
+    let local_pair_egress_blocked = crate::external_cleanup_blocked_by_local_pair(
+        &prepared,
+        settings.cleanup_provider,
+        &settings.cleanup_endpoint(),
+        settings.cleanup_enabled,
+    );
+    let pairs_hint = prepared
+        .pairs_hint_for_provider(settings.cleanup_provider, &settings.cleanup_endpoint())
+        .map(str::to_owned);
     let intent = prepared.intent.clone();
     if !try_claim_operation(&state, OperationLease::HistoryReclean) {
         return Err("Dictation is active; try history cleanup again after it finishes".into());
@@ -477,8 +659,9 @@ pub(crate) async fn reclean_history(
     let mut native_request_id = None;
     let mut cleanup_attempt_kind = Some("not_called".to_owned());
     let mut cleanup_transformations = Some(Vec::new());
-    let mut cleanup_failure_reason: Option<String> = None;
-    let cleanup_decision = if !settings.cleanup_enabled {
+    let mut cleanup_failure_reason: Option<String> =
+        local_pair_egress_blocked.then(|| "local_pair_egress_blocked".to_owned());
+    let cleanup_decision = if !settings.cleanup_enabled || local_pair_egress_blocked {
         CleanupDecision::Disabled
     } else {
         let cleanup_endpoint = settings.cleanup_endpoint();
@@ -653,6 +836,7 @@ pub(crate) async fn reclean_history(
             output_projection_list_revision_proof: None,
             layout_source: None,
             exact_fallback: false,
+            allow_model_selected_paragraphs: false,
         },
     ) {
         Ok(finalized) => {
@@ -708,7 +892,7 @@ pub(crate) async fn reclean_history(
     {
         cleanup_attempt_kind = Some("final_guard".to_owned());
     }
-    let cleanup_status = if !settings.cleanup_enabled {
+    let cleanup_status = if !settings.cleanup_enabled || local_pair_egress_blocked {
         CLEANUP_STATUS_LOCAL_ONLY
     } else if !degraded {
         CLEANUP_STATUS_AI_SUCCESS
@@ -1226,13 +1410,14 @@ async fn retry_dictation_inner(
     let settings = lock_recover(&state.settings).clone();
     let scene = store::history_scene(&dir, id).map_err(|e| e.to_string())?;
     let pairs = store::list_learn_pairs(&dir).unwrap_or_default();
+    let asr_dictionary = settings.asr_dictionary_words(&pairs);
     let scope = lexicon::PromptScope::from_history(
         scene.profile_id.as_deref(),
         scene.family.as_deref(),
         scene.browser_host.as_deref(),
     );
     let asr_prompt = lexicon::build_asr_prompt_bundle(
-        &settings.dictionary,
+        &asr_dictionary,
         scene.policy.as_ref(),
         &pairs,
         Some(&scope),
@@ -1306,7 +1491,9 @@ async fn retry_dictation_inner(
         )
     };
     let raw_text = prepared.text.clone();
-    let pairs_hint = prepared.pairs_hint.clone();
+    let pairs_hint = prepared
+        .pairs_hint_for_provider(settings.cleanup_provider, &settings.cleanup_endpoint())
+        .map(str::to_owned);
     let clipboard =
         snippets::read_clipboard_if_needed(&settings.snippets, &prepared.snippet_input, || {
             clipboard_text_for_snippets(&app)
@@ -1320,7 +1507,20 @@ async fn retry_dictation_inner(
     let cleanup_input = snippet_expansion
         .clone()
         .unwrap_or_else(|| intent.content.clone());
-    let cleanup_route = crate::cleanup_route_for_resolved_scene(&settings, prepared.scene, &intent);
+    let requested_cleanup_route =
+        crate::cleanup_route_for_resolved_scene(&settings, prepared.scene, &intent);
+    let local_pair_egress_blocked = crate::external_cleanup_blocked_by_local_pair(
+        &prepared,
+        settings.cleanup_provider,
+        &settings.cleanup_endpoint(),
+        snippet_expansion.is_none()
+            && matches!(requested_cleanup_route, lexicon::CleanupRoute::Provider(_)),
+    );
+    let cleanup_route = if local_pair_egress_blocked {
+        lexicon::CleanupRoute::LocalOnly
+    } else {
+        requested_cleanup_route
+    };
     let cleanup_output_projection = match cleanup_route {
         lexicon::CleanupRoute::Provider(effort) if snippet_expansion.is_none() => {
             history_retry_output_projection(HistoryRetryOutputProjectionInput {
@@ -1344,7 +1544,8 @@ async fn retry_dictation_inner(
         .map(|_| cleanup_input.clone());
     let mut cleanup_attempt_kind = Some("not_called".to_owned());
     let mut cleanup_transformations = Some(Vec::new());
-    let mut cleanup_failure_reason: Option<String> = None;
+    let mut cleanup_failure_reason: Option<String> =
+        local_pair_egress_blocked.then(|| "local_pair_egress_blocked".to_owned());
     let cleanup_decision = match cleanup_route {
         lexicon::CleanupRoute::Provider(_)
             if settings.asr_provider == crate::providers::EngineProvider::AssemblyAi
@@ -1499,6 +1700,9 @@ async fn retry_dictation_inner(
         CleanupDecision::Disabled if snippet_expansion.is_some() => CLEANUP_STATUS_SNIPPET_BYPASS,
         CleanupDecision::Disabled => CLEANUP_STATUS_LOCAL_ONLY,
     };
+    if local_pair_egress_blocked {
+        cleanup_status = CLEANUP_STATUS_LOCAL_ONLY;
+    }
     let resolved = finalize_text_for_scene(
         &cleanup_input,
         cleanup_decision,
@@ -1514,6 +1718,7 @@ async fn retry_dictation_inner(
             output_projection_list_revision_proof: None,
             layout_source: None,
             exact_fallback: false,
+            allow_model_selected_paragraphs: false,
         },
     )
     .map_err(|_| "No speech detected".to_owned())?;
@@ -1680,6 +1885,11 @@ mod tests {
             id: "history-app".into(),
             label: "History App".into(),
             family: context::ContextFamily::Document,
+            writing_task_id: None,
+            writing_preferences: Vec::new(),
+            preference_guidance_provider_approved: false,
+            preference_revision: 0,
+            deleted: false,
             mode_id: None,
             bundle_id: Some("com.example.Editor".into()),
             executable: None,
@@ -2049,6 +2259,13 @@ mod tests {
                 "id": 2,
                 "final_text": "edited text",
                 "revision_reason": "manual_edit",
+                "editor_commit": {
+                    "version": 1,
+                    "editor_session_id": "00000000-0000-4000-8000-000000000001",
+                    "input_kinds": ["trusted_text"],
+                    "composing_at_save": false,
+                    "save_action_trusted": true,
+                },
             }),
             0,
         )
@@ -2079,11 +2296,41 @@ mod tests {
         id: i64,
         final_text: String,
         revision_reason: Option<String>,
+        editor_commit: Option<HistoryEditorCommitV1>,
         app: tauri::AppHandle<tauri::test::MockRuntime>,
         state: State<'_, AppState>,
     ) -> Result<super::ManualHistorySaveResponse, String> {
-        let _ = (id, final_text, revision_reason, app, state);
+        let _ = (id, final_text, revision_reason, editor_commit, app, state);
         panic!("the generated IPC decoder must reject unmanaged state before calling the body")
+    }
+
+    #[test]
+    fn weak_history_evidence_requires_verified_paste_or_history_only_delivery() {
+        assert!(history_delivery_supports_weak_preference(
+            "ok",
+            Some("paste"),
+            None
+        ));
+        assert!(history_delivery_supports_weak_preference(
+            "history",
+            Some("history"),
+            None
+        ));
+        for (status, method, fallback) in [
+            (
+                "unverified",
+                Some("paste_unverified"),
+                Some("paste_unverified"),
+            ),
+            ("degraded", Some("paste"), Some("provider_failure")),
+            ("copied", Some("clipboard"), None),
+            ("history", Some("history"), Some("paste_failed")),
+            ("delivery_unconfirmed", Some("unknown"), Some("restart")),
+        ] {
+            assert!(!history_delivery_supports_weak_preference(
+                status, method, fallback
+            ));
+        }
     }
 
     #[test]
@@ -2093,7 +2340,7 @@ mod tests {
             changed: true,
             learning: crate::dictionary_learn::ManualHistoryLearningStatus::Pending {
                 hits: 1,
-                required: 3,
+                required: 0,
             },
         };
         assert_eq!(
@@ -2104,7 +2351,7 @@ mod tests {
                 "learning": {
                     "status": "pending",
                     "hits": 1,
-                    "required": 3,
+                    "required": 0,
                 },
             })
         );

@@ -44,13 +44,7 @@ pub fn trim_and_compress(samples: &[f32]) -> Vec<f32> {
 }
 
 fn speech_ranges(samples: &[f32]) -> Vec<(usize, usize)> {
-    let frame_rms: Vec<(usize, f32)> = (0..samples.len())
-        .step_by(HOP)
-        .map(|index| {
-            let end = (index + FRAME).min(samples.len());
-            (index, rms(&samples[index..end]))
-        })
-        .collect();
+    let frame_rms: Vec<(usize, f32)> = frame_rms(samples).collect();
     let energies: Vec<f32> = frame_rms.iter().map(|(_, energy)| *energy).collect();
     let Some(threshold) = activity_threshold(&energies) else {
         return Vec::new();
@@ -98,6 +92,15 @@ fn rms(samples: &[f32]) -> f32 {
         return 0.0;
     }
     (samples.iter().map(|sample| sample * sample).sum::<f32>() / samples.len() as f32).sqrt()
+}
+
+/// Iterates `(sample_start, rms)` frames across `samples` using the shared
+/// 30 ms analysis window and 10 ms hop.
+pub(crate) fn frame_rms(samples: &[f32]) -> impl Iterator<Item = (usize, f32)> + '_ {
+    (0..samples.len()).step_by(HOP).map(|index| {
+        let end = (index + FRAME).min(samples.len());
+        (index, rms(&samples[index..end]))
+    })
 }
 
 /// Adaptive activity threshold shared by trimming and finalize-time VAD.

@@ -288,6 +288,18 @@ impl PreparedCleanupCase {
             PreparedCleanupSource::Snippet { .. } => None,
         }
     }
+    fn cloud_pairs_hint(&self) -> Option<&str> {
+        match &self.source {
+            PreparedCleanupSource::Transcript(prepared) => prepared.cloud_pairs_hint.as_deref(),
+            PreparedCleanupSource::Snippet { .. } => None,
+        }
+    }
+    fn pairs_hint_for_transport(&self, transport: &CleanupTransport) -> Option<&str> {
+        match transport {
+            CleanupTransport::Cloud(_) => self.cloud_pairs_hint(),
+            CleanupTransport::VerifiedLocalOpenAi { .. } => self.pairs_hint(),
+        }
+    }
     pub(crate) fn finalization_context(&self) -> crate::FinalizationContext<'_> {
         let prepared = match &self.source {
             PreparedCleanupSource::Transcript(prepared) => Some(prepared),
@@ -311,6 +323,7 @@ impl PreparedCleanupCase {
             output_projection_list_revision_proof: None,
             layout_source: None,
             exact_fallback: false,
+            allow_model_selected_paragraphs: false,
         }
     }
 }
@@ -637,7 +650,7 @@ pub(crate) fn cleanup_candidate_request_facts(
             context: None,
             policy: Some(&policy),
             profile: Some(&prepared.snapshot.profile),
-            pairs_hint: prepared.pairs_hint(),
+            pairs_hint: prepared.cloud_pairs_hint(),
             effort,
             visible_context: None,
             source_transcript: None,
@@ -864,7 +877,7 @@ pub(crate) async fn run_cleanup_candidate(
                                 Some(&policy),
                                 Some(&prepared.snapshot.profile),
                                 Some(prepared.intent()),
-                                prepared.pairs_hint(),
+                                prepared.cloud_pairs_hint(),
                                 effort,
                                 None,
                             )
@@ -1236,13 +1249,28 @@ pub(crate) fn prepare_cleanup_case_with_fixture(
     snapshot.profile.confidence = 1.0;
     snapshot.policy = ContextPolicy::for_family(family);
     snapshot.policy.input_kind = input_kind;
-    let settings = crate::store::Settings {
+    let mut settings = crate::store::Settings {
         cleanup_intensity: case.cleanup.clone(),
         cleanup_enabled: case.mode != "ai-off",
-        dictionary: fixture.map(|f| f.dictionary.clone()).unwrap_or_default(),
+        dictionary: Vec::new(),
         fuzzy_dictionary_enabled: fixture.is_some_and(|f| f.fuzzy),
         ..crate::store::Settings::default()
     };
+    // Evaluation vocabulary comes from the explicitly selected, validated
+    // fixture. Give those terms an independent owner so the production
+    // provider-visible dictionary projection can treat them like an explicit
+    // global vocabulary input without weakening product authorization.
+    if let Some(fixture) = fixture {
+        let owner = crate::store::DictionarySource::Manual;
+        for word in &fixture.dictionary {
+            if !settings.has_dictionary_source(word, &owner) {
+                assert!(
+                    settings.add_dictionary_source(word, owner.clone()),
+                    "validated evaluation vocabulary must fit the settings dictionary"
+                );
+            }
+        }
+    }
     if case.mode == "snippet" {
         let snippet = crate::snippets::Snippet {
             id: case.id.clone(),
@@ -1421,7 +1449,7 @@ pub(crate) fn cleanup_request_fingerprint(
         source: prepared.source(),
         request_content: &prepared.intent().content,
         intent: prepared.intent(),
-        pairs_hint: prepared.pairs_hint(),
+        pairs_hint: prepared.pairs_hint_for_transport(&candidate.transport),
         profile: &prepared.snapshot.profile,
         policy: context.policy,
         effort: context.effort.map(crate::llm::CleanupEffort::as_label),
@@ -2213,6 +2241,39 @@ pub(crate) fn corpus_focus_kind(value: &str) -> FocusKind {
 #[cfg(test)]
 mod tests {
     use super::{classify_llm_error, timing_summary};
+
+    #[test]
+    fn evaluation_preparation_fixture_keeps_explicit_fuzzy_dictionary_terms() {
+        let case = super::EvalCase {
+            id: "fuzzy-fixture".into(),
+            group: "fixture".into(),
+            input: "type script".into(),
+            expected: "TypeScript".into(),
+            reference_variants: Vec::new(),
+            cleanup: "light".into(),
+            family: "general".into(),
+            focus_kind: "editable".into(),
+            mode: "provider-failure".into(),
+            protected: Vec::new(),
+        };
+        let fixture = super::super::controls::PreparationFixture {
+            // Fixture validation intentionally permits case variants, while
+            // Settings dictionary identity is case-insensitive. Keep the
+            // first spelling authoritative and add the Manual owner once.
+            dictionary: vec!["TypeScript".into(), "typescript".into()],
+            pairs: Vec::new(),
+            fuzzy: true,
+            spoken_layout: true,
+        };
+
+        let prepared = super::prepare_cleanup_case_with_fixture(&case, Some(&fixture));
+
+        assert_eq!(prepared.source(), "TypeScript");
+        assert!(matches!(
+            prepared.route,
+            crate::lexicon::CleanupRoute::Provider(_)
+        ));
+    }
 
     #[test]
     fn native_local_failure_keeps_typed_reason_without_inventing_http_status() {

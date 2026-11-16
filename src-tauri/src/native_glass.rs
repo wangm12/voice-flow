@@ -250,7 +250,7 @@ pub fn configure_and_publish(app: &AppHandle, requested: &str) -> HudAppearanceS
             APPLIED_REVISION.store(revision, Ordering::Release);
             return status(requested);
         }
-        return status(requested);
+        status(requested)
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -522,8 +522,56 @@ fn runtime_capability() -> Result<(), &'static str> {
 }
 
 #[cfg(target_os = "macos")]
-fn install_native_glass(window: &tauri::WebviewWindow) -> Result<bool, String> {
+fn glass_frame_for_content_bounds(
+    content_bounds: core_graphics::geometry::CGRect,
+    bottom_offset: f64,
+) -> core_graphics::geometry::CGRect {
     use core_graphics::geometry::{CGPoint, CGRect, CGSize};
+    let x = ((content_bounds.size.width - 220.0) / 2.0).max(0.0);
+    let max_y = (content_bounds.size.height - 48.0).max(0.0);
+    let y = bottom_offset.clamp(0.0, max_y);
+    CGRect::new(&CGPoint::new(x, y), &CGSize::new(220.0, 48.0))
+}
+
+#[cfg(target_os = "macos")]
+pub fn sync_frame_on_main(window: &tauri::WebviewWindow, bottom_offset: f64) {
+    use core_graphics::geometry::CGRect;
+    use objc::runtime::Object;
+    use objc::{msg_send, sel, sel_impl};
+
+    let glass = GLASS_VIEW.load(Ordering::Acquire);
+    if glass == 0 {
+        return;
+    }
+    let Ok(ptr) = window.ns_window() else {
+        return;
+    };
+    unsafe {
+        let native_window = ptr as *mut Object;
+        let content_view: *mut Object = msg_send![native_window, contentView];
+        if content_view.is_null() {
+            return;
+        }
+        let content_bounds: CGRect = msg_send![content_view, bounds];
+        let target = glass_frame_for_content_bounds(content_bounds, bottom_offset);
+        let glass_view = glass as *mut Object;
+        let current: CGRect = msg_send![glass_view, frame];
+        let changed = (current.origin.x - target.origin.x).abs() > 0.5
+            || (current.origin.y - target.origin.y).abs() > 0.5
+            || (current.size.width - target.size.width).abs() > 0.5
+            || (current.size.height - target.size.height).abs() > 0.5;
+        if changed {
+            let _: () = msg_send![glass_view, setFrame: target];
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn sync_frame_on_main(_window: &tauri::WebviewWindow, _bottom_offset: f64) {}
+
+#[cfg(target_os = "macos")]
+fn install_native_glass(window: &tauri::WebviewWindow) -> Result<bool, String> {
+    use core_graphics::geometry::CGRect;
     use objc::runtime::{Class, Object};
     use objc::{msg_send, sel, sel_impl};
 
@@ -537,8 +585,10 @@ fn install_native_glass(window: &tauri::WebviewWindow) -> Result<bool, String> {
         let content_view = content_view as *mut Object;
         let webview = webview as *mut Object;
         let content_bounds: CGRect = msg_send![content_view, bounds];
-        let x = ((content_bounds.size.width - 220.0) / 2.0).max(0.0);
-        let frame = CGRect::new(&CGPoint::new(x, 8.0), &CGSize::new(220.0, 48.0));
+        let frame = glass_frame_for_content_bounds(
+            content_bounds,
+            crate::island_window::current_primary_pill_bottom_offset(),
+        );
         let allocated: *mut Object = msg_send![glass_class, alloc];
         let glass: *mut Object = msg_send![allocated, initWithFrame: frame];
         if glass.is_null() {

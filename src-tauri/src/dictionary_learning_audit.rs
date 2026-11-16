@@ -626,6 +626,11 @@ pub(crate) struct LearningAuditPairV1 {
     pair_key: String,
     before_surface: String,
     after_surface: String,
+    match_policy: store::LearnPairMatchPolicy,
+    manual_scoped: bool,
+    auto_scoped: bool,
+    binding_invalidated_at: Option<String>,
+    binding_invalidated_reason: Option<String>,
     rule_kind: &'static str,
     record_state: &'static str,
     candidate_hits: u32,
@@ -704,10 +709,8 @@ fn project(
     let classification = word.then(|| {
         dictionary_learn::classify_learn_pair_decision(&row.before_surface, &row.after_surface)
     });
-    let threshold = classification
-        .as_ref()
-        .filter(|c| c.class != dictionary_learn::LearnClass::Rejected)
-        .map(|c| dictionary_learn::promote_hits_for(c.class));
+    // History and live-observer candidates require explicit confirmation;
+    // their evidence count is not an automatic promotion threshold.
     let contains = store::dictionary_contains_word(dictionary, &row.after_surface);
     let eligible = lexicon::pair_is_replaceable(&row, contains);
     let tombstone = row.ignored || row.tombstoned_at.is_some();
@@ -725,9 +728,16 @@ fn project(
             "pending"
         },
         rule_kind: kind,
+        match_policy: row.match_policy,
+        manual_scoped: row.manual_scoped,
+        auto_scoped: row.auto_scoped,
+        binding_invalidated_at: row.binding_invalidated_at.clone(),
+        binding_invalidated_reason: row.binding_invalidated_reason.clone(),
         candidate_hits: row.hits,
         current_classification: classification,
-        current_promote_threshold: threshold,
+        // Production History and live-observer word candidates require an
+        // explicit review. Numeric thresholds belong to research fixtures.
+        current_promote_threshold: None,
         classification_authority: if word {
             "current_owner_classification"
         } else {
@@ -936,6 +946,18 @@ mod tests {
             },
         }
     }
+    fn unavailable_observation(registration: Registration, outcome: &'static str) -> Fact {
+        Fact::PostPasteAttempt {
+            registration,
+            verified_paste: false,
+            outcome,
+            classification: None,
+            candidate_decision: "not_attempted",
+            candidate_store: PersistenceFactV1::untouched(),
+            settings_store: PersistenceFactV1::untouched(),
+            attribution: "not_observed",
+        }
+    }
     #[test]
     fn native_wire_fixture_uses_the_production_audit_serializer() {
         let saved: Result<(), ()> = Ok(());
@@ -945,6 +967,11 @@ mod tests {
             pair_key: "fixture-manual-app-scoped-pair".into(),
             before_surface: "知呼".into(),
             after_surface: "知乎".into(),
+            match_policy: store::LearnPairMatchPolicy::IgnoreCase,
+            manual_scoped: true,
+            auto_scoped: false,
+            binding_invalidated_at: None,
+            binding_invalidated_reason: None,
             rule_kind: "word_pair",
             record_state: "db_promoted",
             candidate_hits: 3,
@@ -952,7 +979,7 @@ mod tests {
                 class: dictionary_learn::LearnClass::Term,
                 reason: None,
             }),
-            current_promote_threshold: Some(3),
+            current_promote_threshold: None,
             classification_authority: "current_owner_classification",
             recorded_scope: Scope {
                 family: Some("document".into()),
@@ -985,7 +1012,7 @@ mod tests {
         let snapshot = LearningAuditSnapshotV1 {
             schema_version: 1,
             runtime_id: "11111111-1111-4111-8111-111111111111".into(),
-            audit_revision: "8".into(),
+            audit_revision: "9".into(),
             clear_generation: "0".into(),
             observer_epoch: "7".into(),
             coverage: Coverage {
@@ -994,7 +1021,7 @@ mod tests {
                 dropped_entries: "0".into(),
                 dropped_updates: "0".into(),
                 oldest_sequence: Some("1".into()),
-                latest_sequence: Some("8".into()),
+                latest_sequence: Some("12".into()),
                 projection_consistency: "stable_revision",
                 atomicity: "not_cross_store_transaction",
                 consistency_scope: "audit_metadata_revision_only",
@@ -1090,10 +1117,52 @@ mod tests {
                     "closed",
                     Some("22222222-2222-4222-8222-222222222222"),
                     observation(
-                        started,
+                        started.clone(),
                         "single_token",
                         "db_promotion_failed",
                         PersistenceFactV1::failed(),
+                    ),
+                ),
+                activity(
+                    9,
+                    Some(7),
+                    "closed",
+                    Some("22222222-2222-4222-8222-222222222222"),
+                    observation(
+                        started,
+                        "single_token",
+                        "mapping_binding_invalidated",
+                        PersistenceFactV1::untouched(),
+                    ),
+                ),
+                activity(
+                    10,
+                    Some(7),
+                    "closed",
+                    None,
+                    unavailable_observation(
+                        no_registration("accessibility_permission_revoked"),
+                        "unknown",
+                    ),
+                ),
+                activity(
+                    11,
+                    Some(7),
+                    "closed",
+                    None,
+                    unavailable_observation(
+                        no_registration("input_source_unsupported"),
+                        "not_observed",
+                    ),
+                ),
+                activity(
+                    12,
+                    Some(7),
+                    "closed",
+                    None,
+                    unavailable_observation(
+                        no_registration("input_source_unknown"),
+                        "not_observed",
                     ),
                 ),
             ],
@@ -1247,6 +1316,7 @@ mod tests {
         let owner = Owner::new(false);
         let pair = project(rows[0].clone(), &[], &owner).unwrap();
         assert_eq!(pair.record_state, "db_promoted");
+        assert_eq!(pair.current_promote_threshold, None);
         assert_eq!(pair.replacement_policy, "context_scoped_promoted_rules");
         assert_eq!(pair.replacement_eligibility, "not_eligible_now");
         assert_eq!(pair.origin, "unknown_not_persisted");
@@ -1278,6 +1348,47 @@ mod tests {
                 .unwrap()
                 .promoted
         );
+    }
+    #[test]
+    fn weak_history_and_live_candidates_have_no_automatic_threshold_in_audit() {
+        let dir = OwnedStore::new();
+        let scope = store::LearnPairScope {
+            family: Some("personal_chat".into()),
+            mapping_id: Some("messages".into()),
+            native_bundle: Some("com.apple.MobileSMS".into()),
+            ..Default::default()
+        };
+        let pair_key = store::scoped_word_rule_key(
+            "黎明",
+            "李明",
+            &scope,
+            store::word_rule_match_policy("黎明", "李明"),
+        )
+        .into_string();
+        let observation =
+            store::LearnPairObservation::paste_session("audit-weak-candidate", &pair_key);
+        let row = match store::upsert_auto_scoped_learn_pair_with_observation(
+            &dir.0,
+            &pair_key,
+            "黎明",
+            "李明",
+            Some(&scope),
+            Some(&observation),
+        )
+        .unwrap()
+        {
+            store::LearnPairUpsert::Stored(row) => *row,
+            store::LearnPairUpsert::Skipped(reason) => panic!("candidate skipped: {reason:?}"),
+        };
+        assert!(row.auto_scoped);
+        assert!(row.is_pending());
+
+        let pair = project(row, &[], &Owner::new(false)).unwrap();
+        assert_eq!(
+            pair.current_classification.unwrap().class,
+            dictionary_learn::LearnClass::Name
+        );
+        assert_eq!(pair.current_promote_threshold, None);
     }
     #[test]
     fn complete_store_budget_covers_promoted_rows_not_only_pending_cap() {

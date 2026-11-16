@@ -314,7 +314,10 @@ async fn run_trial(
                             Some(&request_snapshot.policy),
                             Some(&request_snapshot.profile),
                             Some(&request_prepared.intent),
-                            request_prepared.pairs_hint.as_deref(),
+                            request_prepared.pairs_hint_for_provider(
+                                settings.cleanup_provider,
+                                &settings.cleanup_endpoint(),
+                            ),
                             effort,
                             None,
                             Some(text),
@@ -354,6 +357,7 @@ async fn run_trial(
             output_projection_list_revision_proof: None,
             layout_source: None,
             exact_fallback: false,
+            allow_model_selected_paragraphs: false,
         },
     );
     result.elapsed_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
@@ -654,6 +658,7 @@ mod tests {
                 output_projection_list_revision_proof: None,
                 layout_source: None,
                 exact_fallback: false,
+                allow_model_selected_paragraphs: false,
             },
         );
         assert_eq!(result.status, PreviewStatus::GuardFallback);

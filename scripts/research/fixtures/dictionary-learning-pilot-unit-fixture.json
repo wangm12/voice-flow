@@ -1,0 +1,10 @@
+{
+  "artifact_type": "voiceflow_dictionary_learning_pilot_evidence",
+  "schema_version": 1,
+  "stage": "technical",
+  "batch_id": "unit-fixture",
+  "evidence_class": "unit_fixture",
+  "fixture_only": true,
+  "human_data_attested": false,
+  "trials": []
+}

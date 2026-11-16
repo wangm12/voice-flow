@@ -1,13 +1,12 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { SettingsGroup, SettingsPageHeader, SettingsRow, SettingsShell } from "../SettingsLayout";
 import { Toggle } from "../Toggle";
 import { WhatsNewDialog, type WhatsNewPayload } from "../WhatsNewDialog";
+import { ClampedNumberInput } from "./ClampedNumberInput";
 import { useI18n } from "../../lib/i18n";
-import { secondaryButtonClass, inputClass } from "../../lib/theme";
+import { secondaryButtonClass } from "../../lib/theme";
 import type { SaveSettings, Settings } from "../../types/settings";
-
-const controlClass = inputClass;
 
 export function DebugSettings({
   settings,
@@ -26,9 +25,12 @@ export function DebugSettings({
       <SettingsPageHeader title={t("调试设置")} description={t("录音缓冲、语音检测和诊断预览。")} saveHint={t("更改自动保存")} />
       <SettingsGroup title={t("录音")}>
         <SettingsRow title={t("句尾缓冲")} description={t("说完后多录一会儿，避免吞掉句尾。")}>
-          <BufferNumberField
+          <ClampedNumberInput
             label={t("句尾缓冲")}
             value={settings.extra_recording_buffer_ms ?? 250}
+            min={0}
+            max={2000}
+            widthClassName="w-28"
             onCommit={(extra_recording_buffer_ms) => save({ extra_recording_buffer_ms })}
           />
           <span className="text-xs text-secondary">{t("毫秒")}</span>
@@ -75,46 +77,5 @@ export function DebugSettings({
         <WhatsNewDialog payload={whatsNewPreview} onDismiss={() => setWhatsNewPreview(null)} />
       )}
     </SettingsShell>
-  );
-}
-
-function BufferNumberField({
-  label,
-  value,
-  onCommit,
-}: {
-  label: string;
-  value: number;
-  onCommit: (next: number) => void;
-}) {
-  const [draft, setDraft] = useState(String(value));
-  useEffect(() => setDraft(String(value)), [value]);
-
-  const commit = () => {
-    const parsed = Number(draft);
-    if (!Number.isFinite(parsed)) {
-      setDraft(String(value));
-      return;
-    }
-    const clamped = Math.min(2000, Math.max(0, Math.round(parsed)));
-    setDraft(String(clamped));
-    if (clamped !== value) onCommit(clamped);
-  };
-
-  return (
-    <input
-      aria-label={label}
-      type="number"
-      min={0}
-      max={2000}
-      step={1}
-      value={draft}
-      onChange={(event) => setDraft(event.target.value)}
-      onBlur={commit}
-      onKeyDown={(event) => {
-        if (event.key === "Enter") event.currentTarget.blur();
-      }}
-      className={`${controlClass} w-28 text-right`}
-    />
   );
 }

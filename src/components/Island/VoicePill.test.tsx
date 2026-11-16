@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import type { ComponentProps } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { VoicePill, type VoicePillRecoveryAction } from "./VoicePill";
@@ -58,6 +58,68 @@ describe("VoicePill", () => {
     expect(document.querySelector(".voice-pill__label")).toHaveTextContent("Recording");
     expect(document.querySelector(".voice-pill__subtitle")).toHaveAttribute("title", "Selected input: AirPods Pro");
     expect(screen.getByText("01:05")).toBeInTheDocument();
+  });
+
+  it("uses a headphone glyph for custom AirPods names in the input-device subtitle", () => {
+    renderPill({
+      state: "recording",
+      audioDeviceName: "Not ur airpods",
+      audioDeviceSourceLabel: "Selected input",
+      audioDeviceTitle: "Selected input: Not ur airpods",
+      audioCaptureStatus: "receiving_audio",
+    });
+
+    expect(document.querySelector(".voice-pill__indicator svg")).toHaveAttribute("data-glyph", "mic");
+    expect(document.querySelector(".voice-pill__subtitle svg")).toHaveAttribute("data-glyph", "headphones");
+    expect(document.querySelector(".voice-pill__subtitle")).toHaveTextContent("Not ur airpods");
+  });
+
+  it.each(["no_audio_yet", "no_recent_audio", "device_error", "unavailable", "no_speech"] as const)(
+    "keeps %s in the leading microphone failure cue ahead of a target avatar",
+    (audioCaptureStatus) => {
+      renderPill({
+        state: "recording",
+        audioCaptureStatus,
+        recordingTargetIcon: "data:image/png;base64,aGVsbG8=",
+      });
+
+      expect(document.querySelector(".voice-pill__target-icon")).not.toBeInTheDocument();
+      expect(document.querySelectorAll('[data-glyph="mic-off"]')).toHaveLength(1);
+      expect(document.querySelector(".voice-pill__subtitle svg")).not.toBeInTheDocument();
+    },
+  );
+
+  it("keeps the ordinary microphone glyph while waiting for the first frame without an app avatar", () => {
+    renderPill({ state: "recording", audioCaptureStatus: "waiting_first_frame" });
+
+    expect(document.querySelector(".voice-pill__target-icon")).not.toBeInTheDocument();
+    expect(document.querySelector(".voice-pill__indicator svg")).toHaveAttribute("data-glyph", "mic");
+    expect(document.querySelector(".voice-pill__subtitle svg")).not.toBeInTheDocument();
+    expect(screen.getByText("Waiting for microphone")).toBeInTheDocument();
+    expect(screen.getByText("No audio has arrived yet")).toBeInTheDocument();
+  });
+
+  it("uses the ordinary microphone glyph when the first-frame wait arrives before recording starts", () => {
+    renderPill({ state: "starting", audioCaptureStatus: "waiting_first_frame" });
+
+    expect(document.querySelector(".voice-pill__indicator svg")).toHaveAttribute("data-glyph", "mic");
+    expect(document.querySelector(".voice-pill__subtitle svg")).not.toBeInTheDocument();
+    expect(screen.getByText("Waiting for microphone")).toBeInTheDocument();
+    expect(screen.getByText("No audio has arrived yet")).toBeInTheDocument();
+  });
+
+  it("preserves the target app avatar while waiting for the first frame", () => {
+    renderPill({
+      state: "recording",
+      audioCaptureStatus: "waiting_first_frame",
+      recordingTargetIcon: "data:image/png;base64,aGVsbG8=",
+    });
+
+    expect(document.querySelector(".voice-pill__target-icon")).toHaveAttribute("src", "data:image/png;base64,aGVsbG8=");
+    expect(document.querySelector(".voice-pill__indicator svg")).not.toBeInTheDocument();
+    expect(document.querySelector(".voice-pill__subtitle svg")).not.toBeInTheDocument();
+    expect(screen.getByText("Waiting for microphone")).toBeInTheDocument();
+    expect(screen.getByText("No audio has arrived yet")).toBeInTheDocument();
   });
 
   it("shows the waiting-for-audio source honestly and keeps the original stop square", () => {
@@ -239,6 +301,13 @@ describe("VoicePill", () => {
     expect(document.querySelector(".voice-pill__subtitle")).toHaveTextContent("Saved to History");
   });
 
+  it("uses a completion check cue in the done capsule and its details", () => {
+    renderPill({ state: "done", detailsOpen: true });
+
+    expect(document.querySelector(".voice-pill__indicator svg")).toHaveAttribute("data-glyph", "check");
+    expect(document.querySelector(".voice-pill__details-icon svg")).toHaveAttribute("data-glyph", "check");
+  });
+
   it("shows recovery actions only with a concrete recovery payload", () => {
     const onAction = vi.fn();
     const recoveryAction: VoicePillRecoveryAction = {
@@ -342,5 +411,43 @@ describe("VoicePill", () => {
   it("announces recovery action failures without relying on visual detail text", () => {
     renderPill({ state: "error", detailsOpen: true, detailsActionError: "Could not open History. Try again." });
     expect(screen.getByRole("status")).toHaveTextContent("Could not open History. Try again.");
+    expect(document.querySelector(".voice-pill__secondary--details")).toHaveClass("voice-pill__secondary--has-error");
+  });
+
+  it("renders recovery error inside the recovery copy column beside the message", () => {
+    const recoveryAction: VoicePillRecoveryAction = {
+      title: "Recording saved",
+      message: "The recording was saved to History.",
+      actionLabel: "View History",
+      busy: false,
+      error: "Could not save right now.",
+      onAction: vi.fn(),
+      onDismiss: vi.fn(),
+    };
+    renderPill({ state: "error", recoveryAction, detailsOpen: true });
+
+    const copy = document.querySelector(".voice-pill__recovery-copy");
+    expect(copy?.querySelector(".voice-pill__recovery-message")).toHaveTextContent("The recording was saved to History.");
+    expect(copy?.querySelector(".voice-pill__recovery-error")).toHaveTextContent("Could not save right now.");
+    expect(document.querySelector(".voice-pill__secondary--recovery")).toHaveClass("voice-pill__secondary--has-error");
+  });
+
+  it("crossfades the working orb out across processing -> done when motion is enabled", () => {
+    vi.useFakeTimers();
+    const { rerender } = renderPill({ state: "processing", phase: "cleanup", phaseConfirmed: true, reduced: false });
+    expect(document.querySelector("[data-orb-state='working']")).toBeInTheDocument();
+    expect(document.querySelector(".voice-pill__center-state--active [data-orb-state='working']")).toBeInTheDocument();
+
+    rerender(
+      <I18nProvider initialLanguage="en">
+        <VoicePill state="done" contextLabel={null} waveformLevels={[]} reduced={false} />
+      </I18nProvider>,
+    );
+    expect(document.querySelector("[data-orb-state='working']")).toBeInTheDocument();
+    expect(document.querySelector(".voice-pill__center-state--active [data-orb-state='working']")).not.toBeInTheDocument();
+    expect(document.querySelector(".voice-pill__center-cue [data-glyph='check']")).toBeInTheDocument();
+
+    act(() => { vi.advanceTimersByTime(220); });
+    expect(document.querySelector("[data-orb-state='working']")).not.toBeInTheDocument();
   });
 });

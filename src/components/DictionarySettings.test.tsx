@@ -5,7 +5,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type { Settings } from "../types/settings";
 import { DictionarySettings } from "./DictionarySettings";
-import { auditPair, auditSnapshot } from "../test/dictionaryLearningAuditFixtures";
+import { auditObservation, auditPair, auditSnapshot } from "../test/dictionaryLearningAuditFixtures";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn() }));
@@ -247,7 +247,7 @@ describe("DictionarySettings", () => {
 
     const toggle = screen.getByRole("switch", { name: "学习词条" });
     expect(toggle).toHaveAttribute("aria-checked", "true");
-    expect(screen.getByText(/普通词需 3 次、人名需 2 次不同听写中的纠正/)).toBeInTheDocument();
+    expect(screen.getByText("现场观察和 History 编辑只生成待确认候选；不会按纠正次数自动生效。你可在历史或本页明确确认，确认后的规则只在记录的 App 范围内应用；继续打字不会学习。", { exact: true })).toBeInTheDocument();
     expect(screen.getByText(/继续打字不会学习/)).toBeInTheDocument();
     expect(await screen.findByText(/还没有已生效替换/)).toBeInTheDocument();
 
@@ -305,22 +305,59 @@ describe("DictionarySettings", () => {
   it("opens the authoritative audit without replaying controls or multiplying shared term usage", async () => {
     const save = vi.fn();
     invokeMock.mockImplementation(async (command) => {
-      if (command === "list_learn_pairs") return [promotedPair, { ...promotedPair, pair_key: "second-rule", before_surface: "知乎" }];
-      if (command === "list_learned_term_usage") return [{ word: "知乎", replacement_runs: 7, last_replaced_at: "2026-10-15 00:00:00" }];
-      if (command === "get_dictionary_learning_audit") return auditSnapshot({ pairs: [auditPair({ before_surface: "知呼", after_surface: "知乎", record_state: "db_promoted" }), auditPair({ pair_ref: "55555555-5555-4555-8555-555555555555", pair_key: "second-rule", before_surface: "知乎", after_surface: "知乎", record_state: "db_promoted" })] });
+      if (command === "list_learn_pairs") return [{ ...promotedPair, replacement_runs: 7 }, { ...promotedPair, pair_key: "second-rule", before_surface: "知乎", replacement_runs: 3 }];
+      if (command === "list_learned_term_usage") return [{ word: "知乎", replacement_runs: 10, last_replaced_at: "2026-11-12 00:00:00" }];
+      if (command === "get_dictionary_learning_audit") return auditSnapshot({
+        pairs: [auditPair({ before_surface: "知呼", after_surface: "知乎", record_state: "db_promoted" }), auditPair({ pair_ref: "55555555-5555-4555-8555-555555555555", pair_key: "second-rule", before_surface: "知乎", after_surface: "知乎", record_state: "db_promoted" })],
+        activity: [auditObservation({ fact: {
+          kind: "post_paste_attempt",
+          registration: { status: "skipped", reason: "accessibility_permission_revoked" },
+          verified_paste: false,
+          outcome: "unknown",
+          classification: null,
+          candidate_decision: "mapping_binding_invalidated",
+          candidate_store: { status: "not_attempted", reason: null },
+          settings_store: { status: "not_attempted", reason: null },
+          attribution: "not_observed",
+        } })],
+      });
       return [];
     });
     render(<DictionarySettings settings={{ ...settings, dictionary: ["知乎"] }} save={save} />);
     await screen.findByText("知呼 → 知乎");
     expect(invokeMock.mock.calls.some(([command]) => command === "get_dictionary_learning_audit")).toBe(false);
     fireEvent.click(screen.getByRole("button", { name: /学习统计/ }));
-    expect(screen.getAllByText(/7 次本机处理/)).toHaveLength(1);
+    expect(screen.getByText(/7 次本机处理/)).toBeInTheDocument();
+    expect(screen.getByText(/3 次本机处理/)).toBeInTheDocument();
+    expect(screen.getByText("10").closest("dd")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "学习审查：来源、原因与保存步骤" }));
     await screen.findByLabelText("学习审查读取结果");
-    expect(screen.getAllByText(/7 次本机处理/)).toHaveLength(1);
+    fireEvent.click(screen.getByText("#1 · 插入后观察尝试 · 本次活动已结束"));
+    expect(screen.getByText("App mapping 绑定已失效")).toBeInTheDocument();
+    expect(screen.getByText(/辅助功能权限已撤销/)).toBeInTheDocument();
+    expect(screen.getByText(/7 次本机处理/)).toBeInTheDocument();
+    expect(screen.getByText(/3 次本机处理/)).toBeInTheDocument();
     expect(save).not.toHaveBeenCalled();
     expect(invokeMock.mock.calls.some(([command]) => ["promote_learn_pair", "undo_learn_pair", "ignore_learn_pair", "get_context_snapshot", "show_permission_guide"].includes(command as string))).toBe(false);
-    expect(invokeMock.mock.calls.filter(([command]) => command === "list_learned_term_usage")).toHaveLength(1);
+    expect(invokeMock.mock.calls.some(([command]) => command === "list_learned_term_usage")).toBe(true);
+  });
+
+  it("warns that app-only and mapping-scoped conflicts pause only in overlapping scopes", async () => {
+    const appScope = { family: "developer_collaboration", mapping_id: null, browser_host: null, native_bundle: "com.openai.codex" };
+    const mappingScope = { ...appScope, mapping_id: "codex" };
+    invokeMock.mockImplementation(async (command) => command === "list_learn_pairs" ? [
+      { ...promotedPair, pair_key: "word:v2:first", before_surface: "github", after_surface: "GitHub", match_policy: "exact", ...appScope },
+      { ...promotedPair, pair_key: "word:v2:second", before_surface: "github", after_surface: "GitHub Enterprise", match_policy: "ignore_case", ...mappingScope },
+    ] : []);
+    render(<DictionarySettings settings={settings} save={vi.fn()} />);
+    expect(await screen.findByText("只有规则的实际适用范围重叠且来源词指向不同目标时才会暂停；更宽的 App 规则在没有匹配窄规则的其他范围仍可能生效。忘记其中一条可解除重叠范围内的冲突。")).toBeInTheDocument();
+    const activeGroup = screen.getByRole("heading", { name: /已生效替换/ }).closest("section");
+    if (!activeGroup) throw new Error("active replacements section missing");
+    expect(within(activeGroup).getByText(/还没有已生效替换/)).toBeInTheDocument();
+    const conflictGroup = screen.getByRole("heading", { name: /范围重叠的冲突纠正/ }).closest("section");
+    if (!conflictGroup) throw new Error("conflicted replacements section missing");
+    expect(within(conflictGroup).getAllByRole("button", { name: "忘记" })).toHaveLength(2);
+    expect(within(conflictGroup).getAllByText("仅在与另一条规则的适用范围重叠时暂停；不重叠的范围不受影响。")).toHaveLength(2);
   });
 
   it("teaches at the real dictionary entry without adding its example or discarding a typed term", async () => {
@@ -331,7 +368,7 @@ describe("DictionarySettings", () => {
     const input = screen.getByRole("textbox", { name: "添加个人词典词条" });
     fireEvent.change(input, { target: { value: "保留我的草稿" } });
     fireEvent.click(screen.getByRole("button", { name: "词典与纠错：从添加到真正使用" }));
-    expect(screen.getByText(/同一听写只计一次/)).toBeVisible();
+    expect(screen.getByText(/不会按人名或普通词的纠正次数自动生效/)).toBeVisible();
     fireEvent.click(screen.getByRole("button", { name: "添加自己的术语" }));
     expect(input).toHaveFocus();
     expect(input).toHaveValue("保留我的草稿");
@@ -362,8 +399,7 @@ describe("DictionarySettings", () => {
   it.each(["done", "copied", "history", "unverified", "degraded"])("refreshes actual replacement usage after %s completion", async (state) => {
     let runs = 2;
     invokeMock.mockImplementation(async (command) => {
-      if (command === "list_learn_pairs") return [promotedPair, { ...pendingPair, pair_key: "other", after_surface: "另一个词" }];
-      if (command === "list_learned_term_usage") return [{ word: "知乎", replacement_runs: runs, last_replaced_at: "2026-10-02 04:00:00" }, { word: "已忘记", replacement_runs: 20, last_replaced_at: "2026-10-01 00:00:00" }];
+      if (command === "list_learn_pairs") return [{ ...promotedPair, replacement_runs: runs }, { ...pendingPair, pair_key: "other", after_surface: "另一个词" }];
       return [];
     });
     render(<DictionarySettings settings={{ ...settings, dictionary: ["知乎"], dictionary_learn_enabled: false }} save={vi.fn()} />);
@@ -380,15 +416,14 @@ describe("DictionarySettings", () => {
     expect(await screen.findByText(/3 次本机处理/)).toBeInTheDocument();
   });
 
-  it("does not show missing usage as zero when the feedback query fails", async () => {
+  it("does not show usage as zero when pair data cannot be loaded", async () => {
     invokeMock.mockImplementation(async (command) => {
-      if (command === "list_learn_pairs") return [promotedPair];
-      if (command === "list_learned_term_usage") throw new Error("synthetic unavailable usage");
+      if (command === "list_learn_pairs") throw new Error("synthetic unavailable pair data");
       return [];
     });
     render(<DictionarySettings settings={settings} save={vi.fn()} />);
     expect(await screen.findByRole("alert")).toHaveTextContent(/未能读取/);
-    expect(within(screen.getByLabelText("学习反馈")).getByText("已用于本机纠正").parentElement).toHaveTextContent("—");
+    expect(within(screen.getByLabelText("学习反馈")).getByText("学习反馈尚未读取。")).toBeInTheDocument();
   });
 
   it("shows the historical correction count without presenting it as the independent threshold", async () => {
@@ -428,13 +463,19 @@ describe("DictionarySettings", () => {
 
   it("confirms and ignores pending pairs", async () => {
     invokeMock.mockImplementation(async (command) => {
-      if (command === "list_learn_pairs") return [pendingPair];
+      if (command === "list_learn_pairs") return [{
+        ...pendingPair,
+        native_bundle: "com.example.editor",
+        mapping_id: "editor-chat",
+        family: "work_chat",
+      }];
       if (command === "list_style_drafts") return [];
       if (command === "list_pinned_terms") return [];
       return undefined;
     });
     render(<DictionarySettings settings={settings} save={vi.fn()} />);
     expect(await screen.findByRole("group", { name: "知呼 → 知乎" })).toBeInTheDocument();
+    expect(screen.getByText("适用范围： com.example.editor · editor-chat · work_chat")).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "确认" }));
     await waitFor(() =>
@@ -452,6 +493,29 @@ describe("DictionarySettings", () => {
         pairKey: pendingPair.pair_key,
       }),
     );
+  });
+
+  it("serially confirms selected lexical candidates and reports partial failure", async () => {
+    const second = { ...pendingPair, pair_key: "second", before_surface: "A", after_surface: "B" };
+    const promoted: string[] = [];
+    invokeMock.mockImplementation(async (command, args) => {
+      if (command === "list_learn_pairs") return [pendingPair, second];
+      if (command === "list_style_drafts" || command === "list_pinned_terms") return [];
+      if (command === "promote_learn_pair") {
+        const pairKey = (args as { pairKey: string }).pairKey;
+        promoted.push(pairKey);
+        if (pairKey === second.pair_key) throw new Error("sample failure");
+      }
+      return undefined;
+    });
+    render(<DictionarySettings settings={settings} save={vi.fn()} />);
+    await screen.findByRole("group", { name: "知呼 → 知乎" });
+    fireEvent.click(screen.getByRole("checkbox", { name: "选择待确认词条 知呼 → 知乎" }));
+    fireEvent.click(screen.getByRole("checkbox", { name: "选择待确认词条 A → B" }));
+    fireEvent.click(screen.getByRole("button", { name: "确认所选词条 (2)" }));
+
+    expect(await screen.findByText(/批量确认部分完成：1 条成功；1 条失败或结果未确认/)).toBeInTheDocument();
+    expect(promoted).toEqual([pendingPair.pair_key, second.pair_key]);
   });
 
   it("lists promoted dictionary words with deletion and preserves their separate rule Forget action", async () => {
@@ -492,6 +556,51 @@ describe("DictionarySettings", () => {
         pairKey: promotedPair.pair_key,
       }),
     );
+  });
+
+  it("keeps an imported auto-scoped replacement local and does not offer a global pin", async () => {
+    const importedLocalPair = { ...promotedPair, auto_scoped: true, manual_scoped: false };
+    invokeMock.mockImplementation(async (command) => command === "list_learn_pairs" ? [importedLocalPair] : []);
+    render(<DictionarySettings settings={settings} save={vi.fn()} />);
+
+    expect(await screen.findByText("知呼 → 知乎")).toBeInTheDocument();
+    const activeGroup = screen.getByRole("heading", { name: /已生效替换/ }).closest("section");
+    expect(activeGroup).not.toBeNull();
+    expect(within(activeGroup!).getByText("仅本机词典规则；不会写入全局词条")).toBeInTheDocument();
+    expect(within(activeGroup!).queryByRole("button", { name: "置顶 知乎" })).not.toBeInTheDocument();
+    expect(within(activeGroup!).getByRole("button", { name: "忘记" })).toBeInTheDocument();
+    expect(invokeMock.mock.calls.some(([command]) => command === "pin_dictionary_term")).toBe(false);
+  });
+
+  it("shows mapping-invalidated rules as paused and uses the explicit rebind action", async () => {
+    const invalidatedPair = {
+      ...promotedPair,
+      binding_invalidated_at: "2026-11-01 00:00:00",
+      binding_invalidated_reason: "declared_identity_changed",
+    };
+    let rebound = false;
+    invokeMock.mockImplementation(async (command) => {
+      if (command === "list_learn_pairs") return rebound ? [promotedPair] : [invalidatedPair];
+      if (command === "list_style_drafts" || command === "list_pinned_terms") return [];
+      if (command === "rebind_invalidated_learn_pair") {
+        rebound = true;
+        return undefined;
+      }
+      return undefined;
+    });
+    render(<DictionarySettings settings={settings} save={vi.fn()} />);
+
+    expect(await screen.findByText("已暂停的 App 专用纠正")).toBeInTheDocument();
+    expect(screen.getByText("App mapping 的匹配条件已变更")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "重新绑定" }));
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("rebind_invalidated_learn_pair", {
+        pairKey: promotedPair.pair_key,
+      }),
+    );
+    await waitFor(() => expect(rebound).toBe(true));
+    expect(await screen.findByText("知呼 → 知乎")).toBeInTheDocument();
+    expect(screen.queryByText("已暂停的 App 专用纠正")).not.toBeInTheDocument();
   });
 
   it("shows initial read failure with retry instead of a successful empty state", async () => {

@@ -63,13 +63,64 @@ pub fn asr_prompt_shape_for(
 pub struct LexiconPair {
     pub before: String,
     pub after: String,
+    pub match_policy: crate::store::LearnPairMatchPolicy,
+    pub rule_key: Option<String>,
+    pub(crate) expansion_policy: PairExpansionPolicy,
+}
+
+/// Controls whether a pair may expand beyond its declared alias.
+///
+/// Match casing is a separate rule. New and scoped stored pairs are alias-only;
+/// legacy evaluation fixtures opt in through their existing fixture contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PairExpansionPolicy {
+    AliasOnly,
+    LegacyHeuristics,
 }
 
 impl LexiconPair {
+    #[cfg(test)]
     pub fn new(before: impl Into<String>, after: impl Into<String>) -> Self {
         Self {
             before: before.into(),
             after: after.into(),
+            match_policy: crate::store::LearnPairMatchPolicy::IgnoreCase,
+            rule_key: None,
+            expansion_policy: PairExpansionPolicy::AliasOnly,
+        }
+    }
+
+    /// Construct a rule from the versioned evaluation fixture's legacy local
+    /// replacement contract, which explicitly retains historical heuristics.
+    #[cfg(any(test, feature = "evaluation"))]
+    pub(crate) fn legacy_fixture(before: impl Into<String>, after: impl Into<String>) -> Self {
+        Self {
+            before: before.into(),
+            after: after.into(),
+            match_policy: crate::store::LearnPairMatchPolicy::IgnoreCase,
+            rule_key: None,
+            expansion_policy: PairExpansionPolicy::LegacyHeuristics,
+        }
+    }
+
+    fn from_record(row: &LearnPairRecord) -> Self {
+        let is_legacy_unscoped_rule = row.match_policy
+            == crate::store::LearnPairMatchPolicy::IgnoreCase
+            && row.pair_key
+                == crate::dictionary_learn::pair_key(&row.before_surface, &row.after_surface)
+            && !row.manual_scoped
+            && !row.auto_scoped
+            && !row.has_declared_scope();
+        Self {
+            before: row.before_surface.clone(),
+            after: row.after_surface.clone(),
+            match_policy: row.match_policy,
+            rule_key: Some(row.pair_key.clone()),
+            expansion_policy: if is_legacy_unscoped_rule {
+                PairExpansionPolicy::LegacyHeuristics
+            } else {
+                PairExpansionPolicy::AliasOnly
+            },
         }
     }
 }
@@ -231,18 +282,29 @@ fn mapping_matching_target<'a>(
     browser_host: Option<&str>,
 ) -> Option<&'a AppMapping> {
     mappings.iter().find(|mapping| {
-        mapping.enabled
-            && (bundle_id.is_some() && mapping.bundle_id.as_deref() == bundle_id
-                || host_is_or_under(
-                    browser_host
-                        .and_then(crate::context::normalize_host)
-                        .as_deref(),
-                    mapping
-                        .browser_host
-                        .as_deref()
-                        .and_then(crate::context::normalize_host)
-                        .as_deref(),
-                ))
+        if !mapping.enabled
+            // This fallback has no executable, URL path, or focus evidence.
+            // Leave those selectors to the exact profile-ID path above.
+            || mapping.executable.is_some()
+            || mapping.browser_path_prefix.is_some()
+            || mapping.focused_field.is_some()
+        {
+            return false;
+        }
+        let bundle_matches = mapping.bundle_id.as_deref().is_none_or(|expected| {
+            bundle_id.is_some_and(|actual| expected.eq_ignore_ascii_case(actual))
+        });
+        let host_matches = mapping.browser_host.as_deref().is_none_or(|expected| {
+            host_is_or_under(
+                browser_host
+                    .and_then(crate::context::normalize_host)
+                    .as_deref(),
+                crate::context::normalize_host(expected).as_deref(),
+            )
+        });
+        (mapping.bundle_id.is_some() || mapping.browser_host.is_some())
+            && bundle_matches
+            && host_matches
     })
 }
 
@@ -402,7 +464,7 @@ fn apply_lexicon_replacements_with_facts(
             {
                 continue;
             }
-            if !region_matches(&chars, index, &needle) {
+            if !region_matches(&chars, index, &needle, rule.match_policy) {
                 continue;
             }
             if is_latin_surface(&rule.before) {
@@ -421,7 +483,14 @@ fn apply_lexicon_replacements_with_facts(
             output.push_str(&rule.after);
             applied_terms.insert(rule.after.clone());
             if !applied_pairs.iter().any(|applied: &LexiconPair| {
-                applied.before == rule.before && applied.after == rule.after
+                match (&applied.rule_key, &rule.rule_key) {
+                    (Some(left), Some(right)) => left == right,
+                    _ => {
+                        applied.before == rule.before
+                            && applied.after == rule.after
+                            && applied.match_policy == rule.match_policy
+                    }
+                }
             }) {
                 applied_pairs.push((*rule).clone());
             }
@@ -449,7 +518,7 @@ pub fn replaceable_pairs(pairs: &[LearnPairRecord], dictionary: &[String]) -> Ve
                 crate::store::dictionary_contains_word(dictionary, &row.after_surface),
             )
         })
-        .map(|row| LexiconPair::new(&row.before_surface, &row.after_surface))
+        .map(LexiconPair::from_record)
         .collect()
 }
 
@@ -829,19 +898,52 @@ fn soundex_digit(ch: char) -> u8 {
 }
 
 pub fn hit_pairs(text: &str, pairs: &[LexiconPair], blocking: &[String]) -> Vec<LexiconPair> {
+    hit_pairs_with_matching_universe(text, pairs, pairs, blocking)
+}
+
+/// Select and budget eligible cleanup hints while keeping the full applicable
+/// rule set available to matching and overlap checks. A local-only rule may
+/// block a shorter cloud-eligible alias without itself being emitted.
+pub(crate) fn hit_pairs_with_matching_universe(
+    text: &str,
+    candidates: &[LexiconPair],
+    matching_universe: &[LexiconPair],
+    blocking: &[String],
+) -> Vec<LexiconPair> {
     let searchable = nonliteral_line_slices(text);
     let mut hits = Vec::new();
     let mut chars = 0usize;
-    for pair in pairs {
+    for pair in candidates {
         if pair.before.is_empty() {
             continue;
         }
-        if !searchable.iter().any(|slice| {
-            independent_surface(slice, &pair.before, pairs, blocking)
-                || independent_surface(slice, &pair.after, pairs, blocking)
-                || phonetic_surface_hit(slice, pair, pairs)
-                || latin_fuzzy_hit(slice, pair)
-        }) {
+        let matched = searchable.iter().any(|slice| match pair.match_policy {
+            crate::store::LearnPairMatchPolicy::Exact => independent_surface(
+                slice,
+                &pair.before,
+                matching_universe,
+                blocking,
+                pair.match_policy,
+            ),
+            crate::store::LearnPairMatchPolicy::IgnoreCase => {
+                independent_surface(
+                    slice,
+                    &pair.before,
+                    matching_universe,
+                    blocking,
+                    pair.match_policy,
+                ) || (pair.expansion_policy == PairExpansionPolicy::LegacyHeuristics
+                    && (independent_surface(
+                        slice,
+                        &pair.after,
+                        matching_universe,
+                        blocking,
+                        pair.match_policy,
+                    ) || phonetic_surface_hit(slice, pair, matching_universe)
+                        || latin_fuzzy_hit(slice, pair)))
+            }
+        });
+        if !matched {
             continue;
         }
         let rendered = format!("{}→{}", pair.before, pair.after);
@@ -918,7 +1020,10 @@ pub fn collect_ranked_terms(
     let mut terms = Vec::new();
     let scope = scope.cloned().unwrap_or_default();
 
-    for row in pairs.iter().filter(|row| row.is_live_promoted()) {
+    for row in pairs
+        .iter()
+        .filter(|row| row.is_live_promoted() && row.is_provider_egress_eligible_dictionary_owner())
+    {
         if !crate::store::dictionary_contains_word(dictionary, &row.after_surface) {
             continue;
         }
@@ -946,6 +1051,7 @@ pub fn collect_ranked_terms(
             crate::store::dictionary_words_equal(&item.after_surface, word)
                 && item.before_surface.is_empty()
                 && item.is_live_promoted()
+                && item.is_provider_egress_eligible_dictionary_owner()
         });
         terms.push(RankedTerm {
             term: word.to_owned(),
@@ -1238,7 +1344,13 @@ pub fn used_pair_keys(applied_pairs: &[LexiconPair], pairs: &[LearnPairRecord]) 
         .filter(|row| row.is_live_promoted())
         .filter(|row| {
             applied_pairs.iter().any(|applied| {
-                applied.before == row.before_surface && applied.after == row.after_surface
+                if let Some(rule_key) = applied.rule_key.as_deref() {
+                    rule_key == row.pair_key
+                } else {
+                    applied.before == row.before_surface
+                        && applied.after == row.after_surface
+                        && applied.match_policy == row.match_policy
+                }
             })
         })
         .map(|row| row.pair_key.clone())
@@ -1287,11 +1399,20 @@ fn independent_surface(
     needle: &str,
     pairs: &[LexiconPair],
     blocking: &[String],
+    match_policy: crate::store::LearnPairMatchPolicy,
 ) -> bool {
-    if needle.is_empty() || !text.contains(needle) {
+    if needle.is_empty()
+        || (match_policy == crate::store::LearnPairMatchPolicy::Exact && !text.contains(needle))
+    {
         return false;
     }
-    let probe = [LexiconPair::new(needle, "\u{FFFC}")];
+    let probe = [LexiconPair {
+        before: needle.to_owned(),
+        after: "\u{FFFC}".to_owned(),
+        match_policy,
+        rule_key: None,
+        expansion_policy: PairExpansionPolicy::AliasOnly,
+    }];
     let mut blockers = blocking.to_vec();
     for pair in pairs {
         if !pair.before.is_empty() {
@@ -1343,7 +1464,12 @@ fn scope_score(row: &LearnPairRecord, scope: &PromptScope) -> u8 {
     0
 }
 
-fn region_matches(haystack: &[char], start: usize, needle: &[char]) -> bool {
+fn region_matches(
+    haystack: &[char],
+    start: usize,
+    needle: &[char],
+    match_policy: crate::store::LearnPairMatchPolicy,
+) -> bool {
     if start + needle.len() > haystack.len() || needle.is_empty() {
         return false;
     }
@@ -1351,10 +1477,11 @@ fn region_matches(haystack: &[char], start: usize, needle: &[char]) -> bool {
         .iter()
         .zip(needle)
         .all(|(left, right)| {
-            if is_latin_start(*left)
-                || is_latin_cont(*left)
-                || is_latin_start(*right)
-                || is_latin_cont(*right)
+            if match_policy == crate::store::LearnPairMatchPolicy::IgnoreCase
+                && (is_latin_start(*left)
+                    || is_latin_cont(*left)
+                    || is_latin_start(*right)
+                    || is_latin_cont(*right))
             {
                 left.eq_ignore_ascii_case(right)
             } else {
@@ -1366,8 +1493,31 @@ fn region_matches(haystack: &[char], start: usize, needle: &[char]) -> bool {
 fn latin_boundaries_ok(chars: &[char], start: usize, len: usize) -> bool {
     let before_ok = start == 0 || !is_latin_token_char(chars[start - 1]);
     let after_index = start + len;
-    let after_ok = after_index >= chars.len() || !is_latin_token_char(chars[after_index]);
+    let after_ok = match chars.get(after_index) {
+        None => true,
+        Some(&'.') => period_run_is_sentence_boundary(chars, after_index, start),
+        Some(&value) => !is_latin_token_char(value),
+    };
     before_ok && after_ok
+}
+
+fn period_run_is_sentence_boundary(
+    chars: &[char],
+    period_index: usize,
+    alias_start: usize,
+) -> bool {
+    let mut next_index = period_index + 1;
+    while chars.get(next_index) == Some(&'.') {
+        next_index += 1;
+    }
+    let followed_by_sentence_gap = chars
+        .get(next_index)
+        .is_none_or(|value| value.is_whitespace());
+    let follows_path_separator = alias_start
+        .checked_sub(1)
+        .and_then(|index| chars.get(index))
+        .is_some_and(|value| matches!(value, '/' | '\\'));
+    followed_by_sentence_gap && !follows_path_separator
 }
 
 fn is_latin_token_char(value: char) -> bool {
@@ -1389,6 +1539,11 @@ fn phonetic_replace_rules(text: &str, pairs: &[LexiconPair]) -> Vec<LexiconPair>
     let mut extra = Vec::new();
     let mut seen = HashSet::new();
     for pair in pairs {
+        if pair.expansion_policy != PairExpansionPolicy::LegacyHeuristics
+            || pair.match_policy == crate::store::LearnPairMatchPolicy::Exact
+        {
+            continue;
+        }
         let window_len = pair.after.chars().count();
         if !(2..=8).contains(&window_len) || !is_cjk_surface(&pair.after) {
             continue;
@@ -1413,7 +1568,13 @@ fn phonetic_replace_rules(text: &str, pairs: &[LexiconPair]) -> Vec<LexiconPair>
             if !seen.insert(window.clone()) {
                 continue;
             }
-            extra.push(LexiconPair::new(window, pair.after.clone()));
+            extra.push(LexiconPair {
+                before: window,
+                after: pair.after.clone(),
+                match_policy: pair.match_policy,
+                rule_key: pair.rule_key.clone(),
+                expansion_policy: pair.expansion_policy,
+            });
         }
     }
     extra
@@ -1562,6 +1723,7 @@ mod tests {
     use crate::context::ContextFamily;
     use crate::dictionary_learn::pair_key;
     use crate::llm::{CleanupIntensity, CleanupIntent};
+    use crate::store::LearnPairMatchPolicy;
 
     fn decide(
         enabled: bool,
@@ -1577,6 +1739,11 @@ mod tests {
             id: "wechat".into(),
             label: "微信".into(),
             family: ContextFamily::PersonalChat,
+            writing_task_id: None,
+            writing_preferences: Vec::new(),
+            preference_guidance_provider_approved: false,
+            preference_revision: 0,
+            deleted: false,
             mode_id: None,
             bundle_id: None,
             executable: None,
@@ -1615,7 +1782,316 @@ mod tests {
             promote_hits: 0,
             manual_scoped: false,
             auto_scoped: false,
+            match_policy: LearnPairMatchPolicy::default(),
+            binding_invalidated_at: None,
+            binding_invalidated_reason: None,
+            replacement_runs: 0,
         }
+    }
+
+    fn global_live_pair(before: &str, after: &str, hits: u32) -> LearnPairRecord {
+        let mut row = live_pair(before, after, "general", hits);
+        row.family = None;
+        row
+    }
+
+    #[test]
+    fn c1_word_identity_and_matching_keep_ordinary_casefold_and_exact_casing_distinct() {
+        let scope = crate::store::LearnPairScope {
+            family: Some("developer_collaboration".into()),
+            mapping_id: Some("codex".into()),
+            native_bundle: Some("com.openai.codex".into()),
+            ..crate::store::LearnPairScope::default()
+        };
+        let ordinary_policy = crate::store::LearnPairMatchPolicy::IgnoreCase;
+        let ordinary_key =
+            crate::store::scoped_word_rule_key("voysflow", "VoiceFlow", &scope, ordinary_policy);
+        let differently_cased_key =
+            crate::store::scoped_word_rule_key("VOYSFLOW", "VoiceFlow", &scope, ordinary_policy);
+        assert_eq!(ordinary_key, differently_cased_key);
+        let mut ordinary_row = live_pair("voysflow", "VoiceFlow", "developer_collaboration", 3);
+        ordinary_row.pair_key = ordinary_key.into_string();
+        ordinary_row.mapping_id = scope.mapping_id.clone();
+        ordinary_row.native_bundle = scope.native_bundle.clone();
+        ordinary_row.manual_scoped = true;
+        let ordinary = replaceable_pairs(&[ordinary_row], &[]);
+        assert_eq!(
+            apply_explicit_replacements_with_usage("Use VOYSFLOW today", &ordinary, &[]).0,
+            "Use VoiceFlow today"
+        );
+        assert_eq!(hit_pairs("Use VOYSFLOW today", &ordinary, &[]).len(), 1);
+
+        let exact_policy = crate::store::LearnPairMatchPolicy::Exact;
+        let exact_key =
+            crate::store::scoped_word_rule_key("github", "GitHub", &scope, exact_policy);
+        let capitalized_alias_key =
+            crate::store::scoped_word_rule_key("GitHub", "github", &scope, exact_policy);
+        assert_ne!(exact_key, capitalized_alias_key);
+        let mut exact_row = live_pair("github", "GitHub", "developer_collaboration", 3);
+        exact_row.pair_key = exact_key.into_string();
+        exact_row.mapping_id = scope.mapping_id.clone();
+        exact_row.native_bundle = scope.native_bundle.clone();
+        exact_row.match_policy = exact_policy;
+        exact_row.manual_scoped = true;
+        let exact = replaceable_pairs(&[exact_row], &[]);
+        assert_eq!(
+            apply_explicit_replacements_with_usage("github", &exact, &[]).0,
+            "GitHub"
+        );
+        assert_eq!(
+            apply_explicit_replacements_with_usage("GitHub", &exact, &[]).0,
+            "GitHub"
+        );
+        assert_eq!(hit_pairs("github", &exact, &[]).len(), 1);
+        assert!(hit_pairs("GitHub", &exact, &[]).is_empty());
+        assert!(hit_pairs("GITHUB", &exact, &[]).is_empty());
+    }
+
+    #[test]
+    fn latin_alias_period_boundaries_preserve_identifiers_across_match_policies() {
+        let scope = crate::store::LearnPairScope {
+            mapping_id: Some("codex".into()),
+            native_bundle: Some("com.openai.codex".into()),
+            ..crate::store::LearnPairScope::default()
+        };
+        let scoped_rule = |before: &str, after: &str, match_policy: LearnPairMatchPolicy| {
+            let mut row = live_pair(before, after, "developer_collaboration", 3);
+            row.pair_key = crate::store::scoped_word_rule_key(before, after, &scope, match_policy)
+                .into_string();
+            row.mapping_id = scope.mapping_id.clone();
+            row.native_bundle = scope.native_bundle.clone();
+            row.match_policy = match_policy;
+            row.manual_scoped = true;
+            replaceable_pairs(&[row], &[])
+                .into_iter()
+                .next()
+                .expect("manual scoped alias is locally replaceable")
+        };
+
+        let alias_policy = crate::store::word_rule_match_policy("Reakt", "React");
+        assert_eq!(alias_policy, LearnPairMatchPolicy::IgnoreCase);
+        let alias = scoped_rule("Reakt", "React", alias_policy);
+        for (source, expected) in [
+            ("Use Reakt.", "Use React."),
+            ("Use Reakt. today.", "Use React. today."),
+            ("Use Reakt...", "Use React..."),
+        ] {
+            let (replaced, used, applied) =
+                apply_explicit_replacements_with_facts(source, std::slice::from_ref(&alias), &[]);
+            assert_eq!(replaced, expected, "{source}");
+            assert_eq!(used, vec!["React"], "{source}");
+            assert_eq!(applied, vec![alias.clone()], "{source}");
+            assert_eq!(
+                hit_pairs(source, std::slice::from_ref(&alias), &[]),
+                vec![alias.clone()],
+                "{source}"
+            );
+        }
+
+        for protected in [
+            "Acme.Reakt",
+            ".Reakt",
+            "foo._Reakt",
+            "Reakt.dev",
+            "Reakt._internal",
+            "Reakt.équipe",
+            "Reakt.中文",
+            "./Reakt./src",
+            "./Reakt.",
+            "https://Reakt.",
+        ] {
+            let (replaced, used, applied) = apply_explicit_replacements_with_facts(
+                protected,
+                std::slice::from_ref(&alias),
+                &[],
+            );
+            assert_eq!(replaced, protected, "{protected}");
+            assert!(used.is_empty(), "{protected}");
+            assert!(applied.is_empty(), "{protected}");
+            assert!(
+                hit_pairs(protected, std::slice::from_ref(&alias), &[]).is_empty(),
+                "{protected}"
+            );
+        }
+
+        let exact_policy = crate::store::word_rule_match_policy("github", "GitHub");
+        assert_eq!(exact_policy, LearnPairMatchPolicy::Exact);
+        let exact_alias = scoped_rule("github", "GitHub", exact_policy);
+        let exact_source = "Use github.";
+        let (replaced, used, applied) = apply_explicit_replacements_with_facts(
+            exact_source,
+            std::slice::from_ref(&exact_alias),
+            &[],
+        );
+        assert_eq!(replaced, "Use GitHub.");
+        assert_eq!(used, vec!["GitHub"]);
+        assert_eq!(applied, vec![exact_alias.clone()]);
+        assert_eq!(
+            hit_pairs(exact_source, std::slice::from_ref(&exact_alias), &[]),
+            vec![exact_alias]
+        );
+
+        let dotted_policy = crate::store::word_rule_match_policy("Reakt.dev", "React.dev");
+        let dotted_alias = scoped_rule("Reakt.dev", "React.dev", dotted_policy);
+        let source = "Use Reakt.dev.";
+        let (replaced, used, applied) = apply_explicit_replacements_with_facts(
+            source,
+            std::slice::from_ref(&dotted_alias),
+            &[],
+        );
+        assert_eq!(replaced, "Use React.dev.");
+        assert_eq!(used, vec!["React.dev"]);
+        assert_eq!(applied, vec![dotted_alias.clone()]);
+        assert_eq!(
+            hit_pairs(source, std::slice::from_ref(&dotted_alias), &[]),
+            vec![dotted_alias]
+        );
+    }
+
+    #[test]
+    fn scoped_stored_aliases_match_only_the_declared_surface() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "voiceflow-lexicon-scoped-alias-{}-{now}",
+            std::process::id()
+        ));
+        let scope_a = crate::store::LearnPairScope {
+            mapping_id: Some("codex".into()),
+            native_bundle: Some("com.openai.codex".into()),
+            ..crate::store::LearnPairScope::default()
+        };
+        let scope_b = crate::store::LearnPairScope {
+            mapping_id: Some("textedit".into()),
+            native_bundle: Some("com.apple.TextEdit".into()),
+            ..crate::store::LearnPairScope::default()
+        };
+        let declared = [
+            ("知呼", "知乎"),
+            ("之乎", "之湖"),
+            ("voysflow", "VoiceFlow"),
+            ("github", "GitHub"),
+        ];
+        for (before, after) in declared {
+            let policy = crate::store::word_rule_match_policy(before, after);
+            let key = crate::store::scoped_word_rule_key(before, after, &scope_a, policy);
+            crate::store::ensure_manual_scoped_learn_pair(
+                &dir,
+                key.as_str(),
+                before,
+                after,
+                &scope_a,
+            )
+            .expect("save actual manual scoped pair");
+        }
+
+        let rows = crate::store::list_learn_pairs(&dir).expect("read stored manual pairs");
+        assert_eq!(rows.len(), declared.len());
+        assert!(rows.iter().all(|row| row.manual_scoped));
+        let selected_a = scope_a.applicable_promoted_records(&rows);
+        let rules_a = replaceable_pairs(&selected_a, &[]);
+        assert_eq!(selected_a.len(), declared.len());
+
+        let rule = |before: &str| {
+            rules_a
+                .iter()
+                .find(|pair| pair.before == before)
+                .expect("stored alias is applicable")
+                .clone()
+        };
+        let zhihu_alias = rule("知呼");
+        let zhi_hu_alias = rule("之乎");
+        let latin_ignore_case = rule("voysflow");
+        let latin_exact = rule("github");
+
+        let (positive, used, applied) =
+            apply_explicit_replacements_with_facts("今天去知呼", &rules_a, &[]);
+        assert_eq!(positive, "今天去知乎");
+        assert_eq!(used, vec!["知乎"]);
+        assert_eq!(applied, vec![zhihu_alias.clone()]);
+        assert_eq!(
+            hit_pairs("今天去知呼", &rules_a, &[]),
+            vec![zhihu_alias.clone()]
+        );
+
+        // A one-name mapping must not turn another same-sound name into its target.
+        let (unrelated, unused, unapplied) = apply_explicit_replacements_with_facts(
+            "我提到之乎",
+            std::slice::from_ref(&zhihu_alias),
+            &[],
+        );
+        assert_eq!(unrelated, "我提到之乎");
+        assert!(unused.is_empty());
+        assert!(unapplied.is_empty());
+        assert!(hit_pairs("我提到之乎", std::slice::from_ref(&zhihu_alias), &[]).is_empty());
+        assert!(hit_pairs("今天提到知乎", std::slice::from_ref(&zhihu_alias), &[]).is_empty());
+        assert!(used_pair_keys(&unapplied, &selected_a).is_empty());
+
+        // When both names are explicitly declared, each surface keeps its own owner.
+        let (second_name, _, second_applied) =
+            apply_explicit_replacements_with_facts("我提到之乎", &rules_a, &[]);
+        assert_eq!(second_name, "我提到之湖");
+        assert_eq!(second_applied, vec![zhi_hu_alias.clone()]);
+        assert_eq!(hit_pairs("我提到之乎", &rules_a, &[]), vec![zhi_hu_alias]);
+
+        let (casefolded, _, casefolded_applied) =
+            apply_explicit_replacements_with_facts("Use VOYSFLOW", &rules_a, &[]);
+        assert_eq!(casefolded, "Use VoiceFlow");
+        assert_eq!(casefolded_applied, vec![latin_ignore_case.clone()]);
+        assert_eq!(
+            hit_pairs("Use VOYSFLOW", &rules_a, &[]),
+            vec![latin_ignore_case]
+        );
+        let (fuzzy_latin, fuzzy_used, fuzzy_applied) =
+            apply_explicit_replacements_with_facts("Use VoiceF1o", &rules_a, &[]);
+        assert_eq!(fuzzy_latin, "Use VoiceF1o");
+        assert!(fuzzy_used.is_empty());
+        assert!(fuzzy_applied.is_empty());
+        assert!(hit_pairs("Use VoiceF1o", &rules_a, &[]).is_empty());
+
+        let (exact_alias, _, exact_applied) =
+            apply_explicit_replacements_with_facts("github", &rules_a, &[]);
+        assert_eq!(exact_alias, "GitHub");
+        assert_eq!(exact_applied, vec![latin_exact.clone()]);
+        let (wrong_case, _, wrong_case_applied) =
+            apply_explicit_replacements_with_facts("GitHub", &rules_a, &[]);
+        assert_eq!(wrong_case, "GitHub");
+        assert!(wrong_case_applied.is_empty());
+        assert!(hit_pairs("GitHub", &[latin_exact], &[]).is_empty());
+
+        let protected = "`知呼` and \"知呼\"";
+        let (protected_output, protected_used, protected_applied) =
+            apply_explicit_replacements_with_facts(
+                protected,
+                std::slice::from_ref(&zhihu_alias),
+                &[],
+            );
+        assert_eq!(protected_output, protected);
+        assert!(protected_used.is_empty());
+        assert!(protected_applied.is_empty());
+        assert!(hit_pairs(protected, &[zhihu_alias], &[]).is_empty());
+
+        crate::store::bump_learn_pairs_used(&dir, &[]).expect("apply empty usage update");
+        let after_unrelated = crate::store::list_learn_pairs(&dir).expect("read usage counters");
+        assert!(after_unrelated
+            .iter()
+            .all(|row| row.replacement_runs == 0 && row.last_used_at.is_none()));
+
+        let selected_b = scope_b.applicable_promoted_records(&rows);
+        assert!(
+            selected_b.is_empty(),
+            "the existing scope owner rejects App B"
+        );
+        let rules_b = replaceable_pairs(&selected_b, &[]);
+        let (wrong_app, _, wrong_app_applied) =
+            apply_explicit_replacements_with_facts("今天去知呼", &rules_b, &[]);
+        assert_eq!(wrong_app, "今天去知呼");
+        assert!(wrong_app_applied.is_empty());
+        assert!(hit_pairs("今天去知呼", &rules_b, &[]).is_empty());
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     fn ranked(term: &str) -> RankedTerm {
@@ -1731,7 +2207,8 @@ mod tests {
 
     #[test]
     fn usage_only_includes_live_dictionary_replacements_including_phonetic_rules() {
-        let pair = live_pair("知呼", "知乎", "personal_chat", 3);
+        let mut pair = live_pair("知呼", "知乎", "personal_chat", 3);
+        pair.family = None;
         let (text, used) = apply_promoted_replacements_with_usage(
             "今天去之乎看看",
             std::slice::from_ref(&pair),
@@ -1763,8 +2240,10 @@ mod tests {
     #[test]
     fn ascii_case_membership_preserves_rule_surface_and_ranks_before_deduplication() {
         let mut older = live_pair("VoiceFlo", "VoiceFlow", "general", 100);
+        older.family = None;
         older.last_used_at = Some("2026-01-01".into());
         let mut pinned = live_pair("VoiceFlo beta", "voiceflow", "general", 1);
+        pinned.family = None;
         pinned.pinned = true;
         pinned.last_used_at = Some("2026-01-02".into());
         let pairs = vec![older, pinned];
@@ -1784,6 +2263,7 @@ mod tests {
         assert!(ranked[0].pinned);
 
         let mut screen_term = live_pair("", "voiceflow", "general", 1);
+        screen_term.family = None;
         screen_term.pinned = true;
         screen_term.last_used_at = Some("2026-02-01".into());
         let with_screen_term = collect_ranked_terms(
@@ -1797,6 +2277,19 @@ mod tests {
             with_screen_term[0].last_used_at.as_deref(),
             Some("2026-02-01")
         );
+    }
+
+    #[test]
+    fn scoped_pair_does_not_promote_manual_dictionary_casing_in_asr_ranking() {
+        let dictionary = vec!["acme".to_owned()];
+        let scoped = live_pair("Acme alias", "AcMe", "general", 100);
+        let ranked = collect_ranked_terms(&dictionary, &[scoped], None);
+
+        assert_eq!(ranked.len(), 1);
+        assert_eq!(ranked[0].term, "acme");
+        assert_eq!(ranked[0].scope_score, 0);
+        assert_eq!(ranked[0].hits, 0);
+        assert!(!ranked[0].pinned);
     }
 
     #[test]
@@ -1844,16 +2337,58 @@ mod tests {
 
     #[test]
     fn hit_pairs_retrieves_same_pinyin_cjk_that_is_not_the_stored_before() {
-        let pairs = vec![LexiconPair::new("知呼", "知乎")];
+        let pairs = vec![LexiconPair::legacy_fixture("知呼", "知乎")];
         assert_eq!(
             hit_pairs("今天去之乎看看吧", &pairs, &[]),
-            vec![LexiconPair::new("知呼", "知乎")]
+            vec![LexiconPair::legacy_fixture("知呼", "知乎")]
+        );
+    }
+
+    #[test]
+    fn legacy_expansions_require_canonical_legacy_provenance_and_ignorecase() {
+        let mut legacy = live_pair("知呼", "知乎", "personal_chat", 3);
+        legacy.family = None;
+        let dictionary = ["知乎".to_owned()];
+        let legacy_rules = replaceable_pairs(std::slice::from_ref(&legacy), &dictionary);
+        assert_eq!(
+            apply_explicit_replacements_with_usage("之乎", &legacy_rules, &dictionary).0,
+            "知乎"
+        );
+        assert_eq!(
+            hit_pairs("之乎", &legacy_rules, &dictionary),
+            legacy_rules,
+            "canonical unscoped legacy rows retain their historical phonetic expansion"
+        );
+
+        let alias_only = LexiconPair::new("知呼", "知乎");
+        assert_eq!(
+            apply_explicit_replacements_with_usage("之乎", std::slice::from_ref(&alias_only), &[])
+                .0,
+            "之乎"
+        );
+        assert!(hit_pairs("之乎", &[alias_only], &[]).is_empty());
+
+        let mut exact_legacy = legacy.clone();
+        exact_legacy.match_policy = crate::store::LearnPairMatchPolicy::Exact;
+        let exact_rules = replaceable_pairs(std::slice::from_ref(&exact_legacy), &dictionary);
+        assert_eq!(
+            apply_explicit_replacements_with_usage("之乎", &exact_rules, &dictionary).0,
+            "之乎"
+        );
+
+        let mut malformed_legacy = legacy;
+        malformed_legacy.pair_key = "unrelated\u{1e}key".into();
+        let malformed_rules = replaceable_pairs(&[malformed_legacy], &dictionary);
+        assert_eq!(
+            apply_explicit_replacements_with_usage("之乎", &malformed_rules, &dictionary).0,
+            "之乎"
         );
     }
 
     #[test]
     fn apply_replaces_unique_same_pinyin_cjk_surface() {
-        let pair = live_pair("知呼", "知乎", "personal_chat", 3);
+        let mut pair = live_pair("知呼", "知乎", "personal_chat", 3);
+        pair.family = None;
         let dictionary = vec!["知乎".into()];
         assert_eq!(
             apply_promoted_replacements("今天去之乎看看", &[pair], &dictionary),
@@ -1873,10 +2408,11 @@ mod tests {
 
     #[test]
     fn apply_does_not_replace_when_two_afters_share_the_same_pinyin() {
-        let pairs = [
+        let mut pairs = [
             live_pair("医士", "医师", "personal_chat", 3),
             live_pair("意示", "意识", "personal_chat", 3),
         ];
+        pairs.iter_mut().for_each(|pair| pair.family = None);
         let dictionary = vec!["医师".into(), "意识".into()];
         assert_eq!(
             apply_promoted_replacements("一时再说", &pairs, &dictionary),
@@ -1886,10 +2422,10 @@ mod tests {
 
     #[test]
     fn hit_pairs_retrieves_latin_within_edit_distance_two() {
-        let pairs = vec![LexiconPair::new("配森", "Python")];
+        let pairs = vec![LexiconPair::legacy_fixture("配森", "Python")];
         assert_eq!(
             hit_pairs("install pyton now", &pairs, &[]),
-            vec![LexiconPair::new("配森", "Python")]
+            vec![LexiconPair::legacy_fixture("配森", "Python")]
         );
     }
 
@@ -1926,6 +2462,25 @@ mod tests {
     }
 
     #[test]
+    fn cloud_hint_candidate_keeps_local_long_alias_as_a_matching_blocker() {
+        let manual_short = LexiconPair::new("链接", "link");
+        let local_long = LexiconPair::new("超链接", "超连结");
+        let eligible = [manual_short.clone()];
+        let full_universe = [manual_short.clone(), local_long];
+
+        assert_eq!(
+            hit_pairs_with_matching_universe("点击超链接", &eligible, &full_universe, &[],),
+            Vec::<LexiconPair>::new(),
+            "the private longer alias must block a spurious short cloud hint"
+        );
+        assert_eq!(
+            hit_pairs("点击超链接", &eligible, &[]),
+            vec![manual_short],
+            "without the longer blocker the short alias would be emitted"
+        );
+    }
+
+    #[test]
     fn exact_pair_replacement_hits_and_usage_skip_quoted_and_code_literals() {
         let pair = LexiconPair::new("LOM", "LLM");
         let source = "LOM `LOM` \"LOM\"\nLOM";
@@ -1955,12 +2510,12 @@ mod tests {
         for index in 0..80 {
             let after = format!("旧词{index}超长家庭词条");
             dictionary.push(after.clone());
-            pairs.push(live_pair(&format!("旧{index}"), &after, "work_chat", 1));
+            pairs.push(global_live_pair(&format!("旧{index}"), &after, 1));
         }
         for index in 0..3 {
             let after = format!("微信词{index}");
             dictionary.push(after.clone());
-            pairs.push(live_pair(&format!("微{index}"), &after, "personal_chat", 9));
+            pairs.push(global_live_pair(&format!("微{index}"), &after, 9));
         }
         dictionary.push("手动导入".into());
         let scope = PromptScope {
@@ -2041,9 +2596,9 @@ mod tests {
     fn asr_prompt_weaves_a_fictional_transcript_not_a_comma_list() {
         let dictionary = vec!["晓雯".into(), "知乎".into(), "TypeScript".into()];
         let pairs = vec![
-            live_pair("小文", "晓雯", "work_chat", 1),
-            live_pair("知呼", "知乎", "personal_chat", 5),
-            live_pair("类型脚本", "TypeScript", "personal_chat", 9),
+            global_live_pair("小文", "晓雯", 1),
+            global_live_pair("知呼", "知乎", 5),
+            global_live_pair("类型脚本", "TypeScript", 9),
         ];
         let scope = PromptScope {
             family: Some("personal_chat".into()),
@@ -2078,9 +2633,9 @@ mod tests {
     fn gpt_transcribe_prompt_is_a_short_scene_with_ranked_keywords() {
         let dictionary = vec!["晓雯".into(), "知乎".into(), "TypeScript".into()];
         let pairs = vec![
-            live_pair("小文", "晓雯", "work_chat", 1),
-            live_pair("知呼", "知乎", "personal_chat", 5),
-            live_pair("类型脚本", "TypeScript", "personal_chat", 9),
+            global_live_pair("小文", "晓雯", 1),
+            global_live_pair("知呼", "知乎", 5),
+            global_live_pair("类型脚本", "TypeScript", 9),
         ];
         let scope = PromptScope {
             family: Some("personal_chat".into()),
@@ -2185,9 +2740,9 @@ mod tests {
     fn asr_prompt_for_context_engines_is_a_term_list() {
         let dictionary = vec!["晓雯".into(), "知乎".into(), "TypeScript".into()];
         let pairs = vec![
-            live_pair("小文", "晓雯", "work_chat", 1),
-            live_pair("知呼", "知乎", "personal_chat", 5),
-            live_pair("类型脚本", "TypeScript", "personal_chat", 9),
+            global_live_pair("小文", "晓雯", 1),
+            global_live_pair("知呼", "知乎", 5),
+            global_live_pair("类型脚本", "TypeScript", 9),
         ];
         let scope = PromptScope {
             family: Some("personal_chat".into()),
@@ -2497,6 +3052,11 @@ mod tests {
             id: "workday".into(),
             label: "Workday".into(),
             family: ContextFamily::FormFilling,
+            writing_task_id: None,
+            writing_preferences: Vec::new(),
+            preference_guidance_provider_approved: false,
+            preference_revision: 0,
+            deleted: false,
             mode_id: None,
             bundle_id: None,
             executable: None,
@@ -2523,11 +3083,66 @@ mod tests {
     }
 
     #[test]
+    fn coarse_learning_fallback_requires_all_available_app_and_host_anchors() {
+        let mut mapping = sample_mapping();
+        mapping.bundle_id = Some("com.example.browser".into());
+        mapping.browser_host = Some("mail.example.com".into());
+        mapping.dictionary_learn_enabled = false;
+
+        assert!(!scene_allows_learn(
+            &[mapping.clone()],
+            "browser.unknown",
+            Some("com.example.browser"),
+            Some("mail.example.com")
+        ));
+        assert!(scene_allows_learn(
+            &[mapping.clone()],
+            "browser.unknown",
+            Some("com.example.other-browser"),
+            Some("mail.example.com")
+        ));
+        assert!(scene_allows_learn(
+            &[mapping],
+            "browser.unknown",
+            Some("com.example.browser"),
+            Some("docs.example.com")
+        ));
+    }
+
+    #[test]
+    fn coarse_learning_fallback_does_not_ignore_path_or_focus_selectors() {
+        let mut mapping = sample_mapping();
+        mapping.bundle_id = Some("com.example.browser".into());
+        mapping.browser_host = Some("mail.example.com".into());
+        mapping.browser_path_prefix = Some("/inbox".into());
+        mapping.focused_field = Some(crate::context::FocusKind::Email);
+        mapping.dictionary_learn_enabled = false;
+
+        assert!(scene_allows_learn(
+            &[mapping.clone()],
+            "browser.unknown",
+            Some("com.example.browser"),
+            Some("mail.example.com")
+        ));
+        assert!(!scene_allows_learn(
+            &[mapping],
+            "user.wechat",
+            Some("com.example.browser"),
+            Some("mail.example.com")
+        ));
+    }
+
+    #[test]
     fn mapping_can_disable_learning() {
         let mut mapping = AppMapping {
             id: "wechat".into(),
             label: "微信".into(),
             family: ContextFamily::PersonalChat,
+            writing_task_id: None,
+            writing_preferences: Vec::new(),
+            preference_guidance_provider_approved: false,
+            preference_revision: 0,
+            deleted: false,
             mode_id: None,
             bundle_id: Some("com.tencent.xinWeChat".into()),
             executable: None,

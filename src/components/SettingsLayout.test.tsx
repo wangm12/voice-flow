@@ -46,6 +46,17 @@ describe("SettingsDisclosure", () => {
     expect(screen.getByRole("alert")).toBeVisible();
     expect(screen.getByRole("textbox", { name: "地址" })).toBeVisible();
   });
+
+  it("reports user initiated disclosure changes", () => {
+    const onExpandedChange = vi.fn();
+    render(<SettingsDisclosure title="候选" onExpandedChange={onExpandedChange}><p>候选列表</p></SettingsDisclosure>);
+    const trigger = screen.getByRole("button", { name: "候选" });
+
+    fireEvent.click(trigger);
+    fireEvent.click(trigger);
+
+    expect(onExpandedChange.mock.calls).toEqual([[true], [false]]);
+  });
 });
 
 it("associates important row descriptions with switches and selectors", () => {

@@ -26,17 +26,17 @@ const persistence = object({
 });
 const observation = object({
   kind: literal("post_paste_attempt"),
-  registration: object({ status: choice("checking", "started", "skipped"), reason: nullable(choice("registered", "unverified", "read_owner_unavailable", "delivery_owner_mismatch", "read_lease_expired", "delivery_fact_mismatch", "secure", "unreadable", "stale_or_cancelled", "no_grant", "protected_target", "no_mapping", "ax_or_learning_not_allowed", "scene_not_allowed", "target_changed", "ambiguous_inserted_range", "fixture_baseline_mismatch")) }),
+  registration: object({ status: choice("checking", "started", "skipped"), reason: nullable(choice("registered", "unverified", "read_owner_unavailable", "delivery_owner_mismatch", "read_lease_expired", "delivery_fact_mismatch", "accessibility_permission_revoked", "input_source_unsupported", "input_source_unknown", "secure", "unreadable", "stale_or_cancelled", "no_grant", "protected_target", "no_mapping", "ax_or_learning_not_allowed", "scene_not_allowed", "target_changed", "ambiguous_inserted_range", "fixture_baseline_mismatch")) }),
   verified_paste: boolean,
-  outcome: choice("not_observed", "observing", "nochange", "target_changed", "unreadable", "single_token", "multiple_tokens", "short_style_rewrite", "style_signal", "ambiguous", "stale_or_cancelled"),
+  outcome: choice("not_observed", "observing", "nochange", "target_changed", "unreadable", "single_token", "multiple_tokens", "short_style_rewrite", "style_signal", "ambiguous", "unknown", "stale_or_cancelled"),
   classification: nullable(classification),
-  candidate_decision: choice("not_attempted", "pending", "db_promoted", "already_db_promoted", "rejected", "tombstone_or_ignored", "cap", "unknown", "unknown_scope", "scope_conflict", "duplicate_observation", "dictation_origin_unknown", "db_promotion_failed"),
+  candidate_decision: choice("not_attempted", "pending", "db_promoted", "already_db_promoted", "rejected", "tombstone_or_ignored", "mapping_binding_invalidated", "cap", "unknown", "unknown_scope", "scope_conflict", "cross_scope_auto_promotion_blocked", "duplicate_observation", "dictation_origin_unknown", "db_promotion_failed"),
   candidate_store: persistence, settings_store: persistence,
   attribution: choice("not_observed", "whole_field_difference_only"),
 });
 const review = object({
   kind: literal("review_action"),
-  action: choice("add_dictionary_entries", "confirm_pair", "ignore_pair", "undo_pair", "remove_dictionary_word", "confirm_style_draft", "dismiss_style_draft", "add_manual_scoped_pair"),
+  action: choice("add_dictionary_entries", "confirm_pair", "ignore_pair", "undo_pair", "remove_dictionary_word", "confirm_style_draft", "dismiss_style_draft", "add_manual_scoped_pair", "rebind_invalidated_pair"),
   source: choice("dictionary_command", "manual_confirmation_with_history_reference"),
   history_reference: choice("not_provided", "lookup_succeeded", "lookup_unknown"),
   outcome: choice("requested", "completed", "failed", "stale"),
@@ -53,6 +53,8 @@ const activity = object({
 const pair = object({
   pair_ref: uuid, pair_key: text, before_surface: text, after_surface: text,
   rule_kind: choice("word_pair", "style_preference", "cleanup_intensity"),
+  match_policy: choice("ignore_case", "exact"), manual_scoped: boolean, auto_scoped: boolean,
+  binding_invalidated_at: nullable(text), binding_invalidated_reason: nullable(choice("mapping_deleted", "declared_identity_changed", "missing_binding_at_migration")),
   record_state: choice("pending", "db_promoted", "tombstoned"), candidate_hits: u32,
   current_classification: nullable(classification), current_promote_threshold: nullable(u32),
   classification_authority: choice("current_owner_classification", "not_word_pair"),

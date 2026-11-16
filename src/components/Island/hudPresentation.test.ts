@@ -2,6 +2,16 @@ import { describe, expect, it } from "vitest";
 import { hudPresentation } from "./hudPresentation";
 
 describe("HUD presentation from real app outcomes", () => {
+  it("uses a completion glyph without changing the clean done copy", () => {
+    expect(hudPresentation({ state: "done" })).toEqual({
+      title: null,
+      subtitle: null,
+      detail: null,
+      icon: "check",
+      action: null,
+    });
+  });
+
   it("shows the raw-ASR notice for critical-memory cleanup fallback", () => {
     expect(hudPresentation({ state: "degraded", fallbackReason: "critical_memory_pressure" })).toMatchObject({
       title: "已保留 ASR 原稿",
@@ -34,6 +44,8 @@ describe("HUD presentation from real app outcomes", () => {
     const result = hudPresentation({ state: "recording", captureStatus: "waiting_first_frame" });
     expect(result.title).toBe("等待麦克风");
     expect(result.subtitle).toBe("尚未收到音频");
+    expect(result.icon).toBe("mic");
+    expect(result.action).toEqual({ destination: "microphone", label: "检查麦克风" });
   });
 
   it("does not let an old microphone status label active processing", () => {

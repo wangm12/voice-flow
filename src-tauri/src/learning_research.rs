@@ -412,7 +412,7 @@ pub(crate) struct LearningUndoReceiptV2 {
     pub independent_target_oracle: &'static str,
 }
 
-#[cfg(any(test, feature = "research-harness"))]
+#[cfg(feature = "research-harness")]
 #[derive(Serialize)]
 pub(crate) struct LearningWavReceiptV2 {
     pub schema_version: u8,
@@ -497,7 +497,7 @@ struct LearningArmManifestV2 {
     identity_sha256: String,
 }
 
-#[cfg(any(test, feature = "research-harness"))]
+#[cfg(feature = "research-harness")]
 pub(crate) struct LearningWavResources<'a> {
     wav_root: &'a Path,
     model_source_root: &'a Path,
@@ -841,6 +841,7 @@ impl LearningEpisodeV2 {
             .find(|operation| operation.operation_id == operation_id)
     }
 
+    #[cfg(feature = "research-harness")]
     fn wav_operation(&self, task_id: &str) -> Option<&LearningWavOperationV2> {
         self.wav_operations
             .iter()
@@ -904,6 +905,7 @@ impl LearningArmV2 {
         })
     }
 
+    #[cfg(feature = "research-harness")]
     pub(crate) fn identity_sha256(&self) -> &str {
         &self.identity_sha256
     }
@@ -1254,6 +1256,7 @@ impl LearningArmV2 {
         })
     }
 
+    #[cfg(feature = "research-harness")]
     pub(crate) async fn execute_wav(
         &mut self,
         episode: &LearningEpisodeV2,
@@ -1787,7 +1790,7 @@ fn valid_learning_wav_relative_path(value: &str) -> bool {
             .is_some_and(|extension| extension.eq_ignore_ascii_case("wav"))
 }
 
-#[cfg(any(test, feature = "research-harness"))]
+#[cfg(feature = "research-harness")]
 fn read_declared_learning_wav(
     root: &Path,
     source: &LearningWavSourceV2,
@@ -1860,7 +1863,7 @@ fn read_declared_learning_wav(
     Ok(bytes)
 }
 
-#[cfg(any(test, feature = "research-harness"))]
+#[cfg(feature = "research-harness")]
 fn validate_research_wav(bytes: &[u8]) -> anyhow::Result<()> {
     if bytes.len() > LEARNING_WAV_MAX_BYTES {
         anyhow::bail!("learning_wav_source_length_mismatch");
@@ -1885,14 +1888,14 @@ fn validate_research_wav(bytes: &[u8]) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(any(test, feature = "research-harness"))]
+#[cfg(feature = "research-harness")]
 struct VerifiedResearchModelFacts {
     revision: String,
     manifest_sha256: String,
     file_count: usize,
 }
 
-#[cfg(any(test, feature = "research-harness"))]
+#[cfg(feature = "research-harness")]
 #[derive(Serialize)]
 struct ResearchInstalledModelManifestV1<'a> {
     schema_version: u32,
@@ -1901,7 +1904,7 @@ struct ResearchInstalledModelManifestV1<'a> {
     files: Vec<ResearchInstalledModelFileV1<'a>>,
 }
 
-#[cfg(any(test, feature = "research-harness"))]
+#[cfg(feature = "research-harness")]
 #[derive(Serialize)]
 struct ResearchInstalledModelFileV1<'a> {
     path: &'a str,
@@ -1909,7 +1912,7 @@ struct ResearchInstalledModelFileV1<'a> {
     sha256: &'a str,
 }
 
-#[cfg(any(test, feature = "research-harness"))]
+#[cfg(feature = "research-harness")]
 async fn materialize_verified_model(
     source_root: &Path,
     models_root: &Path,
@@ -1939,7 +1942,7 @@ async fn materialize_verified_model(
     }
 }
 
-#[cfg(any(test, feature = "research-harness"))]
+#[cfg(feature = "research-harness")]
 fn materialize_verified_model_blocking(
     source_root: &Path,
     models_root: &Path,
@@ -2129,6 +2132,11 @@ fn initial_arm_settings(episode: &LearningEpisodeV2) -> store::Settings {
         id: episode.scope.mapping_id.clone(),
         label: "Controlled learning fixture".into(),
         family: episode.scope.family,
+        writing_task_id: None,
+        writing_preferences: Vec::new(),
+        preference_guidance_provider_approved: false,
+        preference_revision: 0,
+        deleted: false,
         mode_id: None,
         bundle_id: Some(episode.scope.native_bundle.clone()),
         executable: None,
@@ -2350,7 +2358,7 @@ fn write_private_json(path: &Path, value: &impl Serialize) -> anyhow::Result<()>
     write_result
 }
 
-#[cfg(any(test, feature = "research-harness"))]
+#[cfg(feature = "research-harness")]
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct LearningPhaseArmManifestV3 {
@@ -2361,7 +2369,7 @@ struct LearningPhaseArmManifestV3 {
     identity_sha256: String,
 }
 
-#[cfg(any(test, feature = "research-harness"))]
+#[cfg(feature = "research-harness")]
 #[derive(Serialize)]
 struct LearningPhasePairSnapshotV3 {
     term_fixture_id: String,
@@ -2375,7 +2383,7 @@ struct LearningPhasePairSnapshotV3 {
     row_sha256: Option<String>,
 }
 
-#[cfg(any(test, feature = "research-harness"))]
+#[cfg(feature = "research-harness")]
 #[derive(Serialize)]
 struct LearningPhaseArmSnapshotV3 {
     schema_version: u8,
@@ -2390,14 +2398,14 @@ struct LearningPhaseArmSnapshotV3 {
 /// Versioned, single-database research arm for an immutable set of explicitly
 /// granted context phases. Every mapping declared by the plan stays in this
 /// arm's settings for its full lifetime.
-#[cfg(any(test, feature = "research-harness"))]
+#[cfg(feature = "research-harness")]
 struct LearningArmV3 {
     root: PathBuf,
     identity_sha256: String,
     settings: store::Settings,
 }
 
-#[cfg(any(test, feature = "research-harness"))]
+#[cfg(feature = "research-harness")]
 impl LearningArmV3 {
     fn open(
         base_root: &Path,
@@ -2691,6 +2699,7 @@ impl LearningArmV3 {
         }))
     }
 
+    #[cfg(feature = "research-harness")]
     fn execute_phase_followup(
         &mut self,
         plan: &learning_phase_v3::LearningPhasePlanV3,
@@ -3107,7 +3116,7 @@ impl LearningArmV3 {
     }
 }
 
-#[cfg(any(test, feature = "research-harness"))]
+#[cfg(feature = "research-harness")]
 fn unique_phase_scopes(
     plan: &learning_phase_v3::LearningPhasePlanV3,
 ) -> anyhow::Result<Vec<LearningScopeV2>> {
@@ -3127,12 +3136,17 @@ fn unique_phase_scopes(
     Ok(scopes)
 }
 
-#[cfg(any(test, feature = "research-harness"))]
+#[cfg(feature = "research-harness")]
 fn phase_fixture_mapping(scope: &LearningScopeV2) -> crate::context::AppMapping {
     crate::context::AppMapping {
         id: scope.mapping_id.clone(),
         label: "Controlled learning phase fixture".into(),
         family: scope.family,
+        writing_task_id: None,
+        writing_preferences: Vec::new(),
+        preference_guidance_provider_approved: false,
+        preference_revision: 0,
+        deleted: false,
         mode_id: None,
         bundle_id: Some(scope.native_bundle.clone()),
         executable: None,
@@ -3152,7 +3166,7 @@ fn phase_fixture_mapping(scope: &LearningScopeV2) -> crate::context::AppMapping 
     }
 }
 
-#[cfg(any(test, feature = "research-harness"))]
+#[cfg(feature = "research-harness")]
 fn initial_phase_arm_settings(
     plan: &learning_phase_v3::LearningPhasePlanV3,
 ) -> anyhow::Result<store::Settings> {
@@ -3172,7 +3186,7 @@ fn initial_phase_arm_settings(
     Ok(settings)
 }
 
-#[cfg(any(test, feature = "research-harness"))]
+#[cfg(feature = "research-harness")]
 fn validate_phase_arm_settings(
     settings: &store::Settings,
     plan: &learning_phase_v3::LearningPhasePlanV3,
@@ -3216,7 +3230,7 @@ fn validate_phase_arm_settings(
     Ok(())
 }
 
-#[cfg(any(test, feature = "research-harness"))]
+#[cfg(feature = "research-harness")]
 fn row_within_phase_plan_scope(
     row: &store::LearnPairRecord,
     plan: &learning_phase_v3::LearningPhasePlanV3,
@@ -3226,7 +3240,7 @@ fn row_within_phase_plan_scope(
         .any(|phase| row_within_episode_scope(row, &phase.scope))
 }
 
-#[cfg(any(test, feature = "research-harness"))]
+#[cfg(feature = "research-harness")]
 fn phase_row_scope_value(row: &store::LearnPairRecord) -> serde_json::Value {
     serde_json::json!({
         "family": row.family.as_deref(),
@@ -3236,7 +3250,7 @@ fn phase_row_scope_value(row: &store::LearnPairRecord) -> serde_json::Value {
     })
 }
 
-#[cfg(any(test, feature = "research-harness"))]
+#[cfg(feature = "research-harness")]
 fn phase_scope_value(scope: &LearningScopeV2) -> serde_json::Value {
     serde_json::json!({
         "mapping_id": scope.mapping_id.as_str(),
@@ -3246,7 +3260,7 @@ fn phase_scope_value(scope: &LearningScopeV2) -> serde_json::Value {
     })
 }
 
-#[cfg(any(test, feature = "research-harness"))]
+#[cfg(feature = "research-harness")]
 fn phase_application_origin(
     plan: &learning_phase_v3::LearningPhasePlanV3,
     phase: &learning_phase_v3::LearningPhaseV3,
@@ -3275,7 +3289,7 @@ fn phase_action_operation_ids(action: &learning_phase_v3::LearningPhaseActionV3)
     }
 }
 
-#[cfg(any(test, feature = "research-harness"))]
+#[cfg(feature = "research-harness")]
 fn phase_owner_learning_observations_present(
     root: &Path,
     plan: &learning_phase_v3::LearningPhasePlanV3,
@@ -5816,7 +5830,7 @@ fn native_target_process_identity_summary(
     })
 }
 
-#[cfg(any(test, feature = "research-harness"))]
+#[cfg(feature = "research-harness")]
 fn learning_asr_error_details(
     error: &crate::asr::AsrError,
     paths: &[(&PathBuf, &str)],
@@ -5843,7 +5857,7 @@ fn learning_asr_error_details(
     (category, sanitize_research_diagnostic(detail, paths))
 }
 
-#[cfg(any(test, feature = "research-harness"))]
+#[cfg(feature = "research-harness")]
 fn sanitize_research_diagnostic(detail: &str, paths: &[(&PathBuf, &str)]) -> String {
     let mut redactions = paths
         .iter()
@@ -6000,7 +6014,7 @@ fn parse_standalone_arguments(
     })
 }
 
-#[cfg(any(test, feature = "research-harness"))]
+#[cfg(feature = "research-harness")]
 fn validate_external_directory(path: &Path) -> anyhow::Result<PathBuf> {
     if !path.is_absolute() {
         anyhow::bail!("research input directory must be absolute");
@@ -6663,13 +6677,13 @@ pub(crate) fn selected_pairs(dir: &std::path::Path) -> Vec<store::LearnPairRecor
         .collect()
 }
 #[derive(Serialize)]
-#[cfg(any(test, feature = "research-harness"))]
+#[cfg(feature = "research-harness")]
 pub(crate) struct SelectedLearningState {
     pub identity: String,
     pub records: Vec<LearningRecordV1>,
 }
 /// Content identity of only the caller-selected state, never an ambient DB dump.
-#[cfg(any(test, feature = "research-harness"))]
+#[cfg(feature = "research-harness")]
 pub(crate) fn selected_state_snapshot(
     consent: &LearningConsent,
     dir: &std::path::Path,

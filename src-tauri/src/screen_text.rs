@@ -474,8 +474,7 @@ pub fn extract_live(
 ) -> ScreenTextContext {
     let guard = guard.clone();
     let mut ctx = extract_with_reader(move || {
-        let mut fixture = live_fixture_from_guard(family, &guard);
-        fixture.focus_kind = focus_kind;
+        let fixture = live_fixture_from_guard(family, focus_kind, &guard);
         extract_from_fixture(&fixture)
     });
     ctx.family = family;
@@ -501,8 +500,7 @@ pub fn fixture_from_live_ax(
     focus_kind: FocusKind,
     snap: LiveAxSnapshot,
 ) -> AxWindowFixture {
-    let mut fix = empty_live_fixture(family, guard);
-    fix.focus_kind = focus_kind;
+    let mut fix = empty_live_fixture(family, focus_kind, guard);
     if !snap.focused_role.is_empty() {
         fix.focused_role = snap.focused_role;
         if fix.focused_role == "AXSecureTextField" {
@@ -522,11 +520,12 @@ pub fn fixture_from_live_ax(
 
 fn empty_live_fixture(
     family: ContextFamily,
+    focus_kind: FocusKind,
     guard: &crate::context::TargetAppGuard,
 ) -> AxWindowFixture {
     AxWindowFixture {
         family,
-        focus_kind: FocusKind::Unknown,
+        focus_kind,
         known_ide: is_known_ide_bundle(guard.bundle_id.as_deref()),
         counterpart: None,
         bubbles: Vec::new(),
@@ -567,15 +566,16 @@ fn is_known_ide_bundle(bundle_id: Option<&str>) -> bool {
 
 fn live_fixture_from_guard(
     family: ContextFamily,
+    focus_kind: FocusKind,
     guard: &crate::context::TargetAppGuard,
 ) -> AxWindowFixture {
-    let fix = empty_live_fixture(family, guard);
+    let fix = empty_live_fixture(family, focus_kind, guard);
     if layer1_forbidden(&fix) {
         return fix;
     }
     #[cfg(target_os = "macos")]
     if let Some(snap) = macos_live_ax::read_live_ax(guard) {
-        return fixture_from_live_ax(family, guard, FocusKind::Unknown, snap);
+        return fixture_from_live_ax(family, guard, focus_kind, snap);
     }
     fix
 }
@@ -907,8 +907,13 @@ mod macos_live_ax {
         let Some(value) = copy_raw_attr(element, "AXChildren") else {
             return Vec::new();
         };
-        let array =
-            unsafe { CFArray::<*const c_void>::wrap_under_create_rule(value as CFArrayRef) };
+        let cf_type = unsafe { CFType::wrap_under_create_rule(value) };
+        if cf_type.type_of() != CFArray::<*const c_void>::type_id() {
+            return Vec::new();
+        }
+        let array = unsafe {
+            CFArray::<*const c_void>::wrap_under_get_rule(cf_type.as_CFTypeRef() as CFArrayRef)
+        };
         let mut children = Vec::new();
         for index in 0..array.len() {
             let Some(item) = array.get(index) else {
@@ -1308,6 +1313,7 @@ mod tests {
     fn live_fixture_marks_onepassword_as_banking() {
         let fix = live_fixture_from_guard(
             ContextFamily::FormFilling,
+            FocusKind::Unknown,
             &test_guard("com.agilebits.onepassword7", None),
         );
         assert!(fix.banking_preset);
@@ -1319,6 +1325,7 @@ mod tests {
     fn live_fixture_marks_workday_host_as_banking() {
         let fix = live_fixture_from_guard(
             ContextFamily::BrowserSearch,
+            FocusKind::Unknown,
             &test_guard("com.google.Chrome", Some("company.myworkday.com")),
         );
         assert!(fix.banking_preset);

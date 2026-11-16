@@ -1007,16 +1007,9 @@ pub(crate) enum TestGroqKeyImportResult {
 // Diagnostic enums and import/status helpers are available to unit tests and
 // explicit research-harness builds. Runtime Keychain access is compiled only
 // for macOS release builds with that feature enabled.
-#[cfg_attr(
-    not(all(
-        feature = "research-harness",
-        target_os = "macos",
-        not(debug_assertions)
-    )),
-    allow(dead_code)
-)]
+#[cfg(feature = "research-harness")]
+#[cfg_attr(not(all(target_os = "macos", not(debug_assertions))), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg(any(test, feature = "research-harness"))]
 pub(crate) enum TestCredentialPhase {
     Admission,
     InteractionPolicy,
@@ -1026,7 +1019,8 @@ pub(crate) enum TestCredentialPhase {
     Complete,
 }
 
-#[cfg(any(test, feature = "research-harness"))]
+#[cfg(feature = "research-harness")]
+#[cfg_attr(not(all(target_os = "macos", not(debug_assertions))), allow(dead_code))]
 impl TestCredentialPhase {
     pub(crate) fn code(self) -> &'static str {
         match self {
@@ -1040,16 +1034,9 @@ impl TestCredentialPhase {
     }
 }
 
-#[cfg_attr(
-    not(all(
-        feature = "research-harness",
-        target_os = "macos",
-        not(debug_assertions)
-    )),
-    allow(dead_code)
-)]
+#[cfg(feature = "research-harness")]
+#[cfg_attr(not(all(target_os = "macos", not(debug_assertions))), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg(any(test, feature = "research-harness"))]
 pub(crate) enum TestCredentialAddOutcome {
     NotStarted,
     Added,
@@ -1058,7 +1045,8 @@ pub(crate) enum TestCredentialAddOutcome {
     Unknown,
 }
 
-#[cfg(any(test, feature = "research-harness"))]
+#[cfg(feature = "research-harness")]
+#[cfg_attr(not(all(target_os = "macos", not(debug_assertions))), allow(dead_code))]
 impl TestCredentialAddOutcome {
     pub(crate) fn code(self) -> &'static str {
         match self {
@@ -1092,7 +1080,8 @@ pub(crate) enum TestCredentialReadOutcome {
     Unavailable,
 }
 
-#[cfg(any(test, feature = "research-harness"))]
+#[cfg(feature = "research-harness")]
+#[cfg_attr(not(all(target_os = "macos", not(debug_assertions))), allow(dead_code))]
 impl TestCredentialReadOutcome {
     pub(crate) fn code(self) -> &'static str {
         match self {
@@ -1125,7 +1114,8 @@ pub(crate) enum TestCredentialWaitOutcome {
     Disconnected,
 }
 
-#[cfg(any(test, feature = "research-harness"))]
+#[cfg(feature = "research-harness")]
+#[cfg_attr(not(all(target_os = "macos", not(debug_assertions))), allow(dead_code))]
 impl TestCredentialWaitOutcome {
     pub(crate) fn code(self) -> &'static str {
         match self {
@@ -1138,7 +1128,8 @@ impl TestCredentialWaitOutcome {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg(any(test, feature = "research-harness"))]
+#[cfg(feature = "research-harness")]
+#[cfg_attr(not(all(target_os = "macos", not(debug_assertions))), allow(dead_code))]
 pub(crate) struct TestCredentialAttemptDiagnostic {
     pub(crate) add: TestCredentialAddOutcome,
     pub(crate) read: TestCredentialReadOutcome,
@@ -1146,7 +1137,8 @@ pub(crate) struct TestCredentialAttemptDiagnostic {
     pub(crate) operation_os_status: Option<i32>,
 }
 
-#[cfg(any(test, feature = "research-harness"))]
+#[cfg(feature = "research-harness")]
+#[cfg_attr(not(all(target_os = "macos", not(debug_assertions))), allow(dead_code))]
 impl Default for TestCredentialAttemptDiagnostic {
     fn default() -> Self {
         Self {
@@ -1159,7 +1151,8 @@ impl Default for TestCredentialAttemptDiagnostic {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg(any(test, feature = "research-harness"))]
+#[cfg(feature = "research-harness")]
+#[cfg_attr(not(all(target_os = "macos", not(debug_assertions))), allow(dead_code))]
 pub(crate) struct TestGroqKeyImportDiagnostic {
     pub(crate) phase: TestCredentialPhase,
     pub(crate) location: &'static str,
@@ -1181,7 +1174,8 @@ pub(crate) struct TestGroqKeyImportOutcome {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg(any(test, feature = "research-harness"))]
+#[cfg(feature = "research-harness")]
+#[cfg_attr(not(all(target_os = "macos", not(debug_assertions))), allow(dead_code))]
 pub(crate) struct TestCredentialReadStatus {
     pub(crate) outcome: TestCredentialReadOutcome,
     pub(crate) phase: TestCredentialPhase,
@@ -1189,7 +1183,8 @@ pub(crate) struct TestCredentialReadStatus {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg(any(test, feature = "research-harness"))]
+#[cfg(feature = "research-harness")]
+#[cfg_attr(not(all(target_os = "macos", not(debug_assertions))), allow(dead_code))]
 pub(crate) struct TestGroqKeyStatus {
     pub(crate) primary: TestCredentialReadStatus,
     pub(crate) fallback: TestCredentialReadStatus,

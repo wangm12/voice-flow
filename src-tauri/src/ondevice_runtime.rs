@@ -3273,10 +3273,6 @@ impl OnDeviceRuntime {
     }
 
     pub async fn status(&self) -> RuntimeSnapshot {
-        #[cfg(test)]
-        if self.fixture.is_some() {
-            return self.snapshot();
-        }
         let current = self.snapshot();
         if self.shutting_down.load(Ordering::Acquire) || current.runtime_status == "loading" {
             return current;
@@ -3284,7 +3280,11 @@ impl OnDeviceRuntime {
         if !self.runtime_platform_supported() {
             return self.update_status("unsupported_platform", None, None, None, None);
         }
-        if sidecar_executable().is_none() {
+        #[cfg(test)]
+        let sidecar_missing = self.fixture.is_none() && sidecar_executable().is_none();
+        #[cfg(not(test))]
+        let sidecar_missing = sidecar_executable().is_none();
+        if sidecar_missing {
             return self.update_status("sidecar_missing", None, None, None, None);
         }
         let mut session = match self.session.try_lock() {

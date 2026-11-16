@@ -296,6 +296,8 @@ enum EngineCmd {
         reply: mpsc::Sender<()>,
     },
     AutoStop {
+        stream_id: u64,
+        session_generation: u64,
         app: AppHandle,
     },
     StreamError {
@@ -1561,7 +1563,11 @@ impl CaptureWorker {
                                 if newly_limited {
                                     if let Some(app) = app.as_ref() {
                                         let _ = auto_stop_tx
-                                            .send(EngineCmd::AutoStop { app: app.clone() });
+                                            .send(EngineCmd::AutoStop {
+                                                stream_id,
+                                                session_generation,
+                                                app: app.clone(),
+                                            });
                                     }
                                 }
                             }
@@ -4195,16 +4201,36 @@ fn wait_recording_tail(
             fail_recording(rec, &app, &message);
             TailCommand::Stop(true)
         }
-        EngineCmd::AutoStop { app } => {
-            close_capture_continuity(rec);
-            drop(rec.stream.take());
-            let _ = app.emit(
-                "audio://limit",
-                serde_json::json!({
-                    "max_recording_secs": MAX_RECORDING_SECS,
-                    "session_generation": rec.session_generation,
-                }),
-            );
+        EngineCmd::AutoStop {
+            stream_id,
+            session_generation,
+            app,
+        } => {
+            let expected_stream_id = rec.stream_id;
+            let expected_generation = rec.session_generation;
+            if !dispatch_auto_stop_if_current(
+                expected_stream_id,
+                expected_generation,
+                stream_id,
+                session_generation,
+                || {
+                    close_capture_continuity(rec);
+                    drop(rec.stream.take());
+                    let _ = app.emit(
+                        "audio://limit",
+                        serde_json::json!({
+                            "max_recording_secs": MAX_RECORDING_SECS,
+                            "session_generation": rec.session_generation,
+                        }),
+                    );
+                },
+            ) {
+                return TailCommand::Pending(EngineCmd::AutoStop {
+                    stream_id,
+                    session_generation,
+                    app,
+                });
+            }
             TailCommand::Stop(true)
         }
         command => TailCommand::Pending(command),
@@ -4330,6 +4356,27 @@ fn capture_session_matches(
     event_generation: Option<u64>,
 ) -> bool {
     event_stream_id == expected_stream_id && event_generation == Some(expected_generation)
+}
+
+/// Shared AutoStop dispatch gate for the active engine and stop-tail readers.
+/// Stale commands must remain side-effect free and available to the next owner.
+fn dispatch_auto_stop_if_current(
+    expected_stream_id: u64,
+    expected_generation: u64,
+    event_stream_id: u64,
+    event_generation: u64,
+    apply: impl FnOnce(),
+) -> bool {
+    if !capture_session_matches(
+        expected_stream_id,
+        expected_generation,
+        event_stream_id,
+        Some(event_generation),
+    ) {
+        return false;
+    }
+    apply();
+    true
 }
 
 fn stream_failure_matches(expected_stream_id: u64, event_stream_id: u64) -> bool {
@@ -4735,19 +4782,33 @@ fn handle_cmd(
             }
             let _ = reply.send(());
         }
-        EngineCmd::AutoStop { app } => {
+        EngineCmd::AutoStop {
+            stream_id,
+            session_generation,
+            app,
+        } => {
             if let Some(rec) = active.as_mut() {
-                close_capture_continuity(rec);
-                if rec.stream.take().is_some() {
-                    reset_audio_level(&app, &rec.level, rec.session_generation);
-                    let _ = app.emit(
-                        "audio://limit",
-                        serde_json::json!({
-                            "max_recording_secs": MAX_RECORDING_SECS,
-                            "session_generation": rec.session_generation,
-                        }),
-                    );
-                }
+                let expected_stream_id = rec.stream_id;
+                let expected_generation = rec.session_generation;
+                let _ = dispatch_auto_stop_if_current(
+                    expected_stream_id,
+                    expected_generation,
+                    stream_id,
+                    session_generation,
+                    || {
+                        close_capture_continuity(rec);
+                        if rec.stream.take().is_some() {
+                            reset_audio_level(&app, &rec.level, rec.session_generation);
+                            let _ = app.emit(
+                                "audio://limit",
+                                serde_json::json!({
+                                    "max_recording_secs": MAX_RECORDING_SECS,
+                                    "session_generation": rec.session_generation,
+                                }),
+                            );
+                        }
+                    },
+                );
             }
         }
         EngineCmd::StreamError {
@@ -9034,13 +9095,32 @@ mod tests {
     }
 
     #[test]
-    fn capture_events_are_bound_to_the_open_session_generation() {
+    fn capture_events_and_auto_stop_are_bound_to_the_open_session_generation() {
+        // AutoStop is consumed by both the active engine and stop-tail paths;
+        // each must use this stream+generation identity predicate.
         assert!(super::capture_session_matches(12, 7, 12, Some(7)));
         assert!(!super::capture_session_matches(12, 7, 12, Some(6)));
         assert!(!super::capture_session_matches(12, 7, 13, Some(7)));
         assert!(!super::capture_session_matches(12, 7, 12, None));
         assert!(super::stream_failure_matches(12, 12));
         assert!(!super::stream_failure_matches(12, 13));
+    }
+
+    #[test]
+    fn auto_stop_dispatch_ignores_stale_stream_and_generation_until_current_limit() {
+        let mut observed_limit_actions = Vec::new();
+
+        assert!(!super::dispatch_auto_stop_if_current(12, 7, 13, 7, || {
+            observed_limit_actions.push(("stale_stream", 7));
+        }));
+        assert!(!super::dispatch_auto_stop_if_current(12, 7, 12, 6, || {
+            observed_limit_actions.push(("stale_generation", 6));
+        }));
+        assert!(super::dispatch_auto_stop_if_current(12, 7, 12, 7, || {
+            observed_limit_actions.push(("audio_limit", 7));
+        }));
+
+        assert_eq!(observed_limit_actions, [("audio_limit", 7)]);
     }
 
     #[test]

@@ -1,4 +1,4 @@
-function settingsErrorMessage(reason: unknown): string {
+export function settingsErrorMessage(reason: unknown): string {
   if (typeof reason === "string") return reason;
   if (reason instanceof Error) return reason.message;
   if (reason && typeof reason === "object" && "message" in reason) {
@@ -45,13 +45,13 @@ export function friendlySettingsError(
     return translate("无法保存到这台 Mac 的钥匙串。请重启 VoiceFlow 后再试。");
   }
   if (normalized.includes("api key validation failed") || normalized.includes("invalid")) {
-    return translate("这个 Groq API Key 无效，请检查后重试。");
+    return translate("这个 API Key 无效，请检查后重试。");
   }
   if (normalized.includes("rate_limited") || normalized.includes("请求过频")) {
     return translate("验证请求过频，请稍后再试。");
   }
   if (normalized.includes("network") || normalized.includes("timeout")) {
-    return translate("暂时无法连接 Groq，请检查网络后重试。");
+    return translate("暂时无法连接服务，请检查网络后重试。");
   }
   return translate(message);
 }

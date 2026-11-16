@@ -23,10 +23,22 @@
         "before": "VoiceFlo",
         "after": "VoiceFlow",
         "global_dictionary_seed": ["VoiceFlow"],
-        "candidate_hits": 3
+        "scope": {
+          "family": "general",
+          "mapping_id": "fixture-mapping-01",
+          "native_bundle": "com.voiceflow.a0"
+        }
       },
       "target": {
-        "global_dictionary_word_retained": true
+        "row_promoted_before_undo": true,
+        "manual_and_rule_owners_durable_before_undo": true,
+        "manual_dictionary_owner_retained": true,
+        "rule_dictionary_owner_removed": true,
+        "global_dictionary_word_retained": true,
+        "pending_add_before_undo_version": 1,
+        "pending_remove_after_tombstone_version": 2,
+        "pending_effects_after_undo": 0,
+        "tombstoned_after_undo": true
       }
     },
     {
@@ -34,6 +46,7 @@
       "classification": "cross_channel_origin",
       "input": {
         "dictation_origin_id": "fixture-dictation-01",
+        "paste_session_id": "fixture-paste-session-01",
         "history_text_before": "cobolt",
         "before": "cobolt",
         "after": "cobalt",
@@ -44,7 +57,13 @@
         }
       },
       "target": {
-        "hits_after": 1
+        "hits_after": 1,
+        "independent_dictation_origins": 1,
+        "first_origin_recorded": true,
+        "paste_replay_duplicate": true,
+        "receipt_count_after_first": 1,
+        "receipt_count_after_paste": 1,
+        "live_promoted": false
       }
     },
     {
@@ -55,6 +74,8 @@
         "after": "quartz",
         "legacy_hits_without_receipt": 2,
         "new_paste_session_id": "fixture-new-session-01",
+        "dictation_origin_id": "fixture-dictation-02",
+        "history_text": "quortz",
         "scope": {
           "family": "general",
           "mapping_id": "fixture-mapping-01",
@@ -64,7 +85,10 @@
       "target": {
         "live_promoted": false,
         "receipt_count_after_new_origin": 1,
-        "legacy_origin_known": false
+        "independent_dictation_origins": 1,
+        "legacy_origin_known": false,
+        "receipt_channel": "paste",
+        "proof_eligible": true
       }
     },
     {

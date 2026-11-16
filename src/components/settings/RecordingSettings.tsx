@@ -2,7 +2,8 @@ import { audioRetentionOptions as retentionOptions, historyRetentionOptions } fr
 import { Select } from "../Select";
 import { invoke } from "@tauri-apps/api/core";
 import { FnHotkeyNote } from "../FnHotkeyNote";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useState } from "react";
+import { ClampedNumberInput } from "./ClampedNumberInput";
 import { HotkeyRecorder } from "../HotkeyRecorder";
 import { SettingsDisclosure, SettingsGroup, SettingsPageHeader, SettingsRow, SettingsShell, type SettingsSaveFailure } from "../SettingsLayout";
 import { Toggle } from "../Toggle";
@@ -105,9 +106,13 @@ export function RecordingSettings({ settings, save, saveFailure, dictationBusy =
         </SettingsRow>
         {(settings.audio_feedback_enabled ?? false) && (
           <SettingsRow title={t("提示音音量")} description={t("范围 0.0–1.0。")}>
-            <VolumeNumberField
+            <ClampedNumberInput
               label={t("提示音音量")}
               value={settings.audio_feedback_volume ?? 0.6}
+              min={0}
+              max={1}
+              step={0.1}
+              decimals={1}
               onCommit={(audio_feedback_volume) => save({ audio_feedback_volume })}
             />
           </SettingsRow>
@@ -256,156 +261,27 @@ export function RecordingSettings({ settings, save, saveFailure, dictationBusy =
       <SettingsDisclosure title={t("高级录音设置")} description={t("调整麦克风增益和长录音分段。")} error={advancedSaveError}>
       <SettingsGroup title={t("麦克风增益")}>
         <SettingsRow title={t("输入增益")} description={<>{t("放大麦克风音量，适合说话较轻的情况。1.0 为原始音量。范围 0.5–4.0。")}{(settings.input_gain ?? 1) > 1 && <p role="note" className="mt-1 text-xs leading-5 text-secondary">{t("增益大于 1 时，过大的声音会被压限，避免削波。说话很轻再提高。")}</p>}</>}>
-          <GainNumberField
+          <ClampedNumberInput
             label={t("输入增益")}
             value={settings.input_gain ?? 1}
             min={0.5}
             max={4}
+            step={0.1}
+            decimals={1}
             onCommit={(input_gain) => save({ input_gain })}
           />
         </SettingsRow>
       </SettingsGroup>
       <SettingsGroup title={t("长录音")} description={t("较长的录音会自动分段处理，避免一次请求过大。")}>
         <SettingsRow title={t("开始分段（秒）")} description={t("超过这个时长后开始分段。默认 25 秒。范围 5–3600。")}>
-          <ChunkNumberField label={t("开始分段（秒）")} value={settings.chunk_threshold_secs} min={5} max={3600} onCommit={(chunk_threshold_secs) => save({ chunk_threshold_secs })} />
+          <ClampedNumberInput label={t("开始分段（秒）")} value={settings.chunk_threshold_secs} min={5} max={3600} onCommit={(chunk_threshold_secs) => save({ chunk_threshold_secs })} />
         </SettingsRow>
         <SettingsRow title={t("每段长度（秒）")} description={t("每个语音请求的目标长度。默认 35 秒。范围 15–60。")}>
-          <ChunkNumberField label={t("每段长度（秒）")} value={settings.chunk_length_secs} min={15} max={60} onCommit={(chunk_length_secs) => save({ chunk_length_secs })} />
+          <ClampedNumberInput label={t("每段长度（秒）")} value={settings.chunk_length_secs} min={15} max={60} onCommit={(chunk_length_secs) => save({ chunk_length_secs })} />
         </SettingsRow>
       </SettingsGroup>
       </SettingsDisclosure>
 
     </SettingsShell>
-  );
-}
-
-function VolumeNumberField({
-  label,
-  value,
-  onCommit,
-}: {
-  label: string;
-  value: number;
-  onCommit: (next: number) => void;
-}) {
-  const [draft, setDraft] = useState(String(value));
-  useEffect(() => setDraft(String(value)), [value]);
-
-  const commit = () => {
-    const parsed = Number(draft);
-    if (!Number.isFinite(parsed)) {
-      setDraft(String(value));
-      return;
-    }
-    const clamped = Math.min(1, Math.max(0, Math.round(parsed * 10) / 10));
-    setDraft(String(clamped));
-    if (clamped !== value) onCommit(clamped);
-  };
-
-  return (
-    <input
-      aria-label={label}
-      type="number"
-      min={0}
-      max={1}
-      step={0.1}
-      value={draft}
-      onChange={(event) => setDraft(event.target.value)}
-      onBlur={commit}
-      onKeyDown={(event) => {
-        if (event.key === "Enter") event.currentTarget.blur();
-      }}
-      className={`${controlClass} w-[88px] text-right`}
-    />
-  );
-}
-
-function GainNumberField({
-  label,
-  value,
-  min,
-  max,
-  onCommit,
-}: {
-  label: string;
-  value: number;
-  min: number;
-  max: number;
-  onCommit: (next: number) => void;
-}) {
-  const [draft, setDraft] = useState(String(value));
-  useEffect(() => setDraft(String(value)), [value]);
-
-  const commit = () => {
-    const parsed = Number(draft);
-    if (!Number.isFinite(parsed)) {
-      setDraft(String(value));
-      return;
-    }
-    const clamped = Math.min(max, Math.max(min, Math.round(parsed * 10) / 10));
-    setDraft(String(clamped));
-    if (clamped !== value) onCommit(clamped);
-  };
-
-  return (
-    <input
-      aria-label={label}
-      type="number"
-      min={min}
-      max={max}
-      step={0.1}
-      value={draft}
-      onChange={(event) => setDraft(event.target.value)}
-      onBlur={commit}
-      onKeyDown={(event) => {
-        if (event.key === "Enter") event.currentTarget.blur();
-      }}
-      className={`${controlClass} w-[88px] text-right`}
-    />
-  );
-}
-
-function ChunkNumberField({
-  label,
-  value,
-  min,
-  max,
-  onCommit,
-}: {
-  label: string;
-  value: number;
-  min: number;
-  max: number;
-  onCommit: (next: number) => void;
-}) {
-  const [draft, setDraft] = useState(String(value));
-  useEffect(() => setDraft(String(value)), [value]);
-
-  const commit = () => {
-    const parsed = Number(draft);
-    if (!Number.isFinite(parsed)) {
-      setDraft(String(value));
-      return;
-    }
-    const clamped = Math.min(max, Math.max(min, Math.round(parsed)));
-    setDraft(String(clamped));
-    if (clamped !== value) onCommit(clamped);
-  };
-
-  return (
-    <input
-      aria-label={label}
-      type="number"
-      min={min}
-      max={max}
-      step={1}
-      value={draft}
-      onChange={(event) => setDraft(event.target.value)}
-      onBlur={commit}
-      onKeyDown={(event) => {
-        if (event.key === "Enter") event.currentTarget.blur();
-      }}
-      className={`${controlClass} w-[88px] text-right`}
-    />
   );
 }

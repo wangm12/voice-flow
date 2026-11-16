@@ -332,7 +332,10 @@ pub(crate) async fn dispatch_remote_cli_action(
     action: RemoteCliAction,
 ) {
     match action {
-        RemoteCliAction::Cancel => dictation::cancel_internal(app, state).await,
+        RemoteCliAction::Cancel => {
+            dictation::cancel_internal_with_source(app, state, crate::metrics::StopSource::Cli)
+                .await
+        }
         RemoteCliAction::ToggleVerbatim => dictation::handle_cli_toggle_verbatim(app, state).await,
         RemoteCliAction::ToggleTranscription => dictation::handle_hotkey_toggle(app, state).await,
     }

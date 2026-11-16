@@ -3908,15 +3908,6 @@ impl DeliveryTrace {
                 "剪贴板已被其他应用更新，已保留较新的内容；请从历史记录复制听写文字",
             );
         }
-        if self.keyboard_paste_may_have_been_posted {
-            return self.for_unverified_paste();
-        }
-        if self.clipboard_write_failed && self.clipboard_write_owned == Some(true) {
-            return self.diagnostic(
-                "paste_unverified",
-                "无法确认自动粘贴结果，听写文字仍在剪贴板；请按 ⌘V 粘贴",
-            );
-        }
         if self.clipboard_write_attempted && self.clipboard_write_owned != Some(true) {
             return match self.clipboard_write_owned {
                 Some(false) => self.diagnostic(
@@ -3937,6 +3928,15 @@ impl DeliveryTrace {
                 ),
                 Some(true) => unreachable!(),
             };
+        }
+        if self.keyboard_paste_may_have_been_posted {
+            return self.for_unverified_paste();
+        }
+        if self.clipboard_write_failed && self.clipboard_write_owned == Some(true) {
+            return self.diagnostic(
+                "paste_unverified",
+                "无法确认自动粘贴结果，听写文字仍在剪贴板；请按 ⌘V 粘贴",
+            );
         }
         if matches!(
             self.stage,
@@ -4196,6 +4196,7 @@ pub(crate) fn run_paste_attempt(
     )
 }
 
+#[cfg(any(test, all(target_os = "macos", feature = "research-harness")))]
 fn run_paste_attempt_with_post_ack_recheck(
     cancellation: &CancellationToken,
     verify_target: impl Fn() -> Result<(), PasteError>,
@@ -8307,29 +8308,35 @@ mod macos_ax {
         )
     }
 
-    fn copy_range_attr(element: &AxElement, name: &str) -> Option<(i64, i64)> {
+    fn copy_ax_value_attr<T>(
+        element: &AxElement,
+        name: &str,
+        expected_type: u32,
+        mut out: T,
+    ) -> Option<T> {
         let value = unsafe { CFType::wrap_under_create_rule(copy_raw_attr(element, name)?) };
         if value.type_of() != unsafe { AXValueGetTypeID() } {
             return None;
         }
         let ax_value = value.as_CFTypeRef() as AXValueRef;
-        if unsafe { AXValueGetType(ax_value) } != AX_VALUE_CF_RANGE {
+        if unsafe { AXValueGetType(ax_value) } != expected_type {
             return None;
         }
-        let mut range = CFRange {
-            location: 0,
-            length: 0,
-        };
-        let ok = unsafe {
-            AXValueGetValue(
-                ax_value,
-                AX_VALUE_CF_RANGE,
-                &mut range as *mut _ as *mut c_void,
-            )
-        };
-        if ok == 0 {
-            return None;
-        }
+        let ok =
+            unsafe { AXValueGetValue(ax_value, expected_type, &mut out as *mut T as *mut c_void) };
+        (ok != 0).then_some(out)
+    }
+
+    fn copy_range_attr(element: &AxElement, name: &str) -> Option<(i64, i64)> {
+        let range = copy_ax_value_attr(
+            element,
+            name,
+            AX_VALUE_CF_RANGE,
+            CFRange {
+                location: 0,
+                length: 0,
+            },
+        )?;
         Some((
             i64::try_from(range.location).ok()?,
             i64::try_from(range.length).ok()?,
@@ -8337,34 +8344,19 @@ mod macos_ax {
     }
 
     fn copy_point_attr(element: &AxElement, name: &str) -> Option<CgPoint> {
-        let value = copy_raw_attr(element, name)?;
-        let value = unsafe { CFType::wrap_under_create_rule(value) };
-        let mut point = CgPoint { x: 0.0, y: 0.0 };
-        let ok = unsafe {
-            AXValueGetValue(
-                value.as_CFTypeRef() as AXValueRef,
-                AX_VALUE_CGPOINT,
-                &mut point as *mut _ as *mut c_void,
-            )
-        };
-        (ok != 0).then_some(point)
+        copy_ax_value_attr(element, name, AX_VALUE_CGPOINT, CgPoint { x: 0.0, y: 0.0 })
     }
 
     fn copy_size_attr(element: &AxElement, name: &str) -> Option<CgSize> {
-        let value = copy_raw_attr(element, name)?;
-        let value = unsafe { CFType::wrap_under_create_rule(value) };
-        let mut size = CgSize {
-            width: 0.0,
-            height: 0.0,
-        };
-        let ok = unsafe {
-            AXValueGetValue(
-                value.as_CFTypeRef() as AXValueRef,
-                AX_VALUE_CGSIZE,
-                &mut size as *mut _ as *mut c_void,
-            )
-        };
-        (ok != 0).then_some(size)
+        copy_ax_value_attr(
+            element,
+            name,
+            AX_VALUE_CGSIZE,
+            CgSize {
+                width: 0.0,
+                height: 0.0,
+            },
+        )
     }
 
     fn is_settable(element: &AxElement, name: &str) -> bool {
@@ -8888,7 +8880,7 @@ mod macos_ax {
 mod macos_raise {
     use core::ffi::c_void;
     use core_foundation::array::{CFArray, CFArrayRef};
-    use core_foundation::base::{CFRelease, CFRetain, CFTypeRef, TCFType};
+    use core_foundation::base::{CFRelease, CFRetain, CFType, CFTypeID, CFTypeRef, TCFType};
     use core_foundation::number::CFNumber;
     use core_foundation::string::{CFString, CFStringRef};
 
@@ -8920,6 +8912,8 @@ mod macos_raise {
         ) -> i32;
         fn AXUIElementPerformAction(element: AXUIElementRef, action: CFStringRef) -> i32;
         fn AXUIElementSetMessagingTimeout(element: AXUIElementRef, timeout_in_seconds: f32) -> i32;
+        fn AXValueGetTypeID() -> CFTypeID;
+        fn AXValueGetType(value: AXValueRef) -> u32;
         fn AXValueGetValue(value: AXValueRef, the_type: u32, value_ptr: *mut c_void) -> u8;
         fn _AXUIElementGetWindow(element: AXUIElementRef, identifier: *mut u32) -> i32;
     }
@@ -9011,8 +9005,13 @@ mod macos_raise {
         if err != AX_SUCCESS || value.is_null() {
             return Vec::new();
         }
-        let array =
-            unsafe { CFArray::<*const c_void>::wrap_under_create_rule(value as CFArrayRef) };
+        let cf_type = unsafe { CFType::wrap_under_create_rule(value) };
+        if cf_type.type_of() != CFArray::<*const c_void>::type_id() {
+            return Vec::new();
+        }
+        let array = unsafe {
+            CFArray::<*const c_void>::wrap_under_get_rule(cf_type.as_CFTypeRef() as CFArrayRef)
+        };
         let mut windows = Vec::new();
         for index in 0..array.len() {
             let Some(item) = array.get(index) else {
@@ -9041,40 +9040,47 @@ mod macos_raise {
     }
 
     fn copy_number_attr(element: &AxElement, name: &str) -> Option<i64> {
-        let value = copy_raw_attr(element, name)?;
-        let number = unsafe { CFNumber::wrap_under_create_rule(value as _) };
+        let cf_type = unsafe { CFType::wrap_under_create_rule(copy_raw_attr(element, name)?) };
+        if cf_type.type_of() != CFNumber::type_id() {
+            return None;
+        }
+        let number = unsafe { CFNumber::wrap_under_get_rule(cf_type.as_CFTypeRef() as _) };
         number.to_i64()
     }
 
+    fn copy_ax_value_attr<T>(
+        element: &AxElement,
+        name: &str,
+        expected_type: u32,
+        mut out: T,
+    ) -> Option<T> {
+        let cf_type = unsafe { CFType::wrap_under_create_rule(copy_raw_attr(element, name)?) };
+        if cf_type.type_of() != unsafe { AXValueGetTypeID() } {
+            return None;
+        }
+        let ax_value = cf_type.as_CFTypeRef() as AXValueRef;
+        if unsafe { AXValueGetType(ax_value) } != expected_type {
+            return None;
+        }
+        let ok =
+            unsafe { AXValueGetValue(ax_value, expected_type, &mut out as *mut T as *mut c_void) };
+        (ok != 0).then_some(out)
+    }
+
     fn copy_point_attr(element: &AxElement, name: &str) -> Option<CgPoint> {
-        let value = copy_raw_attr(element, name)?;
-        let mut point = CgPoint { x: 0.0, y: 0.0 };
-        let ok = unsafe {
-            AXValueGetValue(
-                value as AXValueRef,
-                AX_VALUE_CGPOINT,
-                &mut point as *mut _ as *mut c_void,
-            )
-        };
-        unsafe { CFRelease(value) };
-        (ok != 0).then_some(point)
+        copy_ax_value_attr(element, name, AX_VALUE_CGPOINT, CgPoint { x: 0.0, y: 0.0 })
     }
 
     fn copy_size_attr(element: &AxElement, name: &str) -> Option<CgSize> {
-        let value = copy_raw_attr(element, name)?;
-        let mut size = CgSize {
-            width: 0.0,
-            height: 0.0,
-        };
-        let ok = unsafe {
-            AXValueGetValue(
-                value as AXValueRef,
-                AX_VALUE_CGSIZE,
-                &mut size as *mut _ as *mut c_void,
-            )
-        };
-        unsafe { CFRelease(value) };
-        (ok != 0).then_some(size)
+        copy_ax_value_attr(
+            element,
+            name,
+            AX_VALUE_CGSIZE,
+            CgSize {
+                width: 0.0,
+                height: 0.0,
+            },
+        )
     }
 }
 

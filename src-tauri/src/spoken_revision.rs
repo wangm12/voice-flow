@@ -1822,6 +1822,7 @@ mod tests {
                 output_projection_list_revision_proof: None,
                 layout_source: None,
                 exact_fallback: false,
+                allow_model_selected_paragraphs: false,
             },
         );
         assert_eq!(reason, None);
@@ -1891,6 +1892,7 @@ mod tests {
                 output_projection_list_revision_proof: None,
                 layout_source: None,
                 exact_fallback: false,
+                allow_model_selected_paragraphs: false,
             },
         );
         assert_eq!(reason, None);

@@ -208,15 +208,19 @@ HTTP providers 使用 batch ASR，且当前都报告 `streaming_partial_results=
 
 录音预处理压缩长静音并裁掉数字静音，同时根据本次录音较安静的帧自适应判断语音边界；单凭固定音量门槛不会删除整段低音量语音。数字静音仍返回无语音。
 
+Groq Whisper 的 `verbose_json` 若返回顶层 transcript 与 segments，至少一个非空 segment 保留时，provider 顶层文字会原样进入后续准备流程；segment 置信度仍过滤其元数据，供现有级联判断使用。若没有非空 segment 保留（顶层文字为空时仍从保留段重建），只有 segment 文本忽略空白后完整覆盖顶层文字时才按空结果抑制；覆盖不完整时保留顶层文字。空 segments 仍沿用 provider 顶层文字。该规则适用于 Groq Whisper 原生路线及显式 `groq/` Whisper 模型路由；其他 provider 与未带 `groq/` 前缀的自定义端点沿用其现有流程。
+
 普通与长录音先在本机按同一顺序执行语音标点 / 有界布局、用户词典与局部明确改口，再由本地解析 CleanupIntent。独立的中文口述标点词可以映射成符号；紧跟「把 / 用 / 加 / 换成 / 改成 / 删掉 / 输入」等编辑动词的标点词保持原文。局部改口排除引号与 Markdown code literal 区域。列表改口只在同一块中用显式 ordinal cue 唯一指向较早的编号项、且目标项、占位项、cue、reference、replacement source span 均逐字验证后，才替换那一项；cue 仅匹配完整措辞（包括 `spoken_revision` 的标记及其内部标点），proof 的来源字节范围绑定到标点保护检查通过后布局解析实际接收的输入；若标点变更未通过保护检查，布局会回退到布局入口文本并从该文本建立来源范围。proof 向最终保护 owner 提供这份布局输入的来源证据，不表示每个范围仍对应 provider 原始 ASR 字节。尾项明确计数保留也接受“算了吧，只要前两个”及“只留前两个”，仍须产生布局输入绑定的 retention proof；明确“不要第 N 个”或“删掉第 N 个”仅在同一块有连续编号列表且 N 指向实际列表项时删除该项，剩余项按原顺序重新编号。列表渲染会去掉项目末尾的分隔逗号，但 proof 仍保留布局入口 list_source 的原始 value 与 byte span；该坐标位于标点处理之后，不保证对应 provider 原始 ASR 的字节；数字、日期、代码、否定和其他 protected 内容不因渲染变化而改写。目标缺失、重复、歧义或修正语句处于 literal 中时，原项与改口 cue 都保留；解释性、假设和引用文字不会授权改写。没有显式回指的尾部“不对”仅在相邻的下一编号且既有 backtrack parser 确认时作为 false start 处理；其他情况不会猜作 forward correction。标点与每个布局阶段分别以该阶段完整输入定位引号 / code literal；只有解析器实际成功消费的精确语法范围可豁免自身 protected-span 匹配，每步检查通过后才进入下一步。payload 中的同词、部分重叠实体、引号内容和文件路径仍受保护；Markdown code 的外层 fence / backtick 可省略，但 code payload 必须作为完整 token / expression 逐字节保留，不能用扩展后的标识符、flag、路径、成员或调用中的子串代替，并保持原顺序、重复次数和代码块缩进；省略包装符号时，只要求保留 literal 边缘原有的 code attachment（比较局部语法时规范化空白），新接入的成员、调用、flag 后缀或运算仍会被拒绝，周围普通 prose 仍可按现有 cleanup 规则编辑；紧邻 CJK 正文时，只用原边缘相邻字符作最小锚点；重复或重叠正文必须能按顺序唯一绑定，否则保守拒绝；每条 transcript 最多绑定 64 个 literal、每个正文最多枚举 256 个候选出现，超限保守拒绝；布局标签只移除空白和明确的命令分隔符，保留文件名等 payload 点号；code literal payload 不计作 prose 的布局内容，口述布局恢复只以候选中已逐字绑定的 occurrence 作占位并从候选原样移回，不会从原稿补入缺失或修改的 payload。启用 cleanup 时，准备稿是模型编辑目标。仅在 Groq 的隐式 Cleanup 且完整 ASR 原稿与准备稿不同时，共享请求构造器会省略原始 ASR reference，以准备稿作为唯一文本依据；原稿仍保留在本机 History 与来源记录。其他 provider 和明确选区 / 操作沿用现有 reference 行为。语气试跑内存响应在最终 guard 前分别保留完整解析后的 provider candidate 和共享 cleanup adapter 接受后的文本；二者均不写入普通成功 History，adapter candidate 不代表未经处理的模型 wire response。最终验证不再对所有出现位置追加全局词典改写，并会拒绝丢失结构化行内容或改变代码缩进的候选。当整理关闭或场景被路由为本地处理时，不发起整理请求；短、长录音的 Off 结果都经过同一最终本地保护检查，并保持已准备的文字不变。provider 失败或验证拒绝时使用保守 fallback 并保留准备稿布局。未携带共享 cleanup plan 的遗留 Groq Cleanup 路径仍会追加固定列表保真提醒，并只在候选因遗漏编号列表前言触发布局拒绝时尝试有限恢复；恢复后的文字仍经过完整保护检查。该 legacy 提示不适用于普通短录音、长录音和 History 音频重试的共享 plan 路径；这些路径不追加该 reminder，且被拒绝的 `StructureSafe` 候选不会通过 preamble recovery 复活。其它非 StructureSafe 路径仍保留既有的受证明恢复规则，失败后走对应的本地 fallback。`asr_text` 保留 provider 原始结果，便于区分原始识别与本地准备后的草稿。
 
-普通录音与 History 音频重试共享一份 effective cleanup policy：Auto 仍按既有强度解析，并只选择一个场景输出 add-on；手动 Email、Bullets、Meeting Notes 仅在有已捕获多行能力的兼容目标应用。本机只在来源 cue 足够明确时渲染推断段落 / 列表；证据不足时保留原呈现。History 音频重试没有活动目标的 multiline 证据，使用当前保存的场景 / 强度和翻译目标，但手动 layout mode 回退到该场景的 Auto add-on，不推断新布局。提供或本地渲染的结构使用 `StructureSafe`：provider 只能调整受保护 literal 外的安全标点，必须逐字保留所有词、大小写、空白字节、换行、列表前缀和缩进；canonical 和 projection 的既有 source authorization、literal、实体、列表 proof 与 finalizer 检查仍有效。模型不会创建标题、摘要或布局。Code 模式的普通听写与音频重试不调用共同 cleanup；AssemblyAI 此时走 raw Sync，不走 fused Dictation；既有明确片段匹配仍按原路径处理，未匹配片段时识别稿原样通过。没有输出投影的模型请求（口述或 History 的 rewrite / shorten / formalize / casualize 命令、History 已选择文字 Reclean、语气试跑、评测和启动 warmup）同样由共享 prompt 构造：Cleanup / Translate 按有效强度选择 Light / Standard / Heavy 预算（命令强度按 Standard），其他已授权操作使用单一 authorized-operation 预算；add-on 取当前 profile 场景的 Auto add-on（Translate 用 Translation add-on），不使用手动 layout add-on，也不选择 `StructureSafe`。翻译仍使用现有固定目标的 `Translate` operation。AssemblyAI 其余 fused 行为和指令保持独立；History 的已选择文字 Reclean 也不使用 live-mode Code 路由。
+普通录音与 History 音频重试共享一份 effective cleanup policy：Auto 仍按既有强度解析，并只选择一个场景输出 add-on；手动 Email、Bullets、Meeting Notes 仅在有已捕获多行能力的兼容目标应用。本机只在来源 cue 足够明确时渲染推断段落 / 列表；证据不足时保留原呈现。History 音频重试没有活动目标的 multiline 证据，使用当前保存的场景 / 强度和翻译目标，但手动 layout mode 回退到该场景的 Auto add-on，不推断新布局。提供或本地渲染的结构使用 `StructureSafe`：provider 只能调整受保护 literal 外的安全标点，必须逐字保留所有词、大小写、空白字节、换行、列表前缀和缩进；canonical 和 projection 的既有 source authorization、literal、实体、列表 proof 与 finalizer 检查仍有效。普通 Auto cleanup 仅在有原生 multiline 证据的 prose editor 中允许模型选择句末主题段落，唯有精确 Codex target 在原生多行角色和 ASR 自然语言推断共同确认 CodingPrompt 时可从观测到的 Code route 进入；provider 与 final guard 按顺序逐段对齐准备稿正文，只容许既有句子边界和已允许的安全标点，无法证明时回退到 canonical 准备稿。单段结果继续使用普通 cleanup；Code mode、未知 / secure target、StructureSafe 来源投影、S1-mini 和 AssemblyAI fused 不启用此段落策略。Code 模式的普通听写与音频重试不调用共同 cleanup；AssemblyAI 此时走 raw Sync，不走 fused Dictation；既有明确片段匹配仍按原路径处理，未匹配片段时识别稿原样通过。没有输出投影的模型请求（口述或 History 的 rewrite / shorten / formalize / casualize 命令、History 已选择文字 Reclean、语气试跑、评测和启动 warmup）同样由共享 prompt 构造：Cleanup / Translate 按有效强度选择 Light / Standard / Heavy 预算（命令强度按 Standard），其他已授权操作使用单一 authorized-operation 预算；add-on 取当前 profile 场景的 Auto add-on（Translate 用 Translation add-on），不使用手动 layout add-on，也不选择 `StructureSafe`。翻译仍使用现有固定目标的 `Translate` operation。AssemblyAI 其余 fused 行为和指令保持独立；History 的已选择文字 Reclean 也不使用 live-mode Code 路由。
 
 在没有 `StructureSafe` plan 的 adapter 路径中，若同一 code literal body / attachment 绑定失败并同时导致布局检查拒绝，adapter 报告 `protected_token_changed`；其他布局拒绝仍报告 `explicit_layout_changed`。`StructureSafe` 路径先运行标点专用 guard，这类候选会按结构拒绝处理，不走该 taxonomy。provider 回复与最终输出各由同一个 guard owner 检查一次布局、文字体系和受保护 token；最终边界另外保留只在本机准备阶段可得的 proof 与已晋升词对检查。
 
 列表 owner 也只消费有 proof 的明确连接词、误起填充词和同一列表块里的保留指令；它不会全局删除「是 / 才是」，而会保留「是否 / 是不是 / 是什么 / 是的」、否定、强调和不确定语气。仅当 2–10 项的计数保留指令有连续序号证明，且相邻前一项的明确改口把一个值改成新值、后一项以「才是」开头并逐字复用该旧值时，来源 proof 才记录该连接词的精确来源与输出范围；准备稿 owner 在模型请求前按 proof 同步规范化该处，更新保留项和修订输出范围。provider adapter 与最终布局检查因此都检查同一份规范化准备稿，其他同词仍须保留。明确的「啊算了…只保留前两个」会按同一组 cue、动作、数量和连续序号事实解析：同一块内必须有末尾编号项中的直接撤回 cue，保留数量在 2–10 之间且小于当前编号项数，才撤回该数量之后的项；旧式「前面两个，第一个和第二个」仍要求唯一匹配前两项的显式回指。疑问标点组合、缺项或序号不符，以及角色不明的指令都会完整保留。指令里的「如果分支」等内容词本身不会把紧邻的实际指令改判为假设。跨段落或先前已交付的内容不受影响。通过解析的列表项正文可清理边界清楚的呃 / 嗯 / uh / um 等填充词和单个明确误起；「嗯嗯」等有意义的重复、普通词语前缀（例如 `umbrella`）与重复强调（如「非常非常」）会保留。模型遵循同一清理边界，但最终输出仍须通过来源、实体、否定和布局验证。
 
-词典设置允许用户手动创建明确的「听写识别为 → 应替换为」纠正规则，并从当前运行的原生 App 列表选择唯一 bundle 范围；不要求先建语气 / context mapping，也不写入全局个人词典或编辑旧 History。保存后该 pair 不依赖目标词已存在于全局词典，仍通过唯一的当前场景适用集进入本地替换、提示、使用计数和最终来源保护。未知目标范围不匹配，已有相同 pair 在另一 scope 时拒绝覆盖；「忘记」使用现有 tombstone 撤销这条规则。当前手动入口不支持 browser host scope。
+词典设置允许用户手动创建明确的「听写识别为 → 应替换为」纠正规则，并从当前运行的原生 App 列表选择唯一 bundle 范围；不要求先建语气 / context mapping，也不写入全局个人词典或编辑旧 History。保存后该 pair 不依赖目标词已存在于全局词典，仍通过唯一的当前场景适用集进入本地替换、提示、使用计数和最终来源保护。未知目标范围不匹配。History schema v20 为普通词规则使用包含 scope、词面和匹配策略的 opaque identity，因此同一词对可由 A、B 各自持有；同一有效范围内别名重叠而目标不同的规则统一 abstain。生产 History / live 弱证据候选不会按类别门槛自动晋升；若旧 lower-case pair identity 已有一条 live 规则，另一 scope 的同 pair 候选继续 pending；用户仍可显式确认 A/B。修改 mapping 身份或删除 mapping 会暂停旧绑定词规则，须经 Settings 明确 rebind。旧 v19 词对行不重键、也不向 v2 行转移计数。当前手动入口不支持 browser host scope。
+
+普通 History 捕获额外保存所选 user mapping 的 selector 指纹，仅用于验证 bundle、executable、browser host/path 与 focused-field selector 是否仍是产生这条记录的同一声明。旧 History 行没有该指纹时，History 学习建议与手动编辑学习会 fail closed；Settings 中的显式 rebind 仍可把已暂停的规则绑定到当前 mapping。mapping 删除或 selector 改动后，SQLite 先提交 binding invalidation，并取消该 scope 的待执行 Add、排入只移除对应 Rule owner 的 Remove；通知与在途听写取消在数据库提交后发生。若 Settings 文件写入失败，Remove 保持 pending，后续 Settings 同步 / 启动可重放；Manual、Screen 等其他词条来源不受影响。主窗口 capability 已授予 `rebind_invalidated_learn_pair`，普通学习审查会严格展示匹配策略、mapping binding、manual/auto owner 与 rebind / 跨范围候选决定。当前同一 App 范围出现别名重叠但目标不同的已晋升规则时，两条均从“已生效替换”移入冲突暂停组，用户可忘记其中一条解除冲突。大小写纠正规则在 admission 与最终 cleanup 比较都按 exact casing 检查，并跳过引号和 code literal；普通规则沿用 ASCII 大小写不敏感匹配。每规则 replacement count 与既有 `learned_term_usage` 词条汇总并行维护。v19 原始 key、hits、tombstone 与证据不会重键或清除；与 v20 live 词规则发生同范围冲突时会共同 abstain，v19 tombstone 不会被 passive v20 upsert 绕过。独立的 V3 phase fixture 保持其 pre-C1 `pair_key` 协议，不覆盖这些 v20 History / paste 行为；该 fixture 仍可单独运行，v20 行为由 fresh isolated DB 测试覆盖。
 
 共同云端整理只有协议明确成功终止时才产生候选：OpenAI-compatible 流式需要 `finish_reason: stop`，已收到 stop 后的正常 EOF 可接受；`[DONE]` 本身不能替代完成状态。Anthropic 需要 `end_turn` 或 `stop_sequence`，工具内容不作为整理结果。缺失完成状态、过滤、工具调用或 token 预算耗尽走完整准备稿的本地回退。共同 LLM 和视觉客户端与 ASR 一样不跟随 HTTP 重定向。
 
@@ -282,7 +286,35 @@ sequenceDiagram
 4. 请求发出和结果返回时都会验证权限、录音 session、目标与页面 fingerprint。撤销权限 / 取消 / 目标或页面变化后丢弃证据或结果；图像不落盘、不进 History / 导出 / 日志。
 5. HUD 只显示实际送入当前 provider 请求的来源（AX、设备端 OCR、云端视觉或无），不显示原始内容。raw URL、query、fragment、窗口标题、PID 和目标 identity 只用于本地路由与绑定。
 
+### App × writing task 显式偏好
+
+Context Settings 可在 `AppMapping` 中显式选择 `writing_task_id`，并按 `task_id × dimension` 保存、暂停或忘记受支持的结构化偏好。任务身份只在唯一匹配的 verified focused-field selector（同时有活动输入 token 和窗口 identity）或 verified browser host/path selector（同时有当前 URL / target token）下可信；bundle-only、同特异性歧义或缺少正向 identity 时保持 unknown，偏好不召回。相同 App 可通过不同 verified field/path 规则区分任务。
+
+列表偏好只在本机整理路线影响有逐项来源边界、顺序和事实可对齐的 implicit cleanup；云端请求始终使用未应用任务列表偏好的文本。称呼只处理原话已有且紧跟标点或空白边界的 `你好/您好`；句末标点只处理支持任务中的单句、无歧义陈述句，并拒绝含有内部中英文句号的内容。只在 Auto 模式、无显式单次命令且整理 plan 允许时生成结构化指导；本次 mode / command、任务 / 内容不兼容、StructureSafe 预算和 S1-mini 都跳过。云端结构化偏好 permission 单独显式开启且默认 false，与 `context_text_to_providers` 和 `style_examples_approved` 各自独立；撤销样例授权不会改动结构化偏好授权，反之亦然。
+
+发送前和每次 retry 都会重新读取 `context_enabled`、当前 App / task、敏感目标和 cloud permission，并对照偏好 revision。目标或授权变化会拒绝 queued request 并走 canonical 本地 fallback。mapping save 使用 `preference_revision` compare-and-save；pause/forget 记录 task-scoped 状态并保留 forgotten tombstone，删除 mapping 会清除其余内容并仅保留 mapping ID 与 revision tombstone，阻止旧设置视图重建原 mapping。通用 `update_settings_patch` 与后台 learning snapshot 不能覆盖或复活已忘记或已删除的偏好。
+
+History 的人工改字现在可产生 metadata-only 弱证据候选。每个 History 页面会生成编辑 session UUID；保存 payload 记录有限输入类别、composition 状态和 trusted Save 动作，IME 仍组字时 Save 禁用。只有 VoiceFlow 自有 History 编辑器、可信任务及 mapping identity/revision、无冲突的最新 History 来源和 classifier 支持的有限表面编辑可进入弱证据；同一听写只有对原始交付 History 文本的首次可信手动编辑可以贡献样本，而且原始交付后必须尚无任何 History revision；先前的 `ai_reclean`、恢复或其他 action revision 均使该来源不合格。后续保存不增加独立数。此限制只用于写作偏好弱证据，不改变既有 lexical History 学习行为。单次 Verbatim 绕过会被排除，但全局关闭整理后仍经本机 `PreparedTranscript` 路径的记录可以进入分类。AX 和 paste observation 不能作为 author / IME proof。分类只记录候选值、origin/content/template/session 指纹及时间，不复制原文，不自动改变后续输出。候选窗口 14 天，至少 3 个不同 origin/content/template、2 个自然日和 2 个编辑 session；自然日按原始听写 `dictations.created_at` 通过 SQLite `localtime` 计算，编辑时间单独计量编辑证据的 14 天窗口；候选读取和复核时，原始听写来源也必须仍在滚动 14 天内。元数据在编辑后 14 天或来源满 14 天时较早到达的期限清理，因此第 13 天编辑的来源到第 15 天时已过期。同 origin、内容或模板家族重复不增加独立数。同一有效 mapping selector × task × dimension scope 中，当前 14 天窗口内未忽略的反向值证据会阻止候选就绪，即使跨 generation；忽略只关闭当前 generation，该 generation 不再支持或阻塞后续候选。候选证据有界保存（最多 256 行）。
+
+这里的 256 行只计算 `writing_preference_evidence` 中的弱证据元数据行；达到上限时拒绝新增证据，不会裁剪或删除对应的 History 来源记录。来源内容仍由常规 History 保留期和用户删除操作管理。
+
+模板族 hash 是粗略结构指纹：同一分句中的同脚本短语折叠为一个形状标记，单独改变词面或词数不能制造不同家族；数字槽、内部标点和段落边界保留宽泛结构，句末标点变化本身不会增加多样性。它只保守去重，可能把语义不同的文本合并，不能证明模板或长期意图独立；无法计算 hash 的文本不能满足模板多样性。
+
+用户在 Context Settings 的“待复核的写作偏好”区主动打开列表后，UI 才请求候选和当前 mapping snapshot；每项按 stable mapping ID 显示准确的 App 选择器范围、task、dimension、predicted value、聚合计数，以及固定“无原文样例”状态。每批最多选择 64 项；列表更多时，先处理当前批次，再继续选择其余候选。可混合批量批准或忽略；结果逐项返回。mapping revision 变化、权限失效、候选过期、已有偏好冲突和持久化失败会显示对应结果；最新 History source 重查时遇到 I/O 错误返回逐项 `source_recheck_failed`，该 mapping 组不提交 Settings，但同批其他 mapping 可继续；若来源已变化或过期则返回 `stale_candidate`。UI 要求刷新候选后才可重新选择。整批 IPC 未确认时也必须刷新候选后才可再次处理。批准后刷新 mapping，只在当前编辑器仍对应同一 mapping/task、范围未变且目标偏好 / 云端授权没有脏草稿时合并批准项；否则保留草稿、阻止保存并提供显式重载获批规则的操作。批准只保存本机结构化偏好，不授权 style sample 或 cloud guidance；短称呼 / 句末标点审批会撤销 mapping 级结构化偏好 provider grant。忽略只关闭当前候选代次；该 generation 的证据不再支持或阻塞后续候选，也不忘记或撤销已批准偏好。当前 14 天窗口内同一有效 mapping selector × task × dimension scope 的未忽略反向值会阻止候选就绪。
+
+命名的 owner-chain regression `writing_preference_drafts::tests::history_edit_candidate_review_owner_chain_persists_and_applies` 在隔离 History DB 中覆盖先单项批准、再批准同 mapping 其他维度与另一 mapping 的候选、decision marker / Settings reload 和兼容的本机 bullet projection，可通过 `cargo test --manifest-path src-tauri/Cargo.toml --lib writing_preference_drafts::tests::history_edit_candidate_review_owner_chain_persists_and_applies -- --exact` 运行。它用合成 History 事务和 editor-commit fixture 调用实际 revision 保存、History classifier / metadata evidence writer、候选派生及审批 helper。此测试不是运行中的 Tauri IPC、Test bundle/macOS Host、真人输入或 IME 验收；自动推断启用仍关闭，独立 shadow、holdout 与用户收益尚待完成。
+
+候选收集与处理要求现有 opt-ins：全局词典“学习词条”、默认关闭的“本机观察插入后的改动”、全局上下文开关、该 App mapping 的学习开关，以及可信的显式 writing task；browser mapping 还需当时可用的浏览器访问。关闭全局词典学习、本机改动观察或 App mapping 学习会清除未批准证据和 decision markers；删除 mapping 清除此 mapping 的元数据。关闭全局上下文、暂停 / 禁用 mapping 或浏览器访问暂不可用仅阻止采集 / 复核，不清除元数据。Clear All 删除候选与忽略水印，但保留已批准的 AppMapping 设置。独立 shadow、冻结 holdout、真人收益试验、真实 Tauri IPC / Test bundle acceptance 仍待完成；代码实现和定向 UI tests 不构成这些结果的证据。
+
 手动「看屏幕」仍须用户自己录入 `screen_action_hotkey` 和配置视觉模型。触发后只截当前窗口一张内存 PNG（长边 ≤1280），连同语音指令发给用户配置的 vision provider，再弹出一次性事务预览（替换 / 只复制 / 取消）；确认会复核当前目标，目标变化或不能验证时只复制；若 ⌘V 可能已发出或结果未确认，则报告 `unverified`，不再复制，取消会丢掉 PNG。屏幕结果沿用相同的确认 / 复制 / 取消事务命令，但不会被描述为经过选中文本操作的事实保护检查。手动动作不依赖自动上下文 grant，也不会启用后续自动截图。会议录音、Spark、生图仍然不做。
+
+## 跨 Mac 学习配置迁移
+
+设置中的「学习配置迁移」使用原生保存 / 打开文件面板，不接受 renderer 提供的任意文件路径。导出写入用户选择的本机 JSON 文件；用户可自行用 AirDrop 等本机方式将文件送到另一台 Mac。文件版本化并有 1 MiB 上限，只包含当前可进入全局 ASR / fuzzy 词表且来源可证明为 Manual / Screen / Other owner 或仍有效全局 Rule owner 的个人词条、仍处于 live / promoted 状态且可安全重建 scope 的纠正规则，以及仍处于 active 状态的结构化写作偏好。Paused / forgotten / tombstoned 纠正规则和非 active 写作偏好不导出。仅由 scoped Rule 或 `legacy_unknown` 支持的词条不导出；无法证明来源或范围、来源 mapping 已禁用的 mapping-owned pair / 偏好，以及单项本地词面无效的全局词条 / pair 会跳过并计入 skipped 数；无效项不会阻止其余项目导出。生成文件仍会执行完整格式校验，校验失败则不写文件；即使全局词条、纠正规则和偏好都为 0，界面仍显示 skipped 数。文件不包含 History、音频、候选、审计、Keychain 凭据、权限或来源授权。
+
+导入先用原生文件选择器打开文件并完整验证格式、版本和所有项目，再生成带短期本机 session 的逐项预览。格式错误的 bundle / host、同一 selector 自相矛盾的 selected task 等会拒绝整个文件。预览记录文件与相关本机学习状态指纹；应用时重新读取并核对，过期或发生变化就要求重新预览。纠正规则按文件里的 selector 与 pair 自身观察到的 family / host / native bundle scope 恢复，不依赖 mapping 当前选中的 writing task；写作偏好则要求 selector 和 selected task 都匹配目标 mapping，偏好自己的 `taskId` 可以不同，合法 selector 也可带 `selectedTask: null`。目标 mapping 必须唯一对应；精确目标若已禁用会阻止该项，目标缺失时与任何未删除的本机 selector 重叠（包括禁用 mapping）也会阻止创建。同一文件内重叠的目标 selector 若按运行时特异性有唯一胜者，可共同创建且结果不依赖文件顺序；特异性相同会阻止相关项，单独已阻止的项不会预留 selector。来源 mapping 若与另一条启用中的重叠 selector 特异性相同，其绑定纠正规则和偏好会跳过，因为本机 mapping ID 的平局无法移植。selector 或观察到的 host / native bundle 不一致、缺失或无法重建时会跳过。新 mapping 不替换现有映射，默认启用以参与目标匹配，但学习开关、AX / OCR / 云端视觉 / provider 文字和其它授权均关闭；预览会标明将新建 mapping。已有 mapping 的 selector、task 和 grant 不会被静默改写。
+
+预览使用当前纠正规则快照；目的 Mac 尚无 History SQLite 时按空快照预览，不会因此创建数据库。应用前会重读并验证文件、本机状态及 pair 快照，快照覆盖已存在和用户选择保留本机的 pair；任何变化都要求重新预览。冲突默认保留本机；用户可对支持的冲突明确选替换，或为全局词条明确选择加入全局词典。实际导入的全局词条会在目的 Mac 增加 `Manual` owner，原 Rule owner identity 不会移植；纠正规则按 pair 项写入目的 Mac 本机规则库，并保留词面匹配策略与具体 scope。同一文件可为同一 scope / alias 携带 Exact 与 IgnoreCase 两条同输出规则；若目的地只有另一匹配策略的同范围规则，仍显示冲突，须用户明确选择替换。应用先保存 Settings，再写入 SQLite 纠正规则；若 Settings 已保存后原生数据库写入失败，会返回 partial 和逐项失败结果。写作偏好只在目标和 task 匹配时生效，不继承云端结构化指导许可。逐项结果区分已导入、已保留、已存在、阻止和失败；原生面板取消或关闭预览均不执行导入。导入只写入获选的本机学习配置，不迁移或改写听写 History、音频、候选、审计或用户同意记录；不访问 Keychain、不调用 provider，也不改变云端授权。
 
 ## 可选录音策略
 
@@ -332,7 +364,7 @@ The external oracle must retain the original child and private request/response 
 
 The same lease accepts optional `learning`, owned by `learning_research::LearningConsent`: selected_state_id, nullable baseline_run, edit_fixture_id, purpose (correction/baseline/unseen/negative/undo/delete/restart), mapping_id, bundle_id, observer_enabled, post_insert_field, settled_field and at most eight terms[{fixture_id,before,after}]. Test state must be explicitly created/selected; this entry creates no parallel profile, imports no private History and never clears a normal dictionary. Prepare returns selected_learning_state with a content SHA and initial selected-pair facts, not a claim that the whole DB is empty. Missing consent keeps the original disabled-learning fixture rules.
 
-Consented dictation uses the real paste observer/classifier/candidate SQL/settings save owners. Names still require two hits, terms three; each declared family, mapping, browser-host and native-bundle constraint must be known and match the saved context. A mismatch or unknown required dimension disables that pair. One applicable-pair set drives replacement, hints, usage and final protection; exact replacement and hit detection skip quoted and code literals. Version-1 learning_record fields retain null/not_observed/not_measured for unknown stages. SQL promoted is distinct from completed settings persistence; hint/replacement usage is actual local prepare and can precede later cancellation. The 3-second initial/400ms sample/1.5-second idle/12-second total observer window is unchanged. Drain adds learning_tasks and pipeline_closed; session_terminal waits for all observer/persistence descendants. Cancellation, expiry and configuration changes cannot attribute late work to a subsequent run.
+Consented native dictation uses the real paste observer/classifier/candidate SQL/settings save owners, but live native observations now remain pending and do not automatically promote names or terms; activation requires explicit confirmation. The controlled V3 fixture retains its two-hit name and three-hit term thresholds. Each declared family, mapping, browser-host and native-bundle constraint must be known and match the saved context. A mismatch or unknown required dimension disables that pair. One applicable-pair set drives replacement, hints, usage and final protection; exact replacement and hit detection skip quoted and code literals. Version-1 learning_record fields retain null/not_observed/not_measured for unknown stages. SQL promoted is distinct from completed settings persistence; hint/replacement usage is actual local prepare and can precede later cancellation. The 3-second initial/400ms sample/1.5-second idle/12-second total observer window is unchanged. Drain adds learning_tasks and pipeline_closed; session_terminal waits for all observer/persistence descendants. Cancellation, expiry and configuration changes cannot attribute late work to a subsequent run.
 
 Private Driver learning_edit pressure requires the real eligible-registration receipt plus fresh independent AX window/control/text/UTF-16 caret proof. Host rechecks its own foreground/key-window/control/caret before its declared programmatic setter. This is synthetic actor evidence, not human action or ASR quality. Independent original-insertion scoring stays unchanged; learning-readback.json separately describes the controlled final field, and unseen quality still needs independent text/labels. Prepared-only learning_action(run_id,fixture_id,action=undo|delete) calls the existing undo/Forget owner and returns selected tombstone/dictionary-retention and partial failure facts, then closes the unstarted lease. It supplies no recording terminal or clipboard read authority. Driver consumes purpose=undo/delete and cleans up before clipboard/go/recording.
 
@@ -372,7 +404,7 @@ The fixture's `followup_templates[].expected_output_text` is test metadata only.
 
 The same feature-gated research binary also accepts `prepare_plan` with a version-3 phase plan. An ordinary learning plan binds its complete phase order, mappings, source payload hashes and byte lengths, operation IDs, per-phase grants and TTLs to one identity hash. It creates or reopens one `learning-arms-v3/<arm_state_id>` beneath the caller's private `--arm-root`; all declared mappings remain in that arm's settings. `enter_phase` opens only the next declared phase grant, one phase lease may be active at a time, and `end_phase` requires an admitted operation receipt for every operation declared for that phase. `LearnText`, `ApplyFollowup` and `Undo` use the existing production learning, local-replacement and tombstone owners. The phase scope remains plan-declared metadata (`identity_kind=plan_declared_not_observed_target`), not proof of a focused native app. The separate target-only `ObserveTarget` plan does not create or reopen a learning arm or Settings.
 
-The fixtures `learning-v3-multiscope.json`, `learning-v3-pending-apply.json` and `learning-v3-postundo-multiscope.json` exercise the real stdin dispatcher. They use synthetic programmatic text only. A/B phases keep the same family but use separate mapping IDs and bundle IDs in one arm. For replacement, V3 obtains the candidate set from production `LearnPairScope::applicable_promoted_records`; an A-owned row applied under B therefore yields the ordinary scope mismatch, no selected-pair application and no usage. It may add one `research_fixture_noop` operation receipt, but that receipt is not a learning hit/proof or usage. A B-side attempt to learn the same pair exercises the existing normalized `pair_key` collision: the owner returns a scope conflict with the actual stored/requested scopes and the entire SQL state remains unchanged. This records the C1 identity gap; it does not add a second rule identity or make same-pair rules independently ownable across scopes.
+The fixtures `learning-v3-multiscope.json`, `learning-v3-pending-apply.json` and `learning-v3-postundo-multiscope.json` exercise the real stdin dispatcher. They use synthetic programmatic text only. A/B phases keep the same family but use separate mapping IDs and bundle IDs in one arm. For replacement, V3 obtains the candidate set from production `LearnPairScope::applicable_promoted_records`; an A-owned row applied under B therefore yields the ordinary scope mismatch, no selected-pair application and no usage. It may add one `research_fixture_noop` operation receipt, but that receipt is not a learning hit/proof or usage. This V3 fixture protocol remains separately runnable with its pre-C1 legacy `pair_key` contract: a B-side attempt to learn the same pair still returns the version-bound scope conflict and leaves SQL unchanged. It does not exercise the v20 History/paste scoped word identity; current C1 behavior is covered by fresh-database tests.
 
 V3 keeps local-only rules `auto_scoped`, preserves the existing global dictionary byte-for-byte (including a legal preseeded word), and does not save Settings for a local rule or its undo. Application and no-op operations have distinct retained observation kinds; Undo requires the exact positive receipt for its referenced application phase, so a no-op receipt cannot borrow usage from another operation. A later A- or B-scoped follow-up after Undo observes the tombstoned A row and does not apply it. A one-hit pending row likewise produces no-op receipts for both its owner scope and the other scope. Reopening the same arm from a new process preserves the stored owner scope and tombstone.
 
@@ -391,16 +423,299 @@ The existing pending/promoted/usage/draft UI remains. EN10 per-observation eligi
 
 | 入口 | 说明与实际操作 owner |
 | --- | --- |
-| 个人词典 | 手动术语、固定错词示例、同框纠错观察 / 分类 / 晋升、候选确认 / 忽略、已生效替换 / 忘记和实际使用计数。添加仍由现有词典命令完成；错词建议由 History 的显式编辑保存产生；自动 History 学习比较编辑前已采用版本，按同一事务捕获的 scene / App mapping 保持范围，只接受分类器认可的单词纠正，不读取 AX / raw ASR，也不追加到全局个人词典；同一 History 行的同一 pair 只计一次，粘贴观察与 History 编辑通过数据库中的同一听写事务来源去重。旧 receipt 没有可恢复来源时保持 unknown，不猜为独立证据。Latin 自动纠正还要求 CamelCase、全大写缩写或下划线等标识符形状；Latin 普通单词、书写数字 / 量词、否定反转、单复数和跨文字体系替换不会自动晋升，用户仍可在现有 History 候选中手动确认。连续中文长串中没有明确分隔边界的同音人名编辑会放弃词条与风格学习，避免把邻近上下文字当作姓名；完整有界的 2–3 字姓名仍可按现有同音规则自动晋升。若学习存储在版本已保存后暂时失败，保持编辑并再次保存会复用原版本来源与 History 回执，不增加版本或命中。现场同框观察默认关闭独立的「本机观察插入后的改动」许可（已有 AX 文字许可也仍可允许）；它只观察通过原 paste owner 确认的 UTF-16 插入范围，前后原文变化时不学习，不读取其他屏幕文字或发送改动。人名 2 次、术语 3 次以及 tombstone 保持原规则；family 仅用于区分宽泛类型，单独的 family 不构成已知作用域；family 缺失时仍保留既有全局作用域语义。作用域中的 mapping ID、browser host、native bundle 必须由当前记录提供并逐项匹配；缺少所需上下文或与其他 App / 网站不符时不应用。旧的 family-only 已晋升词对会降为候选，不再应用于同类所有 App。History / 本机局部观察晋升的 scene pair 通过 `auto_scoped` 资格在对应范围内替换并生成 cleanup 提示，无需把目标词写入全局词典；此标记不跳过当前 scope 匹配，也不解除既有目标 / 任务保护：普通 Code、Secure、Terminal、Form、Search 等仍不会仅因 scope 匹配而自动替换或生成提示。只有有效且明确的 `PromptOrCode` 声明可将 Code 的整理输入按 `CodingPrompt` 处理后，才会按现有规则使用；本机观察许可本身不会解除这些保护。旧记录默认没有 `auto_scoped` 资格，忘记后 tombstone 会停止应用。替换、提示、使用计数和最终保护共用同一份适用词条；逐字替换与命中检查跳过引号和 code literal。 |
+| 个人词典 | 手动术语、固定错词示例、同框纠错观察 / 分类 / 晋升、候选确认 / 忽略、已生效替换 / 忘记和实际使用计数。添加仍由现有词典命令完成；错词建议由 History 的显式编辑保存产生；候选提取比较编辑前已采用版本，并按同一事务捕获的 scene / App mapping 保持范围，只接受分类器认可的单词纠正，不读取 AX / raw ASR，也不追加到全局个人词典；同一 History 行的同一 pair 只计一次，粘贴观察与 History 编辑通过数据库中的同一听写事务来源去重。旧 receipt 没有可恢复来源时保持 unknown，不猜为独立证据。Latin 自动纠正还要求 CamelCase、全大写缩写或下划线等标识符形状；Latin 普通单词、书写数字 / 量词、否定反转、单复数和跨文字体系替换不会生成候选；用户可在现有 History 候选中明确确认。连续中文长串中没有明确分隔边界的同音人名编辑会放弃词条与风格学习，避免把邻近上下文字当作姓名；完整有界的 2–3 字姓名仍可生成按当前 mapping 隔离的待确认候选；生产 History 与 live-observer 弱证据即使达到原人名命中数也不会自动晋升，同一听写事务来源跨两路只计一次；用户在 History 或词典中明确确认后，规则才在对应范围内生效。若学习存储在版本已保存后暂时失败，保持编辑并再次保存会复用原版本来源与 History 回执，不增加版本或命中。现场同框观察默认关闭独立的「本机观察插入后的改动」许可（已有 AX 文字许可也仍可允许）；它只观察通过原 paste owner 确认的 UTF-16 插入范围，前后原文变化时不学习，不读取其他屏幕文字或发送改动。人名 2 次、术语 3 次的晋升阈值只保留在 research/test fixture owner，不改变生产候选行为；tombstone 保持原规则；family 仅用于区分宽泛类型，单独的 family 不构成已知作用域；family 缺失时仍保留既有全局作用域语义。作用域中的 mapping ID、browser host、native bundle 必须由当前记录提供并逐项匹配；缺少所需上下文或与其他 App / 网站不符时不应用。旧的 family-only 已晋升词对会降为候选，不再应用于同类所有 App。经 History / 本机局部观察候选明确确认的 scene pair 通过 `auto_scoped` 资格在对应范围内替换并生成 cleanup 提示，无需把目标词写入全局词典；此标记不跳过当前 scope 匹配，也不解除既有目标 / 任务保护：普通 Code、Secure、Terminal、Form、Search 等仍不会仅因 scope 匹配而自动替换或生成提示。只有有效且明确的 `PromptOrCode` 声明可将 Code 的整理输入按 `CodingPrompt` 处理后，才会按现有规则使用；本机观察许可本身不会解除这些保护。旧记录默认没有 `auto_scoped` 资格，忘记后 tombstone 会停止应用。替换、提示、使用计数和最终保护共用同一份适用词条；逐字替换与命中检查跳过引号和 code literal。 |
 | 语气的 App 来源规则；智能整理；更多快捷键的看屏幕入口 | 分别解释 AX 文字、OCR、provider 文字用途、云端视觉和独立风格样例批准。导航到系统权限本身不请求授权，用户还需主动打开对应原生提示；不会因为阅读说明截图。配置、权限读回和本次捕获不能互相替代。 |
 | 可选选中文本试用；更多快捷键；真实来源捕获后的事务预览 | 标记固定原稿与可选任务；真实试用复用当前 lease / generation / 选区快照，预览仍显示当前事务的操作、来源、结果。没有选区需回原输入框重选；来源或目标改变保留结果供复制；取消 / 失败后的迟到结果不成为新成功。教学不会按旧选区执行，不增加发送或 Enter。 |
 | 语气与预览；词典中的风格草稿入口 | 区分保存的 Prompt、未保存草稿、待确认样例及已批准的 App 样例。比较复用用户主动点击的 WritingPreview，可能请求已配置整理服务；阅读说明不请求。App / executable / host / path / focused field 条件仍由现有映射 owner 同时匹配。 |
 
 相关页面、试用与预览中的就地说明默认折叠，由用户主动展开，不会取得焦点；快捷键页折叠组内也保持手动展开。收起不写完成状态，随时可重看。只有明确点击「知道了」才调用原生 `acknowledge_guide`，读取与保存均验证四类 ID、教学版本和回执；保存失败保持未确认。阅读状态由现有原生设置 owner 持久化，不使用 localStorage，不修改来源 grants、onboarded 或处理配置 generation，也不根据成功 toast 猜测已读。
 
-教学中的固定原稿只是演示，不自动成为词条、样例、识别结果或质量证明。风格草稿的原有确认框现在显示实际前后文本，并明确说明确认会保存、批准后续 App 整理请求；当下不发请求。手动输入的样例仍需单独批准并保存；在 App 规则关掉样例批准并保存后停止后续使用，旧预览不表示当前授权。其他 AI 账户不需要导入。
+教学中的固定原稿只是演示，不自动成为词条、样例、识别结果或质量证明。风格草稿确认框显示实际前后文本；确认只将样例保存到本机，不会批准将其发送给后续 App 整理请求。需要单独在语气的 App 规则中批准样例发送；样例内容变化后需再次批准。当下确认草稿不发请求。手动输入的样例仍需单独批准并保存；在 App 规则关掉样例批准并保存后停止后续使用，旧预览不表示当前授权。其他 AI 账户不需要导入。
 
 就地说明用有标签的按钮和 region，隐藏内容退出键盘顺序；关闭只在当前窗口仍有焦点且焦点仍在说明内时返回入口。说明导航到设置页时，在窗口仍活动的情况下聚焦新标题；语气、映射、服务、词典和片段的未提交表单在同一窗口内跨页保留，不会因导航自动保存；关闭窗口后丢弃。语气切换编辑对象、清空规则或开始编辑另一条规则时，仍使用现有放弃修改确认。说明没有新增动画，窄窗口可换行并沿用页面 / 预览的滚动区域。ARIA 和源 fixture 不证明真实 VoiceOver、多屏、外部选区或粘贴验收通过，这些仍需真实 macOS 验证。
+
+## Week-one dictionary learning preflight and isolated verification
+
+Build the Installable Test app with the exact test identifier. The Tauri CLI merges this JSON override into the repository config; Tauri derives a separate AppData / Keychain namespace only when the identifier is exactly `com.voiceflow.installable-test`:
+
+```sh
+npm run tauri -- build --features research-harness --bundles app --config '{"identifier":"com.voiceflow.installable-test"}'
+test_app="src-tauri/target/release/bundle/macos/VoiceFlow.app"
+/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$test_app/Contents/Info.plist"
+```
+
+The final command must print `com.voiceflow.installable-test`. Verify that identifier before opening the app. `instance.rs` also takes a process-wide lock from the current macOS user's temporary directory, shared by dev and packaged builds; while another VoiceFlow process is running, a second launch may exit successfully without opening its own window. Do not quit or kill a personal VoiceFlow process to make room. Launch the Test app only after confirming that no VoiceFlow process owns the lock, or from a separate macOS login user with a fresh Test AppData directory. Never clear an existing AppData or Keychain item. Native participant preflight remains pending until an isolated Test process is independently verified. After verifying the lock condition, launch the inspected bundle with `open "$test_app"`.
+
+For an explicit Teach batch, freeze and record the existing Settings readback before the first task. Select an already-installed, verified on-device ASR model; set `cleanup_enabled=false`, `fuzzy_dictionary_enabled=false`, `dictionary_learn_enabled=false`, and `local_edit_learning_enabled=false`. Keep `context_enabled=true` and the native App mappings enabled so App A/B scope resolution remains available, but disable every `context_mappings[].dictionary_learn_enabled` and set every mapping's `source_permissions` (`ax_text`, `local_ocr`, `cloud_vision`, `context_text_to_providers`) to false. Set `browser_access_enabled=false` and `window_ocr_enabled=false`; do not invoke Look-at-screen or provider-context capture. This keeps passive dictionary learning and Screen/provider seeding out of the Teach arm while leaving explicit user approval of the selected App pair available. Freeze mapping scope/enabled state, style-example approval and content, writing modes, output mode, ASR model, cleanup settings, and fuzzy setting for the whole batch. Use a fresh Test AppData root with an empty global dictionary and the existing explicitly scoped App pair. If any global Screen, Manual, or legacy word is already authorized, preserve it; the no-term-injection Teach arm is `blocked` until it has a separately prepared clean Test root. Do not clear existing AppData or Keychain items. If no verified local ASR model is already installed, mark the arm `blocked` instead of downloading one or calling it a no-hint run.
+
+Passive observation is a separate arm with its own fresh Test AppData root and its own consented mappings. The private V3 research arm is a deterministic programmatic-text fixture, not a passive-observation arm: it does not start the normal App observer, inspect a native target or provide human/IME evidence. A Test app process must not be running against the same root as another arm. With no participant available, human correction, independent author/host proof, IME commit, and native target outcome remain pending; synthetic fixture results do not fill those fields.
+
+Do not restart the Test app after each task. Assign each task an ID and retain its dictation/delivery generation, audit `runtime_id`, pre/post `audit_revision`, `clear_generation`, `observer_epoch`, sequence bounds, dropped counters, matching `activity_id` and `pair_ref`, lifecycle, registration/outcome, candidate-store and Settings-store statuses, plus the expected task-specific state changes. Wait for that task's observer activity to leave `in_progress` as `closed` or `superseded`, check persistence statuses and the corresponding Settings/SQLite owner readback, and record the independent target result. `unknown`, a missing activity, dropped audit entries/updates, an unfinished lifecycle, or incomplete persistence blocks that task; do not infer closure from a stable audit revision. The normal audit has only the current process's latest 128 activities and is not a cross-store transaction. This gives per-task owner settlement evidence without forcing a process restart. At batch boundaries, close the Test app normally and take a final closed-owner fingerprint; never terminate a personal process to obtain one.
+
+For a reproducible rule/state fingerprint, run this bounded read-only projection only against the exact Test AppData root. Both initial and confirmation reads of `settings.json` read at most `MAX_SETTINGS_BYTES + 1` bytes and block on overflow; each SQLite table is preflighted with `MAX_ROWS_PER_TABLE + 1` rows before its bounded payload is read. It reports per-component Settings hashes, per-mapping hashes, stable per-row hashes over rule/source/scope/tombstone state, and separate hashes for the declared mutable usage fields (`learn_pairs.last_used_at` and `replacement_runs`, plus `learned_term_usage.replacement_runs` and `last_replaced_at`). C1 updates the per-rule `learn_pairs.replacement_runs` counter when a selected rule is used. Other row fields, including candidate evidence, remain in the stable digest. Source text, credential fields, dictionary values, and raw row contents are never printed.
+
+```sh
+VOICEFLOW_TEST_DATA_ROOT="$HOME/Library/Application Support/com.voiceflow.installable-test" python3 - <<'PY'
+import hashlib, json, os, sqlite3, tempfile
+from pathlib import Path
+
+MAX_SETTINGS_BYTES = 2 * 1024 * 1024
+MAX_ROWS_PER_TABLE = 1024
+MAX_SQL_BYTES = 2 * 1024 * 1024
+MAX_OUTPUT_BYTES = 16 * 1024 * 1024
+MUTABLE_USAGE_FIELDS = {
+    "learn_pairs": ("last_used_at", "replacement_runs"),
+    "learn_observations": (),
+    "learned_term_usage": ("replacement_runs", "last_replaced_at"),
+    "style_drafts": (),
+}
+
+def canonical(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+def sha_bytes(value):
+    return hashlib.sha256(value).hexdigest()
+
+def sha_value(value):
+    return sha_bytes(canonical(value).encode())
+
+def read_bounded_bytes(path, limit):
+    with path.open("rb") as source:
+        data = source.read(limit + 1)
+    if len(data) > limit:
+        raise SystemExit("blocked: Settings exceeds the read bound")
+    return data
+
+def fingerprint_rows(table, rows, key_column):
+    mutable_fields = MUTABLE_USAGE_FIELDS[table]
+    stable_rows = []
+    usage_rows = []
+    for row in rows:
+        identity = row.get(key_column)
+        if not isinstance(identity, str):
+            raise SystemExit("blocked: row identity is invalid for " + table)
+        ref = sha_value(identity)[:24]
+        stable = {key: value for key, value in row.items() if key not in mutable_fields}
+        stable_rows.append({"ref": ref, "sha256": sha_value(stable)})
+        if mutable_fields:
+            usage = {field: row.get(field) for field in mutable_fields}
+            usage_rows.append({"ref": ref, "sha256": sha_value(usage)})
+    stable_rows.sort(key=lambda row: row["ref"])
+    usage_rows.sort(key=lambda row: row["ref"])
+    stable = {
+        "rows": len(stable_rows),
+        "sha256": sha_value(stable_rows),
+        "row_fingerprints": stable_rows,
+    }
+    usage = None if not mutable_fields else {
+        "fields": list(mutable_fields),
+        "rows": len(usage_rows),
+        "sha256": sha_value(usage_rows),
+        "row_fingerprints": usage_rows,
+    }
+    return stable, usage
+
+def read_rows_for_test(connection, table):
+    cursor = connection.execute(f'SELECT * FROM "{table}" ORDER BY rowid')
+    columns = [item[0] for item in cursor.description]
+    return [dict(zip(columns, row)) for row in cursor.fetchall()]
+
+def fingerprint_self_test():
+    with tempfile.TemporaryDirectory(prefix="voiceflow-fingerprint-self-test-") as temp:
+        db_path = Path(temp) / "synthetic.sqlite"
+        connection = sqlite3.connect(db_path)
+        connection.executescript("""
+            CREATE TABLE learn_pairs (
+                pair_key TEXT PRIMARY KEY, native_bundle TEXT, tombstoned_at TEXT,
+                ignored INTEGER, last_used_at TEXT, replacement_runs INTEGER NOT NULL
+            );
+            CREATE TABLE learned_term_usage (
+                word TEXT PRIMARY KEY, replacement_runs INTEGER, last_replaced_at TEXT
+            );
+            INSERT INTO learn_pairs VALUES ('synthetic-rule-ref', 'scope-a', NULL, 0, 'before', 0);
+            INSERT INTO learned_term_usage VALUES ('synthetic-word-ref', 0, NULL);
+        """)
+        before_rule, before_rule_usage = fingerprint_rows(
+            "learn_pairs", read_rows_for_test(connection, "learn_pairs"), "pair_key"
+        )
+        before_usage, before_usage_counters = fingerprint_rows(
+            "learned_term_usage", read_rows_for_test(connection, "learned_term_usage"), "word"
+        )
+        connection.execute("UPDATE learn_pairs SET last_used_at='allowed-use', replacement_runs=1 WHERE pair_key='synthetic-rule-ref'")
+        connection.execute("UPDATE learned_term_usage SET replacement_runs=1, last_replaced_at='allowed-use' WHERE word='synthetic-word-ref'")
+        usage_only_rule, usage_only_rule_usage = fingerprint_rows(
+            "learn_pairs", read_rows_for_test(connection, "learn_pairs"), "pair_key"
+        )
+        usage_only, usage_only_counters = fingerprint_rows(
+            "learned_term_usage", read_rows_for_test(connection, "learned_term_usage"), "word"
+        )
+        if usage_only_rule["sha256"] != before_rule["sha256"] or usage_only["sha256"] != before_usage["sha256"]:
+            raise SystemExit("fingerprint self-test failed: allowed usage changed invariant digest")
+        if usage_only_rule_usage["sha256"] == before_rule_usage["sha256"] or usage_only_counters["sha256"] == before_usage_counters["sha256"]:
+            raise SystemExit("fingerprint self-test failed: declared usage change was not isolated")
+
+        connection.execute("UPDATE learn_pairs SET native_bundle='scope-b', tombstoned_at='unexpected-tombstone', ignored=1, last_used_at='allowed-use-2', replacement_runs=2 WHERE pair_key='synthetic-rule-ref'")
+        connection.execute("UPDATE learned_term_usage SET replacement_runs=2, last_replaced_at='allowed-use-2' WHERE word='synthetic-word-ref'")
+        combined_rule, combined_rule_usage = fingerprint_rows(
+            "learn_pairs", read_rows_for_test(connection, "learn_pairs"), "pair_key"
+        )
+        combined_usage, combined_usage_counters = fingerprint_rows(
+            "learned_term_usage", read_rows_for_test(connection, "learned_term_usage"), "word"
+        )
+        connection.close()
+        if combined_rule["sha256"] == before_rule["sha256"] or combined_usage["sha256"] != before_usage["sha256"]:
+            raise SystemExit("fingerprint self-test failed: combined unauthorized change was hidden")
+        if combined_rule_usage["sha256"] == before_rule_usage["sha256"] or combined_usage_counters["sha256"] == before_usage_counters["sha256"]:
+            raise SystemExit("fingerprint self-test failed: allowed usage counter was not reported")
+        bounded_path = Path(temp) / "bounded-settings.json"
+        bounded_path.write_bytes(b"12345")
+        try:
+            read_bounded_bytes(bounded_path, 4)
+        except SystemExit:
+            pass
+        else:
+            raise SystemExit("fingerprint self-test failed: MAX+1 read was admitted")
+    print(json.dumps({"fingerprint_self_test": "passed"}))
+
+if os.environ.get("VOICEFLOW_FINGERPRINT_SELF_TEST") == "1":
+    fingerprint_self_test()
+    raise SystemExit(0)
+
+root = Path(os.environ["VOICEFLOW_TEST_DATA_ROOT"]).resolve(strict=True)
+expected = (Path.home() / "Library/Application Support/com.voiceflow.installable-test").resolve(strict=True)
+if root != expected or root.name != "com.voiceflow.installable-test":
+    raise SystemExit("blocked: not the exact Installable Test AppData directory")
+
+settings_path = root / "settings.json"
+if settings_path.is_symlink() or not settings_path.is_file():
+    raise SystemExit("blocked: Settings owner is unavailable or redirected")
+settings_before = settings_path.stat()
+settings_bytes = read_bounded_bytes(settings_path, MAX_SETTINGS_BYTES)
+settings = json.loads(settings_bytes)
+if not isinstance(settings.get("dictionary_sources"), dict):
+    raise SystemExit("blocked: dictionary source ownership is unavailable")
+mappings = settings.get("context_mappings", [])
+if not isinstance(mappings, list):
+    raise SystemExit("blocked: mapping rows are unavailable")
+
+components = {
+    "asr_cleanup": {key: settings.get(key) for key in (
+        "asr_provider", "asr_model", "cleanup_enabled", "cleanup_provider",
+        "cleanup_model", "cleanup_intensity", "fuzzy_dictionary_enabled", "output_mode",
+    )},
+    "dictionary": {key: settings.get(key) for key in (
+        "dictionary", "dictionary_sources", "dictionary_learn_enabled",
+        "local_edit_learning_enabled",
+    )},
+    "screen_context": {key: settings.get(key) for key in (
+        "context_enabled", "browser_access_enabled", "window_ocr_enabled",
+    )},
+    "writing": {"writing_modes": settings.get("writing_modes")},
+}
+mapping_rows = []
+for mapping in mappings:
+    if not isinstance(mapping, dict) or not isinstance(mapping.get("id"), str):
+        raise SystemExit("blocked: mapping identity is unavailable")
+    mapping_rows.append({"ref": sha_value(mapping["id"])[:24], "sha256": sha_value(mapping)})
+mapping_rows.sort(key=lambda row: row["ref"])
+
+db_path = root / "history.sqlite"
+if db_path.is_symlink() or not db_path.is_file():
+    raise SystemExit("blocked: Test AppData learning database is unavailable or redirected")
+db_stat_before = db_path.stat()
+connection = sqlite3.connect(db_path.as_uri() + "?mode=ro", uri=True, timeout=1.0)
+connection.execute("PRAGMA query_only=ON")
+data_version_before = connection.execute("PRAGMA data_version").fetchone()[0]
+connection.execute("BEGIN")
+tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+table_keys = {
+    "learn_pairs": "pair_key", "learn_observations": "observation_key",
+    "learned_term_usage": "word", "style_drafts": "draft_key",
+}
+missing = sorted(set(table_keys) - tables)
+if missing:
+    raise SystemExit("blocked: learning tables unavailable: " + ",".join(missing))
+stable_tables = {}
+mutable_usage_tables = {}
+total_sql_bytes = 0
+for table, key_column in table_keys.items():
+    info = connection.execute(f'PRAGMA table_info("{table}")').fetchall()
+    columns = [row[1] for row in info]
+    if key_column not in columns:
+        raise SystemExit("blocked: row identity unavailable for " + table)
+    quoted = ['"' + column.replace('"', '""') + '"' for column in columns]
+    size_expr = " + ".join(f"COALESCE(length(CAST({column} AS BLOB)),0)" for column in quoted)
+    sizes = connection.execute(
+        f'SELECT rowid, {size_expr} FROM "{table}" ORDER BY rowid LIMIT ?',
+        (MAX_ROWS_PER_TABLE + 1,),
+    ).fetchall()
+    if len(sizes) > MAX_ROWS_PER_TABLE:
+        raise SystemExit("blocked: row count exceeds bound for " + table)
+    total_sql_bytes += sum(size for _, size in sizes)
+    if total_sql_bytes > MAX_SQL_BYTES:
+        raise SystemExit("blocked: SQLite source projection exceeds byte bound")
+    cursor = connection.execute(f'SELECT * FROM "{table}" ORDER BY rowid')
+    row_columns = [column[0] for column in cursor.description]
+    rows = [dict(zip(row_columns, values)) for values in cursor.fetchall()]
+    stable, usage = fingerprint_rows(table, rows, key_column)
+    stable_tables[table] = stable
+    if usage is not None:
+        mutable_usage_tables[table] = usage
+connection.commit()
+data_version_after = connection.execute("PRAGMA data_version").fetchone()[0]
+connection.close()
+settings_after = settings_path.stat()
+settings_bytes_after = read_bounded_bytes(settings_path, MAX_SETTINGS_BYTES)
+db_stat_after = db_path.stat()
+if settings_bytes != settings_bytes_after or (settings_before.st_ino, settings_before.st_size, settings_before.st_mtime_ns) != (settings_after.st_ino, settings_after.st_size, settings_after.st_mtime_ns):
+    raise SystemExit("blocked: Settings changed during fingerprint read")
+if data_version_before != data_version_after or (db_stat_before.st_ino, db_stat_before.st_size, db_stat_before.st_mtime_ns) != (db_stat_after.st_ino, db_stat_after.st_size, db_stat_after.st_mtime_ns):
+    raise SystemExit("blocked: SQLite changed during fingerprint read")
+result = {
+    "consistency": "per_file_stable_read_not_cross_store_atomic",
+    "settings_components": {name: sha_value(value) for name, value in components.items()},
+    "mapping_rows": mapping_rows,
+    "sqlite_stable_tables": stable_tables,
+    "sqlite_declared_mutable_usage": mutable_usage_tables,
+    "sqlite_source_bytes": total_sql_bytes,
+}
+encoded = canonical(result).encode()
+if len(encoded) > MAX_OUTPUT_BYTES:
+    raise SystemExit("blocked: fingerprint output exceeds byte bound")
+print(json.dumps({"sha256": sha_bytes(encoded), **result}, sort_keys=True))
+PY
+```
+
+Run the same code block with `VOICEFLOW_FINGERPRINT_SELF_TEST=1` to execute its adversarial check before any Test-root validation or read. It creates a temporary SQLite database, confirms changes to per-rule `last_used_at`/`replacement_runs` and term-level usage counters leave the stable digest unchanged while changing their usage digest, then combines those usage changes with an unauthorized scope/tombstone change and confirms the stable digest changes; it also checks the `MAX+1` settings read rejection. It prints only a fixed pass status and removes its temporary directory on exit.
+
+At each task, pair the fingerprint with the exact task's effective hint evidence: capture the actual serialized ASR `prompt` and/or cleanup `DICTIONARY_AND_STYLE_REFERENCES` field when the route sends one; record `not_requested` only for an established local/off route. The production audit does not expose request fields, so unavailable live request bytes are `unknown`, not inferred from the row projection. Keep fingerprints, task results, and audit receipts outside the repository. If a full owner-settled fingerprint is unavailable at a batch boundary, mark `blocked`; an App B no-replacement result alone is not isolation evidence.
+
+Run the isolated machine checks without a provider key or remote endpoint:
+
+```sh
+cargo test --manifest-path src-tauri/Cargo.toml manual_app_pair_replaces_without_a_global_dictionary_word_and_stays_scoped -- --nocapture
+cargo test --manifest-path src-tauri/Cargo.toml learning_a0_baseline_runs_production_probes_and_emits_observed_facts -- --nocapture
+cargo test --manifest-path src-tauri/Cargo.toml asr_wire_and_fixed_transcript_replace_only_in_matching_bundle -- --nocapture
+cargo test --manifest-path src-tauri/Cargo.toml cleanup_wire_blocks_local_pair_edits_and_keeps_unmatched_source -- --nocapture
+```
+
+The A0 command prints observed production-owner facts and fails when any frozen `target_met` is false. The ASR and cleanup wire tests hold family/mapping/input fixed and vary App A vs App B bundle. Both ASR calls return the same fixed synthetic transcript; exact multipart `prompt` inspection proves independently Manual-owned global words are sent while scoped-only canonical terms, aliases, `legacy_unknown`, orphaned Rule owners with no current SQLite row, unowned dictionary values, transcript markers and audio markers are absent. Within App A, a test-only exact-replacement switch compares the same ASR text with only final replacement execution enabled or disabled. The cleanup test captures the full cloud and loopback Ollama requests: App A scoped manual, auto and legacy pairs change its prepared text; a recognized unscoped legacy pair with only a `LegacyUnknown` canonical owner also stays out of cloud hints and blocks its changed transcript. The shared route guard records no-call for both cases and the cloud collector receives no App A request; the local Ollama wire carries the complete local references. App B leaves those scoped aliases untouched, sends the natural original text to the selected cloud route, and carries only the independent global pair hint. Assertions inspect `TRANSCRIPT` and `DICTIONARY_AND_STYLE_REFERENCES` and prove the scoped pair associations are absent from the cloud wire. The audio marker is a byte string, not evidence of speech. These checks preserve independently owned global Screen / Manual egress; they do not count as human trials, IME tests or quality evidence. The current owner preflight has no independent IME-commit or human/host author proof; stable AX readback therefore remains `unknown` for those acceptance dimensions.
+
+Run the existing V3 multi-scope fixture through its real stdin CLI in a new private temporary arm. Its programmatic text and declared scope are synthetic and do not create a passive observer arm or native App evidence. Keep output under `/tmp`; inspect the final completion response, because intermediate fixture requests intentionally include negative cases:
+
+```sh
+fixture_path=src-tauri/src/fixtures/learning-v3-multiscope.json
+arm_root="$(mktemp -d "${TMPDIR:-/tmp}/voiceflow-learning-v3-arm.XXXXXX")"
+chmod 700 "$arm_root"
+result_path="$(mktemp "${TMPDIR:-/tmp}/voiceflow-learning-v3-result.XXXXXX")"
+jq -c '.stdin_requests[]' "$fixture_path" \
+  | cargo run --manifest-path src-tauri/Cargo.toml --locked --offline --features research-harness --bin voiceflow-learning-harness -- --arm-root "$arm_root" \
+  > "$result_path"
+jq -e 'select(.result.complete == true)' "$result_path" >/dev/null
+```
+
+The final `jq` is the machine gate. A shell exit alone is insufficient if the final `result.complete` response is absent. This invocation never touches the Installable Test AppData or Keychain; discard only the newly created private temp arm/result after retaining the needed digest and receipt outside the repo.
+
 ## Deterministic learning baseline boundary
 
 The A0 replay fixture at [`learning-a0-baseline.json`](../src-tauri/evals/learning-a0-baseline.json) contains bounded inputs, frozen targets, and case classifications only. `dictionary_learn::tests::learning_a0_baseline_runs_production_probes_and_emits_observed_facts` executes the existing observer, candidate store, receipt, promotion, tombstone-owner, and replacement functions against isolated temporary state. It prints one `VOICEFLOW_LEARNING_A0_BASELINE_JSON` line with observed facts and target comparisons; save that run output outside the repository. The fixture itself is not a report of current behavior.
@@ -413,15 +728,17 @@ The observer now requires a successful read of the same changed inserted segment
 
 The backend adds `get_dictionary_learning_audit` using facts from the existing dictionary-learning registration, same-field observer, classifier, candidate store and review/save owners. It creates no second learning loop. One metadata token moves into the observer's actual selected persistence descendant and closes on its return; stale epochs, unknown aborts, evictions and clear generations remain distinct. Rejected unpersisted edits retain no text or invented pair link. Source UI wiring is present; runtime acceptance remains separately gated.
 
+An actual SQLite read or write error in the weak live-candidate path records `candidate_decision: unknown` with `candidate_store: failed/store_error`, then keeps propagating the error to its existing caller. A policy skip leaves candidate persistence `not_attempted`.
+
 The paste-to-observer handoff carries an internal, non-serialized `ConfirmedInsertionV1` minted only when the original paste owner confirms the exact expected UTF-16 splice in the same focused field with `PasteVerificationFact::Verified`; `VerifiedFullRange` does not authorize learning. The observer reads through that original anchor and uses the confirmed UTF-16 range with unchanged prefix/suffix anchors to localize the observed segment; it does not recapture the current field or locate the inserted text by searching. B1b now extracts up to three non-overlapping local word corrections from a bounded observed edit. It checks every hunk before deduplication; the lexical path rejects the entire edit when any hunk is unsafe, mixed with content changes, ambiguous, moved/reordered, insertion/deletion-only, or beyond the limit. A sentence-final period is excluded from the alias surface while periods inside identifiers remain part of the token; unsupported Unicode boundaries abstain. Explicit style handling uses a narrow whole-edit allowlist, so content-changing rewrites do not fall through to style. Structural suggestions do not imply automatic eligibility: every pair still passes the existing automatic gate, and `Reakt` → `React` has no evidence for automatic learning. History and local-only learning keep their existing conservative single-pair gate. The same owner holds separate grants: one single-use 3-second Undo and one absolute 12-second read lease. It checks observer epoch, cancellation and deadline on the owner side before and after each synchronous AX call; a call already in progress cannot be interrupted. The research learning task closes after all in-flight learning AX calls have actually returned and the read lease closes; the independent Undo owner may continue until its own grant is consumed, released or expires. This does not validate a real AppState multi-pair paste-to-native-AX chain, a same-Host delivery→correction→final-read sequence, native IME behavior, human correction, or learning benefit.
 
-SQLite promotion, settings-file call outcome, in-memory dictionary membership and the lexicon eligibility predicate are separate facts. A completed call does not establish all-row mutation or all-leg success; failure does not imply no side effects. Style/intensity records are distinguished from word classification and the existing two-name/three-term thresholds. Each learned rule keeps its saved scope; replacement, prompt hints, usage and final protection use the same applicable set, with missing required context remaining unknown. The projection calls existing `last_used_at` bookkeeping `last_output_surface_match_at`. Actual `replacement_runs` remains the separate term-level local-prepare counter, possibly preceding cancellation or unconfirmed delivery; multiple same-after rules must not multiply or reattribute it.
+SQLite promotion, settings-file call outcome, in-memory dictionary membership and the lexicon eligibility predicate are separate facts. A completed call does not establish all-row mutation or all-leg success; failure does not imply no side effects. Style/intensity records are distinguished from word classification and the existing two-name/three-term thresholds. Each learned rule keeps its saved scope; replacement, prompt hints, usage and final protection use the same applicable set, with missing required context remaining unknown. The projection calls per-rule `last_used_at` bookkeeping `last_output_surface_match_at`; `learn_pairs.replacement_runs` is the separate per-rule replacement count. `learned_term_usage.replacement_runs` remains the term-level local-prepare counter. Both usage counters can precede cancellation or unconfirmed delivery; multiple same-after rules must not multiply or reattribute the term-level count.
 
-C0 keeps public `Settings.dictionary` as a string list and persists separate per-word source ownership for manual entries, legacy words with unknown origin, and learning rules. A whole-dictionary settings patch remains a replacement: unchanged words keep their sources, new words become manual, and explicit removals clear the word's global effect and cancel pending additions. Add/import sends the unique valid words accepted by that action, including an existing learned spelling when the user explicitly adds it; it does not resend the merged dictionary. A full list still accepts an existing valid entry for manual ownership, while new words beyond the cap remain rejected. Forgetting a learning rule removes only that rule's source; manual or legacy ownership keeps the word. Paste observation and History edits use the database-owned dictation transaction as their shared origin; the same rule and origin count once. Retained legacy hit counts stay visible but do not combine with new known origins to satisfy automatic thresholds; only distinct eligible correction proofs count, while operation receipts and unknown-origin rows do not. Explicit confirmation is separate from evidence counting. Pending independent proof count comes from retained receipt rows, so History deletion may reduce a pending count; a promoted rule is not demoted. SQLite records the finite dictionary effect/version with the learning action before syncing Settings. If that second step fails, the command reports a partial result and UI says the source/rule was saved but the dictionary projection still needs retry. The deterministic local-only fixture does not exercise global Settings ownership, shared paste/History origin, or cross-store partial sync; its scoped replace/undo evidence is not C0 acceptance or quality evidence.
+C0 keeps public `Settings.dictionary` as a string list and persists separate per-word source ownership for manual entries, legacy words with unknown origin, and learning rules. A whole-dictionary settings patch remains a replacement: unchanged words keep their sources, new words become manual, and explicit removals clear the word's global effect and cancel pending additions. Add/import sends the unique valid words accepted by that action, including an existing learned spelling when the user explicitly adds it; it does not resend the merged dictionary. A full list still accepts an existing valid entry for manual ownership, while new words beyond the cap remain rejected. Forgetting a learning rule removes only that rule's source; manual or legacy ownership keeps the word. Paste observation and History edits use the database-owned dictation transaction as their shared origin; the same rule and origin count once. Retained legacy hit counts stay visible but do not combine with new known origins to satisfy automatic thresholds; only distinct eligible correction proofs count, while operation receipts and unknown-origin rows do not. Explicit confirmation is separate from evidence counting. Pending independent proof count comes from retained receipt rows, so History deletion may reduce a pending count; a promoted rule is not demoted. SQLite records the finite dictionary effect/version with the learning action before syncing Settings. If that second step fails, the command reports a partial result and UI says the source/rule was saved but the dictionary projection still needs retry. The corrected A0 probe exercises Manual source ownership, rule-source removal, and shared paste/History dictation origin through isolated production owners. It does not exercise cross-store partial sync or establish C0 acceptance; its deterministic evidence is not quality evidence.
 
 The content-free `dictionary_learning_audit://changed {runtime_id,audit_revision}` event only invalidates a snapshot. Audit revision stability does not certify a coherent DB/settings interval or authorize historic actions. A historic entry may only focus separately resolved existing current controls; changed/stale/error states do not enable audit-derived actions. Existing confirm/undo owners retain their validation. The API adds no mutation action. Activity is limited to 128 current-process entries; complete pair reads and actual encoding have separate 1024-row/2-MiB-source/16-MiB-JSON admission budgets and return typed unavailable on excess.
 
-The separate Settings form `add_manual_scoped_learn_pair` accepts an explicit before / after pair and a bundle selected from the current running native-app catalog. It does not require or create a style/context mapping, append the destination to the global personal dictionary, or edit a History row. A pair is stored in `learn_pairs` with `manual_scoped=true` and its native bundle. Scope resolution is fail closed; replacement, prompt hints, local usage and final pair protection reuse the single applicable promoted-pair set. Because the target word need not exist globally, this manual row has its own explicit eligibility fact, not a second replacement path. A pair-key collision with another scope is rejected and explained in Settings rather than silently combining scopes. Forgetting tombstones the row and does not remove a global dictionary word. The current selector offers native applications only; browser host pairs are not supported by this form.
+The separate Settings form `add_manual_scoped_learn_pair` accepts an explicit before / after pair and a bundle selected from the current running native-app catalog. It does not require or create a style/context mapping, append the destination to the global personal dictionary, or edit a History row. A pair is stored in `learn_pairs` with `manual_scoped=true` and its native bundle. Scope resolution is fail closed; replacement, local prompt hints, local usage and final pair protection reuse the single applicable promoted-pair set. This row has local replacement eligibility without global word ownership: it is excluded from cloud pair hints, and if its replacement changes text for a remote Cleanup request, that request is skipped with an auditable local-only result. C1 stores each mapping-scoped word rule under an opaque v2 identity containing scope, surfaces and match policy, so explicit A/B rules can coexist. If live rules in one applicable scope overlap on an alias but have different targets, the shared applicable set abstains. Existing automatic categories and thresholds remain unchanged; another automatic scope stays pending when the same legacy-normalized pair already has a live owner. Explicit manual confirmation remains available per scope. Mapping identity changes and deletion pause bound word rules until an explicit Settings rebind. Existing v19 learning rows are not rekeyed and their evidence is not transferred. Forgetting tombstones only this scoped row and does not remove another rule owner or a global dictionary word. The current selector offers native applications only; browser host pairs are not supported by this form.
 
 
 ### Onboarding check ownership and current readiness

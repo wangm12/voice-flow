@@ -2,7 +2,7 @@
 
 use crate::metrics::{
     CacheStatus, DeliveryOutcome, DictationClass, DictationTrace, ReportedStageDuration, Stage,
-    StopToInsertTimer,
+    StopDiagnostics, StopToInsertTimer,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
@@ -31,6 +31,8 @@ struct PersistedTrace {
     reported_stages: Vec<ReportedStageDuration>,
     #[serde(skip_serializing_if = "Option::is_none")]
     cache_status: Option<CacheStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stop_diagnostics: Option<StopDiagnostics>,
 }
 
 impl PersistedTrace {
@@ -49,6 +51,7 @@ impl PersistedTrace {
             stages: trace.stages,
             reported_stages: trace.reported_stages,
             cache_status: trace.cache_status,
+            stop_diagnostics: trace.stop_diagnostics,
         }
     }
 
@@ -417,14 +420,13 @@ fn write_record_with_failure(
         return Ok(());
     }
     let mut records = read_valid(path, now, max_bytes, retention_ms)?;
-    records.push_back(incoming.to_vec());
+    records.push_back((incoming_record.timestamp_ms, incoming.to_vec()));
     let mut records = records.into_iter().collect::<Vec<_>>();
-    records.sort_by_key(|line| {
-        serde_json::from_slice::<PersistedTrace>(&line[..line.len() - 1])
-            .map(|record| record.timestamp_ms)
-            .unwrap_or_default()
-    });
-    let mut records = records.into_iter().collect::<VecDeque<_>>();
+    records.sort_by_key(|(timestamp_ms, _)| *timestamp_ms);
+    let mut records = records
+        .into_iter()
+        .map(|(_, line)| line)
+        .collect::<VecDeque<_>>();
     let mut bytes = records.iter().map(Vec::len).sum::<usize>();
     while bytes > max_bytes {
         let Some(oldest) = records.pop_front() else {
@@ -449,8 +451,10 @@ fn prune_file_with_limits(
     max_bytes: usize,
     retention_ms: u64,
 ) -> std::io::Result<()> {
-    let records = read_valid(path, now, max_bytes, retention_ms)?;
-    let mut retained = records;
+    let mut retained = read_valid(path, now, max_bytes, retention_ms)?
+        .into_iter()
+        .map(|(_, line)| line)
+        .collect::<VecDeque<_>>();
     let mut bytes = retained.iter().map(Vec::len).sum::<usize>();
     while bytes > max_bytes {
         let Some(oldest) = retained.pop_front() else {
@@ -467,7 +471,7 @@ fn read_valid(
     now: u64,
     max_bytes: usize,
     retention_ms: u64,
-) -> std::io::Result<VecDeque<Vec<u8>>> {
+) -> std::io::Result<VecDeque<(u64, Vec<u8>)>> {
     let parent = path
         .parent()
         .ok_or_else(|| std::io::Error::other("missing trace parent"))?;
@@ -517,14 +521,10 @@ fn read_valid(
             }
             let mut canonical = serde_json::to_vec(&record).ok()?;
             canonical.push(b'\n');
-            (canonical.len() <= MAX_LINE_BYTES).then_some(canonical)
+            (canonical.len() <= MAX_LINE_BYTES).then_some((record.timestamp_ms, canonical))
         })
         .collect::<Vec<_>>();
-    retained.sort_by_key(|line| {
-        serde_json::from_slice::<PersistedTrace>(&line[..line.len() - 1])
-            .map(|record| record.timestamp_ms)
-            .unwrap_or_default()
-    });
+    retained.sort_by_key(|(timestamp_ms, _)| *timestamp_ms);
     Ok(retained.into())
 }
 
@@ -885,6 +885,7 @@ mod tests {
                 )],
                 reported_stages: Vec::new(),
                 cache_status: None,
+                stop_diagnostics: None,
             };
             let mut line = serde_json::to_vec(&record).unwrap();
             line.push(b'\n');
@@ -908,6 +909,7 @@ mod tests {
                 scope: crate::metrics::ReportedScope::Generation,
             }],
             cache_status: None,
+            stop_diagnostics: None,
         })
         .unwrap();
         unknown_nested["reported_stages"][0]["future_field"] = serde_json::json!("sentinel");
@@ -926,6 +928,7 @@ mod tests {
             stages: vec![(Stage::QueueWait, 0, 1); 257],
             reported_stages: Vec::new(),
             cache_status: None,
+            stop_diagnostics: None,
         })
         .unwrap();
         too_many.push(b'\n');
@@ -1043,7 +1046,7 @@ mod tests {
         let ordered = read_valid(&out_of_order_path, now, newer_existing.len(), 100).unwrap();
         assert_eq!(ordered.len(), 1);
         assert_eq!(
-            serde_json::from_slice::<PersistedTrace>(&ordered[0][..ordered[0].len() - 1])
+            serde_json::from_slice::<PersistedTrace>(&ordered[0].1[..ordered[0].1.len() - 1])
                 .unwrap()
                 .timestamp_ms,
             now - 10
@@ -1076,6 +1079,7 @@ mod tests {
                     stages: vec![(Stage::QueueWait, 0, 1); 257],
                     reported_stages: Vec::new(),
                     cache_status: None,
+                    stop_diagnostics: None,
                 })
                 .unwrap();
                 line.push(b'\n');
@@ -1145,6 +1149,7 @@ mod tests {
                 scope: crate::metrics::ReportedScope::FullPrompt,
             }],
             cache_status: None,
+            stop_diagnostics: None,
         };
         let size_cap = recent.len() + serde_json::to_vec(&expected_new).unwrap().len() + 1;
         let size_sink = DictationTraceSink::new(size_root.0.clone()).with_test_policy(
@@ -1363,6 +1368,7 @@ mod tests {
             stages: Vec::new(),
             reported_stages: Vec::new(),
             cache_status: None,
+            stop_diagnostics: None,
         };
         let mut prior = serde_json::to_vec(&prior_record).unwrap();
         prior.push(b'\n');

@@ -139,11 +139,13 @@ describe("provider catalog", () => {
     expect(isKnownModel("groq", "llm", "qwen/qwen3.8-27b")).toBe(true);
   });
 
-  it("retires uncalibrated and legacy on-device ASR models for new selections and downloads", () => {
-    for (const id of ["qwen3-asr-1.7b", "cohere-transcribe-2b", "sensevoice-small"]) {
+  it("retires legacy on-device ASR models for new selections and downloads while keeping Qwen3-ASR models available", () => {
+    for (const id of ["cohere-transcribe-2b", "sensevoice-small"]) {
       expect(isKnownModel("on_device", "asr", id)).toBe(true);
       expect(isRetiredOnDeviceModel(id)).toBe(true);
     }
+    expect(isKnownModel("on_device", "asr", "qwen3-asr-1.7b")).toBe(true);
+    expect(isRetiredOnDeviceModel("qwen3-asr-1.7b")).toBe(false);
     expect(isRetiredOnDeviceModel("qwen3-asr-0.6b")).toBe(false);
     expect(defaultModel("on_device", "asr")).toBe("qwen3-asr-0.6b");
   });

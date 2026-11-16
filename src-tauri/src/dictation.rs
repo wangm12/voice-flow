@@ -164,7 +164,7 @@ impl OwnedReplayTargetBinding {
         self.target.bundle_id.as_deref().unwrap_or_default()
     }
 
-    #[cfg(any(test, all(feature = "research-harness", target_os = "macos")))]
+    #[cfg(all(feature = "research-harness", target_os = "macos"))]
     pub(crate) fn expected_document_path(&self) -> Option<&std::path::Path> {
         self.expected_document_path.as_deref()
     }
@@ -307,6 +307,7 @@ pub(crate) struct DictationManager {
     pub(crate) onboarding_trial: Option<crate::onboarding::TrialSnapshot>,
     pub(crate) research_trace: Option<crate::research_trace::Trace>,
     pub(crate) stop_when_recording: bool,
+    pending_stop_source: Option<crate::metrics::StopSource>,
     pub(crate) skip_llm_cleanup: bool,
     pub(crate) translation_target_language: Option<String>,
     pub(crate) owned_replay_learning_suppressed: bool,
@@ -333,6 +334,7 @@ impl DictationManager {
             onboarding_trial: None,
             research_trace: None,
             stop_when_recording: false,
+            pending_stop_source: None,
             skip_llm_cleanup: false,
             translation_target_language: None,
             owned_replay_learning_suppressed: false,
@@ -504,6 +506,7 @@ pub(crate) struct StopClaim {
     pub(crate) recording_generation: u64,
     pub(crate) delivery_settlement: Option<std::sync::Arc<DeliverySettlementOwner>>,
     pub(crate) ended_during_start: bool,
+    pub(crate) source: crate::metrics::StopSource,
     pub(crate) skip_llm_cleanup: bool,
     pub(crate) translation_target_language: Option<String>,
     pub(crate) owned_replay_learning_suppressed: bool,
@@ -539,6 +542,7 @@ pub(crate) fn claim_start_manager(
     manager.paste_owner_state = PasteOwnerState::NotStarted;
     manager.onboarding_trial = None;
     manager.research_trace = None;
+    manager.pending_stop_source = None;
     manager.phase = Phase::Starting;
     manager.session_generation = manager.session_generation.wrapping_add(1);
     manager.recording_generation = manager.session_generation;
@@ -645,17 +649,29 @@ fn admit_started_settlement(
 }
 
 pub(crate) fn claim_stop_manager(manager: &mut DictationManager) -> Option<StopClaim> {
+    claim_stop_manager_with_source(manager, crate::metrics::StopSource::Unknown)
+}
+
+fn claim_stop_manager_with_source(
+    manager: &mut DictationManager,
+    requested_source: crate::metrics::StopSource,
+) -> Option<StopClaim> {
     if manager.phase != Phase::Recording {
         return None;
     }
     let recording_generation = manager.session_generation;
     manager.session_generation = manager.session_generation.wrapping_add(1);
+    let source = manager
+        .pending_stop_source
+        .take()
+        .unwrap_or(requested_source);
     let claim = StopClaim {
         started: manager.started,
         session_generation: manager.session_generation,
         recording_generation,
         delivery_settlement: manager.delivery_settlement.clone(),
         ended_during_start: manager.stop_when_recording,
+        source,
         skip_llm_cleanup: manager.skip_llm_cleanup,
         translation_target_language: manager.translation_target_language.clone(),
         owned_replay_learning_suppressed: manager.owned_replay_learning_suppressed,
@@ -685,10 +701,22 @@ pub(crate) fn claim_stop_manager_for_generation(
     manager: &mut DictationManager,
     expected_generation: u64,
 ) -> Option<StopClaim> {
+    claim_stop_manager_for_generation_with_source(
+        manager,
+        expected_generation,
+        crate::metrics::StopSource::Unknown,
+    )
+}
+
+pub(crate) fn claim_stop_manager_for_generation_with_source(
+    manager: &mut DictationManager,
+    expected_generation: u64,
+    source: crate::metrics::StopSource,
+) -> Option<StopClaim> {
     if manager.phase != Phase::Recording || manager.session_generation != expected_generation {
         return None;
     }
-    claim_stop_manager(manager)
+    claim_stop_manager_with_source(manager, source)
 }
 
 fn hud_cancel_matches_session(phase: Phase, generation: u64, expected_generation: u64) -> bool {
@@ -860,12 +888,22 @@ pub(crate) fn claim_stop(state: &AppState) -> Option<StopClaim> {
 
 /// A release or second tap: stop now if recording, otherwise remember to stop once
 /// `Starting` becomes `Recording`.
+#[cfg(all(feature = "research-harness", target_os = "macos"))]
 pub(crate) fn request_stop(manager: &mut DictationManager) -> Option<StopClaim> {
-    if let Some(claim) = claim_stop_manager(manager) {
-        return Some(claim);
+    request_stop_with_source(manager, crate::metrics::StopSource::Unknown)
+}
+
+fn request_stop_with_source(
+    manager: &mut DictationManager,
+    source: crate::metrics::StopSource,
+) -> Option<StopClaim> {
+    if manager.phase == Phase::Recording {
+        manager.pending_stop_source = Some(source);
+        return claim_stop_manager_with_source(manager, source);
     }
-    if manager.phase == Phase::Starting {
+    if manager.phase == Phase::Starting && !manager.stop_when_recording {
         manager.stop_when_recording = true;
+        manager.pending_stop_source = Some(source);
     }
     None
 }
@@ -964,20 +1002,32 @@ pub(crate) fn record_owned_replay_source_started(
     )
 }
 
-pub(crate) async fn claim_stop_entry(state: &AppState) -> Option<StopClaim> {
+pub(crate) async fn claim_stop_entry_with_source(
+    state: &AppState,
+    source: crate::metrics::StopSource,
+) -> Option<StopClaim> {
     let _gate = state.hotkey_gate.lock().await;
-    claim_stop(state)
+    if source == crate::metrics::StopSource::Unknown {
+        return claim_stop(state);
+    }
+    let mut manager = lock_recover(&state.manager);
+    claim_stop_manager_with_source(&mut manager, source)
 }
 
 /// Stop claim bound to the Recording generation named by an engine event, so a
 /// late `audio://limit` for an older session cannot stop a newer one.
-pub(crate) async fn claim_stop_entry_for_generation(
+pub(crate) async fn claim_stop_entry_for_generation_with_source(
     state: &AppState,
     expected_generation: u64,
+    source: crate::metrics::StopSource,
 ) -> Option<StopClaim> {
     let _gate = state.hotkey_gate.lock().await;
     let mut manager = lock_recover(&state.manager);
-    claim_stop_manager_for_generation(&mut manager, expected_generation)
+    if source == crate::metrics::StopSource::Unknown {
+        claim_stop_manager_for_generation(&mut manager, expected_generation)
+    } else {
+        claim_stop_manager_for_generation_with_source(&mut manager, expected_generation, source)
+    }
 }
 
 #[cfg(all(feature = "research-harness", target_os = "macos"))]
@@ -1025,6 +1075,7 @@ pub(crate) fn reset_starting_manager(manager: &mut DictationManager) -> u64 {
         manager.recording_learning_snapshot = None;
         manager.recording_translation_target_language = None;
         manager.stop_when_recording = false;
+        manager.pending_stop_source = None;
         clear_hotkey_session(manager);
     }
     manager.session_generation
@@ -1048,6 +1099,7 @@ pub(crate) struct CancelClaim {
     /// Start generation of the cancelled recording; see
     /// `DictationManager::recording_generation`.
     pub(crate) recording_generation: u64,
+    pub(crate) source: crate::metrics::StopSource,
     pub(crate) delivery_settlement: Option<std::sync::Arc<DeliverySettlementOwner>>,
     pub(crate) had_action: bool,
     pub(crate) text_action: Option<crate::TextActionIdentity>,
@@ -1068,6 +1120,7 @@ fn claim_cancel_for_interrupt_manager(manager: &mut DictationManager) -> Option<
         phase,
         generation: manager.session_generation,
         recording_generation: manager.recording_generation,
+        source: crate::metrics::StopSource::Interrupt,
         delivery_settlement,
         had_action: false,
         text_action: None,
@@ -1096,19 +1149,29 @@ pub(crate) fn claim_cancel_manager(manager: &mut DictationManager, had_preview: 
         manager.recording_learning_snapshot = None;
         manager.recording_translation_target_language = None;
         manager.stop_when_recording = false;
+        manager.pending_stop_source = None;
         clear_hotkey_session(manager);
     }
     phase
 }
 
+#[cfg(any(test, all(feature = "research-harness", target_os = "macos")))]
 pub(crate) fn claim_cancel(state: &AppState) -> CancelClaim {
+    claim_cancel_with_source(state, crate::metrics::StopSource::Unknown)
+}
+
+pub(crate) fn claim_cancel_with_source(
+    state: &AppState,
+    source: crate::metrics::StopSource,
+) -> CancelClaim {
     let text_action = crate::cancel_active_text_action(state);
-    claim_cancel_for_text_action(state, text_action)
+    claim_cancel_for_text_action(state, text_action, source)
 }
 
 fn claim_cancel_for_text_action(
     state: &AppState,
     text_action: Option<crate::TextActionIdentity>,
+    source: crate::metrics::StopSource,
 ) -> CancelClaim {
     clear_selected_action(state);
     clear_screen_action(state);
@@ -1139,12 +1202,40 @@ fn claim_cancel_for_text_action(
         phase,
         generation: manager.session_generation,
         recording_generation: manager.recording_generation,
+        source,
         delivery_settlement,
         had_action,
         text_action,
         onboarding_trial: manager.onboarding_trial.clone(),
         research_trace: manager.research_trace.clone(),
     }
+}
+
+pub(crate) fn record_terminal_capture_end_diagnostic(
+    state: &AppState,
+    recording_generation: u64,
+    source: crate::metrics::StopSource,
+    outcome: crate::metrics::DeliveryOutcome,
+    reason: &'static str,
+) {
+    // Cancellation during capture is persisted through the same bounded trace
+    // sink, but does not count as an ordinary stop-to-insert delivery sample.
+    let mut timer = crate::metrics::Metrics::default().stop_to_insert(
+        crate::metrics::MetricGroup::unknown("dictation"),
+        CancellationToken::new(),
+    );
+    let trace = timer.bind_trace(recording_generation);
+    trace.set_stop_diagnostics(crate::metrics::StopDiagnostics {
+        recording_generation,
+        action: crate::metrics::StopAction::Cancel,
+        source,
+        capture_duration_ms: None,
+        post_stop_asr_started: None,
+    });
+    if let Some(sink) = &state.dictation_trace_sink {
+        sink.bind(&mut timer);
+    }
+    timer.finish(outcome, Some(reason));
 }
 
 fn claim_cancel_for_interrupt(state: &AppState) -> Option<CancelClaim> {
@@ -1178,11 +1269,6 @@ fn claim_cancel_for_interrupt(state: &AppState) -> Option<CancelClaim> {
     Some(claim)
 }
 
-async fn claim_cancel_entry(state: &AppState) -> CancelClaim {
-    let _gate = state.hotkey_gate.lock().await;
-    claim_cancel(state)
-}
-
 async fn claim_cancel_entry_for_hud(
     state: &AppState,
     expected_generation: u64,
@@ -1196,7 +1282,7 @@ async fn claim_cancel_entry_for_hud(
             expected_generation,
         )
     };
-    matches.then(|| claim_cancel(state))
+    matches.then(|| claim_cancel_with_source(state, crate::metrics::StopSource::Hud))
 }
 
 pub(crate) async fn cancel_text_action_by_id(
@@ -1216,7 +1302,11 @@ pub(crate) async fn cancel_text_action_by_id(
             // The commit owner settles the preview and reports its own outcome.
             return Some(outcome);
         };
-        let claim = claim_cancel_for_text_action(state, Some(owner.clone()));
+        let claim = claim_cancel_for_text_action(
+            state,
+            Some(owner.clone()),
+            crate::metrics::StopSource::Hud,
+        );
         (outcome, claim)
     };
     let crate::PreviewCancel::Cancelled(identity, _) = &cancelled else {
@@ -1248,7 +1338,11 @@ pub(crate) async fn settle_cancel_during_commit(
         {
             return false;
         }
-        claim_cancel_for_text_action(state, Some(identity.clone()))
+        claim_cancel_for_text_action(
+            state,
+            Some(identity.clone()),
+            crate::metrics::StopSource::Hud,
+        )
     };
     execute_cancel_claim(app, state, claim).await;
     true
@@ -1305,6 +1399,19 @@ pub(crate) async fn execute_cancel_claim(
     state: &AppState,
     claim: CancelClaim,
 ) {
+    if claim.phase != Phase::Idle {
+        record_terminal_capture_end_diagnostic(
+            state,
+            claim.recording_generation,
+            claim.source,
+            crate::metrics::DeliveryOutcome::Cancelled,
+            if matches!(claim.phase, Phase::Starting | Phase::Recording) {
+                "cancelled_before_stop"
+            } else {
+                "cancelled_after_stop"
+            },
+        );
+    }
     state.gate.set_session_generation(claim.generation);
     // The cancellation claim seals synchronously while generation changes are
     // serialized. Join outside `hotkey_gate` so a running native writer can
@@ -1386,8 +1493,15 @@ pub(crate) async fn execute_cancel_claim(
     }
 }
 
-pub(crate) async fn cancel_internal(app: &tauri::AppHandle, state: &AppState) {
-    let claim = claim_cancel_entry(state).await;
+pub(crate) async fn cancel_internal_with_source(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    source: crate::metrics::StopSource,
+) {
+    let claim = {
+        let _gate = state.hotkey_gate.lock().await;
+        claim_cancel_with_source(state, source)
+    };
     execute_cancel_claim(app, state, claim).await;
 }
 
@@ -1407,7 +1521,7 @@ pub(crate) async fn cancel_onboarding_trial(
         }) {
             return;
         }
-        claim_cancel(state)
+        claim_cancel_with_source(state, crate::metrics::StopSource::Unknown)
     };
     execute_cancel_claim(app, state, claim).await;
 }
@@ -1416,7 +1530,8 @@ pub(crate) async fn stop_internal(app: &tauri::AppHandle, state: &AppState) -> R
     if state.exit_state.load(std::sync::atomic::Ordering::Acquire) != 0 {
         return Ok(());
     }
-    let Some(claim) = claim_stop_entry(state).await else {
+    let Some(claim) = claim_stop_entry_with_source(state, crate::metrics::StopSource::Cli).await
+    else {
         return Ok(());
     };
     stop_claimed(app, state, claim).await
@@ -1433,7 +1548,11 @@ async fn stop_from_hud_internal(
     let claim = {
         let _gate = state.hotkey_gate.lock().await;
         let mut manager = lock_recover(&state.manager);
-        claim_stop_manager_for_generation(&mut manager, expected_generation)
+        claim_stop_manager_for_generation_with_source(
+            &mut manager,
+            expected_generation,
+            crate::metrics::StopSource::Hud,
+        )
     };
     if let Some(claim) = claim {
         stop_claimed(app, state, claim).await?;
@@ -1570,12 +1689,12 @@ pub(crate) fn install_hotkey_dispatcher(app: tauri::AppHandle) {
                 match input {
                     HotkeyInputMessage::FullCancel => claim_cancel_from_fifo(
                         FifoCancelOrigin::Full,
-                        || claim_cancel(&state),
+                        || claim_cancel_with_source(&state, crate::metrics::StopSource::Esc),
                         || claim_cancel_for_interrupt(&state),
                     ),
                     HotkeyInputMessage::Interrupt => claim_cancel_from_fifo(
                         FifoCancelOrigin::Interrupt,
-                        || claim_cancel(&state),
+                        || claim_cancel_with_source(&state, crate::metrics::StopSource::Interrupt),
                         || claim_cancel_for_interrupt(&state),
                     ),
                     HotkeyInputMessage::Gesture(input)
@@ -1596,12 +1715,13 @@ pub(crate) fn install_hotkey_dispatcher(app: tauri::AppHandle) {
                         let claim = {
                             let mut lease = lock_recover(&state.operation_lease);
                             let mut manager = lock_recover(&state.manager);
-                            let mut claim = claim_gesture(
+                            let mut claim = claim_gesture_with_source(
                                 &mut manager,
                                 &mut lease,
                                 mode,
                                 input.trigger,
                                 input.gesture_id,
+                                crate::metrics::StopSource::Toggle,
                             );
                             if let EntryClaim::Start(generation) = &claim {
                                 if admit_started_settlement(
@@ -1620,7 +1740,10 @@ pub(crate) fn install_hotkey_dispatcher(app: tauri::AppHandle) {
                             claim
                         };
                         if matches!(claim, EntryClaim::Cancel(_)) {
-                            EntryClaim::Cancel(claim_cancel(&state))
+                            EntryClaim::Cancel(claim_cancel_with_source(
+                                &state,
+                                crate::metrics::StopSource::Interrupt,
+                            ))
                         } else {
                             claim
                         }
@@ -1639,12 +1762,31 @@ pub(crate) fn install_hotkey_dispatcher(app: tauri::AppHandle) {
     });
 }
 
+#[cfg(test)]
 fn claim_gesture(
     manager: &mut DictationManager,
     lease: &mut OperationLease,
     mode: RecordingMode,
     trigger: ModeTrigger,
     gesture_id: u64,
+) -> EntryClaim {
+    claim_gesture_with_source(
+        manager,
+        lease,
+        mode,
+        trigger,
+        gesture_id,
+        crate::metrics::StopSource::Unknown,
+    )
+}
+
+fn claim_gesture_with_source(
+    manager: &mut DictationManager,
+    lease: &mut OperationLease,
+    mode: RecordingMode,
+    trigger: ModeTrigger,
+    gesture_id: u64,
+    stop_source: crate::metrics::StopSource,
 ) -> EntryClaim {
     let source = mode.source();
     match trigger {
@@ -1664,7 +1806,7 @@ fn claim_gesture(
         ModeTrigger::Toggle
             if manager.recording_source.is_none() || manager.recording_source == Some(source) =>
         {
-            request_stop(manager)
+            request_stop_with_source(manager, stop_source)
                 .map(EntryClaim::Stop)
                 .unwrap_or(EntryClaim::Ignore)
         }
@@ -1684,6 +1826,7 @@ fn claim_gesture(
                     phase: manager.phase,
                     generation: manager.session_generation,
                     recording_generation: manager.recording_generation,
+                    source: crate::metrics::StopSource::Interrupt,
                     delivery_settlement: manager.delivery_settlement.clone(),
                     had_action: false,
                     text_action: None,
@@ -1691,9 +1834,16 @@ fn claim_gesture(
                     research_trace: manager.research_trace.clone(),
                 })
             } else {
-                request_stop(manager)
-                    .map(EntryClaim::Stop)
-                    .unwrap_or(EntryClaim::Ignore)
+                request_stop_with_source(
+                    manager,
+                    if trigger == ModeTrigger::Release {
+                        crate::metrics::StopSource::HoldRelease
+                    } else {
+                        stop_source
+                    },
+                )
+                .map(EntryClaim::Stop)
+                .unwrap_or(EntryClaim::Ignore)
             }
         }
         _ => EntryClaim::Ignore,
@@ -1708,7 +1858,14 @@ async fn handle_cli_toggle(app: &tauri::AppHandle, state: &AppState, mode: Recor
         let _gate = state.hotkey_gate.lock().await;
         let mut lease = lock_recover(&state.operation_lease);
         let mut manager = lock_recover(&state.manager);
-        let claim = claim_gesture(&mut manager, &mut lease, mode, ModeTrigger::Toggle, 0);
+        let claim = claim_gesture_with_source(
+            &mut manager,
+            &mut lease,
+            mode,
+            ModeTrigger::Toggle,
+            0,
+            crate::metrics::StopSource::Cli,
+        );
         if matches!(&claim, EntryClaim::Start(_))
             && !admit_started_settlement(&mut manager, &mut lease, &state.delivery_settlements)
         {
@@ -2490,6 +2647,7 @@ mod tests {
             phase,
             generation: manager.session_generation,
             recording_generation: manager.recording_generation,
+            source: crate::metrics::StopSource::Unknown,
             delivery_settlement,
             had_action: had_action || phase != Phase::Idle,
             text_action: None,
@@ -3054,6 +3212,11 @@ mod skip_session_tests {
             id: "editor".into(),
             label: "Editor".into(),
             family: context::ContextFamily::Document,
+            writing_task_id: None,
+            writing_preferences: Vec::new(),
+            preference_guidance_provider_approved: false,
+            preference_revision: 0,
+            deleted: false,
             mode_id: None,
             bundle_id: Some("com.example.editor".into()),
             executable: None,

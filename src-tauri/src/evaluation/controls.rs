@@ -247,7 +247,7 @@ impl JobFixtureInputs {
                 row.map(|r| {
                     r.replacements
                         .iter()
-                        .map(|p| crate::lexicon::LexiconPair::new(&p.before, &p.after))
+                        .map(|p| crate::lexicon::LexiconPair::legacy_fixture(&p.before, &p.after))
                         .collect()
                 })
                 .unwrap_or_default()

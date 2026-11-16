@@ -5,8 +5,9 @@ export const auditPairRef = "22222222-2222-4222-8222-222222222222";
 export function auditPair(overrides: Partial<LearningAuditPair> = {}): LearningAuditPair {
   return {
     pair_ref: auditPairRef, pair_key: "fixture-star-protocol", before_surface: "星蓝协议", after_surface: "星澜协议",
+    match_policy: "ignore_case", manual_scoped: false, auto_scoped: false, binding_invalidated_at: null, binding_invalidated_reason: null,
     rule_kind: "word_pair", record_state: "pending", candidate_hits: 1,
-    current_classification: { class: "term", reason: null }, current_promote_threshold: 3, classification_authority: "current_owner_classification",
+    current_classification: { class: "term", reason: null }, current_promote_threshold: null, classification_authority: "current_owner_classification",
     recorded_scope: { family: "document", mapping_id: "fixture.document", browser_host: null, native_bundle: "test.fixture.document" },
     origin: "unknown_not_persisted", tombstone_reason: null, latest_record_change_at: "2026-10-15 00:00:00",
     last_output_surface_match_at: null, current_dictionary_contains_after: false,

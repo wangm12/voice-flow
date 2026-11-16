@@ -16,6 +16,8 @@ import { ContextLesson, SceneLesson } from "./Onboarding/ContextualLessons";
 import { SettingsAlert, SettingsDisclosure, SettingsGroup, SettingsPageHeader, SettingsRow, SettingsShell, type SettingsSaveFailure } from "./SettingsLayout";
 import { translationLanguageOptions } from "../lib/translationLanguages";
 import type { ProviderId } from "../lib/providers";
+import { WritingPreferenceReview, type WritingPreferenceCandidate, type WritingPreferenceDecisionItem, type WritingPreferenceDecisionOutcome } from "./WritingPreferenceReview";
+import { settingsErrorMessage } from "../lib/settingsError";
 
 export type ContextFamily =
   | "email"
@@ -54,8 +56,109 @@ export type ContextSourcePermissions = {
   context_text_to_providers: boolean;
 };
 
+export type WritingTaskId = "project_update" | "email" | "work_chat" | "personal_chat" | "document_editing";
+export type WritingPreferenceDimension = "list_structure" | "greeting_tone" | "terminal_punctuation";
+export type WritingPreferenceValue = "bullets" | "conversational_greeting" | "respectful_greeting" | "terminal_period" | "no_terminal_period";
+export type WritingPreferenceStatus = "active" | "paused" | "forgotten";
+
+export type ContextWritingPreference = {
+  task_id?: WritingTaskId;
+  dimension: WritingPreferenceDimension;
+  value: WritingPreferenceValue;
+  status: WritingPreferenceStatus;
+  version: number;
+};
+
+type PreferenceDraftItem = {
+  value: WritingPreferenceValue | "";
+  status: WritingPreferenceStatus | "";
+};
+
+type WritingPreferenceDraft = Record<WritingPreferenceDimension, PreferenceDraftItem>;
+
+type PreferenceReviewEditorState = {
+  editingMappingId: string | null;
+  preferenceRevisionBaseline: { mappingId: string | null; revision: number | null };
+  selectedModeFamily: ContextFamily | null;
+  selectedWritingTaskId: WritingTaskId | "";
+  selectedApplicationId: string;
+  selectedExecutable: string;
+  selectedWebsite: string;
+  browserPathPrefix: string;
+  focusedField: FocusKind | "";
+  writingPreferenceDraft: WritingPreferenceDraft;
+  preferenceGuidanceProviderApproved: boolean;
+};
+
+type PreferenceReviewStartSnapshot = {
+  mapping: ContextMapping | undefined;
+};
+
+type PreferenceReviewConflict = {
+  candidateId: string;
+  mappingId: string;
+  taskId: WritingTaskId;
+  dimension: WritingPreferenceDimension;
+  reason: "scope_changed" | "preference_draft_changed" | "provider_grant_changed";
+};
+
+function writingPreferenceCandidateKey(candidate: Pick<WritingPreferenceCandidate, "candidate_id" | "candidate_generation">): string {
+  return `${candidate.candidate_id}:${candidate.candidate_generation}`;
+}
+
+function samePreferenceDraftItem(left: PreferenceDraftItem, right: PreferenceDraftItem): boolean {
+  return left.value === right.value && left.status === right.status;
+}
+
+function selectedModeFamilyForEditor(
+  modes: WritingMode[],
+  selectedModeId: string,
+  draftModeId: string | null,
+): ContextFamily | null {
+  return modes.find((mode) => mode.id === selectedModeId && mode.id !== draftModeId)?.family ?? null;
+}
+
+function mappingSelectorsFromEditor(editor: PreferenceReviewEditorState): Pick<ContextMapping, "bundle_id" | "executable" | "browser_host" | "browser_path_prefix" | "focused_field"> | null {
+  const rawWebsite = editor.selectedWebsite.trim();
+  const browserHost = rawWebsite ? normalizeBrowserHost(rawWebsite) : null;
+  if (rawWebsite && !browserHost) return null;
+  return {
+    bundle_id: editor.selectedApplicationId || null,
+    executable: editor.selectedExecutable.trim() || null,
+    browser_host: browserHost,
+    browser_path_prefix: editor.browserPathPrefix.trim() || null,
+    focused_field: editor.focusedField || null,
+  };
+}
+
+function writingPreferenceMappingScope(
+  mapping: ContextMapping | undefined,
+  applications: ApplicationOption[],
+  translate: (source: string) => string,
+): string | null {
+  if (!mapping || !mapping.enabled) return null;
+  const selectors: string[] = [];
+  if (mapping.bundle_id) {
+    const app = applications.find((option) => option.bundle_id === mapping.bundle_id);
+    selectors.push(`${translate("App")}: ${app?.label ?? mapping.label} (${mapping.bundle_id})`);
+  }
+  if (mapping.executable) selectors.push(`${translate("可执行文件")}: ${mapping.executable}`);
+  if (mapping.browser_host) {
+    selectors.push(`${translate("网站")}: ${translate(websiteLabels[mapping.browser_host] ?? mapping.browser_host)} (${mapping.browser_host})`);
+  }
+  if (mapping.browser_path_prefix) selectors.push(`${translate("路径前缀")}: ${mapping.browser_path_prefix}`);
+  if (mapping.focused_field) selectors.push(`${translate("输入框")}: ${focusFieldLabel(mapping.focused_field, translate)}`);
+  return selectors.length > 0 ? selectors.join(" · ") : null;
+}
+
+const emptyWritingPreferenceDraft: WritingPreferenceDraft = {
+  list_structure: { value: "", status: "" },
+  greeting_tone: { value: "", status: "" },
+  terminal_punctuation: { value: "", status: "" },
+};
+
 type ContextSnapshot = {
-  profile: { id: string; family: ContextFamily; writing_mode_id?: string | null; app_label: string; icon_key: string; source: string; confidence: number };
+  profile: { id: string; family: ContextFamily; writing_mode_id?: string | null; writing_task_id?: WritingTaskId | null; app_label: string; icon_key: string; source: string; confidence: number };
   policy?: { input_kind?: FocusKind };
   browser_access_status: "not_applicable" | "disabled" | "needs_permission" | "granted" | "unavailable";
 };
@@ -64,6 +167,10 @@ export type ContextMapping = {
   id: string;
   label: string;
   family: ContextFamily;
+  writing_task_id?: WritingTaskId | null;
+  writing_preferences?: ContextWritingPreference[];
+  preference_guidance_provider_approved?: boolean;
+  preference_revision?: number;
   mode_id?: string | null;
   bundle_id?: string | null;
   executable?: string | null;
@@ -194,11 +301,46 @@ const focusFieldOptions: { value: FocusKind; label: string }[] = [
   { value: "coding_prompt", label: "代码提示输入框" },
 ];
 
+const writingTaskOptions: { value: WritingTaskId; label: string }[] = [
+  { value: "project_update", label: "项目更新" },
+  { value: "email", label: "邮件正文" },
+  { value: "work_chat", label: "工作聊天" },
+  { value: "personal_chat", label: "私人聊天" },
+  { value: "document_editing", label: "文档撰写" },
+];
+
 function sourcePermissionValue(
   permissions: ContextMapping["source_permissions"],
   key: keyof ContextSourcePermissions,
 ): boolean {
   return permissions?.[key] === true;
+}
+
+function preferenceDraftFrom(mapping?: ContextMapping, taskId?: WritingTaskId | ""): WritingPreferenceDraft {
+  const draft: WritingPreferenceDraft = {
+    list_structure: { ...emptyWritingPreferenceDraft.list_structure },
+    greeting_tone: { ...emptyWritingPreferenceDraft.greeting_tone },
+    terminal_punctuation: { ...emptyWritingPreferenceDraft.terminal_punctuation },
+  };
+  for (const preference of mapping?.writing_preferences ?? []) {
+    if ((preference.task_id ?? mapping?.writing_task_id) === taskId && preference.dimension in draft) {
+      draft[preference.dimension] = { value: preference.value, status: preference.status };
+    }
+  }
+  return draft;
+}
+
+function preferencesFromDraft(draft: WritingPreferenceDraft, taskId: WritingTaskId | ""): ContextWritingPreference[] {
+  if (!taskId) return [];
+  return (Object.entries(draft) as [WritingPreferenceDimension, PreferenceDraftItem][])
+    .flatMap(([dimension, item]) => item.value && item.status
+      ? [{ task_id: taskId, dimension, value: item.value, status: item.status, version: 1 }]
+      : []);
+}
+
+function hasCloudSupportedActivePreference(preferences: ContextWritingPreference[]): boolean {
+  return preferences.some((preference) => preference.status === "active"
+    && (preference.dimension === "greeting_tone" || preference.dimension === "terminal_punctuation"));
 }
 
 function sourceLabel(source: string, translate: (source: string) => string): string {
@@ -255,23 +397,24 @@ function normalizeBrowserHost(value: string): string | null {
 }
 
 function selectorsEqual(left: ContextMapping, right: Pick<ContextMapping, "bundle_id" | "executable" | "browser_host" | "browser_path_prefix" | "focused_field">): boolean {
+  const normalizePath = (value: string | null | undefined) => {
+    const path = value?.trim() ?? "";
+    if (!path) return null;
+    if (!path.startsWith("/") || path.includes("//") || /[\\\s?#]/.test(path)) return path;
+    return path === "/" ? path : path.replace(/\/+$/, "");
+  };
+  const normalizeHost = (value: string | null | undefined) => {
+    const host = value?.trim() ?? "";
+    return host ? normalizeBrowserHost(host) ?? host.toLowerCase() : null;
+  };
   return (left.bundle_id ?? null) === (right.bundle_id ?? null)
-    && (left.executable?.trim() || null) === (right.executable?.trim() || null)
-    && (left.browser_host?.toLowerCase() || null) === (right.browser_host?.toLowerCase() || null)
-    && (left.browser_path_prefix?.trim() || null) === (right.browser_path_prefix?.trim() || null)
+    && (left.executable || null) === (right.executable || null)
+    && normalizeHost(left.browser_host) === normalizeHost(right.browser_host)
+    && normalizePath(left.browser_path_prefix) === normalizePath(right.browser_path_prefix)
     && (left.focused_field ?? null) === (right.focused_field ?? null);
 }
 
-function newMappingId(selectors: Pick<ContextMapping, "bundle_id" | "executable" | "browser_host" | "browser_path_prefix" | "focused_field">): string {
-  if (selectors.bundle_id && !selectors.executable && !selectors.browser_host && !selectors.browser_path_prefix && !selectors.focused_field) {
-    return selectors.bundle_id;
-  }
-  if (selectors.bundle_id && selectors.browser_host && !selectors.executable && !selectors.browser_path_prefix && !selectors.focused_field) {
-    return `${selectors.bundle_id}:${selectors.browser_host}`;
-  }
-  if (!selectors.bundle_id && !selectors.executable && selectors.browser_host && !selectors.browser_path_prefix && !selectors.focused_field) {
-    return `site:${selectors.browser_host}`;
-  }
+function newMappingId(): string {
   const unique = typeof crypto !== "undefined" && "randomUUID" in crypto
     ? crypto.randomUUID()
     : `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
@@ -342,6 +485,7 @@ export function ContextSettings({
   const [browserPathPrefix, setBrowserPathPrefix] = useSessionDraftState(`${draftKey}:browserPathPrefix`, "");
   const [focusedField, setFocusedField] = useSessionDraftState<FocusKind | "">(`${draftKey}:focusedField`, "");
   const [editingMappingId, setEditingMappingId] = useSessionDraftState<string | null>(`${draftKey}:editingMappingId`, null);
+  const [preferenceRevisionBaseline, setPreferenceRevisionBaseline] = useSessionDraftState<{ mappingId: string | null; revision: number | null }>(`${draftKey}:preferenceRevisionBaseline`, { mappingId: null, revision: null });
   const [sourcePermissions, setSourcePermissions] = useSessionDraftState<ContextSourcePermissions>(`${draftKey}:sourcePermissions`, {
     ax_text: false,
     local_ocr: false,
@@ -349,6 +493,9 @@ export function ContextSettings({
     context_text_to_providers: false,
   });
   const [selectedModeId, setSelectedModeId] = useSessionDraftState(`${draftKey}:selectedModeId`, "general");
+  const [selectedWritingTaskId, setSelectedWritingTaskId] = useSessionDraftState<WritingTaskId | "">(`${draftKey}:selectedWritingTaskId`, "");
+  const [writingPreferenceDraft, setWritingPreferenceDraft] = useSessionDraftState<WritingPreferenceDraft>(`${draftKey}:writingPreferenceDraft`, emptyWritingPreferenceDraft);
+  const [preferenceGuidanceProviderApproved, setPreferenceGuidanceProviderApproved] = useSessionDraftState(`${draftKey}:preferenceGuidanceProviderApproved`, false);
   const [styleExampleInput, setStyleExampleInput] = useSessionDraftState(`${draftKey}:styleExampleInput`, "");
   const [styleExampleOutput, setStyleExampleOutput] = useSessionDraftState(`${draftKey}:styleExampleOutput`, "");
   const [removeStyleExamples, setRemoveStyleExamples] = useSessionDraftState(`${draftKey}:removeStyleExamples`, false);
@@ -365,6 +512,10 @@ export function ContextSettings({
   const [enabled, setEnabled] = useState(true);
   const [overrideFamily, setOverrideFamily] = useState<ContextFamily | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [preferenceScopeMigrationNotice, setPreferenceScopeMigrationNotice] = useState(false);
+  const [preferenceReviewRefreshIds, setPreferenceReviewRefreshIds] = useState<Set<string>>(() => new Set());
+  const [preferenceReviewScopeConflictId, setPreferenceReviewScopeConflictId] = useState<string | null>(null);
+  const [preferenceReviewConflicts, setPreferenceReviewConflicts] = useState<PreferenceReviewConflict[]>([]);
   const [initializationError, setInitializationError] = useState<string | null>(null);
   const [errorScope, setErrorScope] = useState<"prompt" | "mapping" | "override" | "context" | "browser" | "applications" | null>(null);
   const [promptErrorPlacement, setPromptErrorPlacement] = useState<"preview" | "prompt">("preview");
@@ -376,6 +527,45 @@ export function ContextSettings({
   const previousManagedModesRef = useRef(managedModesSnapshot);
   const [busyAction, setBusyAction] = useState<"context" | "browser" | "override" | "applications" | "mapping" | "delete_mapping" | null>(null);
   const busy = busyAction !== null;
+  const lifecycleRef = useRef(0);
+  const mappingsRef = useRef(mappings);
+  mappingsRef.current = mappings;
+  const applicationsRef = useRef(applications);
+  applicationsRef.current = applications;
+  const preferenceReviewEditorRef = useRef<PreferenceReviewEditorState>({
+    editingMappingId,
+    preferenceRevisionBaseline,
+    selectedModeFamily: selectedModeFamilyForEditor(writingModes, selectedModeId, draftModeId),
+    selectedWritingTaskId,
+    selectedApplicationId,
+    selectedExecutable,
+    selectedWebsite,
+    browserPathPrefix,
+    focusedField,
+    writingPreferenceDraft,
+    preferenceGuidanceProviderApproved,
+  });
+  preferenceReviewEditorRef.current = {
+    editingMappingId,
+    preferenceRevisionBaseline,
+    selectedModeFamily: selectedModeFamilyForEditor(writingModes, selectedModeId, draftModeId),
+    selectedWritingTaskId,
+    selectedApplicationId,
+    selectedExecutable,
+    selectedWebsite,
+    browserPathPrefix,
+    focusedField,
+    writingPreferenceDraft,
+    preferenceGuidanceProviderApproved,
+  };
+  const preferenceReviewStartRef = useRef<Map<string, PreferenceReviewStartSnapshot>>(new Map());
+  useEffect(() => {
+    const lifecycle = lifecycleRef.current + 1;
+    lifecycleRef.current = lifecycle;
+    return () => {
+      if (lifecycleRef.current === lifecycle) lifecycleRef.current += 1;
+    };
+  }, []);
   useEffect(() => {
     if (error && errorScope === "mapping" && mappingDetailsRef.current) mappingDetailsRef.current.open = true;
   }, [error, errorScope]);
@@ -383,7 +573,7 @@ export function ContextSettings({
     title: string;
     description: string;
     confirmLabel: string;
-    action: { type: "select_mode"; modeId: string } | { type: "add_mode" } | { type: "delete_mode"; modeId: string } | { type: "delete_mapping"; mappingId: string };
+    action: { type: "select_mode"; modeId: string } | { type: "add_mode" } | { type: "delete_mode"; modeId: string } | { type: "delete_mapping"; mappingId: string } | { type: "forget_preference"; dimension: WritingPreferenceDimension };
   } | null>(null);
 
   const savedWritingModes = draftModeId ? writingModes.filter((mode) => mode.id !== draftModeId) : writingModes;
@@ -443,7 +633,7 @@ export function ContextSettings({
         setOverrideFamily(nextOverride);
       })
       .catch((reason: unknown) => {
-        if (!cancelled) setInitializationError(reason instanceof Error ? reason.message : String(reason));
+        if (!cancelled) setInitializationError(settingsErrorMessage(reason));
       });
 
     void invoke<ApplicationOption[]>("get_available_applications")
@@ -451,7 +641,7 @@ export function ContextSettings({
         if (!cancelled) setApplications((current) => mergeApplicationOptions(nextApplications, current));
       })
       .catch((reason: unknown) => {
-        if (!cancelled) setInitializationError(reason instanceof Error ? reason.message : String(reason));
+        if (!cancelled) setInitializationError(settingsErrorMessage(reason));
       })
       .finally(() => {
         if (!cancelled) setApplicationsLoading(false);
@@ -468,7 +658,7 @@ export function ContextSettings({
         }
       })
       .catch((reason: unknown) => {
-        if (!cancelled) setInitializationError(reason instanceof Error ? reason.message : String(reason));
+        if (!cancelled) setInitializationError(settingsErrorMessage(reason));
       });
     return () => {
       cancelled = true;
@@ -487,7 +677,7 @@ export function ContextSettings({
       setApplications((current) => mergeApplicationOptions(nextApplications, current));
       setErrorScope(null);
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
+      setError(settingsErrorMessage(reason));
     } finally {
       setApplicationsLoading(false);
       setBusyAction(null);
@@ -513,7 +703,7 @@ export function ContextSettings({
       selectApplication(application.bundle_id);
       setErrorScope(null);
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
+      setError(settingsErrorMessage(reason));
     } finally {
       setBusyAction(null);
     }
@@ -671,13 +861,31 @@ export function ContextSettings({
   };
 
   const loadMapping = (existing?: ContextMapping) => {
+    setPreferenceScopeMigrationNotice(false);
     setEditingMappingId(existing?.id ?? null);
+    setPreferenceRevisionBaseline({
+      mappingId: existing?.id ?? null,
+      revision: existing ? existing.preference_revision ?? 0 : null,
+    });
+    if (existing) {
+      setPreferenceReviewConflicts((current) => current.filter((conflict) => conflict.mappingId !== existing.id));
+      setPreferenceReviewScopeConflictId((current) => current === existing.id ? null : current);
+    }
     setSelectedApplicationId(existing?.bundle_id ?? "");
     setSelectedExecutable(existing?.executable ?? "");
     setSelectedWebsite(existing?.browser_host ?? "");
     setBrowserPathPrefix(existing?.browser_path_prefix ?? "");
     setFocusedField(existing?.focused_field ?? "");
     setSelectedModeId(existing?.mode_id ?? familyModeId(existing?.family ?? "general"));
+    setSelectedWritingTaskId(existing?.writing_task_id ?? "");
+    setWritingPreferenceDraft(preferenceDraftFrom(existing, existing?.writing_task_id ?? ""));
+    setPreferenceGuidanceProviderApproved(
+      existing?.preference_guidance_provider_approved === true
+      && hasCloudSupportedActivePreference(preferencesFromDraft(
+        preferenceDraftFrom(existing, existing?.writing_task_id ?? ""),
+        existing?.writing_task_id ?? "",
+      )),
+    );
     setRemoveStyleExamples(false);
     setStyleExampleInput(existing?.style_example_input ?? "");
     setStyleExampleOutput(existing?.style_example_output ?? "");
@@ -710,6 +918,9 @@ export function ContextSettings({
       || styleExampleInput.trim()
       || styleExampleOutput.trim()
       || styleExamplesApproved
+      || selectedWritingTaskId
+      || preferencesFromDraft(writingPreferenceDraft, selectedWritingTaskId).length > 0
+      || preferenceGuidanceProviderApproved
       || Object.values(sourcePermissions).some(Boolean)
     );
     const existing = bundleId && !hasOtherSelector
@@ -725,7 +936,54 @@ export function ContextSettings({
       loadMapping(existing);
     } else {
       setEditingMappingId(null);
+      setPreferenceRevisionBaseline({ mappingId: null, revision: null });
       setSelectedApplicationId(bundleId);
+    }
+  };
+
+  const selectWritingTask = (value: WritingTaskId | "") => {
+    if (value === selectedWritingTaskId) return;
+    setSelectedWritingTaskId(value);
+    const existing = mappings.find((mapping) => mapping.id === editingMappingId);
+    setWritingPreferenceDraft(preferenceDraftFrom(existing, value));
+    setPreferenceGuidanceProviderApproved(existing?.writing_task_id === value
+      && existing.preference_guidance_provider_approved === true
+      && hasCloudSupportedActivePreference(preferencesFromDraft(
+        preferenceDraftFrom(existing, value),
+        value,
+      )));
+  };
+
+  const setPreferenceValue = (dimension: WritingPreferenceDimension, value: WritingPreferenceValue | "") => {
+    setWritingPreferenceDraft((current) => ({
+      ...current,
+      [dimension]: value
+        ? { value, status: "active" }
+        : { value: "", status: "" },
+    }));
+    if (!value) setPreferenceGuidanceProviderApproved(false);
+  };
+
+  const setPreferenceStatus = (dimension: WritingPreferenceDimension, status: WritingPreferenceStatus | "") => {
+    const current = writingPreferenceDraft[dimension];
+    if (!current.value && status) {
+      setErrorScope("mapping");
+      setError(t("请先选择要保存的偏好值"));
+      return;
+    }
+    if (status === "forgotten") {
+      setPendingConfirm({
+        title: t("忘记此写作偏好"),
+        description: t("忘记后会保留撤销标记，并停止在此任务中应用该偏好。确认保存后生效。"),
+        confirmLabel: t("忘记偏好"),
+        action: { type: "forget_preference", dimension },
+      });
+      return;
+    }
+    const next = { ...writingPreferenceDraft, [dimension]: { ...current, status } };
+    setWritingPreferenceDraft(next);
+    if (!Object.values(next).some((item) => item.status === "active")) {
+      setPreferenceGuidanceProviderApproved(false);
     }
   };
 
@@ -738,7 +996,7 @@ export function ContextSettings({
       setEnabled(nextEnabled);
       setErrorScope(null);
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
+      setError(settingsErrorMessage(reason));
     } finally {
       setBusyAction(null);
     }
@@ -754,7 +1012,7 @@ export function ContextSettings({
       setSnapshot(next);
       setErrorScope(null);
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
+      setError(settingsErrorMessage(reason));
     } finally {
       setBusyAction(null);
     }
@@ -771,14 +1029,199 @@ export function ContextSettings({
       setOverrideFamily(family);
       setErrorScope(null);
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
+      setError(settingsErrorMessage(reason));
     } finally {
       setBusyAction(null);
     }
   };
 
+  const loadWritingPreferenceDrafts = async () => {
+    const lifecycle = lifecycleRef.current;
+    const [candidates, nextMappings] = await Promise.all([
+      invoke<WritingPreferenceCandidate[]>("list_writing_preference_drafts"),
+      invoke<ContextMapping[]>("get_context_mappings"),
+    ]);
+    if (lifecycleRef.current !== lifecycle) return [];
+    const nextApplications = mergeApplicationOptions(applicationsRef.current, applicationsFromMappings(nextMappings));
+    setMappings(nextMappings);
+    setApplications(nextApplications);
+    return candidates.map((candidate) => ({
+      ...candidate,
+      display_scope: writingPreferenceMappingScope(
+        nextMappings.find((mapping) => mapping.id === candidate.mapping_id),
+        nextApplications,
+        t,
+      ),
+    }));
+  };
+
+  const decideWritingPreferenceDrafts = (
+    decisions: WritingPreferenceDecisionItem[],
+    candidates: WritingPreferenceCandidate[],
+  ) => {
+    for (const candidate of candidates) {
+      preferenceReviewStartRef.current.set(writingPreferenceCandidateKey(candidate), {
+        mapping: mappingsRef.current.find((mapping) => mapping.id === candidate.mapping_id),
+      });
+    }
+    return invoke<WritingPreferenceDecisionOutcome[]>("review_writing_preference_drafts", { decisions });
+  };
+
+  const refreshMappingsAfterPreferenceReview = async (
+    approvedCandidates: WritingPreferenceCandidate[],
+    outcomes: WritingPreferenceDecisionOutcome[],
+  ) => {
+    const lifecycle = lifecycleRef.current;
+    const outcomeByCandidate = new Map(outcomes.map((outcome) => [outcome.candidate_id, outcome]));
+    const mappingIds = [...new Set(approvedCandidates.map((candidate) => candidate.mapping_id))];
+    setPreferenceReviewRefreshIds((current) => new Set([...current, ...mappingIds]));
+
+    const nextMappings = await invoke<ContextMapping[]>("get_context_mappings");
+    if (lifecycleRef.current !== lifecycle) return;
+    const reconciliations: { candidate: WritingPreferenceCandidate; mapping: ContextMapping; preference: ContextWritingPreference }[] = [];
+    for (const candidate of approvedCandidates) {
+      const outcome = outcomeByCandidate.get(candidate.candidate_id);
+      const mapping = nextMappings.find((item) => item.id === candidate.mapping_id);
+      if (outcome?.status !== "approved"
+        || outcome.mapping_id !== candidate.mapping_id
+        || typeof outcome.new_mapping_revision !== "number") {
+        throw new Error("preference_review_mapping_refresh_incomplete");
+      }
+      // get_context_mappings is the authoritative owner snapshot. A successful
+      // approval may race with an explicit mapping deletion; do not keep the
+      // whole batch stuck retrying an owner that no longer exists.
+      if (!mapping) continue;
+      const preference = mapping.writing_preferences?.find((item) =>
+        (item.task_id ?? mapping.writing_task_id) === candidate.task_id
+        && item.dimension === candidate.dimension,
+      );
+      if (typeof mapping.preference_revision !== "number"
+        || mapping.preference_revision < outcome.new_mapping_revision
+        || !preference
+        || preference.value !== candidate.value
+        || preference.status !== "active") {
+        throw new Error("preference_review_mapping_refresh_incomplete");
+      }
+      reconciliations.push({ candidate, mapping, preference });
+    }
+
+    setMappings(nextMappings);
+    setApplications((current) => mergeApplicationOptions(current, applicationsFromMappings(nextMappings)));
+    const conflicts: PreferenceReviewConflict[] = [];
+    const editor = preferenceReviewEditorRef.current;
+    for (const { candidate, mapping, preference } of reconciliations) {
+      if (editor.editingMappingId !== candidate.mapping_id) continue;
+      setPreferenceReviewScopeConflictId(mapping.id);
+      const candidateKey = writingPreferenceCandidateKey(candidate);
+      const savedBeforeReview = preferenceReviewStartRef.current.get(candidateKey)?.mapping;
+      const currentSelectors = mappingSelectorsFromEditor(editor);
+      const scopeUnchanged = savedBeforeReview
+        && savedBeforeReview.preference_revision === candidate.mapping_revision
+        && editor.preferenceRevisionBaseline.mappingId === candidate.mapping_id
+        && editor.preferenceRevisionBaseline.revision === candidate.mapping_revision
+        && savedBeforeReview.family === editor.selectedModeFamily
+        && editor.selectedWritingTaskId === candidate.task_id
+        && currentSelectors !== null
+        && selectorsEqual(savedBeforeReview, currentSelectors);
+      if (!scopeUnchanged) {
+        conflicts.push({ candidateId: candidateKey, mappingId: mapping.id, taskId: candidate.task_id, dimension: candidate.dimension, reason: "scope_changed" });
+        continue;
+      }
+
+      const savedPreference = preferenceDraftFrom(savedBeforeReview, candidate.task_id)[candidate.dimension];
+      let preferenceDraftChanged = false;
+      setWritingPreferenceDraft((current) => {
+        if (!samePreferenceDraftItem(current[candidate.dimension], savedPreference)) {
+          preferenceDraftChanged = true;
+          return current;
+        }
+        return { ...current, [candidate.dimension]: { value: preference.value, status: preference.status } };
+      });
+      if (preferenceDraftChanged) {
+        conflicts.push({ candidateId: candidateKey, mappingId: mapping.id, taskId: candidate.task_id, dimension: candidate.dimension, reason: "preference_draft_changed" });
+      }
+
+      const savedCloudGrant = savedBeforeReview.preference_guidance_provider_approved === true
+        && hasCloudSupportedActivePreference(preferencesFromDraft(
+          preferenceDraftFrom(savedBeforeReview, candidate.task_id),
+          candidate.task_id,
+        ));
+      if (editor.preferenceGuidanceProviderApproved === savedCloudGrant) {
+        setPreferenceGuidanceProviderApproved(mapping.preference_guidance_provider_approved === true
+          && hasCloudSupportedActivePreference(mapping.writing_preferences ?? []));
+      } else {
+        conflicts.push({ candidateId: candidateKey, mappingId: mapping.id, taskId: candidate.task_id, dimension: candidate.dimension, reason: "provider_grant_changed" });
+      }
+      preferenceReviewStartRef.current.delete(candidateKey);
+    }
+
+    if (conflicts.length > 0) {
+      setPreferenceReviewConflicts((current) => [
+        ...current.filter((existing) => !conflicts.some((conflict) => conflict.candidateId === existing.candidateId)),
+        ...conflicts,
+      ]);
+    }
+    const editedMappingIds = new Set(reconciliations
+      .filter(({ candidate }) => editor.editingMappingId === candidate.mapping_id)
+      .map(({ candidate }) => candidate.mapping_id));
+    for (const mappingId of editedMappingIds) {
+      if (conflicts.some((conflict) => conflict.mappingId === mappingId)) continue;
+      const refreshedMapping = nextMappings.find((mapping) => mapping.id === mappingId);
+      if (typeof refreshedMapping?.preference_revision !== "number") continue;
+      setPreferenceRevisionBaseline((current) => current.mappingId === mappingId
+        ? { mappingId, revision: refreshedMapping.preference_revision ?? 0 }
+        : current);
+    }
+    setPreferenceReviewRefreshIds((current) => {
+      const next = new Set(current);
+      for (const id of mappingIds) next.delete(id);
+      return next;
+    });
+    for (const candidate of approvedCandidates) {
+      preferenceReviewStartRef.current.delete(writingPreferenceCandidateKey(candidate));
+    }
+  };
+
+  const reloadMappingAfterPreferenceReview = (mappingId: string) => {
+    const mapping = mappingsRef.current.find((item) => item.id === mappingId);
+    if (!mapping) {
+      setErrorScope("mapping");
+      setError(t("此 App 规则已不可用，请刷新规则列表后重新选择。"));
+      return;
+    }
+    loadMapping(mapping);
+  };
+
   const saveMapping = async () => {
     setErrorScope("mapping");
+    if (editingMappingId && preferenceReviewConflicts.some((conflict) => conflict.mappingId === editingMappingId)) {
+      setError(t("批量复核期间此 App 规则的偏好或授权草稿发生冲突。草稿仍保留；请重新加载获批规则后再保存。"));
+      return;
+    }
+    if (editingMappingId && preferenceReviewRefreshIds.has(editingMappingId)) {
+      setError(t("偏好已批准，但此 App 规则的最新修订尚未同步。请先在候选复核区重试同步，再保存映射。"));
+      return;
+    }
+    if (editingMappingId && !mappings.some((mapping) => mapping.id === editingMappingId)) {
+      setError(t("此映射已删除或不再可用，请重新选择规则后再保存。"));
+      return;
+    }
+    const activeMapping = mappings.find((mapping) => mapping.id === editingMappingId);
+    if (activeMapping && (preferenceRevisionBaseline.mappingId !== activeMapping.id
+      || preferenceRevisionBaseline.revision !== (activeMapping.preference_revision ?? 0))) {
+      setError(t("此 App 规则在当前草稿建立后已更新。草稿仍保留；请重新加载最新规则后再保存，避免覆盖已批准偏好。"));
+      return;
+    }
+    const partialPreference = Object.values(writingPreferenceDraft).some(({ value, status }) => Boolean(value) !== Boolean(status));
+    if (partialPreference) {
+      setError(t("每个偏好值都需要选择保存、暂停或忘记状态"));
+      return;
+    }
+    const preferenceRecords = preferencesFromDraft(writingPreferenceDraft, selectedWritingTaskId);
+    if (preferenceRecords.length > 0 && !selectedWritingTaskId) {
+      setError(t("保存任务偏好前，请先明确选择写作任务"));
+      return;
+    }
     const application = applications.find((item) => item.bundle_id === selectedApplicationId);
     const mode = savedWritingModes.find((item) => item.id === selectedModeId);
     if (!mode) {
@@ -809,6 +1252,15 @@ export function ContextSettings({
       setError(t("至少选择一个匹配条件"));
       return;
     }
+    const hasTaskAnchor = Boolean(application?.bundle_id || executable || browserHost);
+    const hasTaskDisambiguator = Boolean(
+      (focusedField && !["unknown", "secure", "search"].includes(focusedField))
+      || (browserHost && pathPrefix),
+    );
+    if (selectedWritingTaskId && (!hasTaskAnchor || !hasTaskDisambiguator)) {
+      setError(t("指定写作任务需要 App 或网站锚点，以及可验证的输入框类型或网站路径前缀"));
+      return;
+    }
     const selectors = {
       bundle_id: application?.bundle_id ?? null,
       executable,
@@ -816,6 +1268,14 @@ export function ContextSettings({
       browser_path_prefix: pathPrefix || null,
       focused_field: focusedField || null,
     };
+    if (editingMappingId && preferenceReviewScopeConflictId === editingMappingId) {
+      const persisted = mappings.find((mapping) => mapping.id === editingMappingId);
+      if (persisted && (persisted.family !== mode.family || !selectorsEqual(persisted, selectors))) {
+        setError(t("批量复核已更新此 App 规则的偏好。当前范围与已保存范围不同；为避免把批准的偏好移到其他范围，请恢复已保存范围后再保存。表单草稿仍保留。"));
+        return;
+      }
+      setPreferenceReviewScopeConflictId(null);
+    }
     const savedSelectorMatch = mappings.find((mapping) => selectorsEqual(mapping, selectors));
     if (savedSelectorMatch && savedSelectorMatch.id !== editingMappingId) {
       if (!editingMappingId) loadMapping(savedSelectorMatch);
@@ -829,7 +1289,10 @@ export function ContextSettings({
       return;
     }
     const existing = mappings.find((mapping) => mapping.id === editingMappingId);
-    const mappingId = existing?.id ?? newMappingId(selectors);
+    const declaredScopeChanged = Boolean(existing && (
+      existing.family !== mode.family || !selectorsEqual(existing, selectors)
+    ));
+    const mappingId = existing?.id ?? newMappingId();
     const mappingLabel = existing?.label
       ?? (application?.label ?? (executable ? t("自定义 App 规则") : t("网站规则")));
     setBusyAction("mapping");
@@ -840,6 +1303,16 @@ export function ContextSettings({
         label: mappingLabel,
         family: mode.family,
         mode_id: mode.id,
+        writing_task_id: selectedWritingTaskId || null,
+        writing_preferences: preferenceRecords,
+        preference_guidance_provider_approved: Boolean(
+          selectedWritingTaskId
+          && preferenceGuidanceProviderApproved
+          && hasCloudSupportedActivePreference(preferenceRecords),
+        ),
+        preference_revision: existing
+          ? preferenceRevisionBaseline.mappingId === existing.id ? preferenceRevisionBaseline.revision ?? 0 : 0
+          : 0,
         ...selectors,
         source_permissions: { ...sourcePermissions },
         style_examples_approved: styleExamplesApproved,
@@ -856,8 +1329,22 @@ export function ContextSettings({
       mapping.style_example_pairs = removeStyleExamples ? [] : existing?.style_example_pairs ?? [];
       const next = await invoke<ContextMapping[]>("save_context_mapping", { mapping, replaceStyleExamples: true });
       setMappings(next);
+      if (declaredScopeChanged) {
+        const savedMapping = next.find((saved) => saved.id === mappingId);
+        if (!savedMapping) {
+          throw new Error(t("保存后的映射未返回；请刷新映射列表后检查保存状态"));
+        }
+        loadMapping(savedMapping);
+        setPreferenceScopeMigrationNotice(true);
+        return;
+      }
+      setPreferenceGuidanceProviderApproved(
+        next.find((saved) => saved.id === mappingId)?.preference_guidance_provider_approved === true,
+      );
       setRemoveStyleExamples(false);
+      setPreferenceReviewScopeConflictId(null);
       setEditingMappingId(null);
+      setPreferenceRevisionBaseline({ mappingId: null, revision: null });
       setSelectedApplicationId("");
       setSelectedExecutable("");
       setSelectedWebsite("");
@@ -870,6 +1357,14 @@ export function ContextSettings({
         context_text_to_providers: false,
       });
       setSelectedModeId("general");
+      setSelectedWritingTaskId("");
+      setWritingPreferenceDraft({
+        list_structure: { ...emptyWritingPreferenceDraft.list_structure },
+        greeting_tone: { ...emptyWritingPreferenceDraft.greeting_tone },
+        terminal_punctuation: { ...emptyWritingPreferenceDraft.terminal_punctuation },
+      });
+      setPreferenceGuidanceProviderApproved(false);
+      setPreferenceScopeMigrationNotice(false);
       setStyleExampleInput("");
       setStyleExampleOutput("");
       setStyleExamplesApproved(false);
@@ -878,7 +1373,7 @@ export function ContextSettings({
       setMappingLearnEnabled(true);
       setErrorScope(null);
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
+      setError(settingsErrorMessage(reason));
     } finally {
       setBusyAction(null);
     }
@@ -889,10 +1384,12 @@ export function ContextSettings({
     setErrorScope("mapping");
     setError(null);
     try {
-      setMappings(await invoke<ContextMapping[]>("delete_context_mapping", { id }));
+      const nextMappings = await invoke<ContextMapping[]>("delete_context_mapping", { id });
+      setMappings(nextMappings);
+      if (editingMappingId === id) loadMapping();
       setErrorScope(null);
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
+      setError(settingsErrorMessage(reason));
     } finally {
       setBusyAction(null);
     }
@@ -908,7 +1405,58 @@ export function ContextSettings({
     focused_field: focusedField || null,
   };
   const selectedExistingMapping = mappings.find((mapping) => selectorsEqual(mapping, selectedSelectors));
-  const editedMapping = mappings.find((mapping) => mapping.id === editingMappingId) ?? selectedExistingMapping;
+  const savedEditingMapping = mappings.find((mapping) => mapping.id === editingMappingId);
+  const editingMappingOwnerMissing = Boolean(editingMappingId && !savedEditingMapping);
+  const preferenceRevisionBaselineMismatch = Boolean(editingMappingId && savedEditingMapping
+    && (preferenceRevisionBaseline.mappingId !== savedEditingMapping.id
+      || preferenceRevisionBaseline.revision !== (savedEditingMapping.preference_revision ?? 0)));
+  const editedMapping = savedEditingMapping ?? selectedExistingMapping;
+  useEffect(() => {
+    if (!editingMappingId || !preferenceGuidanceProviderApproved) return;
+    const currentOwner = mappings.find((mapping) => mapping.id === editingMappingId);
+    const currentDraftSelectors = {
+      bundle_id: selectedApplication?.bundle_id ?? null,
+      executable: selectedExecutable.trim() || null,
+      browser_host: selectedBrowserHost,
+      browser_path_prefix: browserPathPrefix.trim() || null,
+      focused_field: focusedField || null,
+    };
+    if (currentOwner && !selectorsEqual(currentOwner, currentDraftSelectors)) {
+      setPreferenceGuidanceProviderApproved(false);
+    }
+  }, [
+    editingMappingId,
+    mappings,
+    preferenceGuidanceProviderApproved,
+    selectedApplication?.bundle_id,
+    selectedExecutable,
+    selectedBrowserHost,
+    browserPathPrefix,
+    focusedField,
+  ]);
+  useEffect(() => {
+    if (!editingMappingId || !styleExamplesApproved) return;
+    const currentOwner = mappings.find((mapping) => mapping.id === editingMappingId);
+    const currentDraftSelectors = {
+      bundle_id: selectedApplication?.bundle_id ?? null,
+      executable: selectedExecutable.trim() || null,
+      browser_host: selectedBrowserHost,
+      browser_path_prefix: browserPathPrefix.trim() || null,
+      focused_field: focusedField || null,
+    };
+    if (currentOwner && !selectorsEqual(currentOwner, currentDraftSelectors)) {
+      setStyleExamplesApproved(false);
+    }
+  }, [
+    editingMappingId,
+    mappings,
+    styleExamplesApproved,
+    selectedApplication?.bundle_id,
+    selectedExecutable,
+    selectedBrowserHost,
+    browserPathPrefix,
+    focusedField,
+  ]);
   const retainedStylePairs = removeStyleExamples ? [] : editedMapping?.style_example_pairs ?? [];
   const hasStyleExamples = Boolean(
     styleExampleInput.trim()
@@ -1134,10 +1682,15 @@ export function ContextSettings({
 
       <SceneLesson onOpenDictionary={onOpenDictionary ? () => openGuideDestination("dictionary") : undefined} />
       <SettingsGroup title={t("App / 网站映射")} description={t("可组合 App、可执行文件、网站、路径和输入框条件；所有已选条件必须同时匹配。")}>
+        {preferenceScopeMigrationNotice && (
+          <p role="status" className="px-5 pt-3 text-xs leading-5 text-warning-ink">
+            {t("范围已保存；该映射的所有任务偏好和云端批准已清除。本次填写的偏好没有保存；请在当前表单重新选择偏好并再次保存。")}
+          </p>
+        )}
         <div className="vf-mapping-form space-y-4 px-5 py-4">
           <div className="flex flex-wrap items-end gap-2">
             <label className="min-w-0 flex-1 text-xs text-secondary">{t("选择 App（可选）")}
-              <Select aria-label={t("选择 App")} value={selectedApplicationId} onValueChange={(value) => selectApplication(value)} disabled={applicationsLoading || busy || applications.length === 0} className={`mt-2 w-full ${fieldClass}`}>
+              <Select aria-label={t("选择 App")} value={selectedApplicationId} onValueChange={(value) => { if (value !== selectedApplicationId) setStyleExamplesApproved(false); selectApplication(value); }} disabled={applicationsLoading || busy || applications.length === 0} className={`mt-2 w-full ${fieldClass}`}>
                 <option value="">{applicationsLoading ? t("正在加载 App…") : applications.length === 0 ? t("没有找到 App") : t("不限定 App")}</option>
                 {applications.map((application) => <option key={application.bundle_id} value={application.bundle_id}>{application.label}</option>)}
               </Select>
@@ -1148,6 +1701,75 @@ export function ContextSettings({
           {inlineError(errorScope === "applications" ? error : null)}
           <p className="flex items-center gap-1.5 text-xs text-tertiary"><AppWindowMac size={14} aria-hidden="true" />{t("运行中的 App 会随刷新更新；手动添加的 App 即使未打开也能生效。")} </p>
           <label className="block text-xs text-secondary">{t("语气")}<Select aria-label={t("应用映射语气")} value={selectedMappingMode?.id ?? ""} onValueChange={(value) => setSelectedModeId(value)} disabled={busy || savedWritingModes.length === 0} className={`mt-2 w-full ${fieldClass}`}>{savedWritingModes.map((mode) => <option key={mode.id} value={mode.id}>{t(mode.label)}{mode.builtin ? "" : ` · ${t("自定义")}`}</option>)}</Select></label>
+          <SettingsDisclosure
+            variant="plain"
+            title={t("任务级写作偏好")}
+            description={t("显式指定此映射对应的写作任务；没有可信任务身份时，偏好不会应用。")}
+            summary={t(selectedWritingTaskId ? writingTaskOptions.find((option) => option.value === selectedWritingTaskId)?.label ?? "已指定任务" : "未指定任务")}
+          >
+            <div className="space-y-4">
+              <label className="block text-xs text-secondary">{t("写作任务 ID")}
+                <Select aria-label={t("写作任务 ID")} value={selectedWritingTaskId} onValueChange={(value) => selectWritingTask(value as WritingTaskId | "")} disabled={busy} className={`mt-2 w-full ${fieldClass}`}>
+                  <option value="">{t("未知或不限定任务")}</option>
+                  {writingTaskOptions.map((option) => <option key={option.value} value={option.value}>{t(option.label)}</option>)}
+                </Select>
+                <span className="mt-1 block text-xs text-tertiary">{t("任务 ID 由你明确选择，不从 App、窗口标题或写作语气推断。切换任务时会加载对应已保存偏好，并重置云端批准。")}</span>
+              </label>
+              <p className="text-xs leading-5 text-tertiary">{t("列表只在本机整理且原话有可逐项核对的项目边界时应用。称呼只调整原文已有且边界明确的你好 / 您好；标点只控制无歧义的单句句末句号。不会从观察自动推断。")}</p>
+              <div className="grid gap-3 rounded-lg border border-border p-3 sm:grid-cols-2">
+                <WritingPreferenceRow
+                  dimension="list_structure"
+                  label={t("列表结构")}
+                  value={writingPreferenceDraft.list_structure.value}
+                  status={writingPreferenceDraft.list_structure.status}
+                  valueOptions={[{ value: "bullets", label: t("符合来源证据时使用要点") }]}
+                  preview={writingPreferenceDraft.list_structure.value ? t("三项任务是：更新 API；修复测试；审阅文档。") : undefined}
+                  disabled={busy || !selectedWritingTaskId}
+                  onValueChange={(value) => setPreferenceValue("list_structure", value)}
+                  onStatusChange={(status) => setPreferenceStatus("list_structure", status)}
+                />
+                <WritingPreferenceRow
+                  dimension="greeting_tone"
+                  label={t("短称呼形式")}
+                  value={writingPreferenceDraft.greeting_tone.value}
+                  status={writingPreferenceDraft.greeting_tone.status}
+                  valueOptions={[
+                    { value: "conversational_greeting", label: t("你好（仅替换原有称呼）") },
+                    { value: "respectful_greeting", label: t("您好（仅替换原有称呼）") },
+                  ]}
+                  preview={writingPreferenceDraft.greeting_tone.value === "respectful_greeting"
+                    ? t("你好，Alex。 → 您好，Alex。")
+                    : writingPreferenceDraft.greeting_tone.value === "conversational_greeting"
+                      ? t("您好，Alex。 → 你好，Alex。")
+                      : undefined}
+                  disabled={busy || !selectedWritingTaskId}
+                  onValueChange={(value) => setPreferenceValue("greeting_tone", value)}
+                  onStatusChange={(status) => setPreferenceStatus("greeting_tone", status)}
+                />
+                <div className="sm:col-span-2">
+                  <WritingPreferenceRow
+                    dimension="terminal_punctuation"
+                    label={t("陈述句句末标点")}
+                    value={writingPreferenceDraft.terminal_punctuation.value}
+                    status={writingPreferenceDraft.terminal_punctuation.status}
+                    valueOptions={[
+                      { value: "terminal_period", label: t("保留一个句号") },
+                      { value: "no_terminal_period", label: t("聊天句末省略句号") },
+                    ]}
+                    preview={writingPreferenceDraft.terminal_punctuation.value === "terminal_period"
+                      ? t("好的 → 好的。")
+                      : writingPreferenceDraft.terminal_punctuation.value === "no_terminal_period"
+                        ? t("好的。 → 好的")
+                        : undefined}
+                    disabled={busy || !selectedWritingTaskId}
+                    onValueChange={(value) => setPreferenceValue("terminal_punctuation", value)}
+                    onStatusChange={(status) => setPreferenceStatus("terminal_punctuation", status)}
+                  />
+                </div>
+              </div>
+              <p className="text-xs leading-5 text-tertiary">{t("保存、暂停或忘记状态需点击下方“保存映射”或“更新映射”后生效。忘记会保留撤销标记。")}</p>
+            </div>
+          </SettingsDisclosure>
           <details ref={mappingDetailsRef} className="vf-inline-disclosure border-y border-border py-3 text-xs text-secondary">
             <summary className={`cursor-pointer rounded-md font-medium text-primary ${focusRingClass}`}>
               {t("高级映射选项")}{selectedExecutable || selectedWebsite || browserPathPrefix || focusedField || hasStyleExamples || mappingIntensity !== "inherit" || !mappingCleanupEnabled || !mappingLearnEnabled ? ` · ${t("已设置")}` : ""}
@@ -1156,7 +1778,7 @@ export function ContextSettings({
             <div className="mt-3 space-y-4">
           <label className="block text-xs text-secondary">
             {t("可执行文件（可选）")}
-            <input aria-label={t("可执行文件名")} value={selectedExecutable} onChange={(event) => setSelectedExecutable(event.target.value)} disabled={busy} maxLength={255} placeholder={t("例如 Cursor")} className={`mt-2 w-full ${fieldClass}`} />
+            <input aria-label={t("可执行文件名")} value={selectedExecutable} onChange={(event) => { if (event.target.value !== selectedExecutable) setStyleExamplesApproved(false); setSelectedExecutable(event.target.value); }} disabled={busy} maxLength={255} placeholder={t("例如 Cursor")} className={`mt-2 w-full ${fieldClass}`} />
             <span className="mt-1 block text-xs text-tertiary">{t("可与其他条件组合；不会显示在听写 HUD。")}</span>
           </label>
           <label className="block text-xs text-secondary">
@@ -1165,7 +1787,7 @@ export function ContextSettings({
               aria-label={t("应用映射网站")}
               options={websiteOptions.map((website) => ({ value: website.host, label: website.label }))}
               value={selectedWebsite}
-              onValueChange={setSelectedWebsite}
+              onValueChange={(value) => { if (value !== selectedWebsite) setStyleExamplesApproved(false); setSelectedWebsite(value); }}
               disabled={busy}
               maxLength={253}
               placeholder="mail.google.com"
@@ -1178,7 +1800,7 @@ export function ContextSettings({
             <input
               aria-label={t("网站路径前缀")}
               value={browserPathPrefix}
-              onChange={(event) => setBrowserPathPrefix(event.target.value)}
+              onChange={(event) => { if (event.target.value !== browserPathPrefix) setStyleExamplesApproved(false); setBrowserPathPrefix(event.target.value); }}
               disabled={busy}
               maxLength={512}
               placeholder="/issues"
@@ -1191,7 +1813,7 @@ export function ContextSettings({
             <Select
               aria-label={t("输入框类型")}
               value={focusedField}
-              onValueChange={(value) => setFocusedField(value as FocusKind | "")}
+              onValueChange={(value) => { if (value !== focusedField) setStyleExamplesApproved(false); setFocusedField(value as FocusKind | ""); }}
               disabled={busy}
               className={`mt-2 w-full ${fieldClass}`}
             >
@@ -1202,10 +1824,10 @@ export function ContextSettings({
           </label>
           <div className="grid gap-3 sm:grid-cols-2">
             <label className="block text-xs text-secondary">{t("示例输入")}
-              <textarea aria-label={t("App 风格示例输入")} value={styleExampleInput} onChange={(event) => setStyleExampleInput(event.target.value)} maxLength={2_000} rows={3} disabled={busy} placeholder={t("贴一条你平时微信怎么打")} className={`mt-2 w-full resize-y rounded-lg border ${colors.border} ${colors.bg.elevated} ${colors.text.primary} px-3 py-2 text-sm outline-none focus:border-accent ${focusRingClass}`} />
+              <textarea aria-label={t("App 风格示例输入")} value={styleExampleInput} onChange={(event) => { setStyleExampleInput(event.target.value); setStyleExamplesApproved(false); }} maxLength={2_000} rows={3} disabled={busy} placeholder={t("贴一条你平时微信怎么打")} className={`mt-2 w-full resize-y rounded-lg border ${colors.border} ${colors.bg.elevated} ${colors.text.primary} px-3 py-2 text-sm outline-none focus:border-accent ${focusRingClass}`} />
             </label>
             <label className="block text-xs text-secondary">{t("期望输出")}
-              <textarea aria-label={t("App 风格期望输出")} value={styleExampleOutput} onChange={(event) => setStyleExampleOutput(event.target.value)} maxLength={2_000} rows={3} disabled={busy} placeholder={t("希望 VoiceFlow 输出的样子…")} className={`mt-2 w-full resize-y rounded-lg border ${colors.border} ${colors.bg.elevated} ${colors.text.primary} px-3 py-2 text-sm outline-none focus:border-accent ${focusRingClass}`} />
+              <textarea aria-label={t("App 风格期望输出")} value={styleExampleOutput} onChange={(event) => { setStyleExampleOutput(event.target.value); setStyleExamplesApproved(false); }} maxLength={2_000} rows={3} disabled={busy} placeholder={t("希望 VoiceFlow 输出的样子…")} className={`mt-2 w-full resize-y rounded-lg border ${colors.border} ${colors.bg.elevated} ${colors.text.primary} px-3 py-2 text-sm outline-none focus:border-accent ${focusRingClass}`} />
             </label>
           </div>
           <label className="block text-xs text-secondary">{t("整理强度")}
@@ -1226,7 +1848,18 @@ export function ContextSettings({
           </SettingsRow>
             </div>
           </details>
-          <SettingsDisclosure variant="plain" title={t("上下文与样例授权")} description={t("按需要逐项授权，保存规则后生效。收起不会撤销授权。") } summary={t("{count} 项已开启").replace("{count}", String(Object.values(sourcePermissions).filter(Boolean).length + Number(styleExamplesApproved)))} error={errorScope === "mapping" ? error : null}>
+          <SettingsDisclosure variant="plain" title={t("上下文与样例授权")} description={t("按需要逐项授权，保存规则后生效。收起不会撤销授权。") } summary={t("{count} 项已开启").replace("{count}", String(Object.values(sourcePermissions).filter(Boolean).length + Number(styleExamplesApproved) + Number(preferenceGuidanceProviderApproved)))} error={errorScope === "mapping" ? error : null}>
+          <SettingsRow
+            title={t("允许结构化偏好发送给云端整理服务商")}
+            description={t("云端默认关闭。启用后，只有当前任务已保存的称呼或标点偏好可进入云端整理请求；列表偏好只用于本机整理。不发送样例、候选历史或证据计数。本机路线不需要此授权。此权限独立于风格示例授权。")}
+          >
+            <Toggle
+              checked={preferenceGuidanceProviderApproved}
+              onChange={setPreferenceGuidanceProviderApproved}
+              disabled={busy || !selectedWritingTaskId || !hasCloudSupportedActivePreference(preferencesFromDraft(writingPreferenceDraft, selectedWritingTaskId))}
+              label={t("允许结构化偏好发送给云端整理服务商")}
+            />
+          </SettingsRow>
           <SettingsRow
             title={t("允许风格示例发送给整理服务商")}
             description={t("启用后，此映射保留的输入、期望输出和已学习示例对可能随整理请求发送给已配置的整理服务商。关闭时仍保留这些示例，但不发送。此权限独立于“允许文字发送给服务商”。")}
@@ -1320,6 +1953,27 @@ export function ContextSettings({
                 : "此目标已有规则；使用编辑按钮查看并保留现有权限。")}
             </p>
           )}
+          {editingMappingOwnerMissing && (
+            <SettingsAlert onRetry={() => loadMapping()} retryLabel={t("放弃草稿并新建规则")}>
+              {t("当前编辑的映射已删除。放弃此草稿会清空旧规则的偏好和授权；之后请明确选择新目标。")}
+            </SettingsAlert>
+          )}
+          {editingMappingId && preferenceRevisionBaselineMismatch
+            && !preferenceReviewConflicts.some((conflict) => conflict.mappingId === editingMappingId)
+            && <SettingsAlert onRetry={() => reloadMappingAfterPreferenceReview(editingMappingId)} retryLabel={t("重新加载获批的 App 规则")}>
+              {t("此 App 规则在当前草稿建立后已更新。草稿仍保留；请重新加载最新规则后再保存，避免覆盖已批准偏好。")}
+            </SettingsAlert>}
+          {editingMappingId && preferenceReviewConflicts
+            .filter((conflict) => conflict.mappingId === editingMappingId)
+            .map((conflict) => (
+              <SettingsAlert key={conflict.candidateId} onRetry={() => reloadMappingAfterPreferenceReview(conflict.mappingId)} retryLabel={t("重新加载获批的 App 规则")}>
+                {t(conflict.reason === "scope_changed"
+                  ? "批量复核期间此 App 规则的范围或任务已改变。获批偏好未写入当前表单；草稿仍保留。重新加载最新规则后再继续。"
+                  : conflict.reason === "preference_draft_changed"
+                    ? "此偏好维度有未保存草稿，获批值未覆盖它。草稿仍保留；请重新加载最新规则以核对获批值后再保存。"
+                    : "云端偏好授权有未保存草稿，复核未覆盖它。草稿仍保留；请重新加载最新规则以核对授权状态后再保存。")}
+              </SettingsAlert>
+            ))}
           {inlineError(errorScope === "mapping" ? error : null)}
           <button type="button" onClick={() => void saveMapping()} aria-busy={busyAction === "mapping"} disabled={busy} className={`${buttonClass} min-w-36`}><Plus size={16} aria-hidden="true" />{t(busyAction === "mapping" ? "保存中…" : editingMappingId ? "更新映射" : "保存映射")}</button>
         </div>
@@ -1330,7 +1984,7 @@ export function ContextSettings({
               <div key={mapping.id} className="flex items-center gap-3 border-t border-border py-3">
                 <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-elevated text-xs font-semibold text-primary">{mapping.label.slice(0, 1)}</span>
                 <div className="min-w-0 flex-1">
-                  <p className="break-words text-sm font-medium text-primary">{mapping.label} <span className="font-normal text-secondary">→ {t(writingModes.find((mode) => mode.id === mapping.mode_id)?.label ?? familyLabels[mapping.family])}</span></p>
+                  <p className="break-words text-sm font-medium text-primary">{mapping.label} <span className="font-normal text-secondary">→ {t(writingModes.find((mode) => mode.id === mapping.mode_id)?.label ?? familyLabels[mapping.family])}{mapping.writing_task_id ? ` · ${t(writingTaskOptions.find((option) => option.value === mapping.writing_task_id)?.label ?? "已指定任务")}` : ""}</span></p>
                   <p className="mt-1 break-words text-xs leading-[18px] text-secondary">
                     {matchingSelectors(mapping, applications, t).length > 0
                       ? matchingSelectors(mapping, applications, t).join(" · ")
@@ -1344,6 +1998,11 @@ export function ContextSettings({
           </div>
         )}
       </SettingsGroup>
+      <WritingPreferenceReview
+        onLoadCandidates={loadWritingPreferenceDrafts}
+        onDecideCandidates={decideWritingPreferenceDrafts}
+        onRefreshApprovedMappings={refreshMappingsAfterPreferenceReview}
+      />
       </>}
       <ConfirmDialog
         open={pendingConfirm != null}
@@ -1360,9 +2019,71 @@ export function ContextSettings({
           else if (action?.type === "add_mode") applyAddCustomMode();
           else if (action?.type === "delete_mode") applyDeleteMode(action.modeId);
           else if (action?.type === "delete_mapping") void deleteMapping(action.mappingId);
+          else if (action?.type === "forget_preference") {
+            const next = {
+              ...writingPreferenceDraft,
+              [action.dimension]: {
+                ...writingPreferenceDraft[action.dimension],
+                status: "forgotten" as const,
+              },
+            };
+            setWritingPreferenceDraft(next);
+            if (!Object.values(next).some((item) => item.status === "active")) {
+              setPreferenceGuidanceProviderApproved(false);
+            }
+          }
         }}
       />
     </SettingsShell>
+  );
+}
+
+function WritingPreferenceRow({
+  dimension,
+  label,
+  value,
+  status,
+  valueOptions,
+  preview,
+  disabled,
+  onValueChange,
+  onStatusChange,
+}: {
+  dimension: WritingPreferenceDimension;
+  label: string;
+  value: WritingPreferenceValue | "";
+  status: WritingPreferenceStatus | "";
+  valueOptions: { value: WritingPreferenceValue; label: string }[];
+  preview?: string;
+  disabled: boolean;
+  onValueChange: (value: WritingPreferenceValue | "") => void;
+  onStatusChange: (status: WritingPreferenceStatus | "") => void;
+}) {
+  const { t } = useI18n();
+  return (
+    <div className="space-y-2">
+      <label className="block text-xs text-secondary">{label}
+        <Select aria-label={label} value={value} onValueChange={(next) => onValueChange(next as WritingPreferenceValue | "")} disabled={disabled} className={`mt-2 w-full ${fieldClass}`}>
+          <option value="">{t("不保存偏好")}</option>
+          {valueOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
+        </Select>
+      </label>
+      <label className="block text-xs text-secondary">{t("偏好状态")}
+        <Select aria-label={`${label} · ${t("偏好状态")}`} value={status} onValueChange={(next) => onStatusChange(next as WritingPreferenceStatus | "")} disabled={disabled || !value} className={`mt-2 w-full ${fieldClass}`}>
+          <option value="">{t("未保存")}</option>
+          <option value="active">{t("保存并应用")}</option>
+          <option value="paused">{t("暂停")}</option>
+          <option value="forgotten">{t("忘记此偏好")}</option>
+        </Select>
+      </label>
+      {preview && (
+        <p className="rounded-md bg-elevated/50 px-2.5 py-2 text-xs leading-5 text-secondary">
+          <span className="block text-[11px] font-medium text-tertiary">{t("固定示例，不会调用服务商或修改原文")}</span>
+          <span className="mt-1 block whitespace-pre-wrap">{preview}</span>
+        </p>
+      )}
+      <span className="sr-only" data-preference-dimension={dimension}>{dimension}</span>
+    </div>
   );
 }
 

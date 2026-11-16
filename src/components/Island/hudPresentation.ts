@@ -12,6 +12,7 @@ export type HudIconName =
   | "model"
   | "service"
   | "dictionary"
+  | "check"
   | "notice";
 
 export type HudDestination = "history" | "microphone" | "permissions" | "models" | "service";
@@ -115,7 +116,7 @@ function reasonPresentation(reason: string): Omit<HudPresentation, "detail"> | n
 
 function capturePresentation(status: string): Omit<HudPresentation, "detail"> | null {
   const entries: Record<string, Omit<HudPresentation, "detail">> = {
-    waiting_first_frame: { title: "等待麦克风", subtitle: "尚未收到音频", icon: "mic-off", action: { destination: "microphone", label: "检查麦克风" } },
+    waiting_first_frame: { title: "等待麦克风", subtitle: "尚未收到音频", icon: "mic", action: { destination: "microphone", label: "检查麦克风" } },
     no_audio_yet: { title: "麦克风尚无输入", subtitle: "检查所选设备", icon: "mic-off", action: { destination: "microphone", label: "检查麦克风" } },
     no_recent_audio: { title: "麦克风无响应", subtitle: "检查连接后重试", icon: "mic-off", action: { destination: "microphone", label: "检查麦克风" } },
     device_error: { title: "麦克风已中断", subtitle: "检查输入设备", icon: "mic-off", action: { destination: "microphone", label: "检查麦克风" } },
@@ -193,7 +194,7 @@ export function hudPresentation(
         break;
     }
   }
-  if (!presentation) return { title: null, subtitle: null, detail: null, icon: "mic", action: null };
+  if (!presentation) return { title: null, subtitle: null, detail: null, icon: state === "done" ? "check" : "mic", action: null };
 
   return {
     ...presentation,

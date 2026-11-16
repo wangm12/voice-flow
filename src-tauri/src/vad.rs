@@ -3,7 +3,6 @@
 use std::collections::VecDeque;
 
 const SAMPLE_RATE: usize = 16_000;
-const FRAME: usize = SAMPLE_RATE * 30 / 1_000;
 const HOP: usize = SAMPLE_RATE * 10 / 1_000;
 const PREFILL_FRAMES: usize = 45;
 const ONSET_FRAMES: usize = 6;
@@ -103,9 +102,8 @@ pub fn filter_speech(samples: &[f32], enabled: bool) -> Vec<f32> {
     if !enabled {
         return crate::silence::trim_and_compress(samples);
     }
-    let energies: Vec<f32> = (0..samples.len())
-        .step_by(HOP)
-        .map(|start| rms(&samples[start..(start + FRAME).min(samples.len())]))
+    let energies: Vec<f32> = crate::silence::frame_rms(samples)
+        .map(|(_, energy)| energy)
         .collect();
     let Some(threshold) = crate::silence::activity_threshold(&energies) else {
         return Vec::new();
@@ -125,13 +123,6 @@ pub fn filter_speech(samples: &[f32], enabled: bool) -> Vec<f32> {
         }
     }
     crate::silence::trim_and_compress(&filtered)
-}
-
-fn rms(samples: &[f32]) -> f32 {
-    if samples.is_empty() {
-        return 0.0;
-    }
-    (samples.iter().map(|sample| sample * sample).sum::<f32>() / samples.len() as f32).sqrt()
 }
 #[cfg(test)]
 mod tests {

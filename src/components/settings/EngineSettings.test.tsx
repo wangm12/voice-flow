@@ -998,6 +998,7 @@ describe("EngineSettings form", () => {
         error: "write failed: No space left on device", error_category: "disk_full",
         downloaded_bytes: 0, bytes: 100, sha256: null, revision: null, file_count: 1,
         platform_supported: true, runtime_status: "runtime_ready", loaded: false,
+        download_available: true,
       }];
       return undefined;
     });
@@ -1932,8 +1933,8 @@ describe("EngineSettings form", () => {
 
   it("distinguishes the saved local ASR model from a pending model choice", async () => {
     vi.mocked(invoke).mockImplementation(async (command) => command === "list_on_device_models" ? [
-      { id: "qwen3-asr-0.6b", label: "Qwen3 ASR 0.6B", state: "ready", inference_ready: true, platform_supported: true, runtime_status: "runtime_ready", loaded: false, downloaded_bytes: 100, bytes: 100 },
-      { id: "qwen3-asr-1.7b", label: "Qwen3 ASR 1.7B", state: "ready", inference_ready: true, platform_supported: true, runtime_status: "runtime_ready", loaded: false, downloaded_bytes: 200, bytes: 200 },
+      { id: "qwen3-asr-0.6b", label: "Qwen3 ASR 0.6B", state: "ready", inference_ready: true, platform_supported: true, runtime_status: "runtime_ready", loaded: false, downloaded_bytes: 100, bytes: 100, download_available: true },
+      { id: "qwen3-asr-1.7b", label: "Qwen3 ASR 1.7B", state: "ready", inference_ready: true, platform_supported: true, runtime_status: "runtime_ready", loaded: false, downloaded_bytes: 200, bytes: 200, download_available: true },
     ] : undefined);
     renderEngine({ asr_provider: "on_device", asr_model: "qwen3-asr-1.7b", cleanup_enabled: false });
     activatePage("本地模型");
@@ -2089,7 +2090,11 @@ describe("EngineSettings form", () => {
   });
 
   it("keeps download progress and cancellation scoped to one model without selecting it", async () => {
-    let currentModels = localCleanupModels();
+    let currentModels = localCleanupModels([
+      { download_available: true, downloadable: true },
+      { download_available: true, downloadable: true },
+      { download_available: true, downloadable: true },
+    ]);
     vi.mocked(invoke).mockImplementation(async (command, args) => {
       if (command === "list_on_device_models") return [];
       if (command === "list_local_cleanup_models") return currentModels;
@@ -2133,7 +2138,7 @@ describe("EngineSettings form", () => {
 
   it("offers only installed verified compatible llama.cpp cleanup models and saves an explicit choice", async () => {
     const models = localCleanupModels([
-      { state: "installed", managed: true, verified: true, compatible: true, bytes_total: localCleanupCatalog[0].bytes },
+      { state: "installed", managed: true, verified: true, selectable: true, compatible: true, bytes_total: localCleanupCatalog[0].bytes },
       { state: "installed", managed: true, verified: false, compatible: true, bytes_total: localCleanupCatalog[1].bytes },
       { state: "missing", managed: false, partial_managed: true, verified: false, compatible: true, bytes_done: 262_144, bytes_total: localCleanupCatalog[2].bytes },
     ]);
@@ -2165,7 +2170,7 @@ describe("EngineSettings form", () => {
 
   it("requires an explicit model choice when only one verified local cleanup model is available", async () => {
     const models = localCleanupModels([
-      { state: "installed", managed: true, verified: true, compatible: true, bytes_total: localCleanupCatalog[0].bytes },
+      { state: "installed", managed: true, verified: true, selectable: true, compatible: true, bytes_total: localCleanupCatalog[0].bytes },
       {},
       {},
     ]);
@@ -2197,7 +2202,7 @@ describe("EngineSettings form", () => {
     let currentModels = localCleanupModels([
       {},
       {},
-      { partial_managed: true, bytes_done: 262_144, bytes_total: localCleanupCatalog[2].bytes },
+      { partial_managed: true, download_available: true, downloadable: true, bytes_done: 262_144, bytes_total: localCleanupCatalog[2].bytes },
     ]);
     vi.mocked(invoke).mockImplementation(async (command, args) => {
       if (command === "list_on_device_models") return [];

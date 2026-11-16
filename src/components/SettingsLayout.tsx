@@ -40,7 +40,7 @@ export function SettingsGroup({ title, description, children }: { title: string;
 }
 
 /** Hiding a group preserves drafts and effects; input blur keeps its existing meaning. */
-export function SettingsDisclosure({ title, description, summary, children, defaultOpen = false, locked = false, error, variant = "surface" }: {
+export function SettingsDisclosure({ title, description, summary, children, defaultOpen = false, locked = false, error, variant = "surface", onExpandedChange }: {
   title: string;
   description?: string;
   summary?: ReactNode;
@@ -49,6 +49,7 @@ export function SettingsDisclosure({ title, description, summary, children, defa
   locked?: boolean;
   error?: string | null;
   variant?: "plain" | "surface";
+  onExpandedChange?: (expanded: boolean) => void;
 }) {
   const id = useId();
   const [open, setOpen] = useState(defaultOpen);
@@ -71,7 +72,9 @@ export function SettingsDisclosure({ title, description, summary, children, defa
           aria-disabled={locked || Boolean(error)}
           onClick={() => {
             if (locked || error) return;
-            setOpen(!expanded);
+            const nextExpanded = !expanded;
+            setOpen(nextExpanded);
+            onExpandedChange?.(nextExpanded);
             if (expanded) triggerRef.current?.focus({ preventScroll: true });
           }}
           className={`flex w-full items-center gap-3 rounded-xl px-5 py-4 text-left transition-colors duration-150 motion-reduce:transition-none enabled:hover:bg-elevated/40 enabled:active:bg-elevated ${focusRingClass}`}

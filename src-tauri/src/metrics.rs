@@ -62,6 +62,46 @@ pub enum DictationClass {
     FirstAfterIdleUnload,
 }
 
+/// Fixed source codes for accepted stop and cancellation requests. These are
+/// deliberately independent from hotkey and target identities.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StopSource {
+    Toggle,
+    HoldRelease,
+    Hud,
+    Cli,
+    Esc,
+    Interrupt,
+    DeviceError,
+    DurationCap,
+    AppExit,
+    ConfigurationChange,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StopAction {
+    Stop,
+    Cancel,
+}
+
+/// Content-free stop facts bound to the original recording generation.
+/// `post_stop_asr_started` only describes ASR work started after the stop
+/// claim; in-recording streaming and prefetch work are separate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StopDiagnostics {
+    pub recording_generation: u64,
+    pub action: StopAction,
+    pub source: StopSource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_duration_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub post_stop_asr_started: Option<bool>,
+}
+
 /// Process-local trace payload. Stage offsets and durations are milliseconds
 /// from the owning host monotonic clock; child-process clocks are not mixed in.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -71,6 +111,8 @@ pub struct DictationTrace {
     pub reported_stages: Vec<ReportedStageDuration>,
     pub cache_status: Option<CacheStatus>,
     pub class: DictationClass,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop_diagnostics: Option<StopDiagnostics>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -219,6 +261,44 @@ impl TraceHandle {
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         if !self.terminal.load(Ordering::Acquire) && state.sealed_at.is_none() {
             state.payload.cache_status = Some(value);
+        }
+    }
+
+    pub fn set_stop_diagnostics(&self, diagnostics: StopDiagnostics) {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if !self.terminal.load(Ordering::Acquire) && state.sealed_at.is_none() {
+            state.payload.stop_diagnostics = Some(diagnostics);
+        }
+    }
+
+    pub fn record_capture_duration_seconds(&self, recording_generation: u64, seconds: Option<f64>) {
+        let Some(seconds) = seconds.filter(|value| value.is_finite() && *value >= 0.0) else {
+            return;
+        };
+        let millis = (seconds * 1_000.0).round();
+        if !millis.is_finite() || millis < 0.0 || millis > u64::MAX as f64 {
+            return;
+        }
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if self.terminal.load(Ordering::Acquire) || state.sealed_at.is_some() {
+            return;
+        }
+        if let Some(diagnostics) = state.payload.stop_diagnostics.as_mut() {
+            if diagnostics.recording_generation == recording_generation {
+                diagnostics.capture_duration_ms = Some(millis as u64);
+            }
+        }
+    }
+
+    pub fn record_post_stop_asr_started(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if self.terminal.load(Ordering::Acquire) || state.sealed_at.is_some() {
+            return;
+        }
+        if let Some(diagnostics) = state.payload.stop_diagnostics.as_mut() {
+            if diagnostics.action == StopAction::Stop {
+                diagnostics.post_stop_asr_started = Some(true);
+            }
         }
     }
 }
@@ -1114,6 +1194,7 @@ impl StopToInsertTimer {
                     reported_stages: Vec::new(),
                     cache_status: None,
                     class: DictationClass::Unclassified,
+                    stop_diagnostics: None,
                 },
                 sealed_at: None,
                 next_span_id: 0,
@@ -1351,6 +1432,7 @@ mod tests {
             reported_stages: Vec::new(),
             cache_status: Some(CacheStatus::SnapshotHit),
             class: DictationClass::FirstAfterLaunch,
+            stop_diagnostics: None,
         };
         let serialized = serde_json::to_value(trace).expect("trace serializes");
         assert_eq!(serialized["session_generation"], 17);
@@ -1375,6 +1457,7 @@ mod tests {
                 reported_stages: Vec::new(),
                 cache_status: None,
                 class: DictationClass::Unclassified,
+                stop_diagnostics: None,
             },
             sealed_at: None,
             next_span_id: 0,

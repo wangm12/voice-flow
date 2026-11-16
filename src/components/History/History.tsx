@@ -2,7 +2,7 @@ import { Select } from "../Select";
 import { invoke } from "@tauri-apps/api/core";
 import { Check, CheckCircle2, CircleHelp, CircleX, Copy, Download, Eraser, History as HistoryIcon, LoaderCircle, Pencil, RotateCcw, Save, Trash2, TriangleAlert, Wand2 } from "lucide-react";
 import { Fragment, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { friendlyDictionaryLearningError } from "../../lib/settingsError";
+import { friendlyDictionaryLearningError, settingsErrorMessage } from "../../lib/settingsError";
 import { secondaryButtonClass, compactButtonClass, dangerActionButtonClass, ghostButtonClass, inputClass, colors, radius, focusRingClass } from "../../lib/theme";
 import { ActionMenu } from "../ActionMenu";
 import { IconButton } from "../IconButton";
@@ -60,6 +60,26 @@ type ManualHistorySaveResponse = {
   learning?: { status?: string; hits?: number; required?: number };
 };
 
+type HistoryEditorInputKind =
+  | "trusted_text"
+  | "trusted_delete"
+  | "trusted_line_break"
+  | "trusted_composition_text"
+  | "composition_committed"
+  | "clipboard"
+  | "drop"
+  | "replacement"
+  | "untrusted"
+  | "unknown";
+
+function newHistoryEditorSessionId(): string {
+  try {
+    return typeof crypto.randomUUID === "function" ? crypto.randomUUID() : "";
+  } catch {
+    return "";
+  }
+}
+
 const cleanupAttemptLabels: Record<string, string> = {
   success: "已完成整理请求",
   not_called: "未调用整理服务",
@@ -85,6 +105,7 @@ const cleanupFailureLabels: Record<string, string> = {
   remote_rate_limited: "整理服务限流",
   remote_server_error: "整理服务暂时不可用",
   credentials_unavailable: "缺少整理服务凭据",
+  local_pair_egress_blocked: "本机词对改变了待发文本，已跳过云端整理并保留本机结果",
   empty_completion: "整理服务没有返回可用内容",
   other_provider_failure: "整理请求失败",
   native_input_too_large: "本机整理输入超出支持范围",
@@ -130,7 +151,7 @@ function cleanupFactLabel(value: string | null | undefined, labels: Record<strin
 function historyCommandErrorMessage(reason: unknown, t: (source: string) => string): string {
   const dictionaryError = friendlyDictionaryLearningError(reason, t);
   if (dictionaryError) return dictionaryError;
-  const message = reason instanceof Error ? reason.message : String(reason);
+  const message = settingsErrorMessage(reason);
   if (message === "history_dictionary_learning_retry") {
     return t("历史版本已保存，但词典学习暂时未完成；请再次保存重试。");
   }
@@ -147,6 +168,7 @@ function historyCommandErrorMessage(reason: unknown, t: (source: string) => stri
 
 export function History({ items, reload, hasMore, loading, onLoadMore, error, onRetry, onQueryChange }: { items: HistoryItem[]; reload: () => void; hasMore: boolean; loading: boolean; onLoadMore: () => void; error?: string | null; onRetry?: () => void; onQueryChange?: (query: string) => void }) {
   const { t, language } = useI18n();
+  const [editorSessionId] = useState(newHistoryEditorSessionId);
   const [query, setQuery] = useState("");
   const [dataError, setDataError] = useState<string | null>(null);
   const [dataMessage, setDataMessage] = useState<string | null>(null);
@@ -291,7 +313,7 @@ export function History({ items, reload, hasMore, loading, onLoadMore, error, on
               const previous = index > 0 ? historyDay(visible[index - 1].created_at, t, language) : null;
               return <Fragment key={item.id}>
                 {day.key !== previous?.key && <h2 className="vf-history-date px-5 pb-2 pt-6 text-sm font-semibold leading-5 text-primary first:pt-0">{day.label}</h2>}
-                <HistoryRow item={item} reload={reload} windowed={visible.length > 50} onDeleteStart={beginDeleteFocusTracking} onDeleteSuccess={restoreDeleteFocusAfterRemoval} onDeleteFailure={cancelDeleteFocusTracking} />
+                <HistoryRow item={item} reload={reload} editorSessionId={editorSessionId} windowed={visible.length > 50} onDeleteStart={beginDeleteFocusTracking} onDeleteSuccess={restoreDeleteFocusAfterRemoval} onDeleteFailure={cancelDeleteFocusTracking} />
               </Fragment>;
             })}
           </div>
@@ -322,7 +344,7 @@ export function History({ items, reload, hasMore, loading, onLoadMore, error, on
   );
 }
 
-function HistoryRow({ item, reload, windowed = false, onDeleteStart, onDeleteSuccess, onDeleteFailure }: { item: HistoryItem; reload: () => void; windowed?: boolean; onDeleteStart?: (id: number) => void; onDeleteSuccess?: (id: number) => void; onDeleteFailure?: (id: number) => void }) {
+function HistoryRow({ item, reload, editorSessionId, windowed = false, onDeleteStart, onDeleteSuccess, onDeleteFailure }: { item: HistoryItem; reload: () => void; editorSessionId: string; windowed?: boolean; onDeleteStart?: (id: number) => void; onDeleteSuccess?: (id: number) => void; onDeleteFailure?: (id: number) => void }) {
   const { t, language } = useI18n();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -336,6 +358,9 @@ function HistoryRow({ item, reload, windowed = false, onDeleteStart, onDeleteSuc
   }, [item.revision_count, item.final_text]);
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(item.final_text || item.raw_text);
+  useEffect(() => {
+    if (!editing) setDraft(item.final_text || item.raw_text);
+  }, [editing, item.final_text, item.raw_text]);
   const [showReclean, setShowReclean] = useState(false);
   const [copied, setCopied] = useState(false);
   const copyTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -344,6 +369,9 @@ function HistoryRow({ item, reload, windowed = false, onDeleteStart, onDeleteSuc
   const [dictionaryCandidates, setDictionaryCandidates] = useState<DictionarySuggestion[]>([]);
   const actionsRef = useRef<HTMLDivElement>(null);
   const editorRef = useRef<HTMLTextAreaElement>(null);
+  const editorInputKindsRef = useRef<Set<HistoryEditorInputKind>>(new Set());
+  const composingRef = useRef(false);
+  const [isComposing, setIsComposing] = useState(false);
   const cancelDeleteRef = useRef<HTMLButtonElement>(null);
   const editFocusPending = useRef(false);
   const deleteTriggerRef = useRef<HTMLButtonElement | null>(null);
@@ -366,6 +394,9 @@ function HistoryRow({ item, reload, windowed = false, onDeleteStart, onDeleteSuc
   }, [confirmingDelete]);
   const cancelEditing = () => {
     setDraft(item.final_text || item.raw_text);
+    editorInputKindsRef.current.clear();
+    composingRef.current = false;
+    setIsComposing(false);
     setEditing(false);
     setError(null);
     setSaveNotice(null);
@@ -373,6 +404,59 @@ function HistoryRow({ item, reload, windowed = false, onDeleteStart, onDeleteSuc
   const cancelDelete = () => {
     setConfirmingDelete(false);
     deleteTriggerRef.current?.focus({ preventScroll: true });
+  };
+
+  const recordEditorInputKind = (kind: HistoryEditorInputKind) => {
+    const kinds = editorInputKindsRef.current;
+    if (kinds.has(kind)) return;
+    if (kinds.size >= 12) {
+      kinds.clear();
+      kinds.add("unknown");
+      return;
+    }
+    kinds.add(kind);
+  };
+
+  const trackEditorInput = (event: React.FormEvent<HTMLTextAreaElement>) => {
+    const nativeEvent = event.nativeEvent as InputEvent;
+    if (!nativeEvent.isTrusted) {
+      recordEditorInputKind("untrusted");
+      return;
+    }
+    const inputType = nativeEvent.inputType;
+    if (composingRef.current || nativeEvent.isComposing || inputType === "insertCompositionText" || inputType === "deleteByComposition") {
+      recordEditorInputKind("trusted_composition_text");
+      return;
+    }
+    if (inputType === "insertFromComposition") {
+      recordEditorInputKind("composition_committed");
+      return;
+    }
+    if (inputType === "insertText") {
+      recordEditorInputKind("trusted_text");
+      return;
+    }
+    if (inputType === "insertLineBreak" || inputType === "insertParagraph") {
+      recordEditorInputKind("trusted_line_break");
+      return;
+    }
+    if (["deleteContentBackward", "deleteContentForward", "deleteWordBackward", "deleteWordForward", "deleteSoftLineBackward", "deleteSoftLineForward", "deleteHardLineBackward", "deleteHardLineForward"].includes(inputType)) {
+      recordEditorInputKind("trusted_delete");
+      return;
+    }
+    if (["insertFromPaste", "insertFromPasteAsQuotation", "deleteByCut", "deleteContentByCut", "insertFromYank"].includes(inputType)) {
+      recordEditorInputKind("clipboard");
+      return;
+    }
+    if (["insertFromDrop", "deleteByDrag", "deleteContentByDrag"].includes(inputType)) {
+      recordEditorInputKind("drop");
+      return;
+    }
+    if (["insertReplacementText", "insertFromAutoCorrect"].includes(inputType)) {
+      recordEditorInputKind("replacement");
+      return;
+    }
+    recordEditorInputKind("unknown");
   };
 
   const run = async (command: string, args: Record<string, unknown> = {}, reloadAfter = false): Promise<boolean> => {
@@ -393,7 +477,7 @@ function HistoryRow({ item, reload, windowed = false, onDeleteStart, onDeleteSuc
     }
   };
 
-  const saveManualRevision = async () => {
+  const saveManualRevision = async (event: React.MouseEvent<HTMLButtonElement>) => {
     setBusy(true);
     setError(null);
     setSaveNotice(null);
@@ -402,20 +486,18 @@ function HistoryRow({ item, reload, windowed = false, onDeleteStart, onDeleteSuc
         id: item.id,
         final_text: draft,
         revision_reason: "manual_edit",
+        editor_commit: {
+          version: 1,
+          editor_session_id: editorSessionId,
+          input_kinds: Array.from(editorInputKindsRef.current),
+          composing_at_save: composingRef.current,
+          save_action_trusted: event.nativeEvent.isTrusted,
+        },
       });
       reload();
-      if (
-        saved?.learning?.status === "partial_settings_failure"
-        || saved?.learning?.status === "partial_dictionary_sync_failure"
-      ) {
-        setSaveNotice(t("历史版本已保存；个人词典同步未完成，请再次保存重试。"));
-      } else {
-        setEditing(false);
-      }
+      setEditing(false);
       if (saved?.learning?.status === "pending") {
-        const hits = saved.learning.hits ?? 0;
-        const required = saved.learning.required ?? 0;
-        setSaveNotice(t("历史版本已保存；词典候选仍在收集中") + " (" + hits + "/" + required + ")");
+        setSaveNotice(t("历史版本已保存；该词典候选仅在你明确确认后生效。"));
       }
       await suggestDictionaryCandidates(item.final_text || item.raw_text, draft);
     } catch (reason) {
@@ -441,7 +523,7 @@ function HistoryRow({ item, reload, windowed = false, onDeleteStart, onDeleteSuc
       setRevisions(next);
       setShowRevisions(true);
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
+      setError(settingsErrorMessage(reason));
     } finally {
       setBusy(false);
     }
@@ -449,7 +531,7 @@ function HistoryRow({ item, reload, windowed = false, onDeleteStart, onDeleteSuc
 
   const suggestDictionaryCandidates = async (before: string, after: string) => {
     try {
-      const candidates = await invoke<DictionarySuggestion[]>("suggest_dictionary_entries", { before, after });
+      const candidates = await invoke<DictionarySuggestion[]>("suggest_dictionary_entries", { historyId: item.id, before, after });
       setDictionaryCandidates(Array.isArray(candidates) ? candidates.slice(0, 3) : []);
     } catch {
       setDictionaryCandidates([]);
@@ -492,7 +574,33 @@ function HistoryRow({ item, reload, windowed = false, onDeleteStart, onDeleteSuc
       <div className="min-w-0 flex-1">
         {editing ? (
           <div>
-            <textarea ref={editorRef} aria-label={t("编辑整理结果")} value={draft} disabled={busy} onChange={(event) => setDraft(event.target.value)} rows={3} className={`w-full rounded-lg border border-border bg-elevated px-3 py-2 text-sm text-primary outline-none focus:border-accent ${focusRingClass}`} />
+            <textarea
+              ref={editorRef}
+              aria-label={t("编辑整理结果")}
+              value={draft}
+              disabled={busy}
+              onChange={(event) => {
+                setDraft(event.target.value);
+                if (!event.nativeEvent.isTrusted) recordEditorInputKind("untrusted");
+              }}
+              onInput={trackEditorInput}
+              onCompositionStart={(event) => {
+                if (!event.nativeEvent.isTrusted) recordEditorInputKind("untrusted");
+                composingRef.current = true;
+                setIsComposing(true);
+              }}
+              onCompositionEnd={(event) => {
+                if (event.nativeEvent.isTrusted) recordEditorInputKind("composition_committed");
+                else recordEditorInputKind("untrusted");
+                composingRef.current = false;
+                setIsComposing(false);
+              }}
+              onPaste={() => recordEditorInputKind("clipboard")}
+              onCut={() => recordEditorInputKind("clipboard")}
+              onDrop={() => recordEditorInputKind("drop")}
+              rows={3}
+              className={`w-full rounded-lg border border-border bg-elevated px-3 py-2 text-sm text-primary outline-none focus:border-accent ${focusRingClass}`}
+            />
             <p className="mt-1 text-xs text-secondary">{t("编辑中，保存后生效；Esc 可取消。")}</p>
           </div>
         ) : <p className="line-clamp-2 whitespace-pre-wrap break-words text-sm leading-5 text-primary">{item.final_text || item.raw_text || t("识别失败")}</p>}
@@ -506,10 +614,10 @@ function HistoryRow({ item, reload, windowed = false, onDeleteStart, onDeleteSuc
       <div ref={actionsRef} className="vf-history-actions ml-auto flex shrink-0 flex-wrap items-center justify-end gap-1">
         {editing ? (
           <>
-            <button type="button" aria-label={t("保存历史版本")} className={compactButtonClass} disabled={busy || !draft.trim()} onClick={() => void saveManualRevision()}><Save size={15} aria-hidden="true" />{t(busy ? "保存中…" : "保存版本")}</button>
+            <button type="button" aria-label={t("保存历史版本")} className={compactButtonClass} disabled={busy || isComposing || !draft.trim()} onClick={(event) => void saveManualRevision(event)}><Save size={15} aria-hidden="true" />{t(busy ? "保存中…" : "保存版本")}</button>
             <button type="button" aria-label={t("取消编辑")} disabled={busy} className={ghostButtonClass} onClick={cancelEditing}>{t("取消")}</button>
           </>
-        ) : <IconButton data-history-edit label={t("编辑")} aria-label={t("编辑这条历史记录")} icon={<Pencil size={15} aria-hidden="true" />} disabled={busy || !(item.final_text || item.raw_text)} onClick={() => { setConfirmingDelete(false); setSaveNotice(null); setDraft(item.final_text || item.raw_text); setEditing(true); }} />}
+        ) : <IconButton data-history-edit label={t("编辑")} aria-label={t("编辑这条历史记录")} icon={<Pencil size={15} aria-hidden="true" />} disabled={busy || !(item.final_text || item.raw_text)} onClick={() => { setConfirmingDelete(false); setSaveNotice(null); setDraft(item.final_text || item.raw_text); editorInputKindsRef.current.clear(); composingRef.current = false; setIsComposing(false); setEditing(true); }} />}
         <button type="button" aria-label={t("复制这条历史记录到剪贴板")} className={`${ghostButtonClass} w-24 whitespace-nowrap`} disabled={busy || editing} onClick={() => void (async () => {
           setCopied(false);
           if (copyTimer.current) clearTimeout(copyTimer.current);

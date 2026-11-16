@@ -948,6 +948,7 @@ pub(crate) fn guard_cleanup_candidate(
     candidate: &str,
     operation: Option<CleanupOperation>,
     structure_safe: bool,
+    allow_model_selected_paragraphs: bool,
     boundary: GuardBoundary,
 ) -> Result<String, CandidateRejection> {
     let reject = |reason, candidate: &str| CandidateRejection {
@@ -955,6 +956,24 @@ pub(crate) fn guard_cleanup_candidate(
         candidate: candidate.to_owned(),
     };
     let cleanup = operation == Some(CleanupOperation::Cleanup);
+    let has_candidate_layout = candidate.contains(['\n', '\r']);
+    if cleanup && allow_model_selected_paragraphs && has_candidate_layout {
+        if boundary == GuardBoundary::ProviderReply && candidate.trim().is_empty() {
+            return Err(reject(GuardReason::EmptyCompletion, candidate));
+        }
+        if !crate::cleanup_structure_guard::preserves_model_selected_paragraphs(source, candidate) {
+            return Err(reject(GuardReason::Layout, candidate));
+        }
+        let reason = match boundary {
+            GuardBoundary::ProviderReply => preservation_reason(source, candidate, operation, true),
+            GuardBoundary::FinalOutput if source == candidate => None,
+            GuardBoundary::FinalOutput => preservation_reason(source, candidate, operation, false),
+        };
+        return match reason {
+            Some(reason) => Err(reject(reason, candidate)),
+            None => Ok(candidate.to_owned()),
+        };
+    }
     // The structure-safe predicate already includes the required-layout check
     // for a changed candidate.
     let layout_established = structure_safe && source != candidate;
@@ -1664,6 +1683,9 @@ async fn cleanup_at_with_provider_and_intent_and_source_and_native_runtime_and_l
         )
     });
     let cleanup_output_plan = policy.and_then(|value| value.cleanup_output_plan);
+    let allow_model_selected_paragraphs = cleanup_output_plan.is_some_and(|plan| {
+        plan.structure == crate::cleanup_prompt::StructureClass::ModelSelectedParagraphs
+    });
     let prompt = CleanupPromptContext {
         context,
         policy,
@@ -1691,7 +1713,14 @@ async fn cleanup_at_with_provider_and_intent_and_source_and_native_runtime_and_l
     } else {
         let (mut messages, stable_prefix_user_bytes) =
             cleanup_messages_with_prefix_boundary(&intent, &prompt);
-        append_native_cleanup_recipe_instruction(provider, model, &intent, effort, &mut messages);
+        append_native_cleanup_recipe_instruction(
+            provider,
+            model,
+            &intent,
+            effort,
+            allow_model_selected_paragraphs,
+            &mut messages,
+        );
         (messages, stable_prefix_user_bytes)
     };
     drop(_prompt_span);
@@ -2366,6 +2395,9 @@ fn accept_cleanup_reply_with_plan_recording(
         &parsed_reply,
         Some(intent.operation),
         structure_safe,
+        plan.is_some_and(|plan| {
+            plan.structure == crate::cleanup_prompt::StructureClass::ModelSelectedParagraphs
+        }),
         GuardBoundary::ProviderReply,
     );
     let inspected = match &guarded {
@@ -2815,6 +2847,13 @@ fn is_s1_mini_mlx_recipe(provider: Option<crate::providers::EngineProvider>, mod
             .is_some_and(|candidate| candidate.recipe == crate::modelstore::S1_MINI_CLEANUP_RECIPE)
 }
 
+pub(crate) fn supports_model_selected_paragraphs(
+    provider: Option<crate::providers::EngineProvider>,
+    model: &str,
+) -> bool {
+    !is_s1_mini_mlx_recipe(provider, model)
+}
+
 fn s1_mini_cleanup_messages(
     source_language: Option<&str>,
     text: &str,
@@ -2926,6 +2965,8 @@ fn s1_mini_cleanup_messages(
     } else {
         "general"
     };
+    // S1-mini accepts its fixed styling tags only. Structured preference
+    // guidance has no supported frame and must never be appended to transcript.
     let user =
         format!("[Styling: {styling}] [Structure: {structure}] [Context: {context}]\n{text}");
     Ok(vec![
@@ -2962,30 +3003,42 @@ fn cleanup_messages_with_prefix_boundary(
     intent: &CleanupIntent,
     prompt: &CleanupPromptContext<'_>,
 ) -> (Vec<Message<'static>>, Option<usize>) {
-    let (edit_budget, output_add_on) =
+    let (edit_budget, output_add_on, auto_paragraphing) =
         match prompt.policy.and_then(|policy| policy.cleanup_output_plan) {
-            Some(plan) => (plan.edit_budget, plan.output_add_on),
-            None => crate::cleanup_prompt::unprojected_prompt_selection(
-                prompt.effort,
-                intent.operation,
-                crate::cleanup_output_resolver::auto_scene_for_context(
-                    prompt
-                        .profile
-                        .map(|profile| profile.id.as_str())
-                        .unwrap_or_default(),
-                    prompt
-                        .profile
-                        .map(|profile| profile.family)
-                        .unwrap_or(ContextFamily::General),
-                    prompt
-                        .policy
-                        .map(|policy| policy.input_kind)
-                        .unwrap_or_default(),
-                ),
+            Some(plan) => (
+                plan.edit_budget,
+                plan.output_add_on,
+                plan.structure == crate::cleanup_prompt::StructureClass::ModelSelectedParagraphs,
             ),
+            None => {
+                let (edit_budget, output_add_on) =
+                    crate::cleanup_prompt::unprojected_prompt_selection(
+                        prompt.effort,
+                        intent.operation,
+                        crate::cleanup_output_resolver::auto_scene_for_context(
+                            prompt
+                                .profile
+                                .map(|profile| profile.id.as_str())
+                                .unwrap_or_default(),
+                            prompt
+                                .profile
+                                .map(|profile| profile.family)
+                                .unwrap_or(ContextFamily::General),
+                            prompt
+                                .policy
+                                .map(|policy| policy.input_kind)
+                                .unwrap_or_default(),
+                        ),
+                    );
+                (edit_budget, output_add_on, false)
+            }
         };
-    let system = crate::cleanup_prompt::build_system_prompt(edit_budget, output_add_on)
-        .expect("provider cleanup requests select a model-backed prompt");
+    let system = crate::cleanup_prompt::build_system_prompt_with_paragraphing(
+        edit_budget,
+        output_add_on,
+        auto_paragraphing,
+    )
+    .expect("provider cleanup requests select a model-backed prompt");
     let user = assemble_shared_cleanup_user_prompt(intent, prompt);
     (
         vec![
@@ -3002,13 +3055,15 @@ fn cleanup_messages_with_prefix_boundary(
     )
 }
 
-const MINISTRAL_LIGHT_CLEANUP_INSTRUCTION: &str = "Do not paraphrase any part of this Light cleanup. Copy the transcript word for word, including pronouns and verbs. Change punctuation or remove obvious filler only.";
+const MINISTRAL_LIGHT_CLEANUP_INSTRUCTION: &str = "Do not paraphrase any part of this Light cleanup. Preserve every source word and its order, including pronouns and verbs. Change punctuation or remove obvious filler only.";
+const MINISTRAL_LIGHT_CLEANUP_PARAGRAPHING_INSTRUCTION: &str = "Do not paraphrase this Light cleanup. Preserve every source word and its order. Change punctuation or remove obvious filler. Add paragraph breaks only as AUTO_PARAGRAPHING_POLICY allows.";
 
 fn append_native_cleanup_recipe_instruction(
     provider: Option<crate::providers::EngineProvider>,
     model: &str,
     intent: &CleanupIntent,
     effort: CleanupEffort,
+    allow_model_selected_paragraphs: bool,
     messages: &mut [Message<'static>],
 ) {
     let is_ministral_light_cleanup = provider
@@ -3025,7 +3080,11 @@ fn append_native_cleanup_recipe_instruction(
             .filter(|message| message.role == "system")
         {
             system.content.push_str("\n\n");
-            system.content.push_str(MINISTRAL_LIGHT_CLEANUP_INSTRUCTION);
+            system.content.push_str(if allow_model_selected_paragraphs {
+                MINISTRAL_LIGHT_CLEANUP_PARAGRAPHING_INSTRUCTION
+            } else {
+                MINISTRAL_LIGHT_CLEANUP_INSTRUCTION
+            });
         }
     }
 }
@@ -3089,6 +3148,16 @@ fn assemble_shared_cleanup_user_prompt(
         user.push_str(&frame_reference(
             ReferenceField::UserStyleGuidance,
             writing_prompt,
+        ));
+        user.push('\n');
+    }
+    if let Some(guidance) = policy
+        .and_then(|value| value.preference_guidance.as_deref())
+        .filter(|text| !text.trim().is_empty())
+    {
+        user.push_str(&frame_reference(
+            ReferenceField::UserPreferenceGuidance,
+            guidance,
         ));
         user.push('\n');
     }
@@ -3518,35 +3587,14 @@ async fn consume_openai_response(
     }
     let limits = crate::asr::parse_rate_limits(r.headers());
     let status = r.status();
-    if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
-        return Err(LlmError::Unauthorized);
-    }
-    if status == StatusCode::TOO_MANY_REQUESTS {
-        return Err(LlmError::RateLimited(
-            limits.retry_after.clone().unwrap_or_default(),
-        ));
-    }
     if !status.is_success() {
-        // Error bodies use the same bounded transport; no unbounded .text().
-        let mut bytes = r.bytes_stream();
-        let mut body = Vec::new();
-        while let Some(chunk) = tokio::select! {biased;_=cancellation.cancelled()=>return Err(LlmError::Other(cancellation_message.into())),chunk=bytes.next()=>chunk}
-        {
-            let chunk = chunk.map_err(|e| LlmError::Network(e.without_url().to_string()))?;
-            if body.len().saturating_add(chunk.len()) > total_byte_limit.unwrap_or(1024 * 1024) {
-                return Err(guard_error(GuardReason::ResponseBudget));
-            }
-            body.extend_from_slice(&chunk);
-        }
-        let detail = std::str::from_utf8(&body)
-            .ok()
-            .and_then(provider_error_detail);
-        let message = format_status_with_detail(status, detail.as_deref());
-        return Err(if status.is_server_error() {
-            LlmError::Server(message)
-        } else {
-            LlmError::Other(message)
-        });
+        return Err(map_error_response(
+            r,
+            &limits,
+            total_byte_limit.unwrap_or(1024 * 1024),
+            Some((cancellation, cancellation_message)),
+        )
+        .await);
     }
     let mut bytes = r.bytes_stream();
     let mut buffer = Vec::new();
@@ -3805,35 +3853,10 @@ async fn complete_anthropic(
         })?;
     let limits = crate::asr::parse_rate_limits(response.headers());
     let status = response.status();
-    if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
-        return Err(LlmError::Unauthorized);
-    }
-    if status == StatusCode::TOO_MANY_REQUESTS {
-        return Err(LlmError::RateLimited(
-            limits.retry_after.clone().unwrap_or_default(),
-        ));
-    }
     if !status.is_success() {
-        let detail = response
-            .text()
-            .await
-            .ok()
-            .and_then(|body| provider_error_detail(&body));
-        let message = format_status_with_detail(status, detail.as_deref());
-        if status.is_server_error() {
-            return Err(LlmError::Server(message));
-        }
-        return Err(LlmError::Other(message));
+        return Err(map_error_response(response, &limits, 1024 * 1024, None).await);
     }
-    let mut bytes = response.bytes_stream();
-    let mut body = Vec::new();
-    while let Some(chunk) = bytes.next().await {
-        let chunk = chunk.map_err(|error| LlmError::Network(error.without_url().to_string()))?;
-        if body.len().saturating_add(chunk.len()) > 1024 * 1024 {
-            return Err(guard_error(GuardReason::ResponseBudget));
-        }
-        body.extend_from_slice(&chunk);
-    }
+    let body = read_bounded_bytes(response, 1024 * 1024, None).await?;
     let parsed: serde_json::Value =
         serde_json::from_slice(&body).map_err(|_| guard_error(GuardReason::InvalidResponse))?;
     let content = anthropic_content(&parsed).map_err(|reason| {
@@ -3898,6 +3921,66 @@ async fn complete_anthropic(
         return Err(guard_error(GuardReason::EmptyCompletion));
     }
     Ok((output, limits))
+}
+
+async fn read_bounded_bytes(
+    response: reqwest::Response,
+    limit: usize,
+    cancel: Option<(&tokio_util::sync::CancellationToken, &str)>,
+) -> Result<Vec<u8>, LlmError> {
+    let mut bytes = response.bytes_stream();
+    let mut body = Vec::new();
+    loop {
+        let next = match cancel {
+            Some((cancellation, message)) => {
+                tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => return Err(LlmError::Other(message.into())),
+                    chunk = bytes.next() => chunk,
+                }
+            }
+            None => bytes.next().await,
+        };
+        let Some(chunk) = next else {
+            return Ok(body);
+        };
+        let chunk = chunk.map_err(|e| LlmError::Network(e.without_url().to_string()))?;
+        if body.len().saturating_add(chunk.len()) > limit {
+            return Err(guard_error(GuardReason::ResponseBudget));
+        }
+        body.extend_from_slice(&chunk);
+    }
+}
+
+async fn map_error_response(
+    response: reqwest::Response,
+    limits: &RateLimits,
+    total_byte_limit: usize,
+    cancel: Option<(&tokio_util::sync::CancellationToken, &str)>,
+) -> LlmError {
+    let status = response.status();
+    if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+        return LlmError::Unauthorized;
+    }
+    if status == StatusCode::TOO_MANY_REQUESTS {
+        return LlmError::RateLimited(limits.retry_after.clone().unwrap_or_default());
+    }
+    if status == StatusCode::REQUEST_TIMEOUT {
+        return LlmError::Timeout;
+    }
+    let body = match read_bounded_bytes(response, total_byte_limit, cancel).await {
+        Ok(body) => body,
+        Err(error) => return error,
+    };
+    let detail = std::str::from_utf8(&body)
+        .ok()
+        .and_then(provider_error_detail);
+    let message = format_status_with_detail(status, detail.as_deref());
+    if status.is_server_error() {
+        LlmError::Server(message)
+    } else {
+        LlmError::Other(message)
+    }
 }
 
 fn format_status_with_detail(status: StatusCode, detail: Option<&str>) -> String {
@@ -6590,6 +6673,197 @@ mod tests {
     }
 
     #[test]
+    fn model_selected_paragraph_prompt_and_guard_keep_single_paragraph_cleanup_normal() {
+        let plan = crate::cleanup_prompt::EffectiveCleanupPlan::for_mode(
+            crate::cleanup_prompt::EditBudget::Standard,
+            crate::cleanup_prompt::OutputMode::Auto,
+            crate::cleanup_prompt::AutoScene::Document,
+            crate::cleanup_prompt::StructureClass::ModelSelectedParagraphs,
+        )
+        .expect("Auto prose has an ordinary cleanup plan");
+        let policy = ContextPolicy {
+            output_mode: Some("auto".into()),
+            cleanup_output_plan: Some(plan),
+            ..ContextPolicy::default()
+        };
+        let source = "The release is ready. We should review the docs tomorrow.";
+        let intent = CleanupIntent::implicit(source);
+        let prompt = CleanupPromptContext {
+            context: None,
+            policy: Some(&policy),
+            profile: None,
+            pairs_hint: None,
+            effort: CleanupEffort::Standard,
+            visible_context: None,
+            source_transcript: Some(source),
+        };
+        let messages = cleanup_messages(&intent, &prompt);
+        assert!(messages[0].content.contains("AUTO_PARAGRAPHING_POLICY:"));
+        assert!(messages[0]
+            .content
+            .contains("choose topic breaks only at sentence boundaries"));
+
+        let paragraph_reply =
+            "The release is ready.\n\nWe should review the docs tomorrow.".to_owned();
+        let accepted = accept_cleanup_reply_with_plan_recording(
+            paragraph_reply.clone(),
+            &intent,
+            false,
+            Some(plan),
+        )
+        .expect("source-aligned sentence break is allowed");
+        assert_eq!(accepted.accepted_text, paragraph_reply);
+
+        for invalid in [
+            "We should review the docs tomorrow.\n\nThe release is ready.",
+            "The release is ready.\n\nWe should review the API tomorrow.",
+            "The release is ready.\n\n- We should review the docs tomorrow.",
+        ] {
+            assert!(matches!(
+                accept_cleanup_reply_with_plan_recording(
+                    invalid.into(),
+                    &intent,
+                    false,
+                    Some(plan),
+                ),
+                Err(LlmError::CleanupRejected(CleanupRejectionFact {
+                    reason: GuardReason::Layout,
+                    ..
+                }))
+            ));
+        }
+
+        let punctuation_cleanup_source = "The release is ready we should review the docs tomorrow";
+        let punctuation_cleanup = CleanupIntent::implicit(punctuation_cleanup_source);
+        let accepted = accept_cleanup_reply_with_plan_recording(
+            "The release is ready. We should review the docs tomorrow.".into(),
+            &punctuation_cleanup,
+            false,
+            Some(plan),
+        )
+        .expect("a single-paragraph candidate follows normal cleanup guards");
+        assert_eq!(
+            accepted.accepted_text,
+            "The release is ready. We should review the docs tomorrow."
+        );
+
+        let final_candidate = "The release is ready.\n\nWe should review the docs tomorrow.";
+        assert_eq!(
+            guard_cleanup_candidate(
+                source,
+                final_candidate,
+                Some(CleanupOperation::Cleanup),
+                false,
+                true,
+                GuardBoundary::FinalOutput,
+            )
+            .expect("the final guard is explicitly authorized by the live plan"),
+            final_candidate
+        );
+        let untagged_final = guard_cleanup_candidate(
+            source,
+            final_candidate,
+            Some(CleanupOperation::Cleanup),
+            false,
+            false,
+            GuardBoundary::FinalOutput,
+        )
+        .expect("the existing finalizer flattens untagged paragraph layout");
+        assert_eq!(untagged_final, source);
+    }
+
+    #[tokio::test]
+    async fn model_selected_paragraphing_uses_one_shared_plain_text_request() {
+        let _network_policy_guard = crate::network_policy::strict_offline_test_guard().await;
+        let source = "The release is ready. We should review the docs tomorrow.";
+        let reply = "The release is ready.\n\nWe should review the docs tomorrow.";
+        let response = format!(
+            "data: {}\n\ndata: [DONE]\n\n",
+            serde_json::json!({
+                "choices": [{
+                    "delta": { "content": reply },
+                    "finish_reason": "stop"
+                }]
+            })
+        )
+        .into_bytes();
+        let (endpoint, request) = crate::test_http::spawn_response_with_full_request_capture(
+            200,
+            "text/event-stream",
+            response,
+            &[],
+        )
+        .await;
+        let plan = crate::cleanup_prompt::EffectiveCleanupPlan::for_mode(
+            crate::cleanup_prompt::EditBudget::Standard,
+            crate::cleanup_prompt::OutputMode::Auto,
+            crate::cleanup_prompt::AutoScene::Document,
+            crate::cleanup_prompt::StructureClass::ModelSelectedParagraphs,
+        )
+        .expect("eligible Auto paragraph plan");
+        let policy = ContextPolicy {
+            output_mode: Some("auto".into()),
+            cleanup_output_plan: Some(plan),
+            ..ContextPolicy::default()
+        };
+        let intent = CleanupIntent::implicit(source);
+        let (accepted_text, _) = cleanup_at_with_provider_and_intent(
+            Some(crate::providers::EngineProvider::Groq),
+            &endpoint,
+            MODEL,
+            source,
+            "synthetic-test-key",
+            None,
+            Some(&policy),
+            None,
+            Some(&intent),
+            None,
+            CleanupEffort::Standard,
+            None,
+        )
+        .await
+        .expect("the existing shared request accepts the proved plain-text layout");
+        assert_eq!(accepted_text, reply);
+
+        let request = request.await.expect("shared provider request captured");
+        let body_start = request
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("HTTP request includes its JSON body")
+            + 4;
+        let body: serde_json::Value =
+            serde_json::from_slice(&request[body_start..]).expect("request body is plain JSON");
+        let messages = body["messages"]
+            .as_array()
+            .expect("shared cleanup uses ordinary messages");
+        assert_eq!(messages.len(), 2);
+        assert!(messages[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("AUTO_PARAGRAPHING_POLICY:"));
+        assert!(messages[1]["content"]
+            .as_str()
+            .unwrap()
+            .contains("<TRANSCRIPT_JSON"));
+    }
+
+    #[test]
+    fn s1_mini_recipe_is_excluded_from_model_selected_paragraphs() {
+        assert!(!supports_model_selected_paragraphs(
+            Some(crate::providers::EngineProvider::OnDeviceMlx),
+            crate::modelstore::S1_MINI_MLX_ID,
+        ));
+        assert!(supports_model_selected_paragraphs(
+            Some(crate::providers::EngineProvider::OnDeviceMlx),
+            crate::modelstore::MINISTRAL_3_3B_INSTRUCT_MLX_ID,
+        ));
+        assert!(supports_model_selected_paragraphs(
+            Some(crate::providers::EngineProvider::Groq),
+            crate::modelstore::S1_MINI_MLX_ID,
+        ));
+    }
+
+    #[test]
     fn protected_tokens_are_preserved() {
         assert!(preserves_protected_tokens(
             "部署到 v2 /Users/mingjie/app --dry-run https://example.com",
@@ -7094,6 +7368,38 @@ data: [DONE]
         assert!(!user.contains("App profile guidance:"));
     }
 
+    #[test]
+    fn structured_preference_guidance_uses_its_own_framed_request_field() {
+        let intent = CleanupIntent::implicit("你好，Alex。");
+        let policy = ContextPolicy {
+            preference_guidance: Some(
+                "For an existing opening greeting only, prefer 您好 over 你好.".into(),
+            ),
+            style_example_pairs: vec![crate::context::StyleExamplePair {
+                input: "sample input must stay private".into(),
+                output: "sample output must stay private".into(),
+            }],
+            style_examples_approved: false,
+            ..ContextPolicy::default()
+        };
+        let prompt = CleanupPromptContext {
+            context: None,
+            policy: Some(&policy),
+            profile: None,
+            pairs_hint: None,
+            effort: CleanupEffort::Standard,
+            visible_context: None,
+            source_transcript: None,
+        };
+        let user = assemble_shared_cleanup_user_prompt(&intent, &prompt);
+        assert_eq!(
+            shared_prompt_field(&user, "USER_PREFERENCE_GUIDANCE").as_deref(),
+            Some("For an existing opening greeting only, prefer 您好 over 你好.")
+        );
+        assert!(!user.contains("sample input must stay private"));
+        assert!(!user.contains("sample output must stay private"));
+    }
+
     #[tokio::test]
     async fn gpt_oss_cleanup_still_sends_low_reasoning_effort() {
         let _network_policy_guard = crate::network_policy::strict_offline_test_guard().await;
@@ -7201,6 +7507,7 @@ data: [DONE]
             id: "document.notion".into(),
             family: crate::context::ContextFamily::Document,
             writing_mode_id: None,
+            writing_task_id: None,
             app_label: "Notion".into(),
             icon_key: "document".into(),
             source: crate::context::ContextSource::NativeProcess,
@@ -7483,6 +7790,7 @@ data: [DONE]
             id: "code.cursor".into(),
             family: crate::context::ContextFamily::PromptOrCode,
             writing_mode_id: None,
+            writing_task_id: None,
             app_label: "Cursor — private project title".into(),
             icon_key: "cursor".into(),
             source: crate::context::ContextSource::NativeProcess,
@@ -7513,6 +7821,7 @@ data: [DONE]
             id: "calendar.google".into(),
             family: crate::context::ContextFamily::CalendarTask,
             writing_mode_id: None,
+            writing_task_id: None,
             app_label: "Google Calendar".into(),
             icon_key: "calendar".into(),
             source: crate::context::ContextSource::BrowserDomain,
@@ -7542,6 +7851,7 @@ data: [DONE]
                 id: id.into(),
                 family,
                 writing_mode_id: None,
+                writing_task_id: None,
                 app_label: "App".into(),
                 icon_key: "app".into(),
                 source: crate::context::ContextSource::NativeProcess,
@@ -7696,6 +8006,7 @@ data: [DONE]
             id: "code.prompt_or_code".into(),
             family: ContextFamily::PromptOrCode,
             writing_mode_id: None,
+            writing_task_id: None,
             app_label: "Code".into(),
             icon_key: "code".into(),
             source: crate::context::ContextSource::NativeProcess,
@@ -8215,6 +8526,7 @@ data: [DONE]
             crate::modelstore::MINISTRAL_3_3B_INSTRUCT_MLX_ID,
             &intent,
             CleanupEffort::Light,
+            false,
             &mut messages,
         );
         assert!(messages[0]
@@ -8259,6 +8571,7 @@ data: [DONE]
                 model,
                 intent,
                 effort,
+                false,
                 &mut messages,
             );
             assert_eq!(messages[0].content, "trusted cleanup system");
@@ -8288,6 +8601,27 @@ data: [DONE]
             messages[1].content,
             format!("[Styling: semi-casual] [Structure: prose] [Context: general]\n{source}")
         );
+
+        let preference_policy = ContextPolicy {
+            preference_guidance: Some(
+                "For an existing greeting only, prefer 您好. Do not add a greeting.".into(),
+            ),
+            ..ContextPolicy::default()
+        };
+        let preference_prompt = CleanupPromptContext {
+            policy: Some(&preference_policy),
+            ..prompt
+        };
+        let preference_messages =
+            s1_mini_cleanup_messages(Some("en"), source, &intent, &preference_prompt, None)
+                .expect("unsupported structured guidance is skipped");
+        assert_eq!(preference_messages[1].content, messages[1].content);
+        assert!(!preference_messages[1]
+            .content
+            .contains("USER_PREFERENCE_GUIDANCE"));
+        assert!(!preference_messages[1]
+            .content
+            .contains("Do not add a greeting"));
 
         assert!(s1_mini_cleanup_messages(None, source, &intent, &prompt, None).is_err());
         assert!(s1_mini_cleanup_messages(Some("auto"), source, &intent, &prompt, None).is_err());
@@ -8333,6 +8667,7 @@ data: [DONE]
             id: "email".into(),
             family: ContextFamily::Email,
             writing_mode_id: Some("email".into()),
+            writing_task_id: None,
             app_label: "Email".into(),
             icon_key: "mail".into(),
             source: crate::context::ContextSource::ManualOverride,

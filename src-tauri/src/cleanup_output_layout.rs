@@ -561,15 +561,14 @@ fn trimmed_range(source: &str, range: Range<usize>) -> Range<usize> {
     range.start + start..range.start + end
 }
 
-fn skip_whitespace(source: &str, mut offset: usize) -> usize {
-    while offset < source.len() {
-        let ch = source[offset..].chars().next().expect("offset is in range");
-        if !ch.is_whitespace() {
-            break;
-        }
-        offset += ch.len_utf8();
+fn skip_whitespace(source: &str, offset: usize) -> usize {
+    if offset >= source.len() {
+        return offset;
     }
     offset
+        + source[offset..]
+            .find(|ch: char| !ch.is_whitespace())
+            .unwrap_or(source.len() - offset)
 }
 
 fn overlaps_literal(literals: &[Range<usize>], range: Range<usize>) -> bool {

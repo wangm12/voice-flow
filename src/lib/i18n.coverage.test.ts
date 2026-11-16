@@ -17,7 +17,7 @@ const nativeSources = import.meta.glob(
   { query: "?raw", import: "default", eager: true },
 ) as Record<string, string>;
 
-const translationTablePaths = new Set(["./onboardingGuideTranslations.ts", "./dictionaryLearningAuditTranslations.ts"]);
+const translationTablePaths = new Set(["./onboardingGuideTranslations.ts", "./dictionaryLearningAuditTranslations.ts", "./learningTransferTranslations.ts"]);
 
 function withoutEnglishTable(path: string, content: string): string {
   if (path !== "./i18n.tsx") return content;

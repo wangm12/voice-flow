@@ -76,14 +76,15 @@ pub fn hide_overlay(app: &AppHandle) {
     schedule_reconcile(app);
 }
 
-/// The capsule material follows the primary pill and recovery controls. The
-/// independent learning toast can keep the panel visible without drawing a
-/// second, empty glass capsule behind it.
+/// The capsule material follows the primary pill and recovery controls. Paste
+/// focus yield only changes mouse/key ownership; the visual capsule still owns
+/// its surface until those normal HUD owners release it. The independent
+/// learning toast can keep the panel visible without drawing a second, empty
+/// glass capsule behind it.
 pub fn hud_should_show_native_material() -> bool {
-    !ISLAND_PASTE_YIELD.load(Ordering::Acquire)
-        && (ISLAND_HUD_ACTIONS.load(Ordering::Acquire)
-            || are_details_visible()
-            || ISLAND_RECOVERY_ACTIONS.load(Ordering::Acquire))
+    ISLAND_HUD_ACTIONS.load(Ordering::Acquire)
+        || are_details_visible()
+        || ISLAND_RECOVERY_ACTIONS.load(Ordering::Acquire)
 }
 
 /// The HUD is click-through by default. Active stop/cancel, explicit details,
@@ -404,6 +405,17 @@ fn island_window_size(
     }
 }
 
+fn primary_pill_bottom_offset(learn_toast: bool, details_visible: bool) -> f64 {
+    8.0 + if details_visible { 60.0 } else { 0.0 } + if learn_toast { 52.0 } else { 0.0 }
+}
+
+pub(crate) fn current_primary_pill_bottom_offset() -> f64 {
+    primary_pill_bottom_offset(
+        ISLAND_LEARN_TOAST.load(Ordering::Acquire),
+        are_details_visible(),
+    )
+}
+
 fn apply_island_size(app: &AppHandle) {
     let next_wide = island_should_expand();
     let next_tall = ISLAND_HAS_WARNING_CAPTION.load(Ordering::Acquire);
@@ -413,11 +425,18 @@ fn apply_island_size(app: &AppHandle) {
     let previous_tall = ISLAND_WARNING_APPLIED.swap(next_tall, Ordering::AcqRel);
     let previous_learn = ISLAND_LEARN_APPLIED.swap(next_learn, Ordering::AcqRel);
     let previous_details = ISLAND_DETAILS_APPLIED.swap(next_details, Ordering::AcqRel);
-    if previous_wide == next_wide
-        && previous_tall == next_tall
+    let previous_size = island_window_size(
+        previous_wide,
+        previous_tall,
+        previous_learn,
+        previous_details,
+    );
+    let next_size = island_window_size(next_wide, next_tall, next_learn, next_details);
+    let size_unchanged = (previous_size.0 - next_size.0).abs() < 0.5
+        && (previous_size.1 - next_size.1).abs() < 0.5
         && previous_learn == next_learn
-        && previous_details == next_details
-    {
+        && previous_details == next_details;
+    if size_unchanged {
         return;
     }
     let Some(window) = app.get_webview_window("island") else {
@@ -510,11 +529,13 @@ fn show_overlay_on_main(window: &tauri::WebviewWindow, app: &AppHandle) {
 }
 
 fn position_overlay_on_main(window: &tauri::WebviewWindow, app: &AppHandle) {
+    let learn_toast = ISLAND_LEARN_TOAST.load(Ordering::Acquire);
+    let details_visible = are_details_visible();
     let (width, height) = island_window_size(
         island_should_expand(),
         ISLAND_HAS_WARNING_CAPTION.load(Ordering::Acquire),
-        ISLAND_LEARN_TOAST.load(Ordering::Acquire),
-        are_details_visible(),
+        learn_toast,
+        details_visible,
     );
     let placement = crate::notch::placement_for_cursor_screen_with_size(app, width, height);
     let _ = window.set_position(tauri::Position::Physical(tauri::PhysicalPosition {
@@ -525,6 +546,10 @@ fn position_overlay_on_main(window: &tauri::WebviewWindow, app: &AppHandle) {
         width: placement.width.round().max(1.0) as u32,
         height: placement.height.round().max(1.0) as u32,
     }));
+    crate::native_glass::sync_frame_on_main(
+        window,
+        primary_pill_bottom_offset(learn_toast, details_visible),
+    );
     #[cfg(target_os = "macos")]
     refresh_native_delivery_status_frame(window);
 }
@@ -1027,6 +1052,10 @@ mod tests {
             super::island_window_size(false, false, false, false),
             (244.0, 64.0)
         );
+        assert_eq!(super::primary_pill_bottom_offset(false, false), 8.0);
+        assert_eq!(super::primary_pill_bottom_offset(false, true), 68.0);
+        assert_eq!(super::primary_pill_bottom_offset(true, false), 60.0);
+        assert_eq!(super::primary_pill_bottom_offset(true, true), 120.0);
     }
 
     #[test]

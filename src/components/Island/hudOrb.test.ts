@@ -141,6 +141,9 @@ describe("active HUD evidence and timing", () => {
     expect(hudStageTimerKey(4, "processing", "cleanup", true)).not.toBe(
       hudStageTimerKey(4, "processing", "asr", true),
     );
+    expect(hudStageTimerKey(4, "recording", "finalizing_audio", false)).toBe(
+      hudStageTimerKey(4, "recording_limited", "idle", false),
+    );
     expect(formatHudElapsed(65_000)).toBe("01:05");
     expect(formatHudElapsed(3_661_000)).toBe("1:01:01");
   });

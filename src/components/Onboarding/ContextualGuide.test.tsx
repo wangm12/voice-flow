@@ -82,7 +82,7 @@ describe("optional contextual guide", () => {
     await waitFor(() => expect(screen.getByRole("button", { name: "上下文与看屏幕：分别选择来源和用途" })).toHaveAttribute("aria-expanded", "false"));
     expect(screen.getByRole("button", { name: title })).toHaveAttribute("aria-expanded", "false");
     fireEvent.click(screen.getByRole("button", { name: title }));
-    expect(screen.getByText(/同一听写只计一次/)).toBeVisible();
+    expect(screen.getByText(/现场观察和 History 编辑只生成待确认候选/)).toBeVisible();
   });
 
   it("retains failed acknowledgement as unconfirmed and retries the same native version", async () => {

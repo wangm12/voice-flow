@@ -41,6 +41,8 @@ mod keychain;
 #[cfg(all(feature = "research-harness", target_os = "macos"))]
 mod learning_clipboard_guard;
 mod learning_research;
+mod learning_transfer;
+mod learning_transfer_commands;
 mod lexicon;
 mod llama_cleanup_runtime;
 mod llm;
@@ -67,6 +69,7 @@ mod ondevice_runtime;
 mod paste;
 mod permission_guide;
 mod permissions;
+mod preference_shadow;
 mod prefetch_asr;
 mod protected_span;
 mod providers;
@@ -95,6 +98,7 @@ mod text_action;
 mod vad;
 mod whats_new;
 mod window_capture;
+mod writing_preference_drafts;
 mod writing_preview;
 use delivery_settlement::{
     DeliverySettlementOwner, DeliverySettlementRegistry, DeliveryTerminalOutcome,
@@ -120,7 +124,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use tauri::{Emitter, Listener, Manager, State};
 use tokio_util::sync::CancellationToken;
 
-fn lock_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+pub(crate) fn lock_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1134,7 +1138,7 @@ fn request_snapshot_for_side(
         });
     let prompt = asr_prompt_for_snapshot(
         context.app_data_dir,
-        &settings.dictionary,
+        settings,
         context.recording_context,
         side.provider_kind,
         side.configured_model,
@@ -1326,7 +1330,7 @@ pub(crate) struct AppState {
     screen_preview: Mutex<Option<screen_action::ScreenActionPreview>>,
     text_action_control: Mutex<Option<TextActionControl>>,
     text_action_sequence: AtomicU64,
-    exit_state: AtomicU8,
+    pub(crate) exit_state: AtomicU8,
     operation_lease: Mutex<OperationLease>,
     audio_recovery_ticket: Mutex<Option<AudioRecoveryTicket>>,
     audio_recovery_sequence: AtomicU64,
@@ -1342,7 +1346,7 @@ pub(crate) struct AppState {
     cleanup_model_generation: AtomicU64,
     cleanup_warmup: cleanup_warmup::Coordinator<CleanupWarmupKey>,
     downloads: ondevice_download::DownloadManager,
-    settings: Mutex<store::Settings>,
+    pub(crate) settings: Mutex<store::Settings>,
     settings_generation: AtomicU64,
     pending_provider_credential_read: Mutex<Option<PendingProviderCredentialRead>>,
     /// Monotonic identity for the settings that can alter an in-flight result.
@@ -1353,13 +1357,13 @@ pub(crate) struct AppState {
     active_processing_configuration_generation: AtomicU64,
     context_policy_generation: AtomicU64,
     learning_observer_epoch: Arc<AtomicU64>,
-    context: Mutex<context::ContextState>,
+    pub(crate) context: Mutex<context::ContextState>,
     gate: Arc<queue::RequestGate>,
     metrics: metrics::Metrics,
     dictation_trace_sink: Option<dictation_trace_sink::DictationTraceSink>,
     writing_preview: writing_preview::PreviewManager,
     hotkey_gate: tokio::sync::Mutex<()>,
-    settings_gate: tokio::sync::Mutex<()>,
+    pub(crate) settings_gate: tokio::sync::Mutex<()>,
     pending_recorder_cancel: Mutex<Option<u64>>,
     onboarding_trial: Mutex<onboarding::TrialOwner>,
     onboarding_gate: tokio::sync::Mutex<()>,
@@ -1532,7 +1536,7 @@ fn begin_application_exit(app: &tauri::AppHandle, state: &AppState, exit_code: i
         let state = app.state::<AppState>();
         let _ = tokio::time::timeout(
             std::time::Duration::from_secs(8),
-            dictation::cancel_internal(&app, &state),
+            dictation::cancel_internal_with_source(&app, &state, metrics::StopSource::AppExit),
         )
         .await;
         let asr_settled = ondevice_runtime::shutdown_for_root_with_status(&models_root)
@@ -1667,7 +1671,49 @@ pub(crate) fn commit_learning_settings_snapshot(state: &AppState, settings: stor
 fn apply_learning_settings_snapshot(current: &mut store::Settings, learned: store::Settings) {
     current.dictionary = learned.dictionary;
     current.dictionary_sources = learned.dictionary_sources;
-    current.context_mappings = learned.context_mappings;
+    let current_mappings = current.context_mappings.clone();
+    let mut learned_mappings = learned
+        .context_mappings
+        .into_iter()
+        .map(|mut learned_mapping| {
+            if let Some(current_mapping) = current_mappings
+                .iter()
+                .find(|mapping| mapping.id == learned_mapping.id)
+            {
+                if current_mapping.deleted {
+                    return current_mapping.clone();
+                }
+                learned_mapping.deleted = false;
+                learned_mapping.writing_task_id = current_mapping.writing_task_id;
+                learned_mapping.writing_preferences = current_mapping.writing_preferences.clone();
+                learned_mapping.preference_guidance_provider_approved =
+                    current_mapping.preference_guidance_provider_approved;
+                learned_mapping.preference_revision = current_mapping.preference_revision;
+            } else {
+                if learned_mapping.deleted {
+                    learned_mapping.scrub_as_deleted_tombstone();
+                } else {
+                    learned_mapping.writing_task_id = None;
+                    learned_mapping.writing_preferences.clear();
+                    learned_mapping.preference_guidance_provider_approved = false;
+                    learned_mapping.preference_revision = 0;
+                }
+            }
+            learned_mapping
+        })
+        .collect::<Vec<_>>();
+    for tombstone in current_mappings
+        .into_iter()
+        .filter(|mapping| mapping.deleted)
+    {
+        if !learned_mappings
+            .iter()
+            .any(|mapping| mapping.id == tombstone.id)
+        {
+            learned_mappings.push(tombstone);
+        }
+    }
+    current.context_mappings = learned_mappings;
 }
 
 fn commit_settings_snapshot_if_generation(
@@ -1694,6 +1740,11 @@ fn commit_settings_snapshot_if_generation(
     let preload_model = should_preload.then(|| settings.asr_model.clone());
     let mut history_cancellation = processing_configuration_changed
         .then(|| lock_recover(&state.history_processing_cancellation));
+    if dictionary_learn::observer_permission_policy_changed(&current, &settings) {
+        // Retained AX leases check this epoch before and after each owner read.
+        // Advance it before publishing a grant revocation or mapping change.
+        dictionary_learn::invalidate_learning_observers(&state.learning_observer_epoch);
+    }
     *current = settings;
     state.settings_generation.fetch_add(1, Ordering::AcqRel);
     if let Some(cancellation) = history_cancellation.as_mut() {
@@ -1735,7 +1786,12 @@ async fn cancel_invalidated_dictation(
     configuration_changed: bool,
 ) {
     if configuration_changed {
-        dictation::cancel_internal(app, state).await;
+        dictation::cancel_internal_with_source(
+            app,
+            state,
+            metrics::StopSource::ConfigurationChange,
+        )
+        .await;
     }
 }
 
@@ -2194,8 +2250,8 @@ pub(crate) struct FinalizationContext<'a> {
     /// The exact source projected to the provider when StructureSafe is
     /// active. `source` remains the canonical fallback candidate.
     pub(crate) structure_safe_source: Option<&'a str>,
-    /// Keep a verified scene-inference-suppressed single-line fallback exact
-    /// when the provider is unavailable or rejected.
+    /// Keep the fallback exact when a verified projection or model-selected
+    /// layout requires the canonical prepared source.
     pub(crate) exact_fallback: bool,
     /// The provider-input layout used by the app-level candidate guard when a
     /// source-backed local presentation projection changed only boundaries.
@@ -2203,6 +2259,9 @@ pub(crate) struct FinalizationContext<'a> {
     /// Any alternate source-bound preparation proof used to create the
     /// provider projection; the canonical proof above is always checked too.
     pub(crate) output_projection_list_revision_proof: Option<&'a spoken_layout::ListLayoutProof>,
+    /// The live resolved plan explicitly authorized model-selected paragraph
+    /// breaks for this provider candidate.
+    pub(crate) allow_model_selected_paragraphs: bool,
 }
 
 #[cfg(test)]
@@ -2252,6 +2311,7 @@ fn finalize_text_with_scope(
             exact_fallback: false,
             layout_source: None,
             output_projection_list_revision_proof: None,
+            allow_model_selected_paragraphs: false,
         },
     )
 }
@@ -2362,6 +2422,7 @@ pub(crate) fn finalize_text_for_scene(
             } else {
                 None
             },
+            allow_model_selected_paragraphs: false,
             ..context
         }
     };
@@ -2487,6 +2548,7 @@ pub(crate) fn guard_final_output_with_reason(
         candidate,
         Some(context.operation),
         context.structure_safe_source.is_some(),
+        context.allow_model_selected_paragraphs,
         llm::GuardBoundary::FinalOutput,
     ) {
         Ok(candidate) => candidate,
@@ -2500,13 +2562,27 @@ pub(crate) fn guard_final_output_with_reason(
     };
     if context.operation == llm::CleanupOperation::Cleanup
         && context.promoted_pair_protections.iter().any(|pair| {
-            let source_after_count =
-                surface_occurrences_outside_literals(layout_source, &pair.after);
+            let source_after_count = surface_occurrences_outside_literals_with_policy(
+                layout_source,
+                &pair.after,
+                pair.match_policy,
+            );
             source_after_count > 0
-                && surface_occurrences_outside_literals(layout_source, &pair.before) == 0
-                && (surface_occurrences_outside_literals(&candidate, &pair.before) > 0
-                    || surface_occurrences_outside_literals(&candidate, &pair.after)
-                        < source_after_count)
+                && surface_occurrences_outside_literals_with_policy(
+                    layout_source,
+                    &pair.before,
+                    pair.match_policy,
+                ) == 0
+                && (surface_occurrences_outside_literals_with_policy(
+                    &candidate,
+                    &pair.before,
+                    pair.match_policy,
+                ) > 0
+                    || surface_occurrences_outside_literals_with_policy(
+                        &candidate,
+                        &pair.after,
+                        pair.match_policy,
+                    ) < source_after_count)
         })
     {
         return (
@@ -2606,10 +2682,187 @@ fn cleanup_policy_for_resolved_scene(
     settings: &store::Settings,
     recording_context: &context::ContextSnapshot,
     scene: ResolvedCleanupScene,
+    intent: Option<&llm::CleanupIntent>,
+    cleanup_output_plan: Option<cleanup_prompt::EffectiveCleanupPlan>,
 ) -> context::ContextPolicy {
     let mut policy = cleanup_policy_for(settings, recording_context);
     apply_resolved_scene_to_policy(&mut policy, scene);
+    policy.cleanup_output_plan = cleanup_output_plan;
+    if let Some(intent) = intent.filter(|intent| {
+        intent.source == llm::IntentSource::Implicit
+            && intent.operation == llm::CleanupOperation::Cleanup
+    }) {
+        if let Some(mapping) = trusted_writing_preference_mapping(settings, recording_context) {
+            if !mapping.writing_preferences.is_empty() {
+                policy.preference_scope = Some(format!(
+                    "mapping={};revision={};task={:?};provider_approved={};preferences={:?}",
+                    mapping.id,
+                    mapping.preference_revision,
+                    recording_context.profile.writing_task_id,
+                    mapping.preference_guidance_provider_approved,
+                    mapping.writing_preferences,
+                ));
+            }
+            if settings.output_mode == "auto"
+                && cleanup_output_plan.is_some_and(|plan| {
+                    matches!(
+                        plan.edit_budget,
+                        cleanup_prompt::EditBudget::Light
+                            | cleanup_prompt::EditBudget::Standard
+                            | cleanup_prompt::EditBudget::Heavy
+                    )
+                })
+                && preference_guidance_is_allowed_for_provider(settings, mapping)
+            {
+                policy.preference_guidance = preference_guidance(mapping, &intent.content);
+            }
+        }
+    }
     policy
+}
+
+fn trusted_writing_preference_mapping<'a>(
+    settings: &'a store::Settings,
+    recording_context: &context::ContextSnapshot,
+) -> Option<&'a context::AppMapping> {
+    if recording_context.profile.source != context::ContextSource::UserMapping
+        || recording_context.profile.confidence < 0.75
+        || !settings.context_enabled
+    {
+        return None;
+    }
+    let task_id = recording_context.profile.writing_task_id?;
+    let mapping_id = recording_context.profile.id.strip_prefix("user.")?;
+    let mut matching = settings
+        .context_mappings
+        .iter()
+        .filter(|mapping| mapping.enabled && mapping.id == mapping_id);
+    let mapping = matching.next()?;
+    if matching.next().is_some()
+        || mapping.writing_task_id != Some(task_id)
+        || !mapping.has_task_disambiguator()
+    {
+        return None;
+    }
+    Some(mapping)
+}
+
+fn active_preference_value(
+    mapping: &context::AppMapping,
+    dimension: context::WritingPreferenceDimension,
+) -> Option<context::WritingPreferenceValue> {
+    mapping
+        .writing_preferences
+        .iter()
+        .find(|preference| {
+            preference.dimension == dimension
+                && preference.status == context::WritingPreferenceStatus::Active
+                && preference.task_id.or(mapping.writing_task_id) == mapping.writing_task_id
+        })
+        .map(|preference| preference.value)
+}
+
+fn preference_guidance_is_allowed_for_provider(
+    settings: &store::Settings,
+    mapping: &context::AppMapping,
+) -> bool {
+    mapping.preference_guidance_provider_approved
+        || matches!(
+            settings.cleanup_provider,
+            providers::EngineProvider::OnDeviceMlx | providers::EngineProvider::OnDeviceLlamaCpp
+        )
+        || (settings.cleanup_provider == providers::EngineProvider::Ollama
+            && providers::is_loopback_url(&settings.ollama_base_url))
+}
+
+fn preference_list_projection_is_local(settings: &store::Settings) -> bool {
+    matches!(
+        settings.cleanup_provider,
+        providers::EngineProvider::OnDeviceMlx | providers::EngineProvider::OnDeviceLlamaCpp
+    ) || (settings.cleanup_provider == providers::EngineProvider::Ollama
+        && providers::is_loopback_url(&settings.resolved_provider_base(settings.cleanup_provider)))
+}
+
+fn preference_guidance(mapping: &context::AppMapping, source_text: &str) -> Option<String> {
+    use context::{WritingPreferenceDimension as Dimension, WritingPreferenceValue as Value};
+    let task_id = mapping.writing_task_id?;
+
+    let mut guidance = Vec::new();
+    let task_allows_greeting = matches!(
+        task_id,
+        context::WritingTaskId::Email
+            | context::WritingTaskId::WorkChat
+            | context::WritingTaskId::PersonalChat
+    );
+    if task_allows_greeting && has_supported_opening_greeting(source_text) {
+        match active_preference_value(mapping, Dimension::GreetingTone) {
+            Some(Value::ConversationalGreeting) => guidance.push(
+                "For an existing opening greeting only, prefer 你好 over 您好. Never add a greeting or infer a recipient.",
+            ),
+            Some(Value::RespectfulGreeting) => guidance.push(
+                "For an existing opening greeting only, prefer 您好 over 你好. Never add a greeting or infer a recipient.",
+            ),
+            _ => {}
+        }
+    }
+    match (task_id, active_preference_value(mapping, Dimension::TerminalPunctuation)) {
+        (
+            context::WritingTaskId::Email
+            | context::WritingTaskId::ProjectUpdate
+            | context::WritingTaskId::DocumentEditing,
+            Some(Value::TerminalPeriod),
+        ) if has_safe_single_sentence_surface(source_text, false) => guidance.push(
+            "For this single plain declarative sentence only, use one terminal period. Preserve questions, exclamations, decimals, abbreviations, literals, and all internal punctuation.",
+        ),
+        (
+            context::WritingTaskId::WorkChat | context::WritingTaskId::PersonalChat,
+            Some(Value::NoTerminalPeriod),
+        ) if has_safe_single_sentence_surface(source_text, true) => guidance.push(
+            "For this single plain declarative chat sentence only, omit its existing terminal period. Preserve questions, exclamations, decimals, abbreviations, literals, and all internal punctuation.",
+        ),
+        _ => {}
+    }
+    (!guidance.is_empty()).then(|| guidance.join("\n"))
+}
+
+fn has_supported_opening_greeting(text: &str) -> bool {
+    let first_line = text.lines().next().unwrap_or_default().trim_start();
+    ["你好", "您好"].iter().any(|greeting| {
+        let Some(remainder) = first_line.strip_prefix(greeting) else {
+            return false;
+        };
+        remainder.is_empty()
+            || remainder.chars().next().is_some_and(|character| {
+                character.is_whitespace()
+                    || matches!(
+                        character,
+                        '，' | ',' | '、' | '：' | ':' | '。' | '.' | '！' | '!'
+                    )
+            })
+    })
+}
+
+fn has_safe_single_sentence_surface(text: &str, requires_existing_period: bool) -> bool {
+    let text = text.trim();
+    if text.is_empty()
+        || text.contains(['\n', '\r', '?', '？', '!', '！', ';', '；', ':', '：'])
+        || text.lines().count() != 1
+        || text.starts_with(['-', '*', '+'])
+    {
+        return false;
+    }
+    let terminal_period = text.ends_with(['.', '。']);
+    if terminal_period != requires_existing_period {
+        return false;
+    }
+    let body = if terminal_period {
+        text.strip_suffix('。')
+            .or_else(|| text.strip_suffix('.'))
+            .unwrap_or(text)
+    } else {
+        text
+    };
+    !body.contains(['.', '。', '．', '｡'])
 }
 
 pub(crate) fn apply_resolved_scene_to_policy(
@@ -2785,6 +3038,8 @@ fn startup_cleanup_output_plan(
         output_mode_compatible: false,
         multiline_capable: false,
         focus_kind: scene.effective_input_kind,
+        preferred_bullets: false,
+        allow_model_selected_paragraphs: false,
     };
     match cleanup_output_resolver::resolve_cleanup_projection(facts, "startup warmup") {
         Ok(Some(resolved)) => Some(resolved.plan),
@@ -3264,6 +3519,7 @@ fn cleanup_model_store_completion_succeeded(status: &modelstore::CleanupModelSta
         && matches!(status.state.as_str(), "installed" | "ready")
 }
 
+#[allow(clippy::type_complexity)]
 fn cleanup_projection_signature(
     text: Option<&str>,
     policy: &context::ContextPolicy,
@@ -3272,36 +3528,70 @@ fn cleanup_projection_signature(
     bool,
     Option<String>,
     Option<String>,
+    Option<String>,
+    Option<String>,
     Vec<context::StyleExamplePair>,
+    Option<cleanup_prompt::EffectiveCleanupPlan>,
+    Option<String>,
 ) {
     (
         text.map(str::to_owned),
         policy.style_examples_approved,
+        policy.preference_scope.clone(),
+        policy.preference_guidance.clone(),
         policy.style_example_input.clone(),
         policy.style_example_output.clone(),
         policy.style_example_pairs.clone(),
+        policy.cleanup_output_plan,
+        policy.output_mode.clone(),
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cleanup_projection_still_current(
     state: &AppState,
     captured_settings: &store::Settings,
     recording_context: &context::ContextSnapshot,
     scene: ResolvedCleanupScene,
+    intent: &llm::CleanupIntent,
+    cleanup_output_plan: Option<cleanup_prompt::EffectiveCleanupPlan>,
     sent_text: Option<&str>,
     sent_policy: &context::ContextPolicy,
 ) -> bool {
     let current_settings = lock_recover(&state.settings).clone();
     let context_settings =
         settings_with_current_context_permissions(captured_settings, &current_settings);
+    let live_context = context::detect_snapshot(
+        &context_settings.context_mappings,
+        context_settings.browser_access_enabled,
+    );
+    let carries_context_data = sent_text.is_some()
+        || sent_policy.preference_scope.is_some()
+        || sent_policy.style_examples_approved;
+    if context_target_is_protected(&live_context)
+        || (carries_context_data
+            && !cleanup_projection_target_is_current(
+                recording_context,
+                &live_context,
+                context_settings.browser_access_enabled
+                    || recording_context.target_guard.browser_host.is_some(),
+            ))
+    {
+        return false;
+    }
     let current_screen = session_screen_text(state);
     let current_text = visible_context_for_cleanup(
         &context_settings,
         recording_context,
         current_screen.as_ref(),
     );
-    let current_policy =
-        cleanup_policy_for_resolved_scene(&context_settings, recording_context, scene);
+    let current_policy = cleanup_policy_for_resolved_scene(
+        &context_settings,
+        recording_context,
+        scene,
+        Some(intent),
+        cleanup_output_plan,
+    );
     cleanup_projection_signature(sent_text, sent_policy)
         == cleanup_projection_signature(current_text.as_deref(), &current_policy)
 }
@@ -4737,14 +5027,18 @@ async fn refresh_context_snapshot_request(
     }
 }
 
-async fn persist_context_state(
+pub(crate) async fn persist_context_state(
     app: &tauri::AppHandle,
     state: &AppState,
     enabled: bool,
     browser_access_enabled: bool,
-    mappings: Vec<context::AppMapping>,
+    mut mappings: Vec<context::AppMapping>,
 ) -> Result<(), String> {
     let mut settings = lock_recover(&state.settings).clone();
+    let previous_mappings = settings.context_mappings.clone();
+    bump_mapping_scope_revisions(&previous_mappings, &mut mappings);
+    let mapping_binding_changes =
+        changed_mapping_binding_ids(&settings.context_mappings, &mappings);
     let source_policy_changed = settings.context_enabled != enabled
         || settings.browser_access_enabled != browser_access_enabled
         || settings.context_mappings != mappings;
@@ -4759,7 +5053,53 @@ async fn persist_context_state(
     settings
         .validate_with_models_root(Some(&dir.join("models")))
         .map_err(|error| error.to_string())?;
-    store::save_settings(&dir, &settings).map_err(|error| error.to_string())?;
+    for previous in previous_mappings.iter().filter(|mapping| !mapping.deleted) {
+        let current = mappings
+            .iter()
+            .find(|next| next.id == previous.id && !next.deleted);
+        let still_learning = current.is_some_and(|next| next.dictionary_learn_enabled);
+        let scope_changed = current.is_none_or(|next| {
+            previous.declared_identity_changed(next)
+                || previous.writing_task_id != next.writing_task_id
+        });
+        if !still_learning || scope_changed {
+            store::clear_writing_preference_metadata_for_mapping(&dir, &previous.id).map_err(
+                |error| {
+                    format!("failed to clear mapping-scoped History preference metadata: {error}")
+                },
+            )?;
+        }
+    }
+    let invalidated = store::invalidate_word_rule_mapping_bindings(&dir, &mapping_binding_changes)
+        .map_err(|error| format!("failed to invalidate mapping-bound word rules: {error}"))?;
+    if invalidated > 0 {
+        let _ = app.emit("learn_pairs://changed", ());
+        cancel_invalidated_dictation(app, state, true).await;
+    }
+    let settings_save = if invalidated > 0 {
+        dictionary_learn::save_settings_with_dictionary_effects(
+            &dir,
+            &mut settings,
+            true,
+            true,
+            |settings| store::save_settings(&dir, settings),
+        )
+        .map(|outcome| outcome.sync_error)
+    } else {
+        store::save_settings(&dir, &settings)
+            .map(|()| None)
+            .map_err(|error| error.to_string())
+    };
+    let settings_sync_error = match settings_save {
+        Ok(sync_error) => sync_error,
+        Err(error) => {
+            return Err(if invalidated > 0 {
+                format!("{error}; mapping_change_partial_settings_not_saved")
+            } else {
+                error
+            });
+        }
+    };
     let local_snapshot_changed = {
         let mut current = lock_recover(&state.context);
         let writing_modes = current.writing_modes.clone();
@@ -4782,7 +5122,137 @@ async fn persist_context_state(
         invalidate_session_context_after_policy_change(app, state);
     }
     refresh_context_preview_snapshot(app, state).await;
-    Ok(())
+    settings_sync_error.map_or(Ok(()), Err)
+}
+
+/// Persist an already validated learning-transfer snapshot. The caller owns
+/// `settings_gate` and any operation lease needed to serialize against clear.
+/// Configuration-only persistence preserves Keychain credentials and consumes
+/// staged dictionary effects written by the learn-pair store transaction.
+pub(crate) async fn persist_learning_transfer_import(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    mut settings: store::Settings,
+    database_change_committed: bool,
+) -> Result<Option<String>, String> {
+    settings
+        .validate_configuration()
+        .map_err(|error| error.to_string())?;
+    let previous = lock_recover(&state.settings).clone();
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| error.to_string())?;
+    let outcome = dictionary_learn::save_settings_with_dictionary_effects(
+        &dir,
+        &mut settings,
+        database_change_committed,
+        true,
+        |settings| store::save_configuration(&dir, settings),
+    )?;
+    if !outcome.saved {
+        return Err("learning_transfer_settings_not_saved".into());
+    }
+
+    let context_changed = previous.context_enabled != settings.context_enabled
+        || previous.browser_access_enabled != settings.browser_access_enabled
+        || previous.context_mappings != settings.context_mappings
+        || previous.writing_modes != settings.writing_modes
+        || previous.onboarded != settings.onboarded;
+    let context_source_policy_changed = previous.context_enabled != settings.context_enabled
+        || previous.browser_access_enabled != settings.browser_access_enabled
+        || previous.context_mappings != settings.context_mappings;
+    let local_snapshot_changed = if context_changed {
+        let mappings = settings.context_mappings.clone();
+        let writing_modes = settings.writing_modes.clone();
+        let mut current = lock_recover(&state.context);
+        apply_context_configuration(
+            &mut current,
+            settings.context_enabled,
+            settings.browser_access_enabled,
+            mappings,
+            writing_modes,
+            settings.onboarded,
+        )
+    } else {
+        false
+    };
+    let configuration_changed = commit_settings_snapshot(state, settings.clone());
+    cancel_invalidated_dictation(app, state, configuration_changed).await;
+    let _ = app.emit("settings://changed", store::SettingsView::from(&settings));
+    if local_snapshot_changed {
+        let snapshot = lock_recover(&state.context).snapshot.clone();
+        emit_context_snapshot_if_changed(app, true, &snapshot);
+    }
+    if context_source_policy_changed {
+        invalidate_session_context_after_policy_change(app, state);
+    }
+    if previous.context_mappings != settings.context_mappings {
+        let _ = app.emit("writing_preference_drafts://changed", ());
+    }
+    if context_changed {
+        refresh_context_preview_snapshot(app, state).await;
+    }
+    Ok(outcome.sync_error)
+}
+
+fn changed_mapping_binding_ids(
+    previous: &[context::AppMapping],
+    next: &[context::AppMapping],
+) -> Vec<(String, store::LearnPairBindingInvalidationReason)> {
+    previous
+        .iter()
+        .filter(|old| !old.deleted)
+        .filter_map(
+            |old| match next.iter().find(|new| new.id == old.id && !new.deleted) {
+                None => Some((
+                    old.id.clone(),
+                    store::LearnPairBindingInvalidationReason::MappingDeleted,
+                )),
+                Some(new) if old.declared_identity_changed(new) => Some((
+                    old.id.clone(),
+                    store::LearnPairBindingInvalidationReason::DeclaredIdentityChanged,
+                )),
+                Some(_) => None,
+            },
+        )
+        .collect()
+}
+
+fn bump_mapping_scope_revisions(
+    previous: &[context::AppMapping],
+    next: &mut [context::AppMapping],
+) {
+    for old in previous.iter().filter(|mapping| !mapping.deleted) {
+        let Some(current) = next
+            .iter_mut()
+            .find(|mapping| mapping.id == old.id && !mapping.deleted)
+        else {
+            continue;
+        };
+        let declared_identity_changed = old.declared_identity_changed(current);
+        let selected_task_changed = old.writing_task_id != current.writing_task_id;
+        if declared_identity_changed {
+            current.writing_preferences.clear();
+            current.preference_guidance_provider_approved = false;
+        } else if selected_task_changed {
+            current.preference_guidance_provider_approved = false;
+        }
+        let scope_changed = declared_identity_changed
+            || selected_task_changed
+            || old.dictionary_learn_enabled != current.dictionary_learn_enabled;
+        if scope_changed && current.preference_revision <= old.preference_revision {
+            current.preference_revision = old.preference_revision.wrapping_add(1).max(1);
+        }
+    }
+}
+
+fn live_context_mapping_ids(mappings: &[context::AppMapping]) -> Vec<String> {
+    mappings
+        .iter()
+        .filter(|mapping| !mapping.deleted)
+        .map(|mapping| mapping.id.clone())
+        .collect()
 }
 fn sync_modifier_hotkey_phase(phase: Phase) {
     crate::modifier_hotkey::set_dictation_active(
@@ -4897,6 +5367,7 @@ async fn finish_soniox_stream(
     recording_generation: u64,
     configuration_generation: u64,
     cancellation: &CancellationToken,
+    trace: Option<metrics::TraceHandle>,
 ) -> Option<Result<asr::Transcript, String>> {
     let active = lock_recover(&state.active_soniox_stream).take()?;
     if active.recording_generation != recording_generation
@@ -4918,10 +5389,15 @@ async fn finish_soniox_stream(
         Err(error) => return Some(Err(error)),
     };
     let failure = match active.session {
-        Some(session) => match session.finish(expected_samples).await {
-            Ok(transcript) => return Some(Ok(transcript)),
-            Err(failure) => failure,
-        },
+        Some(session) => {
+            if let Some(trace) = &trace {
+                trace.record_post_stop_asr_started();
+            }
+            match session.finish(expected_samples).await {
+                Ok(transcript) => return Some(Ok(transcript)),
+                Err(failure) => failure,
+            }
+        }
         None => {
             return Some(Err(
                 "Soniox stream session could not be finalized".to_owned()
@@ -4943,6 +5419,9 @@ async fn finish_soniox_stream(
         None,
         None,
     );
+    if let Some(trace) = &trace {
+        trace.record_post_stop_asr_started();
+    }
     match crate::soniox::transcribe_complete_wav(
         wav.to_vec(),
         active.options,
@@ -5948,7 +6427,7 @@ async fn start_claimed_inner(
             // overlapping chunker ceiling is target + five seconds.
             15
         } else {
-            lock_recover(&state.settings).chunk_length_secs
+            settings_snapshot.chunk_length_secs
         };
     let requested_selection = if owned_wav_replay {
         None
@@ -7969,7 +8448,7 @@ async fn handle_audio_error(
     session_id: String,
     message: String,
 ) {
-    let failure_generation = {
+    let failure = {
         let _gate = state.hotkey_gate.lock().await;
         let mut manager = lock_recover(&state.manager);
         if !audio_error_is_current(
@@ -7979,6 +8458,7 @@ async fn handle_audio_error(
         ) {
             None
         } else {
+            let recording_generation = manager.recording_generation;
             if let Some(settlement) = &manager.delivery_settlement {
                 settlement.seal(DeliveryTerminalOutcome::completed(
                     "error",
@@ -7997,12 +8477,19 @@ async fn handle_audio_error(
             manager.recording_context = None;
             manager.recording_learning_snapshot = None;
             manager.recording_translation_target_language = None;
-            Some(manager.session_generation)
+            Some((manager.session_generation, recording_generation))
         }
     };
-    let Some(failure_generation) = failure_generation else {
+    let Some((failure_generation, recording_generation)) = failure else {
         return;
     };
+    dictation::record_terminal_capture_end_diagnostic(
+        state,
+        recording_generation,
+        metrics::StopSource::DeviceError,
+        metrics::DeliveryOutcome::Failed,
+        "audio_device_error",
+    );
     clear_selected_action(state);
     screen_action::clear_screen_action(state);
     // The audio engine marks the active session as device_failed, so canceling
@@ -8095,7 +8582,12 @@ struct AudioLimitPayload {
 }
 
 async fn handle_audio_limit(app: &tauri::AppHandle, state: &AppState, session_generation: u64) {
-    let Some(claim) = dictation::claim_stop_entry_for_generation(state, session_generation).await
+    let Some(claim) = dictation::claim_stop_entry_for_generation_with_source(
+        state,
+        session_generation,
+        metrics::StopSource::DurationCap,
+    )
+    .await
     else {
         return;
     };
@@ -8130,6 +8622,8 @@ async fn paste_text(
     app: &tauri::AppHandle,
     state: &AppState,
     text: &str,
+    original_asr_source: Option<&str>,
+    applied_pairs: &[lexicon::LexiconPair],
     history_transaction_id: &str,
     expected_target: &context::TargetAppGuard,
     accessibility: bool,
@@ -8272,6 +8766,8 @@ async fn paste_text(
             history_transaction_id,
             outcome.outcome.value_after.as_deref(),
             &inserted_text,
+            original_asr_source,
+            applied_pairs,
             confirmed_insertion,
             learning_observation_ticket,
             expected_target,
@@ -8398,20 +8894,13 @@ async fn stop_claimed_inner(
     state: &AppState,
     claim: StopClaim,
 ) -> Result<(), String> {
-    let mut stop_to_insert = state.metrics.stop_to_insert(
-        metrics::MetricGroup::unknown("dictation"),
-        claim.cancellation.clone(),
-    );
-    let _trace_handle = stop_to_insert.bind_trace(claim.session_generation);
-    if let Some(sink) = &state.dictation_trace_sink {
-        sink.bind(&mut stop_to_insert);
-    }
     let StopClaim {
         started,
         session_generation,
         recording_generation,
         delivery_settlement,
         ended_during_start,
+        source,
         skip_llm_cleanup,
         translation_target_language,
         owned_replay_learning_suppressed,
@@ -8424,6 +8913,21 @@ async fn stop_claimed_inner(
         onboarding_trial,
         research_trace: _,
     } = claim;
+    let mut stop_to_insert = state.metrics.stop_to_insert(
+        metrics::MetricGroup::unknown("dictation"),
+        cancellation.clone(),
+    );
+    let trace_handle = stop_to_insert.bind_trace(session_generation);
+    trace_handle.set_stop_diagnostics(metrics::StopDiagnostics {
+        recording_generation,
+        action: metrics::StopAction::Stop,
+        source,
+        capture_duration_ms: None,
+        post_stop_asr_started: Some(false),
+    });
+    if let Some(sink) = &state.dictation_trace_sink {
+        sink.bind(&mut stop_to_insert);
+    }
     let configuration_generation = state
         .active_processing_configuration_generation
         .load(Ordering::Acquire);
@@ -8592,6 +9096,8 @@ async fn stop_claimed_inner(
         actual_device_name,
         device_metadata,
     } = finished_capture;
+    trace_handle
+        .record_capture_duration_seconds(recording_generation, asr::wav_duration_seconds(&wav));
     research_trace::emit(research_trace::capture_device_fact(
         device_metadata.requested_selection,
         device_metadata.clamshell_substituted,
@@ -8788,6 +9294,7 @@ async fn stop_claimed_inner(
             recording_generation,
             configuration_generation,
             &cancellation,
+            Some(trace_handle.clone()),
         )
         .await
     } else {
@@ -8853,6 +9360,7 @@ async fn stop_claimed_inner(
             started,
             &settings,
             &recording_context,
+            skip_llm_cleanup,
             None,
             soniox_result,
             session_generation,
@@ -8879,6 +9387,7 @@ async fn stop_claimed_inner(
             started,
             &settings,
             &recording_context,
+            skip_llm_cleanup,
             prefetch_result.clone(),
             session_generation,
             recording_generation,
@@ -8904,6 +9413,7 @@ async fn stop_claimed_inner(
             started,
             &settings,
             &recording_context,
+            skip_llm_cleanup,
             prefetch_result,
             None,
             session_generation,
@@ -9293,6 +9803,7 @@ struct ReplyAttemptPolicy {
     identity_current: bool,
     ax_text_granted: bool,
     provider_text_granted: bool,
+    live_context_present: bool,
 }
 
 impl ReplyAttemptPolicy {
@@ -9302,6 +9813,7 @@ impl ReplyAttemptPolicy {
             && self.identity_current
             && self.ax_text_granted
             && self.provider_text_granted
+            && self.live_context_present
     }
 }
 
@@ -9354,6 +9866,7 @@ async fn reply_request_is_current(
                 identity_current: text_action_is_current(state, identity),
                 ax_text_granted: permissions.ax_text,
                 provider_text_granted: permissions.context_text_to_providers,
+                live_context_present: live.is_some(),
             }
         },
         || async {
@@ -9460,6 +9973,7 @@ async fn process_selected_action(
     soniox_result: Option<Result<asr::Transcript, String>>,
     stop_to_insert: metrics::StopToInsertTimer,
 ) -> Result<(), String> {
+    let trace_handle = stop_to_insert.trace_handle();
     let identity = selected_action.identity.clone();
     emit_text_action_state(
         app,
@@ -9509,6 +10023,9 @@ async fn process_selected_action(
                 let _latency = state
                     .metrics
                     .timer_for(metrics::MetricKind::FinalAsr, asr_metric_group.clone());
+                if let Some(trace) = &trace_handle {
+                    trace.record_post_stop_asr_started();
+                }
                 history_commands::transcribe_complete_audio(
                     &wav,
                     settings.chunk_length_secs,
@@ -9761,9 +10278,10 @@ async fn process_selected_action(
         return Ok(());
     }
 
-    if selected_action::verify_request_source_snapshot(app, state, &selected_action)
-        .await
-        .is_err()
+    if plan.operation != text_action::TextActionOperation::DraftReply
+        && selected_action::verify_request_source_snapshot(app, state, &selected_action)
+            .await
+            .is_err()
     {
         if cancellation.is_cancelled() || !text_action_is_current(state, &identity) {
             return Ok(());
@@ -9778,33 +10296,6 @@ async fn process_selected_action(
         )
         .await;
         return Ok(());
-    }
-
-    if plan.operation == text_action::TextActionOperation::DraftReply {
-        let current_settings = lock_recover(&state.settings).clone();
-        let live = current_context_for_recording(recording_context, &current_settings);
-        let current_permissions = source_permissions_for_resolved_context(
-            &current_settings,
-            recording_context,
-            live.as_ref(),
-        );
-        if state.context_policy_generation.load(Ordering::Acquire)
-            != selected_action.context_policy_revision
-            || !current_permissions.ax_text
-            || !current_permissions.context_text_to_providers
-            || live.is_none()
-        {
-            fail_text_action(
-                app,
-                state,
-                &identity,
-                recording_context,
-                session_generation,
-                "reply_context_unavailable",
-            )
-            .await;
-            return Ok(());
-        }
     }
 
     let final_text = candidate;
@@ -9944,6 +10435,7 @@ async fn process_screen_action(
     soniox_result: Option<Result<asr::Transcript, String>>,
     stop_to_insert: metrics::StopToInsertTimer,
 ) -> Result<(), String> {
+    let trace_handle = stop_to_insert.trace_handle();
     emit_selected_action_state(
         app,
         "looking_at_screen",
@@ -9993,6 +10485,9 @@ async fn process_screen_action(
                 let _latency = state
                     .metrics
                     .timer_for(metrics::MetricKind::FinalAsr, asr_metric_group);
+                if let Some(trace) = &trace_handle {
+                    trace.record_post_stop_asr_started();
+                }
                 history_commands::transcribe_complete_audio(
                     &wav,
                     settings.chunk_length_secs,
@@ -10506,6 +11001,7 @@ async fn process_short(
     started: std::time::Instant,
     settings: &store::Settings,
     recording_context: &context::ContextSnapshot,
+    session_skip_llm_cleanup: bool,
     prefetch_result: Option<prefetch_asr::PrefetchAsrResult>,
     soniox_result: Option<Result<asr::Transcript, String>>,
     session_generation: u64,
@@ -10945,7 +11441,9 @@ async fn process_short(
         settings.fuzzy_dictionary_enabled && !recording_context.target_guard.secure_input,
     );
     let raw = prepared.text.clone();
-    let pairs_hint = prepared.pairs_hint.clone();
+    let pairs_hint = prepared
+        .pairs_hint_for_provider(settings.cleanup_provider, &settings.cleanup_endpoint())
+        .map(str::to_owned);
     let spoken_raw = raw.clone();
     let intent = prepared.intent.clone();
     let original_asr_source = prepared.original_asr_source.clone();
@@ -10974,12 +11472,13 @@ async fn process_short(
         return Err(message);
     }
     emit_progress(app, 0.45);
-    let cleanup_route = cleanup_route_for_resolved_scene(settings, prepared.scene, &intent);
+    let requested_cleanup_route =
+        cleanup_route_for_resolved_scene(settings, prepared.scene, &intent);
     let fused_candidate = (use_assemblyai_dictation
         && !snippet_expanded
         && intent.operation == llm::CleanupOperation::Cleanup
         && intent.source == llm::IntentSource::Implicit
-        && matches!(cleanup_route, lexicon::CleanupRoute::Provider(_)))
+        && matches!(requested_cleanup_route, lexicon::CleanupRoute::Provider(_)))
     .then(|| {
         provider_cleaned_candidate
             .as_deref()
@@ -10988,6 +11487,19 @@ async fn process_short(
     })
     .flatten();
     let fused_candidate_active = fused_candidate.is_some();
+    let local_pair_egress_blocked = external_cleanup_blocked_by_local_pair(
+        &prepared,
+        settings.cleanup_provider,
+        &settings.cleanup_endpoint(),
+        !fused_candidate_active
+            && !snippet_expanded
+            && matches!(requested_cleanup_route, lexicon::CleanupRoute::Provider(_)),
+    );
+    let cleanup_route = if local_pair_egress_blocked {
+        lexicon::CleanupRoute::LocalOnly
+    } else {
+        requested_cleanup_route
+    };
     let live_cleanup_output = resolve_live_cleanup_output(
         &prepared,
         settings,
@@ -11017,7 +11529,8 @@ async fn process_short(
     );
     // The AssemblyAI fused ASR result is not a separate cleanup request.
     let mut cleanup_attempt_kind = Some("not_called".to_owned());
-    let mut cleanup_failure_reason: Option<String> = None;
+    let mut cleanup_failure_reason: Option<String> =
+        local_pair_egress_blocked.then(|| "local_pair_egress_blocked".to_owned());
     let mut cleanup_transformations = if fused_candidate.is_some() {
         None
     } else {
@@ -11086,12 +11599,25 @@ async fn process_short(
                                 let source = current_screen
                                     .as_ref()
                                     .and_then(|screen| screen.projected_source(permissions));
-                                let mut cleanup_policy = cleanup_policy_for_resolved_scene(
+                                let cleanup_policy = cleanup_policy_for_resolved_scene(
                                     &context_settings,
                                     recording_context,
                                     prepared.scene,
+                                    Some(&prepared.intent),
+                                    cleanup_output_plan,
                                 );
-                                cleanup_policy.cleanup_output_plan = cleanup_output_plan;
+                                if !cleanup_projection_still_current(
+                                    state,
+                                    settings,
+                                    recording_context,
+                                    prepared.scene,
+                                    &prepared.intent,
+                                    cleanup_output_plan,
+                                    visible_context.as_deref(),
+                                    &cleanup_policy,
+                                ) {
+                                    return Err(llm::LlmError::ContextAuthorizationChanged);
+                                }
                                 let result = with_cleanup_warmup_model_demand(
                                 state,
                                 settings.cleanup_provider,
@@ -11126,6 +11652,8 @@ async fn process_short(
                                         settings,
                                         recording_context,
                                         prepared.scene,
+                                        &prepared.intent,
+                                        cleanup_output_plan,
                                         visible_context.as_deref(),
                                         &cleanup_policy,
                                     ) {
@@ -11239,6 +11767,9 @@ async fn process_short(
                         .output_projection_list_revision_proof
                         .as_ref(),
                     exact_fallback: live_cleanup_output.exact_fallback,
+                    allow_model_selected_paragraphs: cleanup_output_plan.is_some_and(|plan| {
+                        plan.structure == cleanup_prompt::StructureClass::ModelSelectedParagraphs
+                    }),
                 },
             )
         })
@@ -11348,6 +11879,16 @@ async fn process_short(
         degraded,
         degraded_reason: degraded_reason.map(str::to_owned),
         context: recording_context.clone(),
+        history_preference_provenance: history_preference_provenance(
+            recording_context,
+            intent.source,
+            &settings.output_mode,
+            snippet_expanded,
+            cleanup_status,
+            &spoken_raw,
+            &final_text,
+            session_skip_llm_cleanup,
+        ),
         engine: winning_engine.clone(),
         cleanup_status: cleanup_status.to_owned(),
         cleanup_rejection: cleanup_rejection.clone(),
@@ -11532,6 +12073,8 @@ async fn process_short(
                     app,
                     state,
                     &final_text,
+                    (!owned_replay_learning_suppressed).then_some(original_asr_source.as_str()),
+                    &prepared.promoted_pair_protections,
                     &history_transaction_id,
                     &recording_context.target_guard,
                     permissions::check().accessibility,
@@ -11929,6 +12472,20 @@ fn should_keep_success_audio(
     if recording_context.target_guard.secure_input {
         return false;
     }
+    if let Some(identity) = recording_context.mapping_identity.as_deref() {
+        let mut exact_mappings = settings
+            .context_mappings
+            .iter()
+            .filter(|mapping| !mapping.deleted)
+            .filter(|mapping| mapping.declared_identity_fingerprint() == identity);
+        if let Some(mapping) = exact_mappings.next() {
+            if exact_mappings.next().is_none()
+                && (!mapping.enabled || !mapping.dictionary_learn_enabled)
+            {
+                return false;
+            }
+        }
+    }
     lexicon::scene_allows_learn(
         &settings.context_mappings,
         &recording_context.profile.id,
@@ -12284,6 +12841,7 @@ struct LongHistoryJob {
     degraded: bool,
     degraded_reason: Option<String>,
     context: context::ContextSnapshot,
+    history_preference_provenance: context::HistoryPreferenceProvenanceV1,
     engine: String,
     cleanup_status: String,
     cleanup_rejection: Option<llm::CleanupRejectionFact>,
@@ -12298,8 +12856,11 @@ impl LongHistoryJob {
         &self,
         transaction_id: String,
     ) -> Result<store::PendingHistoryIntent, String> {
-        let context_policy_json = serde_json::to_string(&self.context.policy.history_metadata())
-            .map_err(|error| error.to_string())?;
+        let mut history_policy = self.context.policy.history_metadata();
+        history_policy.history_preference_provenance =
+            Some(self.history_preference_provenance.clone());
+        let context_policy_json =
+            serde_json::to_string(&history_policy).map_err(|error| error.to_string())?;
         let cleanup_guard_reason = self
             .cleanup_rejection
             .as_ref()
@@ -12332,6 +12893,7 @@ impl LongHistoryJob {
             } else {
                 self.context.target_guard.bundle_id.clone()
             },
+            context_mapping_identity: self.context.mapping_identity.clone(),
             spool_path: None,
             engine: self.engine.clone(),
             cleanup_status: self.cleanup_status.clone(),
@@ -12347,6 +12909,38 @@ impl LongHistoryJob {
             cleanup_failure_reason: self.cleanup_failure_reason.clone(),
             cleanup_final_guard_reason: self.final_guard_reason.clone(),
         })
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn history_preference_provenance(
+    recording_context: &context::ContextSnapshot,
+    intent_source: llm::IntentSource,
+    output_mode: &str,
+    snippet_expanded: bool,
+    cleanup_status: &str,
+    prepared_text: &str,
+    selected_text: &str,
+    session_skip_llm_cleanup: bool,
+) -> context::HistoryPreferenceProvenanceV1 {
+    let output_kind = if snippet_expanded {
+        context::HistoryPreferenceOutputKind::SnippetExpansion
+    } else if cleanup_status == CLEANUP_STATUS_AI_SUCCESS {
+        context::HistoryPreferenceOutputKind::AcceptedCleanup
+    } else if cleanup_status == CLEANUP_STATUS_LOCAL_ONLY && selected_text == prepared_text {
+        context::HistoryPreferenceOutputKind::PreparedTranscript
+    } else {
+        context::HistoryPreferenceOutputKind::Unknown
+    };
+    context::HistoryPreferenceProvenanceV1 {
+        version: 1,
+        task_id: recording_context.profile.writing_task_id,
+        mapping_preference_revision: recording_context.mapping_preference_revision,
+        intent_source,
+        output_kind,
+        output_mode: Some(output_mode.to_owned()),
+        snippet_expanded,
+        session_skip_llm_cleanup: Some(session_skip_llm_cleanup),
     }
 }
 
@@ -13332,6 +13926,7 @@ async fn process_long(
     started: std::time::Instant,
     settings: &store::Settings,
     recording_context: &context::ContextSnapshot,
+    session_skip_llm_cleanup: bool,
     prefetched_transcripts: Option<prefetch_asr::PrefetchAsrResult>,
     session_generation: u64,
     recording_generation: u64,
@@ -13635,99 +14230,33 @@ async fn process_long(
         discard_long_spool(&mut long_spool).await;
         return Ok(());
     }
-    if settings.asr_provider == crate::providers::EngineProvider::OnDevice && failed_chunks > 0 {
-        // A local token budget or chunk failure invalidates the entire result.
-        // Never deliver a successful prefix as if it covered the recording.
-        let saved = persist_long_asr_retry(
-            long_spool.as_ref(),
-            app_data_root.as_deref(),
-            full_wav,
-            started.elapsed().as_secs_f64(),
-            recording_context,
-            &primary_engine,
-            cancellation.clone(),
-        )
-        .await
-        .is_ok();
-        let _ = finish_long_spool(
-            &mut long_spool,
-            if saved {
-                audio::SpoolDisposition::Recoverable
-            } else {
-                audio::SpoolDisposition::Degraded
-            },
-        )
-        .await;
-        let message = if saved {
-            "Local transcription did not cover the full recording. The complete audio was saved for retry.".to_owned()
-        } else {
-            "Local transcription did not cover the full recording. Complete retry audio could not be durably confirmed.".to_owned()
+    if failed_chunks > 0 {
+        let provider_label = match settings.asr_provider {
+            crate::providers::EngineProvider::OnDevice => Some("Local"),
+            crate::providers::EngineProvider::DashScope => Some("Qwen Message"),
+            crate::providers::EngineProvider::AssemblyAi => Some("AssemblyAI"),
+            _ => None,
         };
-        fail_for_generation(app, state, message.clone(), session_generation).await;
-        return Err(message);
-    }
-    if settings.asr_provider == crate::providers::EngineProvider::DashScope && failed_chunks > 0 {
-        // Message transcription chunks are all-or-nothing: a successful
-        // subset is not a complete transcript and must never be delivered.
-        let saved = persist_long_asr_retry(
-            long_spool.as_ref(),
-            app_data_root.as_deref(),
-            full_wav,
-            started.elapsed().as_secs_f64(),
-            recording_context,
-            &primary_engine,
-            cancellation.clone(),
-        )
-        .await
-        .is_ok();
-        let _ = finish_long_spool(
-            &mut long_spool,
-            if saved {
-                audio::SpoolDisposition::Recoverable
-            } else {
-                audio::SpoolDisposition::Degraded
-            },
-        )
-        .await;
-        let message = if saved {
-            "Qwen Message transcription did not cover the full recording. The complete audio was saved for retry.".to_owned()
-        } else {
-            "Qwen Message transcription did not cover the full recording. Complete retry audio could not be durably confirmed.".to_owned()
-        };
-        fail_for_generation(app, state, message.clone(), session_generation).await;
-        return Err(message);
-    }
-    if settings.asr_provider == crate::providers::EngineProvider::AssemblyAi && failed_chunks > 0 {
-        // AssemblyAI's raw Sync route promises one complete transcript across
-        // the recording; a successful subset is not eligible for cleanup or
-        // delivery. Keep the original WAV as a full-audio History retry.
-        let saved = persist_long_asr_retry(
-            long_spool.as_ref(),
-            app_data_root.as_deref(),
-            full_wav,
-            started.elapsed().as_secs_f64(),
-            recording_context,
-            &primary_engine,
-            cancellation.clone(),
-        )
-        .await
-        .is_ok();
-        let _ = finish_long_spool(
-            &mut long_spool,
-            if saved {
-                audio::SpoolDisposition::Recoverable
-            } else {
-                audio::SpoolDisposition::Degraded
-            },
-        )
-        .await;
-        let message = if saved {
-            "AssemblyAI transcription did not cover the full recording. The complete audio was saved for retry.".to_owned()
-        } else {
-            "AssemblyAI transcription did not cover the full recording. Complete retry audio could not be durably confirmed.".to_owned()
-        };
-        fail_for_generation(app, state, message.clone(), session_generation).await;
-        return Err(message);
+        if let Some(provider_label) = provider_label {
+            // Local, DashScope Message, and AssemblyAI Sync routes are
+            // all-or-nothing: a partial prefix must never be delivered.
+            return Err(fail_incomplete_long_asr(
+                app,
+                state,
+                provider_label,
+                session_generation,
+                IncompleteLongAsrRetry {
+                    long_spool: &mut long_spool,
+                    app_data_root: app_data_root.as_deref(),
+                    full_wav,
+                    elapsed_secs: started.elapsed().as_secs_f64(),
+                    recording_context,
+                    primary_engine: &primary_engine,
+                    cancellation: cancellation.clone(),
+                },
+            )
+            .await);
+        }
     }
     let long_engine = if winning_engines.is_empty() {
         primary_engine.clone()
@@ -13788,7 +14317,9 @@ async fn process_long(
         settings.fuzzy_dictionary_enabled && !recording_context.target_guard.secure_input,
     );
     let raw_text = prepared.text.clone();
-    let pairs_hint = prepared.pairs_hint.clone();
+    let pairs_hint = prepared
+        .pairs_hint_for_provider(settings.cleanup_provider, &settings.cleanup_endpoint())
+        .map(str::to_owned);
     let intent = prepared.intent.clone();
     let original_asr_source = prepared.original_asr_source.clone();
     let clipboard =
@@ -13804,7 +14335,20 @@ async fn process_long(
         .clone()
         .unwrap_or_else(|| intent.content.clone());
     let mut cleanup_status;
-    let cleanup_route = cleanup_route_for_resolved_scene(settings, prepared.scene, &intent);
+    let requested_cleanup_route =
+        cleanup_route_for_resolved_scene(settings, prepared.scene, &intent);
+    let local_pair_egress_blocked = external_cleanup_blocked_by_local_pair(
+        &prepared,
+        settings.cleanup_provider,
+        &settings.cleanup_endpoint(),
+        snippet_expansion.is_none()
+            && matches!(requested_cleanup_route, lexicon::CleanupRoute::Provider(_)),
+    );
+    let cleanup_route = if local_pair_egress_blocked {
+        lexicon::CleanupRoute::LocalOnly
+    } else {
+        requested_cleanup_route
+    };
     let live_cleanup_output = resolve_live_cleanup_output(
         &prepared,
         settings,
@@ -13824,6 +14368,10 @@ async fn process_long(
     );
     let mut cleanup_rejection = None;
     let mut provider_cleanup_candidate = None;
+    if local_pair_egress_blocked {
+        cleanup_failure_reason = Some("local_pair_egress_blocked");
+        cleanup_failure_detail = Some("local_pair_egress_blocked".to_owned());
+    }
     let final_text = if let Some(expansion) = snippet_expansion.clone() {
         cleanup_status = CLEANUP_STATUS_SNIPPET_BYPASS;
         expansion
@@ -13900,12 +14448,25 @@ async fn process_long(
                     let source = current_screen
                         .as_ref()
                         .and_then(|screen| screen.projected_source(permissions));
-                    let mut cleanup_policy = cleanup_policy_for_resolved_scene(
+                    let cleanup_policy = cleanup_policy_for_resolved_scene(
                         &context_settings,
                         recording_context,
                         prepared.scene,
+                        Some(&prepared.intent),
+                        cleanup_output_plan,
                     );
-                    cleanup_policy.cleanup_output_plan = cleanup_output_plan;
+                    if !cleanup_projection_still_current(
+                        state,
+                        settings,
+                        recording_context,
+                        prepared.scene,
+                        &prepared.intent,
+                        cleanup_output_plan,
+                        visible_context.as_deref(),
+                        &cleanup_policy,
+                    ) {
+                        return Err(llm::LlmError::ContextAuthorizationChanged);
+                    }
                     let result = with_cleanup_warmup_model_demand(
                         state,
                         settings.cleanup_provider,
@@ -13941,6 +14502,8 @@ async fn process_long(
                             settings,
                             recording_context,
                             prepared.scene,
+                            &prepared.intent,
+                            cleanup_output_plan,
                             visible_context.as_deref(),
                             &cleanup_policy,
                         ) {
@@ -14090,6 +14653,9 @@ async fn process_long(
                         .as_ref()
                         .and(live_cleanup_output.layout_source.as_deref()),
                     exact_fallback: live_cleanup_output.exact_fallback,
+                    allow_model_selected_paragraphs: cleanup_output_plan.is_some_and(|plan| {
+                        plan.structure == cleanup_prompt::StructureClass::ModelSelectedParagraphs
+                    }),
                 },
             )
         })
@@ -14178,13 +14744,8 @@ async fn process_long(
         None,
         Some((total, total)),
     );
-    let degraded = failed_chunks > 0 || cleanup_failure_reason.is_some();
-    let degraded_reason = match (failed_chunks > 0, cleanup_failure_reason) {
-        (true, Some(_)) => Some("partial_asr_and_llm_failure"),
-        (true, None) => Some("partial_asr_failure"),
-        (false, Some(reason)) => Some(reason),
-        (false, None) => None,
-    };
+    let (degraded, degraded_reason) =
+        long_recording_degradation(failed_chunks, cleanup_failure_reason, guard_rejected);
     let delivery_policy = delivery::DeliveryPolicy::parse(&settings.delivery_policy);
     let mut delivered_via_paste = false;
     let mut paste_unconfirmed = false;
@@ -14212,6 +14773,16 @@ async fn process_long(
         degraded,
         degraded_reason: degraded_reason.map(str::to_owned),
         context: recording_context.clone(),
+        history_preference_provenance: history_preference_provenance(
+            recording_context,
+            intent.source,
+            &settings.output_mode,
+            snippet_expansion.is_some(),
+            cleanup_status,
+            &raw_text,
+            &final_text,
+            session_skip_llm_cleanup,
+        ),
         engine: long_engine.clone(),
         cleanup_status: cleanup_status.to_owned(),
         cleanup_rejection: cleanup_rejection.clone(),
@@ -14363,6 +14934,9 @@ async fn process_long(
                 app,
                 state,
                 &final_text,
+                (!owned_replay_learning_suppressed)
+                    .then_some(prepared.original_asr_source.as_str()),
+                &prepared.promoted_pair_protections,
                 &history_transaction_id,
                 &recording_context.target_guard,
                 permissions::check().accessibility,
@@ -14594,7 +15168,9 @@ async fn process_long(
         discard_long_spool(&mut long_spool).await;
         return Ok(());
     }
-    if processing_aborted(state, session_generation) && !persist_history_after_cancel {
+    if (processing_aborted(state, session_generation) || cancellation.is_cancelled())
+        && !persist_history_after_cancel
+    {
         if owned_replay_history_fallback {
             history_handoff.abort();
             discard_long_spool(&mut long_spool).await;
@@ -14833,6 +15409,52 @@ async fn process_long(
         .await;
     }
     Ok(())
+}
+
+struct IncompleteLongAsrRetry<'a> {
+    long_spool: &'a mut Option<audio::LongSpoolSession>,
+    app_data_root: Option<&'a Path>,
+    full_wav: Vec<u8>,
+    elapsed_secs: f64,
+    recording_context: &'a context::ContextSnapshot,
+    primary_engine: &'a str,
+    cancellation: CancellationToken,
+}
+
+async fn fail_incomplete_long_asr(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    provider_label: &str,
+    session_generation: u64,
+    retry: IncompleteLongAsrRetry<'_>,
+) -> String {
+    let saved = persist_long_asr_retry(
+        retry.long_spool.as_ref(),
+        retry.app_data_root,
+        retry.full_wav,
+        retry.elapsed_secs,
+        retry.recording_context,
+        retry.primary_engine,
+        retry.cancellation,
+    )
+    .await
+    .is_ok();
+    let _ = finish_long_spool(
+        retry.long_spool,
+        if saved {
+            audio::SpoolDisposition::Recoverable
+        } else {
+            audio::SpoolDisposition::Degraded
+        },
+    )
+    .await;
+    let message = if saved {
+        format!("{provider_label} transcription did not cover the full recording. The complete audio was saved for retry.")
+    } else {
+        format!("{provider_label} transcription did not cover the full recording. Complete retry audio could not be durably confirmed.")
+    };
+    fail_for_generation(app, state, message.clone(), session_generation).await;
+    message
 }
 
 async fn finish_long_spool(
@@ -15172,6 +15794,27 @@ fn long_completion_state(
     }
 }
 
+fn long_recording_degradation(
+    failed_chunks: usize,
+    cleanup_failure_reason: Option<&'static str>,
+    final_guard_rejected: bool,
+) -> (bool, Option<&'static str>) {
+    let cleanup_degraded_reason = match cleanup_failure_reason {
+        Some("local_pair_egress_blocked") if final_guard_rejected => Some("preservation_guard"),
+        Some("local_pair_egress_blocked") => None,
+        None if final_guard_rejected => Some("preservation_guard"),
+        reason => reason,
+    };
+    let degraded = failed_chunks > 0 || cleanup_degraded_reason.is_some();
+    let degraded_reason = match (failed_chunks > 0, cleanup_degraded_reason) {
+        (true, Some(_)) => Some("partial_asr_and_llm_failure"),
+        (true, None) => Some("partial_asr_failure"),
+        (false, Some(reason)) => Some(reason),
+        (false, None) => None,
+    };
+    (degraded, degraded_reason)
+}
+
 fn completion_state(degraded: bool, pasted: bool) -> &'static str {
     if degraded {
         "degraded"
@@ -15246,13 +15889,65 @@ pub(crate) struct PreparedCleanupTranscript {
     pub(crate) original_asr_source: String,
     pub(crate) snippet_input: String,
     pub(crate) intent: llm::CleanupIntent,
+    /// All locally applicable pair hints. These remain available to native
+    /// cleanup models that do not send the prompt outside the device.
     pub(crate) pairs_hint: Option<String>,
+    /// Pair hints eligible for provider egress. Only recognized, unscoped
+    /// global word rules may appear here; every App-scoped or local-only pair
+    /// remains available through `pairs_hint` for local cleanup models.
+    pub(crate) cloud_pairs_hint: Option<String>,
+    /// Dictionary terms with an independently provable global owner. This is
+    /// also the only dictionary input permitted in provider-visible fuzzy
+    /// preparation.
+    pub(crate) provider_dictionary: Vec<String>,
+    /// True when pair preparation changed text using at least one rule that
+    /// cannot be emitted to cloud (scoped/local-only, or lacking an
+    /// independently egress-owned canonical word).
+    pub(crate) scoped_pair_replacement_applied: bool,
     pub(crate) revision_source: String,
     pub(crate) revision_authorizations: Vec<spoken_revision::AuthorizedCorrection>,
     pub(crate) promoted_pair_protections: Vec<lexicon::LexiconPair>,
     pub(crate) list_revision_proof: Option<spoken_layout::ListLayoutProof>,
     #[cfg(test)]
     pub(crate) source_preparation_preserved: bool,
+}
+
+impl PreparedCleanupTranscript {
+    pub(crate) fn should_block_external_cleanup(
+        &self,
+        provider: providers::EngineProvider,
+        endpoint: &str,
+    ) -> bool {
+        self.scoped_pair_replacement_applied && !cleanup_provider_is_local(provider, endpoint)
+    }
+
+    pub(crate) fn pairs_hint_for_provider(
+        &self,
+        provider: providers::EngineProvider,
+        endpoint: &str,
+    ) -> Option<&str> {
+        if cleanup_provider_is_local(provider, endpoint) {
+            self.pairs_hint.as_deref()
+        } else {
+            self.cloud_pairs_hint.as_deref()
+        }
+    }
+}
+
+fn cleanup_provider_is_local(provider: providers::EngineProvider, endpoint: &str) -> bool {
+    matches!(
+        provider,
+        providers::EngineProvider::OnDeviceMlx | providers::EngineProvider::OnDeviceLlamaCpp
+    ) || (provider == providers::EngineProvider::Ollama && providers::is_loopback_url(endpoint))
+}
+
+pub(crate) fn external_cleanup_blocked_by_local_pair(
+    prepared: &PreparedCleanupTranscript,
+    provider: providers::EngineProvider,
+    endpoint: &str,
+    external_request_would_be_sent: bool,
+) -> bool {
+    external_request_would_be_sent && prepared.should_block_external_cleanup(provider, endpoint)
 }
 
 pub(crate) fn prepare_exact_code_transcript(
@@ -15271,6 +15966,9 @@ pub(crate) fn prepare_exact_code_transcript(
         snippet_input: raw.clone(),
         intent: llm::CleanupIntent::implicit(&raw),
         pairs_hint: None,
+        cloud_pairs_hint: None,
+        provider_dictionary: Vec::new(),
+        scoped_pair_replacement_applied: false,
         revision_source: raw,
         revision_authorizations: Vec::new(),
         promoted_pair_protections: Vec::new(),
@@ -15330,7 +16028,7 @@ pub(crate) fn prepare_cleanup_output_projection(
         && prepared.intent.source == llm::IntentSource::Implicit
         && snippets::matching_snippet(&settings.snippets, &prepared.snippet_input).is_none()
     {
-        text = lexicon::apply_ascii_fuzzy_dictionary(&text, &settings.dictionary);
+        text = lexicon::apply_ascii_fuzzy_dictionary(&text, &prepared.provider_dictionary);
     }
 
     let revision_source = text;
@@ -15385,6 +16083,19 @@ fn resolve_live_cleanup_output(
         _ => cleanup_output_resolver::OutputOperation::Other,
     };
     let focus_kind = recording_context.policy.input_kind;
+    let inferred_codex_multiline_prompt = prepared.scene.codex_transcript_prompt_inferred
+        && prepared.scene.family == context::ContextFamily::PromptOrCode
+        && prepared.scene.observed_input_kind == context::FocusKind::Code
+        && prepared.scene.effective_input_kind == context::FocusKind::CodingPrompt
+        && recording_context.profile.id == "code.codex"
+        && recording_context.target_guard.bundle_id.as_deref() == Some("com.openai.codex")
+        && recording_context.multiline_capability_known
+        && recording_context.multiline_capable;
+    let layout_focus_kind = if inferred_codex_multiline_prompt {
+        context::FocusKind::CodingPrompt
+    } else {
+        focus_kind
+    };
     let compatible_target = recording_context.multiline_capable
         && recording_context.profile.confidence >= 0.75
         && !recording_context.target_guard.secure_input
@@ -15393,9 +16104,9 @@ fn resolve_live_cleanup_output(
             context::FocusKind::Secure
                 | context::FocusKind::Terminal
                 | context::FocusKind::Form
-                | context::FocusKind::Code
                 | context::FocusKind::Search
-        );
+        )
+        && (focus_kind != context::FocusKind::Code || inferred_codex_multiline_prompt);
     let auto_default_mode = match auto_scene {
         cleanup_prompt::AutoScene::Email => cleanup_prompt::OutputMode::Email,
         _ => cleanup_prompt::OutputMode::Auto,
@@ -15422,6 +16133,33 @@ fn resolve_live_cleanup_output(
         .as_ref()
         .map(|projection| projection.text.as_str())
         .unwrap_or(&prepared.text);
+    let preferred_bullets = model_request_eligible
+        && !snippet_expanded
+        && settings.output_mode == "auto"
+        && prepared.intent.source == llm::IntentSource::Implicit
+        && prepared.intent.operation == llm::CleanupOperation::Cleanup
+        && trusted_writing_preference_mapping(settings, recording_context).is_some_and(|mapping| {
+            preference_list_projection_is_local(settings)
+                && preference_guidance_is_allowed_for_provider(settings, mapping)
+                && active_preference_value(
+                    mapping,
+                    context::WritingPreferenceDimension::ListStructure,
+                ) == Some(context::WritingPreferenceValue::Bullets)
+        });
+    let allow_model_selected_paragraphs = model_request_eligible
+        && !snippet_expanded
+        && mode == cleanup_prompt::OutputMode::Auto
+        && operation == cleanup_output_resolver::OutputOperation::OrdinaryCleanup
+        && prepared.intent.source == llm::IntentSource::Implicit
+        && compatible_target
+        && recording_context.multiline_capability_known
+        && focus_kind != context::FocusKind::Unknown
+        && (prepared.scene.allows_automatic_lexicon() || inferred_codex_multiline_prompt)
+        && !preferred_bullets
+        && llm::supports_model_selected_paragraphs(
+            Some(settings.cleanup_provider),
+            &settings.cleanup_request_model(),
+        );
     let facts = cleanup_output_resolver::CleanupOutputFacts {
         intensity: cleanup_intensity_for_resolved_scene(settings, prepared.scene),
         output_mode: mode,
@@ -15430,7 +16168,9 @@ fn resolve_live_cleanup_output(
         model_request_eligible: model_request_eligible && !snippet_expanded,
         output_mode_compatible: compatible_target,
         multiline_capable: recording_context.multiline_capable,
-        focus_kind,
+        focus_kind: layout_focus_kind,
+        preferred_bullets,
+        allow_model_selected_paragraphs,
     };
     let resolved =
         match cleanup_output_resolver::resolve_cleanup_projection(facts, projection_source) {
@@ -15466,14 +16206,19 @@ fn resolve_live_cleanup_output(
     let structure_safe_source = (resolved.plan.edit_budget
         == cleanup_prompt::EditBudget::StructureSafe)
         .then(|| provider_input.clone());
-    let layout_source = (provider_input != canonical_input || structure_safe_source.is_some())
+    let layout_source = (provider_input != canonical_input
+        || structure_safe_source.is_some()
+        || resolved.plan.structure == cleanup_prompt::StructureClass::ModelSelectedParagraphs)
         .then(|| provider_input.clone());
     let mut provider_intent = prepared.intent.clone();
     provider_intent.content = provider_input.clone();
-    let exact_fallback = known_single_line_target
-        && scene_suppressed
-            .as_ref()
-            .is_some_and(|projection| projection.text != canonical_input);
+    let model_selected_paragraphs =
+        resolved.plan.structure == cleanup_prompt::StructureClass::ModelSelectedParagraphs;
+    let exact_fallback = model_selected_paragraphs
+        || (known_single_line_target
+            && scene_suppressed
+                .as_ref()
+                .is_some_and(|projection| projection.text != canonical_input));
     let fallback_input = if exact_fallback {
         provider_input.clone()
     } else {
@@ -15525,6 +16270,8 @@ fn cleanup_projection_matches_canonical(canonical: &str, projection: &str) -> bo
 struct PreparedLexiconTranscript {
     pub(crate) text: String,
     pub(crate) pairs_hint: Option<String>,
+    pub(crate) cloud_pairs_hint: Option<String>,
+    pub(crate) scoped_pair_replacement_applied: bool,
     pub(crate) promoted_pair_protections: Vec<lexicon::LexiconPair>,
 }
 
@@ -15568,6 +16315,38 @@ pub(crate) fn prepare_cleanup_transcript_for_scene(
     )
 }
 
+#[cfg(test)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "test adapter holds the scene fixed while toggling only exact replacement mutation"
+)]
+pub(crate) fn prepare_cleanup_transcript_for_scene_with_exact_replacement_switch(
+    dir: Option<&Path>,
+    settings: &store::Settings,
+    raw: &str,
+    family: context::ContextFamily,
+    confidence: f32,
+    input_kind: context::FocusKind,
+    learn_scope: Option<&store::LearnPairScope>,
+    fuzzy_dictionary_enabled: bool,
+    exact_replacement_enabled: bool,
+) -> PreparedCleanupTranscript {
+    prepare_cleanup_transcript_with_exact_replacement_control(
+        dir,
+        settings,
+        raw,
+        ResolvedCleanupScene::observed(family, input_kind),
+        confidence,
+        PreparationRules {
+            spoken_layout: true,
+            explicit_pairs: None,
+            learn_scope,
+            fuzzy_dictionary_enabled,
+        },
+        exact_replacement_enabled,
+    )
+}
+
 pub(crate) fn prepare_cleanup_transcript_for_resolved_scene(
     dir: Option<&Path>,
     settings: &store::Settings,
@@ -15600,8 +16379,24 @@ fn prepare_cleanup_transcript_with_resolved_rules(
     confidence: f32,
     rules: PreparationRules<'_>,
 ) -> PreparedCleanupTranscript {
+    prepare_cleanup_transcript_with_exact_replacement_control(
+        dir, settings, raw, scene, confidence, rules, true,
+    )
+}
+
+fn prepare_cleanup_transcript_with_exact_replacement_control(
+    dir: Option<&Path>,
+    settings: &store::Settings,
+    raw: &str,
+    scene: ResolvedCleanupScene,
+    confidence: f32,
+    rules: PreparationRules<'_>,
+    exact_replacement_enabled: bool,
+) -> PreparedCleanupTranscript {
     let family = scene.family;
     let learn_scope = rules.learn_scope.cloned().unwrap_or_default();
+    let pair_records = load_learn_pairs(dir);
+    let provider_dictionary = settings.asr_dictionary_words(&pair_records);
     let layout = if rules.spoken_layout {
         spoken_layout::apply_after_punctuation_with_provenance(raw, family, confidence)
     } else {
@@ -15663,24 +16458,35 @@ fn prepare_cleanup_transcript_with_resolved_rules(
             let hits = lexicon::hit_pairs(&structured, pairs, &settings.dictionary);
             let protected = retain_source_anchored_pairs(&text, pairs.to_vec());
             PreparedLexiconTranscript {
-                text,
+                text: if exact_replacement_enabled {
+                    text
+                } else {
+                    structured.clone()
+                },
                 pairs_hint: lexicon::format_cleanup_pairs(&hits),
+                cloud_pairs_hint: lexicon::format_cleanup_pairs(&hits),
+                scoped_pair_replacement_applied: false,
                 promoted_pair_protections: protected,
             }
         } else {
             PreparedLexiconTranscript {
                 text: structured,
                 pairs_hint: None,
+                cloud_pairs_hint: None,
+                scoped_pair_replacement_applied: false,
                 promoted_pair_protections: vec![],
             }
         }
     } else {
         prepare_lexicon_transcript_for_resolved_scene(
             dir,
-            &settings.dictionary,
+            settings,
+            &pair_records,
+            &provider_dictionary,
             &structured,
             scene,
             &learn_scope,
+            exact_replacement_enabled,
         )
     };
     // Dispatch is anchored before fuzzy edits, including authorized spoken
@@ -15721,7 +16527,7 @@ fn prepare_cleanup_transcript_with_resolved_rules(
         && snippets::matching_snippet(&settings.snippets, &snippet_input).is_none()
     {
         lexicon_prepared.text =
-            lexicon::apply_ascii_fuzzy_dictionary(&lexicon_prepared.text, &settings.dictionary);
+            lexicon::apply_ascii_fuzzy_dictionary(&lexicon_prepared.text, &provider_dictionary);
     }
     let revision_source = lexicon_prepared.text;
     let revision = spoken_revision::apply_with_authorizations(&revision_source);
@@ -15749,12 +16555,19 @@ fn prepare_cleanup_transcript_with_resolved_rules(
             snippet_input,
             intent,
             pairs_hint: lexicon_prepared.pairs_hint,
+            cloud_pairs_hint: lexicon_prepared.cloud_pairs_hint,
+            provider_dictionary,
+            scoped_pair_replacement_applied: lexicon_prepared.scoped_pair_replacement_applied,
             revision_source,
             revision_authorizations: revision.authorizations,
-            promoted_pair_protections: retain_source_anchored_pairs(
-                &prepared_text,
-                lexicon_prepared.promoted_pair_protections,
-            ),
+            promoted_pair_protections: if exact_replacement_enabled {
+                retain_source_anchored_pairs(
+                    &prepared_text,
+                    lexicon_prepared.promoted_pair_protections,
+                )
+            } else {
+                lexicon_prepared.promoted_pair_protections
+            },
             list_revision_proof,
             #[cfg(test)]
             source_preparation_preserved: layout_provenance_preserved
@@ -15764,10 +16577,14 @@ fn prepare_cleanup_transcript_with_resolved_rules(
         log::warn!(
             "spoken correction authorization did not match its prepared source; preserving source"
         );
-        let promoted_pair_protections = retain_source_anchored_pairs(
-            &revision_source,
-            lexicon_prepared.promoted_pair_protections,
-        );
+        let promoted_pair_protections = if exact_replacement_enabled {
+            retain_source_anchored_pairs(
+                &revision_source,
+                lexicon_prepared.promoted_pair_protections,
+            )
+        } else {
+            lexicon_prepared.promoted_pair_protections
+        };
         PreparedCleanupTranscript {
             scene,
             text: revision_source.clone(),
@@ -15783,6 +16600,9 @@ fn prepare_cleanup_transcript_with_resolved_rules(
             snippet_input,
             intent,
             pairs_hint: lexicon_prepared.pairs_hint,
+            cloud_pairs_hint: lexicon_prepared.cloud_pairs_hint,
+            provider_dictionary,
+            scoped_pair_replacement_applied: lexicon_prepared.scoped_pair_replacement_applied,
             revision_source,
             revision_authorizations: Vec::new(),
             promoted_pair_protections,
@@ -15810,45 +16630,94 @@ pub(crate) fn prepare_lexicon_transcript_with_provenance(
     input_kind: context::FocusKind,
     learn_scope: &store::LearnPairScope,
 ) -> PreparedLexiconTranscript {
+    let settings = store::Settings {
+        dictionary: dictionary.to_vec(),
+        ..store::Settings::default()
+    };
+    let pair_records = load_learn_pairs(dir);
+    let provider_dictionary = settings.asr_dictionary_words(&pair_records);
     prepare_lexicon_transcript_for_resolved_scene(
         dir,
-        dictionary,
+        &settings,
+        &pair_records,
+        &provider_dictionary,
         raw,
         ResolvedCleanupScene::observed(family, input_kind),
         learn_scope,
+        true,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn prepare_lexicon_transcript_for_resolved_scene(
     dir: Option<&Path>,
-    dictionary: &[String],
+    settings: &store::Settings,
+    pairs: &[store::LearnPairRecord],
+    provider_dictionary: &[String],
     raw: &str,
     scene: ResolvedCleanupScene,
     learn_scope: &store::LearnPairScope,
+    exact_replacement_enabled: bool,
 ) -> PreparedLexiconTranscript {
     if !scene.allows_automatic_lexicon() {
         return PreparedLexiconTranscript {
             text: raw.to_owned(),
             pairs_hint: None,
+            cloud_pairs_hint: None,
+            scoped_pair_replacement_applied: false,
             promoted_pair_protections: Vec::new(),
         };
     }
-    let pairs = load_learn_pairs(dir);
-    let applicable_records = learn_scope.applicable_promoted_records(&pairs);
+    let dictionary = &settings.dictionary;
+    let applicable_records = learn_scope.applicable_promoted_records(pairs);
     let replaceable = lexicon::replaceable_pairs(&applicable_records, dictionary);
     let hits = lexicon::hit_pairs(raw, &replaceable, dictionary);
+    let cloud_records = applicable_records
+        .iter()
+        .filter(|row| row.is_provider_egress_eligible_word_pair())
+        .cloned()
+        .collect::<Vec<_>>();
+    let cloud_replaceable = lexicon::replaceable_pairs(&cloud_records, provider_dictionary);
+    let cloud_hits = lexicon::hit_pairs_with_matching_universe(
+        raw,
+        &cloud_replaceable,
+        &replaceable,
+        dictionary,
+    );
     let (replaced, applied_terms, applied_pairs) =
         lexicon::apply_explicit_replacements_with_facts(raw, &replaceable, dictionary);
-    learning_research::usage(&applied_terms, false);
+    let cloud_pair_keys = cloud_replaceable
+        .iter()
+        .filter_map(|pair| pair.rule_key.as_deref())
+        .collect::<Vec<_>>();
+    let scoped_pair_replacement_applied = exact_replacement_enabled
+        && replaced != raw
+        && applied_pairs.iter().any(|applied| {
+            applied
+                .rule_key
+                .as_deref()
+                .is_none_or(|key| !cloud_pair_keys.contains(&key))
+        });
     let promoted_pair_protections = retain_source_anchored_pairs(&replaced, replaceable);
-    if let Some(path) = dir {
-        let used = lexicon::used_pair_keys(&applied_pairs, &applicable_records);
-        let _ = store::bump_learn_pairs_used(path, &used);
-        let _ = store::record_learned_term_usage(path, &applied_terms);
+    if exact_replacement_enabled {
+        learning_research::usage(&applied_terms, false);
+    }
+    if exact_replacement_enabled {
+        if let Some(path) = dir {
+            let used = lexicon::used_pair_keys(&applied_pairs, &applicable_records);
+            let _ = store::bump_learn_pairs_used(path, &used);
+            let _ = store::record_learned_term_usage(path, &applied_terms);
+        }
     }
     PreparedLexiconTranscript {
-        text: replaced,
+        text: if exact_replacement_enabled {
+            replaced
+        } else {
+            raw.to_owned()
+        },
         pairs_hint: lexicon::format_cleanup_pairs(&hits),
+        cloud_pairs_hint: lexicon::format_cleanup_pairs(&cloud_hits),
+        scoped_pair_replacement_applied,
         promoted_pair_protections,
     }
 }
@@ -15860,25 +16729,41 @@ fn retain_source_anchored_pairs(
     pairs
         .into_iter()
         .filter(|pair| {
-            surface_present_outside_literals(source, &pair.after)
-                && !surface_present_outside_literals(source, &pair.before)
+            surface_present_outside_literals_with_policy(source, &pair.after, pair.match_policy)
+                && !surface_present_outside_literals_with_policy(
+                    source,
+                    &pair.before,
+                    pair.match_policy,
+                )
         })
         .collect()
 }
 
-fn surface_present_outside_literals(text: &str, surface: &str) -> bool {
-    surface_occurrences_outside_literals(text, surface) > 0
+fn surface_present_outside_literals_with_policy(
+    text: &str,
+    surface: &str,
+    match_policy: store::LearnPairMatchPolicy,
+) -> bool {
+    surface_occurrences_outside_literals_with_policy(text, surface, match_policy) > 0
 }
 
-fn surface_occurrences_outside_literals(text: &str, surface: &str) -> usize {
+fn surface_occurrences_outside_literals_with_policy(
+    text: &str,
+    surface: &str,
+    match_policy: store::LearnPairMatchPolicy,
+) -> usize {
     if surface.is_empty() {
         return 0;
     }
-    let folded_text = text.to_ascii_lowercase();
-    let folded_surface = surface.to_ascii_lowercase();
+    let (search_text, search_surface) = match match_policy {
+        store::LearnPairMatchPolicy::Exact => (text.to_owned(), surface.to_owned()),
+        store::LearnPairMatchPolicy::IgnoreCase => {
+            (text.to_ascii_lowercase(), surface.to_ascii_lowercase())
+        }
+    };
     let literal_ranges = spoken_revision::literal_ranges(text);
-    folded_text
-        .match_indices(&folded_surface)
+    search_text
+        .match_indices(&search_surface)
         .filter(|(start, value)| {
             let start = *start;
             let end = start + value.len();
@@ -15891,7 +16776,7 @@ fn surface_occurrences_outside_literals(text: &str, surface: &str) -> usize {
 
 fn asr_prompt_for_snapshot(
     dir: Option<&Path>,
-    dictionary: &[String],
+    settings: &store::Settings,
     snapshot: &context::ContextSnapshot,
     asr_provider: crate::providers::EngineProvider,
     asr_model: &str,
@@ -15899,9 +16784,10 @@ fn asr_prompt_for_snapshot(
     source_permissions: context::ContextSourcePermissions,
 ) -> lexicon::AsrPromptBundle {
     let pairs = load_learn_pairs(dir);
+    let dictionary = settings.asr_dictionary_words(&pairs);
     let scope = lexicon::PromptScope::from_snapshot(snapshot);
     lexicon::build_asr_prompt_bundle_with_permissions(
-        dictionary,
+        &dictionary,
         Some(&snapshot.policy),
         &pairs,
         Some(&scope),
@@ -16063,6 +16949,9 @@ fn settings_with_current_context_permissions(
                 Vec::new()
             };
             mapping.style_examples_approved = examples_remain_approved;
+            mapping.preference_guidance_provider_approved = current_mapping
+                .preference_guidance_provider_approved
+                && captured.preference_guidance_provider_approved;
             if let Some(pair) = mapping.style_example_pairs.first() {
                 mapping.style_example_input = Some(pair.input.clone());
                 mapping.style_example_output = Some(pair.output.clone());
@@ -16300,6 +17189,9 @@ where
                 } else {
                     None
                 };
+                if let Some(trace) = &trace {
+                    trace.record_post_stop_asr_started();
+                }
                 let transcript = future.await;
                 if let Some(span) = &mut asr_span {
                     span.finish();
@@ -16654,7 +17546,10 @@ fn recording_context_matches_live(
 ) -> bool {
     let same_profile = expected.profile.source == context::ContextSource::ManualOverride
         || live.profile.id == expected.profile.id;
+    let same_task = expected.profile.source != context::ContextSource::UserMapping
+        || live.profile.writing_task_id == expected.profile.writing_task_id;
     same_profile
+        && same_task
         && live.policy.input_kind == expected.policy.input_kind
         && context::same_field_mismatch_reason(
             &expected.target_guard,
@@ -16662,6 +17557,15 @@ fn recording_context_matches_live(
             require_browser_identity,
         )
         .is_none()
+}
+
+fn cleanup_projection_target_is_current(
+    expected: &context::ContextSnapshot,
+    live: &context::ContextSnapshot,
+    require_browser_identity: bool,
+) -> bool {
+    !context_target_is_protected(live)
+        && recording_context_matches_live(expected, live, require_browser_identity)
 }
 
 fn cleanup_route_for(
@@ -17786,9 +18690,95 @@ fn read_dictionary_file(path: String) -> Result<String, String> {
 fn get_context_snapshot(state: State<'_, AppState>) -> context::ContextSnapshot {
     lock_recover(&state.context).snapshot.clone()
 }
+
+fn visible_context_mappings(mappings: &[context::AppMapping]) -> Vec<context::AppMapping> {
+    mappings
+        .iter()
+        .filter(|mapping| !mapping.deleted)
+        .cloned()
+        .collect()
+}
+
+fn upsert_context_mapping(
+    mappings: &mut Vec<context::AppMapping>,
+    mut mapping: context::AppMapping,
+    replace_style_examples: bool,
+) -> Result<(), String> {
+    if mapping.deleted {
+        return Err("deleted mapping identities cannot be saved".into());
+    }
+    if mapping.writing_task_id.is_some() && !mapping.has_task_anchor() {
+        return Err("task identity requires an explicit App or site anchor".into());
+    }
+    if mappings
+        .iter()
+        .any(|item| item.id == mapping.id && item.deleted)
+    {
+        return Err("this mapping was deleted; create a new mapping identity".into());
+    }
+    let matching_indices = mappings
+        .iter()
+        .enumerate()
+        .filter_map(|(index, item)| (item.id == mapping.id).then_some(index))
+        .collect::<Vec<_>>();
+    if matching_indices.len() > 1 {
+        return Err("mapping identity is ambiguous; reload mappings before saving".into());
+    }
+    if let Some(index) = matching_indices.first().copied() {
+        context::merge_saved_preferences(&mappings[index], &mut mapping)?;
+        let existing = &mappings[index];
+        let mut merged = context::merge_saved_mapping(existing, mapping, replace_style_examples);
+        let preference_scope_changed = existing.declared_identity_changed(&merged)
+            || existing.writing_task_id != merged.writing_task_id
+            || existing.dictionary_learn_enabled != merged.dictionary_learn_enabled;
+        if preference_scope_changed && merged.preference_revision <= existing.preference_revision {
+            merged.preference_revision = existing.preference_revision.wrapping_add(1).max(1);
+        }
+        let selector_scope_changed = existing.bundle_id != merged.bundle_id
+            || existing.executable != merged.executable
+            || existing.browser_host != merged.browser_host
+            || existing.browser_path_prefix != merged.browser_path_prefix
+            || existing.focused_field != merged.focused_field;
+        if selector_scope_changed
+            || existing.style_example_input != merged.style_example_input
+            || existing.style_example_output != merged.style_example_output
+            || existing.style_example_pairs != merged.style_example_pairs
+        {
+            merged.style_examples_approved = false;
+        }
+        mappings[index] = merged;
+    } else {
+        if mapping.preference_revision != 0 {
+            return Err("new mappings must start at preference revision zero".into());
+        }
+        // A renderer cannot manufacture backend review provenance when it
+        // introduces a mapping. New values are explicit manual settings.
+        for preference in &mut mapping.writing_preferences {
+            preference.source = context::WritingPreferenceSource::Manual;
+            preference.version = 1;
+        }
+        mappings.push(mapping);
+    }
+    Ok(())
+}
+
+fn tombstone_context_mapping(mappings: &mut [context::AppMapping], id: &str) -> bool {
+    let mut changed = false;
+    for mapping in mappings
+        .iter_mut()
+        .filter(|mapping| mapping.id == id && !mapping.deleted)
+    {
+        let next_revision = mapping.preference_revision.wrapping_add(1).max(1);
+        mapping.scrub_as_deleted_tombstone();
+        mapping.preference_revision = next_revision;
+        changed = true;
+    }
+    changed
+}
+
 #[tauri::command]
 fn get_context_mappings(state: State<'_, AppState>) -> Vec<context::AppMapping> {
-    lock_recover(&state.context).mappings.clone()
+    visible_context_mappings(&lock_recover(&state.context).mappings)
 }
 #[tauri::command]
 fn get_available_applications() -> Vec<context::ApplicationOption> {
@@ -17813,6 +18803,9 @@ async fn save_context_mapping(
     mut mapping: context::AppMapping,
     replace_style_examples: Option<bool>,
 ) -> Result<Vec<context::AppMapping>, String> {
+    if mapping.deleted {
+        return Err("deleted mapping identities cannot be saved".into());
+    }
     if let Some(host) = &mapping.browser_host {
         mapping.browser_host = context::normalize_host(host);
     }
@@ -17829,15 +18822,12 @@ async fn save_context_mapping(
             current.mappings.clone(),
         )
     };
-    if let Some(index) = mappings.iter().position(|item| item.id == mapping.id) {
-        mappings[index] = context::merge_saved_mapping(
-            &mappings[index],
-            mapping,
-            replace_style_examples.unwrap_or(false),
-        );
-    } else {
-        mappings.push(mapping);
-    }
+    upsert_context_mapping(
+        &mut mappings,
+        mapping,
+        replace_style_examples.unwrap_or(false),
+    )?;
+    let visible_mappings = visible_context_mappings(&mappings);
     persist_context_state(
         &app,
         &state,
@@ -17846,7 +18836,7 @@ async fn save_context_mapping(
         mappings.clone(),
     )
     .await?;
-    Ok(mappings)
+    Ok(visible_mappings)
 }
 #[tauri::command]
 async fn delete_context_mapping(
@@ -17863,7 +18853,8 @@ async fn delete_context_mapping(
             current.mappings.clone(),
         )
     };
-    mappings.retain(|mapping| mapping.id != id);
+    tombstone_context_mapping(&mut mappings, &id);
+    let visible_mappings = visible_context_mappings(&mappings);
     persist_context_state(
         &app,
         &state,
@@ -17872,7 +18863,7 @@ async fn delete_context_mapping(
         mappings.clone(),
     )
     .await?;
-    Ok(mappings)
+    Ok(visible_mappings)
 }
 #[tauri::command]
 async fn set_context_enabled(
@@ -18270,6 +19261,13 @@ async fn apply_settings(
     settings
         .validate_binding_changes(&prev)
         .map_err(|error| error.to_string())?;
+    if (prev.local_edit_learning_enabled && !settings.local_edit_learning_enabled)
+        || (prev.dictionary_learn_enabled && !settings.dictionary_learn_enabled)
+    {
+        store::clear_writing_preference_metadata(&dir).map_err(|error| {
+            format!("failed to clear local History preference metadata after opt-out: {error}")
+        })?;
+    }
     let requested_dictionary = settings.dictionary.clone();
     let explicitly_removed_dictionary_words = if dictionary_patch_requested {
         store::reconcile_dictionary_patch(&mut settings, requested_dictionary)
@@ -18439,7 +19437,6 @@ async fn apply_settings(
         {
             let _ = hotkey::apply_settings_hotkey(&app, &prev.hotkey, &prev.activation_mode).await;
             restore_auxiliary_hotkeys(&app, &prev).await;
-            hotkey::set_suspended(false);
             return Err(error);
         }
     }
@@ -18456,9 +19453,38 @@ async fn apply_settings(
             return Err(error);
         }
     }
+    let mapping_binding_changes =
+        changed_mapping_binding_ids(&prev.context_mappings, &settings.context_mappings);
+    let mapping_rules_invalidated =
+        match store::invalidate_word_rule_mapping_bindings(&dir, &mapping_binding_changes) {
+            Ok(changed) => changed > 0,
+            Err(error) => {
+                if !hotkey::is_suspended() && hotkey_changed {
+                    let _ =
+                        hotkey::apply_settings_hotkey(&app, &prev.hotkey, &prev.activation_mode)
+                            .await;
+                }
+                if !hotkey::is_suspended() && (hotkey_changed || selected_hotkey_changed) {
+                    let _ = hotkey::apply_selected_action_hotkey(
+                        &app,
+                        &prev.selected_action_hotkey,
+                        prev.selected_actions_enabled,
+                    )
+                    .await;
+                }
+                restore_auxiliary_hotkeys(&app, &prev).await;
+                return Err(format!(
+                    "failed to invalidate mapping-bound word rules: {error}"
+                ));
+            }
+        };
+    if mapping_rules_invalidated {
+        let _ = app.emit("learn_pairs://changed", ());
+        cancel_invalidated_dictation(&app, state, true).await;
+    }
     let save_result = if dictionary_patch_requested {
         (|| -> Result<_, String> {
-            let mut dictionary_database_change = false;
+            let mut dictionary_database_change = mapping_rules_invalidated;
             for word in explicitly_removed_dictionary_words {
                 let cancelled_pending_add =
                     match store::cancel_pending_dictionary_effects_for_word(&dir, &word) {
@@ -18490,6 +19516,20 @@ async fn apply_settings(
                 },
             )
         })()
+    } else if mapping_rules_invalidated {
+        dictionary_learn::save_settings_with_dictionary_effects(
+            &dir,
+            &mut settings,
+            true,
+            true,
+            |settings| {
+                if require_service_readiness {
+                    store::save_settings(&dir, settings)
+                } else {
+                    store::save_configuration(&dir, settings)
+                }
+            },
+        )
     } else {
         let save_result = if require_service_readiness {
             store::save_settings(&dir, &settings)
@@ -18510,7 +19550,11 @@ async fn apply_settings(
                 .await;
             }
             restore_auxiliary_hotkeys(&app, &prev).await;
-            return Err(error.to_string());
+            return Err(if mapping_rules_invalidated {
+                format!("{error}; mapping_change_partial_settings_not_saved")
+            } else {
+                error.to_string()
+            });
         }
         Ok(dictionary_learn::DictionarySettingsSaveOutcome {
             saved: true,
@@ -18533,7 +19577,11 @@ async fn apply_settings(
                 .await;
             }
             restore_auxiliary_hotkeys(&app, &prev).await;
-            return Err(error);
+            return Err(if mapping_rules_invalidated {
+                format!("{error}; mapping_change_partial_settings_not_saved")
+            } else {
+                error
+            });
         }
     };
     let dictionary_sync_error = dictionary_save_outcome.sync_error;
@@ -18763,6 +19811,7 @@ async fn run_daily_retention_tick(app: tauri::AppHandle, research_mode: bool) {
         if let Err(error) = app.emit("style_drafts://changed", ()) {
             log::warn!("failed to invalidate style drafts after retention: {error}");
         }
+        let _ = app.emit("writing_preference_drafts://changed", ());
     }
 }
 
@@ -19114,6 +20163,11 @@ fn validate_settings_patch_fields(
     ];
     if let Some(unknown) = object.keys().find(|key| !ALLOWED.contains(&key.as_str())) {
         return Err(format!("unsupported settings field: {unknown}"));
+    }
+    if object.contains_key("context_mappings") {
+        return Err(
+            "context mappings must be changed through their explicit save/delete commands".into(),
+        );
     }
     if release && object.contains_key("always_on_microphone") {
         return Err("unsupported settings field: always_on_microphone".into());
@@ -20277,6 +21331,18 @@ pub fn run(cli_args: cli::CliArgs) {
             let (mut settings, migrated) = store::load_settings(&dir);
             settings.always_on_microphone =
                 effective_always_on_microphone(&settings, cfg!(not(debug_assertions)));
+            if !research_mode {
+                let mapping_ids = live_context_mapping_ids(&settings.context_mappings);
+                match store::invalidate_missing_word_rule_mapping_bindings(&dir, &mapping_ids) {
+                    Ok(invalidated) if invalidated > 0 => log::warn!(
+                        "disarmed {invalidated} word rules whose App mapping no longer exists"
+                    ),
+                    Ok(_) => {}
+                    Err(error) => log::error!(
+                        "could not record missing App mapping bindings for word rules: {error}"
+                    ),
+                }
+            }
             network_policy::set_strict_offline(settings.strict_offline_enabled);
             // Persist key migrations and other startup normalization (for
             // example, clearing stale onboarded=true when no key is readable).
@@ -20712,6 +21778,7 @@ pub fn run(cli_args: cli::CliArgs) {
             dictionary_learn::remove_dictionary_word,
             dictionary_learn::list_learn_pairs,
             dictionary_learn::add_manual_scoped_learn_pair,
+            dictionary_learn::rebind_invalidated_learn_pair,
             dictionary_learning_audit::get_dictionary_learning_audit,
             dictionary_learn::list_learned_term_usage,
             dictionary_learn::promote_learn_pair,
@@ -20722,6 +21789,8 @@ pub fn run(cli_args: cli::CliArgs) {
             dictionary_learn::list_style_drafts,
             dictionary_learn::confirm_style_draft,
             dictionary_learn::dismiss_style_draft,
+            writing_preference_drafts::list_writing_preference_drafts,
+            writing_preference_drafts::review_writing_preference_drafts,
             read_dictionary_file,
             get_context_snapshot,
             get_context_mappings,
@@ -20739,6 +21808,9 @@ pub fn run(cli_args: cli::CliArgs) {
             history_commands::get_history,
             history_commands::export_history,
             history_commands::export_gold_corpus,
+            learning_transfer_commands::export_learning_transfer,
+            learning_transfer_commands::preview_learning_transfer,
+            learning_transfer_commands::apply_learning_transfer,
             clear_all_data,
             history_commands::retry_dictation,
             probe_engine_draft,
@@ -20858,6 +21930,13 @@ pub fn run_native_glass_poc() {
 
 #[cfg(test)]
 mod tests {
+    fn shared_prompt_test_field(user: &str, tag: &str) -> Option<String> {
+        let start = user.find(&format!("<{tag}_JSON bytes=\""))?;
+        let body_start = start + user[start..].find('\n')? + 1;
+        let body_end = body_start + user[body_start..].find(&format!("\n</{tag}_JSON>"))?;
+        serde_json::from_str(&user[body_start..body_end]).ok()
+    }
+
     #[test]
     fn retired_ondevice_asr_route_may_be_preserved_but_not_newly_selected() {
         let retired_id = crate::ondevice_models::COHERE_TRANSCRIBE_ID;
@@ -20984,6 +22063,14 @@ mod tests {
         assert_eq!(
             super::validate_settings_patch_fields(&unknown, false).unwrap_err(),
             "unsupported settings field: not_a_setting"
+        );
+        let stale_context_mappings = serde_json::json!({"context_mappings": []})
+            .as_object()
+            .unwrap()
+            .clone();
+        assert_eq!(
+            super::validate_settings_patch_fields(&stale_context_mappings, false).unwrap_err(),
+            "context mappings must be changed through their explicit save/delete commands"
         );
     }
 
@@ -21430,6 +22517,7 @@ mod tests {
                 output_projection_list_revision_proof: None,
                 layout_source: None,
                 exact_fallback: false,
+                allow_model_selected_paragraphs: false,
             },
         );
         assert_eq!(final_text, expected);
@@ -21482,6 +22570,7 @@ mod tests {
                     output_projection_list_revision_proof: None,
                     layout_source: None,
                     exact_fallback: false,
+                    allow_model_selected_paragraphs: false,
                 },
             )
             .expect("nonempty deterministic final result")
@@ -21603,6 +22692,7 @@ mod tests {
                 output_projection_list_revision_proof: None,
                 layout_source: None,
                 exact_fallback: false,
+                allow_model_selected_paragraphs: false,
             },
         )
         .expect("nonempty deterministic final result");
@@ -21660,6 +22750,7 @@ mod tests {
                 output_projection_list_revision_proof: None,
                 layout_source: None,
                 exact_fallback: false,
+                allow_model_selected_paragraphs: false,
             },
         )
         .expect("full finalizer accepts source-bound RemoveOrdinal");
@@ -21677,6 +22768,7 @@ mod tests {
             fuzzy_dictionary_enabled: true,
             ..Default::default()
         };
+        assert!(settings.add_dictionary_source("TypeScript", store::DictionarySource::Manual));
         let prepare = |text: &str, settings: &store::Settings| {
             super::prepare_cleanup_transcript_for_scene(
                 None,
@@ -21732,6 +22824,7 @@ mod tests {
         assert_eq!(prepared.intent.source, crate::llm::IntentSource::Implicit);
         assert_eq!(prepared.intent.content, "TypeScript");
         settings.dictionary.push("rewrite".into());
+        assert!(settings.add_dictionary_source("rewrite", store::DictionarySource::Manual));
         let prepared = super::prepare_cleanup_transcript_for_scene(
             None,
             &settings,
@@ -21780,26 +22873,33 @@ mod tests {
     use super::{
         accurate_cascade_allowed, asr_allows_empty_credential, asr_request_snapshot,
         audio_error_is_current, audio_start_error_needs_device_recovery, build_asr_backend,
-        claim_local_watchdog_after_sleep, claim_processing_timeout, completion_state,
-        completion_state_for_delivery, completion_state_for_result, context,
-        delivery_fallback_reason, delivery_method_needs_history_recovery,
+        claim_local_watchdog_after_sleep, claim_processing_timeout,
+        cleanup_route_for_resolved_scene, completion_state, completion_state_for_delivery,
+        completion_state_for_result, context, delivery_fallback_reason,
+        delivery_method_needs_history_recovery, delivery_record_for_history,
         delivery_result_for_paste, details_open_is_current, dictation_has_asr_credential,
-        disarm_local_watchdog, error_completion_is_current, error_fallback_reason, finalize_text,
+        disarm_local_watchdog, error_completion_is_current, error_fallback_reason,
+        external_cleanup_blocked_by_local_pair, finalize_local_candidate_for_scene, finalize_text,
         finalize_text_with_scope, guarded_paste_dispatch_is_current, history_delivery_status,
-        hud_accepts_mouse, hud_destination_is_current, hud_destination_route,
-        long_completion_state, process_bounded_chunk_jobs, processing_completion_is_current,
+        history_preference_provenance, hud_accepts_mouse, hud_destination_is_current,
+        hud_destination_route, long_completion_state, long_off_cleanup_candidate,
+        long_recording_degradation, prepare_cleanup_transcript_for_scene,
+        process_bounded_chunk_jobs, processing_completion_is_current,
         processing_phase_publication_is_current, processing_watchdog_delay,
         quiet_paste_timeout_completion_is_current, read_dictionary_file_contents,
-        recording_publication_is_current, should_chunk_recording, should_spawn_prefetch_asr,
-        stop_transition_is_current, target_guard_mismatch_with_retry, AsrBackend, CleanupDecision,
-        DictationManager, OperationLease, Phase, ProcessingTimeoutClaim, ProcessingTimeoutRecovery,
+        recording_publication_is_current, should_chunk_recording, should_keep_success_audio,
+        should_spawn_prefetch_asr, stop_transition_is_current, target_guard_mismatch_with_retry,
+        AsrBackend, CleanupDecision, DictationManager, FinalizationContext, LongHistoryJob,
+        OperationLease, PendingHistoryAudioPolicy, PendingHistoryHandoff, Phase,
+        ProcessingTimeoutClaim, ProcessingTimeoutRecovery, CLEANUP_STATUS_LOCAL_ONLY,
         LOCAL_WATCHDOG_PENDING, MAX_DICTIONARY_FILE_BYTES,
     };
     use crate::asr::AsrProvider;
     use crate::paste;
     use crate::store;
     use crate::{
-        asr, chunker, delivery, delivery_diagnostics, lexicon, llm, prefetch_asr, providers,
+        asr, chunker, cleanup_prompt, delivery, delivery_diagnostics, lexicon, llm, metrics,
+        prefetch_asr, providers,
     };
     use crate::{screen_text, window_capture};
     use futures_util::StreamExt;
@@ -22030,6 +23130,11 @@ mod tests {
             id: "source-rule".into(),
             label: "Synthetic source rule".into(),
             family: context::ContextFamily::Document,
+            writing_task_id: None,
+            writing_preferences: Vec::new(),
+            preference_guidance_provider_approved: false,
+            preference_revision: 0,
+            deleted: false,
             mode_id: None,
             bundle_id: bundle_id.map(str::to_owned),
             executable: None,
@@ -22139,6 +23244,11 @@ mod tests {
                 id: "editor".into(),
                 label: "Editor".into(),
                 family: ContextFamily::Document,
+                writing_task_id: None,
+                writing_preferences: Vec::new(),
+                preference_guidance_provider_approved: false,
+                preference_revision: 0,
+                deleted: false,
                 mode_id: None,
                 bundle_id: Some("com.example.editor".into()),
                 executable: None,
@@ -22174,6 +23284,11 @@ mod tests {
                 id: "editor".into(),
                 label: "Editor".into(),
                 family: ContextFamily::Document,
+                writing_task_id: None,
+                writing_preferences: Vec::new(),
+                preference_guidance_provider_approved: false,
+                preference_revision: 0,
+                deleted: false,
                 mode_id: None,
                 bundle_id: Some("com.example.editor".into()),
                 executable: None,
@@ -22545,6 +23660,7 @@ mod tests {
                         identity_current: true,
                         ax_text_granted: true,
                         provider_text_granted: true,
+                        live_context_present: true,
                     },
                     || async { true },
                 )
@@ -22575,6 +23691,7 @@ mod tests {
                 identity_current: true,
                 ax_text_granted: true,
                 provider_text_granted: true,
+                live_context_present: true,
             },
             move || async move {
                 // Model a source/target validation that yields while permission
@@ -22989,6 +24106,724 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn asr_wire_and_fixed_transcript_replace_only_in_matching_bundle() {
+        let _network_policy_guard = crate::network_policy::strict_offline_test_guard().await;
+        let global_manual = "VF_GLOBAL_MANUAL_91d3";
+        let alias = "VF_APP_A_ALIAS_92e1";
+        let canonical = "VF_APP_A_CANONICAL_92e1";
+        let local_only_alias = "VF_LOCAL_ONLY_ALIAS_92e1";
+        let local_only_canonical = "VF_LOCAL_ONLY_CANONICAL_92e1";
+        let legacy_unknown_word = "VF_LEGACY_UNKNOWN_ASR_91d3";
+        let orphaned_rule_word = "VF_ORPHANED_RULE_ASR_91d3";
+        let unowned_word = "VF_UNOWNED_ASR_91d3";
+        let synthetic_audio_marker = "VF_SYNTHETIC_AUDIO_91d3";
+        let transcript_marker = "VF_FIXED_TRANSCRIPT_92e1";
+        let fixed_transcript = format!("We discussed {alias} with {transcript_marker} today.");
+        let root = std::env::temp_dir().join(format!(
+            "voiceflow-asr-egress-{}-{}",
+            std::process::id(),
+            super::chrono_like_id()
+        ));
+        std::fs::create_dir(&root).expect("create isolated egress fixture root");
+
+        let scope_a = store::LearnPairScope {
+            native_bundle: Some("com.example.voiceflow.scope-a".into()),
+            ..Default::default()
+        };
+        let scope_b = store::LearnPairScope {
+            native_bundle: Some("com.example.voiceflow.scope-b".into()),
+            ..Default::default()
+        };
+        let scoped_pair_key = store::scoped_word_rule_key(
+            alias,
+            canonical,
+            &scope_a,
+            store::word_rule_match_policy(alias, canonical),
+        )
+        .into_string();
+        store::ensure_manual_scoped_learn_pair(&root, &scoped_pair_key, alias, canonical, &scope_a)
+            .expect("seed the production bundle-only manual pair in isolated SQLite");
+        let local_only_pair_key = store::scoped_word_rule_key(
+            local_only_alias,
+            local_only_canonical,
+            &scope_a,
+            store::word_rule_match_policy(local_only_alias, local_only_canonical),
+        )
+        .into_string();
+        assert!(matches!(
+            store::upsert_auto_scoped_learn_pair_with_observation(
+                &root,
+                &local_only_pair_key,
+                local_only_alias,
+                local_only_canonical,
+                Some(&scope_a),
+                None,
+            )
+            .expect("persist local-only candidate provenance in SQLite"),
+            store::LearnPairUpsert::Stored(_)
+        ));
+        let local_only_pending = store::get_learn_pair(&root, &local_only_pair_key)
+            .expect("read local-only pending pair")
+            .expect("local-only candidate is persisted");
+        assert!(local_only_pending.auto_scoped);
+        store::ensure_learn_pair_promoted(
+            &root,
+            &local_only_pair_key,
+            local_only_alias,
+            local_only_canonical,
+            Some(&scope_a),
+        )
+        .expect("confirm local-only candidate through the production pair owner");
+        let local_only_confirmed = store::get_learn_pair(&root, &local_only_pair_key)
+            .expect("read confirmed local-only pair")
+            .expect("confirmed local-only rule remains persisted");
+        assert!(local_only_confirmed.is_live_promoted() && local_only_confirmed.auto_scoped);
+        assert!(store::list_pending_dictionary_effects(&root)
+            .expect("read global dictionary effects after local-only confirmation")
+            .is_empty());
+
+        let transcript_response = serde_json::json!({
+            "text": fixed_transcript,
+            "segments": [],
+            "words": []
+        })
+        .to_string()
+        .into_bytes();
+        let (base, captured_requests) =
+            crate::test_http::spawn_responses_with_full_request_capture(vec![
+                (200, "application/json", transcript_response.clone()),
+                (200, "application/json", transcript_response),
+            ])
+            .await;
+        let mut settings = store::Settings {
+            dictionary: vec![
+                canonical.into(),
+                local_only_canonical.into(),
+                legacy_unknown_word.into(),
+                orphaned_rule_word.into(),
+            ],
+            asr_provider: crate::providers::EngineProvider::Custom,
+            asr_model: "groq/whisper-large-v3-turbo".into(),
+            custom_base_url: format!("{base}/llm/v1"),
+            asr_api_key: "synthetic-egress-test-key".into(),
+            ..store::Settings::default()
+        };
+        assert!(settings.add_dictionary_source(global_manual, store::DictionarySource::Manual));
+        assert!(settings.add_dictionary_source(
+            canonical,
+            store::DictionarySource::Rule(scoped_pair_key.clone())
+        ));
+        assert!(settings.add_dictionary_source(
+            local_only_canonical,
+            store::DictionarySource::Rule(local_only_pair_key.clone())
+        ));
+        assert!(settings.add_dictionary_source(
+            orphaned_rule_word,
+            store::DictionarySource::Rule("word:v2:cleared-before-egress".into())
+        ));
+        settings.dictionary.push(unowned_word.into());
+        assert!(settings
+            .has_dictionary_source(legacy_unknown_word, &store::DictionarySource::LegacyUnknown));
+        assert!(settings.has_dictionary_source(
+            orphaned_rule_word,
+            &store::DictionarySource::Rule("word:v2:cleared-before-egress".into())
+        ));
+        assert!(
+            !settings.has_dictionary_source(unowned_word, &store::DictionarySource::LegacyUnknown)
+        );
+
+        let mut context_a = context::ContextSnapshot::general();
+        context_a.profile.id = "user.fixture-target".into();
+        context_a.target_guard.bundle_id = scope_a.native_bundle.clone();
+        let mut context_b = context::ContextSnapshot::general();
+        context_b.profile.id = "user.fixture-target".into();
+        context_b.target_guard.bundle_id = scope_b.native_bundle.clone();
+        let mut snapshots = [context_a, context_b]
+            .into_iter()
+            .map(|recording_context| {
+                asr_request_snapshot(
+                    &settings,
+                    std::path::Path::new("/unused-models"),
+                    Some(&root),
+                    &recording_context,
+                    None,
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut fixed_asr_outputs = Vec::new();
+        for snapshot in snapshots.iter_mut() {
+            let synthetic_audio = format!("synthetic audio bytes include {synthetic_audio_marker}");
+            let transcript = snapshot
+                .provider
+                .transcribe_batch(synthetic_audio.into_bytes(), snapshot.options.clone())
+                .await
+                .expect("loopback ASR collector returns its fixed synthetic transcript");
+            fixed_asr_outputs.push(transcript.text);
+        }
+        assert_eq!(
+            fixed_asr_outputs,
+            [fixed_transcript.clone(), fixed_transcript.clone()]
+        );
+
+        let prepared_a_disabled =
+            crate::prepare_cleanup_transcript_for_scene_with_exact_replacement_switch(
+                Some(&root),
+                &settings,
+                &fixed_asr_outputs[0],
+                context::ContextFamily::General,
+                1.0,
+                context::FocusKind::Editable,
+                Some(&scope_a),
+                false,
+                false,
+            );
+        let prepared_a = crate::prepare_cleanup_transcript_for_scene_with_exact_replacement_switch(
+            Some(&root),
+            &settings,
+            &fixed_asr_outputs[0],
+            context::ContextFamily::General,
+            1.0,
+            context::FocusKind::Editable,
+            Some(&scope_a),
+            false,
+            true,
+        );
+        let prepared_b = crate::prepare_cleanup_transcript_for_scene(
+            Some(&root),
+            &settings,
+            &fixed_asr_outputs[1],
+            context::ContextFamily::General,
+            1.0,
+            context::FocusKind::Editable,
+            Some(&scope_b),
+            false,
+        );
+        let expected_a = fixed_transcript.replacen(alias, canonical, 1);
+        assert_eq!(prepared_a.text, expected_a);
+        assert_eq!(prepared_b.text, fixed_transcript);
+        assert_eq!(
+            prepared_a.pairs_hint.as_deref(),
+            Some(format!("{alias}→{canonical}").as_str())
+        );
+        assert!(prepared_b.pairs_hint.is_none());
+
+        // Both arms independently execute the production preparation path on
+        // the same App A scope and fixed ASR text. Only the lexical mutation is
+        // disabled; hint and final-protection selection stay on the same row.
+        assert_eq!(prepared_a_disabled.text, fixed_transcript);
+        assert_eq!(prepared_a_disabled.original_asr_source, fixed_transcript);
+        assert!(prepared_a_disabled.text.contains(alias));
+        assert!(!prepared_a_disabled.text.contains(canonical));
+        assert_eq!(
+            prepared_a_disabled.pairs_hint, prepared_a.pairs_hint,
+            "the switch does not alter the effective cleanup hint"
+        );
+        assert_eq!(
+            prepared_a_disabled.promoted_pair_protections, prepared_a.promoted_pair_protections,
+            "the switch does not alter final pair protection"
+        );
+        assert_eq!(
+            prepared_a.promoted_pair_protections,
+            vec![super::lexicon::LexiconPair {
+                before: alias.into(),
+                after: canonical.into(),
+                match_policy: store::LearnPairMatchPolicy::IgnoreCase,
+                rule_key: Some(scoped_pair_key),
+                expansion_policy: lexicon::PairExpansionPolicy::AliasOnly,
+            }]
+        );
+
+        let requests = captured_requests
+            .await
+            .expect("both synthetic ASR requests captured");
+        assert_eq!(requests.len(), 2);
+        for request in requests {
+            let body_start = request
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .map(|position| position + 4)
+                .expect("captured request contains an HTTP body");
+            let body = &request[body_start..];
+            let multipart = String::from_utf8_lossy(body);
+            let prompt_field = multipart
+                .split_once("name=\"prompt\"\r\n\r\n")
+                .map(|(_, value)| value.split_once("\r\n--").unwrap().0)
+                .expect("provider serializes terminology in the exact prompt field");
+            assert!(prompt_field.contains(global_manual));
+            assert!(!prompt_field.contains(alias));
+            assert!(!prompt_field.contains(canonical));
+            assert!(!prompt_field.contains(local_only_alias));
+            assert!(!prompt_field.contains(local_only_canonical));
+            assert!(!prompt_field.contains(legacy_unknown_word));
+            assert!(!prompt_field.contains(orphaned_rule_word));
+            assert!(!prompt_field.contains(unowned_word));
+            assert!(!prompt_field.contains(transcript_marker));
+            assert!(!prompt_field.contains(synthetic_audio_marker));
+            assert_eq!(
+                multipart.matches(synthetic_audio_marker).count(),
+                1,
+                "the synthetic audio body marker is not evidence of speech"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn cleanup_wire_blocks_local_pair_edits_and_keeps_unmatched_source() {
+        let _network_policy_guard = crate::network_policy::strict_offline_test_guard().await;
+        let alias = "VF_APP_A_ALIAS_92e1";
+        let canonical = "VF_APP_A_CANONICAL_92e1";
+        let local_only_alias = "VF_LOCAL_ONLY_CLEANUP_ALIAS_92e1";
+        let local_only_canonical = "VF_LOCAL_ONLY_CLEANUP_CANONICAL_92e1";
+        let legacy_alias = "VF_LEGACY_SCOPED_ALIAS_92e1";
+        let legacy_canonical = "VF_LEGACY_SCOPED_CANONICAL_92e1";
+        let legacy_unproven_alias = "VF_LEGACY_UNPROVEN_ALIAS_92e1";
+        let legacy_unproven_canonical = "VF_LEGACY_UNPROVEN_CANONICAL_92e1";
+        let global_alias = "VF_GLOBAL_ALIAS_92e1";
+        let global_canonical = "VF_GLOBAL_CANONICAL_92e1";
+        let transcript_marker = "VF_TRANSCRIPT_ONLY_MARKER_92e1";
+        let root = std::env::temp_dir().join(format!(
+            "voiceflow-cleanup-egress-{}-{}",
+            std::process::id(),
+            super::chrono_like_id()
+        ));
+        std::fs::create_dir(&root).expect("create isolated cleanup egress fixture root");
+
+        let scope_a = store::LearnPairScope {
+            native_bundle: Some("com.example.voiceflow.scope-a".into()),
+            ..Default::default()
+        };
+        let scope_b = store::LearnPairScope {
+            native_bundle: Some("com.example.voiceflow.scope-b".into()),
+            ..Default::default()
+        };
+        let manual_pair_key = store::scoped_word_rule_key(
+            alias,
+            canonical,
+            &scope_a,
+            store::word_rule_match_policy(alias, canonical),
+        )
+        .into_string();
+        store::ensure_manual_scoped_learn_pair(&root, &manual_pair_key, alias, canonical, &scope_a)
+            .expect("seed App-scoped manual pair in isolated SQLite");
+        let local_only_pair_key = store::scoped_word_rule_key(
+            local_only_alias,
+            local_only_canonical,
+            &scope_a,
+            store::word_rule_match_policy(local_only_alias, local_only_canonical),
+        )
+        .into_string();
+        assert!(matches!(
+            store::upsert_auto_scoped_learn_pair_with_observation(
+                &root,
+                &local_only_pair_key,
+                local_only_alias,
+                local_only_canonical,
+                Some(&scope_a),
+                None,
+            )
+            .expect("persist local-only cleanup reference in isolated SQLite"),
+            store::LearnPairUpsert::Stored(_)
+        ));
+        store::ensure_local_only_learn_pair_promoted(
+            &root,
+            &local_only_pair_key,
+            local_only_alias,
+            local_only_canonical,
+            Some(&scope_a),
+        )
+        .expect("confirm the local-only cleanup reference");
+        let legacy_pair_key = format!(
+            "{}\u{1e}{}",
+            legacy_alias.to_lowercase(),
+            legacy_canonical.to_lowercase()
+        );
+        store::ensure_learn_pair_promoted(
+            &root,
+            &legacy_pair_key,
+            legacy_alias,
+            legacy_canonical,
+            Some(&scope_a),
+        )
+        .expect("seed a legacy declared-scope row with default flags");
+        let global_scope = store::LearnPairScope::default();
+        let legacy_unproven_pair_key = format!(
+            "{}\u{1e}{}",
+            legacy_unproven_alias.to_lowercase(),
+            legacy_unproven_canonical.to_lowercase()
+        );
+        store::ensure_learn_pair_promoted(
+            &root,
+            &legacy_unproven_pair_key,
+            legacy_unproven_alias,
+            legacy_unproven_canonical,
+            Some(&global_scope),
+        )
+        .expect("seed a recognized unscoped legacy pair without a verified word owner");
+        let global_pair_key = store::scoped_word_rule_key(
+            global_alias,
+            global_canonical,
+            &global_scope,
+            store::word_rule_match_policy(global_alias, global_canonical),
+        )
+        .into_string();
+        store::ensure_learn_pair_promoted(
+            &root,
+            &global_pair_key,
+            global_alias,
+            global_canonical,
+            Some(&global_scope),
+        )
+        .expect("seed a known unscoped global word pair");
+        assert!(store::list_pending_dictionary_effects(&root)
+            .expect("read pending global dictionary effects")
+            .iter()
+            .all(|effect| effect.pair_key != manual_pair_key
+                && effect.pair_key != local_only_pair_key));
+
+        let raw = format!(
+            "We discussed {alias}, {local_only_alias}, {legacy_alias}, and {global_alias} with {transcript_marker} today."
+        );
+        let app_b_prepared = format!(
+            "We discussed {alias}, {local_only_alias}, {legacy_alias}, and {global_canonical} with {transcript_marker} today."
+        );
+        let (cloud_base, cloud_requests) =
+            crate::test_http::spawn_responses_with_full_request_capture(vec![(
+                200,
+                "text/event-stream",
+                format!(
+                    "data: {}\n\ndata: [DONE]\n\n",
+                    serde_json::json!({
+                        "choices": [{
+                            "delta": {"content": app_b_prepared.clone()},
+                            "finish_reason": "stop"
+                        }]
+                    })
+                )
+                .into_bytes(),
+            )])
+            .await;
+        let mut settings = store::Settings {
+            dictionary: vec![
+                canonical.into(),
+                local_only_canonical.into(),
+                legacy_canonical.into(),
+                legacy_unproven_canonical.into(),
+                global_canonical.into(),
+            ],
+            ..store::Settings::default()
+        };
+        assert_eq!(
+            settings.cleanup_provider,
+            providers::EngineProvider::Groq,
+            "the normal cloud cleanup setting remains the default route"
+        );
+        settings.add_dictionary_source(global_canonical, store::DictionarySource::Manual);
+        let groq_endpoint = format!("{cloud_base}/openai/v1/chat/completions");
+        let prepared_a = crate::prepare_cleanup_transcript_for_scene(
+            Some(&root),
+            &settings,
+            &raw,
+            context::ContextFamily::General,
+            1.0,
+            context::FocusKind::Editable,
+            Some(&scope_a),
+            false,
+        );
+        let prepared_b = crate::prepare_cleanup_transcript_for_scene(
+            Some(&root),
+            &settings,
+            &raw,
+            context::ContextFamily::General,
+            1.0,
+            context::FocusKind::Editable,
+            Some(&scope_b),
+            false,
+        );
+        let legacy_unproven_prepared = crate::prepare_cleanup_transcript_for_scene(
+            Some(&root),
+            &settings,
+            &format!("Known legacy rule {legacy_unproven_alias} remains local."),
+            context::ContextFamily::General,
+            1.0,
+            context::FocusKind::Editable,
+            Some(&scope_a),
+            false,
+        );
+        assert_eq!(
+            prepared_a.text,
+            format!(
+                "We discussed {canonical}, {local_only_canonical}, {legacy_canonical}, and {global_canonical} with {transcript_marker} today."
+            )
+        );
+        assert!(prepared_a.scoped_pair_replacement_applied);
+        assert!(!prepared_b.scoped_pair_replacement_applied);
+        assert_eq!(
+            prepared_b.text,
+            format!(
+                "We discussed {alias}, {local_only_alias}, {legacy_alias}, and {global_canonical} with {transcript_marker} today."
+            )
+        );
+        let expected_global_hint = format!("{global_alias}→{global_canonical}");
+        assert_eq!(
+            prepared_a.cloud_pairs_hint.as_deref(),
+            Some(expected_global_hint.as_str())
+        );
+        assert_eq!(
+            prepared_b.cloud_pairs_hint.as_deref(),
+            Some(expected_global_hint.as_str())
+        );
+        assert_eq!(
+            legacy_unproven_prepared.text,
+            format!("Known legacy rule {legacy_unproven_canonical} remains local.")
+        );
+        assert!(legacy_unproven_prepared.cloud_pairs_hint.is_none());
+        assert!(legacy_unproven_prepared
+            .pairs_hint
+            .as_deref()
+            .is_some_and(|hint| hint.contains(legacy_unproven_alias)));
+        assert!(legacy_unproven_prepared.scoped_pair_replacement_applied);
+        assert!(crate::external_cleanup_blocked_by_local_pair(
+            &legacy_unproven_prepared,
+            settings.cleanup_provider,
+            "https://api.groq.com/openai/v1/chat/completions",
+            true,
+        ));
+        for local_only in [
+            format!("{alias}→{canonical}"),
+            format!("{local_only_alias}→{local_only_canonical}"),
+            format!("{legacy_alias}→{legacy_canonical}"),
+        ] {
+            assert!(!prepared_a
+                .cloud_pairs_hint
+                .as_deref()
+                .unwrap()
+                .contains(&local_only));
+            assert!(!prepared_b
+                .cloud_pairs_hint
+                .as_deref()
+                .unwrap()
+                .contains(&local_only));
+        }
+        assert!(prepared_a.pairs_hint.as_deref().unwrap().contains(alias));
+        assert!(prepared_a
+            .pairs_hint
+            .as_deref()
+            .unwrap()
+            .contains(local_only_alias));
+        assert!(prepared_a
+            .pairs_hint
+            .as_deref()
+            .unwrap()
+            .contains(legacy_alias));
+        assert_eq!(
+            prepared_a.pairs_hint_for_provider(
+                providers::EngineProvider::Ollama,
+                "http://127.0.0.1:11434/api/chat",
+            ),
+            prepared_a.pairs_hint.as_deref(),
+            "loopback Ollama keeps the complete local matching references"
+        );
+
+        let default_cloud_endpoint = "https://api.groq.com/openai/v1/chat/completions";
+        assert!(crate::external_cleanup_blocked_by_local_pair(
+            &prepared_a,
+            settings.cleanup_provider,
+            default_cloud_endpoint,
+            true,
+        ));
+        assert!(!crate::external_cleanup_blocked_by_local_pair(
+            &prepared_b,
+            settings.cleanup_provider,
+            default_cloud_endpoint,
+            true,
+        ));
+        assert!(!crate::external_cleanup_blocked_by_local_pair(
+            &prepared_a,
+            providers::EngineProvider::Groq,
+            default_cloud_endpoint,
+            false,
+        ));
+
+        // App A uses the same local pair facts and may send the complete
+        // references to a verified loopback Ollama provider.
+        let (ollama_base, ollama_requests) =
+            crate::test_http::spawn_responses_with_full_request_capture(vec![
+                (200, "application/json", br#"{"version":"0.34.5"}"#.to_vec()),
+                (
+                    200,
+                    "application/json",
+                    serde_json::json!({"models": [{"name": crate::ollama_local::MODEL}]})
+                        .to_string()
+                        .into_bytes(),
+                ),
+                (200, "application/json", b"{}".to_vec()),
+                (
+                    200,
+                    "application/json",
+                    serde_json::json!({
+                        "message": {"role": "assistant", "content": prepared_a.text.clone()},
+                        "done": true,
+                        "done_reason": "stop"
+                    })
+                    .to_string()
+                    .into_bytes(),
+                ),
+            ])
+            .await;
+        let mut local_settings = settings.clone();
+        local_settings.cleanup_provider = providers::EngineProvider::Ollama;
+        local_settings.cleanup_model = crate::ollama_local::MODEL.into();
+        local_settings.ollama_base_url = ollama_base.clone();
+        let ollama_endpoint = local_settings.cleanup_endpoint();
+        assert!(!crate::external_cleanup_blocked_by_local_pair(
+            &prepared_a,
+            providers::EngineProvider::Ollama,
+            &ollama_endpoint,
+            true,
+        ));
+        let runtime = crate::mlx_cleanup_runtime::shared_runtime(
+            std::path::Path::new("/unused-models"),
+            crate::modelstore::shared_manager(),
+        );
+        let (local_reply, _) = llm::cleanup_with_provider_and_native_runtime_and_intent_and_source(
+            local_settings.cleanup_provider,
+            &runtime,
+            &ollama_endpoint,
+            &local_settings.cleanup_request_model(),
+            &prepared_a.text,
+            "",
+            None,
+            None,
+            None,
+            Some(&prepared_a.intent),
+            prepared_a.pairs_hint_for_provider(local_settings.cleanup_provider, &ollama_endpoint),
+            llm::CleanupEffort::Light,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("local cleanup request is served by the loopback Ollama fixture");
+        assert_eq!(local_reply.accepted_text, prepared_a.text);
+        let local_requests = ollama_requests
+            .await
+            .expect("local Ollama requests captured");
+        assert_eq!(local_requests.len(), 4);
+        let local_chat = String::from_utf8_lossy(&local_requests[3]);
+        assert!(local_chat.starts_with("POST /api/chat HTTP/1.1\r\n"));
+        let local_body: serde_json::Value =
+            serde_json::from_str(local_chat.split_once("\r\n\r\n").unwrap().1)
+                .expect("local Ollama chat body is JSON");
+        let local_user = local_body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|message| message["role"] == "user")
+            .and_then(|message| message["content"].as_str())
+            .unwrap();
+        assert_eq!(
+            shared_prompt_test_field(local_user, "TRANSCRIPT"),
+            Some(prepared_a.text.clone())
+        );
+        let local_references =
+            shared_prompt_test_field(local_user, "DICTIONARY_AND_STYLE_REFERENCES")
+                .expect("local route carries full local-only pair references");
+        for local_term in [
+            alias,
+            canonical,
+            local_only_alias,
+            local_only_canonical,
+            legacy_alias,
+            legacy_canonical,
+        ] {
+            assert!(local_references.contains(local_term));
+        }
+
+        // The matching App A cloud route is deliberately not invoked after
+        // the shared route guard. App B sends its unchanged scoped aliases,
+        // while only the independent global pair appears in references.
+        let (reply, _) = llm::cleanup_with_provider_and_native_runtime_and_intent_and_source(
+            settings.cleanup_provider,
+            &runtime,
+            &groq_endpoint,
+            &settings.cleanup_request_model(),
+            &prepared_b.text,
+            "synthetic-groq-egress-key",
+            None,
+            None,
+            None,
+            Some(&prepared_b.intent),
+            prepared_b.pairs_hint_for_provider(settings.cleanup_provider, &groq_endpoint),
+            llm::CleanupEffort::Light,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("unmatched App B cloud request is served by the local collector");
+        assert!(!reply.accepted_text.is_empty());
+        let requests = cloud_requests
+            .await
+            .expect("cloud cleanup requests captured");
+        assert_eq!(
+            requests.len(),
+            1,
+            "matching App A and the unproven legacy target made no external cleanup call"
+        );
+        let request = String::from_utf8_lossy(&requests[0]);
+        assert!(request.starts_with("POST /openai/v1/chat/completions HTTP/1.1\r\n"));
+        assert!(request
+            .to_ascii_lowercase()
+            .contains("authorization: bearer synthetic-groq-egress-key"));
+        let body = request.split_once("\r\n\r\n").unwrap().1;
+        let value: serde_json::Value = serde_json::from_str(body).expect("cloud request JSON");
+        let user = value["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|message| message["role"] == "user")
+            .and_then(|message| message["content"].as_str())
+            .unwrap();
+        assert_eq!(
+            shared_prompt_test_field(user, "TRANSCRIPT"),
+            Some(prepared_b.text.clone())
+        );
+        assert_eq!(user.matches(transcript_marker).count(), 1);
+        let references = shared_prompt_test_field(user, "DICTIONARY_AND_STYLE_REFERENCES")
+            .expect("eligible global pair reference is present");
+        assert!(references.contains(&expected_global_hint));
+        for local_term in [
+            alias,
+            canonical,
+            local_only_alias,
+            local_only_canonical,
+            legacy_alias,
+            legacy_canonical,
+        ] {
+            assert!(
+                !references.contains(local_term),
+                "scoped pair data is absent from references"
+            );
+        }
+        assert!(
+            user.contains(alias),
+            "App B may send the naturally occurring original alias"
+        );
+        assert!(
+            !user.contains(canonical),
+            "App B did not receive a locally introduced target"
+        );
+        assert!(!user.contains(local_only_canonical));
+        assert!(!user.contains(legacy_canonical));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn custom_asr_output_flows_through_preparation_cleanup_and_finalizer() {
         let _network_policy_guard = crate::network_policy::strict_offline_test_guard().await;
         let asr_text = "这段口述提到了 Router v1 和 groq/whisper-large-v3-turbo";
@@ -23092,6 +24927,7 @@ mod tests {
                 output_projection_list_revision_proof: None,
                 layout_source: None,
                 exact_fallback: false,
+                allow_model_selected_paragraphs: false,
             },
         )
         .expect("prepared transcript passes the production finalizer");
@@ -23361,6 +25197,7 @@ mod tests {
                 output_projection_list_revision_proof: None,
                 layout_source: None,
                 exact_fallback: false,
+                allow_model_selected_paragraphs: false,
             },
         ) {
             Ok(finalized) => finalized,
@@ -23407,6 +25244,11 @@ mod tests {
             id: "editor-app".into(),
             label: "Editor".into(),
             family: ContextFamily::DeveloperCollaboration,
+            writing_task_id: None,
+            writing_preferences: Vec::new(),
+            preference_guidance_provider_approved: false,
+            preference_revision: 0,
+            deleted: false,
             mode_id: None,
             bundle_id: Some("com.example.Editor".into()),
             executable: None,
@@ -23537,7 +25379,8 @@ mod tests {
             ),
             lexicon::CleanupRoute::Provider(CleanupEffort::Light)
         ));
-        let derived_policy = super::cleanup_policy_for_resolved_scene(&settings, &snapshot, scene);
+        let derived_policy =
+            super::cleanup_policy_for_resolved_scene(&settings, &snapshot, scene, None, None);
         assert_eq!(derived_policy.input_kind, FocusKind::CodingPrompt);
         assert_eq!(snapshot.policy.input_kind, FocusKind::Code);
 
@@ -23673,6 +25516,107 @@ mod tests {
     }
 
     #[test]
+    fn live_auto_paragraphing_uses_only_proven_multiline_prose_and_exact_codex_inference() {
+        use crate::context::{ContextFamily, ContextSource, FocusKind};
+
+        let settings = store::Settings::default();
+        let codex_context = |bundle_id: &str, input_kind: FocusKind| {
+            let mut snapshot = context::ContextSnapshot::general();
+            snapshot.profile.id = "code.codex".into();
+            snapshot.profile.family = ContextFamily::PromptOrCode;
+            snapshot.profile.source = ContextSource::NativeProcess;
+            snapshot.profile.confidence = 0.95;
+            snapshot.policy.input_kind = input_kind;
+            snapshot.target_guard.bundle_id = Some(bundle_id.into());
+            snapshot.multiline_capability_known = true;
+            snapshot.multiline_capable = true;
+            snapshot
+        };
+        let transcript = "Please review the API response. Also check the tests.";
+
+        let trusted_codex = codex_context("com.openai.codex", FocusKind::Code);
+        let inferred_scene = super::resolve_cleanup_scene_for_transcript(
+            &settings,
+            Some(&trusted_codex),
+            transcript,
+        );
+        assert!(inferred_scene.codex_transcript_prompt_inferred);
+        let prepared = super::prepare_cleanup_transcript_for_resolved_scene(
+            None,
+            &settings,
+            transcript,
+            inferred_scene,
+            1.0,
+            None,
+            false,
+        );
+        let resolved = super::resolve_live_cleanup_output(
+            &prepared,
+            &settings,
+            &trusted_codex,
+            &prepared.intent.content,
+            true,
+            false,
+            false,
+        );
+        assert_eq!(
+            resolved.plan.unwrap().structure,
+            cleanup_prompt::StructureClass::ModelSelectedParagraphs
+        );
+
+        let fake_bundle = codex_context("com.example.other", FocusKind::Code);
+        let untrusted_scene =
+            super::resolve_cleanup_scene_for_transcript(&settings, Some(&fake_bundle), transcript);
+        assert!(!untrusted_scene.codex_transcript_prompt_inferred);
+        let prepared = super::prepare_cleanup_transcript_for_resolved_scene(
+            None,
+            &settings,
+            transcript,
+            untrusted_scene,
+            1.0,
+            None,
+            false,
+        );
+        let resolved = super::resolve_live_cleanup_output(
+            &prepared,
+            &settings,
+            &fake_bundle,
+            &prepared.intent.content,
+            true,
+            false,
+            false,
+        );
+        assert!(resolved.plan.is_none());
+
+        let mut unknown = context::ContextSnapshot::general();
+        unknown.profile.id = "docs.google_docs".into();
+        unknown.profile.family = ContextFamily::Document;
+        unknown.profile.confidence = 0.95;
+        unknown.profile.source = ContextSource::NativeProcess;
+        unknown.policy.input_kind = FocusKind::Unknown;
+        unknown.multiline_capability_known = true;
+        unknown.multiline_capable = true;
+        let scene =
+            super::resolve_cleanup_scene_for_transcript(&settings, Some(&unknown), transcript);
+        let prepared = super::prepare_cleanup_transcript_for_resolved_scene(
+            None, &settings, transcript, scene, 1.0, None, false,
+        );
+        let resolved = super::resolve_live_cleanup_output(
+            &prepared,
+            &settings,
+            &unknown,
+            &prepared.intent.content,
+            true,
+            false,
+            false,
+        );
+        assert_eq!(
+            resolved.plan.unwrap().structure,
+            cleanup_prompt::StructureClass::None
+        );
+    }
+
+    #[test]
     fn codex_request_mentioning_rewrite_is_dictated_not_executed() {
         use crate::context::{ContextFamily, FocusKind};
 
@@ -23768,7 +25712,8 @@ mod tests {
         assert!(prepared.intent.content.contains("lookup_value(user_id)"));
         assert!(prepared.intent.content.contains("--dry-run"));
 
-        let policy = super::cleanup_policy_for_resolved_scene(&settings, &snapshot, scene);
+        let policy =
+            super::cleanup_policy_for_resolved_scene(&settings, &snapshot, scene, None, None);
         assert_eq!(policy.input_kind, FocusKind::CodingPrompt);
         assert_eq!(snapshot.policy.input_kind, FocusKind::Code);
         let lexicon::CleanupRoute::Provider(effort) =
@@ -23857,6 +25802,11 @@ mod tests {
             id: "codex-test".into(),
             label: "Codex test".into(),
             family: ContextFamily::PromptOrCode,
+            writing_task_id: None,
+            writing_preferences: Vec::new(),
+            preference_guidance_provider_approved: false,
+            preference_revision: 0,
+            deleted: false,
             mode_id: Some(mode_id.clone()),
             bundle_id: Some("com.example.codex-test".into()),
             executable: None,
@@ -23879,6 +25829,7 @@ mod tests {
             fuzzy_dictionary_enabled: true,
             ..store::Settings::default()
         };
+        assert!(settings.add_dictionary_source("TypeScript", store::DictionarySource::Manual));
         settings.context_mappings = vec![mapping];
 
         let mut snapshot = context::ContextSnapshot::general();
@@ -25468,6 +27419,251 @@ mod tests {
         assert_eq!(long_completion_state(true, "clipboard", true), "degraded");
         assert_eq!(long_completion_state(false, "clipboard", true), "copied");
         assert_eq!(long_completion_state(false, "paste", false), "done");
+    }
+
+    #[test]
+    fn long_local_pair_route_is_not_a_cleanup_degradation_but_real_failures_remain_visible() {
+        assert_eq!(
+            long_recording_degradation(0, Some("local_pair_egress_blocked"), false),
+            (false, None)
+        );
+        assert_eq!(
+            long_recording_degradation(1, Some("local_pair_egress_blocked"), false),
+            (true, Some("partial_asr_failure"))
+        );
+        assert_eq!(
+            long_recording_degradation(0, Some("llm_cleanup_failed"), false),
+            (true, Some("llm_cleanup_failed"))
+        );
+        assert_eq!(
+            long_recording_degradation(0, Some("local_pair_egress_blocked"), true),
+            (true, Some("preservation_guard"))
+        );
+    }
+
+    #[tokio::test]
+    async fn long_pair_egress_translation_is_local_only_and_commits_success_audio() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "voiceflow-long-local-pair-{}-{stamp}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).expect("create isolated long History root");
+
+        let alias = "VF_LONG_LOCAL_ALIAS_P2";
+        let canonical = "VF_LONG_LOCAL_CANONICAL_P2";
+        let scope = store::LearnPairScope {
+            native_bundle: Some("com.example.voiceflow.long-local-pair".into()),
+            ..Default::default()
+        };
+        let pair_key = store::scoped_word_rule_key(
+            alias,
+            canonical,
+            &scope,
+            store::word_rule_match_policy(alias, canonical),
+        )
+        .into_string();
+        store::ensure_manual_scoped_learn_pair(&root, &pair_key, alias, canonical, &scope)
+            .expect("seed the local App pair through the real store owner");
+
+        let settings = store::Settings {
+            output_mode: "translation".into(),
+            translation_target_language: "en".into(),
+            keep_success_audio: true,
+            ..store::Settings::default()
+        };
+        let mut recording_context = context::ContextSnapshot::general();
+        recording_context.target_guard.bundle_id = scope.native_bundle.clone();
+        // Keep a space after the alias; dots are part of a Latin token in the
+        // existing exact-boundary contract.
+        let raw_asr = format!("Please review {alias} today.");
+        let prepared = prepare_cleanup_transcript_for_scene(
+            Some(&root),
+            &settings,
+            &raw_asr,
+            context::ContextFamily::General,
+            1.0,
+            context::FocusKind::Editable,
+            Some(&scope),
+            false,
+        );
+        assert_eq!(prepared.text, format!("Please review {canonical} today."));
+        assert_eq!(prepared.intent.operation, llm::CleanupOperation::Translate);
+        assert_eq!(prepared.intent.source, llm::IntentSource::OutputMode);
+
+        let requested_route =
+            cleanup_route_for_resolved_scene(&settings, prepared.scene, &prepared.intent);
+        assert!(matches!(
+            requested_route,
+            lexicon::CleanupRoute::Provider(_)
+        ));
+        assert!(external_cleanup_blocked_by_local_pair(
+            &prepared,
+            settings.cleanup_provider,
+            &settings.cleanup_endpoint(),
+            true,
+        ));
+        let route = lexicon::CleanupRoute::LocalOnly;
+        let cleanup_status = CLEANUP_STATUS_LOCAL_ONLY;
+        let local_candidate = long_off_cleanup_candidate(route, &prepared.intent.content)
+            .expect("blocked external Translate route uses the prepared local candidate");
+        assert_eq!(local_candidate, prepared.text);
+
+        let (final_text, final_guard_reason, _) = finalize_local_candidate_for_scene(
+            &prepared.intent.content,
+            &local_candidate,
+            FinalizationContext {
+                scene: prepared.scene,
+                operation: prepared.intent.operation,
+                revision_source: Some(&prepared.revision_source),
+                prepared_transcript: Some(&prepared.text),
+                revision_authorizations: &prepared.revision_authorizations,
+                promoted_pair_protections: &prepared.promoted_pair_protections,
+                list_revision_proof: prepared.list_revision_proof.as_ref(),
+                structure_safe_source: None,
+                output_projection_list_revision_proof: None,
+                layout_source: None,
+                exact_fallback: false,
+                allow_model_selected_paragraphs: false,
+            },
+        );
+        assert_eq!(final_text, prepared.text);
+        assert_eq!(final_guard_reason, None);
+        assert_ne!(final_text, raw_asr, "the local exact pair remains applied");
+
+        let (degraded, degraded_reason) = long_recording_degradation(
+            0,
+            Some("local_pair_egress_blocked"),
+            final_guard_reason.is_some(),
+        );
+        assert!(!degraded);
+        assert_eq!(degraded_reason, None);
+        assert_eq!(
+            long_completion_state(degraded, "clipboard", false),
+            "copied"
+        );
+
+        let provenance = history_preference_provenance(
+            &recording_context,
+            prepared.intent.source,
+            &settings.output_mode,
+            false,
+            cleanup_status,
+            &prepared.text,
+            &final_text,
+            false,
+        );
+        assert_eq!(
+            provenance.output_kind,
+            context::HistoryPreferenceOutputKind::PreparedTranscript,
+            "a local fallback must not be recorded as accepted translation cleanup"
+        );
+        let job = LongHistoryJob {
+            raw_text: prepared.text.clone(),
+            asr_text: raw_asr.clone(),
+            provider_cleaned_candidate: None,
+            final_text: final_text.clone(),
+            duration_secs: 1.0,
+            degraded,
+            degraded_reason: degraded_reason.map(str::to_owned),
+            context: recording_context.clone(),
+            history_preference_provenance: provenance,
+            engine: "synthetic-local-pair-test".into(),
+            cleanup_status: cleanup_status.into(),
+            cleanup_rejection: None,
+            cleanup_attempt_kind: Some("not_called".into()),
+            cleanup_transformations: Some(Vec::new()),
+            cleanup_failure_reason: Some("local_pair_egress_blocked".into()),
+            final_guard_reason: None,
+        };
+        let intent = job
+            .pending_intent(format!("long-local-pair-{stamp}"))
+            .expect("build the real long-recording pending History intent");
+        assert!(!intent.degraded);
+        assert_eq!(intent.degraded_reason, None);
+        assert_eq!(intent.cleanup_status, CLEANUP_STATUS_LOCAL_ONLY);
+        assert_eq!(intent.cleanup_attempt_kind.as_deref(), Some("not_called"));
+        assert_eq!(
+            intent.cleanup_failure_reason.as_deref(),
+            Some("local_pair_egress_blocked"),
+            "the no-call diagnostic remains visible in History"
+        );
+
+        let mut wav_bytes = std::io::Cursor::new(Vec::new());
+        let mut writer = hound::WavWriter::new(
+            &mut wav_bytes,
+            hound::WavSpec {
+                channels: 1,
+                sample_rate: 16_000,
+                bits_per_sample: 16,
+                sample_format: hound::SampleFormat::Int,
+            },
+        )
+        .expect("create a synthetic recovery WAV");
+        for _ in 0..320 {
+            writer.write_sample(1_234_i16).expect("write test sample");
+        }
+        writer.finalize().expect("finish synthetic recovery WAV");
+        let wav = wav_bytes.into_inner();
+        let audio_policy = PendingHistoryAudioPolicy::Candidate {
+            wav,
+            gold_allowed: should_keep_success_audio(&settings, &recording_context),
+            degraded,
+            long_recording: true,
+            long_spool: None,
+            capture_spool: None,
+            capture_audio_retention_days: settings.keep_audio_days,
+            gold_file_name: format!("gold-long-local-pair-{stamp}.wav"),
+            recovery_session_id: format!("failed-long-local-pair-{stamp}"),
+        };
+        let mut handoff = PendingHistoryHandoff::start(
+            root.clone(),
+            intent,
+            audio_policy,
+            metrics::Metrics::default(),
+            metrics::MetricGroup::unknown("long_local_pair_test"),
+        )
+        .expect("admit the real long History owner");
+        handoff
+            .wait_prepared()
+            .await
+            .expect("journal the pending local-only result");
+        let delivery = delivery_record_for_history("clipboard", None, None, degraded, false);
+        let mut receipt = handoff
+            .commit(delivery)
+            .expect("commit the successful local fallback");
+        assert_eq!(receipt.wait_until_complete().await, Ok(false));
+
+        let rows = store::get_history(&root, 10).expect("read committed long History row");
+        let row = rows
+            .iter()
+            .find(|row| row.raw_text == prepared.text)
+            .expect("the local canonical transcript is persisted");
+        assert_eq!(row.status, "copied");
+        assert!(!row.degraded);
+        assert_eq!(row.degraded_reason, None);
+        assert_eq!(row.cleanup_status, CLEANUP_STATUS_LOCAL_ONLY);
+        assert_eq!(row.cleanup_attempt_kind.as_deref(), Some("not_called"));
+        assert_eq!(
+            row.cleanup_failure_reason.as_deref(),
+            Some("local_pair_egress_blocked")
+        );
+        assert_eq!(row.final_text, prepared.text);
+        assert!(
+            row.has_audio,
+            "the local fallback keeps eligible gold audio"
+        );
+        let saved_audio = store::history_audio_bytes(&root, row.id)
+            .expect("read successful local-fallback gold audio");
+        let mut reader = hound::WavReader::new(std::io::Cursor::new(saved_audio))
+            .expect("gold file remains a valid WAV");
+        assert_eq!(reader.samples::<i16>().count(), 320);
+
+        store::clear_all_data(&root).expect("clear the isolated long History owner");
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -27102,6 +29298,7 @@ mod tests {
                 output_projection_list_revision_proof: None,
                 layout_source: None,
                 exact_fallback: false,
+                allow_model_selected_paragraphs: false,
             },
         )
         .expect("the source fallback remains displayable");
@@ -27131,6 +29328,7 @@ mod tests {
                 output_projection_list_revision_proof: None,
                 layout_source: None,
                 exact_fallback: false,
+                allow_model_selected_paragraphs: false,
             },
         )
         .expect("provider rejection still receives local finalization");
@@ -27233,6 +29431,7 @@ mod tests {
             output_projection_list_revision_proof: None,
             layout_source: None,
             exact_fallback: false,
+            allow_model_selected_paragraphs: false,
         };
         let (text, reason, rejected) =
             super::guard_final_output_with_reason(source, candidate, context(None));
@@ -27251,6 +29450,45 @@ mod tests {
             Some(llm::GuardReason::Layout),
             "the structure-safe gate still reports its own layout reason first"
         );
+    }
+
+    #[test]
+    fn exact_case_rule_protection_rejects_cleanup_reverting_canonical_spelling() {
+        let source = "GitHub plus `github`";
+        let candidate = "github plus `github`";
+        let exact = lexicon::LexiconPair {
+            before: "github".into(),
+            after: "GitHub".into(),
+            match_policy: store::LearnPairMatchPolicy::Exact,
+            rule_key: Some("word:v2:case-only-test".into()),
+            expansion_policy: lexicon::PairExpansionPolicy::AliasOnly,
+        };
+        let protections = super::retain_source_anchored_pairs(source, vec![exact.clone()]);
+        assert_eq!(protections, vec![exact]);
+        assert!(super::retain_source_anchored_pairs("`GitHub`", protections.clone()).is_empty());
+
+        let context = super::FinalizationContext {
+            scene: super::ResolvedCleanupScene::observed(
+                context::ContextFamily::DeveloperCollaboration,
+                context::FocusKind::Editable,
+            ),
+            operation: llm::CleanupOperation::Cleanup,
+            revision_source: None,
+            prepared_transcript: None,
+            revision_authorizations: &[],
+            promoted_pair_protections: &protections,
+            list_revision_proof: None,
+            structure_safe_source: None,
+            output_projection_list_revision_proof: None,
+            layout_source: None,
+            exact_fallback: false,
+            allow_model_selected_paragraphs: false,
+        };
+        let (final_text, reason, rejected) =
+            super::guard_final_output_with_reason(source, candidate, context);
+        assert_eq!(final_text, source);
+        assert_eq!(reason, Some(llm::GuardReason::ProtectedToken));
+        assert_eq!(rejected.as_deref(), Some(candidate));
     }
 
     #[test]
@@ -27291,6 +29529,7 @@ mod tests {
                 output_projection_list_revision_proof: None,
                 layout_source: None,
                 exact_fallback: false,
+                allow_model_selected_paragraphs: false,
             },
         )
         .expect("the local finalizer returns its guarded source text");
@@ -27499,6 +29738,7 @@ mod tests {
             output_projection_list_revision_proof: None,
             layout_source: None,
             exact_fallback: false,
+            allow_model_selected_paragraphs: false,
         };
         let candidate = super::long_off_cleanup_candidate(long_route, cleanup_input)
             .expect("production long Off decision selects its prepared candidate");
@@ -27518,6 +29758,7 @@ mod tests {
                 output_projection_list_revision_proof: None,
                 layout_source: None,
                 exact_fallback: false,
+                allow_model_selected_paragraphs: false,
             },
         )
         .expect("short Off finalization");
@@ -27564,6 +29805,10 @@ mod tests {
             promote_hits: 0,
             manual_scoped: false,
             auto_scoped: false,
+            match_policy: store::LearnPairMatchPolicy::default(),
+            binding_invalidated_at: None,
+            binding_invalidated_reason: None,
+            replacement_runs: 0,
         };
         let raw = "今天去知乎看看";
         let pairs = [pair];
@@ -27739,6 +29984,11 @@ mod tests {
             id: "codex".into(),
             label: "Codex".into(),
             family: context::ContextFamily::PromptOrCode,
+            writing_task_id: None,
+            writing_preferences: Vec::new(),
+            preference_guidance_provider_approved: false,
+            preference_revision: 0,
+            deleted: false,
             mode_id: Some(mode_id.clone()),
             bundle_id: Some("com.openai.codex".into()),
             executable: None,
@@ -28474,6 +30724,1216 @@ mod tests {
     }
 
     #[test]
+    fn task_preferences_require_trusted_task_and_independent_cloud_approval() {
+        use context::{
+            WritingPreference, WritingPreferenceDimension as Dimension,
+            WritingPreferenceStatus as Status, WritingPreferenceValue as Value, WritingTaskId,
+        };
+
+        let mapping = context::AppMapping {
+            id: "preference-app".into(),
+            label: "Preference App".into(),
+            family: context::ContextFamily::WorkChat,
+            writing_task_id: Some(WritingTaskId::WorkChat),
+            writing_preferences: vec![
+                WritingPreference {
+                    task_id: Some(WritingTaskId::WorkChat),
+                    dimension: Dimension::ListStructure,
+                    value: Value::Bullets,
+                    status: Status::Active,
+                    version: 1,
+                    source: context::WritingPreferenceSource::Manual,
+                },
+                WritingPreference {
+                    task_id: Some(WritingTaskId::WorkChat),
+                    dimension: Dimension::GreetingTone,
+                    value: Value::RespectfulGreeting,
+                    status: Status::Active,
+                    version: 1,
+                    source: context::WritingPreferenceSource::Manual,
+                },
+                WritingPreference {
+                    task_id: Some(WritingTaskId::WorkChat),
+                    dimension: Dimension::TerminalPunctuation,
+                    value: Value::NoTerminalPeriod,
+                    status: Status::Active,
+                    version: 1,
+                    source: context::WritingPreferenceSource::Manual,
+                },
+            ],
+            preference_guidance_provider_approved: false,
+            preference_revision: 0,
+            deleted: false,
+            mode_id: None,
+            bundle_id: Some("com.example.preference".into()),
+            executable: None,
+            browser_host: None,
+            browser_path_prefix: None,
+            focused_field: Some(context::FocusKind::Chat),
+            source_permissions: Default::default(),
+            style_example_input: Some("sample input".into()),
+            style_example_output: Some("sample output".into()),
+            style_example_pairs: vec![context::StyleExamplePair {
+                input: "sample input".into(),
+                output: "sample output".into(),
+            }],
+            style_examples_approved: true,
+            enabled: true,
+            cleanup_effort: None,
+            cleanup_intensity: None,
+            cleanup_enabled: true,
+            dictionary_learn_enabled: true,
+        };
+        let mut settings = store::Settings {
+            cleanup_provider: providers::EngineProvider::OpenAi,
+            context_mappings: vec![mapping.clone()],
+            ..store::Settings::default()
+        };
+        let mut snapshot = context::ContextSnapshot::general();
+        snapshot.profile = context::ContextProfile {
+            id: "user.preference-app".into(),
+            family: context::ContextFamily::WorkChat,
+            writing_mode_id: Some("document".into()),
+            writing_task_id: Some(WritingTaskId::WorkChat),
+            app_label: mapping.label.clone(),
+            icon_key: "app".into(),
+            source: context::ContextSource::UserMapping,
+            confidence: 1.0,
+        };
+        snapshot.multiline_capable = true;
+        snapshot.multiline_capability_known = true;
+        snapshot.policy.input_kind = context::FocusKind::Chat;
+        let scene = super::ResolvedCleanupScene::observed(
+            context::ContextFamily::WorkChat,
+            context::FocusKind::Chat,
+        );
+        let implicit = llm::CleanupIntent::implicit("你好 Alex.");
+        let safe_preference_plan = cleanup_prompt::EffectiveCleanupPlan::for_mode(
+            cleanup_prompt::EditBudget::Standard,
+            cleanup_prompt::OutputMode::Auto,
+            cleanup_prompt::AutoScene::General,
+            cleanup_prompt::StructureClass::None,
+        )
+        .expect("safe automatic cleanup plan");
+
+        let denied = super::cleanup_policy_for_resolved_scene(
+            &settings,
+            &snapshot,
+            scene,
+            Some(&implicit),
+            Some(safe_preference_plan),
+        );
+        assert_eq!(denied.preference_guidance, None);
+        assert!(denied.preference_scope.is_some());
+
+        settings.cleanup_provider = providers::EngineProvider::OnDeviceMlx;
+        let local_policy = super::cleanup_policy_for_resolved_scene(
+            &settings,
+            &snapshot,
+            scene,
+            Some(&implicit),
+            Some(safe_preference_plan),
+        );
+        let local_guidance = local_policy
+            .preference_guidance
+            .expect("local cleanup can use explicitly saved preferences");
+        assert!(local_guidance.contains("existing opening greeting only"));
+        assert!(local_guidance.contains("single plain declarative chat sentence only"));
+        let list_source = "The three tasks are: update API; fix tests; review docs.";
+        let local_prepared = super::prepare_cleanup_transcript_for_resolved_scene(
+            None,
+            &settings,
+            list_source,
+            scene,
+            1.0,
+            None,
+            false,
+        );
+        let local_output = super::resolve_live_cleanup_output(
+            &local_prepared,
+            &settings,
+            &snapshot,
+            &local_prepared.intent.content,
+            true,
+            false,
+            false,
+        );
+        assert!(local_output.provider_input.contains("\n- update API"));
+
+        settings.cleanup_provider = providers::EngineProvider::OpenAi;
+        settings.context_mappings[0].preference_guidance_provider_approved = true;
+        let approved = super::cleanup_policy_for_resolved_scene(
+            &settings,
+            &snapshot,
+            scene,
+            Some(&implicit),
+            Some(safe_preference_plan),
+        );
+        let guidance = approved
+            .preference_guidance
+            .expect("explicit cloud approval");
+        assert!(guidance.contains("existing opening greeting only"));
+        assert!(guidance.contains("single plain declarative chat sentence only"));
+        assert_eq!(guidance, local_guidance);
+        assert!(!approved.style_examples_approved);
+        assert!(approved.style_example_pairs.is_empty());
+
+        let command = llm::parse_cleanup_intent("make it formal please send the update", None);
+        assert_ne!(command.source, llm::IntentSource::Implicit);
+        let overridden = super::cleanup_policy_for_resolved_scene(
+            &settings,
+            &snapshot,
+            scene,
+            Some(&command),
+            Some(safe_preference_plan),
+        );
+        assert_eq!(overridden.preference_guidance, None);
+        assert_eq!(overridden.preference_scope, None);
+
+        let mut unknown_task = snapshot.clone();
+        unknown_task.profile.writing_task_id = None;
+        let unknown = super::cleanup_policy_for_resolved_scene(
+            &settings,
+            &unknown_task,
+            scene,
+            Some(&implicit),
+            Some(safe_preference_plan),
+        );
+        assert_eq!(unknown.preference_guidance, None);
+        assert_eq!(unknown.preference_scope, None);
+
+        let mut manual_override = snapshot.clone();
+        manual_override.profile.source = context::ContextSource::ManualOverride;
+        let manual = super::cleanup_policy_for_resolved_scene(
+            &settings,
+            &manual_override,
+            scene,
+            Some(&implicit),
+            Some(safe_preference_plan),
+        );
+        assert_eq!(manual.preference_guidance, None);
+        assert_eq!(manual.preference_scope, None);
+
+        settings.output_mode = "email".into();
+        let explicit_mode = super::cleanup_policy_for_resolved_scene(
+            &settings,
+            &snapshot,
+            scene,
+            Some(&implicit),
+            Some(safe_preference_plan),
+        );
+        assert_eq!(explicit_mode.preference_guidance, None);
+        settings.output_mode = "auto".into();
+        let structure_safe_plan = cleanup_prompt::EffectiveCleanupPlan::for_mode(
+            cleanup_prompt::EditBudget::StructureSafe,
+            cleanup_prompt::OutputMode::Auto,
+            cleanup_prompt::AutoScene::General,
+            cleanup_prompt::StructureClass::None,
+        )
+        .expect("structure-safe cleanup plan");
+        let structure_safe = super::cleanup_policy_for_resolved_scene(
+            &settings,
+            &snapshot,
+            scene,
+            Some(&implicit),
+            Some(structure_safe_plan),
+        );
+        assert_eq!(structure_safe.preference_guidance, None);
+
+        let source = "The three tasks are: update API; fix tests; review docs.";
+        settings.context_mappings[0].preference_guidance_provider_approved = false;
+        let prepared = super::prepare_cleanup_transcript_for_resolved_scene(
+            None, &settings, source, scene, 1.0, None, false,
+        );
+        let denied_output = super::resolve_live_cleanup_output(
+            &prepared,
+            &settings,
+            &snapshot,
+            &prepared.intent.content,
+            true,
+            false,
+            false,
+        );
+        assert!(!denied_output.provider_input.contains("\n- update API"));
+
+        settings.context_mappings[0].preference_guidance_provider_approved = true;
+        let approved_output = super::resolve_live_cleanup_output(
+            &prepared,
+            &settings,
+            &snapshot,
+            &prepared.intent.content,
+            true,
+            false,
+            false,
+        );
+        assert_eq!(approved_output.provider_input, source);
+        assert!(!approved_output.provider_input.contains("\n- update API"));
+
+        let mut single_line_context = snapshot.clone();
+        single_line_context.multiline_capability_known = true;
+        single_line_context.multiline_capable = false;
+        let single_line_output = super::resolve_live_cleanup_output(
+            &prepared,
+            &settings,
+            &single_line_context,
+            &prepared.intent.content,
+            true,
+            false,
+            false,
+        );
+        assert!(!single_line_output.provider_input.contains("\n- update API"));
+
+        let command_prepared = super::prepare_cleanup_transcript_for_resolved_scene(
+            None,
+            &settings,
+            "make it formal The three tasks are: update API; fix tests; review docs.",
+            scene,
+            1.0,
+            None,
+            false,
+        );
+        let command_output = super::resolve_live_cleanup_output(
+            &command_prepared,
+            &settings,
+            &snapshot,
+            &command_prepared.intent.content,
+            true,
+            false,
+            false,
+        );
+        assert!(!command_output.provider_input.contains("\n- update API"));
+    }
+
+    #[test]
+    fn preference_copy_guards_require_greeting_delimiters_and_one_cjk_sentence() {
+        assert!(super::has_supported_opening_greeting("你好，Alex"));
+        assert!(super::has_supported_opening_greeting("您好 Alex"));
+        assert!(!super::has_supported_opening_greeting("你好像已经知道了"));
+        assert!(super::has_safe_single_sentence_surface(
+            "提醒我周五更新",
+            false
+        ));
+        assert!(super::has_safe_single_sentence_surface("好的。", true));
+        assert!(!super::has_safe_single_sentence_surface(
+            "先更新文档。然后修复测试",
+            false
+        ));
+        assert!(!super::has_safe_single_sentence_surface(
+            "版本 1.2 已发布",
+            false
+        ));
+        assert!(!super::has_safe_single_sentence_surface(
+            "今天会完成吗？",
+            false
+        ));
+    }
+
+    fn preference_test_context(task: context::WritingTaskId) -> context::ContextSnapshot {
+        let mut snapshot = context::ContextSnapshot::general();
+        snapshot.profile = context::ContextProfile {
+            id: "user.preference-app".into(),
+            family: context::ContextFamily::WorkChat,
+            writing_mode_id: Some("work_chat".into()),
+            writing_task_id: Some(task),
+            app_label: "Preference App".into(),
+            icon_key: "app".into(),
+            source: context::ContextSource::UserMapping,
+            confidence: 1.0,
+        };
+        snapshot.target_guard.pid = 42;
+        snapshot.target_guard.bundle_id = Some("com.example.preference".into());
+        snapshot.target_guard.window_id = Some(420);
+        snapshot.target_guard.input_token = Some(421);
+        snapshot.policy.input_kind = context::FocusKind::Chat;
+        snapshot
+    }
+
+    #[test]
+    fn preference_projection_requires_same_verified_task_and_protected_target_is_inert() {
+        let expected = preference_test_context(context::WritingTaskId::WorkChat);
+        assert!(super::cleanup_projection_target_is_current(
+            &expected, &expected, false
+        ));
+
+        let mut task_changed = expected.clone();
+        task_changed.profile.writing_task_id = Some(context::WritingTaskId::Email);
+        assert!(!super::cleanup_projection_target_is_current(
+            &expected,
+            &task_changed,
+            false
+        ));
+
+        let mut input_changed = expected.clone();
+        input_changed.target_guard.input_token = Some(422);
+        assert!(!super::cleanup_projection_target_is_current(
+            &expected,
+            &input_changed,
+            false
+        ));
+
+        let mut secure = expected.clone();
+        secure.target_guard.secure_input = true;
+        assert!(!super::cleanup_projection_target_is_current(
+            &expected, &secure, false
+        ));
+    }
+
+    #[test]
+    fn mapping_save_owner_grants_fresh_cloud_approval_and_rejects_delete_replay() {
+        let mapping = context::AppMapping {
+            id: "editor-chat".into(),
+            label: "Editor chat".into(),
+            family: context::ContextFamily::WorkChat,
+            writing_task_id: Some(context::WritingTaskId::WorkChat),
+            writing_preferences: vec![
+                context::WritingPreference {
+                    task_id: Some(context::WritingTaskId::WorkChat),
+                    dimension: context::WritingPreferenceDimension::GreetingTone,
+                    value: context::WritingPreferenceValue::RespectfulGreeting,
+                    status: context::WritingPreferenceStatus::Active,
+                    version: 1,
+                    source: context::WritingPreferenceSource::Manual,
+                },
+                context::WritingPreference {
+                    task_id: Some(context::WritingTaskId::Email),
+                    dimension: context::WritingPreferenceDimension::TerminalPunctuation,
+                    value: context::WritingPreferenceValue::TerminalPeriod,
+                    status: context::WritingPreferenceStatus::Forgotten,
+                    version: 1,
+                    source: context::WritingPreferenceSource::Manual,
+                },
+            ],
+            preference_guidance_provider_approved: false,
+            preference_revision: 4,
+            deleted: false,
+            mode_id: None,
+            bundle_id: Some("com.example.editor".into()),
+            executable: None,
+            browser_host: None,
+            browser_path_prefix: None,
+            focused_field: Some(context::FocusKind::Chat),
+            source_permissions: Default::default(),
+            style_example_input: None,
+            style_example_output: None,
+            style_example_pairs: Vec::new(),
+            style_examples_approved: false,
+            enabled: true,
+            cleanup_effort: None,
+            cleanup_intensity: None,
+            cleanup_enabled: true,
+            dictionary_learn_enabled: true,
+        };
+        let mut mappings = vec![mapping.clone()];
+        let mut focus_only = mapping.clone();
+        focus_only.id = "focus-only".into();
+        focus_only.bundle_id = None;
+        assert!(focus_only.validate().is_ok());
+        assert!(super::upsert_context_mapping(&mut mappings, focus_only, true).is_err());
+
+        let mut explicit_grant = mapping.clone();
+        explicit_grant.preference_guidance_provider_approved = true;
+        explicit_grant
+            .validate()
+            .expect("active preference permits explicit grant");
+        super::upsert_context_mapping(&mut mappings, explicit_grant, true)
+            .expect("fresh revision enables cloud permission");
+        assert!(mappings[0].preference_guidance_provider_approved);
+        assert_eq!(mappings[0].preference_revision, 5);
+
+        let mut changed_scope_with_forged_consent = mappings[0].clone();
+        changed_scope_with_forged_consent.bundle_id = Some("com.example.other-editor".into());
+        let stale_scope_payload = changed_scope_with_forged_consent.clone();
+        assert!(changed_scope_with_forged_consent.preference_guidance_provider_approved);
+        super::upsert_context_mapping(&mut mappings, changed_scope_with_forged_consent, true)
+            .expect("selector change saves as a new preference scope");
+        assert!(!mappings[0].preference_guidance_provider_approved);
+        assert_eq!(mappings[0].preference_revision, 6);
+        assert!(
+            mappings[0].writing_preferences.is_empty(),
+            "all task preferences are invalidated when the declared App scope changes"
+        );
+        assert!(super::upsert_context_mapping(&mut mappings, stale_scope_payload, true).is_err());
+
+        let mut fresh_reentry = mappings[0].clone();
+        fresh_reentry.writing_preferences = vec![context::WritingPreference {
+            task_id: Some(context::WritingTaskId::WorkChat),
+            dimension: context::WritingPreferenceDimension::GreetingTone,
+            value: context::WritingPreferenceValue::ConversationalGreeting,
+            status: context::WritingPreferenceStatus::Active,
+            version: 1,
+            source: context::WritingPreferenceSource::Manual,
+        }];
+        super::upsert_context_mapping(&mut mappings, fresh_reentry, true)
+            .expect("the user can explicitly re-enter a preference after scope save");
+        assert_eq!(mappings[0].preference_revision, 7);
+        assert_eq!(
+            mappings[0].writing_preferences[0].source,
+            context::WritingPreferenceSource::Manual
+        );
+
+        let mut fresh_same_scope_grant = mappings[0].clone();
+        fresh_same_scope_grant.preference_guidance_provider_approved = true;
+        super::upsert_context_mapping(&mut mappings, fresh_same_scope_grant, true)
+            .expect("current scope accepts a fresh explicit cloud grant");
+        assert!(mappings[0].preference_guidance_provider_approved);
+        assert_eq!(mappings[0].preference_revision, 8);
+
+        let mut new_mapping_with_forged_review = mapping.clone();
+        new_mapping_with_forged_review.id = "new-untrusted-mapping".into();
+        new_mapping_with_forged_review.label = "New mapping".into();
+        new_mapping_with_forged_review.preference_revision = 0;
+        new_mapping_with_forged_review.writing_preferences[0].source =
+            context::WritingPreferenceSource::ReviewedHistory;
+        let mut new_mapping_owner = Vec::new();
+        super::upsert_context_mapping(&mut new_mapping_owner, new_mapping_with_forged_review, true)
+            .expect("new mapping accepts an explicit preference value");
+        assert_eq!(
+            new_mapping_owner[0].writing_preferences[0].source,
+            context::WritingPreferenceSource::Manual,
+            "renderer cannot forge reviewed History provenance on a new mapping"
+        );
+
+        let mut family_mappings = vec![mapping.clone()];
+        let mut changed_family = mapping.clone();
+        changed_family.family = context::ContextFamily::Email;
+        super::upsert_context_mapping(&mut family_mappings, changed_family, true)
+            .expect("family identity change is saved");
+        assert_eq!(family_mappings[0].preference_revision, 5);
+        assert!(family_mappings[0].writing_preferences.is_empty());
+
+        let mut list_only = mappings[0].clone();
+        list_only.writing_preferences = vec![context::WritingPreference {
+            task_id: Some(context::WritingTaskId::WorkChat),
+            dimension: context::WritingPreferenceDimension::ListStructure,
+            value: context::WritingPreferenceValue::Bullets,
+            status: context::WritingPreferenceStatus::Active,
+            version: 1,
+            source: context::WritingPreferenceSource::Manual,
+        }];
+        list_only.preference_guidance_provider_approved = true;
+        let mut list_only_mappings = vec![list_only.clone()];
+        let mut adds_tone = list_only.clone();
+        adds_tone
+            .writing_preferences
+            .push(context::WritingPreference {
+                task_id: Some(context::WritingTaskId::WorkChat),
+                dimension: context::WritingPreferenceDimension::GreetingTone,
+                value: context::WritingPreferenceValue::RespectfulGreeting,
+                status: context::WritingPreferenceStatus::Active,
+                version: 1,
+                source: context::WritingPreferenceSource::Manual,
+            });
+        super::upsert_context_mapping(&mut list_only_mappings, adds_tone, true)
+            .expect("preference save is accepted");
+        assert!(!list_only_mappings[0].preference_guidance_provider_approved);
+        assert_eq!(list_only_mappings[0].preference_revision, 9);
+
+        let mut explicit_grant_after_tone = list_only_mappings[0].clone();
+        explicit_grant_after_tone.preference_guidance_provider_approved = true;
+        super::upsert_context_mapping(&mut list_only_mappings, explicit_grant_after_tone, true)
+            .expect("new same-scope explicit grant is accepted");
+        assert!(list_only_mappings[0].preference_guidance_provider_approved);
+
+        let mut sample_mapping = mappings[0].clone();
+        let mut sample_mappings = vec![sample_mapping.clone()];
+        sample_mapping.style_example_input = Some("private sample input".into());
+        sample_mapping.style_example_output = Some("private sample output".into());
+        sample_mapping.style_example_pairs = vec![context::StyleExamplePair {
+            input: "private sample input".into(),
+            output: "private sample output".into(),
+        }];
+        sample_mapping.style_examples_approved = true;
+        super::upsert_context_mapping(&mut sample_mappings, sample_mapping, true)
+            .expect("sample settings save is accepted");
+        assert!(!sample_mappings[0].style_examples_approved);
+        assert_eq!(
+            sample_mappings[0].style_example_pairs[0].input,
+            "private sample input"
+        );
+
+        let mut scoped_samples = mappings[0].clone();
+        scoped_samples.style_example_input = Some("same sample input".into());
+        scoped_samples.style_example_output = Some("Same sample output".into());
+        scoped_samples.style_example_pairs = vec![context::StyleExamplePair {
+            input: "same sample input".into(),
+            output: "Same sample output".into(),
+        }];
+        scoped_samples.style_examples_approved = true;
+        let mut scoped_mappings = vec![scoped_samples.clone()];
+        let mut changed_selector = scoped_samples.clone();
+        changed_selector.browser_host = Some("mail.example.com".into());
+        changed_selector.style_examples_approved = true;
+        super::upsert_context_mapping(&mut scoped_mappings, changed_selector, true)
+            .expect("selector scope change is saved");
+        assert!(!scoped_mappings[0].style_examples_approved);
+        assert_eq!(
+            scoped_mappings[0].style_example_pairs,
+            scoped_samples.style_example_pairs
+        );
+
+        let mut fresh_sample_grant = scoped_mappings[0].clone();
+        fresh_sample_grant.style_examples_approved = true;
+        super::upsert_context_mapping(&mut scoped_mappings, fresh_sample_grant, true)
+            .expect("same-scope sample permission can be freshly granted");
+        assert!(scoped_mappings[0].style_examples_approved);
+
+        let mut stale_grant = mapping.clone();
+        stale_grant.preference_guidance_provider_approved = true;
+        assert!(super::upsert_context_mapping(&mut mappings, stale_grant, true).is_err());
+
+        let stale_active_payload = mappings[0].clone();
+        assert!(super::tombstone_context_mapping(
+            &mut mappings,
+            "editor-chat"
+        ));
+        assert!(mappings[0].deleted);
+        assert_eq!(mappings[0].preference_revision, 9);
+        assert!(mappings[0].writing_preferences.is_empty());
+        assert!(mappings[0].bundle_id.is_none());
+        assert!(super::visible_context_mappings(&mappings).is_empty());
+        assert!(
+            super::upsert_context_mapping(&mut mappings, stale_active_payload.clone(), true)
+                .is_err()
+        );
+
+        let mut current = store::Settings {
+            context_mappings: mappings,
+            ..store::Settings::default()
+        };
+        let learned = store::Settings {
+            context_mappings: vec![stale_active_payload],
+            ..current.clone()
+        };
+        super::apply_learning_settings_snapshot(&mut current, learned);
+        assert!(current.context_mappings[0].deleted);
+        assert!(current.context_mappings[0].writing_preferences.is_empty());
+    }
+
+    #[test]
+    fn scope_migration_blocks_old_local_projection_until_fresh_preference_save() {
+        let mapping = context::AppMapping {
+            id: "scope-owner".into(),
+            label: "Preference App".into(),
+            family: context::ContextFamily::WorkChat,
+            writing_task_id: Some(context::WritingTaskId::WorkChat),
+            writing_preferences: vec![
+                context::WritingPreference {
+                    task_id: Some(context::WritingTaskId::WorkChat),
+                    dimension: context::WritingPreferenceDimension::ListStructure,
+                    value: context::WritingPreferenceValue::Bullets,
+                    status: context::WritingPreferenceStatus::Active,
+                    version: 1,
+                    source: context::WritingPreferenceSource::ReviewedHistory,
+                },
+                context::WritingPreference {
+                    task_id: Some(context::WritingTaskId::WorkChat),
+                    dimension: context::WritingPreferenceDimension::GreetingTone,
+                    value: context::WritingPreferenceValue::RespectfulGreeting,
+                    status: context::WritingPreferenceStatus::Active,
+                    version: 1,
+                    source: context::WritingPreferenceSource::Manual,
+                },
+                context::WritingPreference {
+                    task_id: Some(context::WritingTaskId::Email),
+                    dimension: context::WritingPreferenceDimension::GreetingTone,
+                    value: context::WritingPreferenceValue::RespectfulGreeting,
+                    status: context::WritingPreferenceStatus::Forgotten,
+                    version: 1,
+                    source: context::WritingPreferenceSource::Manual,
+                },
+                context::WritingPreference {
+                    task_id: Some(context::WritingTaskId::ProjectUpdate),
+                    dimension: context::WritingPreferenceDimension::TerminalPunctuation,
+                    value: context::WritingPreferenceValue::TerminalPeriod,
+                    status: context::WritingPreferenceStatus::Active,
+                    version: 1,
+                    source: context::WritingPreferenceSource::Manual,
+                },
+            ],
+            preference_guidance_provider_approved: true,
+            preference_revision: 4,
+            deleted: false,
+            mode_id: None,
+            bundle_id: Some("com.example.editor".into()),
+            executable: None,
+            browser_host: None,
+            browser_path_prefix: None,
+            focused_field: Some(context::FocusKind::Chat),
+            source_permissions: Default::default(),
+            style_example_input: None,
+            style_example_output: None,
+            style_example_pairs: Vec::new(),
+            style_examples_approved: false,
+            enabled: true,
+            cleanup_effort: None,
+            cleanup_intensity: None,
+            cleanup_enabled: true,
+            dictionary_learn_enabled: true,
+        };
+        let mut mappings = vec![mapping.clone()];
+        let mut changed_scope = mapping.clone();
+        changed_scope.bundle_id = Some("com.example.new-editor".into());
+        let mut persisted_scope = vec![changed_scope.clone()];
+        super::bump_mapping_scope_revisions(std::slice::from_ref(&mapping), &mut persisted_scope);
+        assert!(persisted_scope[0].writing_preferences.is_empty());
+        assert!(!persisted_scope[0].preference_guidance_provider_approved);
+        assert_eq!(persisted_scope[0].preference_revision, 5);
+
+        super::upsert_context_mapping(&mut mappings, changed_scope, true)
+            .expect("scope save invalidates old task state");
+        assert!(mappings[0].writing_preferences.is_empty());
+        assert_eq!(mappings[0].preference_revision, 5);
+
+        let mut settings = store::Settings {
+            cleanup_provider: providers::EngineProvider::OnDeviceMlx,
+            context_mappings: mappings.clone(),
+            ..store::Settings::default()
+        };
+        let mut snapshot = preference_test_context(context::WritingTaskId::WorkChat);
+        snapshot.profile.id = "user.scope-owner".into();
+        snapshot.target_guard.bundle_id = Some("com.example.new-editor".into());
+        snapshot.multiline_capable = true;
+        snapshot.multiline_capability_known = true;
+        let scene = super::ResolvedCleanupScene::observed(
+            context::ContextFamily::WorkChat,
+            context::FocusKind::Chat,
+        );
+        let source = "The three tasks are: update API; fix tests; review docs.";
+        let without_old_scope = super::prepare_cleanup_transcript_for_resolved_scene(
+            None, &settings, source, scene, 1.0, None, false,
+        );
+        let without_old_projection = super::resolve_live_cleanup_output(
+            &without_old_scope,
+            &settings,
+            &snapshot,
+            &without_old_scope.intent.content,
+            true,
+            false,
+            false,
+        );
+        assert!(!without_old_projection
+            .provider_input
+            .contains("\n- update API"));
+
+        let mut fresh_manual = mappings[0].clone();
+        fresh_manual.writing_preferences = vec![context::WritingPreference {
+            task_id: Some(context::WritingTaskId::WorkChat),
+            dimension: context::WritingPreferenceDimension::ListStructure,
+            value: context::WritingPreferenceValue::Bullets,
+            status: context::WritingPreferenceStatus::Active,
+            version: 1,
+            source: context::WritingPreferenceSource::Manual,
+        }];
+        super::upsert_context_mapping(&mut mappings, fresh_manual, true)
+            .expect("fresh explicit preference can be saved after scope migration");
+        assert_eq!(mappings[0].preference_revision, 6);
+        settings.context_mappings = mappings;
+
+        let with_fresh_scope = super::prepare_cleanup_transcript_for_resolved_scene(
+            None, &settings, source, scene, 1.0, None, false,
+        );
+        let fresh_projection = super::resolve_live_cleanup_output(
+            &with_fresh_scope,
+            &settings,
+            &snapshot,
+            &with_fresh_scope.intent.content,
+            true,
+            false,
+            false,
+        );
+        assert!(fresh_projection.provider_input.contains("\n- update API"));
+        assert!(fresh_projection.provider_input.contains("\n- fix tests"));
+    }
+
+    #[test]
+    fn mapping_owner_keeps_other_task_tombstones_when_selected_task_changes() {
+        let mapping = context::AppMapping {
+            id: "task-switch-owner".into(),
+            label: "Editor chat".into(),
+            family: context::ContextFamily::WorkChat,
+            writing_task_id: Some(context::WritingTaskId::WorkChat),
+            writing_preferences: vec![
+                context::WritingPreference {
+                    task_id: Some(context::WritingTaskId::WorkChat),
+                    dimension: context::WritingPreferenceDimension::GreetingTone,
+                    value: context::WritingPreferenceValue::RespectfulGreeting,
+                    status: context::WritingPreferenceStatus::Forgotten,
+                    version: 1,
+                    source: context::WritingPreferenceSource::Manual,
+                },
+                context::WritingPreference {
+                    task_id: Some(context::WritingTaskId::Email),
+                    dimension: context::WritingPreferenceDimension::TerminalPunctuation,
+                    value: context::WritingPreferenceValue::TerminalPeriod,
+                    status: context::WritingPreferenceStatus::Active,
+                    version: 1,
+                    source: context::WritingPreferenceSource::ReviewedHistory,
+                },
+            ],
+            preference_guidance_provider_approved: false,
+            preference_revision: 4,
+            deleted: false,
+            mode_id: None,
+            bundle_id: Some("com.example.editor".into()),
+            executable: None,
+            browser_host: None,
+            browser_path_prefix: None,
+            focused_field: Some(context::FocusKind::Chat),
+            source_permissions: Default::default(),
+            style_example_input: None,
+            style_example_output: None,
+            style_example_pairs: Vec::new(),
+            style_examples_approved: false,
+            enabled: true,
+            cleanup_effort: None,
+            cleanup_intensity: None,
+            cleanup_enabled: true,
+            dictionary_learn_enabled: true,
+        };
+        let mut mappings = vec![mapping.clone()];
+        let mut switched = mapping.clone();
+        switched.writing_task_id = Some(context::WritingTaskId::Email);
+        switched.writing_preferences = vec![context::WritingPreference {
+            task_id: Some(context::WritingTaskId::Email),
+            dimension: context::WritingPreferenceDimension::TerminalPunctuation,
+            value: context::WritingPreferenceValue::TerminalPeriod,
+            status: context::WritingPreferenceStatus::Active,
+            version: 1,
+            source: context::WritingPreferenceSource::ReviewedHistory,
+        }];
+        super::upsert_context_mapping(&mut mappings, switched, true)
+            .expect("switching selected task keeps the same declared target owner");
+
+        assert!(mappings[0]
+            .writing_preferences
+            .contains(&context::WritingPreference {
+                task_id: Some(context::WritingTaskId::WorkChat),
+                dimension: context::WritingPreferenceDimension::GreetingTone,
+                value: context::WritingPreferenceValue::RespectfulGreeting,
+                status: context::WritingPreferenceStatus::Forgotten,
+                version: 1,
+                source: context::WritingPreferenceSource::Manual,
+            }));
+        assert!(mappings[0]
+            .writing_preferences
+            .contains(&context::WritingPreference {
+                task_id: Some(context::WritingTaskId::Email),
+                dimension: context::WritingPreferenceDimension::TerminalPunctuation,
+                value: context::WritingPreferenceValue::TerminalPeriod,
+                status: context::WritingPreferenceStatus::Active,
+                version: 1,
+                source: context::WritingPreferenceSource::ReviewedHistory,
+            }));
+        assert_eq!(mappings[0].preference_revision, 5);
+    }
+
+    #[test]
+    fn preference_mapping_tombstone_invalidates_c1_rules_and_is_not_live_after_restart() {
+        let dir = std::env::temp_dir().join(format!(
+            "voiceflow-preference-mapping-delete-{}",
+            super::chrono_like_id()
+        ));
+        let mapping = context::AppMapping {
+            id: "editor-chat".into(),
+            label: "Editor chat".into(),
+            family: context::ContextFamily::WorkChat,
+            writing_task_id: Some(context::WritingTaskId::WorkChat),
+            writing_preferences: vec![context::WritingPreference {
+                task_id: Some(context::WritingTaskId::WorkChat),
+                dimension: context::WritingPreferenceDimension::GreetingTone,
+                value: context::WritingPreferenceValue::RespectfulGreeting,
+                status: context::WritingPreferenceStatus::Active,
+                version: 1,
+                source: context::WritingPreferenceSource::Manual,
+            }],
+            preference_guidance_provider_approved: false,
+            preference_revision: 1,
+            deleted: false,
+            mode_id: None,
+            bundle_id: Some("com.example.editor".into()),
+            executable: None,
+            browser_host: None,
+            browser_path_prefix: None,
+            focused_field: Some(context::FocusKind::Chat),
+            source_permissions: Default::default(),
+            style_example_input: None,
+            style_example_output: None,
+            style_example_pairs: Vec::new(),
+            style_examples_approved: false,
+            enabled: true,
+            cleanup_effort: None,
+            cleanup_intensity: None,
+            cleanup_enabled: true,
+            dictionary_learn_enabled: true,
+        };
+        let scope = store::LearnPairScope {
+            family: Some("work_chat".into()),
+            mapping_id: Some(mapping.id.clone()),
+            native_bundle: mapping.bundle_id.clone(),
+            ..store::LearnPairScope::default()
+        };
+        let key = store::scoped_word_rule_key(
+            "Typoed",
+            "Typed",
+            &scope,
+            store::LearnPairMatchPolicy::IgnoreCase,
+        )
+        .into_string();
+        store::ensure_learn_pair_promoted(&dir, &key, "Typoed", "Typed", Some(&scope))
+            .expect("create an active C1 mapping-bound word rule");
+        let before = store::list_learn_pairs(&dir).expect("read active C1 rule");
+        assert!(before
+            .iter()
+            .find(|row| row.pair_key == key)
+            .unwrap()
+            .is_live_promoted());
+
+        let mut mappings = vec![mapping.clone()];
+        let stale_active_payload = mapping.clone();
+        assert!(super::tombstone_context_mapping(&mut mappings, &mapping.id));
+        let changes = super::changed_mapping_binding_ids(&[mapping], &mappings);
+        assert_eq!(
+            changes,
+            vec![(
+                "editor-chat".into(),
+                store::LearnPairBindingInvalidationReason::MappingDeleted,
+            )]
+        );
+        assert_eq!(
+            store::invalidate_word_rule_mapping_bindings(&dir, &changes)
+                .expect("invalidate deleted mapping rules"),
+            1
+        );
+        let invalidated = store::list_learn_pairs(&dir).expect("read invalidated rule");
+        let row = invalidated.iter().find(|row| row.pair_key == key).unwrap();
+        assert!(row.is_binding_invalidated());
+        assert_eq!(
+            row.binding_invalidated_reason.as_deref(),
+            Some("mapping_deleted")
+        );
+        assert!(scope
+            .applicable_promoted_records(std::slice::from_ref(row))
+            .is_empty());
+        assert!(super::upsert_context_mapping(&mut mappings, stale_active_payload, true).is_err());
+
+        let live_ids = super::live_context_mapping_ids(&mappings);
+        assert!(mappings[0].deleted);
+        assert!(live_ids.is_empty());
+
+        // Model a stale process that writes a different rule after deletion;
+        // startup must still see the scrubbed ID as absent and disarm it.
+        let replay_key = store::scoped_word_rule_key(
+            "Reakt",
+            "React",
+            &scope,
+            store::LearnPairMatchPolicy::IgnoreCase,
+        )
+        .into_string();
+        store::ensure_learn_pair_promoted(&dir, &replay_key, "Reakt", "React", Some(&scope))
+            .expect("simulate a stale pre-restart write");
+        assert_eq!(
+            store::invalidate_missing_word_rule_mapping_bindings(&dir, &live_ids)
+                .expect("reconcile startup live mapping IDs"),
+            1
+        );
+        let restarted = store::list_learn_pairs(&dir).expect("read startup reconciliation");
+        let replay = restarted
+            .iter()
+            .find(|row| row.pair_key == replay_key)
+            .unwrap();
+        assert!(replay.is_binding_invalidated());
+        assert_eq!(
+            replay.binding_invalidated_reason.as_deref(),
+            Some("missing_binding_at_migration")
+        );
+        assert!(scope
+            .applicable_promoted_records(std::slice::from_ref(replay))
+            .is_empty());
+        std::fs::remove_dir_all(dir).expect("remove isolated word-rule store");
+    }
+
+    #[tokio::test]
+    async fn cleanup_queue_rechecks_task_target_and_cloud_consent_before_each_retry() {
+        let _network_policy_guard = crate::network_policy::strict_offline_test_guard().await;
+        let request_body =
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"hello\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n".to_vec();
+        let (initial_endpoint, mut initial_request) =
+            crate::test_http::spawn_response_with_full_request_capture(
+                200,
+                "text/event-stream",
+                request_body.clone(),
+                &[],
+            )
+            .await;
+        let expected = preference_test_context(context::WritingTaskId::WorkChat);
+        let mut changed_before_send = expected.clone();
+        changed_before_send.target_guard.input_token = Some(999);
+        let gate = crate::queue::RequestGate::new(None);
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let state = super::AppState::new_dictionary_regression_fixture(
+            crate::store::Settings::default(),
+            std::env::temp_dir().join("voiceflow-preference-queue-test"),
+        );
+        let initial_calls = std::sync::atomic::AtomicUsize::new(0);
+        let initial_result = crate::queue::execute_with_retry_scoped_cancelled_checked(
+            &gate,
+            crate::queue::RequestKind::Llm,
+            &crate::queue::RequestScope::default(),
+            || async {
+                initial_calls.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                let intent = crate::llm::CleanupIntent::implicit("hello");
+                crate::llm::cleanup_with_provider_and_local_runtimes_and_intent_and_source_traced(
+                    crate::providers::EngineProvider::Custom,
+                    &state.mlx_cleanup_runtime,
+                    None,
+                    &initial_endpoint,
+                    "openai/gpt-oss-20b",
+                    "hello",
+                    "synthetic-loopback-key",
+                    None,
+                    None,
+                    None,
+                    Some(&intent),
+                    None,
+                    crate::llm::CleanupEffort::Standard,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some("en"),
+                    None,
+                )
+                .await
+                .map(|_| ())
+            },
+            || {
+                std::future::ready(super::cleanup_projection_target_is_current(
+                    &expected,
+                    &changed_before_send,
+                    false,
+                ))
+            },
+            cancellation.clone(),
+        )
+        .await;
+        assert!(matches!(
+            initial_result,
+            Err(crate::queue::CheckedExecuteError::AuthorizationChanged)
+        ));
+        assert_eq!(initial_calls.load(std::sync::atomic::Ordering::Acquire), 0);
+        assert!(initial_request.try_recv().is_err());
+
+        let (retry_endpoint, retry_request) =
+            crate::test_http::spawn_response_with_full_request_capture(
+                429,
+                "application/json",
+                br#"{"error":{"message":"rate limited"}}"#.to_vec(),
+                &[("Retry-After", "0")],
+            )
+            .await;
+        let authorization_current = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let current_context = std::sync::Arc::new(std::sync::Mutex::new(expected.clone()));
+        let cloud_permission = authorization_current.clone();
+        let retry_live_context = current_context.clone();
+        let retry_expected = expected.clone();
+        let retry_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let retry_call_count = retry_calls.clone();
+        let revoke_after_first = authorization_current.clone();
+        let drift_after_first = current_context.clone();
+        let policy = crate::context::ContextPolicy {
+            preference_guidance: Some("Only use the explicitly saved greeting style.".into()),
+            ..crate::context::ContextPolicy::default()
+        };
+        let intent = crate::llm::CleanupIntent::implicit("hello");
+        let retry_result = crate::queue::execute_with_retry_scoped_cancelled_checked(
+            &gate,
+            crate::queue::RequestKind::Llm,
+            &crate::queue::RequestScope::default(),
+            || async {
+                retry_call_count.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                let result = crate::llm::cleanup_with_provider_and_local_runtimes_and_intent_and_source_traced(
+                    crate::providers::EngineProvider::Custom,
+                    &state.mlx_cleanup_runtime,
+                    None,
+                    &retry_endpoint,
+                    "openai/gpt-oss-20b",
+                    "hello",
+                    "synthetic-loopback-key",
+                    None,
+                    Some(&policy),
+                    None,
+                    Some(&intent),
+                    None,
+                    crate::llm::CleanupEffort::Standard,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some("en"),
+                    None,
+                )
+                .await;
+                if result.is_err() {
+                    revoke_after_first.store(false, std::sync::atomic::Ordering::Release);
+                    super::lock_recover(&drift_after_first).target_guard.input_token = Some(999);
+                }
+                result.map(|_| ())
+            },
+            || {
+                let permitted = cloud_permission.load(std::sync::atomic::Ordering::Acquire)
+                    && super::cleanup_projection_target_is_current(
+                        &retry_expected,
+                        &super::lock_recover(&retry_live_context),
+                        false,
+                    );
+                std::future::ready(permitted)
+            },
+            cancellation,
+        )
+        .await;
+        assert!(matches!(
+            retry_result,
+            Err(crate::queue::CheckedExecuteError::AuthorizationChanged)
+        ));
+        assert_eq!(retry_calls.load(std::sync::atomic::Ordering::Acquire), 1);
+        let sent_request = retry_request
+            .await
+            .expect("first authorized request captured");
+        let sent_request = String::from_utf8_lossy(&sent_request);
+        assert!(sent_request.contains("USER_PREFERENCE_GUIDANCE"));
+    }
+
+    #[tokio::test]
+    async fn cloud_queue_serializes_canonical_text_when_task_has_bullet_preference() {
+        let _network_policy_guard = crate::network_policy::strict_offline_test_guard().await;
+        let source = "The three tasks are: update API; fix tests; review docs.";
+        let request_body = format!(
+            "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{source}\"}},\"finish_reason\":\"stop\"}}]}}\n\ndata: [DONE]\n\n"
+        )
+        .into_bytes();
+        let (endpoint, request) = crate::test_http::spawn_response_with_full_request_capture(
+            200,
+            "text/event-stream",
+            request_body,
+            &[],
+        )
+        .await;
+        let mapping = context::AppMapping {
+            id: "preference-app".into(),
+            label: "Preference App".into(),
+            family: context::ContextFamily::WorkChat,
+            writing_task_id: Some(context::WritingTaskId::WorkChat),
+            writing_preferences: vec![context::WritingPreference {
+                task_id: Some(context::WritingTaskId::WorkChat),
+                dimension: context::WritingPreferenceDimension::ListStructure,
+                value: context::WritingPreferenceValue::Bullets,
+                status: context::WritingPreferenceStatus::Active,
+                version: 1,
+                source: context::WritingPreferenceSource::Manual,
+            }],
+            preference_guidance_provider_approved: true,
+            preference_revision: 3,
+            deleted: false,
+            mode_id: None,
+            bundle_id: Some("com.example.preference".into()),
+            executable: None,
+            browser_host: None,
+            browser_path_prefix: None,
+            focused_field: Some(context::FocusKind::Chat),
+            source_permissions: Default::default(),
+            style_example_input: None,
+            style_example_output: None,
+            style_example_pairs: Vec::new(),
+            style_examples_approved: false,
+            enabled: true,
+            cleanup_effort: None,
+            cleanup_intensity: None,
+            cleanup_enabled: true,
+            dictionary_learn_enabled: true,
+        };
+        let settings = store::Settings {
+            cleanup_provider: providers::EngineProvider::Custom,
+            cleanup_intensity: "heavy".into(),
+            context_mappings: vec![mapping],
+            ..store::Settings::default()
+        };
+        let scene = super::ResolvedCleanupScene::observed(
+            context::ContextFamily::WorkChat,
+            context::FocusKind::Chat,
+        );
+        let mut recording_context = preference_test_context(context::WritingTaskId::WorkChat);
+        recording_context.multiline_capable = true;
+        recording_context.multiline_capability_known = true;
+        let prepared = super::prepare_cleanup_transcript_for_resolved_scene(
+            None, &settings, source, scene, 1.0, None, false,
+        );
+        let resolved = super::resolve_live_cleanup_output(
+            &prepared,
+            &settings,
+            &recording_context,
+            &prepared.intent.content,
+            true,
+            false,
+            false,
+        );
+        assert_eq!(resolved.provider_input, source);
+        assert_eq!(resolved.fallback_input, source);
+
+        let policy = super::cleanup_policy_for_resolved_scene(
+            &settings,
+            &recording_context,
+            scene,
+            Some(&prepared.intent),
+            resolved.plan,
+        );
+        let provider_intent = resolved.provider_intent;
+        let provider_input = resolved.provider_input;
+        let state = super::AppState::new_dictionary_regression_fixture(
+            settings,
+            std::env::temp_dir().join("voiceflow-cloud-list-preference-test"),
+        );
+        let gate = crate::queue::RequestGate::new(None);
+        let result = crate::queue::execute_with_retry_scoped_cancelled_traced(
+            &gate,
+            crate::queue::RequestKind::Llm,
+            &crate::queue::RequestScope::default(),
+            || async {
+                crate::llm::cleanup_with_provider_and_local_runtimes_and_intent_and_source_traced(
+                    crate::providers::EngineProvider::Custom,
+                    &state.mlx_cleanup_runtime,
+                    None,
+                    &endpoint,
+                    "openai/gpt-oss-20b",
+                    &provider_input,
+                    "synthetic-loopback-key",
+                    None,
+                    Some(&policy),
+                    None,
+                    Some(&provider_intent),
+                    None,
+                    crate::llm::CleanupEffort::Standard,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some("en"),
+                    None,
+                )
+                .await
+                .map(|_| ())
+            },
+            tokio_util::sync::CancellationToken::new(),
+            None,
+        )
+        .await;
+        assert!(result.is_ok(), "cloud loopback request failed: {result:?}");
+        let sent_request = request.await.expect("queued request captured");
+        let sent_request = String::from_utf8_lossy(&sent_request);
+        assert!(sent_request.contains(source));
+        assert!(!sent_request.contains("- update API"));
+    }
+
+    #[test]
     fn known_single_line_email_suppresses_scene_layout_for_provider_and_fallback() {
         let settings = store::Settings {
             cleanup_intensity: "standard".into(),
@@ -28683,6 +32143,60 @@ mod tests {
             crate::providers::EngineProvider::OpenAi
         );
         assert_eq!(current.cleanup_model, "captured-cleanup");
+
+        let mapping = |status, revision, cloud_approved| crate::context::AppMapping {
+            id: "editor-chat".into(),
+            label: "Editor chat".into(),
+            family: crate::context::ContextFamily::WorkChat,
+            writing_task_id: Some(crate::context::WritingTaskId::WorkChat),
+            writing_preferences: vec![crate::context::WritingPreference {
+                task_id: Some(crate::context::WritingTaskId::WorkChat),
+                dimension: crate::context::WritingPreferenceDimension::GreetingTone,
+                value: crate::context::WritingPreferenceValue::RespectfulGreeting,
+                status,
+                version: 1,
+                source: crate::context::WritingPreferenceSource::Manual,
+            }],
+            preference_guidance_provider_approved: cloud_approved,
+            preference_revision: revision,
+            deleted: false,
+            mode_id: None,
+            bundle_id: Some("com.example.editor".into()),
+            executable: None,
+            browser_host: None,
+            browser_path_prefix: None,
+            focused_field: Some(crate::context::FocusKind::Chat),
+            source_permissions: Default::default(),
+            style_example_input: None,
+            style_example_output: None,
+            style_example_pairs: Vec::new(),
+            style_examples_approved: false,
+            enabled: true,
+            cleanup_effort: None,
+            cleanup_intensity: None,
+            cleanup_enabled: true,
+            dictionary_learn_enabled: true,
+        };
+        current.context_mappings = vec![mapping(
+            crate::context::WritingPreferenceStatus::Forgotten,
+            4,
+            false,
+        )];
+        let learned = store::Settings {
+            context_mappings: vec![mapping(
+                crate::context::WritingPreferenceStatus::Active,
+                3,
+                true,
+            )],
+            ..current.clone()
+        };
+        super::apply_learning_settings_snapshot(&mut current, learned);
+        assert_eq!(
+            current.context_mappings[0].writing_preferences[0].status,
+            crate::context::WritingPreferenceStatus::Forgotten
+        );
+        assert!(!current.context_mappings[0].preference_guidance_provider_approved);
+        assert_eq!(current.context_mappings[0].preference_revision, 4);
     }
 
     #[test]
@@ -28848,6 +32362,7 @@ mod tests {
                     output_projection_list_revision_proof: None,
                     layout_source: None,
                     exact_fallback: false,
+                    allow_model_selected_paragraphs: false,
                 },
             );
             assert!(!rejected);
@@ -28946,6 +32461,57 @@ mod tests {
         context.target_guard.bundle_id = None;
         settings.keep_audio_days = 0;
         assert!(!super::should_keep_success_audio(&settings, &context));
+    }
+
+    #[test]
+    fn success_audio_respects_exact_retained_mapping_after_profile_override() {
+        let mapping = context::AppMapping {
+            id: "imported-mail".into(),
+            label: "Mail".into(),
+            family: context::ContextFamily::Email,
+            writing_task_id: None,
+            writing_preferences: Vec::new(),
+            preference_guidance_provider_approved: false,
+            preference_revision: 0,
+            deleted: false,
+            mode_id: None,
+            bundle_id: Some("com.example.mail".into()),
+            executable: None,
+            browser_host: None,
+            browser_path_prefix: None,
+            focused_field: Some(context::FocusKind::Email),
+            source_permissions: Default::default(),
+            style_example_input: None,
+            style_example_output: None,
+            style_example_pairs: Vec::new(),
+            style_examples_approved: false,
+            enabled: true,
+            cleanup_effort: None,
+            cleanup_intensity: None,
+            cleanup_enabled: true,
+            dictionary_learn_enabled: false,
+        };
+        let mut settings = store::Settings {
+            keep_success_audio: true,
+            keep_audio_days: 7,
+            context_mappings: vec![mapping.clone()],
+            ..store::Settings::default()
+        };
+        let mut recording_context = context::ContextSnapshot::general();
+        recording_context.profile.family = context::ContextFamily::General;
+        recording_context.target_guard.bundle_id = Some("com.example.mail".into());
+        recording_context.mapping_identity = Some(mapping.declared_identity_fingerprint());
+
+        assert!(!super::should_keep_success_audio(
+            &settings,
+            &recording_context
+        ));
+
+        settings.context_mappings[0].dictionary_learn_enabled = true;
+        assert!(super::should_keep_success_audio(
+            &settings,
+            &recording_context
+        ));
     }
 
     #[cfg(target_os = "macos")]
@@ -29628,6 +33194,7 @@ mod tests {
                 output_projection_list_revision_proof: None,
                 layout_source: None,
                 exact_fallback: false,
+                allow_model_selected_paragraphs: false,
             },
         ) {
             Ok(finalized) => finalized,

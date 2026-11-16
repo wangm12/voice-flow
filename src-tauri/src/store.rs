@@ -2,6 +2,7 @@
 use crate::queue::QuotaView;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::fs::{self, File};
 use std::io::{Read, Write};
 #[cfg(unix)]
@@ -14,7 +15,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const SETTINGS_SCHEMA_VERSION: u32 = 27;
-const HISTORY_SCHEMA_VERSION: i32 = 19;
+const HISTORY_SCHEMA_VERSION: i32 = 21;
 // Migration rollback copies contain historical text, so they have a finite
 // lifetime even when the user elects to keep the live history forever.
 const HISTORY_MIGRATION_BACKUP_MAX_DAYS: u64 = 7;
@@ -2078,6 +2079,57 @@ impl Settings {
             .is_some_and(|owners| owners.contains(source))
     }
 
+    /// Whether this word has a global owner that survives removal of any one
+    /// promoted word-rule owner. Transfer imports use this to distinguish a
+    /// genuinely present global word from a projection that a pair replacement
+    /// may remove later in the same transaction.
+    pub(crate) fn has_independent_global_dictionary_owner(&self, word: &str) -> bool {
+        self.dictionary_sources
+            .owners
+            .iter()
+            .filter(|(existing, _)| dictionary_words_equal(existing, word))
+            .flat_map(|(_, owners)| owners.iter())
+            .any(|owner| {
+                matches!(
+                    owner,
+                    DictionarySource::Manual
+                        | DictionarySource::Screen(_)
+                        | DictionarySource::Other(_)
+                )
+            })
+    }
+
+    /// Return dictionary terms whose current ownership permits ASR hint
+    /// egress. A scoped or missing learn-pair owner cannot make its canonical
+    /// word a global hint; an independent Manual/Screen/Other owner still can.
+    /// LegacyUnknown is never sufficient because its original owner cannot be
+    /// proved, even when its old pair row has been cleared or cannot be read.
+    pub(crate) fn asr_dictionary_words(&self, pairs: &[LearnPairRecord]) -> Vec<String> {
+        self.dictionary
+            .iter()
+            .filter(|word| {
+                self.dictionary_sources
+                    .owners
+                    .iter()
+                    .filter(|(existing, _)| dictionary_words_equal(existing, word))
+                    .flat_map(|(_, owners)| owners.iter())
+                    .any(|owner| match owner {
+                        DictionarySource::Manual
+                        | DictionarySource::Screen(_)
+                        | DictionarySource::Other(_) => true,
+                        DictionarySource::Rule(pair_key) => pairs.iter().any(|row| {
+                            row.pair_key == *pair_key
+                                && row.is_live_promoted()
+                                && row.is_provider_egress_eligible_dictionary_owner()
+                                && dictionary_words_equal(&row.after_surface, word)
+                        }),
+                        DictionarySource::LegacyUnknown => false,
+                    })
+            })
+            .cloned()
+            .collect()
+    }
+
     pub(crate) fn remove_dictionary_source(
         &mut self,
         word: &str,
@@ -2308,6 +2360,10 @@ impl Settings {
         self.context_mappings
             .retain(|mapping| mapping.validate().is_ok());
         for mapping in &mut self.context_mappings {
+            if mapping.deleted {
+                mapping.scrub_as_deleted_tombstone();
+                continue;
+            }
             if let Some(host) = &mapping.browser_host {
                 mapping.browser_host = crate::context::normalize_host(host);
             }
@@ -3622,7 +3678,12 @@ impl From<&Settings> for SettingsView {
             show_tray_icon: settings.show_tray_icon,
             context_enabled: settings.context_enabled,
             browser_access_enabled: settings.browser_access_enabled,
-            context_mappings: settings.context_mappings.clone(),
+            context_mappings: settings
+                .context_mappings
+                .iter()
+                .filter(|mapping| !mapping.deleted)
+                .cloned()
+                .collect(),
             writing_modes: settings.writing_modes.clone(),
             snippets: settings.snippets.clone(),
             output_mode: settings.output_mode.clone(),
@@ -5846,6 +5907,7 @@ fn schema(c: &Connection) -> anyhow::Result<()> {
     ensure_column(c, "context_family", "TEXT")?;
     ensure_column(c, "context_browser_host", "TEXT")?;
     ensure_column(c, "context_native_bundle", "TEXT")?;
+    ensure_column(c, "context_mapping_identity", "TEXT")?;
     ensure_column(c, "cleanup_status", "TEXT")?;
     ensure_column(c, "verbatim_text", "TEXT")?;
     ensure_column(c, "verbatim_reviewed", "INTEGER NOT NULL DEFAULT 0")?;
@@ -5887,7 +5949,9 @@ fn schema(c: &Connection) -> anyhow::Result<()> {
             promoted INTEGER NOT NULL DEFAULT 0,
             last_at TEXT NOT NULL,
             dictionary_pending_action TEXT NOT NULL DEFAULT 'none',
-            dictionary_effect_version INTEGER NOT NULL DEFAULT 0
+            dictionary_effect_version INTEGER NOT NULL DEFAULT 0,
+            match_policy TEXT NOT NULL DEFAULT 'ignore_case',
+            legacy_pair_key TEXT
         );
         CREATE TABLE IF NOT EXISTS learned_term_usage (
             word TEXT PRIMARY KEY,
@@ -5902,7 +5966,55 @@ fn schema(c: &Connection) -> anyhow::Result<()> {
             before_excerpt TEXT NOT NULL,
             after_excerpt TEXT NOT NULL,
             created_at TEXT NOT NULL
-        );",
+        );
+        CREATE TABLE IF NOT EXISTS writing_preference_evidence (
+            source_history_id INTEGER NOT NULL,
+            source_revision_id INTEGER NOT NULL,
+            mapping_id TEXT NOT NULL,
+            mapping_identity_fingerprint TEXT NOT NULL DEFAULT '',
+            mapping_revision INTEGER NOT NULL,
+            task_id TEXT NOT NULL,
+            dimension TEXT NOT NULL,
+            value TEXT NOT NULL,
+            origin_id TEXT NOT NULL,
+            content_fingerprint TEXT NOT NULL,
+            template_family_fingerprint TEXT,
+            occurred_at_ms INTEGER NOT NULL,
+            natural_day TEXT NOT NULL,
+            editor_session_id TEXT NOT NULL,
+            generation INTEGER NOT NULL,
+            eligible INTEGER NOT NULL DEFAULT 1,
+            PRIMARY KEY(mapping_id, origin_id),
+            FOREIGN KEY(source_history_id) REFERENCES dictations(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_preference_evidence_expiry
+            ON writing_preference_evidence(occurred_at_ms);
+        CREATE TABLE IF NOT EXISTS writing_preference_draft_decisions (
+            candidate_id TEXT PRIMARY KEY,
+            mapping_id TEXT NOT NULL,
+            mapping_revision INTEGER NOT NULL,
+            task_id TEXT NOT NULL,
+            dimension TEXT NOT NULL,
+            value TEXT NOT NULL,
+            generation INTEGER NOT NULL,
+            decision TEXT NOT NULL CHECK(decision IN ('dismissed', 'approved')),
+            decided_at_ms INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_preference_decisions_scope
+            ON writing_preference_draft_decisions(mapping_id, mapping_revision, task_id, dimension, value, generation);
+        CREATE INDEX IF NOT EXISTS idx_preference_decisions_expiry
+            ON writing_preference_draft_decisions(decided_at_ms);",
+    )?;
+    ensure_table_column(
+        c,
+        "writing_preference_evidence",
+        "mapping_identity_fingerprint",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    c.execute_batch(
+        "DROP INDEX IF EXISTS idx_preference_evidence_scope;
+         CREATE INDEX idx_preference_evidence_scope
+            ON writing_preference_evidence(mapping_id, mapping_identity_fingerprint, task_id, dimension, value, generation, eligible);",
     )?;
     ensure_table_column(c, "learn_pairs", "family", "TEXT")?;
     ensure_table_column(c, "learn_pairs", "mapping_id", "TEXT")?;
@@ -5938,6 +6050,25 @@ fn schema(c: &Connection) -> anyhow::Result<()> {
         "learn_pairs",
         "dictionary_effect_version",
         "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_table_column(
+        c,
+        "learn_pairs",
+        "match_policy",
+        "TEXT NOT NULL DEFAULT 'ignore_case'",
+    )?;
+    ensure_table_column(c, "learn_pairs", "legacy_pair_key", "TEXT")?;
+    ensure_table_column(c, "learn_pairs", "binding_invalidated_at", "TEXT")?;
+    ensure_table_column(c, "learn_pairs", "binding_invalidated_reason", "TEXT")?;
+    ensure_table_column(
+        c,
+        "learn_pairs",
+        "replacement_runs",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    c.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_learn_pairs_legacy_key
+         ON learn_pairs(legacy_pair_key) WHERE legacy_pair_key IS NOT NULL;",
     )?;
     c.pragma_update(None, "user_version", HISTORY_SCHEMA_VERSION)?;
     Ok(())
@@ -6233,6 +6364,8 @@ pub(crate) struct PendingHistoryIntent {
     pub context_family: Option<String>,
     pub context_browser_host: Option<String>,
     pub context_native_bundle: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_mapping_identity: Option<String>,
     pub spool_path: Option<PathBuf>,
     pub engine: String,
     pub cleanup_status: String,
@@ -6329,6 +6462,7 @@ pub(crate) fn pending_history_intent_for_test(
         context_family: None,
         context_browser_host: None,
         context_native_bundle: None,
+        context_mapping_identity: None,
         spool_path: None,
         engine: "test-engine".into(),
         cleanup_status: "cleanup_not_requested".into(),
@@ -6924,7 +7058,7 @@ pub(crate) fn promote_pending_history_intent(
         )?;
         let inserted_id = transaction.last_insert_rowid();
         transaction.execute(
-            "UPDATE dictations SET transaction_id=?1, created_at=datetime(?2 / 1000, 'unixepoch'), context_profile_id=?3, context_policy_json=?4, context_family=?5, context_browser_host=?6, context_native_bundle=?7, delivery_error_code=?8, delivery_user_reason=?9 WHERE id=?10",
+            "UPDATE dictations SET transaction_id=?1, created_at=datetime(?2 / 1000, 'unixepoch'), context_profile_id=?3, context_policy_json=?4, context_family=?5, context_browser_host=?6, context_native_bundle=?7, context_mapping_identity=?8, delivery_error_code=?9, delivery_user_reason=?10 WHERE id=?11",
             params![
                 intent.transaction_id,
                 intent.created_at_unix_ms,
@@ -6933,6 +7067,7 @@ pub(crate) fn promote_pending_history_intent(
                 intent.context_family,
                 intent.context_browser_host,
                 intent.context_native_bundle,
+                intent.context_mapping_identity,
                 if interrupted { Some("delivery_unconfirmed_after_restart") } else { intent.diagnostic_code.as_deref() },
                 if interrupted { Some("Delivery was interrupted before its final result was recorded.") } else { intent.diagnostic_user_reason.as_deref() },
                 inserted_id
@@ -7233,45 +7368,6 @@ pub fn insert_history_with_asr_candidate_and_delivery_and_spool_and_cleanup(
     engine: &str,
     cleanup_status: &str,
 ) -> anyhow::Result<()> {
-    insert_history_with_asr_candidate_and_delivery_and_spool_and_cleanup_diagnostic(
-        dir,
-        raw,
-        asr_text,
-        provider_cleaned_candidate,
-        final_text,
-        duration,
-        degraded,
-        degraded_reason,
-        status,
-        delivery_method,
-        fallback_reason,
-        context,
-        spool,
-        engine,
-        cleanup_status,
-        None,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn insert_history_with_asr_candidate_and_delivery_and_spool_and_cleanup_diagnostic(
-    dir: &Path,
-    raw: &str,
-    asr_text: Option<&str>,
-    provider_cleaned_candidate: Option<&str>,
-    final_text: &str,
-    duration: f64,
-    degraded: bool,
-    degraded_reason: Option<&str>,
-    status: &str,
-    delivery_method: &str,
-    fallback_reason: Option<&str>,
-    context: &crate::context::ContextSnapshot,
-    spool: Option<&Path>,
-    engine: &str,
-    cleanup_status: &str,
-    diagnostic: Option<&crate::delivery_diagnostics::DeliveryDiagnostic>,
-) -> anyhow::Result<()> {
     insert_history_with_asr_candidate_and_delivery_and_spool_and_cleanup_rejection(
         dir,
         raw,
@@ -7288,7 +7384,7 @@ pub fn insert_history_with_asr_candidate_and_delivery_and_spool_and_cleanup_diag
         spool,
         engine,
         cleanup_status,
-        diagnostic,
+        None,
         None,
         None,
     )
@@ -7379,7 +7475,6 @@ pub fn insert_history_with_delivery_and_spool_and_cleanup(
     )
 }
 #[cfg(test)]
-#[allow(dead_code)]
 pub fn insert_failed_history(
     dir: &Path,
     raw: &str,
@@ -7567,7 +7662,9 @@ fn insert_history_with_status_and_candidate_on_connection(
             snapshot.target_guard.bundle_id.clone()
         }
     });
-    c.execute("INSERT INTO dictations (created_at,duration_secs,raw_text,final_text,cleanup_status,engine,degraded,degraded_reason,status,raw_audio_path,delivery_method,fallback_reason,context_profile_id,context_policy_json,context_family,context_browser_host,context_native_bundle,asr_text,provider_cleaned_candidate,cleanup_rejected_candidate,cleanup_guard_reason,delivery_error_code,delivery_user_reason,cleanup_attempt_kind,cleanup_transformations_json,cleanup_final_guard_reason,cleanup_failure_reason) VALUES (datetime('now'),?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", params![duration, raw, final_text, cleanup_status, engine.unwrap_or("unknown"), degraded as i32, degraded_reason, status, spool.map(|p| p.to_string_lossy().to_string()), delivery_method, fallback_reason, context_profile_id, context_policy_json, context_family, context_browser_host, context_native_bundle, asr_text, provider_cleaned_candidate, cleanup_rejected_candidate, cleanup_guard_reason, diagnostic.map(|item| item.code), diagnostic.map(|item| item.user_reason), cleanup_attempt_kind, cleanup_transformations_json, cleanup_final_guard_reason, cleanup_failure_reason])?;
+    let context_mapping_identity =
+        context.and_then(|snapshot| snapshot.mapping_identity.as_deref());
+    c.execute("INSERT INTO dictations (created_at,duration_secs,raw_text,final_text,cleanup_status,engine,degraded,degraded_reason,status,raw_audio_path,delivery_method,fallback_reason,context_profile_id,context_policy_json,context_family,context_browser_host,context_native_bundle,context_mapping_identity,asr_text,provider_cleaned_candidate,cleanup_rejected_candidate,cleanup_guard_reason,delivery_error_code,delivery_user_reason,cleanup_attempt_kind,cleanup_transformations_json,cleanup_final_guard_reason,cleanup_failure_reason) VALUES (datetime('now'),?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", params![duration, raw, final_text, cleanup_status, engine.unwrap_or("unknown"), degraded as i32, degraded_reason, status, spool.map(|p| p.to_string_lossy().to_string()), delivery_method, fallback_reason, context_profile_id, context_policy_json, context_family, context_browser_host, context_native_bundle, context_mapping_identity, asr_text, provider_cleaned_candidate, cleanup_rejected_candidate, cleanup_guard_reason, diagnostic.map(|item| item.code), diagnostic.map(|item| item.user_reason), cleanup_attempt_kind, cleanup_transformations_json, cleanup_final_guard_reason, cleanup_failure_reason])?;
     if count_asr || count_llm {
         c.execute("INSERT INTO usage(day,asr_requests,llm_requests,audio_seconds) VALUES (date('now'),?,?,?) ON CONFLICT(day) DO UPDATE SET asr_requests=asr_requests+excluded.asr_requests,llm_requests=llm_requests+excluded.llm_requests,audio_seconds=audio_seconds+excluded.audio_seconds", params![count_asr as i64, count_llm as i64, duration])?;
     }
@@ -7709,11 +7806,17 @@ pub(crate) fn purge_history_with_details(
         keep_history_days.min(HISTORY_MIGRATION_BACKUP_MAX_DAYS)
     };
     prune_history_migration_backups(dir, Some(backup_days), SystemTime::now())?;
+    let now_ms = now_epoch_millis();
+    let c = open_history(dir)?;
+    let (expired_preference_evidence, expired_preference_decisions) =
+        prune_writing_preference_metadata(&c, now_ms)?;
     // Zero is the explicit "keep forever" setting for live history text.
     if keep_history_days == 0 {
-        return Ok((0, false));
+        return Ok((
+            0,
+            expired_preference_evidence + expired_preference_decisions > 0,
+        ));
     }
-    let c = open_history(dir)?;
     let cutoff = format!("-{keep_history_days} days");
     let mut statement =
         c.prepare("SELECT raw_audio_path FROM dictations WHERE created_at < datetime('now', ?)")?;
@@ -7737,10 +7840,119 @@ pub(crate) fn purge_history_with_details(
     for path in paths.into_iter().flatten() {
         remove_spool_artifact_inner(dir, Path::new(&path), true);
     }
-    Ok((deleted, deleted_drafts > 0))
+    Ok((
+        deleted,
+        deleted_drafts > 0 || expired_preference_evidence + expired_preference_decisions > 0,
+    ))
 }
 
-const LEARN_PAIR_COLUMNS: &str = "pair_key, before_surface, after_surface, hits, promoted, last_at, family, mapping_id, browser_host, native_bundle, last_used_at, pinned, tombstoned_at, ignored, manual_scoped, auto_scoped";
+const LEARN_PAIR_COLUMNS: &str = "pair_key, before_surface, after_surface, hits, promoted, last_at, family, mapping_id, browser_host, native_bundle, last_used_at, pinned, tombstoned_at, ignored, manual_scoped, auto_scoped, match_policy, binding_invalidated_at, binding_invalidated_reason, replacement_runs";
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LearnPairMatchPolicy {
+    #[default]
+    IgnoreCase,
+    Exact,
+}
+
+impl LearnPairMatchPolicy {
+    fn as_db_str(self) -> &'static str {
+        match self {
+            Self::IgnoreCase => "ignore_case",
+            Self::Exact => "exact",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LearnPairBindingInvalidationReason {
+    MappingDeleted,
+    DeclaredIdentityChanged,
+    MissingBindingAtMigration,
+}
+
+impl LearnPairBindingInvalidationReason {
+    fn as_db_str(self) -> &'static str {
+        match self {
+            Self::MappingDeleted => "mapping_deleted",
+            Self::DeclaredIdentityChanged => "declared_identity_changed",
+            Self::MissingBindingAtMigration => "missing_binding_at_migration",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct LearnPairKey(String);
+
+impl LearnPairKey {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn into_string(self) -> String {
+        self.0
+    }
+}
+
+#[derive(Serialize)]
+struct WordRuleIdentityV2<'a> {
+    version: u8,
+    kind: &'static str,
+    match_policy: LearnPairMatchPolicy,
+    alias_identity: String,
+    canonical_after: &'a str,
+    family: Option<&'a str>,
+    mapping_id: Option<&'a str>,
+    browser_host: Option<&'a str>,
+    native_bundle: Option<&'a str>,
+}
+
+pub fn word_rule_match_policy(before: &str, after: &str) -> LearnPairMatchPolicy {
+    if before != after && before.eq_ignore_ascii_case(after) {
+        LearnPairMatchPolicy::Exact
+    } else {
+        LearnPairMatchPolicy::IgnoreCase
+    }
+}
+
+fn learn_pair_alias_matches(row: &LearnPairRecord, alias: &str) -> bool {
+    match row.match_policy {
+        LearnPairMatchPolicy::IgnoreCase => row.before_surface.eq_ignore_ascii_case(alias),
+        LearnPairMatchPolicy::Exact => row.before_surface == alias,
+    }
+}
+
+pub fn scoped_word_rule_key(
+    before: &str,
+    after: &str,
+    scope: &LearnPairScope,
+    match_policy: LearnPairMatchPolicy,
+) -> LearnPairKey {
+    let alias_identity = match match_policy {
+        LearnPairMatchPolicy::Exact => before.to_owned(),
+        LearnPairMatchPolicy::IgnoreCase => before.to_ascii_lowercase(),
+    };
+    let identity = WordRuleIdentityV2 {
+        version: 2,
+        kind: "word",
+        match_policy,
+        alias_identity,
+        canonical_after: after,
+        family: scope.family.as_deref(),
+        mapping_id: scope.mapping_id.as_deref(),
+        browser_host: scope.browser_host.as_deref(),
+        native_bundle: scope.native_bundle.as_deref(),
+    };
+    let encoded = serde_json::to_vec(&identity).expect("word rule identity is serializable");
+    let digest = hex::encode(Sha256::digest(encoded));
+    LearnPairKey(format!("word:v2:{digest}"))
+}
+
+fn legacy_pair_key_for_surfaces(pair_key: &str, before: &str, after: &str) -> Option<String> {
+    (pair_key.starts_with("word:v2:") && !before.is_empty())
+        .then(|| format!("{}\u{1e}{}", before.to_lowercase(), after.to_lowercase()))
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LearnPairScope {
@@ -7802,12 +8014,50 @@ impl LearnPairScope {
     /// context. Downstream replacement, hinting, usage, and final protection
     /// must all consume this set rather than reinterpreting scope fields.
     pub fn applicable_promoted_records(&self, rows: &[LearnPairRecord]) -> Vec<LearnPairRecord> {
-        rows.iter()
+        let applicable = rows
+            .iter()
             .filter(|row| {
                 row.is_live_promoted() && self.assess_record(row) == LearnPairScopeMatch::Match
             })
-            .cloned()
+            .collect::<Vec<_>>();
+        applicable
+            .iter()
+            .filter(|row| {
+                !is_word_rule_candidate(row)
+                    || !applicable.iter().any(|other| {
+                        other.pair_key != row.pair_key
+                            && is_word_rule_candidate(other)
+                            && other.after_surface != row.after_surface
+                            && learn_pair_alias_domains_intersect(row, other)
+                    })
+            })
+            .map(|row| (*row).clone())
             .collect()
+    }
+}
+
+fn is_scoped_word_rule(row: &LearnPairRecord) -> bool {
+    row.pair_key.starts_with("word:v2:") && !row.before_surface.is_empty()
+}
+
+fn is_word_rule_candidate(row: &LearnPairRecord) -> bool {
+    !row.before_surface.is_empty() && (is_scoped_word_rule(row) || row.pair_key.contains('\u{1e}'))
+}
+
+fn learn_pair_alias_domains_intersect(left: &LearnPairRecord, right: &LearnPairRecord) -> bool {
+    match (left.match_policy, right.match_policy) {
+        (LearnPairMatchPolicy::Exact, LearnPairMatchPolicy::Exact) => {
+            left.before_surface == right.before_surface
+        }
+        (LearnPairMatchPolicy::IgnoreCase, LearnPairMatchPolicy::IgnoreCase) => left
+            .before_surface
+            .eq_ignore_ascii_case(&right.before_surface),
+        (LearnPairMatchPolicy::Exact, LearnPairMatchPolicy::IgnoreCase) => left
+            .before_surface
+            .eq_ignore_ascii_case(&right.before_surface),
+        (LearnPairMatchPolicy::IgnoreCase, LearnPairMatchPolicy::Exact) => left
+            .before_surface
+            .eq_ignore_ascii_case(&right.before_surface),
     }
 }
 
@@ -7841,15 +8091,88 @@ pub struct LearnPairRecord {
     pub manual_scoped: bool,
     #[serde(default)]
     pub auto_scoped: bool,
+    #[serde(default)]
+    pub match_policy: LearnPairMatchPolicy,
+    #[serde(default)]
+    pub binding_invalidated_at: Option<String>,
+    #[serde(default)]
+    pub binding_invalidated_reason: Option<String>,
+    #[serde(default)]
+    pub replacement_runs: u64,
 }
 
 impl LearnPairRecord {
+    /// Whether this row declares any context scope. A family-only legacy row
+    /// is still scoped for provider egress; missing newer flags do not erase
+    /// that declaration.
+    pub fn has_declared_scope(&self) -> bool {
+        [
+            self.family.as_deref(),
+            self.mapping_id.as_deref(),
+            self.browser_host.as_deref(),
+            self.native_bundle.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|value| !value.trim().is_empty())
+    }
+
+    /// A pair can be sent as a provider hint only when it is a known global
+    /// word rule. Manual/local-only rows, any declared scope, and unrecognized
+    /// legacy identities fail closed. `after_surface` still needs independent
+    /// global dictionary ownership at the call site.
+    pub fn is_provider_egress_eligible_word_pair(&self) -> bool {
+        if self.manual_scoped
+            || self.auto_scoped
+            || self.has_declared_scope()
+            || self.before_surface.trim().is_empty()
+            || self.after_surface.trim().is_empty()
+            || self.pair_key.starts_with("learn:style:")
+            || self.pair_key.starts_with("learn:intensity:")
+        {
+            return false;
+        }
+        self.pair_key.starts_with("word:v2:")
+            || self.pair_key
+                == format!(
+                    "{}\u{1e}{}",
+                    self.before_surface.to_lowercase(),
+                    self.after_surface.to_lowercase()
+                )
+    }
+
+    /// A dictionary owner is safe for global ASR term ranking when it is a
+    /// known global word rule or an unscoped pinned term. Scoped screen seeds
+    /// and local-only rules stay out of the global ranking path.
+    pub fn is_provider_egress_eligible_dictionary_owner(&self) -> bool {
+        if !self.before_surface.trim().is_empty() {
+            return self.is_provider_egress_eligible_word_pair();
+        }
+        !self.manual_scoped
+            && !self.auto_scoped
+            && !self.has_declared_scope()
+            && !self.after_surface.trim().is_empty()
+            && !self.pair_key.starts_with("learn:style:")
+            && !self.pair_key.starts_with("learn:intensity:")
+            && self.pair_key == format!("\u{1e}{}", self.after_surface.to_lowercase())
+    }
+
     pub fn is_live_promoted(&self) -> bool {
-        self.promoted && !self.ignored && self.tombstoned_at.is_none()
+        self.promoted
+            && !self.ignored
+            && self.tombstoned_at.is_none()
+            && self.binding_invalidated_at.is_none()
     }
 
     pub fn is_pending(&self) -> bool {
-        !self.promoted && !self.ignored && self.tombstoned_at.is_none()
+        !self.promoted
+            && !self.ignored
+            && self.tombstoned_at.is_none()
+            && self.binding_invalidated_at.is_none()
+    }
+
+    pub fn is_binding_invalidated(&self) -> bool {
+        self.binding_invalidated_at.is_some()
     }
 }
 
@@ -7862,6 +8185,77 @@ pub struct StyleDraftRecord {
     pub before_excerpt: String,
     pub after_excerpt: String,
     pub created_at: String,
+}
+
+/// A content-free evidence row owned by one committed History edit. The
+/// source revision is a binding, while `origin_id` identifies the original
+/// dictation transaction and therefore contributes at most one origin.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WritingPreferenceEvidenceRecord {
+    pub(crate) source_history_id: i64,
+    pub(crate) source_revision_id: i64,
+    pub(crate) mapping_id: String,
+    pub(crate) mapping_identity_fingerprint: String,
+    pub(crate) mapping_revision: u64,
+    pub(crate) task_id: crate::context::WritingTaskId,
+    pub(crate) dimension: crate::context::WritingPreferenceDimension,
+    pub(crate) value: crate::context::WritingPreferenceValue,
+    pub(crate) origin_id: String,
+    pub(crate) content_fingerprint: String,
+    pub(crate) template_family_fingerprint: Option<String>,
+    pub(crate) occurred_at_ms: u64,
+    pub(crate) editor_session_id: String,
+    pub(crate) generation: u64,
+    pub(crate) eligible: bool,
+    pub(crate) natural_day: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WritingPreferenceEvidenceInput {
+    pub(crate) source_history_id: i64,
+    pub(crate) source_revision_id: i64,
+    pub(crate) mapping_id: String,
+    pub(crate) mapping_identity_fingerprint: String,
+    pub(crate) mapping_revision: u64,
+    pub(crate) task_id: crate::context::WritingTaskId,
+    pub(crate) dimension: crate::context::WritingPreferenceDimension,
+    pub(crate) value: crate::context::WritingPreferenceValue,
+    pub(crate) origin_id: String,
+    pub(crate) content_fingerprint: String,
+    pub(crate) template_family_fingerprint: Option<String>,
+    pub(crate) occurred_at_ms: u64,
+    /// Original dictation's device-local calendar day, not its later edit day.
+    pub(crate) natural_day: String,
+    pub(crate) editor_session_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WritingPreferenceDraftDecisionRecord {
+    pub(crate) candidate_id: String,
+    pub(crate) mapping_id: String,
+    pub(crate) mapping_revision: u64,
+    pub(crate) task_id: crate::context::WritingTaskId,
+    pub(crate) dimension: crate::context::WritingPreferenceDimension,
+    pub(crate) value: crate::context::WritingPreferenceValue,
+    pub(crate) generation: u64,
+    pub(crate) decision: WritingPreferenceDraftDecision,
+    pub(crate) decided_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WritingPreferenceDraftDecision {
+    Dismissed,
+    Approved,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WritingPreferenceEvidenceWrite {
+    Inserted,
+    Replaced,
+    Duplicate,
+    StaleOrigin,
+    RejectedSource,
+    AtCapacity,
 }
 
 fn learn_pair_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LearnPairRecord> {
@@ -7883,6 +8277,23 @@ fn learn_pair_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<LearnPairRec
         promote_hits: 0,
         manual_scoped: row.get::<_, Option<i64>>(14)?.unwrap_or(0) != 0,
         auto_scoped: row.get::<_, Option<i64>>(15)?.unwrap_or(0) != 0,
+        match_policy: match row.get::<_, String>(16)?.as_str() {
+            "ignore_case" => LearnPairMatchPolicy::IgnoreCase,
+            "exact" => LearnPairMatchPolicy::Exact,
+            other => {
+                return Err(rusqlite::Error::FromSqlConversionFailure(
+                    16,
+                    rusqlite::types::Type::Text,
+                    Box::new(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("unknown learn pair match policy: {other}"),
+                    )),
+                ));
+            }
+        },
+        binding_invalidated_at: row.get(17)?,
+        binding_invalidated_reason: row.get(18)?,
+        replacement_runs: row.get::<_, i64>(19)?.max(0) as u64,
     })
 }
 
@@ -7905,6 +8316,7 @@ pub fn upsert_learn_pair(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LearnPairSkipReason {
     TombstoneOrIgnored,
+    BindingInvalidated,
     PendingCapacity,
     ScopeConflict,
     DuplicateObservation,
@@ -7914,6 +8326,7 @@ impl LearnPairSkipReason {
     pub fn code(self) -> &'static str {
         match self {
             Self::TombstoneOrIgnored => "tombstone_or_ignored",
+            Self::BindingInvalidated => "mapping_binding_invalidated",
             Self::PendingCapacity => "cap",
             Self::ScopeConflict => "scope_conflict",
             Self::DuplicateObservation => "duplicate_observation",
@@ -7942,6 +8355,10 @@ pub(crate) struct LearnPairObservation {
 }
 
 impl LearnPairObservation {
+    pub(crate) fn uses_scoped_word_identity(&self) -> bool {
+        matches!(self.channel, Some("paste" | "history_edit"))
+    }
+
     pub(crate) fn history_edit(history_id: i64, revision_id: i64, pair_key: &str) -> Self {
         Self {
             observation_key: learn_observation_key(
@@ -7952,9 +8369,9 @@ impl LearnPairObservation {
             source_kind: "history_edit",
             source_history_id: Some(history_id),
             source_revision_id: Some(revision_id),
-            rule_key: None,
+            rule_key: Some(pair_key.to_owned()),
             dictation_origin: None,
-            channel: None,
+            channel: Some("history_edit"),
             proof_eligible: false,
         }
     }
@@ -8097,7 +8514,7 @@ impl LearnPairObservation {
         }
     }
 
-    #[cfg(any(test, feature = "research-harness"))]
+    #[cfg(feature = "research-harness")]
     pub(crate) fn research_fixture_noop(operation_id: &str, pair_key: &str) -> Self {
         Self {
             observation_key: learn_observation_key("research_fixture_noop", operation_id, pair_key),
@@ -8198,6 +8615,7 @@ fn verify_dictation_origin(
     Ok(Some(VerifiedDictationOrigin::Pending(pending_commit)))
 }
 
+#[cfg(test)]
 pub(crate) fn count_independent_learn_pair_hits(dir: &Path, pair_key: &str) -> anyhow::Result<u32> {
     let connection = open_history(dir)?;
     let count = connection.query_row(
@@ -8206,6 +8624,25 @@ pub(crate) fn count_independent_learn_pair_hits(dir: &Path, pair_key: &str) -> a
          WHERE rule_key = ?1
            AND proof_eligible = 1
            AND dictation_origin IS NOT NULL",
+        [pair_key],
+        |row| row.get::<_, i64>(0),
+    )?;
+    Ok(count as u32)
+}
+
+pub(crate) fn count_research_fixture_learn_pair_hits(
+    dir: &Path,
+    pair_key: &str,
+) -> anyhow::Result<u32> {
+    let connection = open_history(dir)?;
+    let count = connection.query_row(
+        "SELECT COUNT(DISTINCT dictation_origin)
+         FROM learn_observations
+         WHERE rule_key = ?1
+           AND proof_eligible = 1
+           AND dictation_origin IS NOT NULL
+           AND source_kind = 'research_fixture_edit'
+           AND channel = 'research_fixture'",
         [pair_key],
         |row| row.get::<_, i64>(0),
     )?;
@@ -8239,6 +8676,27 @@ pub(crate) fn upsert_learn_pair_with_observation(
         scope,
         observation,
         false,
+        false,
+    )
+}
+
+pub(crate) fn upsert_auto_scoped_learn_pair_with_observation(
+    dir: &Path,
+    pair_key: &str,
+    before_surface: &str,
+    after_surface: &str,
+    scope: Option<&LearnPairScope>,
+    observation: Option<&LearnPairObservation>,
+) -> anyhow::Result<LearnPairUpsert> {
+    upsert_learn_pair_with_observation_policy(
+        dir,
+        pair_key,
+        before_surface,
+        after_surface,
+        scope,
+        observation,
+        false,
+        true,
     )
 }
 
@@ -8261,6 +8719,7 @@ pub(crate) fn upsert_style_learning_pair_with_observation(
         scope,
         observation,
         true,
+        false,
     )
 }
 
@@ -8302,7 +8761,7 @@ pub(crate) fn record_research_fixture_application(
     }
     if applied {
         transaction.execute(
-            "UPDATE learn_pairs SET last_used_at = datetime('now') WHERE pair_key = ?1 AND after_surface = ?2 AND promoted = 1 AND ignored = 0 AND tombstoned_at IS NULL",
+            "UPDATE learn_pairs SET last_used_at = datetime('now'), replacement_runs = replacement_runs + 1 WHERE pair_key = ?1 AND after_surface = ?2 AND promoted = 1 AND ignored = 0 AND tombstoned_at IS NULL AND binding_invalidated_at IS NULL",
             params![pair_key, after_surface],
         )?;
         if transaction.changes() != 1 {
@@ -8321,6 +8780,7 @@ pub(crate) fn record_research_fixture_application(
     Ok(true)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn upsert_learn_pair_with_observation_policy(
     dir: &Path,
     pair_key: &str,
@@ -8329,9 +8789,28 @@ fn upsert_learn_pair_with_observation_policy(
     scope: Option<&LearnPairScope>,
     observation: Option<&LearnPairObservation>,
     refresh_conflicting_text: bool,
+    auto_scoped: bool,
 ) -> anyhow::Result<LearnPairUpsert> {
     let mut c = open_history(dir)?;
     let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    if let Some(legacy_key) = legacy_pair_key_for_surfaces(pair_key, before_surface, after_surface)
+    {
+        let legacy_tombstoned: bool = tx.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM learn_pairs
+                WHERE pair_key = ?1
+                  AND before_surface != ''
+                  AND (ignored = 1 OR tombstoned_at IS NOT NULL)
+            )",
+            [&legacy_key],
+            |row| row.get(0),
+        )?;
+        if legacy_tombstoned {
+            return Ok(LearnPairUpsert::Skipped(
+                LearnPairSkipReason::TombstoneOrIgnored,
+            ));
+        }
+    }
     if let Some(existing) = tx
         .query_row(
             &format!("SELECT {LEARN_PAIR_COLUMNS} FROM learn_pairs WHERE pair_key = ?1"),
@@ -8345,6 +8824,11 @@ fn upsert_learn_pair_with_observation_policy(
                 LearnPairSkipReason::TombstoneOrIgnored,
             ));
         }
+        if existing.is_binding_invalidated() {
+            return Ok(LearnPairUpsert::Skipped(
+                LearnPairSkipReason::BindingInvalidated,
+            ));
+        }
         let existing_scope = LearnPairScope {
             family: existing.family.clone(),
             mapping_id: existing.mapping_id.clone(),
@@ -8352,8 +8836,9 @@ fn upsert_learn_pair_with_observation_policy(
             native_bundle: existing.native_bundle.clone(),
         };
         if existing_scope != scope.cloned().unwrap_or_default()
+            || existing.match_policy != word_rule_match_policy(before_surface, after_surface)
             || (!refresh_conflicting_text
-                && (existing.before_surface != before_surface
+                && (!learn_pair_alias_matches(&existing, before_surface)
                     || existing.after_surface != after_surface))
         {
             return Ok(LearnPairUpsert::Skipped(LearnPairSkipReason::ScopeConflict));
@@ -8427,6 +8912,19 @@ fn upsert_learn_pair_with_observation_policy(
                     ],
                 )?;
             }
+            if auto_scoped {
+                tx.execute(
+                    "UPDATE learn_pairs
+                     SET auto_scoped = 1
+                     WHERE pair_key = ?1
+                       AND promoted = 0
+                       AND COALESCE(manual_scoped, 0) = 0
+                       AND ignored = 0
+                       AND tombstoned_at IS NULL
+                       AND binding_invalidated_at IS NULL",
+                    [pair_key],
+                )?;
+            }
             tx.commit()?;
             return Ok(LearnPairUpsert::Skipped(
                 LearnPairSkipReason::DuplicateObservation,
@@ -8440,6 +8938,7 @@ fn upsert_learn_pair_with_observation_policy(
         )?;
     }
     let scope = scope.cloned().unwrap_or_default();
+    let match_policy = word_rule_match_policy(before_surface, after_surface);
     let before_update = if refresh_conflicting_text {
         "excluded.before_surface"
     } else {
@@ -8450,10 +8949,11 @@ fn upsert_learn_pair_with_observation_policy(
     } else {
         "learn_pairs.after_surface"
     };
+    let legacy_pair_key = legacy_pair_key_for_surfaces(pair_key, before_surface, after_surface);
     let record = tx.query_row(
         &format!(
-        "INSERT INTO learn_pairs (pair_key, before_surface, after_surface, hits, promoted, last_at, family, mapping_id, browser_host, native_bundle, last_used_at, pinned, tombstoned_at, ignored)
-             VALUES (?1, ?2, ?3, 1, 0, datetime('now'), ?4, ?5, ?6, ?7, NULL, 0, NULL, 0)
+        "INSERT INTO learn_pairs (pair_key, before_surface, after_surface, hits, promoted, last_at, family, mapping_id, browser_host, native_bundle, last_used_at, pinned, tombstoned_at, ignored, match_policy, legacy_pair_key, auto_scoped)
+             VALUES (?1, ?2, ?3, 1, 0, datetime('now'), ?4, ?5, ?6, ?7, NULL, 0, NULL, 0, ?8, ?9, ?10)
              ON CONFLICT(pair_key) DO UPDATE SET
                before_surface = {before_update},
                after_surface = {after_update},
@@ -8462,7 +8962,13 @@ fn upsert_learn_pair_with_observation_policy(
                family = excluded.family,
                mapping_id = excluded.mapping_id,
                browser_host = excluded.browser_host,
-               native_bundle = excluded.native_bundle
+               native_bundle = excluded.native_bundle,
+               match_policy = excluded.match_policy,
+               legacy_pair_key = COALESCE(learn_pairs.legacy_pair_key, excluded.legacy_pair_key),
+               auto_scoped = CASE
+                 WHEN ?10 AND learn_pairs.promoted = 0 THEN 1
+                 ELSE learn_pairs.auto_scoped
+               END
              RETURNING {LEARN_PAIR_COLUMNS}"
         ),
         params![
@@ -8472,7 +8978,10 @@ fn upsert_learn_pair_with_observation_policy(
             scope.family,
             scope.mapping_id,
             scope.browser_host,
-            scope.native_bundle
+            scope.native_bundle,
+            match_policy.as_db_str(),
+            legacy_pair_key,
+            auto_scoped
         ],
         learn_pair_from_row,
     )?;
@@ -8718,6 +9227,7 @@ pub(crate) fn mark_learn_pair_promoted_with_scope_kind(
 /// Promote an automatically learned pair only while its exact candidate is
 /// still live, in the same scope, and at its required hit threshold. This
 /// conditional update never clears a tombstone or ignored marker.
+#[cfg(test)]
 pub(crate) fn promote_learn_pair_if_eligible(
     dir: &Path,
     pair_key: &str,
@@ -8727,10 +9237,61 @@ pub(crate) fn promote_learn_pair_if_eligible(
     threshold: u32,
     auto_scoped: bool,
 ) -> anyhow::Result<bool> {
+    Ok(matches!(
+        promote_learn_pair_if_eligible_with_status(
+            dir,
+            pair_key,
+            before_surface,
+            after_surface,
+            scope,
+            threshold,
+            auto_scoped,
+        )?,
+        LearnPairPromotionStatus::Promoted
+    ))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LearnPairPromotionStatus {
+    Promoted,
+    Ineligible,
+    CrossScopeAutoBlocked,
+}
+
+pub(crate) fn promote_learn_pair_if_eligible_with_status(
+    dir: &Path,
+    pair_key: &str,
+    before_surface: &str,
+    after_surface: &str,
+    scope: Option<&LearnPairScope>,
+    threshold: u32,
+    auto_scoped: bool,
+) -> anyhow::Result<LearnPairPromotionStatus> {
     let scope = scope.cloned().unwrap_or_default();
     let mut connection = open_history(dir)?;
     let transaction =
         connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    if let Some(legacy_pair_key) =
+        legacy_pair_key_for_surfaces(pair_key, before_surface, after_surface)
+    {
+        let competing_live_rule: bool = transaction.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM learn_pairs
+                WHERE pair_key != ?1
+                  AND before_surface != ''
+                  AND (legacy_pair_key = ?2 OR pair_key = ?2)
+                  AND promoted = 1
+                  AND ignored = 0
+                  AND tombstoned_at IS NULL
+                  AND binding_invalidated_at IS NULL
+            )",
+            params![pair_key, legacy_pair_key],
+            |row| row.get(0),
+        )?;
+        if competing_live_rule {
+            return Ok(LearnPairPromotionStatus::CrossScopeAutoBlocked);
+        }
+    }
     let changed = transaction.execute(
         "UPDATE learn_pairs
          SET promoted = 1,
@@ -8749,10 +9310,13 @@ pub(crate) fn promote_learn_pair_if_eligible(
                WHERE rule_key = ?1
                  AND proof_eligible = 1
                  AND dictation_origin IS NOT NULL
+                 AND source_kind = 'research_fixture_edit'
+                 AND channel = 'research_fixture'
            ) >= ?8)
            AND promoted = 0
            AND ignored = 0
-           AND tombstoned_at IS NULL",
+           AND tombstoned_at IS NULL
+           AND binding_invalidated_at IS NULL",
         params![
             pair_key,
             before_surface,
@@ -8790,7 +9354,11 @@ pub(crate) fn promote_learn_pair_if_eligible(
         }
     }
     transaction.commit()?;
-    Ok(changed > 0)
+    Ok(if changed > 0 {
+        LearnPairPromotionStatus::Promoted
+    } else {
+        LearnPairPromotionStatus::Ineligible
+    })
 }
 
 pub fn ensure_learn_pair_promoted(
@@ -8799,6 +9367,41 @@ pub fn ensure_learn_pair_promoted(
     before_surface: &str,
     after_surface: &str,
     scope: Option<&LearnPairScope>,
+) -> anyhow::Result<()> {
+    ensure_learn_pair_promoted_with_local_only(
+        dir,
+        pair_key,
+        before_surface,
+        after_surface,
+        scope,
+        false,
+    )
+}
+
+pub(crate) fn ensure_local_only_learn_pair_promoted(
+    dir: &Path,
+    pair_key: &str,
+    before_surface: &str,
+    after_surface: &str,
+    scope: Option<&LearnPairScope>,
+) -> anyhow::Result<()> {
+    ensure_learn_pair_promoted_with_local_only(
+        dir,
+        pair_key,
+        before_surface,
+        after_surface,
+        scope,
+        true,
+    )
+}
+
+fn ensure_learn_pair_promoted_with_local_only(
+    dir: &Path,
+    pair_key: &str,
+    before_surface: &str,
+    after_surface: &str,
+    scope: Option<&LearnPairScope>,
+    local_only: bool,
 ) -> anyhow::Result<()> {
     let scope = scope.ok_or_else(|| anyhow::anyhow!("learn pair scope is required"))?;
     let mut c = open_history(dir)?;
@@ -8811,22 +9414,29 @@ pub fn ensure_learn_pair_promoted(
         )
         .optional()?;
     if let Some(existing) = existing {
+        if existing.is_binding_invalidated() {
+            anyhow::bail!("learn pair mapping binding is invalidated");
+        }
         let existing_scope = LearnPairScope {
-            family: existing.family,
-            mapping_id: existing.mapping_id,
-            browser_host: existing.browser_host,
-            native_bundle: existing.native_bundle,
+            family: existing.family.clone(),
+            mapping_id: existing.mapping_id.clone(),
+            browser_host: existing.browser_host.clone(),
+            native_bundle: existing.native_bundle.clone(),
         };
         if existing_scope != *scope {
             anyhow::bail!("learn pair scope conflicts with the recorded scope");
         }
-        if existing.before_surface != before_surface || existing.after_surface != after_surface {
+        let match_policy = word_rule_match_policy(before_surface, after_surface);
+        if existing.match_policy != match_policy
+            || !learn_pair_alias_matches(&existing, before_surface)
+            || existing.after_surface != after_surface
+        {
             anyhow::bail!("learn pair surface conflicts with the recorded pair key");
         }
     }
     tx.execute(
-        "INSERT INTO learn_pairs (pair_key, before_surface, after_surface, hits, promoted, last_at, family, mapping_id, browser_host, native_bundle, pinned, ignored, manual_scoped)
-         VALUES (?1, ?2, ?3, 3, 1, datetime('now'), ?4, ?5, ?6, ?7, 0, 0, 0)
+        "INSERT INTO learn_pairs (pair_key, before_surface, after_surface, hits, promoted, last_at, family, mapping_id, browser_host, native_bundle, pinned, ignored, manual_scoped, auto_scoped, match_policy, legacy_pair_key)
+         VALUES (?1, ?2, ?3, 3, 1, datetime('now'), ?4, ?5, ?6, ?7, 0, 0, 0, ?10, ?8, ?9)
          ON CONFLICT(pair_key) DO UPDATE SET
            promoted = 1,
            ignored = 0,
@@ -8835,7 +9445,12 @@ pub fn ensure_learn_pair_promoted(
            family = excluded.family,
            mapping_id = excluded.mapping_id,
            browser_host = excluded.browser_host,
-           native_bundle = excluded.native_bundle",
+           native_bundle = excluded.native_bundle,
+           auto_scoped = CASE
+             WHEN ?10 AND learn_pairs.promoted = 0 THEN 1
+             ELSE learn_pairs.auto_scoped
+           END,
+           legacy_pair_key = COALESCE(learn_pairs.legacy_pair_key, excluded.legacy_pair_key)",
         params![
             pair_key,
             before_surface,
@@ -8843,7 +9458,10 @@ pub fn ensure_learn_pair_promoted(
             scope.family,
             scope.mapping_id,
             scope.browser_host,
-            scope.native_bundle
+            scope.native_bundle,
+            word_rule_match_policy(before_surface, after_surface).as_db_str(),
+            legacy_pair_key_for_surfaces(pair_key, before_surface, after_surface),
+            local_only
         ],
     )?;
     let (before, after, manual_scoped, auto_scoped) = tx.query_row(
@@ -8859,7 +9477,9 @@ pub fn ensure_learn_pair_promoted(
             ))
         },
     )?;
-    if is_global_dictionary_word_rule(pair_key, &before, &after, manual_scoped, auto_scoped) {
+    if !local_only
+        && is_global_dictionary_word_rule(pair_key, &before, &after, manual_scoped, auto_scoped)
+    {
         // Explicit confirmation also repairs a missing Settings projection for
         // an already-promoted global rule. The Settings owner applies this
         // source idempotently before conditionally acknowledging this version.
@@ -8873,6 +9493,7 @@ pub fn ensure_learn_pair_promoted(
 pub enum ManualScopedPairStoreError {
     InvalidScope,
     ScopeConflict,
+    BindingInvalidated,
     #[expect(
         dead_code,
         reason = "retain the private storage cause for internal diagnostics while code() exposes only a stable category"
@@ -8885,6 +9506,7 @@ impl ManualScopedPairStoreError {
         match self {
             Self::InvalidScope => "manual_pair_scope_unknown",
             Self::ScopeConflict => "manual_pair_scope_conflict",
+            Self::BindingInvalidated => "manual_pair_binding_invalidated",
             Self::Storage(_) => "manual_pair_save_failed",
         }
     }
@@ -8932,13 +9554,20 @@ pub fn ensure_manual_scoped_learn_pair(
         .map_err(|error| ManualScopedPairStoreError::Storage(error.into()))?
         .unwrap_or(false);
     if let Some(existing) = existing {
+        if existing.is_binding_invalidated() {
+            return Err(ManualScopedPairStoreError::BindingInvalidated);
+        }
         let existing_scope = LearnPairScope {
-            family: existing.family,
-            mapping_id: existing.mapping_id,
-            browser_host: existing.browser_host,
-            native_bundle: existing.native_bundle,
+            family: existing.family.clone(),
+            mapping_id: existing.mapping_id.clone(),
+            browser_host: existing.browser_host.clone(),
+            native_bundle: existing.native_bundle.clone(),
         };
-        if existing.before_surface != before_surface || existing.after_surface != after_surface {
+        let match_policy = word_rule_match_policy(before_surface, after_surface);
+        if existing.match_policy != match_policy
+            || !learn_pair_alias_matches(&existing, before_surface)
+            || existing.after_surface != after_surface
+        {
             return Err(ManualScopedPairStoreError::ScopeConflict);
         }
         // A user may explicitly rebind an existing exact pair only after its
@@ -8949,8 +9578,8 @@ pub fn ensure_manual_scoped_learn_pair(
     }
     let row = tx.query_row(
         &format!(
-            "INSERT INTO learn_pairs (pair_key, before_surface, after_surface, hits, promoted, last_at, family, mapping_id, browser_host, native_bundle, pinned, ignored, manual_scoped)
-         VALUES (?1, ?2, ?3, 0, 1, datetime('now'), ?4, ?5, NULL, ?6, 0, 0, 1)
+            "INSERT INTO learn_pairs (pair_key, before_surface, after_surface, hits, promoted, last_at, family, mapping_id, browser_host, native_bundle, pinned, ignored, manual_scoped, match_policy, legacy_pair_key)
+         VALUES (?1, ?2, ?3, 0, 1, datetime('now'), ?4, ?5, NULL, ?6, 0, 0, 1, ?7, ?8)
          ON CONFLICT(pair_key) DO UPDATE SET
            promoted = 1,
            ignored = 0,
@@ -8961,7 +9590,9 @@ pub fn ensure_manual_scoped_learn_pair(
            browser_host = NULL,
            native_bundle = excluded.native_bundle,
            manual_scoped = 1,
-           auto_scoped = 0
+           auto_scoped = 0,
+           match_policy = excluded.match_policy,
+           legacy_pair_key = COALESCE(learn_pairs.legacy_pair_key, excluded.legacy_pair_key)
          RETURNING {LEARN_PAIR_COLUMNS}"
         ),
         params![
@@ -8970,7 +9601,9 @@ pub fn ensure_manual_scoped_learn_pair(
             after_surface,
             scope.family,
             scope.mapping_id,
-            scope.native_bundle
+            scope.native_bundle,
+            word_rule_match_policy(before_surface, after_surface).as_db_str(),
+            legacy_pair_key_for_surfaces(pair_key, before_surface, after_surface)
         ],
         learn_pair_from_row,
     ).map_err(|error| ManualScopedPairStoreError::Storage(error.into()))?;
@@ -9070,6 +9703,225 @@ pub fn tombstone_learn_pair(dir: &Path, pair_key: &str) -> anyhow::Result<bool> 
     Ok(tombstone_learn_pair_with_observation(dir, pair_key, None)?.0)
 }
 
+pub fn invalidate_word_rule_mapping_bindings(
+    dir: &Path,
+    changes: &[(String, LearnPairBindingInvalidationReason)],
+) -> anyhow::Result<usize> {
+    if changes.is_empty() {
+        return Ok(0);
+    }
+    let mut connection = open_history(dir)?;
+    let transaction =
+        connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let mut changed = 0usize;
+    for (mapping_id, reason) in changes {
+        changed += invalidate_mapping_bound_word_rules(&transaction, mapping_id, *reason)?;
+    }
+    transaction.commit()?;
+    Ok(changed)
+}
+
+pub fn invalidate_missing_word_rule_mapping_bindings(
+    dir: &Path,
+    current_mapping_ids: &[String],
+) -> anyhow::Result<usize> {
+    let current_mapping_ids = current_mapping_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<std::collections::HashSet<_>>();
+    let mut connection = open_history(dir)?;
+    let transaction =
+        connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let missing = {
+        let mut statement = transaction.prepare(
+            "SELECT DISTINCT mapping_id FROM learn_pairs
+             WHERE pair_key LIKE 'word:v2:%'
+               AND mapping_id IS NOT NULL
+               AND binding_invalidated_at IS NULL",
+        )?;
+        let referenced = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        referenced
+            .into_iter()
+            .filter(|mapping_id| !current_mapping_ids.contains(mapping_id.as_str()))
+            .collect::<Vec<_>>()
+    };
+    let mut changed = 0usize;
+    for mapping_id in missing {
+        changed += invalidate_mapping_bound_word_rules(
+            &transaction,
+            &mapping_id,
+            LearnPairBindingInvalidationReason::MissingBindingAtMigration,
+        )?;
+    }
+    transaction.commit()?;
+    Ok(changed)
+}
+
+fn invalidate_mapping_bound_word_rules(
+    transaction: &rusqlite::Transaction<'_>,
+    mapping_id: &str,
+    reason: LearnPairBindingInvalidationReason,
+) -> anyhow::Result<usize> {
+    let rows = {
+        let mut statement = transaction.prepare(
+            "SELECT pair_key, before_surface, promoted, manual_scoped, auto_scoped,
+                    dictionary_pending_action
+             FROM learn_pairs
+             WHERE pair_key LIKE 'word:v2:%'
+               AND mapping_id = ?1
+               AND binding_invalidated_at IS NULL",
+        )?;
+        let rows = statement
+            .query_map([mapping_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, bool>(2)?,
+                    row.get::<_, Option<bool>>(3)?.unwrap_or(false),
+                    row.get::<_, Option<bool>>(4)?.unwrap_or(false),
+                    row.get::<_, String>(5)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows
+    };
+    for (pair_key, before, promoted, manual_scoped, auto_scoped, pending_action) in &rows {
+        transaction.execute(
+            "UPDATE learn_pairs
+             SET binding_invalidated_at = datetime('now'), binding_invalidated_reason = ?2
+             WHERE pair_key = ?1 AND binding_invalidated_at IS NULL",
+            params![pair_key, reason.as_db_str()],
+        )?;
+        if !before.is_empty()
+            && (pending_action == "add" || (!manual_scoped && !auto_scoped && *promoted))
+        {
+            // Replacing a pending Add with Remove reconciles both cases where
+            // Settings never received the source and where its previous save
+            // succeeded but acknowledgement did not. Only this Rule owner is
+            // removed; Manual and Screen owners remain separate.
+            stage_dictionary_effect(transaction, pair_key, DictionaryEffectAction::Remove)?;
+        }
+    }
+    Ok(rows.len())
+}
+
+pub fn rebind_invalidated_word_rule(
+    dir: &Path,
+    pair_key: &str,
+    scope: &LearnPairScope,
+) -> Result<LearnPairRecord, ManualScopedPairStoreError> {
+    if !pair_key.starts_with("word:v2:") || scope.mapping_id.as_deref().is_none_or(str::is_empty) {
+        return Err(ManualScopedPairStoreError::InvalidScope);
+    }
+    let mut connection = open_history(dir).map_err(ManualScopedPairStoreError::Storage)?;
+    let transaction = connection
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|error| ManualScopedPairStoreError::Storage(error.into()))?;
+    let existing = transaction
+        .query_row(
+            &format!("SELECT {LEARN_PAIR_COLUMNS} FROM learn_pairs WHERE pair_key = ?1"),
+            [pair_key],
+            learn_pair_from_row,
+        )
+        .optional()
+        .map_err(|error| ManualScopedPairStoreError::Storage(error.into()))?
+        .ok_or_else(|| ManualScopedPairStoreError::ScopeConflict)?;
+    if !existing.is_binding_invalidated()
+        || !existing.promoted
+        || existing.ignored
+        || existing.tombstoned_at.is_some()
+        || existing.before_surface.is_empty()
+    {
+        return Err(ManualScopedPairStoreError::ScopeConflict);
+    }
+    let match_policy = word_rule_match_policy(&existing.before_surface, &existing.after_surface);
+    if existing.match_policy != match_policy {
+        return Err(ManualScopedPairStoreError::ScopeConflict);
+    }
+    let rebound_key = scoped_word_rule_key(
+        &existing.before_surface,
+        &existing.after_surface,
+        scope,
+        match_policy,
+    );
+    if rebound_key.as_str() == pair_key {
+        transaction
+            .execute(
+                "UPDATE learn_pairs
+                 SET binding_invalidated_at = NULL,
+                     binding_invalidated_reason = NULL,
+                     legacy_pair_key = COALESCE(legacy_pair_key, ?2),
+                     last_at = datetime('now')
+                 WHERE pair_key = ?1
+                   AND binding_invalidated_at IS NOT NULL
+                   AND ignored = 0
+                   AND tombstoned_at IS NULL",
+                params![
+                    pair_key,
+                    legacy_pair_key_for_surfaces(
+                        pair_key,
+                        &existing.before_surface,
+                        &existing.after_surface,
+                    )
+                ],
+            )
+            .map_err(|error| ManualScopedPairStoreError::Storage(error.into()))?;
+    } else {
+        let new_key = rebound_key.as_str();
+        let collision = transaction
+            .query_row(
+                "SELECT 1 FROM learn_pairs WHERE pair_key = ?1",
+                [new_key],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(|error| ManualScopedPairStoreError::Storage(error.into()))?
+            .is_some();
+        if collision {
+            return Err(ManualScopedPairStoreError::ScopeConflict);
+        }
+        transaction
+            .execute(
+                "INSERT INTO learn_pairs (
+                    pair_key, before_surface, after_surface, hits, promoted, last_at,
+                    family, mapping_id, browser_host, native_bundle, pinned, ignored,
+                    manual_scoped, auto_scoped, match_policy, legacy_pair_key
+                 ) VALUES (?1, ?2, ?3, 0, 1, datetime('now'), ?4, ?5, ?6, ?7, 0, 0, ?8, ?9, ?10, ?11)",
+                params![
+                    new_key,
+                    existing.before_surface,
+                    existing.after_surface,
+                    scope.family,
+                    scope.mapping_id,
+                    scope.browser_host,
+                    scope.native_bundle,
+                    existing.manual_scoped,
+                    existing.auto_scoped,
+                    match_policy.as_db_str(),
+                    legacy_pair_key_for_surfaces(
+                        new_key,
+                        &existing.before_surface,
+                        &existing.after_surface,
+                    ),
+                ],
+            )
+            .map_err(|error| ManualScopedPairStoreError::Storage(error.into()))?;
+    }
+    let rebound = transaction
+        .query_row(
+            &format!("SELECT {LEARN_PAIR_COLUMNS} FROM learn_pairs WHERE pair_key = ?1"),
+            [rebound_key.as_str()],
+            learn_pair_from_row,
+        )
+        .map_err(|error| ManualScopedPairStoreError::Storage(error.into()))?;
+    transaction
+        .commit()
+        .map_err(|error| ManualScopedPairStoreError::Storage(error.into()))?;
+    Ok(rebound)
+}
+
 #[cfg(any(test, feature = "research-harness"))]
 pub(crate) fn tombstone_research_learn_pair(
     dir: &Path,
@@ -9103,7 +9955,7 @@ pub fn bump_learn_pairs_used(dir: &Path, pair_keys: &[String]) -> anyhow::Result
     }
     let c = open_history(dir)?;
     let mut statement =
-        c.prepare("UPDATE learn_pairs SET last_used_at = datetime('now') WHERE pair_key = ?1")?;
+        c.prepare("UPDATE learn_pairs SET last_used_at = datetime('now'), replacement_runs = replacement_runs + 1 WHERE pair_key = ?1 AND promoted = 1 AND ignored = 0 AND tombstoned_at IS NULL AND binding_invalidated_at IS NULL")?;
     for key in pair_keys {
         statement.execute([key])?;
     }
@@ -9117,6 +9969,596 @@ pub fn list_learn_pairs(dir: &Path) -> anyhow::Result<Vec<LearnPairRecord>> {
     ))?;
     let rows = statement.query_map([], learn_pair_from_row)?;
     rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LearnPairTransferExpectedRow {
+    pub(crate) pair_key: String,
+    pub(crate) before_surface: String,
+    pub(crate) after_surface: String,
+    pub(crate) scope: LearnPairScope,
+    pub(crate) match_policy: LearnPairMatchPolicy,
+    pub(crate) promoted: bool,
+    pub(crate) ignored: bool,
+    pub(crate) pinned: bool,
+    pub(crate) tombstoned: bool,
+    pub(crate) binding_invalidated: bool,
+    pub(crate) manual_scoped: bool,
+    pub(crate) auto_scoped: bool,
+}
+
+impl From<&LearnPairRecord> for LearnPairTransferExpectedRow {
+    fn from(row: &LearnPairRecord) -> Self {
+        Self {
+            pair_key: row.pair_key.clone(),
+            before_surface: row.before_surface.clone(),
+            after_surface: row.after_surface.clone(),
+            scope: LearnPairScope {
+                family: row.family.clone(),
+                mapping_id: row.mapping_id.clone(),
+                browser_host: row.browser_host.clone(),
+                native_bundle: row.native_bundle.clone(),
+            },
+            match_policy: row.match_policy,
+            promoted: row.promoted,
+            ignored: row.ignored,
+            pinned: row.pinned,
+            tombstoned: row.tombstoned_at.is_some(),
+            binding_invalidated: row.binding_invalidated_at.is_some(),
+            manual_scoped: row.manual_scoped,
+            auto_scoped: row.auto_scoped,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LearnPairTransferIntent {
+    /// Destination key recomputed with the destination mapping identity.
+    pub(crate) pair_key: String,
+    pub(crate) before_surface: String,
+    pub(crate) after_surface: String,
+    pub(crate) scope: LearnPairScope,
+    pub(crate) match_policy: LearnPairMatchPolicy,
+    pub(crate) manual_scoped: bool,
+    /// Full relevant conflict snapshot collected during preview. Usage
+    /// counters and timestamps are intentionally absent.
+    pub(crate) expected_rows: Vec<LearnPairTransferExpectedRow>,
+    pub(crate) replace_conflicts: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum LearnPairTransferOutcome {
+    Inserted,
+    Replaced { pair_keys: Vec<String> },
+    AlreadyPresent,
+    Conflict,
+    Blocked,
+    StalePreview,
+}
+
+fn transfer_scope_overlaps(left: &LearnPairScope, right: &LearnPairScope) -> bool {
+    if (left.browser_host.is_some() && right.native_bundle.is_some())
+        || (right.browser_host.is_some() && left.native_bundle.is_some())
+    {
+        return false;
+    }
+    [
+        (left.family.as_deref(), right.family.as_deref()),
+        (left.mapping_id.as_deref(), right.mapping_id.as_deref()),
+        (left.browser_host.as_deref(), right.browser_host.as_deref()),
+        (
+            left.native_bundle.as_deref(),
+            right.native_bundle.as_deref(),
+        ),
+    ]
+    .into_iter()
+    .all(|(left, right)| match (left, right) {
+        (Some(left), Some(right)) => left == right,
+        _ => true,
+    })
+}
+
+fn transfer_alias_domains_intersect(
+    before_surface: &str,
+    match_policy: LearnPairMatchPolicy,
+    row: &LearnPairRecord,
+) -> bool {
+    match (match_policy, row.match_policy) {
+        (LearnPairMatchPolicy::Exact, LearnPairMatchPolicy::Exact) => {
+            before_surface == row.before_surface
+        }
+        _ => before_surface.eq_ignore_ascii_case(&row.before_surface),
+    }
+}
+
+fn transfer_alias_matches(
+    before_surface: &str,
+    match_policy: LearnPairMatchPolicy,
+    row: &LearnPairRecord,
+) -> bool {
+    match match_policy {
+        LearnPairMatchPolicy::Exact => before_surface == row.before_surface,
+        LearnPairMatchPolicy::IgnoreCase => {
+            before_surface.eq_ignore_ascii_case(&row.before_surface)
+        }
+    }
+}
+
+fn transfer_pair_key_is_valid(
+    pair_key: &str,
+    before_surface: &str,
+    after_surface: &str,
+    scope: &LearnPairScope,
+    match_policy: LearnPairMatchPolicy,
+) -> bool {
+    !before_surface.trim().is_empty()
+        && !after_surface.trim().is_empty()
+        && scoped_word_rule_key(before_surface, after_surface, scope, match_policy).as_str()
+            == pair_key
+}
+
+fn transfer_conflict_snapshot(
+    rows: &[LearnPairRecord],
+    pair_key: &str,
+    before_surface: &str,
+    after_surface: &str,
+    scope: &LearnPairScope,
+    match_policy: LearnPairMatchPolicy,
+) -> Vec<LearnPairTransferExpectedRow> {
+    let mut expected = rows
+        .iter()
+        .filter(|row| {
+            let row_scope = LearnPairScope {
+                family: row.family.clone(),
+                mapping_id: row.mapping_id.clone(),
+                browser_host: row.browser_host.clone(),
+                native_bundle: row.native_bundle.clone(),
+            };
+            let exact_marker = transfer_alias_matches(before_surface, match_policy, row)
+                && row.after_surface == after_surface
+                && row_scope == *scope
+                && row.match_policy == match_policy
+                && (row.ignored || row.tombstoned_at.is_some() || row.is_binding_invalidated());
+            row.pair_key == pair_key
+                || exact_marker
+                || (is_word_rule_candidate(row)
+                    && transfer_alias_domains_intersect(before_surface, match_policy, row)
+                    && transfer_scope_overlaps(scope, &row_scope)
+                    && (row.is_live_promoted()
+                        || (row.after_surface != after_surface
+                            && !row.ignored
+                            && row.tombstoned_at.is_none()
+                            && !row.is_binding_invalidated()))
+                    && !row.ignored
+                    && row.tombstoned_at.is_none()
+                    && !row.is_binding_invalidated())
+        })
+        .map(LearnPairTransferExpectedRow::from)
+        .collect::<Vec<_>>();
+    expected.sort_by(|left, right| left.pair_key.cmp(&right.pair_key));
+    expected
+}
+
+/// Capture only rows that can collide with this imported alias at its target
+/// scope. The resulting snapshot is suitable for preview/apply revalidation;
+/// unrelated learning counters and use timestamps are never part of it.
+pub(crate) fn learn_pair_transfer_conflict_snapshot(
+    rows: &[LearnPairRecord],
+    pair_key: &str,
+    before_surface: &str,
+    after_surface: &str,
+    scope: &LearnPairScope,
+    match_policy: LearnPairMatchPolicy,
+) -> anyhow::Result<Vec<LearnPairTransferExpectedRow>> {
+    if !transfer_pair_key_is_valid(pair_key, before_surface, after_surface, scope, match_policy) {
+        anyhow::bail!("invalid transferred word rule identity");
+    }
+    Ok(transfer_conflict_snapshot(
+        rows,
+        pair_key,
+        before_surface,
+        after_surface,
+        scope,
+        match_policy,
+    ))
+}
+
+/// Check previewed pair intents against a previously read pair snapshot.
+/// This is a pure preflight used before the separate Settings store is written;
+/// `apply_learn_pair_transfers` still repeats the comparison in its IMMEDIATE
+/// transaction to protect the actual SQLite mutation.
+pub(crate) fn learn_pair_transfer_intents_match_snapshot(
+    rows: &[LearnPairRecord],
+    intents: &[LearnPairTransferIntent],
+) -> anyhow::Result<bool> {
+    let mut seen_keys = std::collections::HashSet::new();
+    for intent in intents {
+        if !seen_keys.insert(intent.pair_key.as_str()) {
+            anyhow::bail!("duplicate transferred word rule identity");
+        }
+        if !transfer_pair_key_is_valid(
+            &intent.pair_key,
+            &intent.before_surface,
+            &intent.after_surface,
+            &intent.scope,
+            intent.match_policy,
+        ) {
+            anyhow::bail!("invalid transferred word rule identity");
+        }
+        let current = transfer_conflict_snapshot(
+            rows,
+            &intent.pair_key,
+            &intent.before_surface,
+            &intent.after_surface,
+            &intent.scope,
+            intent.match_policy,
+        );
+        let mut expected = intent.expected_rows.clone();
+        expected.sort_by(|left, right| left.pair_key.cmp(&right.pair_key));
+        if current != expected {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Apply a set of already previewed word-pair imports in one SQLite
+/// `IMMEDIATE` transaction. Each row rechecks its complete conflict set so a
+/// concurrent add/forget/confirm cannot be overwritten by a stale preview.
+pub(crate) fn apply_learn_pair_transfers(
+    dir: &Path,
+    intents: &[LearnPairTransferIntent],
+) -> anyhow::Result<Vec<LearnPairTransferOutcome>> {
+    if intents.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut seen_keys = std::collections::HashSet::new();
+    if intents
+        .iter()
+        .any(|intent| !seen_keys.insert(intent.pair_key.as_str()))
+    {
+        anyhow::bail!("duplicate transferred word rule identity");
+    }
+    for intent in intents {
+        if !transfer_pair_key_is_valid(
+            &intent.pair_key,
+            &intent.before_surface,
+            &intent.after_surface,
+            &intent.scope,
+            intent.match_policy,
+        ) {
+            anyhow::bail!("invalid transferred word rule identity");
+        }
+    }
+
+    let mut connection = open_history(dir)?;
+    let transaction =
+        connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let mut statement = transaction.prepare(&format!(
+        "SELECT {LEARN_PAIR_COLUMNS} FROM learn_pairs ORDER BY pair_key ASC"
+    ))?;
+    let initial_rows = statement
+        .query_map([], learn_pair_from_row)?
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(statement);
+    let mut rows = initial_rows.clone();
+    let mut outcomes = Vec::with_capacity(intents.len());
+    let mut batch_imported_keys = std::collections::HashSet::<String>::new();
+
+    for intent in intents {
+        let initial = transfer_conflict_snapshot(
+            &initial_rows,
+            &intent.pair_key,
+            &intent.before_surface,
+            &intent.after_surface,
+            &intent.scope,
+            intent.match_policy,
+        );
+        let mut expected = intent.expected_rows.clone();
+        expected.sort_by(|left, right| left.pair_key.cmp(&right.pair_key));
+        if initial != expected {
+            outcomes.push(LearnPairTransferOutcome::StalePreview);
+            continue;
+        }
+
+        let current = transfer_conflict_snapshot(
+            &rows,
+            &intent.pair_key,
+            &intent.before_surface,
+            &intent.after_surface,
+            &intent.scope,
+            intent.match_policy,
+        );
+        let matching_rows = current
+            .iter()
+            .filter_map(|snapshot| {
+                rows.iter()
+                    .find(|row| row.pair_key == snapshot.pair_key)
+                    .cloned()
+            })
+            .collect::<Vec<_>>();
+        if matching_rows
+            .iter()
+            .any(|row| row.ignored || row.tombstoned_at.is_some() || row.is_binding_invalidated())
+        {
+            outcomes.push(LearnPairTransferOutcome::Blocked);
+            continue;
+        }
+
+        let row_scope = |row: &LearnPairRecord| LearnPairScope {
+            family: row.family.clone(),
+            mapping_id: row.mapping_id.clone(),
+            browser_host: row.browser_host.clone(),
+            native_bundle: row.native_bundle.clone(),
+        };
+        let key_collision_mismatch = matching_rows.iter().any(|row| {
+            row.pair_key == intent.pair_key
+                && (!transfer_alias_matches(&intent.before_surface, intent.match_policy, row)
+                    || row.after_surface != intent.after_surface
+                    || row.match_policy != intent.match_policy
+                    || row_scope(row) != intent.scope)
+        });
+        if key_collision_mismatch
+            || matching_rows
+                .iter()
+                .any(|row| row.pair_key == intent.pair_key && !row.is_live_promoted())
+        {
+            outcomes.push(LearnPairTransferOutcome::Blocked);
+            continue;
+        }
+
+        let candidate_scope = &intent.scope;
+        let exact_present = matching_rows.iter().any(|row| {
+            row.pair_key == intent.pair_key
+                && transfer_alias_matches(&intent.before_surface, intent.match_policy, row)
+                && row.after_surface == intent.after_surface
+                && row.match_policy == intent.match_policy
+                && row_scope(row) == *candidate_scope
+                && row.is_live_promoted()
+        });
+        let equivalent_present = matching_rows.iter().any(|row| {
+            row.is_live_promoted()
+                && row.after_surface == intent.after_surface
+                && row.match_policy == intent.match_policy
+                && transfer_alias_domains_intersect(
+                    &intent.before_surface,
+                    intent.match_policy,
+                    row,
+                )
+                && row_scope(row) == *candidate_scope
+        });
+        let conflicts = matching_rows
+            .iter()
+            .filter(|row| {
+                let compatible_batch_policy_sibling = batch_imported_keys.contains(&row.pair_key)
+                    && row.is_live_promoted()
+                    && row.after_surface == intent.after_surface
+                    && row.match_policy != intent.match_policy
+                    && transfer_alias_domains_intersect(
+                        &intent.before_surface,
+                        intent.match_policy,
+                        row,
+                    )
+                    && row_scope(row) == intent.scope;
+                if compatible_batch_policy_sibling {
+                    return false;
+                }
+                row.after_surface != intent.after_surface
+                    || row.match_policy != intent.match_policy
+                    || row.pair_key == intent.pair_key
+                        && (!transfer_alias_matches(
+                            &intent.before_surface,
+                            intent.match_policy,
+                            row,
+                        ) || row.match_policy != intent.match_policy
+                            || row_scope(row) != intent.scope)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let equivalent_scope_rows = matching_rows
+            .iter()
+            .filter(|row| {
+                row.is_live_promoted()
+                    && row.after_surface == intent.after_surface
+                    && row.match_policy == intent.match_policy
+                    && transfer_alias_domains_intersect(
+                        &intent.before_surface,
+                        intent.match_policy,
+                        row,
+                    )
+                    && row_scope(row) == *candidate_scope
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let needs_localization = equivalent_scope_rows
+            .iter()
+            .any(|row| row.is_provider_egress_eligible_word_pair());
+
+        if (exact_present || equivalent_present) && conflicts.is_empty() && !needs_localization {
+            outcomes.push(LearnPairTransferOutcome::AlreadyPresent);
+            continue;
+        }
+        if conflicts
+            .iter()
+            .any(|row| !row.is_live_promoted() || row_scope(row) != *candidate_scope)
+        {
+            outcomes.push(LearnPairTransferOutcome::Blocked);
+            continue;
+        }
+        if conflicts.iter().any(|row| row.pair_key == intent.pair_key) {
+            // A key/surface mismatch cannot be safely replaced in place:
+            // pending dictionary effects store only the key and read the word
+            // from the current row, so rewriting it would leave an old owner.
+            outcomes.push(LearnPairTransferOutcome::Blocked);
+            continue;
+        }
+        if !conflicts.is_empty() && !intent.replace_conflicts {
+            outcomes.push(LearnPairTransferOutcome::Conflict);
+            continue;
+        }
+
+        let replaceable = conflicts
+            .iter()
+            .all(|row| row.is_live_promoted() && row_scope(row) == *candidate_scope);
+        if !conflicts.is_empty() && !replaceable {
+            outcomes.push(LearnPairTransferOutcome::Blocked);
+            continue;
+        }
+
+        let mut replaced_keys = Vec::new();
+        let mut inherited_pin = false;
+        for row in conflicts {
+            inherited_pin |= row.pinned;
+            let changed = transaction.execute(
+                "UPDATE learn_pairs
+                 SET ignored = 1,
+                     tombstoned_at = COALESCE(tombstoned_at, datetime('now')),
+                     last_at = datetime('now')
+                 WHERE pair_key = ?1
+                   AND promoted = 1
+                   AND ignored = 0
+                   AND tombstoned_at IS NULL
+                   AND binding_invalidated_at IS NULL",
+                [&row.pair_key],
+            )?;
+            if changed != 1 {
+                anyhow::bail!("learn pair changed during transfer replacement");
+            }
+            if is_global_dictionary_word_rule(
+                &row.pair_key,
+                &row.before_surface,
+                &row.after_surface,
+                row.manual_scoped,
+                row.auto_scoped,
+            ) {
+                stage_dictionary_effect(
+                    &transaction,
+                    &row.pair_key,
+                    DictionaryEffectAction::Remove,
+                )?;
+            }
+            if let Some(stored) = rows
+                .iter_mut()
+                .find(|stored| stored.pair_key == row.pair_key)
+            {
+                stored.ignored = true;
+                stored.tombstoned_at = Some("transfer_replaced".into());
+            }
+            replaced_keys.push(row.pair_key.clone());
+        }
+
+        if exact_present || equivalent_present {
+            if needs_localization {
+                if !intent.replace_conflicts {
+                    outcomes.push(LearnPairTransferOutcome::Conflict);
+                    continue;
+                }
+                for row in equivalent_scope_rows
+                    .iter()
+                    .filter(|row| row.is_provider_egress_eligible_word_pair())
+                {
+                    let changed = transaction.execute(
+                        "UPDATE learn_pairs
+                         SET auto_scoped = 1, last_at = datetime('now')
+                         WHERE pair_key = ?1
+                           AND promoted = 1
+                           AND ignored = 0
+                           AND tombstoned_at IS NULL
+                           AND binding_invalidated_at IS NULL
+                           AND COALESCE(manual_scoped, 0) = 0
+                           AND COALESCE(auto_scoped, 0) = 0",
+                        [&row.pair_key],
+                    )?;
+                    if changed != 1 {
+                        anyhow::bail!("learn pair changed during transfer localization");
+                    }
+                    stage_dictionary_effect(
+                        &transaction,
+                        &row.pair_key,
+                        DictionaryEffectAction::Remove,
+                    )?;
+                    if let Some(stored) = rows
+                        .iter_mut()
+                        .find(|stored| stored.pair_key == row.pair_key)
+                    {
+                        stored.auto_scoped = true;
+                    }
+                    replaced_keys.push(row.pair_key.clone());
+                }
+            }
+            if replaced_keys.is_empty() {
+                outcomes.push(LearnPairTransferOutcome::AlreadyPresent);
+            } else {
+                outcomes.push(LearnPairTransferOutcome::Replaced {
+                    pair_keys: replaced_keys,
+                });
+            }
+            continue;
+        }
+
+        let legacy_pair_key = legacy_pair_key_for_surfaces(
+            &intent.pair_key,
+            &intent.before_surface,
+            &intent.after_surface,
+        );
+        transaction.execute(
+            "INSERT INTO learn_pairs (
+                pair_key, before_surface, after_surface, hits, promoted, last_at,
+                family, mapping_id, browser_host, native_bundle, pinned, tombstoned_at,
+                ignored, manual_scoped, auto_scoped, match_policy, legacy_pair_key
+             ) VALUES (
+                ?1, ?2, ?3, 0, 1, datetime('now'), ?4, ?5, ?6, ?7, ?8, NULL,
+                0, ?9, 1, ?10, ?11
+             )",
+            params![
+                intent.pair_key,
+                intent.before_surface,
+                intent.after_surface,
+                intent.scope.family,
+                intent.scope.mapping_id,
+                intent.scope.browser_host,
+                intent.scope.native_bundle,
+                inherited_pin,
+                intent.manual_scoped,
+                intent.match_policy.as_db_str(),
+                legacy_pair_key,
+            ],
+        )?;
+        rows.push(LearnPairRecord {
+            pair_key: intent.pair_key.clone(),
+            before_surface: intent.before_surface.clone(),
+            after_surface: intent.after_surface.clone(),
+            hits: 0,
+            promoted: true,
+            last_at: String::new(),
+            family: intent.scope.family.clone(),
+            mapping_id: intent.scope.mapping_id.clone(),
+            browser_host: intent.scope.browser_host.clone(),
+            native_bundle: intent.scope.native_bundle.clone(),
+            last_used_at: None,
+            pinned: inherited_pin,
+            tombstoned_at: None,
+            ignored: false,
+            promote_hits: 0,
+            manual_scoped: intent.manual_scoped,
+            auto_scoped: true,
+            match_policy: intent.match_policy,
+            binding_invalidated_at: None,
+            binding_invalidated_reason: None,
+            replacement_runs: 0,
+        });
+        batch_imported_keys.insert(intent.pair_key.clone());
+        if replaced_keys.is_empty() {
+            outcomes.push(LearnPairTransferOutcome::Inserted);
+        } else {
+            outcomes.push(LearnPairTransferOutcome::Replaced {
+                pair_keys: replaced_keys,
+            });
+        }
+    }
+
+    transaction.commit()?;
+    Ok(outcomes)
 }
 
 /// Application allocation limits for the complete, non-paged Settings audit.
@@ -9151,7 +10593,7 @@ pub(crate) fn list_learn_pairs_for_audit(
             });
         }
         // SQLite may materialize its current row. No owned String/row copy is made before admission.
-        for index in [0_usize, 1, 2, 5, 6, 7, 8, 9, 10, 12] {
+        for index in [0_usize, 1, 2, 5, 6, 7, 8, 9, 10, 12, 16, 17, 18] {
             let size = match row.get_ref(index).map_err(|_| AuditPairReadError::Store)? {
                 ValueRef::Text(text) => text.len(),
                 ValueRef::Null => 0,
@@ -9282,6 +10724,746 @@ pub fn delete_style_draft(dir: &Path, draft_key: &str) -> anyhow::Result<bool> {
     Ok(c.changes() > 0)
 }
 
+const WRITING_PREFERENCE_WINDOW_MS: u64 = 14 * 24 * 60 * 60 * 1_000;
+const MAX_WRITING_PREFERENCE_EVIDENCE_ROWS: i64 = 256;
+
+fn json_enum_string<T: Serialize>(value: &T) -> anyhow::Result<String> {
+    serde_json::to_value(value)?
+        .as_str()
+        .map(str::to_owned)
+        .ok_or_else(|| anyhow::anyhow!("preference enum did not serialize as a string"))
+}
+
+fn enum_from_database<T: serde::de::DeserializeOwned>(
+    value: &str,
+    column: usize,
+) -> rusqlite::Result<T> {
+    serde_json::from_value(serde_json::Value::String(value.to_owned())).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            column,
+            rusqlite::types::Type::Text,
+            Box::new(error),
+        )
+    })
+}
+
+fn is_sha256_fingerprint(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn preference_evidence_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<WritingPreferenceEvidenceRecord> {
+    let task_id: String = row.get(5)?;
+    let dimension: String = row.get(6)?;
+    let value: String = row.get(7)?;
+    Ok(WritingPreferenceEvidenceRecord {
+        source_history_id: row.get(0)?,
+        source_revision_id: row.get(1)?,
+        mapping_id: row.get(2)?,
+        mapping_identity_fingerprint: row.get(3)?,
+        mapping_revision: row.get::<_, i64>(4)?.max(0) as u64,
+        task_id: enum_from_database(&task_id, 5)?,
+        dimension: enum_from_database(&dimension, 6)?,
+        value: enum_from_database(&value, 7)?,
+        origin_id: row.get(8)?,
+        content_fingerprint: row.get(9)?,
+        template_family_fingerprint: row.get(10)?,
+        occurred_at_ms: row.get::<_, i64>(11)?.max(0) as u64,
+        natural_day: row.get(12)?,
+        editor_session_id: row.get(13)?,
+        generation: row.get::<_, i64>(14)?.max(0) as u64,
+        eligible: row.get::<_, i64>(15)? != 0,
+    })
+}
+
+fn preference_decision_from_database(
+    value: &str,
+) -> anyhow::Result<WritingPreferenceDraftDecision> {
+    match value {
+        "dismissed" => Ok(WritingPreferenceDraftDecision::Dismissed),
+        "approved" => Ok(WritingPreferenceDraftDecision::Approved),
+        other => anyhow::bail!("unknown writing preference decision: {other}"),
+    }
+}
+
+fn preference_decision_to_database(value: WritingPreferenceDraftDecision) -> &'static str {
+    match value {
+        WritingPreferenceDraftDecision::Dismissed => "dismissed",
+        WritingPreferenceDraftDecision::Approved => "approved",
+    }
+}
+
+fn prune_writing_preference_metadata(
+    connection: &Connection,
+    now_ms: u64,
+) -> anyhow::Result<(usize, usize)> {
+    let cutoff = now_ms.saturating_sub(WRITING_PREFERENCE_WINDOW_MS) as i64;
+    let current = now_ms.min(i64::MAX as u64) as i64;
+    let evidence_deleted = connection.execute(
+        "DELETE FROM writing_preference_evidence
+         WHERE occurred_at_ms < ?1
+            OR NOT EXISTS (
+                SELECT 1 FROM dictations d
+                WHERE d.id = writing_preference_evidence.source_history_id
+                  AND CAST(strftime('%s', d.created_at) AS INTEGER) * 1000
+                      BETWEEN ?1 AND ?2
+            )",
+        params![cutoff, current],
+    )?;
+    let decisions_deleted = connection.execute(
+        "DELETE FROM writing_preference_draft_decisions WHERE decided_at_ms < ?1",
+        [cutoff],
+    )?;
+    Ok((evidence_deleted, decisions_deleted))
+}
+
+fn history_revision_is_latest_on_connection(
+    connection: &Connection,
+    source_history_id: i64,
+    source_revision_id: i64,
+    origin_id: &str,
+    required_reason: Option<&str>,
+) -> anyhow::Result<bool> {
+    Ok(connection.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM dictations d
+             JOIN dictation_revisions r ON r.dictation_id = d.id
+             WHERE d.id = ?1 AND d.transaction_id = ?2 AND r.revision_id = ?3
+               AND r.revision_id = (SELECT MAX(latest.revision_id)
+                                    FROM dictation_revisions latest
+                                    WHERE latest.dictation_id = d.id)
+               AND (?4 IS NULL OR r.revision_reason = ?4)
+         )",
+        params![
+            source_history_id,
+            origin_id,
+            source_revision_id,
+            required_reason
+        ],
+        |row| row.get::<_, bool>(0),
+    )?)
+}
+
+fn history_revision_is_first_edit_of_original_delivery_on_connection(
+    connection: &Connection,
+    source_history_id: i64,
+    source_revision_id: i64,
+) -> anyhow::Result<bool> {
+    Ok(connection.query_row(
+        "SELECT EXISTS (
+             SELECT 1 FROM dictation_revisions current
+             WHERE current.dictation_id = ?1
+               AND current.revision_id = ?2
+               AND current.revision_reason = 'manual_edit'
+               AND NOT EXISTS (
+                   SELECT 1 FROM dictation_revisions prior
+                   WHERE prior.dictation_id = current.dictation_id
+                     AND prior.revision_id < current.revision_id
+               )
+         )",
+        params![source_history_id, source_revision_id],
+        |row| row.get::<_, bool>(0),
+    )?)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn history_preference_source_matches_on_connection(
+    connection: &Connection,
+    source_history_id: i64,
+    source_revision_id: i64,
+    origin_id: &str,
+    mapping_id: &str,
+    mapping_identity_fingerprint: &str,
+    mapping_revision: u64,
+    task_id: crate::context::WritingTaskId,
+) -> anyhow::Result<bool> {
+    let source = connection
+        .query_row(
+            "SELECT d.transaction_id, d.context_profile_id, d.context_mapping_identity,
+                    d.context_policy_json,
+                    r.revision_reason,
+                    r.revision_id = (SELECT MAX(latest.revision_id)
+                                    FROM dictation_revisions latest
+                                    WHERE latest.dictation_id = d.id)
+             FROM dictations d
+             JOIN dictation_revisions r ON r.dictation_id = d.id
+             WHERE d.id = ?1 AND r.revision_id = ?2",
+            params![source_history_id, source_revision_id],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, bool>(5)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        stored_origin,
+        stored_profile,
+        stored_mapping_identity,
+        policy_json,
+        reason,
+        is_latest,
+    )) = source
+    else {
+        return Ok(false);
+    };
+    if stored_origin.as_deref() != Some(origin_id)
+        || stored_profile.as_deref() != Some(format!("user.{mapping_id}").as_str())
+        || stored_mapping_identity.as_deref() != Some(mapping_identity_fingerprint)
+        || reason != "manual_edit"
+        || !is_latest
+    {
+        return Ok(false);
+    }
+    let Some(policy_json) = policy_json else {
+        return Ok(false);
+    };
+    let policy: crate::context::ContextPolicy = serde_json::from_str(&policy_json)?;
+    let Some(provenance) = policy.history_preference_provenance.as_ref() else {
+        return Ok(false);
+    };
+    Ok(provenance.version == 1
+        && provenance.task_id == Some(task_id)
+        && provenance.mapping_preference_revision == Some(mapping_revision))
+}
+
+/// Compare edited text against the transaction's original material and prior
+/// revisions without returning any of that text to the caller.
+pub(crate) fn history_text_matches_existing_source(
+    dir: &Path,
+    source_history_id: i64,
+    source_revision_id: i64,
+    edited_text: &str,
+    dimension: crate::context::WritingPreferenceDimension,
+    value: crate::context::WritingPreferenceValue,
+) -> anyhow::Result<bool> {
+    let connection = open_history(dir)?;
+    let normalized = edited_text.trim();
+    let mut statement = connection.prepare(
+        "SELECT source_text FROM (
+             SELECT d.raw_text AS source_text FROM dictations d WHERE d.id = ?1
+             UNION ALL SELECT d.asr_text FROM dictations d WHERE d.id = ?1
+             UNION ALL SELECT d.provider_cleaned_candidate FROM dictations d WHERE d.id = ?1
+             UNION ALL SELECT d.cleanup_rejected_candidate FROM dictations d WHERE d.id = ?1
+             UNION ALL SELECT d.final_text FROM dictations d WHERE d.id = ?1
+             UNION ALL SELECT r.final_text FROM dictation_revisions r
+                 WHERE r.dictation_id = ?1 AND r.revision_id <> ?2
+         ) WHERE source_text IS NOT NULL AND length(CAST(source_text AS BLOB)) <= ?3",
+    )?;
+    let mut rows = statement.query(params![
+        source_history_id,
+        source_revision_id,
+        crate::preference_shadow::MAX_HISTORY_PREFERENCE_TEXT_BYTES as i64
+    ])?;
+    while let Some(row) = rows.next()? {
+        let source = row.get::<_, String>(0)?;
+        if source.trim() == normalized {
+            return Ok(true);
+        }
+        if matches!(
+            crate::preference_shadow::source_slot_match(&source, normalized, dimension, value,),
+            crate::preference_shadow::SourceSlotAlignment::AlreadyPresent
+                | crate::preference_shadow::SourceSlotAlignment::Ambiguous
+        ) {
+            // A prior version may have had this feature in the same slot even
+            // if the rest of the text changed. Ambiguous alignment is also a
+            // reason to abstain; this function returns only a compare result.
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Replace one transaction's current weak edit evidence. `None` turns any
+/// previous eligible row into a hash-free origin watermark so revisions,
+/// reversals, or retries cannot count the same dictation twice.
+pub(crate) fn replace_writing_preference_evidence(
+    dir: &Path,
+    source_history_id: i64,
+    source_revision_id: i64,
+    origin_id: &str,
+    input: Option<&WritingPreferenceEvidenceInput>,
+) -> anyhow::Result<WritingPreferenceEvidenceWrite> {
+    let now_ms = now_epoch_millis();
+    let mut connection = open_history(dir)?;
+    let transaction =
+        connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    prune_writing_preference_metadata(&transaction, now_ms)?;
+    if source_history_id <= 0
+        || source_revision_id <= 0
+        || origin_id.trim().is_empty()
+        || origin_id.len() > 256
+        || now_ms > i64::MAX as u64
+    {
+        transaction.commit()?;
+        return Ok(WritingPreferenceEvidenceWrite::RejectedSource);
+    }
+
+    let Some(input) = input else {
+        if !history_revision_is_latest_on_connection(
+            &transaction,
+            source_history_id,
+            source_revision_id,
+            origin_id,
+            Some("manual_edit"),
+        )? {
+            transaction.commit()?;
+            return Ok(WritingPreferenceEvidenceWrite::RejectedSource);
+        }
+        transaction.execute(
+            "UPDATE writing_preference_evidence
+             SET source_revision_id = ?1, content_fingerprint = '',
+                 template_family_fingerprint = NULL, editor_session_id = '',
+                 occurred_at_ms = ?2,
+                 natural_day = '', eligible = 0
+             WHERE source_history_id = ?3 AND origin_id = ?4
+               AND source_revision_id <= ?1",
+            params![
+                source_revision_id,
+                now_ms as i64,
+                source_history_id,
+                origin_id
+            ],
+        )?;
+        let changed = transaction.changes() > 0;
+        transaction.commit()?;
+        return Ok(if changed {
+            WritingPreferenceEvidenceWrite::Replaced
+        } else {
+            WritingPreferenceEvidenceWrite::Duplicate
+        });
+    };
+
+    let source_day_is_current = transaction
+        .query_row(
+            "SELECT COALESCE(
+             CAST(strftime('%s', d.created_at) AS INTEGER) * 1000
+                 BETWEEN ?1 AND ?2
+                 AND date(d.created_at, 'localtime') = ?3,
+             0
+         )
+         FROM dictations d WHERE d.id = ?4",
+            params![
+                now_ms.saturating_sub(WRITING_PREFERENCE_WINDOW_MS) as i64,
+                now_ms as i64,
+                input.natural_day,
+                source_history_id
+            ],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?
+        .is_some_and(|matches| matches != 0);
+    let valid_input = input.source_history_id == source_history_id
+        && input.source_revision_id == source_revision_id
+        && input.origin_id == origin_id
+        && !input.mapping_id.trim().is_empty()
+        && input.mapping_id.len() <= 256
+        && !input.mapping_identity_fingerprint.trim().is_empty()
+        && input.mapping_identity_fingerprint.len() <= 256
+        && input
+            .mapping_identity_fingerprint
+            .starts_with("mapping:v1:")
+        && input.mapping_revision <= i64::MAX as u64
+        && input.occurred_at_ms <= i64::MAX as u64
+        && input.source_history_id > 0
+        && input.source_revision_id > 0
+        && !input.origin_id.trim().is_empty()
+        && input.origin_id.len() <= 256
+        && is_sha256_fingerprint(&input.content_fingerprint)
+        && input
+            .template_family_fingerprint
+            .as_deref()
+            .is_none_or(is_sha256_fingerprint)
+        && !input.editor_session_id.trim().is_empty()
+        && input.editor_session_id.len() <= 128
+        && input.natural_day.len() == 10
+        && input.occurred_at_ms <= now_epoch_millis().saturating_add(60_000)
+        && input.occurred_at_ms >= now_ms.saturating_sub(WRITING_PREFERENCE_WINDOW_MS)
+        && source_day_is_current
+        && history_revision_is_first_edit_of_original_delivery_on_connection(
+            &transaction,
+            source_history_id,
+            source_revision_id,
+        )?
+        && history_preference_source_matches_on_connection(
+            &transaction,
+            source_history_id,
+            source_revision_id,
+            origin_id,
+            &input.mapping_id,
+            &input.mapping_identity_fingerprint,
+            input.mapping_revision,
+            input.task_id,
+        )?;
+    if !valid_input {
+        // A late/non-latest callback cannot erase a newer origin row. If this
+        // exact latest edit is current but its mapping proof is now invalid,
+        // clear the old positive proof while retaining only its origin key.
+        if history_revision_is_latest_on_connection(
+            &transaction,
+            source_history_id,
+            source_revision_id,
+            origin_id,
+            Some("manual_edit"),
+        )? {
+            transaction.execute(
+                "UPDATE writing_preference_evidence
+                 SET source_revision_id = ?1, content_fingerprint = '',
+                     template_family_fingerprint = NULL, editor_session_id = '',
+                     occurred_at_ms = ?2,
+                     natural_day = '', eligible = 0
+                 WHERE source_history_id = ?3 AND origin_id = ?4
+                   AND source_revision_id <= ?1",
+                params![
+                    source_revision_id,
+                    now_ms as i64,
+                    source_history_id,
+                    origin_id
+                ],
+            )?;
+        }
+        transaction.commit()?;
+        return Ok(WritingPreferenceEvidenceWrite::RejectedSource);
+    }
+
+    let task_id = json_enum_string(&input.task_id)?;
+    let dimension = json_enum_string(&input.dimension)?;
+    let value = json_enum_string(&input.value)?;
+    let existing = transaction
+        .query_row(
+            "SELECT mapping_revision, task_id, dimension, value, generation,
+                    source_revision_id, eligible
+             FROM writing_preference_evidence
+             WHERE mapping_id = ?1 AND origin_id = ?2",
+            params![input.mapping_id, origin_id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?.max(0) as u64,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?.max(0) as u64,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(6)? != 0,
+                ))
+            },
+        )
+        .optional()?;
+    if existing.as_ref().is_some_and(|row| {
+        row.0 != input.mapping_revision
+            || row.1 != task_id
+            || row.2 != dimension
+            || row.3 != value
+            || !row.6
+    }) {
+        transaction.commit()?;
+        return Ok(WritingPreferenceEvidenceWrite::StaleOrigin);
+    }
+    let generation = if let Some(row) = existing.as_ref() {
+        row.4
+    } else {
+        let decision = transaction
+            .query_row(
+                "SELECT generation, decided_at_ms, decision
+                 FROM writing_preference_draft_decisions
+                 WHERE mapping_id = ?1 AND task_id = ?2
+                   AND dimension = ?3 AND value = ?4
+                 ORDER BY decided_at_ms DESC, generation DESC LIMIT 1",
+                params![input.mapping_id, task_id, dimension, value],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?.max(0) as u64,
+                        row.get::<_, i64>(1)?.max(0) as u64,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        if let Some((generation, decided_at_ms, decision)) = decision {
+            if input.occurred_at_ms <= decided_at_ms
+                || preference_decision_from_database(&decision)?
+                    == WritingPreferenceDraftDecision::Approved
+            {
+                transaction.commit()?;
+                return Ok(WritingPreferenceEvidenceWrite::StaleOrigin);
+            }
+            generation.saturating_add(1).max(1)
+        } else {
+            transaction
+                .query_row(
+                    "SELECT COALESCE(MAX(generation), 0)
+                     FROM writing_preference_evidence
+                     WHERE mapping_id = ?1 AND mapping_identity_fingerprint = ?2
+                       AND task_id = ?3 AND dimension = ?4 AND value = ?5",
+                    params![
+                        input.mapping_id,
+                        input.mapping_identity_fingerprint,
+                        task_id,
+                        dimension,
+                        value
+                    ],
+                    |row| row.get::<_, i64>(0),
+                )?
+                .max(1) as u64
+        }
+    };
+
+    if existing.is_none() {
+        let rows: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM writing_preference_evidence",
+            [],
+            |row| row.get(0),
+        )?;
+        if rows >= MAX_WRITING_PREFERENCE_EVIDENCE_ROWS {
+            transaction.commit()?;
+            return Ok(WritingPreferenceEvidenceWrite::AtCapacity);
+        }
+    }
+    let natural_day = input.natural_day.clone();
+    let content_fingerprint = input.content_fingerprint.to_ascii_lowercase();
+    let template_family_fingerprint = input
+        .template_family_fingerprint
+        .as_deref()
+        .map(str::to_ascii_lowercase);
+    let write = if existing.is_some() {
+        transaction.execute(
+            "UPDATE writing_preference_evidence
+             SET source_revision_id = ?1, content_fingerprint = ?2,
+                 template_family_fingerprint = ?3, occurred_at_ms = ?4,
+                 natural_day = ?5, editor_session_id = ?6, eligible = 1
+             WHERE mapping_id = ?7 AND origin_id = ?8 AND source_history_id = ?9
+               AND source_revision_id <= ?1 AND eligible = 1",
+            params![
+                source_revision_id,
+                content_fingerprint,
+                template_family_fingerprint,
+                input.occurred_at_ms as i64,
+                natural_day,
+                input.editor_session_id,
+                input.mapping_id,
+                origin_id,
+                source_history_id
+            ],
+        )?;
+        WritingPreferenceEvidenceWrite::Replaced
+    } else {
+        transaction.execute(
+            "INSERT INTO writing_preference_evidence (
+                 source_history_id, source_revision_id, mapping_id,
+                 mapping_identity_fingerprint, mapping_revision,
+                 task_id, dimension, value, origin_id, content_fingerprint,
+                 template_family_fingerprint, occurred_at_ms, natural_day,
+                 editor_session_id, generation, eligible
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, 1)",
+            params![
+                source_history_id,
+                source_revision_id,
+                input.mapping_id,
+                input.mapping_identity_fingerprint,
+                input.mapping_revision as i64,
+                task_id,
+                dimension,
+                value,
+                origin_id,
+                content_fingerprint,
+                template_family_fingerprint,
+                input.occurred_at_ms as i64,
+                natural_day,
+                input.editor_session_id,
+                generation as i64
+            ],
+        )?;
+        WritingPreferenceEvidenceWrite::Inserted
+    };
+    transaction.commit()?;
+    Ok(write)
+}
+
+fn now_epoch_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u64::MAX as u128) as u64
+}
+
+pub(crate) fn list_writing_preference_evidence(
+    dir: &Path,
+    now_ms: u64,
+) -> anyhow::Result<Vec<WritingPreferenceEvidenceRecord>> {
+    let mut connection = open_history(dir)?;
+    let transaction =
+        connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    prune_writing_preference_metadata(&transaction, now_ms)?;
+    transaction.execute(
+        "UPDATE writing_preference_evidence AS e
+         SET eligible = 0, content_fingerprint = '',
+             template_family_fingerprint = NULL, editor_session_id = ''
+         WHERE e.eligible = 1 AND NOT EXISTS (
+             SELECT 1 FROM dictations d
+             JOIN dictation_revisions r ON r.dictation_id = d.id
+             WHERE d.id = e.source_history_id
+               AND d.transaction_id = e.origin_id
+               AND r.revision_id = e.source_revision_id
+               AND r.revision_reason = 'manual_edit'
+               AND r.revision_id = (SELECT MAX(latest.revision_id)
+                                    FROM dictation_revisions latest
+                                    WHERE latest.dictation_id = d.id)
+         )",
+        [],
+    )?;
+    transaction.commit()?;
+    let connection = open_history(dir)?;
+    let cutoff = now_ms.saturating_sub(WRITING_PREFERENCE_WINDOW_MS) as i64;
+    let current = now_ms.min(i64::MAX as u64) as i64;
+    let mut statement = connection.prepare(
+        "SELECT source_history_id, source_revision_id, mapping_id,
+                mapping_identity_fingerprint, mapping_revision,
+                task_id, dimension, value, origin_id, content_fingerprint,
+                template_family_fingerprint, occurred_at_ms, natural_day,
+                editor_session_id, generation, eligible
+         FROM writing_preference_evidence
+         WHERE occurred_at_ms >= ?1 AND eligible = 1
+           AND EXISTS (
+               SELECT 1 FROM dictations d
+               WHERE d.id = writing_preference_evidence.source_history_id
+                 AND CAST(strftime('%s', d.created_at) AS INTEGER) * 1000
+                     BETWEEN ?1 AND ?2
+           )
+         ORDER BY mapping_id, mapping_revision, task_id, dimension, value, generation,
+                  occurred_at_ms, origin_id",
+    )?;
+    let rows = statement.query_map(params![cutoff, current], preference_evidence_from_row)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
+pub(crate) fn writing_preference_draft_decisions(
+    dir: &Path,
+    now_ms: u64,
+) -> anyhow::Result<Vec<WritingPreferenceDraftDecisionRecord>> {
+    let connection = open_history(dir)?;
+    prune_writing_preference_metadata(&connection, now_ms)?;
+    let mut statement = connection.prepare(
+        "SELECT candidate_id, mapping_id, mapping_revision, task_id, dimension, value,
+                generation, decision, decided_at_ms
+         FROM writing_preference_draft_decisions
+         ORDER BY mapping_id, mapping_revision, task_id, dimension, value, generation",
+    )?;
+    let rows = statement.query_map([], |row| {
+        let task_id: String = row.get(3)?;
+        let dimension: String = row.get(4)?;
+        let value: String = row.get(5)?;
+        let decision: String = row.get(7)?;
+        Ok(WritingPreferenceDraftDecisionRecord {
+            candidate_id: row.get(0)?,
+            mapping_id: row.get(1)?,
+            mapping_revision: row.get::<_, i64>(2)?.max(0) as u64,
+            task_id: enum_from_database(&task_id, 3)?,
+            dimension: enum_from_database(&dimension, 4)?,
+            value: enum_from_database(&value, 5)?,
+            generation: row.get::<_, i64>(6)?.max(0) as u64,
+            decision: match decision.as_str() {
+                "dismissed" => WritingPreferenceDraftDecision::Dismissed,
+                "approved" => WritingPreferenceDraftDecision::Approved,
+                other => {
+                    return Err(rusqlite::Error::FromSqlConversionFailure(
+                        7,
+                        rusqlite::types::Type::Text,
+                        Box::new(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("unknown writing preference decision: {other}"),
+                        )),
+                    ));
+                }
+            },
+            decided_at_ms: row.get::<_, i64>(8)?.max(0) as u64,
+        })
+    })?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
+pub(crate) fn record_writing_preference_draft_decision(
+    dir: &Path,
+    decision: &WritingPreferenceDraftDecisionRecord,
+) -> anyhow::Result<bool> {
+    if decision.candidate_id.trim().is_empty()
+        || decision.candidate_id.len() > 128
+        || decision.mapping_id.trim().is_empty()
+        || decision.mapping_revision > i64::MAX as u64
+        || decision.generation > i64::MAX as u64
+        || decision.decided_at_ms > i64::MAX as u64
+    {
+        anyhow::bail!("writing preference draft decision is invalid");
+    }
+    let task_id = json_enum_string(&decision.task_id)?;
+    let dimension = json_enum_string(&decision.dimension)?;
+    let value = json_enum_string(&decision.value)?;
+    let mut connection = open_history(dir)?;
+    let transaction =
+        connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    prune_writing_preference_metadata(&transaction, decision.decided_at_ms)?;
+    transaction.execute(
+        "INSERT OR IGNORE INTO writing_preference_draft_decisions (
+             candidate_id, mapping_id, mapping_revision, task_id, dimension, value,
+             generation, decision, decided_at_ms
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            decision.candidate_id,
+            decision.mapping_id,
+            decision.mapping_revision as i64,
+            task_id,
+            dimension,
+            value,
+            decision.generation as i64,
+            preference_decision_to_database(decision.decision),
+            decision.decided_at_ms as i64
+        ],
+    )?;
+    let inserted = transaction.changes() > 0;
+    transaction.commit()?;
+    Ok(inserted)
+}
+
+pub(crate) fn clear_writing_preference_metadata(dir: &Path) -> anyhow::Result<()> {
+    let mut connection = open_history(dir)?;
+    let transaction =
+        connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    transaction.execute_batch(
+        "DELETE FROM writing_preference_evidence;
+         DELETE FROM writing_preference_draft_decisions;",
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+pub(crate) fn clear_writing_preference_metadata_for_mapping(
+    dir: &Path,
+    mapping_id: &str,
+) -> anyhow::Result<()> {
+    if mapping_id.trim().is_empty() || mapping_id.len() > 128 {
+        anyhow::bail!("writing preference mapping ID is invalid");
+    }
+    let mut connection = open_history(dir)?;
+    let transaction =
+        connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    transaction.execute(
+        "DELETE FROM writing_preference_evidence WHERE mapping_id = ?1",
+        [mapping_id],
+    )?;
+    transaction.execute(
+        "DELETE FROM writing_preference_draft_decisions WHERE mapping_id = ?1",
+        [mapping_id],
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
 #[cfg(test)]
 pub fn clear_all_data(dir: &Path) -> anyhow::Result<()> {
     let guard = begin_clear_all_data(dir)?;
@@ -9300,7 +11482,7 @@ pub(crate) fn clear_all_data_under_guard(
     }
     let _commit = try_spool_io_commit(dir)?;
     let c = open_history(dir)?;
-    c.execute_batch("DELETE FROM dictations; DELETE FROM learn_observations; DELETE FROM usage; DELETE FROM learn_pairs; DELETE FROM style_drafts; DELETE FROM learned_term_usage;")?;
+    c.execute_batch("DELETE FROM dictations; DELETE FROM learn_observations; DELETE FROM usage; DELETE FROM learn_pairs; DELETE FROM style_drafts; DELETE FROM learned_term_usage; DELETE FROM writing_preference_evidence; DELETE FROM writing_preference_draft_decisions;")?;
     let vacuum_result = c.execute_batch("VACUUM");
     drop(c);
     // Run after open_history: clearing a legacy database can itself create a
@@ -9371,10 +11553,27 @@ pub struct HistoryScene {
     pub family: Option<String>,
     pub browser_host: Option<String>,
     pub native_bundle: Option<String>,
+    pub mapping_identity: Option<String>,
 }
 
 pub(crate) struct ManualHistorySave {
     pub revision_id: Option<i64>,
+    /// Stable original dictation transaction identity used for deduplication.
+    pub origin_id: Option<String>,
+    /// True only when no History revision has ever been written for this
+    /// original delivery, so this edit compares against its original output.
+    pub first_edit_of_original_delivery: bool,
+    /// Original dictation timestamp and device-local calendar day, read from
+    /// the History owner row in the same transaction as this save.
+    pub source_created_at_ms: Option<u64>,
+    pub natural_day: Option<String>,
+    /// Short-lived source text exposed only to the trusted local History
+    /// classifier; neither field is copied into preference evidence.
+    pub raw_text: String,
+    pub asr_text: Option<String>,
+    pub status: String,
+    pub delivery_method: Option<String>,
+    pub fallback_reason: Option<String>,
     /// The adopted text immediately before this manual revision. For an
     /// unchanged retry of the latest manual revision, this is reconstructed
     /// from its predecessor so learning can reuse the same origin receipt.
@@ -9425,7 +11624,7 @@ pub fn history_scene(dir: &Path, id: i64) -> anyhow::Result<HistoryScene> {
     let c = open_history(dir)?;
     let scene = c
         .query_row(
-            "SELECT context_policy_json, context_profile_id, context_family, context_browser_host, context_native_bundle FROM dictations WHERE id=?",
+            "SELECT context_policy_json, context_profile_id, context_family, context_browser_host, context_native_bundle, context_mapping_identity FROM dictations WHERE id=?",
             [id],
             |row| {
                 Ok((
@@ -9434,11 +11633,14 @@ pub fn history_scene(dir: &Path, id: i64) -> anyhow::Result<HistoryScene> {
                     row.get::<_, Option<String>>(2)?,
                     row.get::<_, Option<String>>(3)?,
                     row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
                 ))
             },
         )
         .optional()?;
-    let Some((policy_json, profile_id, family, browser_host, native_bundle)) = scene else {
+    let Some((policy_json, profile_id, family, browser_host, native_bundle, mapping_identity)) =
+        scene
+    else {
         return Ok(HistoryScene::default());
     };
     Ok(HistoryScene {
@@ -9449,6 +11651,7 @@ pub fn history_scene(dir: &Path, id: i64) -> anyhow::Result<HistoryScene> {
         family,
         browser_host,
         native_bundle,
+        mapping_identity,
     })
 }
 
@@ -9513,7 +11716,7 @@ pub(crate) fn save_manual_history_revision(
     let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let row = tx
         .query_row(
-            "SELECT COALESCE(NULLIF((SELECT final_text FROM dictation_revisions WHERE dictation_id=d.id ORDER BY revision_id DESC LIMIT 1),''),NULLIF(d.final_text,''),COALESCE(d.raw_text,'')), (SELECT revision_id FROM dictation_revisions WHERE dictation_id=d.id ORDER BY revision_id DESC LIMIT 1), (SELECT revision_reason FROM dictation_revisions WHERE dictation_id=d.id ORDER BY revision_id DESC LIMIT 1), COALESCE(NULLIF((SELECT final_text FROM dictation_revisions previous WHERE previous.dictation_id=d.id AND previous.revision_id < (SELECT revision_id FROM dictation_revisions latest WHERE latest.dictation_id=d.id ORDER BY latest.revision_id DESC LIMIT 1) ORDER BY previous.revision_id DESC LIMIT 1),''),NULLIF(d.final_text,''),COALESCE(d.raw_text,'')), d.context_policy_json, d.context_profile_id, d.context_family, d.context_browser_host, d.context_native_bundle FROM dictations d WHERE d.id=?1",
+            "SELECT COALESCE(NULLIF((SELECT final_text FROM dictation_revisions WHERE dictation_id=d.id ORDER BY revision_id DESC LIMIT 1),''),NULLIF(d.final_text,''),COALESCE(d.raw_text,'')), (SELECT revision_id FROM dictation_revisions WHERE dictation_id=d.id ORDER BY revision_id DESC LIMIT 1), (SELECT revision_reason FROM dictation_revisions WHERE dictation_id=d.id ORDER BY revision_id DESC LIMIT 1), COALESCE(NULLIF((SELECT final_text FROM dictation_revisions previous WHERE previous.dictation_id=d.id AND previous.revision_id < (SELECT revision_id FROM dictation_revisions latest WHERE latest.dictation_id=d.id ORDER BY latest.revision_id DESC LIMIT 1) ORDER BY previous.revision_id DESC LIMIT 1),''),NULLIF(d.final_text,''),COALESCE(d.raw_text,'')), d.context_policy_json, d.context_profile_id, d.context_family, d.context_browser_host, d.context_native_bundle, d.context_mapping_identity, d.transaction_id, CASE WHEN length(CAST(COALESCE(d.raw_text,'') AS BLOB)) <= 8192 THEN COALESCE(d.raw_text,'') ELSE '' END, CASE WHEN length(CAST(COALESCE(d.asr_text,'') AS BLOB)) <= 8192 THEN d.asr_text ELSE NULL END, d.status, d.delivery_method, d.fallback_reason FROM dictations d WHERE d.id=?1",
             [dictation_id],
             |row| {
                 Ok((
@@ -9526,11 +11729,36 @@ pub(crate) fn save_manual_history_revision(
                     row.get::<_, Option<String>>(6)?,
                     row.get::<_, Option<String>>(7)?,
                     row.get::<_, Option<String>>(8)?,
+                    row.get::<_, Option<String>>(9)?,
+                    row.get::<_, Option<String>>(10)?,
+                    row.get::<_, String>(11)?,
+                    row.get::<_, Option<String>>(12)?,
+                    row.get::<_, String>(13)?,
+                    row.get::<_, Option<String>>(14)?,
+                    row.get::<_, Option<String>>(15)?,
                 ))
             },
         )
         .optional()?
         .ok_or_else(|| anyhow::anyhow!("history record was not found"))?;
+    let (source_created_at_ms, natural_day, first_edit_of_original_delivery) = tx.query_row(
+        "SELECT CAST(strftime('%s', d.created_at) AS INTEGER) * 1000,
+                date(d.created_at, 'localtime'),
+                NOT EXISTS (SELECT 1 FROM dictation_revisions prior
+                            WHERE prior.dictation_id=d.id)
+         FROM dictations d WHERE d.id=?1",
+        [dictation_id],
+        |row| {
+            let created_at_ms = row
+                .get::<_, Option<i64>>(0)?
+                .and_then(|timestamp| u64::try_from(timestamp).ok());
+            Ok((
+                created_at_ms,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, i64>(2)? != 0,
+            ))
+        },
+    )?;
     let (
         previous_text,
         previous_revision_id,
@@ -9541,6 +11769,13 @@ pub(crate) fn save_manual_history_revision(
         family,
         browser_host,
         native_bundle,
+        mapping_identity,
+        origin_id,
+        raw_text,
+        asr_text,
+        status,
+        delivery_method,
+        fallback_reason,
     ) = row;
     let scene = HistoryScene {
         policy: policy_json
@@ -9550,6 +11785,7 @@ pub(crate) fn save_manual_history_revision(
         family,
         browser_host,
         native_bundle,
+        mapping_identity,
     };
     if previous_text == final_text {
         tx.commit()?;
@@ -9557,6 +11793,15 @@ pub(crate) fn save_manual_history_revision(
             previous_revision_id.filter(|_| previous_reason.as_deref() == Some("manual_edit"));
         return Ok(ManualHistorySave {
             revision_id,
+            origin_id,
+            first_edit_of_original_delivery: false,
+            source_created_at_ms,
+            natural_day,
+            raw_text,
+            asr_text,
+            status,
+            delivery_method,
+            fallback_reason,
             learning_before_text: if revision_id.is_some() {
                 retry_before_text
             } else {
@@ -9578,6 +11823,15 @@ pub(crate) fn save_manual_history_revision(
     tx.commit()?;
     Ok(ManualHistorySave {
         revision_id: Some(revision_id),
+        origin_id,
+        first_edit_of_original_delivery,
+        source_created_at_ms,
+        natural_day,
+        raw_text,
+        asr_text,
+        status,
+        delivery_method,
+        fallback_reason,
         learning_before_text: previous_text,
         scene,
         changed: true,
@@ -10531,6 +12785,39 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         dir
+    }
+
+    fn transfer_intent(
+        dir: &Path,
+        before_surface: &str,
+        after_surface: &str,
+        scope: LearnPairScope,
+        match_policy: LearnPairMatchPolicy,
+        manual_scoped: bool,
+        replace_conflicts: bool,
+    ) -> LearnPairTransferIntent {
+        let pair_key =
+            scoped_word_rule_key(before_surface, after_surface, &scope, match_policy).into_string();
+        let rows = list_learn_pairs(dir).unwrap();
+        let expected_rows = learn_pair_transfer_conflict_snapshot(
+            &rows,
+            &pair_key,
+            before_surface,
+            after_surface,
+            &scope,
+            match_policy,
+        )
+        .unwrap();
+        LearnPairTransferIntent {
+            pair_key,
+            before_surface: before_surface.into(),
+            after_surface: after_surface.into(),
+            scope,
+            match_policy,
+            manual_scoped,
+            expected_rows,
+            replace_conflicts,
+        }
     }
 
     #[cfg(unix)]
@@ -11580,6 +13867,11 @@ mod tests {
                 id: "wechat".into(),
                 label: "微信".into(),
                 family: crate::context::ContextFamily::PersonalChat,
+                writing_task_id: None,
+                writing_preferences: Vec::new(),
+                preference_guidance_provider_approved: false,
+                preference_revision: 0,
+                deleted: false,
                 mode_id: None,
                 bundle_id: Some("com.tencent.xinWeChat".into()),
                 executable: None,
@@ -11620,6 +13912,11 @@ mod tests {
             id: "notes".into(),
             label: "Notes".into(),
             family: crate::context::ContextFamily::Document,
+            writing_task_id: None,
+            writing_preferences: Vec::new(),
+            preference_guidance_provider_approved: false,
+            preference_revision: 0,
+            deleted: false,
             mode_id: None,
             bundle_id: Some("com.example.Notes".into()),
             executable: None,
@@ -11657,6 +13954,50 @@ mod tests {
         assert_eq!(legacy.style_example_input.as_deref(), Some("private"));
         assert!(!legacy.style_examples_approved);
         assert_eq!(legacy.source_permissions, Default::default());
+    }
+
+    #[test]
+    fn deleted_mapping_tombstone_persists_identity_but_is_hidden_from_settings_view() {
+        let tombstone = crate::context::AppMapping {
+            id: "rule:deleted-identity".into(),
+            label: "Deleted mapping".into(),
+            family: crate::context::ContextFamily::General,
+            writing_task_id: None,
+            writing_preferences: Vec::new(),
+            preference_guidance_provider_approved: false,
+            preference_revision: 6,
+            deleted: true,
+            mode_id: None,
+            bundle_id: None,
+            executable: None,
+            browser_host: None,
+            browser_path_prefix: None,
+            focused_field: None,
+            source_permissions: Default::default(),
+            style_example_input: None,
+            style_example_output: None,
+            style_example_pairs: Vec::new(),
+            style_examples_approved: false,
+            enabled: false,
+            cleanup_effort: None,
+            cleanup_intensity: None,
+            cleanup_enabled: false,
+            dictionary_learn_enabled: false,
+        };
+        let mut settings = Settings {
+            context_mappings: vec![tombstone],
+            ..Settings::default()
+        };
+        settings.normalize();
+        let encoded = serde_json::to_string(&settings).expect("settings serialize");
+        let mut loaded: Settings = serde_json::from_str(&encoded).expect("settings deserialize");
+        loaded.normalize();
+
+        assert_eq!(loaded.context_mappings.len(), 1);
+        assert_eq!(loaded.context_mappings[0].id, "rule:deleted-identity");
+        assert_eq!(loaded.context_mappings[0].preference_revision, 6);
+        assert!(loaded.context_mappings[0].deleted);
+        assert!(SettingsView::from(&loaded).context_mappings.is_empty());
     }
 
     #[test]
@@ -15397,6 +17738,10 @@ mod tests {
             promote_hits: 0,
             manual_scoped: false,
             auto_scoped: false,
+            match_policy: LearnPairMatchPolicy::default(),
+            binding_invalidated_at: None,
+            binding_invalidated_reason: None,
+            replacement_runs: 0,
         };
         let matching = LearnPairScope {
             family: Some("work_chat".into()),
@@ -15428,6 +17773,532 @@ mod tests {
         }
         .applicable_promoted_records(std::slice::from_ref(&row));
         assert!(selected.is_empty());
+    }
+
+    #[test]
+    fn c1_scoped_word_rules_apply_track_usage_and_forget_per_mapping() {
+        let dir = temp_dir("c1-scoped-word-rule-a-b");
+        let scope_a = LearnPairScope {
+            family: Some("developer_collaboration".into()),
+            mapping_id: Some("app-a".into()),
+            native_bundle: Some("com.example.a".into()),
+            ..LearnPairScope::default()
+        };
+        let scope_b = LearnPairScope {
+            mapping_id: Some("app-b".into()),
+            native_bundle: Some("com.example.b".into()),
+            ..scope_a.clone()
+        };
+        let before = "VoiceFlo";
+        let after = "VoiceFlow";
+        let policy = word_rule_match_policy(before, after);
+        let key_a = scoped_word_rule_key(before, after, &scope_a, policy).into_string();
+        let key_b = scoped_word_rule_key(before, after, &scope_b, policy).into_string();
+        assert!(key_a.starts_with("word:v2:"));
+        assert!(key_b.starts_with("word:v2:"));
+        assert_ne!(key_a, key_b);
+        ensure_manual_scoped_learn_pair(&dir, &key_a, before, after, &scope_a).unwrap();
+        ensure_manual_scoped_learn_pair(&dir, &key_b, before, after, &scope_b).unwrap();
+
+        let rows = list_learn_pairs(&dir).unwrap();
+        assert_eq!(rows.len(), 2);
+        let selected_a = scope_a.applicable_promoted_records(&rows);
+        let selected_b = scope_b.applicable_promoted_records(&rows);
+        assert_eq!(selected_a.len(), 1);
+        assert_eq!(selected_a[0].pair_key, key_a);
+        assert_eq!(selected_b.len(), 1);
+        assert_eq!(selected_b[0].pair_key, key_b);
+
+        let rules_a = crate::lexicon::replaceable_pairs(&selected_a, &[]);
+        let (text_a, _, applied_a) = crate::lexicon::apply_explicit_replacements_with_facts(
+            "Use VOICEFLO today",
+            &rules_a,
+            &[],
+        );
+        assert_eq!(text_a, "Use VoiceFlow today");
+        let used_a = crate::lexicon::used_pair_keys(&applied_a, &selected_a);
+        assert_eq!(used_a.as_slice(), std::slice::from_ref(&key_a));
+        bump_learn_pairs_used(&dir, &used_a).unwrap();
+        let after_a_usage = list_learn_pairs(&dir).unwrap();
+        assert_eq!(
+            after_a_usage
+                .iter()
+                .find(|row| row.pair_key == key_a)
+                .unwrap()
+                .replacement_runs,
+            1
+        );
+        assert_eq!(
+            after_a_usage
+                .iter()
+                .find(|row| row.pair_key == key_b)
+                .unwrap()
+                .replacement_runs,
+            0
+        );
+
+        assert!(tombstone_learn_pair(&dir, &key_a).unwrap());
+        let after_forget = list_learn_pairs(&dir).unwrap();
+        assert!(scope_a
+            .applicable_promoted_records(&after_forget)
+            .is_empty());
+        let selected_b_after_forget = scope_b.applicable_promoted_records(&after_forget);
+        let rules_b = crate::lexicon::replaceable_pairs(&selected_b_after_forget, &[]);
+        let (text_b, _, applied_b) = crate::lexicon::apply_explicit_replacements_with_facts(
+            "Use VOICEFLO today",
+            &rules_b,
+            &[],
+        );
+        assert_eq!(text_b, "Use VoiceFlow today");
+        let used_b = crate::lexicon::used_pair_keys(&applied_b, &selected_b_after_forget);
+        assert_eq!(used_b.as_slice(), std::slice::from_ref(&key_b));
+        bump_learn_pairs_used(&dir, &used_b).unwrap();
+        let final_rows = list_learn_pairs(&dir).unwrap();
+        assert!(
+            final_rows
+                .iter()
+                .find(|row| row.pair_key == key_a)
+                .unwrap()
+                .ignored
+        );
+        assert_eq!(
+            final_rows
+                .iter()
+                .find(|row| row.pair_key == key_b)
+                .unwrap()
+                .replacement_runs,
+            1
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn c1_automatic_pair_does_not_expand_across_scopes_but_manual_confirmation_does() {
+        let dir = temp_dir("c1-cross-scope-auto-owner");
+        let scope_a = LearnPairScope {
+            family: Some("developer_collaboration".into()),
+            mapping_id: Some("app-a".into()),
+            native_bundle: Some("com.example.a".into()),
+            ..LearnPairScope::default()
+        };
+        let scope_b = LearnPairScope {
+            mapping_id: Some("app-b".into()),
+            native_bundle: Some("com.example.b".into()),
+            ..scope_a.clone()
+        };
+        let before = "VoiceFlo";
+        let after = "VoiceFlow";
+        let policy = word_rule_match_policy(before, after);
+        let key_a = scoped_word_rule_key(before, after, &scope_a, policy).into_string();
+        let key_b = scoped_word_rule_key(before, after, &scope_b, policy).into_string();
+
+        let origin_a = "c1-auto-origin-a";
+        let observation_a = LearnPairObservation::research_fixture_origin(origin_a, &key_a);
+        assert!(matches!(
+            upsert_learn_pair_with_observation(
+                &dir,
+                &key_a,
+                before,
+                after,
+                Some(&scope_a),
+                Some(&observation_a),
+            )
+            .unwrap(),
+            LearnPairUpsert::Stored(_)
+        ));
+        assert_eq!(
+            promote_learn_pair_if_eligible_with_status(
+                &dir,
+                &key_a,
+                before,
+                after,
+                Some(&scope_a),
+                1,
+                true,
+            )
+            .unwrap(),
+            LearnPairPromotionStatus::Promoted
+        );
+        assert_eq!(
+            count_research_fixture_learn_pair_hits(&dir, &key_a).unwrap(),
+            1
+        );
+
+        let origin_b = "c1-auto-origin-b";
+        let observation_b = LearnPairObservation::research_fixture_origin(origin_b, &key_b);
+        assert!(matches!(
+            upsert_learn_pair_with_observation(
+                &dir,
+                &key_b,
+                before,
+                after,
+                Some(&scope_b),
+                Some(&observation_b),
+            )
+            .unwrap(),
+            LearnPairUpsert::Stored(_)
+        ));
+        assert_eq!(
+            promote_learn_pair_if_eligible_with_status(
+                &dir,
+                &key_b,
+                before,
+                after,
+                Some(&scope_b),
+                1,
+                true,
+            )
+            .unwrap(),
+            LearnPairPromotionStatus::CrossScopeAutoBlocked
+        );
+        assert_eq!(
+            count_research_fixture_learn_pair_hits(&dir, &key_b).unwrap(),
+            1
+        );
+        let pending_b = get_learn_pair(&dir, &key_b).unwrap().unwrap();
+        assert!(pending_b.is_pending());
+        assert!(!pending_b.auto_scoped);
+
+        ensure_manual_scoped_learn_pair(&dir, &key_b, before, after, &scope_b).unwrap();
+        let rows = list_learn_pairs(&dir).unwrap();
+        assert_eq!(scope_a.applicable_promoted_records(&rows).len(), 1);
+        assert_eq!(scope_b.applicable_promoted_records(&rows).len(), 1);
+        assert!(
+            rows.iter()
+                .find(|row| row.pair_key == key_b)
+                .unwrap()
+                .manual_scoped
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn c1_conflicts_abstain_for_word_targets_without_style_or_pin_suppression() {
+        let dir = temp_dir("c1-word-conflict-scope");
+        let scope = LearnPairScope {
+            family: Some("developer_collaboration".into()),
+            mapping_id: Some("codex".into()),
+            native_bundle: Some("com.openai.codex".into()),
+            ..LearnPairScope::default()
+        };
+        let first_key = scoped_word_rule_key(
+            "VoiceFlo",
+            "VoiceFlow",
+            &scope,
+            LearnPairMatchPolicy::IgnoreCase,
+        )
+        .into_string();
+        let second_key = scoped_word_rule_key(
+            "VOICEFLO",
+            "VoiceFlow Inc.",
+            &scope,
+            LearnPairMatchPolicy::IgnoreCase,
+        )
+        .into_string();
+        ensure_manual_scoped_learn_pair(&dir, &first_key, "VoiceFlo", "VoiceFlow", &scope).unwrap();
+        ensure_manual_scoped_learn_pair(&dir, &second_key, "VOICEFLO", "VoiceFlow Inc.", &scope)
+            .unwrap();
+        let style_key = "learn:style:codex";
+        ensure_learn_pair_promoted(&dir, style_key, "VoiceFlo", "Stylistic", Some(&scope)).unwrap();
+        ensure_pinned_dictionary_term(&dir, "PinnedWord", true).unwrap();
+
+        let rows = list_learn_pairs(&dir).unwrap();
+        let first = rows.iter().find(|row| row.pair_key == first_key).unwrap();
+        let without_competitor = scope.applicable_promoted_records(&[
+            first.clone(),
+            rows.iter()
+                .find(|row| row.pair_key == style_key)
+                .unwrap()
+                .clone(),
+            rows.iter()
+                .find(|row| row.before_surface.is_empty())
+                .unwrap()
+                .clone(),
+        ]);
+        assert!(without_competitor
+            .iter()
+            .any(|row| row.pair_key == first_key));
+
+        let applicable = scope.applicable_promoted_records(&rows);
+        assert!(!applicable
+            .iter()
+            .any(|row| row.pair_key == first_key || row.pair_key == second_key));
+        assert!(applicable.iter().any(|row| row.pair_key == style_key));
+        let pin = applicable
+            .iter()
+            .find(|row| row.before_surface.is_empty())
+            .unwrap();
+        assert!(pin.pinned);
+        assert!(pin.binding_invalidated_at.is_none());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn v19_and_v20_conflicting_word_rules_abstain_without_rekeying_legacy_rows() {
+        let dir = temp_dir("c1-v19-v20-conflict");
+        let scope = LearnPairScope {
+            family: Some("developer_collaboration".into()),
+            mapping_id: Some("codex".into()),
+            native_bundle: Some("com.openai.codex".into()),
+            ..LearnPairScope::default()
+        };
+        let legacy_key = crate::dictionary_learn::pair_key("VoiceFlo", "VoiceFlow");
+        let scoped_key = scoped_word_rule_key(
+            "voiceflo",
+            "VoiceFlow Next",
+            &scope,
+            LearnPairMatchPolicy::IgnoreCase,
+        )
+        .into_string();
+        ensure_learn_pair_promoted(&dir, &legacy_key, "VoiceFlo", "VoiceFlow", Some(&scope))
+            .unwrap();
+        ensure_manual_scoped_learn_pair(&dir, &scoped_key, "voiceflo", "VoiceFlow Next", &scope)
+            .unwrap();
+        let legacy_before = get_learn_pair(&dir, &legacy_key).unwrap().unwrap();
+        let scoped_before = get_learn_pair(&dir, &scoped_key).unwrap().unwrap();
+        let rows = list_learn_pairs(&dir).unwrap();
+        assert!(!scope
+            .applicable_promoted_records(&rows)
+            .iter()
+            .any(|row| row.pair_key == legacy_key || row.pair_key == scoped_key));
+        let legacy_after = get_learn_pair(&dir, &legacy_key).unwrap().unwrap();
+        let scoped_after = get_learn_pair(&dir, &scoped_key).unwrap().unwrap();
+        assert_eq!(
+            legacy_after, legacy_before,
+            "v19 key and counters remain untouched"
+        );
+        assert_eq!(scoped_after, scoped_before);
+        assert_eq!(legacy_after.pair_key, legacy_key);
+
+        assert!(tombstone_learn_pair(&dir, &legacy_key).unwrap());
+        let new_key = scoped_word_rule_key(
+            "VoiceFlo",
+            "VoiceFlow",
+            &scope,
+            LearnPairMatchPolicy::IgnoreCase,
+        )
+        .into_string();
+        let observation = LearnPairObservation::paste_session("v19-tombstone-passive", &new_key);
+        assert!(matches!(
+            upsert_learn_pair_with_observation(
+                &dir,
+                &new_key,
+                "VoiceFlo",
+                "VoiceFlow",
+                Some(&scope),
+                Some(&observation),
+            )
+            .unwrap(),
+            LearnPairUpsert::Skipped(LearnPairSkipReason::TombstoneOrIgnored)
+        ));
+        assert!(get_learn_pair(&dir, &new_key).unwrap().is_none());
+        assert!(
+            ensure_manual_scoped_learn_pair(&dir, &new_key, "VoiceFlo", "VoiceFlow", &scope,)
+                .is_ok(),
+            "explicit current-scope action may proceed while preserving the old tombstone"
+        );
+        assert!(get_learn_pair(&dir, &legacy_key).unwrap().unwrap().ignored);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn c1_mapping_invalidation_disarms_only_bound_words_and_rebind_adds_no_hits() {
+        let dir = temp_dir("c1-mapping-invalidation");
+        let scope = LearnPairScope {
+            family: Some("developer_collaboration".into()),
+            mapping_id: Some("codex".into()),
+            native_bundle: Some("com.openai.codex".into()),
+            ..LearnPairScope::default()
+        };
+        let key_same = scoped_word_rule_key(
+            "VoiceFlo",
+            "VoiceFlow",
+            &scope,
+            LearnPairMatchPolicy::IgnoreCase,
+        )
+        .into_string();
+        let key_changed =
+            scoped_word_rule_key("Reakt", "React", &scope, LearnPairMatchPolicy::IgnoreCase)
+                .into_string();
+        let key_auto = scoped_word_rule_key(
+            "TauriApp",
+            "VoiceFlowApp",
+            &scope,
+            LearnPairMatchPolicy::IgnoreCase,
+        )
+        .into_string();
+        let key_global = scoped_word_rule_key(
+            "GloblTypo",
+            "GlobalTerm",
+            &scope,
+            LearnPairMatchPolicy::IgnoreCase,
+        )
+        .into_string();
+        ensure_manual_scoped_learn_pair(&dir, &key_same, "VoiceFlo", "VoiceFlow", &scope).unwrap();
+        ensure_manual_scoped_learn_pair(&dir, &key_changed, "Reakt", "React", &scope).unwrap();
+        assert!(matches!(
+            upsert_auto_scoped_learn_pair_with_observation(
+                &dir,
+                &key_auto,
+                "TauriApp",
+                "VoiceFlowApp",
+                Some(&scope),
+                None,
+            )
+            .unwrap(),
+            LearnPairUpsert::Stored(_)
+        ));
+        ensure_local_only_learn_pair_promoted(
+            &dir,
+            &key_auto,
+            "TauriApp",
+            "VoiceFlowApp",
+            Some(&scope),
+        )
+        .unwrap();
+        ensure_learn_pair_promoted(&dir, &key_global, "GloblTypo", "GlobalTerm", Some(&scope))
+            .unwrap();
+        assert_eq!(
+            list_pending_dictionary_effects(&dir).unwrap()[0].action,
+            DictionaryEffectAction::Add
+        );
+        let style_key = "learn:style:codex";
+        ensure_learn_pair_promoted(&dir, style_key, "x", "style", Some(&scope)).unwrap();
+        ensure_pinned_dictionary_term(&dir, "PinnedWord", true).unwrap();
+
+        assert_eq!(
+            invalidate_word_rule_mapping_bindings(
+                &dir,
+                &[(
+                    "codex".into(),
+                    LearnPairBindingInvalidationReason::DeclaredIdentityChanged
+                )]
+            )
+            .unwrap(),
+            4
+        );
+        let pending = list_pending_dictionary_effects(&dir).unwrap();
+        assert!(pending.iter().any(|effect| {
+            effect.pair_key == key_global && effect.action == DictionaryEffectAction::Remove
+        }));
+        let invalidated = list_learn_pairs(&dir).unwrap();
+        for key in [&key_same, &key_changed, &key_auto] {
+            let row = invalidated.iter().find(|row| &row.pair_key == key).unwrap();
+            assert!(row.promoted);
+            assert!(row.is_binding_invalidated());
+            assert_eq!(
+                row.binding_invalidated_reason.as_deref(),
+                Some("declared_identity_changed")
+            );
+            assert!(scope
+                .applicable_promoted_records(std::slice::from_ref(row))
+                .is_empty());
+            assert!(ensure_learn_pair_promoted(
+                &dir,
+                key,
+                &row.before_surface,
+                &row.after_surface,
+                Some(&scope),
+            )
+            .is_err());
+        }
+        let style = invalidated
+            .iter()
+            .find(|row| row.pair_key == style_key)
+            .unwrap();
+        assert!(!style.is_binding_invalidated());
+        let pin = invalidated
+            .iter()
+            .find(|row| row.before_surface.is_empty())
+            .unwrap();
+        assert!(pin.pinned);
+        assert!(!pin.is_binding_invalidated());
+
+        let same_scope_rebound = rebind_invalidated_word_rule(&dir, &key_same, &scope).unwrap();
+        assert_eq!(same_scope_rebound.pair_key, key_same);
+        assert!(!same_scope_rebound.is_binding_invalidated());
+        assert_eq!(same_scope_rebound.hits, 0);
+        let changed_scope = LearnPairScope {
+            mapping_id: Some("codex-v2".into()),
+            ..scope.clone()
+        };
+        let changed_scope_rebound =
+            rebind_invalidated_word_rule(&dir, &key_changed, &changed_scope).unwrap();
+        assert_ne!(changed_scope_rebound.pair_key, key_changed);
+        assert!(changed_scope_rebound.is_live_promoted());
+        assert!(changed_scope_rebound.manual_scoped);
+        assert_eq!(changed_scope_rebound.hits, 0);
+        let auto_scope_rebound =
+            rebind_invalidated_word_rule(&dir, &key_auto, &changed_scope).unwrap();
+        assert_ne!(auto_scope_rebound.pair_key, key_auto);
+        assert!(auto_scope_rebound.is_live_promoted());
+        assert!(!auto_scope_rebound.manual_scoped);
+        assert!(auto_scope_rebound.auto_scoped);
+        assert_eq!(auto_scope_rebound.hits, 0);
+        let final_rows = list_learn_pairs(&dir).unwrap();
+        assert!(final_rows
+            .iter()
+            .find(|row| row.pair_key == key_changed)
+            .unwrap()
+            .is_binding_invalidated());
+        assert_eq!(
+            final_rows
+                .iter()
+                .find(|row| row.pair_key == changed_scope_rebound.pair_key)
+                .unwrap()
+                .replacement_runs,
+            0
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn c1_missing_mapping_invalidation_targets_only_v2_word_rules_with_mapping_ids() {
+        let dir = temp_dir("c1-missing-mapping-bindings");
+        let missing_scope = LearnPairScope {
+            family: Some("work_chat".into()),
+            mapping_id: Some("deleted-app".into()),
+            native_bundle: Some("com.example.deleted".into()),
+            ..LearnPairScope::default()
+        };
+        let missing_key = scoped_word_rule_key(
+            "Teh",
+            "The",
+            &missing_scope,
+            LearnPairMatchPolicy::IgnoreCase,
+        )
+        .into_string();
+        let unbound_scope = LearnPairScope {
+            mapping_id: None,
+            native_bundle: Some("com.example.native".into()),
+            ..missing_scope.clone()
+        };
+        let unbound_key = scoped_word_rule_key(
+            "Voys",
+            "Voice",
+            &unbound_scope,
+            LearnPairMatchPolicy::IgnoreCase,
+        )
+        .into_string();
+        ensure_manual_scoped_learn_pair(&dir, &missing_key, "Teh", "The", &missing_scope).unwrap();
+        ensure_manual_scoped_learn_pair(&dir, &unbound_key, "Voys", "Voice", &unbound_scope)
+            .unwrap();
+        assert_eq!(
+            invalidate_missing_word_rule_mapping_bindings(&dir, &[]).unwrap(),
+            1
+        );
+        let rows = list_learn_pairs(&dir).unwrap();
+        let missing = rows.iter().find(|row| row.pair_key == missing_key).unwrap();
+        assert_eq!(
+            missing.binding_invalidated_reason.as_deref(),
+            Some("missing_binding_at_migration")
+        );
+        assert!(!rows
+            .iter()
+            .find(|row| row.pair_key == unbound_key)
+            .unwrap()
+            .is_binding_invalidated());
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -15852,19 +18723,45 @@ mod tests {
         let dir = temp_dir("manual-history-learning-retry");
         insert_history(&dir, "raw", "adopted before", 1.0, false).unwrap();
         let id = get_history(&dir, 10).unwrap()[0].id;
+        let recorded_at_ms = now_epoch_millis().saturating_sub(3 * 24 * 60 * 60 * 1_000);
+        let connection = open_history(&dir).unwrap();
+        connection
+            .execute(
+                "UPDATE dictations SET created_at=datetime(?1 / 1000, 'unixepoch') WHERE id=?2",
+                params![recorded_at_ms as i64, id],
+            )
+            .unwrap();
+        let expected_natural_day: String = connection
+            .query_row(
+                "SELECT date(created_at, 'localtime') FROM dictations WHERE id=?1",
+                [id],
+                |row| row.get(0),
+            )
+            .unwrap();
         let first = save_manual_history_revision(&dir, id, "adopted after").unwrap();
         assert!(first.changed);
+        assert!(first.first_edit_of_original_delivery);
+        assert_eq!(
+            first.source_created_at_ms,
+            Some(recorded_at_ms / 1_000 * 1_000)
+        );
+        assert_eq!(
+            first.natural_day.as_deref(),
+            Some(expected_natural_day.as_str())
+        );
         assert_eq!(first.learning_before_text, "adopted before");
         let first_revision_id = first.revision_id.unwrap();
 
         let retry = save_manual_history_revision(&dir, id, "adopted after").unwrap();
         assert!(!retry.changed);
+        assert!(!retry.first_edit_of_original_delivery);
         assert_eq!(retry.revision_id, Some(first_revision_id));
         assert_eq!(retry.learning_before_text, "adopted before");
         assert_eq!(get_history_revisions(&dir, id).unwrap().len(), 1);
 
         let next = save_manual_history_revision(&dir, id, "third adopted text").unwrap();
         assert!(next.changed);
+        assert!(!next.first_edit_of_original_delivery);
         assert_eq!(next.learning_before_text, "adopted after");
         assert_eq!(get_history_revisions(&dir, id).unwrap().len(), 2);
         let _ = std::fs::remove_dir_all(dir);
@@ -16738,6 +19635,345 @@ mod tests {
     }
 
     #[test]
+    fn transferred_pairs_preserve_match_policy_and_stay_local_only() {
+        let dir = temp_dir("learn-pair-transfer-local-only");
+        let intent = transfer_intent(
+            &dir,
+            "Futu",
+            "FUTU",
+            LearnPairScope::default(),
+            LearnPairMatchPolicy::Exact,
+            false,
+            false,
+        );
+        let pair_key = intent.pair_key.clone();
+        assert_eq!(
+            apply_learn_pair_transfers(&dir, &[intent]).unwrap(),
+            [LearnPairTransferOutcome::Inserted]
+        );
+
+        let row = get_learn_pair(&dir, &pair_key).unwrap().unwrap();
+        assert!(row.is_live_promoted());
+        assert_eq!(row.match_policy, LearnPairMatchPolicy::Exact);
+        assert!(row.auto_scoped);
+        assert!(!row.is_provider_egress_eligible_word_pair());
+        assert!(
+            LearnPairScope::default()
+                .applicable_promoted_records(std::slice::from_ref(&row))
+                .contains(&row),
+            "local-only global imports still apply without a provider grant"
+        );
+        assert!(list_pending_dictionary_effects(&dir).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn transfer_preflight_detects_changed_conflicts_without_writing_the_import() {
+        let dir = temp_dir("learn-pair-transfer-preflight");
+        let scope = LearnPairScope::default();
+        let intent = transfer_intent(
+            &dir,
+            "teh",
+            "the",
+            scope.clone(),
+            LearnPairMatchPolicy::IgnoreCase,
+            false,
+            true,
+        );
+        let imported_key = intent.pair_key.clone();
+        let initial_rows = list_learn_pairs(&dir).unwrap();
+        assert!(learn_pair_transfer_intents_match_snapshot(
+            &initial_rows,
+            std::slice::from_ref(&intent)
+        )
+        .unwrap());
+
+        let conflict_key =
+            scoped_word_rule_key("teh", "they", &scope, LearnPairMatchPolicy::IgnoreCase)
+                .into_string();
+        assert!(matches!(
+            upsert_learn_pair_with_scope(&dir, &conflict_key, "teh", "they", None).unwrap(),
+            LearnPairUpsert::Stored(_)
+        ));
+        assert!(mark_learn_pair_promoted(&dir, &conflict_key).unwrap());
+
+        let changed_rows = list_learn_pairs(&dir).unwrap();
+        assert!(!learn_pair_transfer_intents_match_snapshot(
+            &changed_rows,
+            std::slice::from_ref(&intent)
+        )
+        .unwrap());
+        assert!(get_learn_pair(&dir, &imported_key).unwrap().is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn imported_direct_scope_pair_is_not_deduplicated_by_an_equivalent_global_pair() {
+        let dir = temp_dir("learn-pair-transfer-exact-scope");
+        let global_key = scoped_word_rule_key(
+            "teh",
+            "the",
+            &LearnPairScope::default(),
+            LearnPairMatchPolicy::IgnoreCase,
+        )
+        .into_string();
+        assert!(matches!(
+            upsert_learn_pair_with_scope(&dir, &global_key, "teh", "the", None).unwrap(),
+            LearnPairUpsert::Stored(_)
+        ));
+        assert!(mark_learn_pair_promoted(&dir, &global_key).unwrap());
+
+        let app_scope = LearnPairScope {
+            native_bundle: Some("com.example.notes".into()),
+            ..LearnPairScope::default()
+        };
+        let app_intent = transfer_intent(
+            &dir,
+            "teh",
+            "the",
+            app_scope.clone(),
+            LearnPairMatchPolicy::IgnoreCase,
+            true,
+            false,
+        );
+        let app_key = app_intent.pair_key.clone();
+        assert_eq!(
+            apply_learn_pair_transfers(&dir, &[app_intent]).unwrap(),
+            [LearnPairTransferOutcome::Inserted],
+            "same output at another exact scope must keep its own local rule"
+        );
+        let rows = list_learn_pairs(&dir).unwrap();
+        assert_eq!(rows.len(), 2);
+        let app_row = rows.iter().find(|row| row.pair_key == app_key).unwrap();
+        assert!(app_row.is_live_promoted());
+        assert!(app_row.auto_scoped);
+        assert!(app_row.manual_scoped);
+        assert_eq!(app_row.native_bundle.as_deref(), Some("com.example.notes"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn transfer_replacement_stages_old_global_owner_and_keeps_forget_markers() {
+        let dir = temp_dir("learn-pair-transfer-replacement");
+        let old_key = scoped_word_rule_key(
+            "teh",
+            "the",
+            &LearnPairScope::default(),
+            LearnPairMatchPolicy::IgnoreCase,
+        )
+        .into_string();
+        assert!(matches!(
+            upsert_learn_pair_with_scope(&dir, &old_key, "teh", "the", None).unwrap(),
+            LearnPairUpsert::Stored(_)
+        ));
+        assert!(mark_learn_pair_promoted(&dir, &old_key).unwrap());
+
+        let replacement = transfer_intent(
+            &dir,
+            "teh",
+            "thee",
+            LearnPairScope::default(),
+            LearnPairMatchPolicy::IgnoreCase,
+            false,
+            true,
+        );
+        let new_key = replacement.pair_key.clone();
+        assert_eq!(
+            apply_learn_pair_transfers(&dir, &[replacement]).unwrap(),
+            [LearnPairTransferOutcome::Replaced {
+                pair_keys: vec![old_key.clone()]
+            }]
+        );
+        let old = get_learn_pair(&dir, &old_key).unwrap().unwrap();
+        assert!(old.ignored && old.tombstoned_at.is_some());
+        let new = get_learn_pair(&dir, &new_key).unwrap().unwrap();
+        assert!(new.is_live_promoted());
+        assert!(new.auto_scoped);
+        assert_eq!(new.match_policy, LearnPairMatchPolicy::IgnoreCase);
+        let effects = list_pending_dictionary_effects(&dir).unwrap();
+        assert!(effects.iter().any(|effect| {
+            effect.pair_key == old_key
+                && effect.word == "the"
+                && effect.action == DictionaryEffectAction::Remove
+        }));
+
+        let repeat = transfer_intent(
+            &dir,
+            "teh",
+            "thee",
+            LearnPairScope::default(),
+            LearnPairMatchPolicy::IgnoreCase,
+            false,
+            false,
+        );
+        assert_eq!(
+            apply_learn_pair_transfers(&dir, &[repeat]).unwrap(),
+            [LearnPairTransferOutcome::AlreadyPresent]
+        );
+
+        let forgotten_reimport = transfer_intent(
+            &dir,
+            "teh",
+            "the",
+            LearnPairScope::default(),
+            LearnPairMatchPolicy::IgnoreCase,
+            false,
+            true,
+        );
+        assert_eq!(
+            apply_learn_pair_transfers(&dir, &[forgotten_reimport]).unwrap(),
+            [LearnPairTransferOutcome::Blocked]
+        );
+
+        let second_replacement = transfer_intent(
+            &dir,
+            "teh",
+            "they",
+            LearnPairScope::default(),
+            LearnPairMatchPolicy::IgnoreCase,
+            false,
+            true,
+        );
+        let latest_key = second_replacement.pair_key.clone();
+        assert_eq!(
+            apply_learn_pair_transfers(&dir, &[second_replacement]).unwrap(),
+            [LearnPairTransferOutcome::Replaced {
+                pair_keys: vec![new_key]
+            }]
+        );
+        assert!(get_learn_pair(&dir, &latest_key)
+            .unwrap()
+            .unwrap()
+            .is_live_promoted());
+        assert!(get_learn_pair(&dir, &old_key)
+            .unwrap()
+            .unwrap()
+            .tombstoned_at
+            .is_some());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn transfer_snapshot_ignores_usage_counters_and_same_output_legacy_aliases() {
+        let dir = temp_dir("learn-pair-transfer-snapshot");
+        let before = "teh";
+        let after = "the";
+        let legacy_key = format!("{}\u{1e}{}", before.to_lowercase(), after.to_lowercase());
+        assert!(matches!(
+            upsert_learn_pair_with_scope(&dir, &legacy_key, before, after, None).unwrap(),
+            LearnPairUpsert::Stored(_)
+        ));
+        assert!(mark_learn_pair_promoted(&dir, &legacy_key).unwrap());
+        let competing_key = scoped_word_rule_key(
+            before,
+            "they",
+            &LearnPairScope::default(),
+            LearnPairMatchPolicy::IgnoreCase,
+        )
+        .into_string();
+        assert!(matches!(
+            upsert_learn_pair_with_scope(&dir, &competing_key, before, "they", None).unwrap(),
+            LearnPairUpsert::Stored(_)
+        ));
+        assert!(mark_learn_pair_promoted(&dir, &competing_key).unwrap());
+        let v2_key = scoped_word_rule_key(
+            before,
+            after,
+            &LearnPairScope::default(),
+            LearnPairMatchPolicy::IgnoreCase,
+        )
+        .into_string();
+        let same_output = transfer_intent(
+            &dir,
+            before,
+            after,
+            LearnPairScope::default(),
+            LearnPairMatchPolicy::IgnoreCase,
+            false,
+            false,
+        );
+        assert_eq!(same_output.pair_key, v2_key);
+        assert_eq!(
+            apply_learn_pair_transfers(&dir, &[same_output]).unwrap(),
+            [LearnPairTransferOutcome::Conflict],
+            "an egress-enabled matching row requires explicit local-only replacement"
+        );
+        assert_eq!(list_learn_pairs(&dir).unwrap().len(), 2);
+
+        let localize = transfer_intent(
+            &dir,
+            before,
+            after,
+            LearnPairScope::default(),
+            LearnPairMatchPolicy::IgnoreCase,
+            false,
+            true,
+        );
+        let localized_outcome = apply_learn_pair_transfers(&dir, &[localize]).unwrap();
+        let LearnPairTransferOutcome::Replaced { pair_keys } = &localized_outcome[0] else {
+            panic!("expected explicit replacement and local-only update");
+        };
+        assert!(pair_keys.contains(&legacy_key));
+        assert!(pair_keys.contains(&competing_key));
+        let localized = get_learn_pair(&dir, &legacy_key).unwrap().unwrap();
+        assert!(localized.auto_scoped);
+        assert!(!localized.is_provider_egress_eligible_word_pair());
+        assert!(get_learn_pair(&dir, &competing_key)
+            .unwrap()
+            .unwrap()
+            .tombstoned_at
+            .is_some());
+
+        let same_local = transfer_intent(
+            &dir,
+            before,
+            after,
+            LearnPairScope::default(),
+            LearnPairMatchPolicy::IgnoreCase,
+            false,
+            false,
+        );
+        assert_eq!(
+            apply_learn_pair_transfers(&dir, &[same_local]).unwrap(),
+            [LearnPairTransferOutcome::AlreadyPresent]
+        );
+
+        let candidate = transfer_intent(
+            &dir,
+            before,
+            "their",
+            LearnPairScope::default(),
+            LearnPairMatchPolicy::IgnoreCase,
+            false,
+            false,
+        );
+        bump_learn_pairs_used(&dir, std::slice::from_ref(&legacy_key)).unwrap();
+        assert_eq!(
+            apply_learn_pair_transfers(&dir, &[candidate]).unwrap(),
+            [LearnPairTransferOutcome::Conflict],
+            "usage changes must not invalidate the preview"
+        );
+
+        let stale = transfer_intent(
+            &dir,
+            before,
+            "their",
+            LearnPairScope::default(),
+            LearnPairMatchPolicy::IgnoreCase,
+            false,
+            true,
+        );
+        let stale_key = stale.pair_key.clone();
+        assert!(tombstone_learn_pair(&dir, &legacy_key).unwrap());
+        assert_eq!(
+            apply_learn_pair_transfers(&dir, &[stale]).unwrap(),
+            [LearnPairTransferOutcome::StalePreview]
+        );
+        assert!(get_learn_pair(&dir, &stale_key).unwrap().is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn dictionary_sources_preserve_owners_and_reconcile_case_insensitively() {
         let mut value = serde_json::to_value(Settings::default()).unwrap();
         let object = value.as_object_mut().unwrap();
@@ -16792,6 +20028,130 @@ mod tests {
             "screenterm",
             &DictionarySource::Screen("screen-origin".into())
         ));
+    }
+
+    #[test]
+    fn asr_dictionary_egress_requires_an_independent_global_owner() {
+        let scoped = |pair_key: &str, before: &str, after: &str| LearnPairRecord {
+            pair_key: pair_key.into(),
+            before_surface: before.into(),
+            after_surface: after.into(),
+            hits: 100,
+            promoted: true,
+            last_at: "2026-01-01".into(),
+            family: Some("general".into()),
+            mapping_id: Some("app-a".into()),
+            browser_host: None,
+            native_bundle: Some("com.example.app-a".into()),
+            last_used_at: Some("2026-01-02".into()),
+            pinned: true,
+            tombstoned_at: None,
+            ignored: false,
+            promote_hits: 0,
+            manual_scoped: false,
+            auto_scoped: false,
+            match_policy: LearnPairMatchPolicy::IgnoreCase,
+            binding_invalidated_at: None,
+            binding_invalidated_reason: None,
+            replacement_runs: 0,
+        };
+        let scoped_rule = scoped("word:v2:app-a", "acme alias", "AcMe");
+        let mut settings = Settings {
+            dictionary: vec!["AcMe".into()],
+            ..Settings::default()
+        };
+        settings.dictionary_sources.owners.insert(
+            "AcMe".into(),
+            [DictionarySource::Rule(scoped_rule.pair_key.clone())]
+                .into_iter()
+                .collect(),
+        );
+        assert!(settings
+            .asr_dictionary_words(std::slice::from_ref(&scoped_rule))
+            .is_empty());
+
+        assert!(settings.add_dictionary_source("acme", DictionarySource::Manual));
+        assert_eq!(
+            settings.asr_dictionary_words(std::slice::from_ref(&scoped_rule)),
+            vec!["AcMe"]
+        );
+
+        let mut legacy_unknown = Settings {
+            dictionary: vec!["AcMe".into()],
+            ..Settings::default()
+        };
+        legacy_unknown.dictionary_sources.owners.insert(
+            "AcMe".into(),
+            [DictionarySource::LegacyUnknown].into_iter().collect(),
+        );
+        assert!(legacy_unknown
+            .asr_dictionary_words(std::slice::from_ref(&scoped_rule))
+            .is_empty());
+
+        let unowned = Settings {
+            dictionary: vec!["AcMe".into()],
+            ..Settings::default()
+        };
+        assert!(unowned.asr_dictionary_words(&[]).is_empty());
+
+        let mut orphaned_rule = Settings {
+            dictionary: vec!["AcMe".into()],
+            ..Settings::default()
+        };
+        orphaned_rule.dictionary_sources.owners.insert(
+            "AcMe".into(),
+            [DictionarySource::Rule("word:v2:cleared-rule".into())]
+                .into_iter()
+                .collect(),
+        );
+        assert!(orphaned_rule.asr_dictionary_words(&[]).is_empty());
+
+        let scoped_screen_seed = scoped("\u{1e}acme", "", "AcMe");
+        assert!(legacy_unknown
+            .asr_dictionary_words(std::slice::from_ref(&scoped_screen_seed))
+            .is_empty());
+        let scoped_style = scoped("learn:style:app-a", "style cue", "AcMe");
+        assert!(legacy_unknown
+            .asr_dictionary_words(std::slice::from_ref(&scoped_style))
+            .is_empty());
+
+        for source in [
+            DictionarySource::Screen("current-screen-context".into()),
+            DictionarySource::Other("explicit-global-import".into()),
+        ] {
+            let mut independent = Settings {
+                dictionary: vec!["AcMe".into()],
+                ..Settings::default()
+            };
+            independent
+                .dictionary_sources
+                .owners
+                .insert("AcMe".into(), [source].into_iter().collect());
+            assert_eq!(
+                independent.asr_dictionary_words(std::slice::from_ref(&scoped_rule)),
+                vec!["AcMe"]
+            );
+        }
+
+        let mut global_rule = scoped_rule.clone();
+        global_rule.pair_key = format!("{}\u{1e}{}", "acme alias", "acme");
+        global_rule.family = None;
+        global_rule.mapping_id = None;
+        global_rule.native_bundle = None;
+        let mut verified_rule_owner = Settings {
+            dictionary: vec!["AcMe".into()],
+            ..Settings::default()
+        };
+        verified_rule_owner.dictionary_sources.owners.insert(
+            "AcMe".into(),
+            [DictionarySource::Rule(global_rule.pair_key.clone())]
+                .into_iter()
+                .collect(),
+        );
+        assert_eq!(
+            verified_rule_owner.asr_dictionary_words(std::slice::from_ref(&global_rule)),
+            vec!["AcMe"]
+        );
     }
 
     #[test]
@@ -17280,55 +20640,113 @@ mod tests {
 
         let first_id = insert_test_history_origin(&dir, "first proof origin", "origin-first");
         let second_id = insert_test_history_origin(&dir, "second proof origin", "origin-second");
-        for (session, origin) in [
-            ("session-first", "origin-first"),
-            ("session-second", "origin-second"),
-        ] {
-            let observation = LearnPairObservation::paste_session_with_dictation_origin(
-                session, &pair_key, origin,
-            );
+        let weak = LearnPairObservation::paste_session_with_dictation_origin(
+            "session-weak-first",
+            &pair_key,
+            "origin-first",
+        );
+        assert!(matches!(
             upsert_learn_pair_with_observation(
                 &dir,
                 &pair_key,
                 "VoiceFlo",
                 "VoiceFlow",
                 None,
-                Some(&observation),
+                Some(&weak),
             )
-            .unwrap();
-            if origin == "origin-first" {
-                assert!(!promote_learn_pair_if_eligible(
-                    &dir,
-                    &pair_key,
-                    "VoiceFlo",
-                    "VoiceFlow",
-                    None,
-                    2,
-                    false,
-                )
-                .unwrap());
-            }
-        }
+            .unwrap(),
+            LearnPairUpsert::Stored(_)
+        ));
         assert_eq!(
             count_independent_learn_pair_hits(&dir, &pair_key).unwrap(),
+            1
+        );
+        assert_eq!(
+            count_research_fixture_learn_pair_hits(&dir, &pair_key).unwrap(),
+            0
+        );
+        assert_eq!(
+            promote_learn_pair_if_eligible_with_status(
+                &dir,
+                &pair_key,
+                "VoiceFlo",
+                "VoiceFlow",
+                None,
+                2,
+                false,
+            )
+            .unwrap(),
+            LearnPairPromotionStatus::Ineligible,
+            "a production paste proof cannot satisfy the research-only threshold"
+        );
+
+        let first_fixture =
+            LearnPairObservation::research_fixture_origin("research-origin-first", &pair_key);
+        assert!(matches!(
+            upsert_learn_pair_with_observation(
+                &dir,
+                &pair_key,
+                "VoiceFlo",
+                "VoiceFlow",
+                None,
+                Some(&first_fixture),
+            )
+            .unwrap(),
+            LearnPairUpsert::Stored(_)
+        ));
+        assert_eq!(
+            promote_learn_pair_if_eligible_with_status(
+                &dir,
+                &pair_key,
+                "VoiceFlo",
+                "VoiceFlow",
+                None,
+                2,
+                false,
+            )
+            .unwrap(),
+            LearnPairPromotionStatus::Ineligible,
+            "one distinct research fixture origin remains below threshold"
+        );
+        let second_fixture =
+            LearnPairObservation::research_fixture_origin("research-origin-second", &pair_key);
+        assert!(matches!(
+            upsert_learn_pair_with_observation(
+                &dir,
+                &pair_key,
+                "VoiceFlo",
+                "VoiceFlow",
+                None,
+                Some(&second_fixture),
+            )
+            .unwrap(),
+            LearnPairUpsert::Stored(_)
+        ));
+        assert_eq!(
+            count_independent_learn_pair_hits(&dir, &pair_key).unwrap(),
+            3,
+            "shared observation storage retains both weak and research sources"
+        );
+        assert_eq!(
+            count_research_fixture_learn_pair_hits(&dir, &pair_key).unwrap(),
             2
         );
-        assert!(promote_learn_pair_if_eligible(
-            &dir,
-            &pair_key,
-            "VoiceFlo",
-            "VoiceFlow",
-            None,
-            2,
-            false,
-        )
-        .unwrap());
-        let hits_before_replay = get_learn_pair(&dir, &pair_key).unwrap().unwrap().hits;
-        let replay = LearnPairObservation::paste_session_with_dictation_origin(
-            "session-first-replayed",
-            &pair_key,
-            "origin-first",
+        assert_eq!(
+            promote_learn_pair_if_eligible_with_status(
+                &dir,
+                &pair_key,
+                "VoiceFlo",
+                "VoiceFlow",
+                None,
+                2,
+                false,
+            )
+            .unwrap(),
+            LearnPairPromotionStatus::Promoted
         );
+        let hits_before_replay = get_learn_pair(&dir, &pair_key).unwrap().unwrap().hits;
+        let replay =
+            LearnPairObservation::research_fixture_origin("research-origin-first", &pair_key);
         assert!(matches!(
             upsert_learn_pair_with_observation(
                 &dir,
@@ -17347,6 +20765,10 @@ mod tests {
         );
         assert_eq!(
             count_independent_learn_pair_hits(&dir, &pair_key).unwrap(),
+            3
+        );
+        assert_eq!(
+            count_research_fixture_learn_pair_hits(&dir, &pair_key).unwrap(),
             2
         );
         let connection = open_history(&dir).unwrap();
@@ -17359,7 +20781,12 @@ mod tests {
         drop(connection);
         assert_eq!(
             count_independent_learn_pair_hits(&dir, &pair_key).unwrap(),
-            0
+            2,
+            "fixture receipts remain while the History-linked weak receipt is deleted"
+        );
+        assert_eq!(
+            count_research_fixture_learn_pair_hits(&dir, &pair_key).unwrap(),
+            2
         );
         fs::remove_dir_all(dir).unwrap();
     }
@@ -17767,6 +21194,118 @@ mod tests {
     }
 
     #[test]
+    fn originless_history_edit_keeps_scoped_identity_and_dedupes_by_history_row() {
+        let dir = temp_dir("originless-history-scoped-observation");
+        let before = "黎明";
+        let after = "李明";
+        let scope = LearnPairScope {
+            family: Some("personal_chat".into()),
+            mapping_id: Some("messages".into()),
+            native_bundle: Some("com.apple.MobileSMS".into()),
+            ..LearnPairScope::default()
+        };
+        let pair_key = crate::store::scoped_word_rule_key(
+            before,
+            after,
+            &scope,
+            LearnPairMatchPolicy::IgnoreCase,
+        )
+        .into_string();
+        insert_history(&dir, before, before, 1.0, false).unwrap();
+        let connection = open_history(&dir).unwrap();
+        let history_id = connection
+            .query_row(
+                "SELECT id FROM dictations ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE dictations SET transaction_id = NULL WHERE id = ?1",
+                [history_id],
+            )
+            .unwrap();
+        drop(connection);
+
+        let first_revision = save_manual_history_revision(&dir, history_id, after)
+            .unwrap()
+            .revision_id
+            .unwrap();
+        let first_observation = LearnPairObservation::history_edit_from_store(
+            &dir,
+            history_id,
+            first_revision,
+            &pair_key,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(first_observation.uses_scoped_word_identity());
+        assert_eq!(
+            first_observation.rule_key.as_deref(),
+            Some(pair_key.as_str())
+        );
+        assert_eq!(first_observation.channel, Some("history_edit"));
+        assert!(!first_observation.proof_eligible());
+        assert_eq!(first_observation.source_history_id, Some(history_id));
+        assert_eq!(first_observation.source_revision_id, Some(first_revision));
+
+        assert!(matches!(
+            upsert_auto_scoped_learn_pair_with_observation(
+                &dir,
+                &pair_key,
+                before,
+                after,
+                Some(&scope),
+                Some(&first_observation),
+            )
+            .unwrap(),
+            LearnPairUpsert::Stored(row) if row.hits == 1 && row.auto_scoped
+        ));
+
+        // Revisions that reverse and repeat the same pair on one originless
+        // History row must not make the candidate look like a second source.
+        save_manual_history_revision(&dir, history_id, before).unwrap();
+        let repeated_revision = save_manual_history_revision(&dir, history_id, after)
+            .unwrap()
+            .revision_id
+            .unwrap();
+        let repeated_observation = LearnPairObservation::history_edit_from_store(
+            &dir,
+            history_id,
+            repeated_revision,
+            &pair_key,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            repeated_observation.observation_key,
+            first_observation.observation_key
+        );
+        assert!(matches!(
+            upsert_auto_scoped_learn_pair_with_observation(
+                &dir,
+                &pair_key,
+                before,
+                after,
+                Some(&scope),
+                Some(&repeated_observation),
+            )
+            .unwrap(),
+            LearnPairUpsert::Skipped(LearnPairSkipReason::DuplicateObservation)
+        ));
+        let row = get_learn_pair(&dir, &pair_key).unwrap().unwrap();
+        assert_eq!(row.hits, 1);
+        assert!(!row.promoted);
+        assert!(row.auto_scoped);
+        assert_eq!(
+            count_independent_learn_pair_hits(&dir, &pair_key).unwrap(),
+            0
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn clear_all_data_deletes_style_drafts() {
         let dir = temp_dir("style-drafts-clear");
         upsert_style_draft(&dir, "wechat", "fewer_periods", "你好。", "你好。", "你好").unwrap();
@@ -17844,6 +21383,58 @@ mod tests {
         assert!(row.is_live_promoted());
         assert_eq!(row.family.as_deref(), Some("personal_chat"));
         assert_eq!(row.native_bundle.as_deref(), Some("com.tencent.xinWeChat"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn history_persists_only_the_selected_mapping_identity_fingerprint() {
+        let dir = temp_dir("history-mapping-identity");
+        let mapping = crate::context::AppMapping {
+            id: "codex".into(),
+            label: "Codex".into(),
+            family: crate::context::ContextFamily::DeveloperCollaboration,
+            writing_task_id: None,
+            writing_preferences: Vec::new(),
+            preference_guidance_provider_approved: false,
+            preference_revision: 0,
+            deleted: false,
+            mode_id: None,
+            bundle_id: Some("com.openai.codex".into()),
+            executable: None,
+            browser_host: None,
+            browser_path_prefix: None,
+            focused_field: None,
+            source_permissions: Default::default(),
+            style_example_input: None,
+            style_example_output: None,
+            style_example_pairs: Vec::new(),
+            style_examples_approved: false,
+            enabled: true,
+            cleanup_effort: None,
+            cleanup_intensity: None,
+            cleanup_enabled: true,
+            dictionary_learn_enabled: true,
+        };
+        let fingerprint = mapping.declared_identity_fingerprint();
+        let mut snapshot = crate::context::ContextSnapshot::general();
+        snapshot.profile.id = "user.codex".into();
+        snapshot.profile.family = mapping.family;
+        snapshot.target_guard.bundle_id = mapping.bundle_id.clone();
+        snapshot.mapping_identity = Some(fingerprint.clone());
+        insert_history_with_context(&dir, "raw", "final", 1.0, false, &snapshot).unwrap();
+        let id = get_history_page(&dir, 1, None, None).unwrap().items[0].id;
+        assert_eq!(
+            history_scene(&dir, id).unwrap().mapping_identity.as_deref(),
+            Some(fingerprint.as_str())
+        );
+        assert_eq!(
+            save_manual_history_revision(&dir, id, "edited final")
+                .unwrap()
+                .scene
+                .mapping_identity
+                .as_deref(),
+            Some(fingerprint.as_str())
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 

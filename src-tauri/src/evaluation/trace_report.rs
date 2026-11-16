@@ -4,6 +4,7 @@ use super::quantile::linear_quantile;
 use super::{runner, validation};
 use crate::metrics::{
     CacheStatus, DeliveryOutcome, DictationClass, ReportedScope, ReportedStageDuration, Stage,
+    StopDiagnostics,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -30,6 +31,8 @@ struct PersistedTrace {
     reported_stages: Vec<ReportedStageDuration>,
     #[serde(default)]
     cache_status: Option<CacheStatus>,
+    #[serde(default)]
+    stop_diagnostics: Option<StopDiagnostics>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -94,6 +97,8 @@ struct TerminalRow {
     outcome: DeliveryOutcome,
     total_ms: u64,
     cache_status: Option<CacheStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stop_diagnostics: Option<StopDiagnostics>,
     branch_evidence: BranchEvidence,
     evidence_source: EvidenceSource,
     host_stages: Vec<StageObservation>,
@@ -385,6 +390,7 @@ fn terminal_row(
         outcome: row.outcome,
         total_ms: row.total_ms,
         cache_status: row.cache_status,
+        stop_diagnostics: row.stop_diagnostics,
         branch_evidence: match branch {
             Some(Branch::Short) => BranchEvidence::Short,
             Some(Branch::Long) => BranchEvidence::Long,

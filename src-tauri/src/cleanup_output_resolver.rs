@@ -34,6 +34,12 @@ pub(crate) struct CleanupOutputFacts {
     /// inferred layout; the coarse FocusKind is not sufficient evidence.
     pub(crate) multiline_capable: bool,
     pub(crate) focus_kind: FocusKind,
+    /// A consented task preference may select bullets, but projection still
+    /// requires explicit source boundaries and the existing target checks.
+    pub(crate) preferred_bullets: bool,
+    /// The live caller has positively established an ordinary Auto prose
+    /// request that may ask the model to choose paragraph breaks.
+    pub(crate) allow_model_selected_paragraphs: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,7 +82,11 @@ pub(crate) fn resolve_cleanup_projection(
     // A manual format is compatible only after the caller has established a
     // prose target. Layout evidence is evaluated separately, so weak source
     // evidence can leave prose intact while retaining its one selected add-on.
-    let selected_mode = match (facts.output_mode, operation) {
+    let preference_requests_bullets = facts.preferred_bullets
+        && facts.output_mode == OutputMode::Auto
+        && facts.output_mode_compatible
+        && operation == CleanupOperation::Cleanup;
+    let candidate_mode = match (facts.output_mode, operation) {
         (_, CleanupOperation::Translate) => OutputMode::Translation,
         (OutputMode::Auto, _) | (OutputMode::Code, _) | (OutputMode::Translation, _) => {
             facts.output_mode
@@ -89,23 +99,56 @@ pub(crate) fn resolve_cleanup_projection(
         (OutputMode::Email | OutputMode::Bullets | OutputMode::MeetingNotes, _) => OutputMode::Auto,
     };
 
-    let requested_layout = if operation == CleanupOperation::Cleanup
+    let mut requested_layout = if operation == CleanupOperation::Cleanup
         && facts.output_mode_compatible
         && can_project_layout(facts.focus_kind, facts.multiline_capable)
     {
-        layout_mode(selected_mode, facts.auto_scene)
+        if preference_requests_bullets {
+            OutputLayoutMode::List
+        } else {
+            layout_mode(candidate_mode, facts.auto_scene)
+        }
     } else {
         OutputLayoutMode::None
     };
-    let projection = project_cleanup_layout(canonical_projection_source, requested_layout)?;
+    let mut projection = project_cleanup_layout(canonical_projection_source, requested_layout)?;
+    let mut preference_selected =
+        preference_requests_bullets && projection.structure == ProjectedStructure::List;
+    if preference_requests_bullets
+        && requested_layout == OutputLayoutMode::List
+        && !preference_selected
+    {
+        // If the source cannot prove a list, resolve the original mode's
+        // layout from the same canonical text instead of keeping a failed
+        // preference projection. This preserves AutoEmail paragraph breaks.
+        requested_layout = layout_mode(candidate_mode, facts.auto_scene);
+        projection = project_cleanup_layout(canonical_projection_source, requested_layout)?;
+        preference_selected = false;
+    }
+    let selected_mode = if preference_requests_bullets && preference_selected {
+        OutputMode::Bullets
+    } else {
+        candidate_mode
+    };
     let structure = if crate::spoken_layout::has_structural_layout(canonical_projection_source) {
         StructureClass::SpokenOrRendered
     } else if projection.structure != ProjectedStructure::Unchanged {
         StructureClass::SourceBackedInference
+    } else if facts.allow_model_selected_paragraphs
+        && facts.output_mode == OutputMode::Auto
+        && operation == CleanupOperation::Cleanup
+        && facts.output_mode_compatible
+        && !matches!(
+            facts.focus_kind,
+            FocusKind::Unknown | FocusKind::Code | FocusKind::Search
+        )
+        && can_project_layout(facts.focus_kind, facts.multiline_capable)
+    {
+        StructureClass::ModelSelectedParagraphs
     } else {
         StructureClass::None
     };
-    let Some(plan) = EffectiveCleanupPlan::for_operation(
+    let Some(mut plan) = EffectiveCleanupPlan::for_operation(
         edit_budget,
         selected_mode,
         facts.auto_scene,
@@ -114,6 +157,9 @@ pub(crate) fn resolve_cleanup_projection(
     ) else {
         return Ok(None);
     };
+    if preference_selected {
+        plan.mode_source = crate::cleanup_prompt::ModeSource::Preference;
+    }
 
     Ok(Some(ResolvedCleanupProjection {
         plan,
@@ -217,6 +263,8 @@ mod tests {
             output_mode_compatible: true,
             multiline_capable: true,
             focus_kind: FocusKind::Document,
+            preferred_bullets: false,
+            allow_model_selected_paragraphs: false,
         }
     }
 
@@ -243,6 +291,74 @@ mod tests {
     }
 
     #[test]
+    fn consented_task_bullet_preference_only_projects_source_backed_items() {
+        let mut preference = facts(
+            OutputMode::Auto,
+            AutoScene::IssueBody,
+            CleanupIntensity::Heavy,
+        );
+        preference.preferred_bullets = true;
+        let source = "The three tasks are: update API; fix tests; review docs.";
+        let result = resolve_cleanup_projection(preference, source)
+            .expect("projection is valid")
+            .expect("ordinary cleanup is eligible");
+        assert_eq!(
+            result.projection.text,
+            "The three tasks are:\n- update API\n- fix tests\n- review docs."
+        );
+        assert_eq!(result.plan.output_add_on, OutputAddOn::Bullets);
+        assert_eq!(result.plan.mode_source, ModeSource::Preference);
+        assert_eq!(result.plan.structure, StructureClass::SourceBackedInference);
+
+        let ambiguous_source = "I will review the docs and ask whether they are ready.";
+        let unchanged = resolve_cleanup_projection(preference, ambiguous_source)
+            .expect("projection is valid")
+            .expect("ordinary cleanup is eligible");
+        assert_eq!(unchanged.projection.text, ambiguous_source);
+        assert_eq!(unchanged.plan.mode_source, ModeSource::AutoScene);
+        assert_eq!(unchanged.plan.output_add_on, OutputAddOn::AutoIssueBody);
+
+        let mut explicit_mode = preference;
+        explicit_mode.output_mode = OutputMode::Email;
+        let overridden = resolve_cleanup_projection(explicit_mode, source)
+            .expect("projection is valid")
+            .expect("ordinary cleanup is eligible");
+        assert_eq!(overridden.plan.output_add_on, OutputAddOn::Email);
+        assert_eq!(overridden.plan.mode_source, ModeSource::Manual);
+    }
+
+    #[test]
+    fn email_auto_scene_is_restored_when_preferred_list_has_no_source_proof() {
+        let mut email = facts(
+            OutputMode::Auto,
+            AutoScene::Email,
+            CleanupIntensity::Standard,
+        );
+        email.preferred_bullets = true;
+        let source = "We will ship the patch. Separately, we should review the docs.";
+        let preferred_result = resolve_cleanup_projection(email, source)
+            .expect("projection is valid")
+            .expect("ordinary cleanup is eligible");
+        let mut baseline_facts = email;
+        baseline_facts.preferred_bullets = false;
+        let baseline_result = resolve_cleanup_projection(baseline_facts, source)
+            .expect("baseline projection is valid")
+            .expect("ordinary cleanup is eligible");
+
+        assert_eq!(preferred_result, baseline_result);
+        assert_eq!(
+            preferred_result.projection.structure,
+            ProjectedStructure::Paragraph
+        );
+        assert_eq!(
+            preferred_result.projection.text,
+            "We will ship the patch.\n\nSeparately, we should review the docs."
+        );
+        assert_eq!(preferred_result.plan.output_add_on, OutputAddOn::AutoEmail);
+        assert_eq!(preferred_result.plan.mode_source, ModeSource::AutoScene);
+    }
+
+    #[test]
     fn structure_safe_overrides_heavy_for_source_backed_projection() {
         let source = "The first item is ready. Separately, the release is ready.";
         let result = resolve_cleanup_projection(
@@ -262,6 +378,105 @@ mod tests {
         assert_eq!(
             result.projection.text,
             "The first item is ready.\n\nSeparately, the release is ready."
+        );
+    }
+
+    #[test]
+    fn model_selected_paragraphs_are_live_auto_only_and_keep_the_selected_edit_budget() {
+        let mut eligible = facts(
+            OutputMode::Auto,
+            AutoScene::General,
+            CleanupIntensity::Standard,
+        );
+        eligible.allow_model_selected_paragraphs = true;
+        let source = "The release is ready. Separately, the next review starts tomorrow.";
+        let result = resolve_cleanup_projection(eligible, source)
+            .expect("projection is valid")
+            .expect("ordinary cleanup is eligible");
+        assert_eq!(result.projection.text, source);
+        assert_eq!(
+            result.plan.structure,
+            StructureClass::ModelSelectedParagraphs
+        );
+        assert_eq!(result.plan.edit_budget, EditBudget::Standard);
+
+        let mut explicit_mode = eligible;
+        explicit_mode.output_mode = OutputMode::Email;
+        assert_eq!(
+            resolve_cleanup_projection(explicit_mode, source)
+                .unwrap()
+                .unwrap()
+                .plan
+                .structure,
+            StructureClass::None
+        );
+
+        let mut ineligible = eligible;
+        ineligible.allow_model_selected_paragraphs = false;
+        ineligible.output_mode = OutputMode::MeetingNotes;
+        let structure_source = "The first item is ready. Separately, the release is ready.";
+        assert_eq!(
+            resolve_cleanup_projection(ineligible, structure_source)
+                .unwrap()
+                .unwrap()
+                .plan
+                .edit_budget,
+            EditBudget::StructureSafe
+        );
+
+        let already_structured =
+            resolve_cleanup_projection(eligible, "First line.\n\nSecond line.")
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            already_structured.plan.structure,
+            StructureClass::SpokenOrRendered
+        );
+        assert_eq!(
+            already_structured.plan.edit_budget,
+            EditBudget::StructureSafe
+        );
+    }
+
+    #[test]
+    fn coding_prompt_multiline_can_use_auto_paragraphs_while_code_and_unknown_cannot() {
+        let mut codex_prompt = facts(
+            OutputMode::Auto,
+            AutoScene::DeveloperPrompt,
+            CleanupIntensity::Light,
+        );
+        codex_prompt.focus_kind = FocusKind::CodingPrompt;
+        codex_prompt.allow_model_selected_paragraphs = true;
+        let source = "Please review the implementation. Also check the tests.";
+        assert_eq!(
+            resolve_cleanup_projection(codex_prompt, source)
+                .unwrap()
+                .unwrap()
+                .plan
+                .structure,
+            StructureClass::ModelSelectedParagraphs
+        );
+
+        let mut code = codex_prompt;
+        code.focus_kind = FocusKind::Code;
+        assert_eq!(
+            resolve_cleanup_projection(code, source)
+                .unwrap()
+                .unwrap()
+                .plan
+                .structure,
+            StructureClass::None
+        );
+
+        let mut unknown = codex_prompt;
+        unknown.focus_kind = FocusKind::Unknown;
+        assert_eq!(
+            resolve_cleanup_projection(unknown, source)
+                .unwrap()
+                .unwrap()
+                .plan
+                .structure,
+            StructureClass::None
         );
     }
 

@@ -28,6 +28,19 @@ jobs:
       - name: Release workflow hermetic tests
         run: ./scripts/release-test.sh
 
+  website:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: website/package-lock.json
+      - run: npm ci --prefix website --registry=https://registry.npmjs.org
+      - run: npm run lint --prefix website
+      - run: npm run build --prefix website
+
   rust:
     runs-on: macos-15
     steps:

@@ -90,6 +90,7 @@ impl OutputAddOn {
 pub(crate) enum ModeSource {
     AutoScene,
     Manual,
+    Preference,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,6 +98,9 @@ pub(crate) enum StructureClass {
     None,
     SpokenOrRendered,
     SourceBackedInference,
+    /// An ordinary Auto cleanup may choose paragraph boundaries, subject to
+    /// the strict source alignment guard at both provider and final output.
+    ModelSelectedParagraphs,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -136,8 +140,10 @@ impl EffectiveCleanupPlan {
         }
         let edit_budget = if operation == crate::llm::CleanupOperation::Cleanup
             && output_mode != OutputMode::Translation
-            && structure != StructureClass::None
-        {
+            && matches!(
+                structure,
+                StructureClass::SpokenOrRendered | StructureClass::SourceBackedInference
+            ) {
             EditBudget::StructureSafe
         } else {
             edit_budget
@@ -228,18 +234,74 @@ impl OutputAddOn {
 
 /// Returns `None` for Off so a caller cannot accidentally turn the route
 /// decision into an AI request.
+#[cfg(test)]
 pub(crate) fn build_system_prompt(
     edit_budget: EditBudget,
     output_add_on: OutputAddOn,
 ) -> Option<String> {
+    build_system_prompt_with_paragraphing(edit_budget, output_add_on, false)
+}
+
+pub(crate) fn build_system_prompt_with_paragraphing(
+    edit_budget: EditBudget,
+    output_add_on: OutputAddOn,
+    auto_paragraphing: bool,
+) -> Option<String> {
     if output_add_on == OutputAddOn::Code {
         return None;
     }
-    Some(format!(
+    let auto_paragraphing = auto_paragraphing
+        && !matches!(
+            edit_budget,
+            EditBudget::Off | EditBudget::StructureSafe | EditBudget::AuthorizedOperation
+        )
+        && matches!(
+            output_add_on,
+            OutputAddOn::AutoGeneral
+                | OutputAddOn::AutoPersonalChat
+                | OutputAddOn::AutoWorkChat
+                | OutputAddOn::AutoEmail
+                | OutputAddOn::AutoDocument
+                | OutputAddOn::AutoDeveloperPrompt
+                | OutputAddOn::AutoIssueBody
+                | OutputAddOn::AutoNotes
+        );
+    let mut prompt = format!(
         "{BASE}\n\nEDIT_BUDGET:\n{}\n\nOUTPUT_ADD_ON:\n{}\n\nOutput add-ons do not permit model-created or model-normalized layout and do not permit edits beyond the selected budget or operation.",
         edit_budget.text()?,
         output_add_on.text()
-    ))
+    );
+    if auto_paragraphing {
+        prompt = prompt
+            .replace(
+                "Add or remove no facts, recipients, reasons, greetings, sign-offs, headings, subjects, bullets, or paragraphs. Never create, remove, split, merge, reorder, or normalize line/paragraph boundaries, list prefixes, or indentation.",
+                "Add or remove no facts, recipients, reasons, greetings, sign-offs, headings, subjects, or bullets. Never change line boundaries, list prefixes, or indentation. Add sentence paragraph breaks only as defined by AUTO_PARAGRAPHING_POLICY.",
+            )
+            .replace(
+                "Do not rephrase, reorder, change layout, or change any other wording.",
+                "Do not rephrase, reorder, change layout, or change any other wording except paragraph breaks defined by AUTO_PARAGRAPHING_POLICY.",
+            )
+            .replace(
+                "Do not paraphrase, condense, reorder, or change layout.",
+                "Do not paraphrase, condense, reorder, or change layout except paragraph breaks defined by AUTO_PARAGRAPHING_POLICY.",
+            )
+            .replace(
+                "Do not summarize, condense, reorder, or change layout.",
+                "Do not summarize, condense, reorder, or change layout except paragraph breaks defined by AUTO_PARAGRAPHING_POLICY.",
+            )
+            .replace(
+                "Keep the document presentation established by local preparation. Do not create headings, lists, or paragraphs.",
+                "Keep the document presentation established by local preparation. Do not create headings or lists.",
+            )
+            .replace(
+                "Output add-ons do not permit model-created or model-normalized layout and do not permit edits beyond the selected budget or operation.",
+                "Output add-ons do not permit model-created or model-normalized layout except paragraph breaks defined by AUTO_PARAGRAPHING_POLICY, and do not permit edits beyond the selected budget or operation.",
+            );
+        prompt.push_str(
+            "\n\nAUTO_PARAGRAPHING_POLICY: For eligible Auto prose, choose topic breaks only at sentence boundaries. Preserve body words, case, order, and internal whitespace; allow only safety-approved punctuation edits. Use one blank line; add no headings or bullets. Keep one paragraph unless the topic changes; never split abbreviations, initials, dates, numbers, code, literals, or protected spans.",
+        );
+    }
+    Some(prompt)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -250,6 +312,7 @@ pub(crate) enum ReferenceField {
     VisibleContext,
     DictionaryAndStyleReferences,
     UserStyleGuidance,
+    UserPreferenceGuidance,
     TranslationTarget,
 }
 
@@ -262,6 +325,7 @@ impl ReferenceField {
             Self::VisibleContext => "VISIBLE_CONTEXT",
             Self::DictionaryAndStyleReferences => "DICTIONARY_AND_STYLE_REFERENCES",
             Self::UserStyleGuidance => "USER_STYLE_GUIDANCE",
+            Self::UserPreferenceGuidance => "USER_PREFERENCE_GUIDANCE",
             Self::TranslationTarget => "AUTHORIZED_TRANSLATION_TARGET",
         }
     }

@@ -53,6 +53,9 @@ export function hudStageTimerKey(
   phase: ProcessingPhase,
   phaseConfirmed: boolean,
 ): string {
+  if (state === "recording" || state === "recording_limited") {
+    return `${generation}:recording`;
+  }
   return `${generation}:${state}:${phase}:${phaseConfirmed ? "confirmed" : "unconfirmed"}`;
 }
 

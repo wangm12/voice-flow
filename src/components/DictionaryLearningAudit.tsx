@@ -8,13 +8,17 @@ const labels: Record<string, string> = {
   name: "人名", term: "术语", rejected: "已拒绝", unchanged_or_empty: "文字相同或为空", case_only: "仅大小写变化", surface_rejected: "不符合可学习词形",
   pending: "待确认", db_promoted: "数据库已记为晋升", tombstoned: "已忽略或撤销", eligible_now: "本次词典与记录状态符合筛选", not_eligible_now: "本次词典或记录状态未通过筛选",
   word_pair: "词语替换", style_preference: "风格偏好", cleanup_intensity: "整理强度",
+  ignore_case: "按 ASCII 大小写不敏感匹配", exact: "大小写精确匹配", mapping_binding_invalidated: "App mapping 绑定已失效",
+  mapping_deleted: "App mapping 已删除", declared_identity_changed: "App mapping 匹配条件已变更", missing_binding_at_migration: "未找到原 App mapping", bound: "仍绑定原 mapping",
+  manual_scoped_owner: "手动 App 专用规则", auto_scoped_owner: "自动范围规则", dictionary_rule_owner: "全局词典规则来源",
   in_progress: "进行中", closed: "本次活动已结束", superseded: "已被后续状态取代", unknown: "未知",
   checking: "检查中", started: "已开始观察", skipped: "未开始观察", registered: "同一输入框检查通过", unverified: "插入未核验", read_owner_unavailable: "无法确认输入框读取身份", delivery_owner_mismatch: "插入与输入框读取身份不匹配", read_lease_expired: "输入框读取许可已过期", delivery_fact_mismatch: "插入交付事实不匹配", secure: "安全输入", unreadable: "无法读取输入框",
+  accessibility_permission_revoked: "辅助功能权限已撤销", input_source_unsupported: "输入来源不受支持", input_source_unknown: "输入来源未知",
   stale_or_cancelled: "已过期或取消", no_grant: "学习未获准", protected_target: "受保护的目标", no_mapping: "没有匹配的 App 规则", ax_or_learning_not_allowed: "文字来源或学习未获准", scene_not_allowed: "此场景不允许学习", target_changed: "目标已改变", ambiguous_inserted_range: "插入范围不明确", fixture_baseline_mismatch: "受控基线不匹配",
   not_observed: "未观察", observing: "正在观察", nochange: "未检测到变化", single_token: "检测到短词变化", multiple_tokens: "检测到多个词项变化", short_style_rewrite: "检测到短风格改写", style_signal: "检测到风格信号", ambiguous: "无法明确分类",
-  not_attempted: "未尝试", already_db_promoted: "数据库已有晋升记录", tombstone_or_ignored: "保留忽略或撤销记录", cap: "达到候选容量", completed: "该调用已完成", failed: "该调用失败", unknown_scope: "规则范围未知", dictation_origin_unknown: "听写来源未知", scope_conflict: "现有规则范围冲突", duplicate_observation: "已记录同一观察", db_promotion_failed: "数据库晋升失败",
+  not_attempted: "未尝试", already_db_promoted: "数据库已有晋升记录", tombstone_or_ignored: "保留忽略或撤销记录", cap: "达到候选容量", completed: "该调用已完成", failed: "该调用失败", unknown_scope: "规则范围未知", dictation_origin_unknown: "听写来源未知", scope_conflict: "现有规则范围冲突", cross_scope_auto_promotion_blocked: "已有其他范围的同纠正规则；自动晋升被阻止", duplicate_observation: "已记录同一观察", db_promotion_failed: "数据库晋升失败",
   db_promotion_recorded: "已写入晋升标记", settings_save_completed: "设置保存调用已完成", store_error: "存储调用失败", candidate_db_returned: "候选数据库调用已返回", style_draft_returned: "风格草稿调用已返回", no_settings_change: "没有设置变更", manual_scoped_pair_saved: "App 范围规则已保存",
-  add_dictionary_entries: "添加词条", confirm_pair: "确认规则", ignore_pair: "忽略规则", undo_pair: "撤销规则", remove_dictionary_word: "删除词典词条", confirm_style_draft: "确认风格样例", dismiss_style_draft: "忽略风格草稿", add_manual_scoped_pair: "添加 App 范围规则",
+  add_dictionary_entries: "添加词条", confirm_pair: "确认规则", ignore_pair: "忽略规则", undo_pair: "撤销规则", remove_dictionary_word: "删除词典词条", confirm_style_draft: "确认风格样例", dismiss_style_draft: "忽略风格草稿", add_manual_scoped_pair: "添加 App 范围规则", rebind_invalidated_pair: "重新绑定 App 规则",
   dictionary_command: "词典操作命令", manual_confirmation_with_history_reference: "带历史引用的手动确认", not_provided: "未提供", lookup_succeeded: "历史引用查找成功", lookup_unknown: "历史引用未确认",
   requested: "已请求", stale: "已过期",
 };
@@ -39,7 +43,10 @@ function Pair({ pair }: { pair: LearningAuditPair }) {
     </summary>
     <dl className="mt-3 grid min-w-0 gap-3 sm:grid-cols-2">
       <Fact label={t("当前分类（本次读取推导）")}>{pair.classification_authority === "not_word_pair" ? t("不适用：不是词语规则") : <Classification value={pair.current_classification} />}</Fact>
-      <Fact label={t("候选记录数 / 当前门槛")}>{pair.candidate_hits} / {pair.current_promote_threshold === null ? t("不适用或未知") : pair.current_promote_threshold}</Fact>
+      <Fact label={t("候选记录数 / 自动晋升门槛")}>{pair.candidate_hits} / {pair.current_promote_threshold === null ? t("不适用或未知") : pair.current_promote_threshold}</Fact>
+      <Fact label={t("表面匹配策略")}>{t(labels[pair.match_policy])}</Fact>
+      <Fact label={t("App mapping 绑定")}>{pair.binding_invalidated_reason === null ? t(labels.bound) : t(labels[pair.binding_invalidated_reason])}{pair.binding_invalidated_at !== null && <> · {pair.binding_invalidated_at}</>}</Fact>
+      <Fact label={t("规则来源所有权")}>{t(pair.manual_scoped ? labels.manual_scoped_owner : pair.auto_scoped ? labels.auto_scoped_owner : labels.dictionary_rule_owner)}</Fact>
       <Fact label={t("原始学习来源")}>{t("未持久化，来源未知")}</Fact>
       <Fact label={t("忽略或撤销原因")}>{pair.tombstone_reason === null ? t("未提供或不适用") : t("旧记录未保存具体原因")}</Fact>
       <Fact label={t("记录的场景（不代表当前授权）")}><dl>{([["场景", scope.family], ["App 规则", scope.mapping_id], ["网站", scope.browser_host], ["App 标识", scope.native_bundle]] as const).map(([label, value]) => <div key={label}><dt className="inline">{t(label)}: </dt><dd className="inline">{value === null ? t("未提供") : value === "" ? t("空字符串") : value}</dd></div>)}</dl></Fact>

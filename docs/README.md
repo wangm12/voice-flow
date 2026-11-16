@@ -8,8 +8,9 @@
 | --- | --- |
 | [README.md](../README.md) | 快速开始、日常用法、开发与发布入口 |
 | [THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md) | MLX sidecar 与 llama.cpp runtime 的上游 LICENSE/NOTICE、Swift 参考文本、Handy 组件及固定本地模型的来源说明 |
+| [VoiceFlow 视觉设计规范与 Liquid Glass 指南](design/voiceflow-design-system.md) | 当前设置界面视觉规则、共用组件、主题、间距、HUD 胶囊与 Liquid Glass 实际材质和模拟预览边界 |
 | [privacy.md](privacy.md) | 数据流、本地保留、Keychain、删除 |
-| [end-to-end-workflows.md](end-to-end-workflows.md) | 首次配置 / 本机麦克风自检 / 词典反馈 / batch 预取 / Soniox 实时流与恢复 / AssemblyAI Dictation + raw Sync / Qwen Audio Message / 口述 / 长录音与完整音频恢复 / 六类选中文本操作 / 手动看屏幕 / PromptOrCode 与 Code 中的请求边界 |
+| [end-to-end-workflows.md](end-to-end-workflows.md) | 首次配置 / 本机麦克风自检 / 词典反馈与 History 写作偏好候选复核 / batch 预取 / Soniox 实时流与恢复 / AssemblyAI Dictation + raw Sync / Qwen Audio Message / 口述 / 长录音与完整音频恢复 / 六类选中文本操作 / 手动看屏幕 / PromptOrCode 与 Code 中的请求边界 |
 | [cleanup-evaluation.md](cleanup-evaluation.md) | 确定性本地整理评测、test-only 编辑归因裁判、feature-gated WAV evaluator、strict corpus/recipe/negative 契约、显式 SHA 候选重放、当前执行范围与可选 live provider 协议（不代表 runtime/E2E 验收） |
 | [public-corpus-preparation.md](public-corpus-preparation.md) | 显式有界公共语料下载、ASCEND 待审候选、独立人工标签导入和 YODAS 元数据准备 |
 | [asr-cleanup-later-and-wont.md](asr-cleanup-later-and-wont.md) | 以后再做 / 明确不做 |
@@ -19,6 +20,7 @@
 ## 维护工具
 
 - [依赖归属与原文生成工具](../scripts/research/third-party-notices/tools/README.md)：按锁定依赖生成外部 staging，保留原文、引用类型、缺失和来源身份；测试使用离线 fixtures。
+- [词典学习试点工具与本机证据流程](../scripts/research/dictionary-learning-pilot.md)：冻结并分析 §4–5 的技术验收与真人收益试点；空白账本保持 pending，程序化 fixture 不算真人结果。
 
 ## 仍进行中的计划（不代表当前行为）
 
@@ -27,7 +29,8 @@
 | 文档 | 内容 |
 | --- | --- |
 | [Chatterfly 改进计划](chatterfly-improvement-plan-2026-10-26.md) | 尚未关闭的分阶段改进、验证协议、成功门槛与回退条件 |
-| [Cleanup 与纠错学习 harness 改进计划](cleanup-learning-harness-plan-2026-11-05.md) | 尚未关闭的编辑观察、归因、作用域规则、晋升/召回、prompt 消融与学习 episode 门槛 |
+| [VoiceFlow 词典学习 Harness 执行方案](design/voiceflow-dictionary-learning-harness-plan.md) | 前两周真人链路技术验收、收益试点门槛与 C1 启动条件 |
+| [Cleanup 与纠错学习 harness 改进计划](cleanup-learning-harness-plan-2026-11-05.md) | 编辑观察、归因、作用域规则、晋升/召回、prompt 消融与学习 episode 的详细技术合同。近期执行顺序以词典学习 Harness 执行方案为准 |
 | [本地模型扩充计划](local-model-expansion-plan-2026-11-09.md) | Parakeet V3 托管下载、Fun-ASR-Nano 等中文 ASR 候选、Qwen 4B／Gemma E4B 与 MLX 27B 对照 |
 
 ## 设计参考（归档，不作为实现规范）

@@ -6033,6 +6033,7 @@ mod tests {
                     output_projection_list_revision_proof: None,
                     layout_source: None,
                     exact_fallback: false,
+                    allow_model_selected_paragraphs: false,
                 },
             )
             .expect("nonempty deterministic final result")
@@ -6784,6 +6785,7 @@ mod tests {
                 output_projection_list_revision_proof: None,
                 layout_source: None,
                 exact_fallback: false,
+                allow_model_selected_paragraphs: false,
             },
         )
         .expect("nonempty selected Rewrite candidate has a final result");
@@ -6838,6 +6840,7 @@ mod tests {
                     output_projection_list_revision_proof: None,
                     layout_source: None,
                     exact_fallback: false,
+                    allow_model_selected_paragraphs: false,
                 },
             )
             .expect("nonempty deterministic final result")
@@ -7634,6 +7637,7 @@ mod tests {
                     output_projection_list_revision_proof: None,
                     layout_source: None,
                     exact_fallback: false,
+                    allow_model_selected_paragraphs: false,
                 },
             )
             .expect("nonempty synthetic source always has a final result");

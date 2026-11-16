@@ -18,10 +18,14 @@ describe("normal learning audit native boundary", () => {
     expect(result?.activity[1].fact.kind === "review_action" && result.activity[1].fact.candidate_store).toEqual({ status: "completed", reason: "manual_scoped_pair_saved" });
     expect(result?.activity[2].fact.kind === "review_action" && result.activity[2].fact.candidate_store).toEqual({ status: "failed", reason: "store_error" });
     const decisions = result?.activity.flatMap((entry) => entry.fact.kind === "post_paste_attempt" ? [entry.fact.candidate_decision] : []) ?? [];
-    expect(decisions).toEqual(["not_attempted", "not_attempted", "scope_conflict", "duplicate_observation", "db_promotion_failed"]);
+    expect(decisions).toEqual(["not_attempted", "not_attempted", "scope_conflict", "duplicate_observation", "db_promotion_failed", "mapping_binding_invalidated", "not_attempted", "not_attempted", "not_attempted"]);
     const registrationReasons = result?.activity.flatMap((entry) => entry.fact.kind === "post_paste_attempt" ? [entry.fact.registration.reason] : []) ?? [];
     expect(registrationReasons).toContain("fixture_baseline_mismatch");
     expect(registrationReasons).toContain("ambiguous_inserted_range");
+    expect(registrationReasons).toContain("accessibility_permission_revoked");
+    expect(registrationReasons).toContain("input_source_unsupported");
+    expect(registrationReasons).toContain("input_source_unknown");
+    expect(result?.activity.some((entry) => entry.fact.kind === "post_paste_attempt" && entry.fact.outcome === "unknown")).toBe(true);
     expect(result?.pairs[0].replacement_policy).toBe("context_scoped_promoted_rules");
   });
   it("still rejects unknown native contract values in the shared producer fixture", () => {
@@ -33,10 +37,13 @@ describe("normal learning audit native boundary", () => {
       return value;
     };
     expect(parseDictionaryLearningAudit(withActivityFact(1, { action: "future_action" }))).toBeNull();
+    expect(parseDictionaryLearningAudit(withActivityFact(0, { action: "rebind_invalidated_pair" }))).not.toBeNull();
     expect(parseDictionaryLearningAudit(withActivityFact(1, { candidate_store: { status: "completed", reason: "future_reason" } }))).toBeNull();
     expect(parseDictionaryLearningAudit(withActivityFact(4, { registration: { status: "skipped", reason: "future_skip" } }))).toBeNull();
     expect(parseDictionaryLearningAudit(withActivityFact(5, { candidate_decision: "future_decision" }))).toBeNull();
     expect(parseDictionaryLearningAudit(withActivityFact(5, { outcome: "future_outcome" }))).toBeNull();
+    expect(parseDictionaryLearningAudit({ ...nativeLearningAuditWire, pairs: [{ ...nativeLearningAuditWire.pairs[0], binding_invalidated_reason: "future_reason" }] })).toBeNull();
+    expect(parseDictionaryLearningAudit({ ...nativeLearningAuditWire, pairs: [{ ...nativeLearningAuditWire.pairs[0], match_policy: "unicode_fold" }] })).toBeNull();
     expect(parseDictionaryLearningAudit({ ...nativeLearningAuditWire, schema_version: 2 })).toBeNull();
     expect(parseDictionaryLearningAudit({ ...nativeLearningAuditWire, unexpected: true })).toBeNull();
   });
@@ -48,6 +55,7 @@ describe("normal learning audit native boundary", () => {
       "secure", "no_grant", "unreadable", "delivery_fact_mismatch", "fixture_baseline_mismatch",
       "ambiguous_inserted_range", "stale_or_cancelled", "protected_target", "no_mapping",
       "ax_or_learning_not_allowed", "scene_not_allowed", "target_changed",
+      "accessibility_permission_revoked", "input_source_unsupported", "input_source_unknown",
     ];
     for (const reason of registrationReasons) {
       const value = nativeObservationFact({
@@ -59,7 +67,7 @@ describe("normal learning audit native boundary", () => {
 
     const outcomes = [
       "not_observed", "observing", "nochange", "target_changed", "unreadable", "single_token",
-      "multiple_tokens", "short_style_rewrite", "style_signal", "ambiguous", "stale_or_cancelled",
+      "multiple_tokens", "short_style_rewrite", "style_signal", "ambiguous", "unknown", "stale_or_cancelled",
     ];
     for (const outcome of outcomes) {
       expect(parseDictionaryLearningAudit(nativeObservationFact({ outcome })), outcome).not.toBeNull();
@@ -68,7 +76,8 @@ describe("normal learning audit native boundary", () => {
     const candidateDecisions = [
       "not_attempted", "pending", "db_promoted", "already_db_promoted", "rejected",
       "tombstone_or_ignored", "cap", "unknown", "unknown_scope", "scope_conflict",
-      "duplicate_observation", "dictation_origin_unknown", "db_promotion_failed",
+      "cross_scope_auto_promotion_blocked", "duplicate_observation", "dictation_origin_unknown", "db_promotion_failed",
+      "mapping_binding_invalidated",
     ];
     for (const candidate_decision of candidateDecisions) {
       expect(parseDictionaryLearningAudit(nativeObservationFact({ candidate_decision })), candidate_decision).not.toBeNull();

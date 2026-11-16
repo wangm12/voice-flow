@@ -5903,6 +5903,7 @@ for line in sys.stdin:
             output_projection_list_revision_proof: None,
             layout_source: None,
             exact_fallback: false,
+            allow_model_selected_paragraphs: false,
         };
         let short_finalized = crate::with_traced_final_output(Some(&trace), || {
             crate::finalize_text_for_scene(

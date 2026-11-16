@@ -2480,7 +2480,7 @@ fn verify_directory_against_binding(
     }
     if validate_pinned_metadata {
         validate_model_metadata(directory)?;
-    } else {
+    } else if binding.model_id != MODEL_ID {
         validate_catalog_model_metadata(directory, binding.model_id, expected_files)?;
         validate_catalog_directory_inventory(directory, expected_files, true)?;
     }

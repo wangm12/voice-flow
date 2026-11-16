@@ -9,6 +9,7 @@ import { FileText, Upload } from "lucide-react";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { DictionaryLesson } from "./Onboarding/ContextualLessons";
 import { DictionaryLearningAudit } from "./DictionaryLearningAudit";
+import { LearningTransferSettings } from "./LearningTransferSettings";
 import { SettingsAlert, SettingsDisclosure, SettingsGroup, SettingsPageHeader, SettingsRow, SettingsShell } from "./SettingsLayout";
 import { MAX_DICTIONARY_FILE_BYTES, mergeDictionary, parseDictionaryText } from "../lib/dictionaryImport";
 import { useI18n } from "../lib/i18n";
@@ -40,9 +41,52 @@ type LearnPair = {
   promote_hits?: number;
   pinned?: boolean;
   last_at?: string;
+  replacement_runs?: number;
   manual_scoped?: boolean;
+  auto_scoped?: boolean;
   native_bundle?: string | null;
+  binding_invalidated_at?: string | null;
+  binding_invalidated_reason?: string | null;
+  family?: string | null;
+  mapping_id?: string | null;
+  browser_host?: string | null;
+  match_policy?: "ignore_case" | "exact";
 };
+
+type LearnedTermUsage = { word: string; replacement_runs: number; last_replaced_at: string };
+
+function asciiLower(value: string): string {
+  return value.replace(/[A-Z]/g, (letter) => letter.toLowerCase());
+}
+
+function isWordRule(pair: LearnPair): boolean {
+  return Boolean(pair.before_surface) && !pair.pair_key.startsWith("learn:style:") && !pair.pair_key.startsWith("learn:intensity:");
+}
+
+function scopesOverlap(left: LearnPair, right: LearnPair): boolean {
+  const dimensions: Array<[string | null | undefined, string | null | undefined]> = [
+    [left.family, right.family],
+    [left.mapping_id, right.mapping_id],
+    [left.browser_host, right.browser_host],
+    [left.native_bundle, right.native_bundle],
+  ];
+  if (dimensions.some(([leftValue, rightValue]) => leftValue && rightValue && leftValue !== rightValue)) return false;
+  return !(Boolean(left.browser_host || right.browser_host) && Boolean(left.native_bundle || right.native_bundle));
+}
+
+function hasAliasConflict(pair: LearnPair, peers: LearnPair[]): boolean {
+  if (!isWordRule(pair) || pair.binding_invalidated_at) return false;
+  return peers.some((other) => {
+    if (other.pair_key === pair.pair_key || !isWordRule(other) || other.binding_invalidated_at) return false;
+    if (!scopesOverlap(pair, other)) return false;
+    if (other.after_surface === pair.after_surface) return false;
+    const exactLeft = pair.match_policy === "exact";
+    const exactRight = other.match_policy === "exact";
+    return exactLeft && exactRight
+      ? pair.before_surface === other.before_surface
+      : asciiLower(pair.before_surface) === asciiLower(other.before_surface);
+  });
+}
 
 type ApplicationOption = { bundle_id: string; label: string };
 
@@ -54,8 +98,6 @@ type StyleDraft = {
   before_excerpt: string;
   after_excerpt: string;
 };
-
-type LearnedTermUsage = { word: string; replacement_runs: number; last_replaced_at: string };
 
 export function DictionarySettings({ settings, save, onOpenHistory, onOpenPreferences }: { settings: Settings; save: SaveSettings; onOpenHistory?: () => void; onOpenPreferences?: () => void }) {
   const { t } = useI18n();
@@ -69,15 +111,17 @@ export function DictionarySettings({ settings, save, onOpenHistory, onOpenPrefer
   const [dictionaryImporting, setDictionaryImporting] = useState(false);
   const [pendingDeleteWord, setPendingDeleteWord] = useState<string | null>(null);
   const [pendingPairs, setPendingPairs] = useState<LearnPair[]>([]);
+  const [selectedPendingPairKeys, setSelectedPendingPairKeys] = useState<string[]>([]);
+  const [batchReviewStatus, setBatchReviewStatus] = useState<string | null>(null);
   const [promotedPairs, setPromotedPairs] = useState<LearnPair[]>([]);
   const [manualApplications, setManualApplications] = useState<ApplicationOption[] | null>(null);
   const [manualApplicationsFailed, setManualApplicationsFailed] = useState(false);
   const [manualBefore, setManualBefore] = useSessionDraftState("dictionary:manualBefore", "");
   const [manualAfter, setManualAfter] = useSessionDraftState("dictionary:manualAfter", "");
   const [manualBundle, setManualBundle] = useSessionDraftState("dictionary:manualBundle", "");
-  const [termUsage, setTermUsage] = useState<LearnedTermUsage[] | null>(null);
   const [styleDrafts, setStyleDrafts] = useState<StyleDraft[]>([]);
   const [pinnedTerms, setPinnedTerms] = useState<string[]>([]);
+  const [aggregateUsage, setAggregateUsage] = useState<LearnedTermUsage[]>([]);
   const [pendingStyleDraft, setPendingStyleDraft] = useState<StyleDraft | null>(null);
   const [learningError, setLearningError] = useState<string | null>(null);
   const [learningActionError, setLearningActionError] = useState<string | null>(null);
@@ -107,12 +151,14 @@ export function DictionarySettings({ settings, save, onOpenHistory, onOpenPrefer
       const rows = pairs.value;
       const live = Array.isArray(rows) ? rows.filter((row) => !row.ignored) : [];
       setPendingPairs(live.filter((row) => !row.promoted));
+      const pendingKeys = live.filter((row) => !row.promoted && isWordRule(row)).map((row) => row.pair_key);
+      setSelectedPendingPairKeys((selected) => selected.filter((key) => pendingKeys.includes(key)));
       setPromotedPairs(live.filter((row) => row.promoted && row.before_surface));
       setLearningLoaded(true);
     }
     if (drafts.status === "fulfilled") setStyleDrafts(Array.isArray(drafts.value) ? drafts.value : []);
     if (pinned.status === "fulfilled") setPinnedTerms(Array.isArray(pinned.value) ? pinned.value : []);
-    if (usage.status === "fulfilled") setTermUsage(Array.isArray(usage.value) ? usage.value : []);
+    if (usage.status === "fulfilled") setAggregateUsage(Array.isArray(usage.value) ? usage.value : []);
     setLearningError([pairs, drafts, pinned, usage].some((result) => result.status === "rejected") ? t("部分词典学习数据未能读取，已有内容已保留。请重试。") : null);
     setLearningLoading(false);
   }, [t]);
@@ -122,6 +168,7 @@ export function DictionarySettings({ settings, save, onOpenHistory, onOpenPrefer
     learningBusyRef.current = true;
     setLearningBusy(true);
     setLearningActionError(null);
+    setBatchReviewStatus(null);
     try {
       await invoke(command, args);
       await loadPendingPairs();
@@ -136,13 +183,55 @@ export function DictionarySettings({ settings, save, onOpenHistory, onOpenPrefer
         const message = command === "add_manual_scoped_learn_pair"
           ? reason === "manual_pair_scope_conflict"
             ? "同一纠正已在其他范围登记；请先在已生效替换中忘记旧规则，再添加。"
+            : reason === "manual_pair_binding_invalidated"
+              ? "这条纠正已因 App mapping 变化暂停；请在“已暂停的 App 专用纠正”中明确重新绑定。"
             : reason === "manual_pair_scope_unknown"
               ? "所选 App 已不在运行，或当前范围无法确认；请重新选择后重试。"
               : "专用纠正未能保存；现有规则没有被覆盖，请重试。"
+          : command === "rebind_invalidated_learn_pair"
+            ? "重新绑定未完成；请确认原 App mapping 仍存在，并检查是否已有冲突规则。"
           : "词典操作未完成，请重试。";
         setLearningActionError(t(message));
       }
       return false;
+    } finally {
+      learningBusyRef.current = false;
+      setLearningBusy(false);
+    }
+  };
+
+  const confirmSelectedPendingPairs = async () => {
+    if (learningBusyRef.current) return;
+    const selected = pendingPairs.filter((pair) => isWordRule(pair) && selectedPendingPairKeys.includes(pair.pair_key));
+    if (selected.length === 0) return;
+    learningBusyRef.current = true;
+    setLearningBusy(true);
+    setLearningActionError(null);
+    setBatchReviewStatus(null);
+    let succeeded = 0;
+    let failed = 0;
+    const failedPairs: string[] = [];
+    try {
+      for (const pair of selected) {
+        try {
+          await invoke("promote_learn_pair", {
+            pairKey: pair.pair_key,
+            beforeSurface: pair.before_surface,
+            afterSurface: pair.after_surface,
+          });
+          succeeded += 1;
+        } catch {
+          failed += 1;
+          failedPairs.push(`${pair.before_surface} → ${pair.after_surface}`);
+        }
+      }
+      await loadPendingPairs();
+      setBatchReviewStatus(failed === 0
+        ? t("批量确认完成：已确认 {success} 条。").replace("{success}", String(succeeded))
+        : t("批量确认部分完成：{success} 条成功；{failed} 条失败或结果未确认（{pairs}）。刷新后的列表反映当前状态，可继续逐条处理。")
+          .replace("{success}", String(succeeded))
+          .replace("{failed}", String(failed))
+          .replace("{pairs}", failedPairs.join("、")));
     } finally {
       learningBusyRef.current = false;
       setLearningBusy(false);
@@ -351,10 +440,14 @@ export function DictionarySettings({ settings, save, onOpenHistory, onOpenPrefer
       .finally(() => { addingWordRef.current = false; setAddingWord(false); });
   };
 
-  const learnedAfters = new Set(promotedPairs.map((pair) => pair.after_surface));
   const dictionaryWords = settings.dictionary;
-  const liveUsage = termUsage?.filter((item) => learnedAfters.has(item.word));
-  const recentPairs = [...promotedPairs].sort((a, b) => (b.last_at ?? "").localeCompare(a.last_at ?? "")).slice(0, 3);
+  const invalidatedPairs = promotedPairs.filter((pair) => Boolean(pair.binding_invalidated_at));
+  const livePromotedPairs = promotedPairs.filter((pair) => !pair.binding_invalidated_at);
+  const conflictingPairs = livePromotedPairs.filter((pair) => hasAliasConflict(pair, livePromotedPairs));
+  const conflictingPairKeys = new Set(conflictingPairs.map((pair) => pair.pair_key));
+  const activePromotedPairs = livePromotedPairs.filter((pair) => !conflictingPairKeys.has(pair.pair_key));
+  const liveUsage = activePromotedPairs.filter((pair) => (pair.replacement_runs ?? 0) > 0);
+  const recentPairs = [...activePromotedPairs].sort((a, b) => (b.last_at ?? "").localeCompare(a.last_at ?? "")).slice(0, 3);
 
   const openDictionaryFilePicker = () => dictionaryFileInput.current?.click();
   const handleDictionaryDrop = (event: React.DragEvent<HTMLDivElement>) => {
@@ -413,18 +506,36 @@ export function DictionarySettings({ settings, save, onOpenHistory, onOpenPrefer
         )) : <p className="px-5 py-6 text-sm text-secondary">{t("当前没有个人词典词条。")}</p>}
       </SettingsGroup>
       <SettingsGroup title={t("词典学习")}>
-        <SettingsRow title={t("学习词条")} description={t("普通词需 3 次、人名需 2 次不同听写中的纠正；同一听写重复保存只计一次。也可在历史或本页确认，继续打字不会学习。")}>
+        <SettingsRow title={t("学习词条")} description={t("现场观察和 History 编辑只生成待确认候选；不会按纠正次数自动生效。你可在历史或本页明确确认，确认后的规则只在记录的 App 范围内应用；继续打字不会学习。") }>
           <Toggle checked={settings.dictionary_learn_enabled !== false} onChange={(checked) => save({ dictionary_learn_enabled: checked })} label={t("学习词条")} />
         </SettingsRow>
         <SettingsRow title={t("本机观察插入后的改动")} description={t("仅在 VoiceFlow 已确认插入后，短暂读取同一输入框，并只学习唯一插入片段内的改动；按当前 App 范围学习，不读取其他屏幕文字，也不会发送这些改动。关闭后撤销这项独立授权；若该 App 已单独授权读取辅助功能文字，该权限仍可能允许观察。") }>
           <Toggle checked={settings.local_edit_learning_enabled === true} onChange={(checked) => save({ local_edit_learning_enabled: checked })} label={t("本机观察插入后的改动")} />
         </SettingsRow>
       </SettingsGroup>
+      <LearningTransferSettings />
       {pendingPairs.length > 0 && (
         <SettingsGroup title={t("待确认的纠正")}>
+          {pendingPairs.some(isWordRule) && (
+            <div className="flex flex-wrap items-center gap-2 border-b border-border px-5 py-3">
+              <button type="button" disabled={learningBusy} onClick={() => {
+                const wordKeys = pendingPairs.filter(isWordRule).map((pair) => pair.pair_key);
+                setSelectedPendingPairKeys((selected) => wordKeys.every((key) => selected.includes(key)) ? [] : wordKeys);
+                setBatchReviewStatus(null);
+              }} className={compactButtonClass}>{pendingPairs.filter(isWordRule).every((pair) => selectedPendingPairKeys.includes(pair.pair_key)) ? t("取消全选") : t("全选待确认词条")}</button>
+              <button type="button" disabled={learningBusy || selectedPendingPairKeys.length === 0} onClick={() => void confirmSelectedPendingPairs()} className={compactButtonClass}>{t("确认所选词条")} ({selectedPendingPairKeys.length})</button>
+            </div>
+          )}
+          {batchReviewStatus && <p role="status" className="px-5 py-3 text-sm text-secondary">{batchReviewStatus}</p>}
           {pendingPairs.map((pair) => (
             <div key={pair.pair_key} role="group" aria-label={`${pair.before_surface} → ${pair.after_surface}`} className="flex flex-wrap items-center gap-3 px-5 py-4 text-sm">
-              <span className="min-w-0 flex-1 break-words text-primary">{pair.before_surface} <span className="text-secondary">→</span> <strong className="font-medium">{pair.after_surface}</strong><span className="mt-1 block text-xs tabular-nums text-secondary">{pair.hits} {t("次纠正记录")}</span></span>
+              {isWordRule(pair) && <label className="inline-flex min-h-10 items-center gap-2 text-xs text-secondary"><input type="checkbox" checked={selectedPendingPairKeys.includes(pair.pair_key)} onChange={(event) => {
+                setSelectedPendingPairKeys((selected) => event.target.checked
+                  ? [...selected, pair.pair_key]
+                  : selected.filter((key) => key !== pair.pair_key));
+                setBatchReviewStatus(null);
+              }} aria-label={`${t("选择待确认词条")} ${pair.before_surface} → ${pair.after_surface}`} />{t("选择")}</label>}
+              <span className="min-w-0 flex-1 break-words text-primary">{pair.before_surface} <span className="text-secondary">→</span> <strong className="font-medium">{pair.after_surface}</strong><span className="mt-1 block text-xs text-secondary">{t("适用范围：")} {[pair.native_bundle, pair.browser_host, pair.mapping_id, pair.family].filter(Boolean).join(" · ") || t("范围未知")}</span><span className="mt-1 block text-xs tabular-nums text-secondary">{pair.hits} {t("次纠正记录")}</span></span>
               <button type="button" disabled={learningBusy} onClick={() => void runLearningAction("promote_learn_pair", { pairKey: pair.pair_key, beforeSurface: pair.before_surface, afterSurface: pair.after_surface })} className={compactButtonClass}>{t("确认")}</button>
               <button type="button" disabled={learningBusy} onClick={() => void runLearningAction("ignore_learn_pair", { pairKey: pair.pair_key })} className={`${compactButtonClass} enabled:hover:bg-error/10 enabled:hover:text-error-ink`}>{t("忽略")}</button>
             </div>
@@ -456,7 +567,7 @@ export function DictionarySettings({ settings, save, onOpenHistory, onOpenPrefer
         </form>
       </SettingsGroup>
       {styleDrafts.length > 0 && (
-        <SettingsGroup title={t("待确认口癖")} description={t("确认会保存这组样例，并批准用于该 App 后续的整理请求。可在语气的 App 规则中撤销批准。")}>
+        <SettingsGroup title={t("待确认口癖")} description={t("确认会把这组样例保存在本机；如需发送给云端整理服务商，请在“语气”的 App 规则中单独批准。")}>
           {styleDrafts.map((draft) => (
             <div key={draft.draft_key} className="flex flex-wrap items-center gap-3 px-5 py-4 text-sm">
               <span className="min-w-0 flex-1 text-primary">{draft.mapping_id} · {t(draft.style_key === "fewer_periods" ? "少用句号" : draft.style_key === "more_questions" ? "爱用问号" : "标点密度")} · {draft.excerpt}</span>
@@ -466,9 +577,40 @@ export function DictionarySettings({ settings, save, onOpenHistory, onOpenPrefer
           ))}
         </SettingsGroup>
       )}
-      <SettingsGroup title={t("已生效替换")} description={`${promotedPairs.length} ${t("条")}`}>
-        {promotedPairs.length > 0 ? promotedPairs.map((pair) => {
+      {invalidatedPairs.length > 0 && (
+        <SettingsGroup title={t("已暂停的 App 专用纠正")} description={t("原规则与纠正记录已保留；mapping 变化后不会自动生效。重新绑定会明确授权当前 mapping 使用此纠正。若目标身份已改变，会建立没有继承命中次数的新专用规则。")}>
+          {invalidatedPairs.map((pair) => (
+            <div key={pair.pair_key} className="flex flex-wrap items-center gap-3 px-5 py-4 text-sm">
+              <span className="min-w-0 flex-1 text-primary">
+                {pair.before_surface} → {pair.after_surface}
+                <span className="ml-2 text-xs text-tertiary">{pair.hits} {t("次纠正记录")}</span>
+                <span className="mt-1 block text-xs text-secondary">
+                  {t(pair.binding_invalidated_reason === "mapping_deleted" ? "原 App mapping 已删除" : pair.binding_invalidated_reason === "missing_binding_at_migration" ? "找不到原 App mapping" : "App mapping 的匹配条件已变更")}
+                </span>
+              </span>
+              <button type="button" disabled={learningBusy} onClick={() => void runLearningAction("rebind_invalidated_learn_pair", { pairKey: pair.pair_key })} className={compactButtonClass}>{t("重新绑定")}</button>
+              <button type="button" disabled={learningBusy} onClick={() => void runLearningAction("undo_learn_pair", { pairKey: pair.pair_key })} className={`${compactButtonClass} enabled:hover:bg-error/10 enabled:hover:text-error-ink`}>{t("忘记")}</button>
+            </div>
+          ))}
+        </SettingsGroup>
+      )}
+      {conflictingPairs.length > 0 && (
+        <SettingsGroup title={t("范围重叠的冲突纠正")} description={t("只有规则的实际适用范围重叠且来源词指向不同目标时才会暂停；更宽的 App 规则在没有匹配窄规则的其他范围仍可能生效。忘记其中一条可解除重叠范围内的冲突。") }>
+          {conflictingPairs.map((pair) => (
+            <div key={pair.pair_key} className="flex flex-wrap items-center gap-3 px-5 py-4 text-sm">
+              <span className="min-w-0 flex-1 text-primary">
+                {pair.before_surface} → {pair.after_surface}
+                <span className="mt-1 block text-xs text-warning-ink">{t("仅在与另一条规则的适用范围重叠时暂停；不重叠的范围不受影响。")}</span>
+              </span>
+              <button type="button" disabled={learningBusy} onClick={() => void runLearningAction("undo_learn_pair", { pairKey: pair.pair_key })} className={`${compactButtonClass} enabled:hover:bg-error/10 enabled:hover:text-error-ink`}>{t("忘记")}</button>
+            </div>
+          ))}
+        </SettingsGroup>
+      )}
+      <SettingsGroup title={t("已生效替换")} description={`${activePromotedPairs.length} ${t("条")}`}>
+        {activePromotedPairs.length > 0 ? activePromotedPairs.map((pair) => {
           const pinned = pinnedTerms.includes(pair.after_surface);
+          const localOnly = pair.manual_scoped || pair.auto_scoped;
           return (
             <div key={pair.pair_key} className="flex flex-wrap items-center gap-3 px-5 py-4 text-sm">
               <span className="min-w-0 flex-1 text-primary">
@@ -476,9 +618,9 @@ export function DictionarySettings({ settings, save, onOpenHistory, onOpenPrefer
                 <span className="ml-2 text-xs text-tertiary">{pair.hits} {t("次纠正记录")}</span>
                 {pair.promote_hits === 2 ? <span className="ml-2 text-xs text-tertiary">{t("人名")}</span> : null}
                 {pair.native_bundle ? <span className="mt-1 block text-xs text-secondary">{t("适用 App：")} {manualApplications?.find((application) => application.bundle_id === pair.native_bundle)?.label ?? pair.native_bundle}</span> : null}
-                {pair.manual_scoped ? <span className="mt-1 block text-xs text-secondary">{t("仅本机词典规则；不会写入全局词条")}</span> : null}
+                {localOnly ? <span className="mt-1 block text-xs text-secondary">{t("仅本机词典规则；不会写入全局词条")}</span> : null}
               </span>
-              {!pair.manual_scoped && <button type="button" disabled={learningBusy} aria-label={`${pinned ? t("取消置顶") : t("置顶")} ${pair.after_surface}`} onClick={() => void runLearningAction("pin_dictionary_term", { word: pair.after_surface, pinned: !pinned })} className={compactButtonClass}>{pinned ? t("已置顶") : t("置顶")}</button>}
+              {!localOnly && <button type="button" disabled={learningBusy} aria-label={`${pinned ? t("取消置顶") : t("置顶")} ${pair.after_surface}`} onClick={() => void runLearningAction("pin_dictionary_term", { word: pair.after_surface, pinned: !pinned })} className={compactButtonClass}>{pinned ? t("已置顶") : t("置顶")}</button>}
               <button type="button" disabled={learningBusy} onClick={() => void runLearningAction("undo_learn_pair", { pairKey: pair.pair_key })} className={`${compactButtonClass} enabled:hover:bg-error/10 enabled:hover:text-error-ink`}>{t("忘记")}</button>
             </div>
           );
@@ -491,8 +633,10 @@ export function DictionarySettings({ settings, save, onOpenHistory, onOpenPrefer
           {learningLoaded ? <>
             <dl className="flex flex-wrap gap-x-6 gap-y-2 text-sm">
               <div className="flex gap-2"><dt className="text-secondary">{t("待确认")}</dt><dd className="font-medium tabular-nums text-primary">{pendingPairs.length}</dd></div>
-              <div className="flex gap-2"><dt className="text-secondary">{t("已生效替换")}</dt><dd className="font-medium tabular-nums text-primary">{promotedPairs.length}</dd></div>
-              <div className="flex gap-2"><dt className="text-secondary">{t("已用于本机纠正")}</dt><dd className="font-medium tabular-nums text-primary">{liveUsage ? liveUsage.length : "—"}</dd></div>
+              <div className="flex gap-2"><dt className="text-secondary">{t("已生效替换")}</dt><dd className="font-medium tabular-nums text-primary">{activePromotedPairs.length}</dd></div>
+              {invalidatedPairs.length > 0 && <div className="flex gap-2"><dt className="text-secondary">{t("已暂停")}</dt><dd className="font-medium tabular-nums text-primary">{invalidatedPairs.length}</dd></div>}
+              <div className="flex gap-2"><dt className="text-secondary">{t("已用于本机纠正")}</dt><dd className="font-medium tabular-nums text-primary">{liveUsage.length}</dd></div>
+              <div className="flex gap-2"><dt className="text-secondary">{t("词条累计使用")}</dt><dd className="font-medium tabular-nums text-primary">{aggregateUsage.reduce((total, row) => total + row.replacement_runs, 0)}</dd></div>
             </dl>
             <p className="mt-2 max-w-prose text-xs leading-5 text-tertiary">{t("只统计实际发生的本机词典替换，每段处理按词条计一次。历史重新整理也会计入；不代表识别准确率或成功插入次数。")}</p>
             {settings.dictionary_learn_enabled === false && <p className="mt-2 text-xs text-secondary">{t("新纠正的自动观察已关闭；已生效替换仍可使用，也可在“已生效替换”中忘记。")}</p>}
@@ -507,12 +651,18 @@ export function DictionarySettings({ settings, save, onOpenHistory, onOpenPrefer
             </div> : <p className="mt-3 text-xs leading-5 text-secondary">{t("完成听写后纠正一个人名或术语，可在“待确认的纠正”中确认或忽略。")}</p>}
           </> : <p role="status" className="text-xs text-secondary">{t(learningLoading ? "正在汇总学习反馈…" : "学习反馈尚未读取。")}</p>}
         </div>
-      {liveUsage && liveUsage.length > 0 && <SettingsGroup title={t("最近用于纠正的词条")}>
-        {liveUsage.slice(0, 5).map((item) => <div key={item.word} className="flex flex-wrap items-center justify-between gap-2 px-5 py-4 text-sm">
-          <span className="text-primary">{item.word}</span>
-          <span className="text-xs text-secondary">{item.replacement_runs} {t("次本机处理")} · {item.last_replaced_at} UTC</span>
+      {liveUsage.length > 0 && <SettingsGroup title={t("最近用于纠正的词条")}>
+        {liveUsage.slice(0, 5).map((pair) => <div key={pair.pair_key} className="flex flex-wrap items-center justify-between gap-2 px-5 py-4 text-sm">
+          <span className="text-primary">{pair.after_surface}{pair.native_bundle ? ` · ${manualApplications?.find((application) => application.bundle_id === pair.native_bundle)?.label ?? pair.native_bundle}` : ""}</span>
+          <span className="text-xs text-secondary">{pair.replacement_runs} {t("次本机处理")}</span>
         </div>)}
       </SettingsGroup>}
+            {aggregateUsage.length > 0 && <SettingsGroup title={t("词条累计使用统计")}>
+              {aggregateUsage.slice(0, 5).map((row) => <div key={row.word} className="flex flex-wrap items-center justify-between gap-2 px-5 py-4 text-sm">
+                <span className="text-primary">{row.word}</span>
+                <span className="text-xs text-secondary">{row.replacement_runs} {t("次本机处理")}</span>
+              </div>)}
+            </SettingsGroup>}
       </SettingsDisclosure>
       <DictionaryLearningAudit />
       <ConfirmDialog

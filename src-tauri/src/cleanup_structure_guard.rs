@@ -67,6 +67,245 @@ pub(crate) fn preserves_structure_safe(source: &str, candidate: &str) -> bool {
         && punctuation_changes_are_one_sided(&source_view.punctuation, &candidate_view.punctuation)
 }
 
+/// Prove model-selected paragraph breaks against a flat prepared source.
+/// Paragraph bodies must consume the source continuously and in order; the
+/// only removed source bytes may be whitespace at an existing sentence break,
+/// with a narrow zero-width exception after CJK sentence punctuation.
+pub(crate) fn preserves_model_selected_paragraphs(source: &str, candidate: &str) -> bool {
+    const MAX_PARAGRAPHS: usize = 64;
+    if source.trim() != source
+        || source.contains(['\n', '\r'])
+        || crate::spoken_layout::has_structural_layout(source)
+        || candidate.trim() != candidate
+        || candidate.contains('\r')
+    {
+        return false;
+    }
+
+    let paragraphs = candidate.split("\n\n").collect::<Vec<_>>();
+    if paragraphs.len() < 2
+        || paragraphs.len() > MAX_PARAGRAPHS
+        || paragraphs.iter().any(|paragraph| {
+            paragraph.is_empty()
+                || paragraph.contains('\n')
+                || paragraph.trim() != *paragraph
+                || has_forbidden_paragraph_prefix(paragraph)
+        })
+        || paragraphs[..paragraphs.len() - 1]
+            .iter()
+            .any(|paragraph| !ends_with_sentence_punctuation(paragraph))
+    {
+        return false;
+    }
+
+    let literal_ranges = crate::spoken_revision::literal_ranges(source);
+    let protected =
+        crate::protected_span::protected_spans(source, Some(crate::llm::CleanupOperation::Cleanup));
+    let mut source_start = 0;
+    for (paragraph_index, paragraph) in paragraphs[..paragraphs.len() - 1].iter().enumerate() {
+        let mut matched_next_start = None;
+        for (relative, punctuation) in source[source_start..].char_indices() {
+            if !matches!(punctuation, '.' | '!' | '?' | '。' | '！' | '？') {
+                continue;
+            }
+            let punctuation_start = source_start + relative;
+            let punctuation_end = punctuation_start + punctuation.len_utf8();
+            let mut boundary_end = punctuation_end;
+            while let Some((closing, width)) = source[boundary_end..]
+                .chars()
+                .next()
+                .map(|ch| (ch, ch.len_utf8()))
+            {
+                if !is_closing_quote_or_bracket(closing) {
+                    break;
+                }
+                boundary_end += width;
+            }
+            let next_start = skip_whitespace(source, boundary_end);
+            let has_source_whitespace = next_start > boundary_end;
+            let cjk_zero_width_break = !has_source_whitespace
+                && matches!(punctuation, '。' | '！' | '？')
+                && source[boundary_end..]
+                    .chars()
+                    .next()
+                    .is_some_and(is_cjk_character);
+            if (!has_source_whitespace && !cjk_zero_width_break)
+                || next_start >= source.len()
+                || unsafe_sentence_break(
+                    source,
+                    punctuation,
+                    punctuation_start,
+                    boundary_end,
+                    next_start,
+                )
+                || boundary_inside(&literal_ranges, boundary_end)
+                || separator_overlaps(&literal_ranges, boundary_end..next_start)
+                || protected_boundary_inside(&protected, boundary_end)
+                || separator_overlaps_protected(&protected, boundary_end..next_start)
+            {
+                continue;
+            }
+
+            let source_body = &source[source_start..boundary_end];
+            // Every allowed punctuation change is one-sided and the only
+            // source mark omitted from a segment key can be its terminal
+            // Unicode period. Later boundaries cannot match after this bound.
+            if source_body.len() > paragraph.len().saturating_add(3) {
+                break;
+            }
+            if preserves_structure_safe(source_body, paragraph)
+                && begins_like_a_sentence(paragraphs[paragraph_index + 1])
+            {
+                matched_next_start = Some(next_start);
+                break;
+            }
+        }
+        let Some(next_start) = matched_next_start else {
+            return false;
+        };
+        source_start = next_start;
+    }
+
+    source.get(source_start..).is_some_and(|remaining| {
+        preserves_structure_safe(remaining, paragraphs[paragraphs.len() - 1])
+    })
+}
+
+fn has_forbidden_paragraph_prefix(paragraph: &str) -> bool {
+    let trimmed = paragraph.trim_start();
+    if trimmed.starts_with(['#', '>', '|'])
+        || ["- ", "* ", "+ ", "• ", "‣ ", "– ", "— "]
+            .iter()
+            .any(|prefix| trimmed.starts_with(prefix))
+    {
+        return true;
+    }
+    if let Some(marker_end) = trimmed.find(['.', ')']) {
+        if marker_end > 0
+            && trimmed[..marker_end]
+                .bytes()
+                .all(|byte| byte.is_ascii_digit())
+            && trimmed[marker_end + 1..].starts_with(' ')
+        {
+            return true;
+        }
+    }
+    let normalized = trimmed
+        .trim_end_matches(['.', ':', '：'])
+        .to_ascii_lowercase();
+    [
+        "summary",
+        "overview",
+        "conclusion",
+        "next steps",
+        "action items",
+        "update",
+        "request",
+        "context",
+        "notes",
+    ]
+    .iter()
+    .any(|heading| normalized == *heading)
+}
+
+fn ends_with_sentence_punctuation(paragraph: &str) -> bool {
+    let core = paragraph.trim_end_matches(is_closing_quote_or_bracket);
+    core.chars()
+        .next_back()
+        .is_some_and(|ch| matches!(ch, '.' | '!' | '?' | '。' | '！' | '？'))
+}
+
+fn begins_like_a_sentence(paragraph: &str) -> bool {
+    paragraph
+        .trim_start_matches(is_opening_quote_or_bracket)
+        .chars()
+        .next()
+        .is_some_and(|ch| !ch.is_ascii_lowercase())
+}
+
+fn unsafe_sentence_break(
+    source: &str,
+    punctuation: char,
+    punctuation_start: usize,
+    boundary_end: usize,
+    next_start: usize,
+) -> bool {
+    if punctuation != '.' {
+        return false;
+    }
+    let left = source[..punctuation_start].trim_end();
+    let token = left
+        .rsplit(|character: char| !character.is_ascii_alphabetic())
+        .next()
+        .unwrap_or_default();
+    let token_lower = token.to_ascii_lowercase();
+    const ABBREVIATIONS: &[&str] = &[
+        "a.m", "p.m", "adm", "approx", "ave", "dept", "dr", "e.g", "etc", "fig", "i.e", "inc",
+        "jr", "mr", "mrs", "ms", "no", "prof", "rev", "sr", "st", "vs",
+    ];
+    let previous = left.chars().next_back();
+    let next = source[next_start..].chars().next();
+    token.len() == 1
+        || ABBREVIATIONS.contains(&token_lower.as_str())
+        || previous.is_some_and(|ch| ch.is_ascii_digit())
+            && next.is_some_and(|ch| ch.is_ascii_digit())
+        || boundary_end < next_start && next.is_some_and(|ch| ch.is_ascii_digit())
+}
+
+fn is_opening_quote_or_bracket(ch: char) -> bool {
+    matches!(
+        ch,
+        '"' | '\'' | '“' | '‘' | '「' | '『' | '（' | '(' | '[' | '{'
+    )
+}
+
+fn is_closing_quote_or_bracket(ch: char) -> bool {
+    matches!(
+        ch,
+        '"' | '\'' | '”' | '’' | '」' | '』' | '）' | ')' | ']' | '}'
+    )
+}
+
+fn is_cjk_character(ch: char) -> bool {
+    matches!(ch as u32, 0x2E80..=0x2FFF | 0x3000..=0x30FF | 0x31F0..=0x31FF | 0x3400..=0x9FFF | 0xF900..=0xFAFF)
+}
+
+fn skip_whitespace(source: &str, mut cursor: usize) -> usize {
+    for (relative, character) in source[cursor..].char_indices() {
+        if !character.is_whitespace() {
+            cursor += relative;
+            return cursor;
+        }
+    }
+    source.len()
+}
+
+fn boundary_inside(ranges: &[Range<usize>], boundary: usize) -> bool {
+    ranges
+        .iter()
+        .any(|range| range.start < boundary && boundary < range.end)
+}
+
+fn protected_boundary_inside(
+    protected: &[crate::protected_span::ProtectedSpan],
+    boundary: usize,
+) -> bool {
+    protected
+        .iter()
+        .any(|span| span.start_byte < boundary && boundary < span.end_byte)
+}
+
+fn separator_overlaps(ranges: &[Range<usize>], separator: Range<usize>) -> bool {
+    separator.start < separator.end && overlaps(ranges, separator)
+}
+
+fn separator_overlaps_protected(
+    protected: &[crate::protected_span::ProtectedSpan],
+    separator: Range<usize>,
+) -> bool {
+    separator.start < separator.end && overlaps_protected(protected, separator)
+}
+
 fn safe_view(text: &str) -> Option<SafeView> {
     let literals = crate::spoken_revision::literal_ranges(text);
     let code_regions = crate::protected_span::validated_code_region_pairs(text, text)?
@@ -337,7 +576,83 @@ fn is_cjk(ch: char) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::preserves_structure_safe;
+    use super::{preserves_model_selected_paragraphs, preserves_structure_safe};
+
+    #[test]
+    fn model_selected_paragraphs_require_contiguous_source_sentence_segments() {
+        let source = "The release is ready. We should review the docs tomorrow.";
+        assert!(preserves_model_selected_paragraphs(
+            source,
+            "The release is ready.\n\nWe should review the docs tomorrow."
+        ));
+        assert!(!preserves_model_selected_paragraphs(
+            source,
+            "The release is ready.\n\nWe should review the API tomorrow."
+        ));
+        assert!(!preserves_model_selected_paragraphs(
+            source,
+            "We should review the docs tomorrow.\n\nThe release is ready."
+        ));
+        assert!(!preserves_model_selected_paragraphs(
+            "We should review the docs tomorrow because the release is ready.",
+            "We should review the docs tomorrow.\n\nBecause the release is ready."
+        ));
+    }
+
+    #[test]
+    fn model_selected_paragraphs_reject_abbreviations_initials_and_added_labels() {
+        for (source, candidate) in [
+            (
+                "Please ask Dr. Smith tomorrow about the release.",
+                "Please ask Dr.\n\nSmith tomorrow about the release.",
+            ),
+            (
+                "J. Smith approved the release. The review starts tomorrow.",
+                "J.\n\nSmith approved the release. The review starts tomorrow.",
+            ),
+            (
+                "The date is 2026. 11/14 is the planned launch. Please review tomorrow.",
+                "The date is 2026.\n\n11/14 is the planned launch. Please review tomorrow.",
+            ),
+            (
+                "Use `v1.2` for the API. Then call me.",
+                "Use `v1.\n\n2` for the API. Then call me.",
+            ),
+            (
+                "The release is ready. The review starts tomorrow.",
+                "The release is ready.\n\n- The review starts tomorrow.",
+            ),
+            (
+                "The release is ready. The review starts tomorrow.",
+                "The release is ready.\n\nSummary. The review starts tomorrow.",
+            ),
+        ] {
+            assert!(
+                !preserves_model_selected_paragraphs(source, candidate),
+                "source={source:?} candidate={candidate:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn model_selected_paragraphs_allow_unambiguous_cjk_zero_width_sentence_breaks() {
+        assert!(preserves_model_selected_paragraphs(
+            "第一主题。第二主题。",
+            "第一主题。\n\n第二主题。"
+        ));
+        assert!(preserves_model_selected_paragraphs(
+            "第一主题。第二主题还没结束",
+            "第一主题。\n\n第二主题还没结束"
+        ));
+        assert!(preserves_model_selected_paragraphs(
+            "She said “Done.” We should review the docs",
+            "She said “Done.”\n\nWe should review the docs"
+        ));
+        assert!(!preserves_model_selected_paragraphs(
+            "我们讨论第一主题第二主题。",
+            "我们讨论第一主题。\n\n第二主题。"
+        ));
+    }
 
     #[test]
     fn accepts_unchanged_crlf_blank_lines_and_terminal_newline() {

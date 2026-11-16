@@ -1,4 +1,4 @@
-import { memo, useEffect, useRef, useState, type CSSProperties } from "react";
+import { memo, useEffect, useState, type CSSProperties } from "react";
 import { BorderBeam } from "border-beam";
 import { useI18n } from "../../lib/i18n";
 import { deliveryReasonHudMessage, deliveryReasonMessage } from "../../lib/deliveryCopy";
@@ -9,10 +9,10 @@ import {
   HUD_LABEL_IN_DURATION_MS,
   HUD_LABEL_OUT_MS,
   HUD_MOTION_MS,
-  HUD_THINK_BEAM_FADE_MS,
   HUD_PILL_RADIUS_PX,
   HUD_LISTENING_BEAM,
   HUD_THINKING_BEAM,
+  HUD_THINKING_ORB_SPEED,
   formatHudElapsed,
   hudAudioLevel,
   hudBorderBeamFor,
@@ -48,10 +48,11 @@ export type VoicePillRecoveryAction = {
 
 export type VoicePillAction = "stop" | "cancel";
 
-function HudGlyph({ name, size = 18 }: { name: HudIconName | "arrow" | "close" | "stop"; size?: number }) {
+function HudGlyph({ name, size = 18 }: { name: HudIconName | "arrow" | "close" | "stop" | "input-device" | "headphones"; size?: number }) {
   return (
     <svg
       className="voice-pill__glyph"
+      data-glyph={name}
       width={size}
       height={size}
       viewBox="0 0 20 20"
@@ -73,6 +74,9 @@ function HudGlyph({ name, size = 18 }: { name: HudIconName | "arrow" | "close" |
                       : name === "shield" ? <><path d="M10 2.5 16 5v4.3c0 3.8-2.5 6.5-6 8.2-3.5-1.7-6-4.4-6-8.2V5l6-2.5Z" /><path d="m7.5 9.8 1.7 1.7 3.4-3.7" /></>
                         : name === "document" ? <><path d="M5 2.5h6l4 4v11H5z" /><path d="M11 2.5v4h4m-7 3.5h4m-4 3h4" /></>
                           : name === "clock" ? <><circle cx="10" cy="10" r="7" /><path d="M10 5.5V10l3 2" /></>
+                            : name === "check" ? <path d="m4.5 10.5 3.6 3.4 7.4-7.8" />
+                              : name === "input-device" ? <><rect x="3.5" y="5" width="13" height="10" rx="2" /><path d="M6 10h1.5l1.2-2 2.1 4 1.2-2H14M8 17h4" /></>
+                                : name === "headphones" ? <><path d="M3 10V8a7 7 0 0 1 14 0v2" /><rect x="3" y="10" width="3.5" height="6" rx="1.5" /><rect x="13.5" y="10" width="3.5" height="6" rx="1.5" /></>
                             : name === "model" ? <><path d="m10 2.5 6.5 3.7v7.6L10 17.5l-6.5-3.7V6.2L10 2.5Z" /><path d="m3.5 6.2 6.5 3.9 6.5-3.9M10 10v7.5" /></>
                               : name === "service" ? <><path d="M4 13.5a3.5 3.5 0 0 1 .5-7A5.5 5.5 0 0 1 15 7a3.2 3.2 0 0 1 1 6.3" /><path d="M10 10v7m-2.5-2.5L10 17l2.5-2.5" /></>
                                 : name === "dictionary" ? <><path d="M4 3.5h9.5A2.5 2.5 0 0 1 16 6v10.5H6.5A2.5 2.5 0 0 1 4 14V3.5Z" /><path d="M4 14a2.5 2.5 0 0 1 2.5-2.5H16M8 7h5" /></>
@@ -84,6 +88,10 @@ function HudGlyph({ name, size = 18 }: { name: HudIconName | "arrow" | "close" |
                                     </>}
     </svg>
   );
+}
+
+function isRecognizableHeadsetName(name: string): boolean {
+  return /\b(?:airpods?|headphones?|headsets?|earbuds?|earphones?)\b/i.test(name);
 }
 
 function stateAriaLabel(state: DictationState, t: (source: string) => string): string {
@@ -291,6 +299,10 @@ export const VoicePill = memo(function VoicePill({
                 : state === "error" ? t("查看恢复详情")
                   : null);
   const captionWithCleanupNotice = [caption, presentation.detail].filter(Boolean).join(" · ") || null;
+  const captionIsInputDevice = recording && !audioIssue && !presentation.subtitle && !presentation.detail;
+  const captionIcon = captionIsInputDevice
+    ? isRecognizableHeadsetName(device) ? "headphones" : "input-device"
+    : null;
   const elapsed = formatHudElapsed(stageElapsedMs);
   const audioLevel = listeningAudio.fresh ? listeningAudio.level : 0;
   const reasonDetail = unverifiedTextAction || (uncertainPasteAttempt && !uncertainPasteDetailsAvailable)
@@ -350,22 +362,20 @@ export const VoicePill = memo(function VoicePill({
   const beam = hudBorderBeamFor(state);
   const showThinkingBeam = beam?.size === "line" && !reduced && pageVisible;
   const showListeningBeam = beam?.size === "md" && listeningAudio.fresh && !reduced && pageVisible;
-  const [thinkingLinger, setThinkingLinger] = useState(false);
-  const wasThinking = useRef(showThinkingBeam);
-  if (showThinkingBeam && thinkingLinger) setThinkingLinger(false);
-  else if (wasThinking.current && !showThinkingBeam && !thinkingLinger && !reduced) setThinkingLinger(true);
-  wasThinking.current = showThinkingBeam;
-  useEffect(() => {
-    if (!thinkingLinger) return undefined;
-    if (reduced || !pageVisible) {
-      setThinkingLinger(false);
-      return undefined;
-    }
-    const timer = window.setTimeout(() => setThinkingLinger(false), HUD_THINK_BEAM_FADE_MS);
-    return () => window.clearTimeout(timer);
-  }, [thinkingLinger, reduced, pageVisible]);
-  const thinkFx = showThinkingBeam || (thinkingLinger && !reduced && pageVisible);
   const showOrb = processing && orbConfig != null;
+  const [prevShowOrb, setPrevShowOrb] = useState(showOrb);
+  const [orbExiting, setOrbExiting] = useState(false);
+  if (showOrb !== prevShowOrb) {
+    setPrevShowOrb(showOrb);
+    setOrbExiting(prevShowOrb && !showOrb && !reduced);
+  } else if (reduced && orbExiting) {
+    setOrbExiting(false);
+  }
+  useEffect(() => {
+    if (!orbExiting) return undefined;
+    const timer = window.setTimeout(() => setOrbExiting(false), HUD_MOTION_MS);
+    return () => window.clearTimeout(timer);
+  }, [orbExiting]);
   const activeAction: VoicePillAction = state === "starting" || processing ? "cancel" : "stop";
   const hasAction = activeHud
     || (!isIdle && !activeHud && (!uncertainPasteAttempt || uncertainPasteDetailsAvailable))
@@ -383,11 +393,13 @@ export const VoicePill = memo(function VoicePill({
     showOrb ? "voice-pill--orb" : "",
     reduced ? "voice-pill--reduced" : "",
   ].filter(Boolean).join(" ");
-  const iconUrl = recording && recordingTargetIcon?.startsWith("data:image/png;base64,")
+  const isWaitingForFirstAudioFrame = listening && audioCaptureStatus === "waiting_first_frame";
+  const inputUnavailable = !isWaitingForFirstAudioFrame && Boolean(audioIssue || presentation.icon === "mic-off");
+  const iconUrl = recording && !inputUnavailable && recordingTargetIcon?.startsWith("data:image/png;base64,")
     ? recordingTargetIcon
     : null;
   const iconMode = activeHud
-    ? audioIssue || presentation.icon === "mic-off" ? "mic-off" : "mic"
+    ? inputUnavailable ? "mic-off" : "mic"
     : presentation.icon;
 
   return (
@@ -418,21 +430,26 @@ export const VoicePill = memo(function VoicePill({
             {liveLabel}
           </span>
           <span className="voice-pill__indicator" aria-hidden="true">
-            {showOrb && orbConfig ? (
-              <span className="voice-pill__center-state voice-pill__center-state--active">
+            {(showOrb || orbExiting) && (
+              <span className={`voice-pill__center-state${showOrb ? " voice-pill__center-state--active" : ""}`}>
                 <VoiceHudOrb
                   key="hud-orb-working"
                   state="working"
-                  paused={orbConfig.paused}
-                  speed={orbConfig.speed}
+                  paused={orbConfig?.paused ?? true}
+                  speed={orbConfig?.speed ?? HUD_THINKING_ORB_SPEED}
                   level={0}
-                  dim={orbConfig.dim}
+                  dim={orbConfig?.dim ?? false}
                 />
               </span>
-            ) : iconUrl ? (
-              <img className="voice-pill__target-icon" src={iconUrl} alt="" />
-            ) : (
-              <HudGlyph name={iconMode} />
+            )}
+            {!showOrb && (
+              <span className="voice-pill__center-state voice-pill__center-state--active voice-pill__center-cue">
+                {iconUrl ? (
+                  <img className="voice-pill__target-icon" src={iconUrl} alt="" />
+                ) : (
+                  <HudGlyph name={iconMode} />
+                )}
+              </span>
             )}
           </span>
           <div className="voice-pill__copy">
@@ -444,8 +461,8 @@ export const VoicePill = memo(function VoicePill({
               {recording && <time className="voice-pill__elapsed" aria-live="off" aria-label={`${t("已等待")} ${elapsed}`}>{elapsed}</time>}
             </div>
             {caption && (
-              <span className={`voice-pill__subtitle${audioIssue ? " voice-pill__subtitle--issue" : ""}`} title={deviceDescription}>
-                {recording && <HudGlyph name="mic" size={11} />}
+              <span className={`voice-pill__subtitle${audioIssue ? " voice-pill__subtitle--issue" : ""}`} title={captionIsInputDevice ? deviceDescription : undefined}>
+                {captionIcon && <HudGlyph name={captionIcon} size={12} />}
                 <span>{captionWithCleanupNotice}</span>
               </span>
             )}
@@ -496,7 +513,7 @@ export const VoicePill = memo(function VoicePill({
             duration={HUD_THINKING_BEAM.duration}
             theme="dark"
             borderRadius={HUD_PILL_RADIUS_PX}
-            active={thinkFx}
+            active={showThinkingBeam}
             style={HUD_BEAM_OVERLAY_STYLE}
           >
             <div className="voice-pill__beam-ghost" />
@@ -504,14 +521,20 @@ export const VoicePill = memo(function VoicePill({
         </div>
       </div>
       {recoveryAction && detailsOpen ? (
-        <div className="voice-pill__secondary voice-pill__secondary--recovery" aria-busy={recoveryAction.busy}>
-          <span className="voice-pill__recovery-message" title={recoveryAction.message}>{recoveryAction.message}</span>
-          {(actionError ?? recoveryAction.error) && <span className="voice-pill__recovery-error" title={actionError ?? recoveryAction.error ?? undefined}>{actionError ?? recoveryAction.error}</span>}
+        <div className={`voice-pill__secondary voice-pill__secondary--recovery${(actionError ?? recoveryAction.error) ? " voice-pill__secondary--has-error" : ""}`} aria-busy={recoveryAction.busy}>
+          <span className="voice-pill__recovery-copy">
+            <span className="voice-pill__recovery-message" title={recoveryAction.message}>{recoveryAction.message}</span>
+            {(actionError ?? recoveryAction.error) && (
+              <span className="voice-pill__recovery-error" title={actionError ?? recoveryAction.error ?? undefined}>
+                {actionError ?? recoveryAction.error}
+              </span>
+            )}
+          </span>
           <button className="voice-pill__recovery-action" type="button" disabled={recoveryAction.busy || recoveryAction.disabled === true} aria-busy={recoveryAction.busy} onMouseDown={(event) => event.preventDefault()} onClick={recoveryAction.onAction}>{recoveryAction.actionLabel}</button>
           <button className="voice-pill__recovery-dismiss" type="button" aria-label={t("关闭恢复提示")} title={t("关闭恢复提示")} onMouseDown={(event) => event.preventDefault()} onClick={recoveryAction.onDismiss}><HudGlyph name="close" size={14} /></button>
         </div>
       ) : detailsOpen && (!uncertainPasteAttempt || uncertainPasteDetailsAvailable) && !isIdle ? (
-        <div className="voice-pill__secondary voice-pill__secondary--details" aria-label={t("恢复详情")}>
+        <div className={`voice-pill__secondary voice-pill__secondary--details${detailsActionError ? " voice-pill__secondary--has-error" : ""}`} aria-label={t("恢复详情")}>
           <span className="voice-pill__details-icon" aria-hidden="true"><HudGlyph name={presentation.icon} size={16} /></span>
           <span className="voice-pill__details-copy">
             <strong className="voice-pill__details-title">{presentation.title ?? statusLabel}</strong>

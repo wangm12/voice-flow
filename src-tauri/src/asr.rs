@@ -44,6 +44,19 @@ pub fn is_groq_asr_model(model: &str) -> bool {
     GROQ_ASR_MODELS.contains(&model.trim())
 }
 
+fn uses_groq_whisper_segment_policy(endpoint: &str, model: &str) -> bool {
+    let model_name = final_model_name(model);
+    if !is_groq_asr_model(&model_name) {
+        return false;
+    }
+    let native_groq_endpoint = host_from_url(endpoint).as_deref() == Some("api.groq.com");
+    let explicit_groq_alias = model
+        .trim()
+        .split_once('/')
+        .is_some_and(|(provider, _)| provider.eq_ignore_ascii_case("groq"));
+    native_groq_endpoint || explicit_groq_alias
+}
+
 /// Resolve an OpenAI-compatible path from a user-supplied base.
 /// Empty values use `default_base`. A value that already contains `marker`
 /// is used as-is (trailing slash stripped); a `/v1` base appends `/{suffix}`;
@@ -2076,7 +2089,16 @@ async fn transcribe_at_inner(
         returned_capabilities.segment_timestamps = false;
         returned_capabilities.word_timestamps = false;
     }
-    sanitize_transcript_for_capabilities(result, returned_capabilities)
+    let segment_text_policy = if uses_groq_whisper_segment_policy(endpoint, model) {
+        SegmentTextPolicy::GroqAggregateAuthoritative
+    } else {
+        SegmentTextPolicy::SegmentsAuthoritative
+    };
+    sanitize_transcript_for_capabilities_with_policy(
+        result,
+        returned_capabilities,
+        segment_text_policy,
+    )
 }
 
 const MAX_ASSEMBLYAI_RESPONSE_BYTES: usize = 512 * 1024;
@@ -2370,9 +2392,16 @@ async fn transcribe_assemblyai(
     })
 }
 
-fn sanitize_transcript_for_capabilities(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SegmentTextPolicy {
+    SegmentsAuthoritative,
+    GroqAggregateAuthoritative,
+}
+
+fn sanitize_transcript_for_capabilities_with_policy(
     mut result: Transcript,
     capabilities: AsrCapabilities,
+    segment_text_policy: SegmentTextPolicy,
 ) -> Result<Transcript, AsrError> {
     if capabilities.confidence_support == AsrConfidenceSupport::None {
         result.confidence = None;
@@ -2383,7 +2412,7 @@ fn sanitize_transcript_for_capabilities(
     if !capabilities.word_timestamps {
         result.words.clear();
     }
-    sanitize_transcript(result)
+    sanitize_transcript_with_policy(result, segment_text_policy)
 }
 
 fn append_deepgram_context(
@@ -2663,7 +2692,14 @@ fn observe_filtered_asr(raw: &str, filtered: &str, terminal: &str, reason: Optio
     observations::asr_filter(raw, filtered, terminal, reason);
 }
 
-fn sanitize_transcript(mut result: Transcript) -> Result<Transcript, AsrError> {
+fn sanitize_transcript(result: Transcript) -> Result<Transcript, AsrError> {
+    sanitize_transcript_with_policy(result, SegmentTextPolicy::SegmentsAuthoritative)
+}
+
+fn sanitize_transcript_with_policy(
+    mut result: Transcript,
+    segment_text_policy: SegmentTextPolicy,
+) -> Result<Transcript, AsrError> {
     let reconstructed_segments = result.text.trim().is_empty() && !result.segments.is_empty();
     if result.asr_text.is_none() {
         result.asr_text = Some(
@@ -2697,17 +2733,42 @@ fn sanitize_transcript(mut result: Transcript) -> Result<Transcript, AsrError> {
         .filter(|segment| keep_segment(segment))
         .cloned()
         .collect();
-    if kept.is_empty() {
+    let groq_has_kept_speech = kept.iter().any(|segment| !segment.text.trim().is_empty());
+    let no_usable_kept_segments = kept.is_empty()
+        || (segment_text_policy == SegmentTextPolicy::GroqAggregateAuthoritative
+            && !groq_has_kept_speech);
+    if no_usable_kept_segments {
+        if segment_text_policy == SegmentTextPolicy::GroqAggregateAuthoritative
+            && !result.text.trim().is_empty()
+            && !segment_text_covers_aggregate(&result.text, &result.segments)
+        {
+            result.segments = kept;
+            observe_filtered_asr(
+                result.original_text(),
+                &result.text,
+                "speech_text",
+                Some("incomplete_segment_coverage_preserved_provider_text"),
+            );
+            return Ok(result);
+        }
         observe_filtered_asr(
             result.original_text(),
             "",
             "locally_suppressed",
-            Some("all_segments_filtered"),
+            Some(if kept.is_empty() {
+                "all_segments_filtered"
+            } else {
+                "kept_segments_empty"
+            }),
         );
         return Err(AsrError::EmptyResult);
     }
     let segments_changed = kept.len() != result.segments.len();
-    result.text = kept.iter().map(|segment| segment.text.as_str()).collect();
+    if segment_text_policy != SegmentTextPolicy::GroqAggregateAuthoritative
+        || reconstructed_segments
+    {
+        result.text = kept.iter().map(|segment| segment.text.as_str()).collect();
+    }
     result.segments = kept;
     if result.text.trim().is_empty() {
         observe_filtered_asr(
@@ -2723,7 +2784,15 @@ fn sanitize_transcript(mut result: Transcript) -> Result<Transcript, AsrError> {
         &result.text,
         "speech_text",
         if segments_changed {
-            Some("partial_segments_filtered")
+            Some(
+                if segment_text_policy == SegmentTextPolicy::GroqAggregateAuthoritative
+                    && !reconstructed_segments
+                {
+                    "segment_metadata_filtered_provider_text_preserved"
+                } else {
+                    "partial_segments_filtered"
+                },
+            )
         } else if reconstructed_segments {
             Some("segment_text_reconstruction")
         } else {
@@ -2731,6 +2800,16 @@ fn sanitize_transcript(mut result: Transcript) -> Result<Transcript, AsrError> {
         },
     );
     Ok(result)
+}
+
+fn segment_text_covers_aggregate(aggregate: &str, segments: &[Segment]) -> bool {
+    aggregate
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .eq(segments
+            .iter()
+            .flat_map(|segment| segment.text.chars())
+            .filter(|character| !character.is_whitespace()))
 }
 
 fn keep_segment(segment: &Segment) -> bool {
@@ -2843,6 +2922,26 @@ mod tests {
             resolve_recognition_model("whisper-large-v3-turbo", Some("auto")),
             "whisper-large-v3-turbo"
         );
+    }
+
+    #[test]
+    fn groq_whisper_segment_policy_is_limited_to_known_routes() {
+        assert!(uses_groq_whisper_segment_policy(
+            "https://api.groq.com/openai/v1/audio/transcriptions",
+            "whisper-large-v3-turbo"
+        ));
+        assert!(uses_groq_whisper_segment_policy(
+            "https://router.example/v1/audio/transcriptions",
+            "groq/whisper-large-v3-turbo"
+        ));
+        assert!(!uses_groq_whisper_segment_policy(
+            "https://router.example/v1/audio/transcriptions",
+            "whisper-large-v3-turbo"
+        ));
+        assert!(!uses_groq_whisper_segment_policy(
+            "https://api.groq.com/openai/v1/audio/transcriptions",
+            "whisper-1"
+        ));
     }
 
     #[test]
@@ -3196,6 +3295,159 @@ mod tests {
             transcript.original_text(),
             "spoken plus low confidence filler"
         );
+    }
+
+    #[tokio::test]
+    async fn groq_whisper_keeps_top_level_text_when_only_some_segments_survive() {
+        let _network_policy_guard = crate::network_policy::strict_offline_test_guard().await;
+        let prefix = "P".repeat(129);
+        let suffix = "S".repeat(69);
+        let aggregate = format!("{prefix}{suffix}");
+        assert_eq!(aggregate.chars().count(), 198);
+        let cases = [
+            (
+                "aligned low-confidence prefix with good suffix",
+                vec![
+                    serde_json::json!({
+                        "text": prefix,
+                        "start": 0.0,
+                        "end": 1.0,
+                        "avg_logprob": -0.2,
+                        "no_speech_prob": 0.81
+                    }),
+                    serde_json::json!({
+                        "text": suffix,
+                        "start": 1.0,
+                        "end": 2.0,
+                        "avg_logprob": -0.2,
+                        "no_speech_prob": 0.1
+                    }),
+                ],
+            ),
+            (
+                "good suffix segment without prefix coverage",
+                vec![serde_json::json!({
+                    "text": suffix,
+                    "start": 1.0,
+                    "end": 2.0,
+                    "avg_logprob": -0.2,
+                    "no_speech_prob": 0.1
+                })],
+            ),
+        ];
+
+        for (case_name, segments) in cases {
+            let body = serde_json::json!({
+                "text": aggregate,
+                "segments": segments
+            })
+            .to_string();
+            let endpoint =
+                crate::test_http::spawn_response(200, "application/json", body.into_bytes(), &[])
+                    .await;
+
+            let transcript = transcribe_at(
+                &endpoint,
+                b"synthetic wav".to_vec(),
+                "synthetic-key",
+                None,
+                None,
+                Vec::new(),
+                "groq/whisper-large-v3-turbo",
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{case_name}: {error}"));
+
+            assert_eq!(transcript.text, aggregate, "{case_name}");
+            assert_eq!(transcript.text.chars().count(), 198, "{case_name}");
+            assert_eq!(transcript.original_text(), aggregate, "{case_name}");
+            assert_eq!(transcript.segments.len(), 1, "{case_name}");
+            assert_eq!(transcript.segments[0].text, suffix, "{case_name}");
+            assert!(
+                !segments_look_low_confidence(&transcript.segments),
+                "{case_name}"
+            );
+        }
+    }
+
+    #[test]
+    fn groq_suppresses_all_rejected_segments_only_when_they_cover_provider_text() {
+        let segment = |text: &str, no_speech_prob: f32| Segment {
+            text: text.into(),
+            start: None,
+            end: None,
+            avg_logprob: Some(-0.2),
+            no_speech_prob: Some(no_speech_prob),
+        };
+        let policy = SegmentTextPolicy::GroqAggregateAuthoritative;
+
+        let complete = sanitize_transcript_with_policy(
+            Transcript {
+                text: "synthetic rejected transcript".into(),
+                asr_text: None,
+                provider_cleaned_candidate: None,
+                language: None,
+                confidence: None,
+                segments: vec![segment("synthetic rejected transcript", 0.81)],
+                words: Vec::new(),
+                tokens: Vec::new(),
+                limits: RateLimits::default(),
+            },
+            policy,
+        );
+        assert!(matches!(complete, Err(AsrError::EmptyResult)));
+
+        let incomplete = sanitize_transcript_with_policy(
+            Transcript {
+                text: "unmatched synthetic body rejected suffix".into(),
+                asr_text: None,
+                provider_cleaned_candidate: None,
+                language: None,
+                confidence: None,
+                segments: vec![segment("rejected suffix", 0.81)],
+                words: Vec::new(),
+                tokens: Vec::new(),
+                limits: RateLimits::default(),
+            },
+            policy,
+        )
+        .expect("incomplete segment coverage cannot erase aggregate text");
+        assert_eq!(incomplete.text, "unmatched synthetic body rejected suffix");
+        assert!(incomplete.segments.is_empty());
+    }
+
+    #[test]
+    fn groq_whitespace_only_kept_segment_does_not_revive_complete_rejected_text() {
+        let transcript = sanitize_transcript_with_policy(
+            Transcript {
+                text: "synthetic rejected transcript".into(),
+                asr_text: None,
+                provider_cleaned_candidate: None,
+                language: None,
+                confidence: None,
+                segments: vec![
+                    Segment {
+                        text: "synthetic rejected transcript".into(),
+                        start: None,
+                        end: None,
+                        avg_logprob: Some(-0.2),
+                        no_speech_prob: Some(0.81),
+                    },
+                    Segment {
+                        text: " ".into(),
+                        start: None,
+                        end: None,
+                        avg_logprob: Some(-0.2),
+                        no_speech_prob: Some(0.1),
+                    },
+                ],
+                words: Vec::new(),
+                tokens: Vec::new(),
+                limits: RateLimits::default(),
+            },
+            SegmentTextPolicy::GroqAggregateAuthoritative,
+        );
+        assert!(matches!(transcript, Err(AsrError::EmptyResult)));
     }
 
     #[tokio::test]

@@ -21,6 +21,7 @@ pub(crate) const COMMANDS: &[&str] = &[
     "remove_dictionary_word",
     "list_learn_pairs",
     "add_manual_scoped_learn_pair",
+    "rebind_invalidated_learn_pair",
     "get_dictionary_learning_audit",
     "list_learned_term_usage",
     "promote_learn_pair",
@@ -31,6 +32,8 @@ pub(crate) const COMMANDS: &[&str] = &[
     "list_style_drafts",
     "confirm_style_draft",
     "dismiss_style_draft",
+    "list_writing_preference_drafts",
+    "review_writing_preference_drafts",
     "read_dictionary_file",
     "get_context_snapshot",
     "get_context_mappings",
@@ -48,6 +51,9 @@ pub(crate) const COMMANDS: &[&str] = &[
     "get_history",
     "export_history",
     "export_gold_corpus",
+    "export_learning_transfer",
+    "preview_learning_transfer",
+    "apply_learning_transfer",
     "clear_all_data",
     "retry_dictation",
     "probe_engine_draft",
@@ -135,6 +141,7 @@ mod tests {
         "remove_dictionary_word",
         "list_learn_pairs",
         "add_manual_scoped_learn_pair",
+        "rebind_invalidated_learn_pair",
         "get_dictionary_learning_audit",
         "list_learned_term_usage",
         "promote_learn_pair",
@@ -145,6 +152,8 @@ mod tests {
         "list_style_drafts",
         "confirm_style_draft",
         "dismiss_style_draft",
+        "list_writing_preference_drafts",
+        "review_writing_preference_drafts",
         "read_dictionary_file",
         "get_context_snapshot",
         "get_context_mappings",
@@ -162,6 +171,9 @@ mod tests {
         "get_history",
         "export_history",
         "export_gold_corpus",
+        "export_learning_transfer",
+        "preview_learning_transfer",
+        "apply_learning_transfer",
         "clear_all_data",
         "retry_dictation",
         "probe_engine_draft",
@@ -352,17 +364,34 @@ mod tests {
         assert_eq!(ip, expected_i);
         let ms: BTreeSet<_> = MAIN.iter().copied().collect();
         let is: BTreeSet<_> = ISLAND.iter().copied().collect();
-        assert_eq!(ms.len(), 97);
-        assert_eq!(is.len(), 14);
+        assert_eq!(ms.len(), 104);
+        assert_eq!(is.len(), 15);
         assert_eq!(
             ms.intersection(&is).copied().collect::<BTreeSet<_>>(),
-            ["get_settings", "undo_learn_pair"].into_iter().collect()
+            [
+                "get_hud_appearance_status",
+                "get_settings",
+                "undo_learn_pair"
+            ]
+            .into_iter()
+            .collect()
         );
         assert_eq!(
             ms.union(&is).copied().collect::<BTreeSet<_>>(),
             COMMANDS.iter().copied().collect()
         );
-        assert_eq!(ms.union(&is).count(), 109);
+        assert_eq!(ms.union(&is).count(), 116);
+        for command in [
+            "export_learning_transfer",
+            "preview_learning_transfer",
+            "apply_learning_transfer",
+        ] {
+            assert!(ms.contains(command), "{command} must be available to main");
+            assert!(
+                !is.contains(command),
+                "{command} must not be available to island"
+            );
+        }
         for c in [
             "clear_all_data",
             "update_settings_patch",
@@ -388,7 +417,7 @@ mod tests {
         let app = acl["__app-acl__"]["permissions"]
             .as_object()
             .expect("generated app permissions");
-        assert_eq!(app.len(), 218);
+        assert_eq!(app.len(), 232);
         for c in COMMANDS {
             let allow = &app[&format!("allow-{}", c.replace('_', "-"))]["commands"];
             let deny = &app[&format!("deny-{}", c.replace('_', "-"))]["commands"];

@@ -5,6 +5,7 @@
 //! Tauri IPC boundary or enter an LLM request.
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::process::{Command, Stdio};
@@ -86,6 +87,19 @@ pub struct ContextPolicy {
     /// until the user explicitly approves them.
     #[serde(default)]
     pub style_examples_approved: bool,
+    /// Bounded structured writing guidance from an explicitly saved,
+    /// task-scoped preference. It is ephemeral and never stored in History.
+    #[serde(skip)]
+    pub(crate) preference_guidance: Option<String>,
+    /// Internal request-binding metadata used to cancel cleanup if a saved
+    /// preference or its permission changes while a request is in flight.
+    #[serde(skip)]
+    pub(crate) preference_scope: Option<String>,
+    /// Bounded, local-only provenance for future History preference evidence.
+    /// This is not a cleanup instruction; prompt construction selects only
+    /// the explicit policy fields it needs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) history_preference_provenance: Option<HistoryPreferenceProvenanceV1>,
     /// Accessibility-classified input role captured for this dictation. It is
     /// kept with the policy in History so retries can apply the same
     /// conservative Auto cleanup and lexicon rules even inside a known IDE.
@@ -107,6 +121,8 @@ impl ContextPolicy {
         policy.style_example_output = None;
         policy.style_example_pairs.clear();
         policy.style_examples_approved = false;
+        policy.preference_guidance = None;
+        policy.preference_scope = None;
         policy.cleanup_output_plan = None;
         policy
     }
@@ -133,6 +149,9 @@ impl ContextPolicy {
             style_example_output: None,
             style_example_pairs: Vec::new(),
             style_examples_approved: false,
+            preference_guidance: None,
+            preference_scope: None,
+            history_preference_provenance: None,
             input_kind: FocusKind::Unknown,
             cleanup_output_plan: None,
         };
@@ -241,6 +260,10 @@ pub struct ContextProfile {
     pub family: ContextFamily,
     #[serde(default)]
     pub writing_mode_id: Option<String>,
+    /// A task ID selected by the user on the uniquely matched AppMapping.
+    /// Inferred and ambiguous context profiles deliberately leave it unknown.
+    #[serde(default)]
+    pub writing_task_id: Option<WritingTaskId>,
     pub app_label: String,
     pub icon_key: String,
     pub source: ContextSource,
@@ -300,6 +323,14 @@ pub struct ContextSnapshot {
     pub evidence: crate::screen_text::ContextEvidence,
     #[serde(skip)]
     pub target_guard: TargetAppGuard,
+    /// Opaque version of the selected user mapping's declared target selectors.
+    /// It is persisted only beside a History row so later edits can fail closed.
+    #[serde(skip)]
+    pub mapping_identity: Option<String>,
+    /// Runtime preference-owner revision captured from the same mapping as
+    /// `mapping_identity`; missing mappings stay `None`, never revision zero.
+    #[serde(skip)]
+    pub mapping_preference_revision: Option<u64>,
 }
 
 pub struct ContextState {
@@ -569,6 +600,113 @@ pub fn family_id(family: ContextFamily) -> &'static str {
 pub const MAX_WRITING_MODE_LABEL_CHARS: usize = 64;
 pub const MAX_WRITING_MODE_PROMPT_CHARS: usize = 8_000;
 
+/// User-selected task identity. These values are routing metadata, not a
+/// classifier output. Missing or ambiguous task identity disables preferences.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WritingTaskId {
+    ProjectUpdate,
+    Email,
+    WorkChat,
+    PersonalChat,
+    DocumentEditing,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WritingPreferenceDimension {
+    ListStructure,
+    GreetingTone,
+    TerminalPunctuation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WritingPreferenceValue {
+    Bullets,
+    ConversationalGreeting,
+    RespectfulGreeting,
+    TerminalPeriod,
+    NoTerminalPeriod,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WritingPreferenceStatus {
+    Active,
+    Paused,
+    Forgotten,
+}
+
+/// How an explicitly saved preference acquired its value. Legacy Settings
+/// entries default to `Manual`; History-derived entries require review.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum WritingPreferenceSource {
+    #[default]
+    Manual,
+    ReviewedHistory,
+}
+
+fn default_writing_preference_source() -> WritingPreferenceSource {
+    WritingPreferenceSource::Manual
+}
+
+/// An explicitly saved App × task × dimension preference. `Forgotten` is a
+/// retained tombstone and never authorizes application or inference.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WritingPreference {
+    /// Task identity for this dimension. Optional only for migration of the
+    /// earlier single-task AppMapping shape; missing values are interpreted
+    /// using that mapping's selected task and are normalized on save.
+    #[serde(default)]
+    pub task_id: Option<WritingTaskId>,
+    pub dimension: WritingPreferenceDimension,
+    pub value: WritingPreferenceValue,
+    pub status: WritingPreferenceStatus,
+    #[serde(default = "default_preference_version")]
+    pub version: u16,
+    #[serde(default = "default_writing_preference_source")]
+    pub source: WritingPreferenceSource,
+}
+
+fn default_preference_version() -> u16 {
+    1
+}
+
+/// The output path selected for a History transaction. Unsafe and old routes
+/// remain `Unknown` so a later edit cannot invent provenance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum HistoryPreferenceOutputKind {
+    PreparedTranscript,
+    AcceptedCleanup,
+    SnippetExpansion,
+    #[default]
+    Unknown,
+}
+
+/// Local provenance captured with a History row. These fields identify the
+/// user-selected task and actual cleanup path at recording time; they do not
+/// grant provider egress or activate a preference.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct HistoryPreferenceProvenanceV1 {
+    pub(crate) version: u8,
+    pub(crate) task_id: Option<WritingTaskId>,
+    pub(crate) mapping_preference_revision: Option<u64>,
+    pub(crate) intent_source: crate::llm::IntentSource,
+    pub(crate) output_kind: HistoryPreferenceOutputKind,
+    #[serde(default)]
+    pub(crate) output_mode: Option<String>,
+    #[serde(default)]
+    pub(crate) snippet_expanded: bool,
+    /// Explicit per-recording cleanup bypass, distinct from the global
+    /// cleanup-enabled setting. `None` means an older or incomplete capture.
+    #[serde(default)]
+    pub(crate) session_skip_llm_cleanup: Option<bool>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WritingMode {
     pub id: String,
@@ -767,6 +905,7 @@ pub fn apply_manual_override_with_modes(
         id: format!("manual.{}", family_id(family)),
         family,
         writing_mode_id: Some(family_id(family).into()),
+        writing_task_id: None,
         app_label: "Manual override".into(),
         icon_key: "manual".into(),
         source: ContextSource::ManualOverride,
@@ -782,6 +921,24 @@ pub struct AppMapping {
     pub id: String,
     pub label: String,
     pub family: ContextFamily,
+    /// Explicitly selected writing task for this selector. It is not inferred
+    /// from the family or writing mode.
+    #[serde(default)]
+    pub writing_task_id: Option<WritingTaskId>,
+    #[serde(default)]
+    pub writing_preferences: Vec<WritingPreference>,
+    /// Independent permission for structured preference guidance to leave the
+    /// device with a cloud cleanup request. Style examples use their own gate.
+    #[serde(default)]
+    pub preference_guidance_provider_approved: bool,
+    /// Compare-and-save revision for the preference owner. Generic settings
+    /// patches and stale Settings views cannot replay forgotten preferences.
+    #[serde(default)]
+    pub preference_revision: u64,
+    /// A scrubbed identity tombstone prevents a stale Settings view from
+    /// recreating a deleted mapping with its former active preferences.
+    #[serde(default)]
+    pub deleted: bool,
     #[serde(default)]
     pub mode_id: Option<String>,
     #[serde(default)]
@@ -820,6 +977,163 @@ pub struct AppMapping {
     pub cleanup_enabled: bool,
     #[serde(default = "default_true")]
     pub dictionary_learn_enabled: bool,
+}
+
+/// Versioned, declarative identity used to bind a portable transfer entry to
+/// a destination App mapping. Mapping IDs are deliberately excluded: they are
+/// local implementation details and must never be imported from another
+/// installation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct MappingTransferSelectorV1 {
+    pub(crate) version: u8,
+    pub(crate) family: ContextFamily,
+    pub(crate) bundle_id: Option<String>,
+    pub(crate) executable: Option<String>,
+    pub(crate) browser_host: Option<String>,
+    pub(crate) browser_path_prefix: Option<String>,
+    pub(crate) focused_field: Option<FocusKind>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum MappingTransferResolution {
+    Missing,
+    Unique(String),
+    Ambiguous,
+}
+
+impl MappingTransferSelectorV1 {
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        if self.version != 1 {
+            return Err("unsupported mapping transfer selector version".into());
+        }
+        if self.bundle_id.is_none() && self.executable.is_none() && self.browser_host.is_none() {
+            return Err("mapping transfer selector needs an App or browser anchor".into());
+        }
+        if self
+            .bundle_id
+            .as_deref()
+            .into_iter()
+            .chain(self.executable.as_deref())
+            .any(|value| {
+                value.trim().is_empty() || value.len() > 1024 || value.chars().any(char::is_control)
+            })
+        {
+            return Err("mapping transfer selector is empty or too long".into());
+        }
+        if let Some(host) = &self.browser_host {
+            if host.len() > 253
+                || host.chars().any(char::is_control)
+                || normalize_host(host).as_deref() != Some(host.as_str())
+            {
+                return Err("mapping transfer browser host is not normalized".into());
+            }
+        }
+        if let Some(path) = &self.browser_path_prefix {
+            if path.len() > 2048
+                || path.chars().any(char::is_control)
+                || !valid_path_prefix(path)
+                || normalize_path_prefix(path).as_deref() != Some(path.as_str())
+            {
+                return Err("mapping transfer browser path is not normalized".into());
+            }
+            if self.browser_host.is_none() {
+                return Err("mapping transfer browser path requires a host".into());
+            }
+        }
+        if self.focused_field == Some(FocusKind::Unknown) {
+            return Err("unknown cannot be used as a mapping transfer selector".into());
+        }
+        Ok(())
+    }
+
+    /// Resolve only a unique, structurally valid mapping with the same full
+    /// declared selector set. Label, enabled state, permissions, and mapping
+    /// ID do not participate in identity matching.
+    pub(crate) fn resolve(&self, mappings: &[AppMapping]) -> MappingTransferResolution {
+        if self.validate().is_err() {
+            return MappingTransferResolution::Missing;
+        }
+        let mut matches = mappings.iter().filter(|mapping| {
+            !mapping.deleted
+                && mapping.validate().is_ok()
+                && mapping.transfer_selector().as_ref() == Ok(self)
+        });
+        let Some(first) = matches.next() else {
+            return MappingTransferResolution::Missing;
+        };
+        if matches.next().is_some() {
+            MappingTransferResolution::Ambiguous
+        } else {
+            MappingTransferResolution::Unique(first.id.clone())
+        }
+    }
+}
+
+/// Compare selectors using the same ordering that chooses the active mapping
+/// at runtime. Transfer uses this only after proving two selectors can match
+/// the same signal: a strict ordering means the more specific owner always
+/// wins their intersection, while an equal ordering leaves ownership tied to
+/// local mapping IDs.
+pub(crate) fn transfer_selector_specificity_cmp(
+    left: &MappingTransferSelectorV1,
+    right: &MappingTransferSelectorV1,
+) -> std::cmp::Ordering {
+    selector_specificity(
+        left.bundle_id.as_deref(),
+        left.executable.as_deref(),
+        left.browser_host.as_deref(),
+        left.browser_path_prefix.as_deref(),
+        left.focused_field,
+    )
+    .cmp(&selector_specificity(
+        right.bundle_id.as_deref(),
+        right.executable.as_deref(),
+        right.browser_host.as_deref(),
+        right.browser_path_prefix.as_deref(),
+        right.focused_field,
+    ))
+}
+
+fn selector_specificity(
+    bundle_id: Option<&str>,
+    executable: Option<&str>,
+    browser_host: Option<&str>,
+    browser_path_prefix: Option<&str>,
+    focused_field: Option<FocusKind>,
+) -> (
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+    usize,
+) {
+    let host = browser_host.and_then(normalize_host);
+    let path = browser_path_prefix.and_then(normalize_path_prefix);
+    let host_labels = host.as_deref().map_or(0, |value| value.split('.').count());
+    let path_segments = path.as_deref().map_or(0, |value| {
+        value.split('/').filter(|part| !part.is_empty()).count()
+    });
+    let path_length = path.as_deref().map_or(0, str::len);
+    (
+        usize::from(host.is_some()),
+        host_labels,
+        usize::from(path.is_some()),
+        path_segments,
+        path_length,
+        usize::from(focused_field.is_some()),
+        usize::from(bundle_id.is_some()),
+        usize::from(executable.is_some()),
+        usize::from(bundle_id.is_some())
+            + usize::from(executable.is_some())
+            + usize::from(browser_host.is_some())
+            + usize::from(browser_path_prefix.is_some())
+            + usize::from(focused_field.is_some()),
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -865,9 +1179,119 @@ fn default_true() -> bool {
 }
 
 impl AppMapping {
+    pub(crate) fn transfer_selector(&self) -> Result<MappingTransferSelectorV1, String> {
+        self.validate()?;
+        if self.deleted {
+            return Err("deleted mappings cannot be transferred".into());
+        }
+        let browser_host = self
+            .browser_host
+            .as_deref()
+            .map(|host| normalize_host(host).ok_or_else(|| "invalid mapping host".to_owned()))
+            .transpose()?;
+        let browser_path_prefix = self
+            .browser_path_prefix
+            .as_deref()
+            .map(|path| {
+                normalize_path_prefix(path).ok_or_else(|| "invalid mapping browser path".to_owned())
+            })
+            .transpose()?;
+        let selector = MappingTransferSelectorV1 {
+            version: 1,
+            family: self.family,
+            bundle_id: self.bundle_id.clone(),
+            executable: self.executable.clone(),
+            browser_host,
+            browser_path_prefix,
+            focused_field: self.focused_field,
+        };
+        selector.validate()?;
+        Ok(selector)
+    }
+
+    /// Return only active structured preferences, normalized to explicit task
+    /// IDs. Paused and forgotten rows are intentionally not portable.
+    pub(crate) fn active_transfer_preferences(&self) -> Result<Vec<WritingPreference>, String> {
+        self.validate()?;
+        if self.deleted {
+            return Err("deleted mappings cannot transfer preferences".into());
+        }
+        let mut preferences = self
+            .writing_preferences
+            .iter()
+            .filter(|preference| preference.status == WritingPreferenceStatus::Active)
+            .cloned()
+            .map(|mut preference| {
+                preference.task_id = preference.task_id.or(self.writing_task_id);
+                preference
+            })
+            .collect::<Vec<_>>();
+        preferences.sort_by_key(|preference| (preference.task_id, preference.dimension));
+        Ok(preferences)
+    }
+
+    /// Whether a saved mapping changed selectors that define its declared
+    /// target identity. Labels, style samples, permissions, and cleanup policy
+    /// do not change the target identity of learned word rules.
+    pub fn declared_identity_changed(&self, next: &Self) -> bool {
+        fn normalized_host(value: &Option<String>) -> Option<String> {
+            value.as_deref().map(|value| {
+                normalize_host(value).unwrap_or_else(|| value.trim().to_ascii_lowercase())
+            })
+        }
+
+        fn normalized_path(value: &Option<String>) -> Option<String> {
+            value.as_deref().map(|value| {
+                normalize_path_prefix(value).unwrap_or_else(|| value.trim().to_owned())
+            })
+        }
+
+        self.family != next.family
+            || self.bundle_id != next.bundle_id
+            || self.executable != next.executable
+            || normalized_host(&self.browser_host) != normalized_host(&next.browser_host)
+            || normalized_path(&self.browser_path_prefix)
+                != normalized_path(&next.browser_path_prefix)
+            || self.focused_field != next.focused_field
+    }
+
+    pub fn declared_identity_fingerprint(&self) -> String {
+        #[derive(Serialize)]
+        struct Identity<'a> {
+            version: u8,
+            id: &'a str,
+            family: ContextFamily,
+            bundle_id: Option<&'a str>,
+            executable: Option<&'a str>,
+            browser_host: Option<String>,
+            browser_path_prefix: Option<String>,
+            focused_field: Option<FocusKind>,
+        }
+
+        let identity = Identity {
+            version: 1,
+            id: &self.id,
+            family: self.family,
+            bundle_id: self.bundle_id.as_deref(),
+            executable: self.executable.as_deref(),
+            browser_host: self.browser_host.as_deref().map(|value| {
+                normalize_host(value).unwrap_or_else(|| value.trim().to_ascii_lowercase())
+            }),
+            browser_path_prefix: self.browser_path_prefix.as_deref().map(|value| {
+                normalize_path_prefix(value).unwrap_or_else(|| value.trim().to_owned())
+            }),
+            focused_field: self.focused_field,
+        };
+        let encoded = serde_json::to_vec(&identity).expect("mapping identity is serializable");
+        format!("mapping:v1:{}", hex::encode(Sha256::digest(encoded)))
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         if self.id.trim().is_empty() || self.id.len() > 128 {
             return Err("mapping id must contain between 1 and 128 characters".into());
+        }
+        if self.deleted {
+            return Ok(());
         }
         if self.label.trim().is_empty() || self.label.len() > 128 {
             return Err("mapping label must contain between 1 and 128 characters".into());
@@ -895,6 +1319,72 @@ impl AppMapping {
             .is_some_and(|mode| mode.is_empty() || mode.len() > 128)
         {
             return Err("mapping mode id must contain between 1 and 128 characters".into());
+        }
+        if self.writing_task_id.is_some() && !self.has_task_disambiguator() {
+            return Err(
+                "task identity requires a verified focused field or browser path selector".into(),
+            );
+        }
+        if self.writing_task_id.is_some()
+            && self.focused_field.is_some_and(|field| {
+                matches!(
+                    field,
+                    FocusKind::Unknown | FocusKind::Secure | FocusKind::Search
+                )
+            })
+        {
+            return Err("task identity cannot use an unknown, secure, or search field".into());
+        }
+        if self.preference_guidance_provider_approved
+            && !self.writing_preferences.iter().any(|preference| {
+                preference.status == WritingPreferenceStatus::Active
+                    && preference.task_id.or(self.writing_task_id) == self.writing_task_id
+                    && matches!(
+                        preference.dimension,
+                        WritingPreferenceDimension::GreetingTone
+                            | WritingPreferenceDimension::TerminalPunctuation
+                    )
+            })
+        {
+            return Err(
+                "provider preference approval requires an active cloud-supported preference".into(),
+            );
+        }
+        if self.preference_guidance_provider_approved && self.writing_task_id.is_none() {
+            return Err("provider preference approval requires an explicitly selected task".into());
+        }
+        if self.writing_preferences.len() > 15 {
+            return Err("a mapping can contain at most 15 task-scoped preferences".into());
+        }
+        let mut seen_dimensions = std::collections::HashSet::new();
+        for preference in &self.writing_preferences {
+            let task_id = preference.task_id.or(self.writing_task_id).ok_or_else(|| {
+                "writing preferences require an explicitly selected task".to_owned()
+            })?;
+            if !seen_dimensions.insert((task_id, preference.dimension)) {
+                return Err("a task can contain only one preference per dimension".into());
+            }
+            if preference.version != 1 {
+                return Err("unsupported writing preference version".into());
+            }
+            let supported = matches!(
+                (preference.dimension, preference.value),
+                (
+                    WritingPreferenceDimension::ListStructure,
+                    WritingPreferenceValue::Bullets
+                ) | (
+                    WritingPreferenceDimension::GreetingTone,
+                    WritingPreferenceValue::ConversationalGreeting
+                        | WritingPreferenceValue::RespectfulGreeting
+                ) | (
+                    WritingPreferenceDimension::TerminalPunctuation,
+                    WritingPreferenceValue::TerminalPeriod
+                        | WritingPreferenceValue::NoTerminalPeriod
+                )
+            );
+            if !supported {
+                return Err("writing preference value is not supported for its dimension".into());
+            }
         }
         if let Some(host) = &self.browser_host {
             if normalize_host(host).is_none() {
@@ -941,6 +1431,40 @@ impl AppMapping {
         }
         Ok(())
     }
+
+    pub(crate) fn has_task_disambiguator(&self) -> bool {
+        self.focused_field.is_some()
+            || (self.browser_host.is_some() && self.browser_path_prefix.is_some())
+    }
+
+    pub(crate) fn has_task_anchor(&self) -> bool {
+        self.bundle_id.is_some() || self.executable.is_some() || self.browser_host.is_some()
+    }
+
+    pub(crate) fn scrub_as_deleted_tombstone(&mut self) {
+        self.deleted = true;
+        self.enabled = false;
+        self.label = "Deleted mapping".into();
+        self.family = ContextFamily::General;
+        self.writing_task_id = None;
+        self.writing_preferences.clear();
+        self.preference_guidance_provider_approved = false;
+        self.mode_id = None;
+        self.bundle_id = None;
+        self.executable = None;
+        self.browser_host = None;
+        self.browser_path_prefix = None;
+        self.focused_field = None;
+        self.source_permissions = ContextSourcePermissions::default();
+        self.style_example_input = None;
+        self.style_example_output = None;
+        self.style_example_pairs.clear();
+        self.style_examples_approved = false;
+        self.cleanup_effort = None;
+        self.cleanup_intensity = None;
+        self.cleanup_enabled = false;
+        self.dictionary_learn_enabled = false;
+    }
 }
 
 pub fn merge_saved_mapping(
@@ -975,6 +1499,159 @@ pub fn merge_saved_mapping(
     }
     incoming.style_example_pairs.truncate(3);
     incoming
+}
+
+/// Merge one explicit AppMapping save with the current preference owner.
+/// Preferences from other task IDs, especially forgotten tombstones, remain
+/// owned by the mapping when the Settings form switches its selected task.
+pub fn merge_saved_preferences(
+    existing: &AppMapping,
+    incoming: &mut AppMapping,
+) -> Result<(), String> {
+    merge_saved_preferences_with_reviewed_source(existing, incoming, false)
+}
+
+/// Merge a candidate that passed the backend's explicit review command. The
+/// renderer-facing Settings save uses `merge_saved_preferences` and cannot
+/// introduce `ReviewedHistory` provenance.
+pub(crate) fn merge_reviewed_history_preferences(
+    existing: &AppMapping,
+    incoming: &mut AppMapping,
+) -> Result<(), String> {
+    merge_saved_preferences_with_reviewed_source(existing, incoming, true)
+}
+
+fn merge_saved_preferences_with_reviewed_source(
+    existing: &AppMapping,
+    incoming: &mut AppMapping,
+    allow_reviewed_history_source: bool,
+) -> Result<(), String> {
+    if incoming.preference_revision != existing.preference_revision {
+        return Err(
+            "writing preferences changed elsewhere; reload this mapping before saving".into(),
+        );
+    }
+
+    // Preference approval belongs to the declared App / site / field identity.
+    // A selector or family change starts a new owner even when the mapping ID
+    // stays the same. Drop both the old owner state and any renderer payload in
+    // this save; the user can explicitly enter or review preferences again
+    // after the new scope has been persisted.
+    if existing.declared_identity_changed(incoming) {
+        incoming.writing_preferences.clear();
+        incoming.preference_guidance_provider_approved = false;
+        incoming.preference_revision = existing.preference_revision.wrapping_add(1).max(1);
+        return Ok(());
+    }
+
+    let current_task = incoming.writing_task_id;
+    let mut current_preferences = existing.writing_preferences.clone();
+    for preference in &mut current_preferences {
+        if preference.task_id.is_none() {
+            preference.task_id = existing.writing_task_id;
+        }
+    }
+    let mut incoming_preferences = incoming.writing_preferences.clone();
+    for preference in &mut incoming_preferences {
+        if preference.task_id.is_none() {
+            preference.task_id = current_task;
+        }
+        let existing_preference = current_preferences.iter().find(|existing_preference| {
+            existing_preference.task_id == preference.task_id
+                && existing_preference.dimension == preference.dimension
+                && existing_preference.value == preference.value
+        });
+        if let Some(existing_preference) = existing_preference {
+            // The renderer does not own provenance. Preserve the backend's
+            // source and version for the same scoped rule, even when a status
+            // toggle changes Active/Paused/Forgotten.
+            preference.source = existing_preference.source;
+            preference.version = existing_preference.version;
+        } else {
+            // A changed or newly introduced value is an explicit manual save;
+            // a stale renderer payload cannot forge a reviewed History source.
+            if !allow_reviewed_history_source
+                || preference.source != WritingPreferenceSource::ReviewedHistory
+            {
+                preference.source = WritingPreferenceSource::Manual;
+            }
+        }
+    }
+    let mut merged = current_preferences
+        .into_iter()
+        .filter(|preference| preference.task_id != current_task)
+        .collect::<Vec<_>>();
+    merged.extend(
+        incoming_preferences
+            .into_iter()
+            .filter(|preference| preference.task_id == current_task),
+    );
+    merged.sort_by_key(|preference| (preference.task_id, preference.dimension));
+    merged.dedup_by_key(|preference| (preference.task_id, preference.dimension));
+
+    if existing.writing_task_id != current_task
+        || (incoming.preference_guidance_provider_approved
+            && !merged.iter().any(|preference| {
+                preference.task_id == current_task
+                    && preference.status == WritingPreferenceStatus::Active
+                    && matches!(
+                        preference.dimension,
+                        WritingPreferenceDimension::GreetingTone
+                            | WritingPreferenceDimension::TerminalPunctuation
+                    )
+            }))
+    {
+        incoming.preference_guidance_provider_approved = false;
+    }
+
+    let existing_had_cloud_supported_preference =
+        existing.writing_preferences.iter().any(|preference| {
+            preference.task_id.or(existing.writing_task_id) == existing.writing_task_id
+                && preference.status == WritingPreferenceStatus::Active
+                && matches!(
+                    preference.dimension,
+                    WritingPreferenceDimension::GreetingTone
+                        | WritingPreferenceDimension::TerminalPunctuation
+                )
+        });
+    let incoming_has_cloud_supported_preference = merged.iter().any(|preference| {
+        preference.task_id == current_task
+            && preference.status == WritingPreferenceStatus::Active
+            && matches!(
+                preference.dimension,
+                WritingPreferenceDimension::GreetingTone
+                    | WritingPreferenceDimension::TerminalPunctuation
+            )
+    });
+    if existing.preference_guidance_provider_approved
+        && !existing_had_cloud_supported_preference
+        && incoming_has_cloud_supported_preference
+    {
+        // A legacy/list-only grant cannot silently authorize newly added tone
+        // or punctuation guidance. The user can grant it in a fresh save.
+        incoming.preference_guidance_provider_approved = false;
+    }
+
+    let mut existing_preferences = existing.writing_preferences.clone();
+    for preference in &mut existing_preferences {
+        if preference.task_id.is_none() {
+            preference.task_id = existing.writing_task_id;
+        }
+    }
+    existing_preferences.sort_by_key(|preference| (preference.task_id, preference.dimension));
+    existing_preferences.dedup_by_key(|preference| (preference.task_id, preference.dimension));
+
+    let changed = existing.writing_task_id != incoming.writing_task_id
+        || existing.preference_guidance_provider_approved
+            != incoming.preference_guidance_provider_approved
+        || existing_preferences != merged;
+    incoming.writing_preferences = merged;
+    incoming.preference_revision = if changed {
+        existing.preference_revision.wrapping_add(1).max(1)
+    } else {
+        existing.preference_revision
+    };
+    Ok(())
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1365,6 +2042,11 @@ fn snapshot_for_signal_with_modes(
     } else {
         BrowserAccessStatus::NotApplicable
     };
+    let selected_mapping = mappings
+        .iter()
+        .find(|mapping| profile.id == format!("user.{}", mapping.id));
+    let mapping_identity = selected_mapping.map(AppMapping::declared_identity_fingerprint);
+    let mapping_preference_revision = selected_mapping.map(|mapping| mapping.preference_revision);
     ContextSnapshot {
         profile,
         policy,
@@ -1385,12 +2067,19 @@ fn snapshot_for_signal_with_modes(
             input_token: signal.input_token,
             secure_input: signal.focus_kind.is_secure(),
         },
+        mapping_identity,
+        mapping_preference_revision,
     }
 }
 
 fn resolve_profile(signal: &AppSignal, mappings: &[AppMapping]) -> ContextProfile {
     if let Some(mapping) = best_mapping_match(signal, mappings) {
-        return profile_from_mapping(mapping);
+        let mut profile = profile_from_mapping(mapping);
+        profile.writing_task_id = best_unambiguous_mapping_match(signal, mappings)
+            .filter(|unambiguous| unambiguous.id == mapping.id)
+            .filter(|unambiguous| task_identity_is_verified(unambiguous, signal))
+            .and_then(|unambiguous| unambiguous.writing_task_id);
+        return profile;
     }
 
     // A positively identified search control is more specific than the
@@ -1609,13 +2298,38 @@ fn resolve_profile(signal: &AppSignal, mappings: &[AppMapping]) -> ContextProfil
     )
 }
 
+fn task_identity_is_verified(mapping: &AppMapping, signal: &AppSignal) -> bool {
+    if mapping.deleted || !mapping.has_task_anchor() {
+        return false;
+    }
+    if let Some(expected_field) = mapping.focused_field {
+        return !signal.window_identity_ambiguous
+            && !matches!(
+                expected_field,
+                FocusKind::Unknown | FocusKind::Secure | FocusKind::Search
+            )
+            && signal.focus_kind == expected_field
+            && signal.input_token.is_some()
+            && (signal.window_id.is_some() || signal.window_token.is_some());
+    }
+    mapping.browser_host.is_some()
+        && mapping.browser_path_prefix.is_some()
+        && signal.browser_host.is_some()
+        && signal.browser_path.is_some()
+        && signal.browser_target_token.is_some()
+}
+
 fn best_mapping_match<'a>(
     signal: &AppSignal,
     mappings: &'a [AppMapping],
 ) -> Option<&'a AppMapping> {
     mappings
         .iter()
-        .filter(|mapping| mapping.enabled && mapping_matches(mapping, signal))
+        .filter(|mapping| {
+            mapping.enabled
+                && !(mapping.writing_task_id.is_some() && !mapping.has_task_anchor())
+                && mapping_matches(mapping, signal)
+        })
         .reduce(|best, candidate| {
             match mapping_specificity(candidate).cmp(&mapping_specificity(best)) {
                 std::cmp::Ordering::Greater => candidate,
@@ -1624,6 +2338,36 @@ fn best_mapping_match<'a>(
                 std::cmp::Ordering::Equal => best,
             }
         })
+}
+
+fn best_unambiguous_mapping_match<'a>(
+    signal: &AppSignal,
+    mappings: &'a [AppMapping],
+) -> Option<&'a AppMapping> {
+    let mut best: Option<&AppMapping> = None;
+    let mut tied = false;
+    for candidate in mappings.iter().filter(|mapping| {
+        mapping.enabled
+            && !(mapping.writing_task_id.is_some() && !mapping.has_task_anchor())
+            && mapping_matches(mapping, signal)
+    }) {
+        match best
+            .map(mapping_specificity)
+            .map(|specificity| mapping_specificity(candidate).cmp(&specificity))
+        {
+            None | Some(std::cmp::Ordering::Greater) => {
+                best = Some(candidate);
+                tied = false;
+            }
+            Some(std::cmp::Ordering::Equal) => tied = true,
+            Some(std::cmp::Ordering::Less) => {}
+        }
+    }
+    if tied {
+        None
+    } else {
+        best
+    }
 }
 
 fn mapping_specificity(
@@ -1639,30 +2383,12 @@ fn mapping_specificity(
     usize,
     usize,
 ) {
-    let host = mapping.browser_host.as_deref().and_then(normalize_host);
-    let path = mapping
-        .browser_path_prefix
-        .as_deref()
-        .and_then(normalize_path_prefix);
-    let host_labels = host.as_deref().map_or(0, |value| value.split('.').count());
-    let path_segments = path.as_deref().map_or(0, |value| {
-        value.split('/').filter(|part| !part.is_empty()).count()
-    });
-    let path_length = path.as_deref().map_or(0, str::len);
-    (
-        usize::from(host.is_some()),
-        host_labels,
-        usize::from(path.is_some()),
-        path_segments,
-        path_length,
-        usize::from(mapping.focused_field.is_some()),
-        usize::from(mapping.bundle_id.is_some()),
-        usize::from(mapping.executable.is_some()),
-        usize::from(mapping.bundle_id.is_some())
-            + usize::from(mapping.executable.is_some())
-            + usize::from(mapping.browser_host.is_some())
-            + usize::from(mapping.browser_path_prefix.is_some())
-            + usize::from(mapping.focused_field.is_some()),
+    selector_specificity(
+        mapping.bundle_id.as_deref(),
+        mapping.executable.as_deref(),
+        mapping.browser_host.as_deref(),
+        mapping.browser_path_prefix.as_deref(),
+        mapping.focused_field,
     )
 }
 
@@ -1924,6 +2650,7 @@ fn profile_from_mapping(mapping: &AppMapping) -> ContextProfile {
             .clone()
             .unwrap_or_else(|| family_id(mapping.family).into()),
     );
+    profile.writing_task_id = mapping.writing_task_id;
     profile
 }
 
@@ -1952,6 +2679,7 @@ fn profile(
         id: id.into(),
         family,
         writing_mode_id: None,
+        writing_task_id: None,
         app_label: label.into(),
         icon_key: icon_key.into(),
         source,
@@ -4081,6 +4809,19 @@ mod tests {
     }
 
     #[test]
+    fn ephemeral_preference_guidance_and_scope_never_enter_history_metadata() {
+        let mut policy = ContextPolicy::for_family(ContextFamily::Document);
+        policy.preference_guidance = Some("Use bullets only when source boundaries align.".into());
+        policy.preference_scope = Some("task=ProjectUpdate;provider_approved=true".into());
+        let history = policy.history_metadata();
+        assert_eq!(history.preference_guidance, None);
+        assert_eq!(history.preference_scope, None);
+        let serialized = serde_json::to_value(history).expect("policy metadata serializes");
+        assert!(serialized.get("preference_guidance").is_none());
+        assert!(serialized.get("preference_scope").is_none());
+    }
+
+    #[test]
     fn normalize_migrates_the_old_shared_chat_prompt() {
         let mut modes = builtin_writing_modes();
         for mode in &mut modes {
@@ -4203,8 +4944,199 @@ mod tests {
             id: "cursor-formal".into(),
             label: "Research writing".into(),
             family: ContextFamily::Document,
+            writing_task_id: Some(WritingTaskId::ProjectUpdate),
+            writing_preferences: Vec::new(),
+            preference_guidance_provider_approved: false,
+            preference_revision: 0,
+            deleted: false,
             mode_id: None,
             bundle_id: Some("com.todesktop.230313mzl4w4u92".into()),
+            executable: None,
+            browser_host: None,
+            browser_path_prefix: None,
+            focused_field: Some(FocusKind::Document),
+            source_permissions: Default::default(),
+            style_example_input: None,
+            style_example_output: None,
+            style_example_pairs: Vec::new(),
+            style_examples_approved: false,
+            enabled: true,
+            cleanup_effort: None,
+            cleanup_intensity: None,
+            cleanup_enabled: true,
+            dictionary_learn_enabled: true,
+        };
+        let mut active = signal("com.todesktop.230313mzl4w4u92", "Cursor", None);
+        active.focus_kind = FocusKind::Document;
+        active.input_token = Some(111);
+        active.window_id = Some(222);
+        let snapshot = snapshot_for_signal(&active, &[mapping], false);
+        assert_eq!(snapshot.profile.id, "user.cursor-formal");
+        assert_eq!(snapshot.profile.family, ContextFamily::Document);
+        assert_eq!(
+            snapshot.profile.writing_task_id,
+            Some(WritingTaskId::ProjectUpdate)
+        );
+    }
+
+    #[test]
+    fn transfer_selector_uses_exact_declared_scope_and_destination_id() {
+        let mapping = |id: &str, host: &str, path: &str| AppMapping {
+            id: id.into(),
+            label: format!("{id} label"),
+            family: ContextFamily::BrowserSearch,
+            writing_task_id: None,
+            writing_preferences: Vec::new(),
+            preference_guidance_provider_approved: false,
+            preference_revision: 0,
+            deleted: false,
+            mode_id: None,
+            bundle_id: Some("com.example.browser".into()),
+            executable: None,
+            browser_host: Some(host.into()),
+            browser_path_prefix: Some(path.into()),
+            focused_field: None,
+            source_permissions: ContextSourcePermissions::default(),
+            style_example_input: None,
+            style_example_output: None,
+            style_example_pairs: Vec::new(),
+            style_examples_approved: false,
+            enabled: true,
+            cleanup_effort: None,
+            cleanup_intensity: None,
+            cleanup_enabled: true,
+            dictionary_learn_enabled: true,
+        };
+
+        let source = mapping("source-local-id", "HTTPS://MAIL.EXAMPLE.COM/", "/compose/");
+        let selector = source.transfer_selector().unwrap();
+        assert_eq!(selector.browser_host.as_deref(), Some("mail.example.com"));
+        assert_eq!(selector.browser_path_prefix.as_deref(), Some("/compose"));
+        assert!(serde_json::to_value(&selector).unwrap().get("id").is_none());
+
+        let destination = mapping("destination-local-id", "mail.example.com", "/compose");
+        assert_eq!(
+            selector.resolve(std::slice::from_ref(&destination)),
+            MappingTransferResolution::Unique("destination-local-id".into())
+        );
+        let different_path = mapping("other", "mail.example.com", "/inbox");
+        assert_eq!(
+            selector.resolve(std::slice::from_ref(&different_path)),
+            MappingTransferResolution::Missing
+        );
+        let duplicate = mapping("second-destination", "mail.example.com", "/compose");
+        assert_eq!(
+            selector.resolve(&[destination, duplicate]),
+            MappingTransferResolution::Ambiguous
+        );
+    }
+
+    #[test]
+    fn transfer_selector_requires_a_specific_app_or_browser_anchor() {
+        let mapping = AppMapping {
+            id: "focused-only".into(),
+            label: "Focused field only".into(),
+            family: ContextFamily::Document,
+            writing_task_id: None,
+            writing_preferences: Vec::new(),
+            preference_guidance_provider_approved: false,
+            preference_revision: 0,
+            deleted: false,
+            mode_id: None,
+            bundle_id: None,
+            executable: None,
+            browser_host: None,
+            browser_path_prefix: None,
+            focused_field: Some(FocusKind::Document),
+            source_permissions: ContextSourcePermissions::default(),
+            style_example_input: None,
+            style_example_output: None,
+            style_example_pairs: Vec::new(),
+            style_examples_approved: false,
+            enabled: true,
+            cleanup_effort: None,
+            cleanup_intensity: None,
+            cleanup_enabled: true,
+            dictionary_learn_enabled: true,
+        };
+        assert!(mapping.transfer_selector().is_err());
+    }
+
+    #[test]
+    fn active_transfer_preferences_excludes_paused_and_forgotten_rows() {
+        let mapping = AppMapping {
+            id: "mail-writing".into(),
+            label: "Mail writing".into(),
+            family: ContextFamily::Email,
+            writing_task_id: Some(WritingTaskId::Email),
+            writing_preferences: vec![
+                WritingPreference {
+                    task_id: None,
+                    dimension: WritingPreferenceDimension::GreetingTone,
+                    value: WritingPreferenceValue::RespectfulGreeting,
+                    status: WritingPreferenceStatus::Active,
+                    version: 1,
+                    source: WritingPreferenceSource::ReviewedHistory,
+                },
+                WritingPreference {
+                    task_id: Some(WritingTaskId::WorkChat),
+                    dimension: WritingPreferenceDimension::TerminalPunctuation,
+                    value: WritingPreferenceValue::NoTerminalPeriod,
+                    status: WritingPreferenceStatus::Paused,
+                    version: 1,
+                    source: WritingPreferenceSource::Manual,
+                },
+                WritingPreference {
+                    task_id: Some(WritingTaskId::Email),
+                    dimension: WritingPreferenceDimension::ListStructure,
+                    value: WritingPreferenceValue::Bullets,
+                    status: WritingPreferenceStatus::Forgotten,
+                    version: 1,
+                    source: WritingPreferenceSource::Manual,
+                },
+            ],
+            preference_guidance_provider_approved: true,
+            preference_revision: 1,
+            deleted: false,
+            mode_id: None,
+            bundle_id: Some("com.example.mail".into()),
+            executable: None,
+            browser_host: None,
+            browser_path_prefix: None,
+            focused_field: Some(FocusKind::Email),
+            source_permissions: ContextSourcePermissions::default(),
+            style_example_input: None,
+            style_example_output: None,
+            style_example_pairs: Vec::new(),
+            style_examples_approved: false,
+            enabled: true,
+            cleanup_effort: None,
+            cleanup_intensity: None,
+            cleanup_enabled: true,
+            dictionary_learn_enabled: true,
+        };
+        let preferences = mapping.active_transfer_preferences().unwrap();
+        assert_eq!(preferences.len(), 1);
+        assert_eq!(preferences[0].task_id, Some(WritingTaskId::Email));
+        assert_eq!(
+            preferences[0].source,
+            WritingPreferenceSource::ReviewedHistory
+        );
+    }
+
+    #[test]
+    fn bundle_only_and_ambiguous_mapping_selectors_never_establish_task_identity() {
+        let mut bundle_only = AppMapping {
+            id: "cursor-project".into(),
+            label: "Cursor project update".into(),
+            family: ContextFamily::Document,
+            writing_task_id: Some(WritingTaskId::ProjectUpdate),
+            writing_preferences: Vec::new(),
+            preference_guidance_provider_approved: false,
+            preference_revision: 0,
+            deleted: false,
+            mode_id: None,
+            bundle_id: Some("com.example.editor".into()),
             executable: None,
             browser_host: None,
             browser_path_prefix: None,
@@ -4220,13 +5152,480 @@ mod tests {
             cleanup_enabled: true,
             dictionary_learn_enabled: true,
         };
-        let snapshot = snapshot_for_signal(
-            &signal("com.todesktop.230313mzl4w4u92", "Cursor", None),
-            &[mapping],
-            false,
+        let mut active = signal("com.example.editor", "Editor", None);
+        active.focus_kind = FocusKind::Document;
+        active.input_token = Some(111);
+        active.window_id = Some(222);
+        assert!(bundle_only.validate().is_err());
+        assert_eq!(
+            snapshot_for_signal(&active, &[bundle_only.clone()], false)
+                .profile
+                .writing_task_id,
+            None
         );
-        assert_eq!(snapshot.profile.id, "user.cursor-formal");
-        assert_eq!(snapshot.profile.family, ContextFamily::Document);
+
+        let mut focus_only = bundle_only.clone();
+        focus_only.bundle_id = None;
+        focus_only.focused_field = Some(FocusKind::Document);
+        assert!(focus_only.validate().is_ok());
+        assert_eq!(
+            snapshot_for_signal(&active, &[focus_only.clone()], false)
+                .profile
+                .writing_task_id,
+            None
+        );
+        assert_ne!(
+            snapshot_for_signal(&active, &[focus_only], false)
+                .profile
+                .source,
+            ContextSource::UserMapping
+        );
+
+        bundle_only.focused_field = Some(FocusKind::Document);
+        let mut other = bundle_only.clone();
+        other.id = "editor-chat-duplicate".into();
+        assert_eq!(
+            snapshot_for_signal(&active, &[bundle_only, other], false)
+                .profile
+                .writing_task_id,
+            None
+        );
+    }
+
+    #[test]
+    fn same_app_uses_distinct_verified_fields_for_distinct_tasks() {
+        let mapping = |id: &str, field, task| AppMapping {
+            id: id.into(),
+            label: id.into(),
+            family: ContextFamily::General,
+            writing_task_id: Some(task),
+            writing_preferences: Vec::new(),
+            preference_guidance_provider_approved: false,
+            preference_revision: 0,
+            deleted: false,
+            mode_id: None,
+            bundle_id: Some("com.example.editor".into()),
+            executable: None,
+            browser_host: None,
+            browser_path_prefix: None,
+            focused_field: Some(field),
+            source_permissions: Default::default(),
+            style_example_input: None,
+            style_example_output: None,
+            style_example_pairs: Vec::new(),
+            style_examples_approved: false,
+            enabled: true,
+            cleanup_effort: None,
+            cleanup_intensity: None,
+            cleanup_enabled: true,
+            dictionary_learn_enabled: true,
+        };
+        let project = mapping(
+            "editor-project",
+            FocusKind::Document,
+            WritingTaskId::ProjectUpdate,
+        );
+        let chat = mapping("editor-chat", FocusKind::Chat, WritingTaskId::WorkChat);
+        let mut active = signal("com.example.editor", "Editor", None);
+        active.input_token = Some(111);
+        active.window_id = Some(222);
+
+        active.focus_kind = FocusKind::Document;
+        assert_eq!(
+            snapshot_for_signal(&active, &[project.clone(), chat.clone()], false)
+                .profile
+                .writing_task_id,
+            Some(WritingTaskId::ProjectUpdate)
+        );
+        active.focus_kind = FocusKind::Chat;
+        assert_eq!(
+            snapshot_for_signal(&active, &[project, chat], false)
+                .profile
+                .writing_task_id,
+            Some(WritingTaskId::WorkChat)
+        );
+    }
+
+    #[test]
+    fn legacy_mapping_deserializes_with_unknown_task_and_cloud_preferences_denied() {
+        let mapping: AppMapping = serde_json::from_value(serde_json::json!({
+            "id": "legacy",
+            "label": "Legacy App",
+            "family": "general",
+            "bundle_id": "com.example.legacy"
+        }))
+        .expect("old mapping settings remain readable");
+        assert_eq!(mapping.writing_task_id, None);
+        assert!(mapping.writing_preferences.is_empty());
+        assert!(!mapping.preference_guidance_provider_approved);
+        assert!(!mapping.style_examples_approved);
+    }
+
+    #[test]
+    fn mapping_rejects_unsupported_or_unscoped_preferences() {
+        let mut mapping = AppMapping {
+            id: "preference-app".into(),
+            label: "Preference App".into(),
+            family: ContextFamily::Document,
+            writing_task_id: None,
+            writing_preferences: vec![WritingPreference {
+                task_id: None,
+                dimension: WritingPreferenceDimension::ListStructure,
+                value: WritingPreferenceValue::Bullets,
+                status: WritingPreferenceStatus::Active,
+                version: 1,
+                source: WritingPreferenceSource::Manual,
+            }],
+            preference_guidance_provider_approved: false,
+            preference_revision: 0,
+            deleted: false,
+            mode_id: None,
+            bundle_id: Some("com.example.preference".into()),
+            executable: None,
+            browser_host: None,
+            browser_path_prefix: None,
+            focused_field: Some(FocusKind::Document),
+            source_permissions: Default::default(),
+            style_example_input: None,
+            style_example_output: None,
+            style_example_pairs: Vec::new(),
+            style_examples_approved: false,
+            enabled: true,
+            cleanup_effort: None,
+            cleanup_intensity: None,
+            cleanup_enabled: true,
+            dictionary_learn_enabled: true,
+        };
+        assert!(mapping.validate().is_err());
+
+        mapping.writing_task_id = Some(WritingTaskId::ProjectUpdate);
+        mapping.preference_guidance_provider_approved = true;
+        assert!(mapping.validate().is_err());
+        mapping.preference_guidance_provider_approved = false;
+        assert!(mapping.validate().is_ok());
+        mapping.writing_preferences[0].dimension = WritingPreferenceDimension::GreetingTone;
+        mapping.writing_preferences[0].value = WritingPreferenceValue::RespectfulGreeting;
+        mapping.preference_guidance_provider_approved = true;
+        assert!(mapping.validate().is_ok());
+        mapping.writing_preferences[0].value = WritingPreferenceValue::TerminalPeriod;
+        assert!(mapping.validate().is_err());
+    }
+
+    #[test]
+    fn preference_tombstones_survive_task_switch_and_reject_stale_replay() {
+        let existing = AppMapping {
+            id: "editor-chat".into(),
+            label: "Editor chat".into(),
+            family: ContextFamily::WorkChat,
+            writing_task_id: Some(WritingTaskId::WorkChat),
+            writing_preferences: vec![WritingPreference {
+                task_id: Some(WritingTaskId::WorkChat),
+                dimension: WritingPreferenceDimension::GreetingTone,
+                value: WritingPreferenceValue::RespectfulGreeting,
+                status: WritingPreferenceStatus::Forgotten,
+                version: 1,
+                source: WritingPreferenceSource::Manual,
+            }],
+            preference_guidance_provider_approved: false,
+            preference_revision: 4,
+            deleted: false,
+            mode_id: None,
+            bundle_id: Some("com.example.editor".into()),
+            executable: None,
+            browser_host: None,
+            browser_path_prefix: None,
+            focused_field: Some(FocusKind::Chat),
+            source_permissions: Default::default(),
+            style_example_input: None,
+            style_example_output: None,
+            style_example_pairs: Vec::new(),
+            style_examples_approved: false,
+            enabled: true,
+            cleanup_effort: None,
+            cleanup_intensity: None,
+            cleanup_enabled: true,
+            dictionary_learn_enabled: true,
+        };
+
+        let mut stale = existing.clone();
+        stale.preference_revision = 3;
+        stale.writing_preferences[0].status = WritingPreferenceStatus::Active;
+        assert!(merge_saved_preferences(&existing, &mut stale).is_err());
+
+        let mut switched = existing.clone();
+        switched.writing_task_id = Some(WritingTaskId::Email);
+        switched.writing_preferences = vec![WritingPreference {
+            task_id: Some(WritingTaskId::Email),
+            dimension: WritingPreferenceDimension::TerminalPunctuation,
+            value: WritingPreferenceValue::TerminalPeriod,
+            status: WritingPreferenceStatus::Active,
+            version: 1,
+            source: WritingPreferenceSource::Manual,
+        }];
+        merge_saved_preferences(&existing, &mut switched).expect("fresh explicit save");
+        assert!(switched.writing_preferences.contains(&WritingPreference {
+            task_id: Some(WritingTaskId::WorkChat),
+            dimension: WritingPreferenceDimension::GreetingTone,
+            value: WritingPreferenceValue::RespectfulGreeting,
+            status: WritingPreferenceStatus::Forgotten,
+            version: 1,
+            source: WritingPreferenceSource::Manual,
+        }));
+        assert!(switched.writing_preferences.contains(&WritingPreference {
+            task_id: Some(WritingTaskId::Email),
+            dimension: WritingPreferenceDimension::TerminalPunctuation,
+            value: WritingPreferenceValue::TerminalPeriod,
+            status: WritingPreferenceStatus::Active,
+            version: 1,
+            source: WritingPreferenceSource::Manual,
+        }));
+        assert_eq!(switched.preference_revision, 5);
+    }
+
+    fn multi_task_preference_mapping() -> AppMapping {
+        AppMapping {
+            id: "editor-chat".into(),
+            label: "Editor chat".into(),
+            family: ContextFamily::WorkChat,
+            writing_task_id: Some(WritingTaskId::WorkChat),
+            writing_preferences: vec![
+                WritingPreference {
+                    task_id: Some(WritingTaskId::WorkChat),
+                    dimension: WritingPreferenceDimension::GreetingTone,
+                    value: WritingPreferenceValue::RespectfulGreeting,
+                    status: WritingPreferenceStatus::Active,
+                    version: 1,
+                    source: WritingPreferenceSource::ReviewedHistory,
+                },
+                WritingPreference {
+                    task_id: Some(WritingTaskId::Email),
+                    dimension: WritingPreferenceDimension::TerminalPunctuation,
+                    value: WritingPreferenceValue::TerminalPeriod,
+                    status: WritingPreferenceStatus::Forgotten,
+                    version: 1,
+                    source: WritingPreferenceSource::Manual,
+                },
+                WritingPreference {
+                    task_id: Some(WritingTaskId::ProjectUpdate),
+                    dimension: WritingPreferenceDimension::ListStructure,
+                    value: WritingPreferenceValue::Bullets,
+                    status: WritingPreferenceStatus::Active,
+                    version: 1,
+                    source: WritingPreferenceSource::Manual,
+                },
+            ],
+            preference_guidance_provider_approved: true,
+            preference_revision: 4,
+            deleted: false,
+            mode_id: None,
+            bundle_id: Some("com.example.editor".into()),
+            executable: Some("Editor".into()),
+            browser_host: Some("docs.example.com".into()),
+            browser_path_prefix: Some("/compose".into()),
+            focused_field: Some(FocusKind::Chat),
+            source_permissions: Default::default(),
+            style_example_input: None,
+            style_example_output: None,
+            style_example_pairs: Vec::new(),
+            style_examples_approved: false,
+            enabled: true,
+            cleanup_effort: None,
+            cleanup_intensity: None,
+            cleanup_enabled: true,
+            dictionary_learn_enabled: true,
+        }
+    }
+
+    #[test]
+    fn declared_scope_change_discards_all_task_preferences_and_renderer_payload() {
+        let existing = multi_task_preference_mapping();
+        type MappingChange = (&'static str, fn(&mut AppMapping));
+        let changes: [MappingChange; 6] = [
+            ("family", |mapping| mapping.family = ContextFamily::Email),
+            ("bundle", |mapping| {
+                mapping.bundle_id = Some("com.example.other".into())
+            }),
+            ("executable", |mapping| {
+                mapping.executable = Some("Other Editor".into())
+            }),
+            ("host", |mapping| {
+                mapping.browser_host = Some("mail.example.com".into())
+            }),
+            ("path", |mapping| {
+                mapping.browser_path_prefix = Some("/inbox".into())
+            }),
+            ("focused field", |mapping| {
+                mapping.focused_field = Some(FocusKind::Document)
+            }),
+        ];
+
+        for (changed_selector, change) in changes {
+            let mut incoming = existing.clone();
+            change(&mut incoming);
+            // A stale settings view sends the full task snapshot, including a
+            // previously reviewed approval and a forgotten tombstone.
+            incoming.preference_guidance_provider_approved = true;
+            merge_saved_preferences(&existing, &mut incoming)
+                .expect("a current revision can save a new declared scope");
+
+            assert!(
+                incoming.writing_preferences.is_empty(),
+                "{changed_selector} change must invalidate every task-owned preference"
+            );
+            assert!(
+                !incoming.preference_guidance_provider_approved,
+                "{changed_selector} change must revoke cloud guidance approval"
+            );
+            assert_eq!(incoming.preference_revision, 5, "{changed_selector}");
+        }
+    }
+
+    #[test]
+    fn normalized_host_and_path_roundtrip_preserves_preferences_and_cloud_grant() {
+        let mut existing = multi_task_preference_mapping();
+        existing.browser_host = Some("Docs.Example.com.".into());
+        existing.browser_path_prefix = Some("/compose/".into());
+        let mut incoming = existing.clone();
+        incoming.browser_host = Some("docs.example.com".into());
+        incoming.browser_path_prefix = Some("/compose".into());
+
+        assert!(!existing.declared_identity_changed(&incoming));
+        merge_saved_preferences(&existing, &mut incoming)
+            .expect("normalizing equivalent selector spellings is a same-scope save");
+
+        assert_eq!(
+            incoming.writing_preferences.len(),
+            existing.writing_preferences.len()
+        );
+        assert!(existing
+            .writing_preferences
+            .iter()
+            .all(|preference| incoming.writing_preferences.contains(preference)));
+        assert!(incoming.preference_guidance_provider_approved);
+        assert_eq!(incoming.preference_revision, existing.preference_revision);
+    }
+
+    #[test]
+    fn merge_saved_preferences_preserves_reviewed_origin_and_rejects_forged_source() {
+        let existing = AppMapping {
+            id: "reviewed-preference".into(),
+            label: "Reviewed preference".into(),
+            family: ContextFamily::Email,
+            writing_task_id: Some(WritingTaskId::Email),
+            writing_preferences: vec![WritingPreference {
+                task_id: Some(WritingTaskId::Email),
+                dimension: WritingPreferenceDimension::GreetingTone,
+                value: WritingPreferenceValue::RespectfulGreeting,
+                status: WritingPreferenceStatus::Active,
+                version: 7,
+                source: WritingPreferenceSource::ReviewedHistory,
+            }],
+            preference_guidance_provider_approved: false,
+            preference_revision: 12,
+            deleted: false,
+            mode_id: None,
+            bundle_id: Some("com.example.mail".into()),
+            executable: None,
+            browser_host: None,
+            browser_path_prefix: None,
+            focused_field: Some(FocusKind::Email),
+            source_permissions: Default::default(),
+            style_example_input: None,
+            style_example_output: None,
+            style_example_pairs: Vec::new(),
+            style_examples_approved: false,
+            enabled: true,
+            cleanup_effort: None,
+            cleanup_intensity: None,
+            cleanup_enabled: true,
+            dictionary_learn_enabled: true,
+        };
+
+        let mut unchanged = existing.clone();
+        unchanged.writing_preferences[0].source = WritingPreferenceSource::Manual;
+        merge_saved_preferences(&existing, &mut unchanged).expect("settings form roundtrip");
+        assert_eq!(
+            unchanged.writing_preferences[0].source,
+            WritingPreferenceSource::ReviewedHistory
+        );
+        assert_eq!(unchanged.writing_preferences[0].version, 7);
+
+        let mut forged = existing.clone();
+        forged.writing_preferences[0].value = WritingPreferenceValue::ConversationalGreeting;
+        forged.writing_preferences[0].source = WritingPreferenceSource::ReviewedHistory;
+        merge_saved_preferences(&existing, &mut forged).expect("fresh manual value");
+        assert_eq!(
+            forged.writing_preferences[0].source,
+            WritingPreferenceSource::Manual
+        );
+
+        let mut empty_owner = existing.clone();
+        empty_owner.writing_preferences.clear();
+        let mut reviewed = empty_owner.clone();
+        reviewed.writing_preferences.push(WritingPreference {
+            task_id: Some(WritingTaskId::Email),
+            dimension: WritingPreferenceDimension::GreetingTone,
+            value: WritingPreferenceValue::RespectfulGreeting,
+            status: WritingPreferenceStatus::Active,
+            version: 1,
+            source: WritingPreferenceSource::ReviewedHistory,
+        });
+        merge_reviewed_history_preferences(&empty_owner, &mut reviewed)
+            .expect("the backend review path may establish reviewed provenance");
+        assert_eq!(
+            reviewed.writing_preferences[0].source,
+            WritingPreferenceSource::ReviewedHistory
+        );
+    }
+
+    #[test]
+    fn fresh_revision_can_grant_cloud_preference_approval_but_stale_cannot() {
+        let mut existing = AppMapping {
+            id: "editor-chat".into(),
+            label: "Editor chat".into(),
+            family: ContextFamily::WorkChat,
+            writing_task_id: Some(WritingTaskId::WorkChat),
+            writing_preferences: vec![WritingPreference {
+                task_id: Some(WritingTaskId::WorkChat),
+                dimension: WritingPreferenceDimension::GreetingTone,
+                value: WritingPreferenceValue::RespectfulGreeting,
+                status: WritingPreferenceStatus::Active,
+                version: 1,
+                source: WritingPreferenceSource::Manual,
+            }],
+            preference_guidance_provider_approved: false,
+            preference_revision: 4,
+            deleted: false,
+            mode_id: None,
+            bundle_id: Some("com.example.editor".into()),
+            executable: None,
+            browser_host: None,
+            browser_path_prefix: None,
+            focused_field: Some(FocusKind::Chat),
+            source_permissions: Default::default(),
+            style_example_input: None,
+            style_example_output: None,
+            style_example_pairs: Vec::new(),
+            style_examples_approved: false,
+            enabled: true,
+            cleanup_effort: None,
+            cleanup_intensity: None,
+            cleanup_enabled: true,
+            dictionary_learn_enabled: true,
+        };
+        let mut fresh = existing.clone();
+        fresh.preference_guidance_provider_approved = true;
+        merge_saved_preferences(&existing, &mut fresh).expect("current revision save");
+        assert!(fresh.preference_guidance_provider_approved);
+        assert_eq!(fresh.preference_revision, 5);
+
+        let mut replay = existing.clone();
+        replay.preference_guidance_provider_approved = true;
+        assert!(merge_saved_preferences(&fresh, &mut replay).is_err());
+
+        existing.writing_preferences[0].status = WritingPreferenceStatus::Forgotten;
+        existing.preference_guidance_provider_approved = true;
+        assert!(existing.validate().is_err());
     }
 
     #[test]
@@ -4235,6 +5634,11 @@ mod tests {
             id: "a-chrome".into(),
             label: "Chrome general".into(),
             family: ContextFamily::General,
+            writing_task_id: None,
+            writing_preferences: Vec::new(),
+            preference_guidance_provider_approved: false,
+            preference_revision: 0,
+            deleted: false,
             mode_id: None,
             bundle_id: Some("com.google.Chrome".into()),
             executable: None,
@@ -4256,6 +5660,11 @@ mod tests {
             id: "z-gmail".into(),
             label: "Gmail composer".into(),
             family: ContextFamily::Email,
+            writing_task_id: None,
+            writing_preferences: Vec::new(),
+            preference_guidance_provider_approved: false,
+            preference_revision: 0,
+            deleted: false,
             mode_id: None,
             bundle_id: Some("com.google.Chrome".into()),
             executable: None,
@@ -4289,6 +5698,11 @@ mod tests {
             id: "chrome-on-gmail-only".into(),
             label: "Chrome Gmail only".into(),
             family: ContextFamily::Email,
+            writing_task_id: None,
+            writing_preferences: Vec::new(),
+            preference_guidance_provider_approved: false,
+            preference_revision: 0,
+            deleted: false,
             mode_id: None,
             bundle_id: Some("com.google.Chrome".into()),
             executable: None,
@@ -4329,6 +5743,11 @@ mod tests {
                 id: id.into(),
                 label: id.into(),
                 family: ContextFamily::General,
+                writing_task_id: None,
+                writing_preferences: Vec::new(),
+                preference_guidance_provider_approved: false,
+                preference_revision: 0,
+                deleted: false,
                 mode_id: None,
                 bundle_id: bundle_id.map(str::to_owned),
                 executable: None,
@@ -4380,8 +5799,10 @@ mod tests {
             "issues"
         );
 
-        let tie_z = rule("z-tie", None, Some("github.com"), None);
-        let tie_a = rule("a-tie", None, Some("github.com"), None);
+        let mut tie_z = rule("z-tie", None, Some("github.com"), None);
+        tie_z.writing_task_id = Some(WritingTaskId::ProjectUpdate);
+        let mut tie_a = rule("a-tie", None, Some("github.com"), None);
+        tie_a.writing_task_id = Some(WritingTaskId::Email);
         assert_eq!(
             best_mapping_match(&github, &[tie_z.clone(), tie_a.clone()])
                 .unwrap()
@@ -4389,9 +5810,14 @@ mod tests {
             "a-tie"
         );
         assert_eq!(
-            best_mapping_match(&github, &[tie_a, tie_z]).unwrap().id,
+            best_mapping_match(&github, &[tie_a.clone(), tie_z.clone()])
+                .unwrap()
+                .id,
             "a-tie"
         );
+        let tied_snapshot = snapshot_for_signal(&github, &[tie_z, tie_a], true);
+        assert_eq!(tied_snapshot.profile.id, "user.a-tie");
+        assert_eq!(tied_snapshot.profile.writing_task_id, None);
     }
 
     #[test]
@@ -4408,6 +5834,11 @@ mod tests {
             id: "github-issues".into(),
             label: "GitHub issues".into(),
             family: ContextFamily::ProjectManagement,
+            writing_task_id: None,
+            writing_preferences: Vec::new(),
+            preference_guidance_provider_approved: false,
+            preference_revision: 0,
+            deleted: false,
             mode_id: None,
             bundle_id: None,
             executable: None,
@@ -4630,6 +6061,11 @@ mod tests {
             id: "wechat".into(),
             label: "微信".into(),
             family: ContextFamily::PersonalChat,
+            writing_task_id: None,
+            writing_preferences: Vec::new(),
+            preference_guidance_provider_approved: false,
+            preference_revision: 0,
+            deleted: false,
             mode_id: None,
             bundle_id: Some("com.tencent.xinWeChat".into()),
             executable: None,
@@ -4656,6 +6092,42 @@ mod tests {
             cleanup_enabled: true,
             dictionary_learn_enabled: true,
         };
+        let label_and_style_edit = AppMapping {
+            label: "微信工作区".into(),
+            cleanup_intensity: Some(crate::llm::CleanupIntensity::Light),
+            style_example_input: Some("新的例句".into()),
+            ..existing.clone()
+        };
+        assert!(!existing.declared_identity_changed(&label_and_style_edit));
+        assert_eq!(
+            existing.declared_identity_fingerprint(),
+            label_and_style_edit.declared_identity_fingerprint()
+        );
+        let selector_edit = AppMapping {
+            bundle_id: Some("com.example.wechat".into()),
+            ..existing.clone()
+        };
+        assert!(existing.declared_identity_changed(&selector_edit));
+        assert_ne!(
+            existing.declared_identity_fingerprint(),
+            selector_edit.declared_identity_fingerprint()
+        );
+        let browser_identity = AppMapping {
+            bundle_id: None,
+            browser_host: Some("EXAMPLE.com.".into()),
+            browser_path_prefix: Some("/docs/".into()),
+            ..existing.clone()
+        };
+        let normalized_browser_identity = AppMapping {
+            browser_host: Some("https://example.com".into()),
+            browser_path_prefix: Some("/docs".into()),
+            ..browser_identity.clone()
+        };
+        assert!(!browser_identity.declared_identity_changed(&normalized_browser_identity));
+        assert_eq!(
+            browser_identity.declared_identity_fingerprint(),
+            normalized_browser_identity.declared_identity_fingerprint()
+        );
         let incoming = AppMapping {
             style_example_input: None,
             style_example_output: None,
@@ -4691,6 +6163,11 @@ mod tests {
             id: "wechat".into(),
             label: "微信".into(),
             family: ContextFamily::PersonalChat,
+            writing_task_id: None,
+            writing_preferences: Vec::new(),
+            preference_guidance_provider_approved: false,
+            preference_revision: 0,
+            deleted: false,
             mode_id: None,
             bundle_id: Some("com.tencent.xinWeChat".into()),
             executable: None,
@@ -4736,6 +6213,11 @@ mod tests {
             id: "legacy-style".into(),
             label: "Legacy style".into(),
             family: ContextFamily::PersonalChat,
+            writing_task_id: None,
+            writing_preferences: Vec::new(),
+            preference_guidance_provider_approved: false,
+            preference_revision: 0,
+            deleted: false,
             mode_id: None,
             bundle_id: Some("com.tencent.xinWeChat".into()),
             executable: None,
@@ -4783,6 +6265,11 @@ mod tests {
             id: "cursor-custom".into(),
             label: "Cursor · 我的简洁模式".into(),
             family: ContextFamily::General,
+            writing_task_id: None,
+            writing_preferences: Vec::new(),
+            preference_guidance_provider_approved: false,
+            preference_revision: 0,
+            deleted: false,
             mode_id: Some(custom.id.clone()),
             bundle_id: Some("com.todesktop.230313mzl4w4u92".into()),
             executable: None,
@@ -4855,6 +6342,11 @@ mod tests {
             id: "cursor-only".into(),
             label: "Cursor writing".into(),
             family: ContextFamily::PromptOrCode,
+            writing_task_id: None,
+            writing_preferences: Vec::new(),
+            preference_guidance_provider_approved: false,
+            preference_revision: 0,
+            deleted: false,
             mode_id: None,
             bundle_id: Some("com.todesktop.230313mzl4w4u92".into()),
             executable: None,

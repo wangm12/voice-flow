@@ -742,10 +742,10 @@ fn deduplicate_correction_pairs(
         .collect()
 }
 
-/// History text is a user-selected comparison, so automatic learning accepts
+/// History text is a user-selected comparison, so candidate extraction accepts
 /// only one independently safe lexical correction from the complete edit.
-/// A mixed edit or a multi-hunk edit remains available for explicit review but
-/// cannot be silently learned through History.
+/// A mixed edit or a multi-hunk edit remains available for explicit review, but
+/// a lexical candidate still requires a separate confirmation before use.
 fn history_lexical_correction(before: &str, after: &str) -> Option<DictionarySuggestion> {
     if before.trim().is_empty() || after.trim().is_empty() || before == after {
         return None;
@@ -1117,14 +1117,36 @@ fn bounded_edit_distance(left: &str, right: &str, limit: usize) -> usize {
 
 #[tauri::command]
 pub(crate) fn suggest_dictionary_entries(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
+    history_id: i64,
     before: String,
     after: String,
-) -> Vec<DictionarySuggestion> {
-    if !lock_recover(&state.settings).dictionary_learn_enabled {
-        return Vec::new();
+) -> Result<Vec<DictionarySuggestion>, String> {
+    let settings = lock_recover(&state.settings).clone();
+    if !settings.dictionary_learn_enabled {
+        return Ok(Vec::new());
     }
-    dictionary_suggestions(&before, &after)
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| error.to_string())?;
+    let scene = store::history_scene(&dir, history_id).map_err(|error| error.to_string())?;
+    if !history_suggestion_scope_is_current(&scene, &settings) {
+        return Ok(Vec::new());
+    }
+    let scope = scene.learn_scope();
+    if confirm_scope_is_unknown(&scope) {
+        return Ok(Vec::new());
+    }
+    Ok(dictionary_suggestions(&before, &after)
+        .into_iter()
+        .map(|mut suggestion| {
+            suggestion.pair_key =
+                scoped_word_key_for(&suggestion.before_span, &suggestion.after, Some(&scope));
+            suggestion
+        })
+        .collect())
 }
 
 #[tauri::command]
@@ -1194,6 +1216,12 @@ pub(crate) fn pairs_for_dictionary_settings(
             if row.is_pending() {
                 return true;
             }
+            if row.is_binding_invalidated() {
+                return row.promoted
+                    && !row.ignored
+                    && row.tombstoned_at.is_none()
+                    && !row.before_surface.is_empty();
+            }
             row.is_live_promoted() && !row.before_surface.is_empty()
         })
         .map(|mut row| {
@@ -1220,6 +1248,7 @@ pub(crate) async fn promote_learn_pair(
             .map_err(|error| error.to_string())?;
         let state = app.state::<AppState>();
         let _gate = state.settings_gate.lock().await;
+        let current_settings = lock_recover(&state.settings).clone();
         let row = store::get_learn_pair(&dir, &pair_key).map_err(|error| error.to_string())?;
         if let Some(row) = &row {
             audit.pair(row);
@@ -1237,7 +1266,18 @@ pub(crate) async fn promote_learn_pair(
         let scope = if let Some(id) = history_id {
             let scene = store::history_scene(&dir, id).map_err(|error| error.to_string())?;
             audit.history_reference(true);
-            scene.learn_scope()
+            current_history_scope_for_confirmation(&scene, &current_settings).map_err(|reason| {
+                match reason {
+                    HistoryConfirmationScopeError::MappingChanged => {
+                        "the App mapping changed; refresh the History correction before confirming"
+                            .to_string()
+                    }
+                    HistoryConfirmationScopeError::UnknownScope => {
+                        "this correction has no known application scope; add a scoped rule instead"
+                            .to_string()
+                    }
+                }
+            })?
         } else {
             row.as_ref()
                 .map(|item| store::LearnPairScope {
@@ -1261,22 +1301,42 @@ pub(crate) async fn promote_learn_pair(
         }) {
             return Err("the selected history scope does not match the recorded correction".into());
         }
-        let global_dictionary_word = learned_rule_kind(&pair_key) == LearnedRuleKind::Word
-            && !before.trim().is_empty()
-            && !after.trim().is_empty()
-            && row
-                .as_ref()
-                .is_none_or(|item| !item.manual_scoped && !item.auto_scoped);
+        if row
+            .as_ref()
+            .is_some_and(store::LearnPairRecord::is_binding_invalidated)
+        {
+            return Err(
+                "the App mapping changed; explicitly rebind this rule before confirming it".into(),
+            );
+        }
+        if row.is_none() && pair_key != scoped_word_key_for(&before, &after, Some(&scope)) {
+            return Err("the selected correction identity does not match its App scope".into());
+        }
+        let global_dictionary_word = confirmation_adds_global_dictionary_word(
+            &pair_key,
+            &before,
+            &after,
+            row.as_ref(),
+            history_id.is_some(),
+        );
         let mut snapshot = global_dictionary_word.then(|| lock_recover(&state.settings).clone());
         let settings_were_updated = snapshot.is_some();
         if let Some(settings) = snapshot.as_ref() {
             require_dictionary_confirmation_capacity(&dir, settings, &after)?;
         }
-        audit
-            .candidate_result(
-                store::ensure_learn_pair_promoted(&dir, &pair_key, &before, &after, Some(&scope)),
-                "db_promotion_recorded",
+        let promotion_result = if history_id.is_some() {
+            store::ensure_local_only_learn_pair_promoted(
+                &dir,
+                &pair_key,
+                &before,
+                &after,
+                Some(&scope),
             )
+        } else {
+            store::ensure_learn_pair_promoted(&dir, &pair_key, &before, &after, Some(&scope))
+        };
+        audit
+            .candidate_result(promotion_result, "db_promotion_recorded")
             .map_err(|error| error.to_string())?;
         let settings_saved = if let Some(snapshot) = snapshot.as_mut() {
             let settings_save =
@@ -1409,15 +1469,20 @@ pub(crate) async fn add_manual_scoped_learn_pair(
             native_bundle: Some(bundle_id.to_owned()),
             ..store::LearnPairScope::default()
         };
-        let key = pair_key(before, after);
+        let key = scoped_word_key_for(before, after, Some(&scope));
         let dir = app
             .path()
             .app_data_dir()
             .map_err(|error| error.to_string())?;
+        let state = app.state::<AppState>();
+        let _settings_gate = state.settings_gate.lock().await;
         let persistence = store::ensure_manual_scoped_learn_pair(&dir, &key, before, after, &scope);
         let persistence_reason = match &persistence {
             Err(store::ManualScopedPairStoreError::ScopeConflict) => {
                 "manual_scoped_pair_scope_conflict"
+            }
+            Err(store::ManualScopedPairStoreError::BindingInvalidated) => {
+                "manual_scoped_pair_binding_invalidated"
             }
             Err(store::ManualScopedPairStoreError::InvalidScope) => {
                 "manual_scoped_pair_scope_unknown"
@@ -1442,12 +1507,68 @@ pub(crate) async fn add_manual_scoped_learn_pair(
 }
 
 #[tauri::command]
+pub(crate) async fn rebind_invalidated_learn_pair(
+    app: tauri::AppHandle,
+    pair_key: String,
+) -> Result<(), String> {
+    let mut audit = AuditAttempt::review(&app, "rebind_invalidated_pair");
+    let result = async {
+        let state = app.state::<crate::AppState>();
+        let _settings_gate = state.settings_gate.lock().await;
+        let dir = app
+            .path()
+            .app_data_dir()
+            .map_err(|error| error.to_string())?;
+        let row = store::get_learn_pair(&dir, &pair_key)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "learn pair was not found".to_string())?;
+        audit.pair(&row);
+        let mapping_id = row
+            .mapping_id
+            .as_deref()
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| "the rule has no App mapping to rebind".to_string())?;
+        let settings = crate::lock_recover(&state.settings).clone();
+        let mapping = settings
+            .context_mappings
+            .iter()
+            .find(|mapping| mapping.id == mapping_id)
+            .ok_or_else(|| {
+                "the App mapping no longer exists; create a new scoped rule".to_string()
+            })?;
+        let browser_host = mapping
+            .browser_host
+            .as_deref()
+            .and_then(context::normalize_host);
+        let scope = store::LearnPairScope {
+            family: Some(context::family_id(mapping.family).to_owned()),
+            mapping_id: Some(mapping.id.clone()),
+            browser_host: browser_host.clone(),
+            native_bundle: if browser_host.is_some() {
+                None
+            } else {
+                mapping.bundle_id.clone().or(row.native_bundle.clone())
+            },
+        };
+        let rebound = store::rebind_invalidated_word_rule(&dir, &pair_key, &scope)
+            .map_err(|error| error.code().to_owned())?;
+        audit.pair(&rebound);
+        let _ = app.emit("learn_pairs://changed", ());
+        Ok(())
+    }
+    .await;
+    audit.result(result)
+}
+
+#[tauri::command]
 pub(crate) async fn ignore_learn_pair(
     app: tauri::AppHandle,
     pair_key: String,
 ) -> Result<(), String> {
     let mut audit = AuditAttempt::review(&app, "ignore_pair");
     let result = async {
+        let state = app.state::<AppState>();
+        let _settings_gate = state.settings_gate.lock().await;
         let dir = app
             .path()
             .app_data_dir()
@@ -1579,9 +1700,9 @@ fn remove_style_pair(pairs: &mut Vec<context::StyleExamplePair>, input: &str, ou
 }
 
 fn confirm_style_example(mapping: &mut context::AppMapping, input: &str, output: &str) {
-    if !mapping.style_examples_approved {
-        mapping.style_example_pairs.clear();
-    }
+    // Confirmation adopts the example locally. Cloud sharing remains a
+    // separate, explicit Settings permission and changed examples revoke it.
+    mapping.style_examples_approved = false;
     push_style_pair(
         &mut mapping.style_example_pairs,
         input.to_owned(),
@@ -1589,7 +1710,6 @@ fn confirm_style_example(mapping: &mut context::AppMapping, input: &str, output:
     );
     mapping.style_example_input = Some(input.to_owned());
     mapping.style_example_output = Some(output.to_owned());
-    mapping.style_examples_approved = true;
 }
 
 async fn restore_mapping_learn(
@@ -2125,6 +2245,17 @@ pub(crate) fn invalidate_learning_observers(epoch: &AtomicU64) -> u64 {
     epoch.fetch_add(1, Ordering::AcqRel).wrapping_add(1)
 }
 
+pub(crate) fn observer_permission_policy_changed(
+    previous: &store::Settings,
+    next: &store::Settings,
+) -> bool {
+    previous.context_enabled != next.context_enabled
+        || previous.browser_access_enabled != next.browser_access_enabled
+        || previous.dictionary_learn_enabled != next.dictionary_learn_enabled
+        || previous.local_edit_learning_enabled != next.local_edit_learning_enabled
+        || previous.context_mappings != next.context_mappings
+}
+
 fn learning_observer_is_current(epoch: &AtomicU64, expected: u64) -> bool {
     epoch.load(Ordering::Acquire) == expected
 }
@@ -2238,6 +2369,294 @@ fn inserted_segment_for_observation(
     }
     let current_end = current_units.len().checked_sub(suffix.len())?;
     String::from_utf16(current_units.get(prefix.len()..current_end)?).ok()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PassiveObserverGateFailure {
+    AccessibilityPermissionRevoked,
+    InputSourceUnsupported,
+    InputSourceUnknown,
+}
+
+impl PassiveObserverGateFailure {
+    fn stage(self) -> &'static str {
+        match self {
+            Self::AccessibilityPermissionRevoked => "accessibility_permission_revoked",
+            Self::InputSourceUnsupported => "input_source_unsupported",
+            Self::InputSourceUnknown => "input_source_unknown",
+        }
+    }
+}
+
+fn passive_observer_gate_failure(
+    accessibility_trusted: bool,
+    input_source: crate::input_source::PassiveLearningInputSource,
+) -> Option<PassiveObserverGateFailure> {
+    if !accessibility_trusted {
+        return Some(PassiveObserverGateFailure::AccessibilityPermissionRevoked);
+    }
+    match input_source {
+        crate::input_source::PassiveLearningInputSource::DirectAsciiKeyboardLayout => None,
+        crate::input_source::PassiveLearningInputSource::Unsupported => {
+            Some(PassiveObserverGateFailure::InputSourceUnsupported)
+        }
+        crate::input_source::PassiveLearningInputSource::Unknown => {
+            Some(PassiveObserverGateFailure::InputSourceUnknown)
+        }
+    }
+}
+
+fn current_passive_observer_gate() -> Result<(), PassiveObserverGateFailure> {
+    passive_observer_gate_failure(
+        crate::permissions::accessibility_is_trusted(),
+        crate::input_source::passive_learning_input_source(),
+    )
+    .map_or(Ok(()), Err)
+}
+
+fn with_passive_observer_gate<T>(
+    gate: Result<(), PassiveObserverGateFailure>,
+    read: impl FnOnce() -> T,
+) -> Result<T, PassiveObserverGateFailure> {
+    gate?;
+    Ok(read())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PassiveAsrAttribution {
+    SourceAligned,
+    ReverseAppliedRule,
+    SourceMismatch,
+    Unknown,
+}
+
+/// Bounded in-memory evidence connecting a candidate token to the same
+/// transaction's ASR text. The raw transcript is discarded after this is
+/// built; only insertion-relative character ranges and up to three changed
+/// word pairs remain for the observation lease.
+struct PassiveAsrEvidence {
+    available: bool,
+    aligned_inserted_ranges: Vec<std::ops::Range<usize>>,
+    source_changes: Vec<DictionarySuggestion>,
+    source_changes_complete: bool,
+    applied_pairs: Vec<lexicon::LexiconPair>,
+}
+
+impl PassiveAsrEvidence {
+    fn from_transaction(
+        original_asr: Option<&str>,
+        inserted_text: &str,
+        applied_pairs: &[lexicon::LexiconPair],
+    ) -> Self {
+        let Some(original_asr) = original_asr.filter(|text| !text.is_empty()) else {
+            return Self::unknown();
+        };
+        let original_chars = original_asr.chars().collect::<Vec<_>>();
+        let inserted_chars = inserted_text.chars().collect::<Vec<_>>();
+        if original_chars.len() > MAX_EDIT_ALIGNMENT_CHARS
+            || inserted_chars.len() > MAX_EDIT_ALIGNMENT_CHARS
+            || inserted_chars.is_empty()
+        {
+            return Self::unknown();
+        }
+        let Some(hunks) = unique_alignment_hunks(&original_chars, &inserted_chars) else {
+            return Self::unknown();
+        };
+        let Some(aligned_inserted_ranges) =
+            unchanged_right_ranges(&original_chars, &inserted_chars, &hunks)
+        else {
+            return Self::unknown();
+        };
+        let (source_changes, source_changes_complete) =
+            match extract_word_corrections(original_asr, inserted_text) {
+                Some(changes) => (changes, true),
+                None => (Vec::new(), false),
+            };
+        Self {
+            available: true,
+            aligned_inserted_ranges,
+            source_changes,
+            source_changes_complete,
+            applied_pairs: applied_pairs
+                .iter()
+                .filter(|pair| {
+                    !pair.before.is_empty()
+                        && !pair.after.is_empty()
+                        && pair.before.len() <= 256
+                        && pair.after.len() <= 256
+                })
+                .cloned()
+                .collect(),
+        }
+    }
+
+    fn unknown() -> Self {
+        Self {
+            available: false,
+            aligned_inserted_ranges: Vec::new(),
+            source_changes: Vec::new(),
+            source_changes_complete: false,
+            applied_pairs: Vec::new(),
+        }
+    }
+
+    fn classify(&self, inserted_text: &str, before: &str, after: &str) -> PassiveAsrAttribution {
+        if !self.available {
+            return PassiveAsrAttribution::Unknown;
+        }
+        let Some(candidate_range) = unique_char_surface_range(inserted_text, before) else {
+            return PassiveAsrAttribution::Unknown;
+        };
+        if self
+            .aligned_inserted_ranges
+            .iter()
+            .any(|range| range.start <= candidate_range.start && candidate_range.end <= range.end)
+        {
+            return PassiveAsrAttribution::SourceAligned;
+        }
+        if !self.source_changes_complete {
+            return PassiveAsrAttribution::Unknown;
+        }
+        let reverse_rule_applied = self.source_changes.iter().any(|source_change| {
+            self.applied_pairs.iter().any(|pair| {
+                surfaces_match_with_policy(
+                    &pair.before,
+                    &source_change.before_span,
+                    pair.match_policy,
+                ) && surfaces_match_with_policy(
+                    &pair.after,
+                    &source_change.after,
+                    pair.match_policy,
+                ) && surfaces_match_with_policy(&source_change.after, before, pair.match_policy)
+                    && surfaces_match_with_policy(
+                        &source_change.before_span,
+                        after,
+                        pair.match_policy,
+                    )
+            })
+        });
+        if reverse_rule_applied {
+            PassiveAsrAttribution::ReverseAppliedRule
+        } else if self.source_changes_complete {
+            PassiveAsrAttribution::SourceMismatch
+        } else {
+            PassiveAsrAttribution::Unknown
+        }
+    }
+}
+
+fn passive_asr_attribution_for_outcome(
+    outcome: &ObserveOutcome,
+    inserted_text: &str,
+    evidence: &PassiveAsrEvidence,
+) -> Option<PassiveAsrAttribution> {
+    let corrections: Vec<(&str, &str)> = match outcome {
+        ObserveOutcome::SingleToken { before_span, after } => {
+            vec![(before_span.as_str(), after.as_str())]
+        }
+        ObserveOutcome::MultipleTokens { corrections, .. } => corrections
+            .iter()
+            .map(|correction| (correction.before_span.as_str(), correction.after.as_str()))
+            .collect(),
+        _ => return None,
+    };
+    let mut attribution = PassiveAsrAttribution::SourceAligned;
+    for (before, after) in corrections {
+        match evidence.classify(inserted_text, before, after) {
+            PassiveAsrAttribution::SourceAligned => {}
+            PassiveAsrAttribution::ReverseAppliedRule => {
+                return Some(PassiveAsrAttribution::ReverseAppliedRule);
+            }
+            PassiveAsrAttribution::SourceMismatch => {
+                attribution = PassiveAsrAttribution::SourceMismatch;
+            }
+            PassiveAsrAttribution::Unknown
+                if attribution == PassiveAsrAttribution::SourceAligned =>
+            {
+                attribution = PassiveAsrAttribution::Unknown;
+            }
+            PassiveAsrAttribution::Unknown => {}
+        }
+    }
+    Some(attribution)
+}
+
+fn passive_asr_attribution_stage(attribution: PassiveAsrAttribution) -> Option<&'static str> {
+    match attribution {
+        PassiveAsrAttribution::SourceAligned => None,
+        PassiveAsrAttribution::ReverseAppliedRule => Some("reverse_rule_feedback"),
+        PassiveAsrAttribution::SourceMismatch => Some("asr_source_mismatch"),
+        PassiveAsrAttribution::Unknown => Some("asr_source_unknown"),
+    }
+}
+
+fn unchanged_right_ranges(
+    left: &[char],
+    right: &[char],
+    hunks: &[(std::ops::Range<usize>, std::ops::Range<usize>)],
+) -> Option<Vec<std::ops::Range<usize>>> {
+    let (mut left_cursor, mut right_cursor) = (0usize, 0usize);
+    let mut ranges = Vec::new();
+    for (left_hunk, right_hunk) in hunks {
+        let left_unchanged = left_cursor..left_hunk.start;
+        let right_unchanged = right_cursor..right_hunk.start;
+        if left_unchanged.len() != right_unchanged.len()
+            || left.get(left_unchanged.clone())? != right.get(right_unchanged.clone())?
+        {
+            return None;
+        }
+        if !right_unchanged.is_empty() {
+            ranges.push(right_unchanged);
+        }
+        left_cursor = left_hunk.end;
+        right_cursor = right_hunk.end;
+    }
+    let left_unchanged = left_cursor..left.len();
+    let right_unchanged = right_cursor..right.len();
+    if left_unchanged.len() != right_unchanged.len()
+        || left.get(left_unchanged.clone())? != right.get(right_unchanged.clone())?
+    {
+        return None;
+    }
+    if !right_unchanged.is_empty() {
+        ranges.push(right_unchanged);
+    }
+    Some(ranges)
+}
+
+fn unique_char_surface_range(text: &str, surface: &str) -> Option<std::ops::Range<usize>> {
+    if surface.is_empty() {
+        return None;
+    }
+    let chars = text.chars().collect::<Vec<_>>();
+    let needle = surface.chars().collect::<Vec<_>>();
+    if needle.is_empty() || needle.len() > chars.len() {
+        return None;
+    }
+    let mut found = None;
+    for start in 0..=chars.len() - needle.len() {
+        if chars.get(start..start + needle.len()) == Some(needle.as_slice()) {
+            if found.is_some() {
+                return None;
+            }
+            found = Some(start..start + needle.len());
+        }
+    }
+    found
+}
+
+fn surfaces_match_with_policy(
+    left: &str,
+    right: &str,
+    policy: store::LearnPairMatchPolicy,
+) -> bool {
+    match policy {
+        store::LearnPairMatchPolicy::Exact => left == right,
+        store::LearnPairMatchPolicy::IgnoreCase if left.is_ascii() && right.is_ascii() => {
+            left.eq_ignore_ascii_case(right)
+        }
+        store::LearnPairMatchPolicy::IgnoreCase => left == right,
+    }
 }
 
 struct ObserveSampleCallbacks<ReadValue, Sleep, KeepWatching, SameFieldIsCurrent> {
@@ -2716,7 +3135,7 @@ struct ControlledCandidate<'a> {
 
 /// Preserve the existing two-state research call by routing it through the
 /// same trajectory adapter used by the versioned text operation.
-#[cfg(any(test, feature = "research-harness"))]
+#[cfg(feature = "research-harness")]
 pub(crate) fn record_controlled_fixture_edit(
     dir: &std::path::Path,
     settings: &mut store::Settings,
@@ -4168,15 +4587,19 @@ pub enum RecordPairResult {
     Ignored,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum WeakCandidateResult {
+    Pending { hits: u32 },
+    AlreadyPromoted,
+    Ignored,
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub(crate) enum ManualHistoryLearningStatus {
     NotApplicable,
     Pending { hits: u32, required: u32 },
-    Promoted,
     AlreadyPromoted,
-    PartialSettingsFailure,
-    PartialDictionarySyncFailure,
 }
 
 #[cfg(test)]
@@ -4209,6 +4632,65 @@ pub fn token_key(surface: &str) -> String {
 
 pub fn pair_key(before: &str, after: &str) -> String {
     format!("{}\u{1e}{}", token_key(before), token_key(after))
+}
+
+fn scoped_word_key_for(before: &str, after: &str, scope: Option<&store::LearnPairScope>) -> String {
+    let empty_scope = store::LearnPairScope::default();
+    store::scoped_word_rule_key(
+        before,
+        after,
+        scope.unwrap_or(&empty_scope),
+        store::word_rule_match_policy(before, after),
+    )
+    .into_string()
+}
+
+fn learn_pair_key_for_observation(
+    before: &str,
+    after: &str,
+    scope: Option<&store::LearnPairScope>,
+    observation: Option<&store::LearnPairObservation>,
+) -> String {
+    if observation.is_some_and(store::LearnPairObservation::uses_scoped_word_identity) {
+        scoped_word_key_for(before, after, scope)
+    } else {
+        pair_key(before, after)
+    }
+}
+
+#[cfg(test)]
+fn promoted_pair_event_payload(
+    before: &str,
+    after: &str,
+    scope: Option<&store::LearnPairScope>,
+    observation: &store::LearnPairObservation,
+) -> serde_json::Value {
+    serde_json::json!({
+        "pair_key": learn_pair_key_for_observation(before, after, scope, Some(observation)),
+        "before": before,
+        "after": after,
+    })
+}
+
+fn confirmation_adds_global_dictionary_word(
+    pair_key: &str,
+    before: &str,
+    after: &str,
+    row: Option<&store::LearnPairRecord>,
+    history_confirmation: bool,
+) -> bool {
+    !history_confirmation
+        && learned_rule_kind(pair_key) == LearnedRuleKind::Word
+        && !before.trim().is_empty()
+        && !after.trim().is_empty()
+        && row.is_none_or(|item| !item.manual_scoped && !item.auto_scoped)
+}
+
+fn learn_pair_aliases_match(row: &store::LearnPairRecord, alias: &str) -> bool {
+    match row.match_policy {
+        store::LearnPairMatchPolicy::IgnoreCase => row.before_surface.eq_ignore_ascii_case(alias),
+        store::LearnPairMatchPolicy::Exact => row.before_surface == alias,
+    }
 }
 
 #[cfg(test)]
@@ -4316,10 +4798,11 @@ fn record_learn_pair_with_observation_audited(
     auto_scoped: bool,
     mut audit: Option<&mut AuditAttempt>,
 ) -> anyhow::Result<RecordPairResult> {
+    let key = learn_pair_key_for_observation(before, after, scope, observation);
     let selected =
         crate::learning_research::consent().filter(|consent| consent.term(before, after).is_some());
     let old_row = if selected.is_some() {
-        store::get_learn_pair(dir, &pair_key(before, after))?
+        store::get_learn_pair(dir, &key)?
     } else {
         None
     };
@@ -4344,7 +4827,6 @@ fn record_learn_pair_with_observation_audited(
             }
             return Ok(RecordPairResult::Ignored);
         }
-        let key = pair_key(before, after);
         if let Some(existing) = store::get_learn_pair(dir, &key)? {
             if let Some(audit) = audit.as_deref_mut() {
                 audit.pair(&existing);
@@ -4356,7 +4838,7 @@ fn record_learn_pair_with_observation_audited(
                 native_bundle: existing.native_bundle.clone(),
             };
             if recorded_scope != scope.cloned().unwrap_or_default()
-                || existing.before_surface != before
+                || !learn_pair_aliases_match(&existing, before)
                 || existing.after_surface != after
             {
                 if let Some(audit) = audit.as_deref_mut() {
@@ -4383,10 +4865,11 @@ fn record_learn_pair_with_observation_audited(
                     match upsert_candidate_row_with_observation(
                         dir,
                         &key,
-                        before,
+                        &existing.before_surface,
                         after,
                         scope,
                         Some(observation),
+                        auto_scoped,
                     )? {
                         store::LearnPairUpsert::Stored(row) => {
                             if let Some(audit) = audit.as_deref_mut() {
@@ -4422,7 +4905,7 @@ fn record_learn_pair_with_observation_audited(
                 return try_promote_learn_pair(
                     dir,
                     dictionary,
-                    before,
+                    &existing.before_surface,
                     after,
                     &key,
                     scope,
@@ -4439,6 +4922,7 @@ fn record_learn_pair_with_observation_audited(
             after,
             scope,
             observation,
+            auto_scoped,
         )? {
             store::LearnPairUpsert::Stored(row) => {
                 if let Some(audit) = audit.as_deref_mut() {
@@ -4463,7 +4947,7 @@ fn record_learn_pair_with_observation_audited(
                     let current = store::get_learn_pair(dir, &key)?;
                     if let Some(current) = current.filter(|row| {
                         row.is_pending()
-                            && row.before_surface == before
+                            && learn_pair_aliases_match(row, before)
                             && row.after_surface == after
                             && store::LearnPairScope {
                                 family: row.family.clone(),
@@ -4488,7 +4972,7 @@ fn record_learn_pair_with_observation_audited(
         try_promote_learn_pair(
             dir,
             dictionary,
-            before,
+            &row.before_surface,
             after,
             &key,
             scope,
@@ -4524,7 +5008,7 @@ fn record_learn_pair_with_observation_audited(
         });
         record.promote_threshold = (class != LearnClass::Rejected).then_some(threshold);
         record.hits_before = Some(old_row.as_ref().map_or(0, |row| row.hits));
-        match store::get_learn_pair(dir, &pair_key(before, after)) {
+        match store::get_learn_pair(dir, &key) {
             Ok(row) => {
                 record.hits_after = Some(row.as_ref().map_or(0, |row| row.hits));
                 record.promoted = row.as_ref().map(|row| row.is_live_promoted());
@@ -4554,7 +5038,7 @@ fn promotion_evidence_hits(
     observation: Option<&store::LearnPairObservation>,
 ) -> anyhow::Result<u32> {
     if observation.is_some() {
-        store::count_independent_learn_pair_hits(dir, pair_key)
+        store::count_research_fixture_learn_pair_hits(dir, pair_key)
     } else {
         Ok(legacy_hits)
     }
@@ -4605,13 +5089,184 @@ fn upsert_candidate_row_with_observation(
     after: &str,
     scope: Option<&store::LearnPairScope>,
     observation: Option<&store::LearnPairObservation>,
+    auto_scoped: bool,
 ) -> anyhow::Result<store::LearnPairUpsert> {
-    let result =
-        store::upsert_learn_pair_with_observation(dir, key, before, after, scope, observation)?;
+    let result = if auto_scoped {
+        store::upsert_auto_scoped_learn_pair_with_observation(
+            dir,
+            key,
+            before,
+            after,
+            scope,
+            observation,
+        )?
+    } else {
+        store::upsert_learn_pair_with_observation(dir, key, before, after, scope, observation)?
+    };
     if let store::LearnPairUpsert::Skipped(reason) = &result {
         crate::learning_research::stage(LearningStage::StoreGuard, reason.code());
     }
     Ok(result)
+}
+
+/// Live post-paste and History edits are weak correction evidence. Keep
+/// eligible evidence reviewable as a pending candidate, but never promote it
+/// automatically; explicit confirmation owns activation.
+trait WeakCandidateAudit {
+    fn candidate(
+        &mut self,
+        decision: &'static str,
+        class: Option<ClassificationV1>,
+        persistence: PersistenceFactV1,
+    );
+    fn pair(&mut self, row: &store::LearnPairRecord);
+}
+
+impl WeakCandidateAudit for AuditAttempt {
+    fn candidate(
+        &mut self,
+        decision: &'static str,
+        class: Option<ClassificationV1>,
+        persistence: PersistenceFactV1,
+    ) {
+        AuditAttempt::candidate(self, decision, class, persistence);
+    }
+
+    fn pair(&mut self, row: &store::LearnPairRecord) {
+        AuditAttempt::pair(self, row);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_weak_candidate_only_audited(
+    dir: &std::path::Path,
+    before: &str,
+    after: &str,
+    scope: Option<&store::LearnPairScope>,
+    observation: &store::LearnPairObservation,
+    mut audit: Option<&mut dyn WeakCandidateAudit>,
+) -> anyhow::Result<WeakCandidateResult> {
+    let key = learn_pair_key_for_observation(before, after, scope, Some(observation));
+    let classification = classify_learn_pair_decision(before, after);
+    if let Some(audit) = audit.as_deref_mut() {
+        audit.candidate(
+            "not_attempted",
+            Some(classification.clone()),
+            PersistenceFactV1::untouched(),
+        );
+    }
+    let record_store_failure = |audit: &mut Option<&mut dyn WeakCandidateAudit>| {
+        if let Some(audit) = audit.as_deref_mut() {
+            audit.candidate("unknown", None, PersistenceFactV1::failed());
+        }
+    };
+    if after == before || classification.class == LearnClass::Rejected {
+        if let Some(audit) = audit.as_deref_mut() {
+            audit.candidate(
+                "rejected",
+                Some(classification),
+                PersistenceFactV1::untouched(),
+            );
+        }
+        return Ok(WeakCandidateResult::Ignored);
+    }
+    let existing =
+        store::get_learn_pair(dir, &key).inspect_err(|_| record_store_failure(&mut audit))?;
+    if let Some(existing) = existing {
+        if let Some(audit) = audit.as_deref_mut() {
+            audit.pair(&existing);
+        }
+        let recorded_scope = store::LearnPairScope {
+            family: existing.family.clone(),
+            mapping_id: existing.mapping_id.clone(),
+            browser_host: existing.browser_host.clone(),
+            native_bundle: existing.native_bundle.clone(),
+        };
+        if recorded_scope != scope.cloned().unwrap_or_default()
+            || !learn_pair_aliases_match(&existing, before)
+            || existing.after_surface != after
+        {
+            if let Some(audit) = audit.as_deref_mut() {
+                audit.candidate(
+                    "scope_conflict",
+                    Some(classification),
+                    PersistenceFactV1::untouched(),
+                );
+            }
+            return Ok(WeakCandidateResult::Ignored);
+        }
+        if existing.ignored || existing.tombstoned_at.is_some() {
+            if let Some(audit) = audit.as_deref_mut() {
+                audit.candidate(
+                    "tombstone_or_ignored",
+                    Some(classification),
+                    PersistenceFactV1::untouched(),
+                );
+            }
+            return Ok(WeakCandidateResult::Ignored);
+        }
+        if existing.is_live_promoted() {
+            if let Some(audit) = audit.as_deref_mut() {
+                audit.candidate(
+                    "already_db_promoted",
+                    Some(classification),
+                    PersistenceFactV1::untouched(),
+                );
+            }
+            return Ok(WeakCandidateResult::AlreadyPromoted);
+        }
+    }
+
+    let upsert = upsert_candidate_row_with_observation(
+        dir,
+        &key,
+        before,
+        after,
+        scope,
+        Some(observation),
+        true,
+    )
+    .inspect_err(|_| record_store_failure(&mut audit))?;
+    match upsert {
+        store::LearnPairUpsert::Stored(row) => {
+            if let Some(audit) = audit.as_deref_mut() {
+                audit.pair(&row);
+                audit.candidate(
+                    "pending",
+                    Some(classification),
+                    PersistenceFactV1::completed("candidate_db_returned"),
+                );
+            }
+            Ok(WeakCandidateResult::Pending { hits: row.hits })
+        }
+        store::LearnPairUpsert::Skipped(reason) => {
+            if let Some(audit) = audit.as_deref_mut() {
+                audit.candidate(
+                    reason.code(),
+                    Some(classification.clone()),
+                    PersistenceFactV1::untouched(),
+                );
+            }
+            if reason == store::LearnPairSkipReason::DuplicateObservation {
+                let current = store::get_learn_pair(dir, &key)
+                    .inspect_err(|_| record_store_failure(&mut audit))?;
+                if let Some(current) = current.filter(|row| {
+                    row.is_pending()
+                        && learn_pair_aliases_match(row, before)
+                        && row.after_surface == after
+                        && store::LearnPairScope {
+                            family: row.family.clone(),
+                            mapping_id: row.mapping_id.clone(),
+                            browser_host: row.browser_host.clone(),
+                            native_bundle: row.native_bundle.clone(),
+                        } == scope.cloned().unwrap_or_default()
+                }) {
+                    return Ok(WeakCandidateResult::Pending { hits: current.hits });
+                }
+            }
+            Ok(WeakCandidateResult::Ignored)
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4639,7 +5294,7 @@ fn try_promote_learn_pair(
     {
         return Ok(RecordPairResult::Pending { hits: threshold });
     }
-    let promoted = store::promote_learn_pair_if_eligible(
+    let promotion_status = store::promote_learn_pair_if_eligible_with_status(
         dir,
         key,
         before,
@@ -4650,8 +5305,8 @@ fn try_promote_learn_pair(
     );
     // The caller already validated scope for fast paths. Retrieve it again
     // here only to keep the store's promotion guard tied to the recorded row.
-    let promoted = match promoted {
-        Ok(promoted) => promoted,
+    let promotion_status = match promotion_status {
+        Ok(status) => status,
         Err(error) => {
             if let Some(audit) = audit.as_deref_mut() {
                 audit.candidate("db_promotion_failed", None, PersistenceFactV1::failed());
@@ -4659,7 +5314,17 @@ fn try_promote_learn_pair(
             return Err(error);
         }
     };
-    if !promoted {
+    if promotion_status == store::LearnPairPromotionStatus::CrossScopeAutoBlocked {
+        if let Some(audit) = audit.as_deref_mut() {
+            audit.candidate(
+                "cross_scope_auto_promotion_blocked",
+                None,
+                PersistenceFactV1::untouched(),
+            );
+        }
+        return Ok(RecordPairResult::Pending { hits: threshold });
+    }
+    if promotion_status == store::LearnPairPromotionStatus::Ineligible {
         let current = store::get_learn_pair(dir, key)?;
         if current.as_ref().is_some_and(|row| {
             row.before_surface == before
@@ -4735,6 +5400,8 @@ pub(crate) fn maybe_observe_after_paste(
     history_transaction_id: &str,
     post_insert_field: Option<&str>,
     inserted_text: &str,
+    original_asr_source: Option<&str>,
+    applied_pairs: &[lexicon::LexiconPair],
     confirmed_insertion: Option<crate::paste::ConfirmedInsertionV1>,
     observation_ticket: Option<crate::paste::LearningObservationTicket>,
     target_guard: &context::TargetAppGuard,
@@ -4899,6 +5566,8 @@ pub(crate) fn maybe_observe_after_paste(
     };
     let settings_for_check = settings.clone();
     let baseline = baseline.to_owned();
+    let asr_evidence =
+        PassiveAsrEvidence::from_transaction(original_asr_source, inserted_text, applied_pairs);
     let inserted_text = inserted_text.to_owned();
     let history_transaction_id = history_transaction_id.to_owned();
     let expected = confirmed_insertion.target_identity.clone();
@@ -4920,6 +5589,11 @@ pub(crate) fn maybe_observe_after_paste(
             .is_none_or(|snapshot| !crate::context_target_is_current(snapshot, &settings_for_check))
         {
             audit.skip("target_changed");
+            return;
+        }
+        if let Err(failure) = current_passive_observer_gate() {
+            audit.skip(failure.stage());
+            crate::learning_research::stage(LearningStage::Observation, failure.stage());
             return;
         }
         let read_target = || {
@@ -4945,6 +5619,7 @@ pub(crate) fn maybe_observe_after_paste(
         let unselected_edit = std::cell::Cell::new(false);
         let readable_samples = std::cell::Cell::new(0usize);
         let read_failure = std::cell::Cell::new(None);
+        let gate_failure = std::cell::Cell::new(None);
         // The original delivery owner established this focus identity. Every
         // later read is served by that same retained anchor and updates this
         // fact only after before/after focus checks succeed.
@@ -4968,18 +5643,29 @@ pub(crate) fn maybe_observe_after_paste(
                     read_failure.set(Some(crate::paste::FocusedFieldReadError::Expired));
                     return None;
                 }
-                let sample = match observation_ticket.read_sample(
-                    &observer_cancellation,
-                    crate::paste::MAX_FULL_RANGE_READBACK_UTF16,
-                    Arc::clone(&observer_epoch),
-                    expected_observer_epoch,
-                ) {
-                    Ok(sample) => sample,
-                    Err(error) => {
-                        read_failure.set(Some(error));
-                        return None;
-                    }
-                };
+                let sample =
+                    match with_passive_observer_gate(current_passive_observer_gate(), || {
+                        observation_ticket.read_sample(
+                            &observer_cancellation,
+                            crate::paste::MAX_FULL_RANGE_READBACK_UTF16,
+                            Arc::clone(&observer_epoch),
+                            expected_observer_epoch,
+                        )
+                    }) {
+                        Ok(Ok(sample)) => sample,
+                        Ok(Err(error)) => {
+                            read_failure.set(Some(error));
+                            return None;
+                        }
+                        Err(failure) => {
+                            gate_failure.set(Some(failure));
+                            return None;
+                        }
+                    };
+                if let Err(failure) = current_passive_observer_gate() {
+                    gate_failure.set(Some(failure));
+                    return None;
+                }
                 last_focus_matches.set(sample.focus_matches);
                 if sample.focus_matches != Some(true) {
                     read_failure.set(Some(match sample.focus_matches {
@@ -5011,6 +5697,7 @@ pub(crate) fn maybe_observe_after_paste(
                     && !observer_cancellation.is_cancelled()
                     && std::time::Instant::now() < observation_deadline
                     && read_failure.get().is_none()
+                    && gate_failure.get().is_none()
                     && !unselected_edit.get()
             },
         );
@@ -5061,6 +5748,18 @@ pub(crate) fn maybe_observe_after_paste(
             crate::learning_research::stage(LearningStage::Observation, "unselected_edit");
             return;
         }
+        if let Some(failure) = gate_failure.get() {
+            audit.observed("unknown");
+            audit.finish();
+            crate::learning_research::stage(LearningStage::Observation, failure.stage());
+            return;
+        }
+        if let Err(failure) = current_passive_observer_gate() {
+            audit.observed("unknown");
+            audit.finish();
+            crate::learning_research::stage(LearningStage::Observation, failure.stage());
+            return;
+        }
         if !crate::research_trace::allowed()
             || !learning_observer_is_current(&observer_epoch, expected_observer_epoch)
             || observer_cancellation.is_cancelled()
@@ -5082,6 +5781,16 @@ pub(crate) fn maybe_observe_after_paste(
             audit.finish();
             crate::learning_research::stage(LearningStage::Observation, "unreadable");
             return;
+        }
+        if let Some(attribution) =
+            passive_asr_attribution_for_outcome(&outcome, &inserted_text, &asr_evidence)
+        {
+            if let Some(stage) = passive_asr_attribution_stage(attribution) {
+                audit.observed("unknown");
+                audit.finish();
+                crate::learning_research::stage(LearningStage::Classification, stage);
+                return;
+            }
         }
         audit.observed(match &outcome {
             ObserveOutcome::Unchanged => "nochange",
@@ -5316,6 +6025,9 @@ fn history_scope_matches_mapping(
     scene: &store::HistoryScene,
     mapping: &context::AppMapping,
 ) -> bool {
+    if scene.mapping_identity.as_deref() != Some(mapping.declared_identity_fingerprint().as_str()) {
+        return false;
+    }
     let profile_mapping = scene
         .profile_id
         .as_deref()
@@ -5341,6 +6053,51 @@ fn history_scope_matches_mapping(
     }
 }
 
+fn history_suggestion_scope_is_current(
+    scene: &store::HistoryScene,
+    settings: &store::Settings,
+) -> bool {
+    let scope = scene.learn_scope();
+    let Some(mapping_id) = scope.mapping_id.as_deref() else {
+        return !scene
+            .profile_id
+            .as_deref()
+            .is_some_and(|profile| profile.starts_with("user."))
+            && !scope_is_unknown(&scope);
+    };
+    settings.context_mappings.iter().any(|mapping| {
+        mapping.id == mapping_id
+            && mapping.enabled
+            && mapping.dictionary_learn_enabled
+            && history_scope_matches_mapping(scene, mapping)
+            && (scope.browser_host.is_none() || settings.browser_access_enabled)
+            && !lexicon::is_default_learn_off_target(
+                mapping.bundle_id.as_deref(),
+                mapping.browser_host.as_deref(),
+            )
+    })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HistoryConfirmationScopeError {
+    MappingChanged,
+    UnknownScope,
+}
+
+fn current_history_scope_for_confirmation(
+    scene: &store::HistoryScene,
+    settings: &store::Settings,
+) -> Result<store::LearnPairScope, HistoryConfirmationScopeError> {
+    if !history_suggestion_scope_is_current(scene, settings) {
+        return Err(HistoryConfirmationScopeError::MappingChanged);
+    }
+    let scope = scene.learn_scope();
+    if confirm_scope_is_unknown(&scope) {
+        return Err(HistoryConfirmationScopeError::UnknownScope);
+    }
+    Ok(scope)
+}
+
 /// Explicit History edits are a local source the user has already chosen to
 /// save. They do not require AX text-context permission and never become scene
 /// style evidence or cloud/provider context.
@@ -5353,12 +6110,15 @@ pub(crate) async fn learn_from_manual_history_edit(
     edited_text: &str,
     scene: &store::HistoryScene,
 ) -> anyhow::Result<ManualHistoryLearningStatus> {
-    let Some(suggestion) = history_lexical_correction(previous_text, edited_text) else {
+    let Some(mut suggestion) = history_lexical_correction(previous_text, edited_text) else {
         return Ok(ManualHistoryLearningStatus::NotApplicable);
     };
     let _gate = state.settings_gate.lock().await;
-    let mut snapshot = lock_recover(&state.settings).clone();
+    let snapshot = lock_recover(&state.settings).clone();
     if !snapshot.dictionary_learn_enabled || !snapshot.context_enabled {
+        return Ok(ManualHistoryLearningStatus::NotApplicable);
+    }
+    if !history_suggestion_scope_is_current(scene, &snapshot) {
         return Ok(ManualHistoryLearningStatus::NotApplicable);
     }
     let scope = scene.learn_scope();
@@ -5383,6 +6143,8 @@ pub(crate) async fn learn_from_manual_history_edit(
     {
         return Ok(ManualHistoryLearningStatus::NotApplicable);
     }
+    suggestion.pair_key =
+        scoped_word_key_for(&suggestion.before_span, &suggestion.after, Some(&scope));
     let dir = app.path().app_data_dir()?;
     let Some(observation) = store::LearnPairObservation::history_edit_from_store(
         &dir,
@@ -5393,59 +6155,23 @@ pub(crate) async fn learn_from_manual_history_edit(
     else {
         return Ok(ManualHistoryLearningStatus::NotApplicable);
     };
-    // History-derived corrections stay in their verified scene pair; do not
-    // append their target term to the global personal dictionary.
-    let mut scoped_dictionary = Vec::new();
-    let class = classify_learn_pair_decision(&suggestion.before_span, &suggestion.after).class;
-    let required = promote_hits_for(class);
-    let result = record_learn_pair_with_observation_audited(
+    // History-derived corrections stay in their verified scene pair and
+    // remain candidates until the History confirmation action is used.
+    let result = record_weak_candidate_only_audited(
         &dir,
-        &mut scoped_dictionary,
         &suggestion.before_span,
         &suggestion.after,
         Some(&scope),
-        Some(&observation),
-        true,
+        &observation,
         None,
     )?;
-    let settings_outcome =
-        match save_settings_with_dictionary_effects(&dir, &mut snapshot, false, false, |settings| {
-            store::save_settings(&dir, settings)
-        }) {
-            Ok(saved) => saved,
-            Err(error) if error.starts_with(DICTIONARY_SETTINGS_PARTIAL_ERROR) => {
-                return Ok(ManualHistoryLearningStatus::PartialSettingsFailure);
-            }
-            Err(error) => return Err(anyhow::anyhow!(error)),
-        };
-    if settings_outcome.saved {
-        crate::commit_learning_settings_snapshot(state, snapshot.clone());
-        let _ = app.emit("settings://changed", store::SettingsView::from(&snapshot));
-    }
-    if settings_outcome.sync_error.is_some() {
-        return Ok(ManualHistoryLearningStatus::PartialDictionarySyncFailure);
-    }
     match result {
-        RecordPairResult::Promoted { .. } => {
+        WeakCandidateResult::Pending { hits } => {
             let _ = app.emit("learn_pairs://changed", ());
-            let _ = app.emit(
-                "learn_pairs://promoted",
-                serde_json::json!({
-                    "pair_key": suggestion.pair_key,
-                    "before": suggestion.before_span,
-                    "after": suggestion.after,
-                }),
-            );
-            crate::island_window::show_overlay(app);
-            crate::island_window::set_learn_toast_interactive(app, true);
-            Ok(ManualHistoryLearningStatus::Promoted)
+            Ok(ManualHistoryLearningStatus::Pending { hits, required: 0 })
         }
-        RecordPairResult::Pending { hits } => {
-            let _ = app.emit("learn_pairs://changed", ());
-            Ok(ManualHistoryLearningStatus::Pending { hits, required })
-        }
-        RecordPairResult::AlreadyPromoted => Ok(ManualHistoryLearningStatus::AlreadyPromoted),
-        RecordPairResult::Ignored => Ok(ManualHistoryLearningStatus::NotApplicable),
+        WeakCandidateResult::AlreadyPromoted => Ok(ManualHistoryLearningStatus::AlreadyPromoted),
+        WeakCandidateResult::Ignored => Ok(ManualHistoryLearningStatus::NotApplicable),
     }
 }
 
@@ -5455,6 +6181,11 @@ fn mapping_from_style_draft_id(mapping_id: &str) -> Option<context::AppMapping> 
             id: mapping_id.to_owned(),
             label: bundle_style_label(bundle),
             family: bundle_style_family(bundle),
+            writing_task_id: None,
+            writing_preferences: Vec::new(),
+            preference_guidance_provider_approved: false,
+            preference_revision: 0,
+            deleted: false,
             mode_id: None,
             bundle_id: Some(bundle.to_owned()),
             executable: None,
@@ -5478,6 +6209,11 @@ fn mapping_from_style_draft_id(mapping_id: &str) -> Option<context::AppMapping> 
             id: mapping_id.to_owned(),
             label: host.to_owned(),
             family: context::ContextFamily::General,
+            writing_task_id: None,
+            writing_preferences: Vec::new(),
+            preference_guidance_provider_approved: false,
+            preference_revision: 0,
+            deleted: false,
             mode_id: None,
             bundle_id: None,
             executable: None,
@@ -5534,7 +6270,7 @@ fn persist_learn_pair(
     let app = app.clone();
     let before = before.to_string();
     let after = after.to_string();
-    let pair_key = pair_key(&before, &after);
+    let pair_key = scoped_word_key_for(&before, &after, scope.as_ref());
     let observation = store::LearnPairObservation::paste_session_with_dictation_origin(
         &paste_session_observation_id(session_generation),
         &pair_key,
@@ -5577,7 +6313,9 @@ fn persist_learn_pairs(
         let mut seen = HashSet::new();
         let mut first_audit = Some(audit);
         for correction in corrections {
-            if !seen.insert(correction.pair_key.clone()) {
+            let pair_key =
+                scoped_word_key_for(&correction.before_span, &correction.after, scope.as_ref());
+            if !seen.insert(pair_key.clone()) {
                 continue;
             }
             let mut pair_audit = first_audit.take().unwrap_or_else(|| {
@@ -5597,7 +6335,7 @@ fn persist_learn_pairs(
             }
             let observation = store::LearnPairObservation::paste_session_with_dictation_origin(
                 &session,
-                &correction.pair_key,
+                &pair_key,
                 &history_transaction_id,
             );
             persist_learn_pair_locked(
@@ -5692,6 +6430,11 @@ async fn persist_style_intensity_learn_locked(
         );
         return;
     }
+    if let Err(failure) = current_passive_observer_gate() {
+        audit.skip(failure.stage());
+        crate::learning_research::stage(LearningStage::Persistence, failure.stage());
+        return;
+    }
     let Ok(dir) = app.path().app_data_dir() else {
         return;
     };
@@ -5730,6 +6473,11 @@ async fn persist_style_intensity_learn_locked(
                 "stale_or_cancelled"
             },
         );
+        return;
+    }
+    if let Err(failure) = current_passive_observer_gate() {
+        audit.skip(failure.stage());
+        crate::learning_research::stage(LearningStage::Persistence, failure.stage());
         return;
     }
     let session_id = paste_session_observation_id(session_generation);
@@ -5859,7 +6607,13 @@ fn persist_style_draft(
             audit.finish();
             return;
         }
-        let settings = lock_recover(&state.settings);
+        if let Err(failure) = current_passive_observer_gate() {
+            audit.skip(failure.stage());
+            crate::learning_research::stage(LearningStage::Persistence, failure.stage());
+            audit.finish();
+            return;
+        }
+        let settings = lock_recover(&state.settings).clone();
         if !settings.dictionary_learn_enabled || !settings.context_enabled {
             audit.finish();
             return;
@@ -5901,6 +6655,12 @@ fn persist_style_draft(
                     "stale_or_cancelled"
                 },
             );
+            audit.finish();
+            return;
+        }
+        if let Err(failure) = current_passive_observer_gate() {
+            audit.skip(failure.stage());
+            crate::learning_research::stage(LearningStage::Persistence, failure.stage());
             audit.finish();
             return;
         }
@@ -5961,10 +6721,15 @@ async fn persist_learn_pair_locked(
         );
         return;
     }
+    if let Err(failure) = current_passive_observer_gate() {
+        audit.skip(failure.stage());
+        crate::learning_research::stage(LearningStage::Persistence, failure.stage());
+        return;
+    }
     let Ok(dir) = app.path().app_data_dir() else {
         return;
     };
-    let mut snapshot = lock_recover(&state.settings).clone();
+    let snapshot = lock_recover(&state.settings).clone();
     if !snapshot.dictionary_learn_enabled || !snapshot.context_enabled {
         return;
     }
@@ -5988,42 +6753,10 @@ async fn persist_learn_pair_locked(
     {
         return;
     }
-    let auto_scoped = !mapping.source_permissions.ax_text && snapshot.local_edit_learning_enabled;
-    // The local-only grant creates a scene preference; it never adds the
-    // target to the global personal dictionary. Existing AX text permission
-    // keeps its prior global-dictionary behavior. The Vec remains a capacity
-    // probe; only the pending Rule effect may change the owned Settings list.
-    let mut scoped_dictionary = Vec::new();
-    let mut global_dictionary_probe = if auto_scoped {
-        Vec::new()
-    } else {
-        let effects = match store::list_pending_dictionary_effects(&dir) {
-            Ok(effects) => effects,
-            Err(error) => {
-                log::warn!("dictionary pending effect capacity check failed: {error}");
-                crate::learning_research::stage(
-                    LearningStage::SettingsPersistence,
-                    "pending_effect_read_failed",
-                );
-                return;
-            }
-        };
-        let mut projected_settings = snapshot.clone();
-        if apply_pending_dictionary_effects(&mut projected_settings, &effects).is_err() {
-            log::warn!("dictionary pending effects exceed the current capacity");
-            crate::learning_research::stage(
-                LearningStage::SettingsPersistence,
-                "pending_effect_capacity_blocked",
-            );
-            return;
-        }
-        projected_settings.dictionary
-    };
-    let dictionary = if auto_scoped {
-        &mut scoped_dictionary
-    } else {
-        &mut global_dictionary_probe
-    };
+    // Live AX edits lack independent IME-commit and user-versus-host proof.
+    // Keep any resulting candidate bound to this existing mapping, including
+    // when AX text permission is also granted; explicit confirmation cannot
+    // silently turn this evidence into a global dictionary word.
     if cancellation.is_cancelled() || std::time::Instant::now() >= observation_ticket.expires_at() {
         audit.stale();
         crate::learning_research::stage(
@@ -6038,14 +6771,17 @@ async fn persist_learn_pair_locked(
         );
         return;
     }
-    let result = match record_learn_pair_with_observation_audited(
+    if let Err(failure) = current_passive_observer_gate() {
+        audit.skip(failure.stage());
+        crate::learning_research::stage(LearningStage::Persistence, failure.stage());
+        return;
+    }
+    let result = match record_weak_candidate_only_audited(
         &dir,
-        dictionary,
         before,
         after,
         scope,
-        Some(observation),
-        auto_scoped,
+        observation,
         Some(&mut *audit),
     ) {
         Ok(result) => result,
@@ -6054,54 +6790,11 @@ async fn persist_learn_pair_locked(
             return;
         }
     };
-    let database_change_committed = matches!(result, RecordPairResult::Promoted { .. });
-    let settings_outcome = match save_settings_with_dictionary_effects(
-        &dir,
-        &mut snapshot,
-        database_change_committed,
-        false,
-        |settings| store::save_settings(&dir, settings),
-    ) {
-        Ok(saved) => saved,
-        Err(error) => {
-            let _ = audit.settings_result(Err::<(), anyhow::Error>(anyhow::anyhow!(error.clone())));
-            crate::learning_research::stage(LearningStage::SettingsPersistence, "failed");
-            log::warn!("dictionary learn persist failed: {error}");
-            return;
-        }
-    };
-    if settings_outcome.saved {
-        if let Err(error) = audit.settings_result(Ok::<(), anyhow::Error>(())) {
-            log::warn!("dictionary learn audit persistence failed: {error}");
-        }
-        crate::commit_learning_settings_snapshot(&state, snapshot.clone());
-        crate::learning_research::stage(
-            LearningStage::SettingsPersistence,
-            "save_settings_completed",
-        );
-        let _ = app.emit("settings://changed", store::SettingsView::from(&snapshot));
-    }
-    if let Some(error) = settings_outcome.sync_error {
-        log::warn!("dictionary effect acknowledgement remains pending: {error}");
-    }
     match result {
-        RecordPairResult::Promoted { .. } => {
-            let _ = app.emit("learn_pairs://changed", ());
-            let _ = app.emit(
-                "learn_pairs://promoted",
-                serde_json::json!({
-                    "pair_key": pair_key(before, after),
-                    "before": before,
-                    "after": after,
-                }),
-            );
-            crate::island_window::show_overlay(app);
-            crate::island_window::set_learn_toast_interactive(app, true);
-        }
-        RecordPairResult::Pending { .. } => {
+        WeakCandidateResult::Pending { .. } => {
             let _ = app.emit("learn_pairs://changed", ());
         }
-        RecordPairResult::AlreadyPromoted | RecordPairResult::Ignored => {}
+        WeakCandidateResult::AlreadyPromoted | WeakCandidateResult::Ignored => {}
     }
 }
 
@@ -6153,6 +6846,106 @@ mod tests {
     use std::collections::HashSet;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
+
+    #[test]
+    fn mapping_disarm_reconciles_only_rule_owner_after_failed_settings_save_and_restart() {
+        let root = temp_dir("mapping-disarm-restart");
+        let scope = crate::store::LearnPairScope {
+            family: Some("developer_collaboration".into()),
+            mapping_id: Some("codex".into()),
+            native_bundle: Some("com.openai.codex".into()),
+            ..crate::store::LearnPairScope::default()
+        };
+        let pair_key = crate::store::scoped_word_rule_key(
+            "VoiceFlo",
+            "VoiceFlow",
+            &scope,
+            crate::store::LearnPairMatchPolicy::IgnoreCase,
+        )
+        .into_string();
+        let mut settings = crate::store::Settings::default();
+        settings.add_dictionary_source("VoiceFlow", crate::store::DictionarySource::Manual);
+        settings.add_dictionary_source(
+            "VoiceFlow",
+            crate::store::DictionarySource::Screen("screen-owner".into()),
+        );
+        crate::store::save_settings(&root, &settings).unwrap();
+        crate::store::ensure_learn_pair_promoted(
+            &root,
+            &pair_key,
+            "VoiceFlo",
+            "VoiceFlow",
+            Some(&scope),
+        )
+        .unwrap();
+        super::save_settings_with_dictionary_effects(
+            &root,
+            &mut settings,
+            true,
+            true,
+            |settings| crate::store::save_settings(&root, settings),
+        )
+        .unwrap();
+        let rule_owner = crate::store::DictionarySource::Rule(pair_key.clone());
+        assert!(settings.has_dictionary_source("VoiceFlow", &rule_owner));
+
+        assert_eq!(
+            crate::store::invalidate_word_rule_mapping_bindings(
+                &root,
+                &[(
+                    "codex".into(),
+                    crate::store::LearnPairBindingInvalidationReason::MappingDeleted,
+                )],
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            crate::store::list_pending_dictionary_effects(&root).unwrap()[0].action,
+            crate::store::DictionaryEffectAction::Remove
+        );
+
+        let mut after_restart = crate::store::load_settings(&root).0;
+        let failed_save = super::save_settings_with_dictionary_effects(
+            &root,
+            &mut after_restart,
+            true,
+            true,
+            |_| Err(anyhow::anyhow!("synthetic settings disk failure")),
+        );
+        let Err(save_error) = failed_save else {
+            panic!("failed settings write must leave removal pending");
+        };
+        assert!(save_error.contains("settings_save_failed"));
+        assert_eq!(
+            crate::store::list_pending_dictionary_effects(&root).unwrap()[0].action,
+            crate::store::DictionaryEffectAction::Remove
+        );
+        let still_saved = crate::store::load_settings(&root).0;
+        assert!(still_saved.has_dictionary_source("VoiceFlow", &rule_owner));
+
+        let mut after_second_restart = crate::store::load_settings(&root).0;
+        let result = super::save_settings_with_dictionary_effects(
+            &root,
+            &mut after_second_restart,
+            true,
+            true,
+            |settings| crate::store::save_settings(&root, settings),
+        )
+        .unwrap();
+        assert!(result.saved);
+        assert!(!after_second_restart.has_dictionary_source("VoiceFlow", &rule_owner));
+        assert!(after_second_restart
+            .has_dictionary_source("VoiceFlow", &crate::store::DictionarySource::Manual));
+        assert!(after_second_restart.has_dictionary_source(
+            "VoiceFlow",
+            &crate::store::DictionarySource::Screen("screen-owner".into())
+        ));
+        assert!(crate::store::list_pending_dictionary_effects(&root)
+            .unwrap()
+            .is_empty());
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     #[test]
     fn mutate_dictionary_failed_save_leaves_live_settings() {
@@ -6242,13 +7035,13 @@ mod tests {
         crate::store::save_configuration(&dir, &persisted).unwrap();
         let before = "VoiceFlo";
         let after = "VoiceFlow";
-        let key = super::pair_key(before, after);
         let scope = crate::store::LearnPairScope {
             family: Some("general".into()),
             mapping_id: Some("fixture".into()),
             native_bundle: Some("com.example.fixture".into()),
             ..Default::default()
         };
+        let key = super::pair_key(before, after);
         assert!(matches!(
             crate::store::upsert_learn_pair_with_scope(&dir, &key, before, after, Some(&scope))
                 .unwrap(),
@@ -6959,6 +7752,321 @@ mod tests {
         );
         assert_eq!(stale_outcome, ObserveOutcome::Unchanged);
         assert_eq!(reads_after_clear.get(), 0);
+    }
+
+    #[test]
+    fn passive_observer_gate_prevents_ax_reads_for_revoked_or_unknown_grants() {
+        for failure in [
+            super::passive_observer_gate_failure(
+                false,
+                crate::input_source::PassiveLearningInputSource::DirectAsciiKeyboardLayout,
+            ),
+            super::passive_observer_gate_failure(
+                true,
+                crate::input_source::PassiveLearningInputSource::Unknown,
+            ),
+            super::passive_observer_gate_failure(
+                true,
+                crate::input_source::PassiveLearningInputSource::Unsupported,
+            ),
+        ] {
+            let reads = Cell::new(0usize);
+            let result = super::with_passive_observer_gate(
+                Err(failure.expect("unsafe grant/source should reject")),
+                || reads.set(reads.get() + 1),
+            );
+            assert!(result.is_err());
+            assert_eq!(reads.get(), 0);
+        }
+        assert!(super::passive_observer_gate_failure(
+            true,
+            crate::input_source::PassiveLearningInputSource::DirectAsciiKeyboardLayout,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn live_observer_candidate_stays_scoped_when_explicitly_confirmed() {
+        let dir = temp_dir("live-observer-candidate-only");
+        let before = "VoiceFlo";
+        let after = "VoiceFlow";
+        let scope = crate::store::LearnPairScope {
+            family: Some("general".into()),
+            mapping_id: Some("fixture".into()),
+            native_bundle: Some("com.example.fixture".into()),
+            ..Default::default()
+        };
+        let mut settings = crate::store::Settings::default();
+        assert!(
+            settings.add_dictionary_source("GlobalManual", crate::store::DictionarySource::Manual)
+        );
+        crate::store::save_configuration(&dir, &settings).unwrap();
+
+        let origin = "live-observer-candidate-origin";
+        insert_test_dictation_origin(&dir, origin);
+        let key = super::scoped_word_key_for(before, after, Some(&scope));
+        let observation = crate::store::LearnPairObservation::paste_session_with_dictation_origin(
+            "live-observer-candidate-session",
+            &key,
+            origin,
+        );
+        assert_eq!(
+            super::record_weak_candidate_only_audited(
+                &dir,
+                before,
+                after,
+                Some(&scope),
+                &observation,
+                None,
+            )
+            .unwrap(),
+            super::WeakCandidateResult::Pending { hits: 1 }
+        );
+
+        let pending = crate::store::get_learn_pair(&dir, &key)
+            .unwrap()
+            .expect("observer should persist a reviewable candidate");
+        assert!(pending.is_pending());
+        assert!(pending.auto_scoped);
+        assert_eq!(pending.mapping_id.as_deref(), Some("fixture"));
+        assert_eq!(
+            crate::store::count_independent_learn_pair_hits(&dir, &key).unwrap(),
+            1
+        );
+        assert!(!super::confirmation_adds_global_dictionary_word(
+            &key,
+            before,
+            after,
+            Some(&pending),
+            false,
+        ));
+
+        // The normal DB confirmation owner is allowed to activate this
+        // candidate, but auto_scoped provenance keeps it out of Settings.
+        crate::store::ensure_learn_pair_promoted(&dir, &key, before, after, Some(&scope)).unwrap();
+        let confirmed = crate::store::get_learn_pair(&dir, &key)
+            .unwrap()
+            .expect("explicit confirmation should activate the scoped rule");
+        assert!(confirmed.is_live_promoted());
+        assert!(confirmed.auto_scoped);
+        assert!(crate::store::list_pending_dictionary_effects(&dir)
+            .unwrap()
+            .is_empty());
+        let (persisted, _) = crate::store::load_settings(&dir);
+        assert!(crate::store::dictionary_contains_word(
+            &persisted.dictionary,
+            "GlobalManual"
+        ));
+        assert!(!crate::store::dictionary_contains_word(
+            &persisted.dictionary,
+            after
+        ));
+        assert!(!persisted.has_dictionary_source(after, &crate::store::DictionarySource::Manual));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[derive(Default)]
+    struct WeakCandidateAuditProbe {
+        candidates: Vec<(&'static str, &'static str, Option<&'static str>)>,
+    }
+
+    impl super::WeakCandidateAudit for WeakCandidateAuditProbe {
+        fn candidate(
+            &mut self,
+            decision: &'static str,
+            _class: Option<super::ClassificationV1>,
+            persistence: super::PersistenceFactV1,
+        ) {
+            self.candidates
+                .push((decision, persistence.status, persistence.reason));
+        }
+
+        fn pair(&mut self, _row: &crate::store::LearnPairRecord) {}
+    }
+
+    #[test]
+    fn weak_candidate_store_failures_are_audited_and_never_activate() {
+        let before = "VoiceFlo";
+        let after = "VoiceFlow";
+        let scope = crate::store::LearnPairScope {
+            family: Some("general".into()),
+            mapping_id: Some("fixture".into()),
+            native_bundle: Some("com.example.fixture".into()),
+            ..Default::default()
+        };
+        let weak_observation = |session: &str, key: &str, origin: &str| {
+            crate::store::LearnPairObservation::paste_session_with_dictation_origin(
+                session, key, origin,
+            )
+        };
+
+        let read_failure_dir = temp_dir("weak-candidate-audit-read-failure");
+        std::fs::create_dir_all(&read_failure_dir).unwrap();
+        let read_db = rusqlite::Connection::open(read_failure_dir.join("history.sqlite")).unwrap();
+        read_db.pragma_update(None, "user_version", 9_999).unwrap();
+        drop(read_db);
+        let read_key = super::scoped_word_key_for(before, after, Some(&scope));
+        let read_observation = weak_observation(
+            "weak-candidate-read-failure-session",
+            &read_key,
+            "weak-candidate-read-failure-origin",
+        );
+        let mut read_audit = WeakCandidateAuditProbe::default();
+        let read_error = super::record_weak_candidate_only_audited(
+            &read_failure_dir,
+            before,
+            after,
+            Some(&scope),
+            &read_observation,
+            Some(&mut read_audit),
+        )
+        .expect_err("unsupported SQLite schema should fail the initial candidate read");
+        assert!(read_error.to_string().contains("newer than supported"));
+        assert_eq!(
+            read_audit.candidates.last().copied(),
+            Some(("unknown", "failed", Some("store_error")))
+        );
+
+        let write_failure_dir = temp_dir("weak-candidate-audit-write-failure");
+        let write_origin = "weak-candidate-write-failure-origin";
+        insert_test_dictation_origin(&write_failure_dir, write_origin);
+        let write_key = super::scoped_word_key_for(before, after, Some(&scope));
+        let write_observation = weak_observation(
+            "weak-candidate-write-failure-session",
+            &write_key,
+            write_origin,
+        );
+        rusqlite::Connection::open(write_failure_dir.join("history.sqlite"))
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER reject_weak_candidate BEFORE INSERT ON learn_pairs
+                 BEGIN SELECT RAISE(ABORT, 'fixture candidate write failure'); END;",
+            )
+            .unwrap();
+        let mut write_audit = WeakCandidateAuditProbe::default();
+        let write_error = super::record_weak_candidate_only_audited(
+            &write_failure_dir,
+            before,
+            after,
+            Some(&scope),
+            &write_observation,
+            Some(&mut write_audit),
+        )
+        .expect_err("aborted SQLite insert should fail the candidate write");
+        assert!(write_error
+            .to_string()
+            .contains("fixture candidate write failure"));
+        assert_eq!(
+            write_audit.candidates.last().copied(),
+            Some(("unknown", "failed", Some("store_error")))
+        );
+
+        assert!(crate::store::get_learn_pair(&write_failure_dir, &write_key)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            crate::store::count_independent_learn_pair_hits(&write_failure_dir, &write_key)
+                .unwrap(),
+            0
+        );
+        assert!(
+            crate::store::list_pending_dictionary_effects(&write_failure_dir)
+                .unwrap()
+                .is_empty()
+        );
+        let (settings, _) = crate::store::load_settings(&write_failure_dir);
+        assert!(!crate::store::dictionary_contains_word(
+            &settings.dictionary,
+            after
+        ));
+        let _ = std::fs::remove_dir_all(&read_failure_dir);
+        let _ = std::fs::remove_dir_all(&write_failure_dir);
+    }
+
+    #[test]
+    fn passive_asr_evidence_accepts_only_the_same_aligned_inserted_surface() {
+        let inserted = "Please open VoiceFlo now.";
+        let evidence = super::PassiveAsrEvidence::from_transaction(Some(inserted), inserted, &[]);
+        assert_eq!(
+            evidence.classify(inserted, "VoiceFlo", "VoiceFlow"),
+            super::PassiveAsrAttribution::SourceAligned
+        );
+
+        let mismatch = super::PassiveAsrEvidence::from_transaction(
+            Some("Please open VoiceFlo now."),
+            "Please open VoiceFlow now.",
+            &[],
+        );
+        assert_eq!(
+            mismatch.classify("Please open VoiceFlow now.", "VoiceFlow", "VoiceFlo"),
+            super::PassiveAsrAttribution::SourceMismatch
+        );
+        assert_eq!(
+            mismatch.classify("Please open VoiceFlow now.", "VoiceFlow", "VoiceFlowX"),
+            super::PassiveAsrAttribution::SourceMismatch
+        );
+    }
+
+    #[test]
+    fn passive_asr_evidence_blocks_only_a_proven_reverse_of_the_applied_rule() {
+        let inserted = "VoiceFlow";
+        let applied = crate::lexicon::LexiconPair::new("VoiceFlo", "VoiceFlow");
+        let evidence =
+            super::PassiveAsrEvidence::from_transaction(Some("VoiceFlo"), inserted, &[applied]);
+        assert_eq!(
+            evidence.classify(inserted, "VoiceFlow", "VoiceFlo"),
+            super::PassiveAsrAttribution::ReverseAppliedRule
+        );
+
+        let unknown = super::PassiveAsrEvidence::from_transaction(Some("VoiceFlo"), inserted, &[]);
+        assert_eq!(
+            unknown.classify(inserted, "VoiceFlow", "VoiceFlo"),
+            super::PassiveAsrAttribution::SourceMismatch,
+            "a mismatch without current applied-rule proof is not called rule rejection"
+        );
+    }
+
+    #[test]
+    fn passive_asr_evidence_abstains_on_ambiguous_or_oversized_source() {
+        let duplicate = "VoiceFlo VoiceFlo";
+        let evidence = super::PassiveAsrEvidence::from_transaction(Some(duplicate), duplicate, &[]);
+        assert_eq!(
+            evidence.classify(duplicate, "VoiceFlo", "VoiceFlow"),
+            super::PassiveAsrAttribution::Unknown
+        );
+
+        let oversized = "a".repeat(super::MAX_EDIT_ALIGNMENT_CHARS + 1);
+        let evidence =
+            super::PassiveAsrEvidence::from_transaction(Some(&oversized), &oversized, &[]);
+        assert_eq!(
+            evidence.classify(&oversized, "a", "b"),
+            super::PassiveAsrAttribution::Unknown
+        );
+        assert_eq!(
+            super::PassiveAsrEvidence::from_transaction(None, "VoiceFlo", &[]).classify(
+                "VoiceFlo",
+                "VoiceFlo",
+                "VoiceFlow"
+            ),
+            super::PassiveAsrAttribution::Unknown
+        );
+    }
+
+    #[test]
+    fn observer_epoch_invalidates_only_when_observation_grants_or_scope_change() {
+        let original = crate::store::Settings::default();
+        let mut changed = original.clone();
+        changed.dictionary_learn_enabled = !changed.dictionary_learn_enabled;
+        assert!(super::observer_permission_policy_changed(
+            &original, &changed
+        ));
+
+        let mut changed = original.clone();
+        changed.cleanup_intensity = "light".into();
+        assert!(!super::observer_permission_policy_changed(
+            &original, &changed
+        ));
     }
 
     #[test]
@@ -7915,6 +9023,10 @@ mod tests {
             promote_hits: 0,
             manual_scoped: false,
             auto_scoped: false,
+            match_policy: Default::default(),
+            binding_invalidated_at: None,
+            binding_invalidated_reason: None,
+            replacement_runs: 0,
         };
         let promoted = crate::store::LearnPairRecord {
             promoted: true,
@@ -7939,6 +9051,10 @@ mod tests {
             promote_hits: 0,
             manual_scoped: false,
             auto_scoped: false,
+            match_policy: Default::default(),
+            binding_invalidated_at: None,
+            binding_invalidated_reason: None,
+            replacement_runs: 0,
         };
         let manual = crate::store::LearnPairRecord {
             pair_key: super::pair_key("", "手动导入"),
@@ -7958,6 +9074,10 @@ mod tests {
             promote_hits: 0,
             manual_scoped: false,
             auto_scoped: false,
+            match_policy: Default::default(),
+            binding_invalidated_at: None,
+            binding_invalidated_reason: None,
+            replacement_runs: 0,
         };
         let visible = super::pairs_for_dictionary_settings(vec![pending, promoted, name, manual]);
         assert_eq!(visible.len(), 3);
@@ -8004,6 +9124,20 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         dir
+    }
+
+    fn insert_test_dictation_origin(dir: &std::path::Path, origin: &str) -> i64 {
+        crate::store::insert_history(dir, "test transcript", "test transcript", 0.1, false)
+            .unwrap();
+        let history_id = crate::store::get_history(dir, 1).unwrap()[0].id;
+        let connection = rusqlite::Connection::open(dir.join("history.sqlite")).unwrap();
+        connection
+            .execute(
+                "UPDATE dictations SET transaction_id = ?1 WHERE id = ?2",
+                rusqlite::params![origin, history_id],
+            )
+            .unwrap();
+        history_id
     }
 
     #[test]
@@ -8277,7 +9411,7 @@ mod tests {
             let observed = match id {
                 "manual_word_ownership_after_unscoped_undo" => {
                     let root = temp_dir("a0-manual-word-undo");
-                    let mut dictionary = input["global_dictionary_seed"]
+                    let global_words = input["global_dictionary_seed"]
                         .as_array()
                         .expect("A0 dictionary seed must be an array")
                         .iter()
@@ -8287,127 +9421,294 @@ mod tests {
                                 .to_owned()
                         })
                         .collect::<Vec<_>>();
-                    let hits = input["candidate_hits"]
-                        .as_u64()
-                        .expect("candidate hit count must be set");
-                    assert!(
-                        (1..=8).contains(&hits),
-                        "A0 candidate hit count is unbounded"
-                    );
                     let before = a0_fixture_input_str(input, "before");
                     let after = a0_fixture_input_str(input, "after");
-                    for _ in 0..hits {
-                        super::record_learn_pair_with_scope(
-                            &root,
-                            &mut dictionary,
-                            before,
-                            after,
-                            None,
-                        )
-                        .expect("production candidate owner must complete");
-                    }
                     let key = super::pair_key(before, after);
+                    let scope = a0_scope(input);
+                    let mut settings = crate::store::Settings::default();
+                    for word in &global_words {
+                        assert!(settings
+                            .add_dictionary_source(word, crate::store::DictionarySource::Manual));
+                    }
+                    crate::store::save_configuration(&root, &settings)
+                        .expect("persist isolated Settings with real manual word owners");
+                    crate::store::ensure_learn_pair_promoted(
+                        &root,
+                        &key,
+                        before,
+                        after,
+                        Some(&scope),
+                    )
+                    .expect("production explicit-confirm owner promotes the rule");
+                    let pending_before_undo = crate::store::list_pending_dictionary_effects(&root)
+                        .expect("read the pending dictionary Add owner");
+                    assert_eq!(pending_before_undo.len(), 1);
+                    assert_eq!(pending_before_undo[0].pair_key, key);
+                    assert_eq!(pending_before_undo[0].word, after);
+                    assert_eq!(
+                        pending_before_undo[0].action,
+                        crate::store::DictionaryEffectAction::Add
+                    );
+                    assert_eq!(pending_before_undo[0].version, 1);
+                    super::save_settings_with_dictionary_effects(
+                        &root,
+                        &mut settings,
+                        true,
+                        true,
+                        |snapshot| crate::store::save_configuration(&root, snapshot),
+                    )
+                    .expect("Settings owner applies and acknowledges rule Add");
+                    let persisted_before_undo: crate::store::Settings = serde_json::from_slice(
+                        &std::fs::read(root.join("settings.json"))
+                            .expect("read durable A0 Settings after rule Add"),
+                    )
+                    .expect("parse durable A0 Settings after rule Add");
+                    assert!(persisted_before_undo
+                        .has_dictionary_source(after, &crate::store::DictionarySource::Manual));
+                    assert!(persisted_before_undo.has_dictionary_source(
+                        after,
+                        &crate::store::DictionarySource::Rule(key.clone())
+                    ));
+                    assert!(crate::store::dictionary_contains_word(
+                        &persisted_before_undo.dictionary,
+                        after
+                    ));
                     let promoted_row = crate::store::get_learn_pair(&root, &key)
                         .expect("read isolated A0 candidate")
                         .expect("candidate row must be persisted");
                     let promoted_before_undo = promoted_row.is_live_promoted();
-                    assert!(
-                        crate::store::tombstone_learn_pair(&root, &key)
-                            .expect("production tombstone owner must complete"),
-                        "A0 undo probe must tombstone its candidate"
+                    assert!(!promoted_row.ignored && promoted_row.tombstoned_at.is_none());
+                    let pending_remove = {
+                        let changed = crate::store::tombstone_learn_pair(&root, &key)
+                            .expect("production tombstone owner must complete");
+                        assert!(changed, "A0 undo probe must tombstone its candidate");
+                        let tombstoned = crate::store::get_learn_pair(&root, &key)
+                            .expect("read the durable A0 tombstone")
+                            .expect("A0 pair row remains for undo history");
+                        assert!(tombstoned.ignored && tombstoned.tombstoned_at.is_some());
+                        let pending = crate::store::list_pending_dictionary_effects(&root)
+                            .expect("read exact pending Remove effect after tombstone");
+                        assert_eq!(pending.len(), 1);
+                        assert_eq!(pending[0].pair_key, key);
+                        assert_eq!(pending[0].word, after);
+                        assert_eq!(
+                            pending[0].action,
+                            crate::store::DictionaryEffectAction::Remove
+                        );
+                        assert_eq!(pending[0].version, 2);
+                        pending[0].clone()
+                    };
+                    super::save_settings_with_dictionary_effects(
+                        &root,
+                        &mut settings,
+                        true,
+                        false,
+                        |snapshot| crate::store::save_configuration(&root, snapshot),
+                    )
+                    .expect("Settings owner applies and acknowledges rule Remove");
+                    let persisted_after_undo: crate::store::Settings = serde_json::from_slice(
+                        &std::fs::read(root.join("settings.json"))
+                            .expect("read durable A0 Settings after rule Remove"),
+                    )
+                    .expect("parse durable A0 Settings after rule Remove");
+                    let manual_owner_retained = persisted_after_undo
+                        .has_dictionary_source(after, &crate::store::DictionarySource::Manual);
+                    let rule_owner_removed = !persisted_after_undo.has_dictionary_source(
+                        after,
+                        &crate::store::DictionarySource::Rule(key.clone()),
                     );
-                    let rows_after_tombstone = crate::store::list_learn_pairs(&root)
-                        .expect("read isolated A0 rows after tombstone");
-                    let remove_dictionary_entry = super::should_remove_dictionary_entry_after_undo(
-                        &promoted_row,
-                        &rows_after_tombstone,
+                    let retained = crate::store::dictionary_contains_word(
+                        &persisted_after_undo.dictionary,
+                        after,
                     );
-                    if remove_dictionary_entry {
-                        super::remove_dictionary_entry(&mut dictionary, after);
-                    }
-                    let retained = crate::store::dictionary_contains_word(&dictionary, after);
+                    let pending_after_undo = crate::store::list_pending_dictionary_effects(&root)
+                        .expect("read pending effects after undo");
+                    assert!(pending_after_undo.is_empty());
+                    let tombstoned_after_undo = crate::store::get_learn_pair(&root, &key)
+                        .expect("read final A0 tombstone")
+                        .expect("tombstoned row remains durable");
+                    assert!(tombstoned_after_undo.ignored);
+                    assert!(tombstoned_after_undo.tombstoned_at.is_some());
+                    assert!(!tombstoned_after_undo.is_live_promoted());
                     let _ = std::fs::remove_dir_all(root);
                     serde_json::json!({
                         "row_promoted_before_undo": promoted_before_undo,
-                        "undo_owner_removed_dictionary_entry": remove_dictionary_entry,
-                        "global_dictionary_word_retained": retained
+                        "manual_and_rule_owners_durable_before_undo": true,
+                        "manual_dictionary_owner_retained": manual_owner_retained,
+                        "rule_dictionary_owner_removed": rule_owner_removed,
+                        "global_dictionary_word_retained": retained,
+                        "pending_add_before_undo_version": 1,
+                        "pending_remove_after_tombstone_version": pending_remove.version,
+                        "pending_effects_after_undo": pending_after_undo.len(),
+                        "tombstoned_after_undo": tombstoned_after_undo.ignored && tombstoned_after_undo.tombstoned_at.is_some()
                     })
                 }
                 "same_dictation_paste_and_history_receipts" => {
                     let root = temp_dir("a0-same-origin-cross-channel");
                     let before = a0_fixture_input_str(input, "before");
                     let after = a0_fixture_input_str(input, "after");
-                    let key = super::pair_key(before, after);
                     let scope = a0_scope(input);
-                    crate::store::insert_history(
+                    // History and paste observations now address the scoped word identity used by
+                    // production. Keep the fixture inputs and its externally observed contract
+                    // unchanged while exercising the v20 key at this version-bound boundary.
+                    let key = super::scoped_word_key_for(before, after, Some(&scope));
+                    let dictation_origin = a0_fixture_input_str(input, "dictation_origin_id");
+                    let history_owner =
+                        crate::store::register_pending_history_owner(&root, dictation_origin)
+                            .expect("register isolated A0 History transaction owner");
+                    let history_intent = crate::store::pending_history_intent_for_test(
+                        dictation_origin,
+                        "ok",
+                        "history",
+                        a0_fixture_input_str(input, "history_text_before"),
+                    );
+                    crate::store::write_pending_history_intent(
                         &root,
-                        a0_fixture_input_str(input, "history_text_before"),
-                        a0_fixture_input_str(input, "history_text_before"),
-                        1.0,
-                        false,
+                        &history_intent,
+                        &history_owner,
                     )
-                    .expect("insert isolated A0 History row");
-                    let history_id = crate::store::get_history(&root, 1)
-                        .expect("read isolated A0 History row")
-                        .first()
-                        .expect("A0 History row must exist")
-                        .id;
+                    .expect("write isolated A0 History intent through its production owner");
+                    crate::store::promote_pending_history_intent(
+                        &root,
+                        dictation_origin,
+                        &history_owner,
+                    )
+                    .expect("commit isolated A0 History transaction through its production owner");
+                    drop(history_owner);
+                    let connection = rusqlite::Connection::open(root.join("history.sqlite"))
+                        .expect("read committed A0 History transaction owner");
+                    let history_id = connection
+                        .query_row(
+                            "SELECT id FROM dictations WHERE transaction_id = ?1",
+                            [dictation_origin],
+                            |row| row.get::<_, i64>(0),
+                        )
+                        .expect("A0 committed History row must retain its transaction origin");
+                    drop(connection);
                     let revision =
                         crate::store::save_manual_history_revision(&root, history_id, after)
                             .expect("save isolated A0 History correction");
                     let revision_id = revision
                         .revision_id
                         .expect("A0 History correction must have a revision id");
-                    let paste_receipt = crate::store::LearnPairObservation::paste_session(
-                        a0_fixture_input_str(input, "dictation_origin_id"),
-                        &key,
-                    );
-                    let history_receipt = crate::store::LearnPairObservation::history_edit(
-                        history_id,
-                        revision_id,
-                        &key,
-                    );
-                    let mut dictionary = Vec::new();
-                    super::record_learn_pair_with_observation_audited(
+                    let history_receipt =
+                        crate::store::LearnPairObservation::history_edit_from_store(
+                            &root,
+                            history_id,
+                            revision_id,
+                            &key,
+                        )
+                        .expect("derive History receipt from the stored owner")
+                        .expect("History row and revision must remain available");
+                    let paste_receipt =
+                        crate::store::LearnPairObservation::paste_session_with_dictation_origin(
+                            a0_fixture_input_str(input, "paste_session_id"),
+                            &key,
+                            dictation_origin,
+                        );
+                    let first_origin = super::record_weak_candidate_only_audited(
                         &root,
-                        &mut dictionary,
                         before,
                         after,
                         Some(&scope),
-                        Some(&paste_receipt),
-                        true,
+                        &history_receipt,
                         None,
                     )
-                    .expect("record production paste-session receipt");
-                    super::record_learn_pair_with_observation_audited(
+                    .expect("record first History-origin weak candidate");
+                    assert_eq!(
+                        first_origin,
+                        super::WeakCandidateResult::Pending { hits: 1 }
+                    );
+                    let connection = rusqlite::Connection::open(root.join("history.sqlite"))
+                        .expect("read first A0 History-origin proof");
+                    let receipt_count_after_first: i64 = connection
+                        .query_row(
+                            "SELECT COUNT(*) FROM learn_observations WHERE rule_key = ?1 AND dictation_origin = ?2",
+                            rusqlite::params![key, dictation_origin],
+                            |row| row.get(0),
+                        )
+                        .expect("count first A0 History-origin proof");
+                    assert_eq!(receipt_count_after_first, 1);
+                    drop(connection);
+                    let paste_replay = super::record_weak_candidate_only_audited(
                         &root,
-                        &mut dictionary,
                         before,
                         after,
                         Some(&scope),
-                        Some(&history_receipt),
-                        true,
+                        &paste_receipt,
                         None,
                     )
-                    .expect("record production History-edit receipt");
+                    .expect("record same-origin paste replay through weak candidate owner");
+                    assert!(matches!(
+                        paste_replay,
+                        super::WeakCandidateResult::Pending { hits: 1 }
+                    ));
                     let row = crate::store::get_learn_pair(&root, &key)
                         .expect("read isolated A0 pair")
                         .expect("A0 cross-channel pair must exist");
+                    assert!(row.is_pending());
+                    assert!(row.auto_scoped);
+                    assert!(!row.is_live_promoted());
                     let connection = rusqlite::Connection::open(root.join("history.sqlite"))
                         .expect("open isolated A0 receipt store");
                     let mut statement = connection
-                        .prepare("SELECT source_kind FROM learn_observations ORDER BY source_kind")
+                        .prepare(
+                            "SELECT source_kind, rule_key, dictation_origin, channel,
+                                    source_history_id, source_revision_id, proof_eligible
+                             FROM learn_observations ORDER BY source_kind",
+                        )
                         .expect("prepare isolated A0 receipt query");
                     let receipt_sources = statement
-                        .query_map([], |receipt| receipt.get::<_, String>(0))
+                        .query_map([], |receipt| {
+                            Ok(serde_json::json!({
+                                "source_kind": receipt.get::<_, String>(0)?,
+                                "rule_key": receipt.get::<_, Option<String>>(1)?,
+                                "dictation_origin": receipt.get::<_, Option<String>>(2)?,
+                                "channel": receipt.get::<_, Option<String>>(3)?,
+                                "source_history_id": receipt.get::<_, Option<i64>>(4)?,
+                                "source_revision_id": receipt.get::<_, Option<i64>>(5)?,
+                                "proof_eligible": receipt.get::<_, bool>(6)?
+                            }))
+                        })
                         .expect("query isolated A0 receipts")
                         .collect::<Result<Vec<_>, _>>()
                         .expect("read isolated A0 receipts");
+                    let independent_dictation_origins =
+                        crate::store::count_independent_learn_pair_hits(&root, &key)
+                            .expect("count DB-owned independent dictation origins");
+                    assert_eq!(receipt_sources.len(), 1);
+                    assert_eq!(
+                        receipt_sources[0],
+                        serde_json::json!({
+                            "source_kind": "history_edit",
+                            "rule_key": key,
+                            "dictation_origin": dictation_origin,
+                            "channel": "history_edit",
+                            "source_history_id": history_id,
+                            "source_revision_id": revision_id,
+                            "proof_eligible": true
+                        })
+                    );
+                    assert_eq!(independent_dictation_origins, 1);
+                    let receipt_count_after_paste: i64 = connection
+                        .query_row(
+                            "SELECT COUNT(*) FROM learn_observations WHERE rule_key = ?1 AND dictation_origin = ?2",
+                            rusqlite::params![key, dictation_origin],
+                            |row| row.get(0),
+                        )
+                        .expect("count retained A0 proof after duplicate paste");
+                    assert_eq!(receipt_count_after_paste, 1);
                     let result = serde_json::json!({
                         "dictation_origin_id": input["dictation_origin_id"],
                         "history_id": history_id,
                         "receipt_sources": receipt_sources,
-                        "hits_after": row.hits
+                        "hits_after": row.hits,
+                        "independent_dictation_origins": independent_dictation_origins,
+                        "first_origin_recorded": true,
+                        "paste_replay_duplicate": true,
+                        "receipt_count_after_first": receipt_count_after_first,
+                        "receipt_count_after_paste": receipt_count_after_paste,
+                        "live_promoted": row.is_live_promoted()
                     });
                     drop(statement);
                     drop(connection);
@@ -8418,8 +9719,9 @@ mod tests {
                     let root = temp_dir("a0-legacy-pending-origin");
                     let before = a0_fixture_input_str(input, "before");
                     let after = a0_fixture_input_str(input, "after");
-                    let key = super::pair_key(before, after);
                     let scope = a0_scope(input);
+                    let legacy_key = super::pair_key(before, after);
+                    let scoped_key = super::scoped_word_key_for(before, after, Some(&scope));
                     let mut dictionary = Vec::new();
                     let legacy_hits = input["legacy_hits_without_receipt"]
                         .as_u64()
@@ -8448,39 +9750,134 @@ mod tests {
                         })
                         .expect("read receipts before new origin");
                     drop(connection);
+                    assert_eq!(receipts_before_new_origin, 0);
                     let legacy_origin_known = receipts_before_new_origin > 0;
-                    let new_origin = crate::store::LearnPairObservation::paste_session(
-                        a0_fixture_input_str(input, "new_paste_session_id"),
-                        &key,
+
+                    let dictation_origin = a0_fixture_input_str(input, "dictation_origin_id");
+                    let history_owner =
+                        crate::store::register_pending_history_owner(&root, dictation_origin)
+                            .expect("register isolated A0 legacy-boundary History owner");
+                    let history_intent = crate::store::pending_history_intent_for_test(
+                        dictation_origin,
+                        "ok",
+                        "history",
+                        a0_fixture_input_str(input, "history_text"),
                     );
-                    super::record_learn_pair_with_observation_audited(
+                    crate::store::write_pending_history_intent(
                         &root,
-                        &mut dictionary,
+                        &history_intent,
+                        &history_owner,
+                    )
+                    .expect("write isolated A0 History intent through its production owner");
+                    crate::store::promote_pending_history_intent(
+                        &root,
+                        dictation_origin,
+                        &history_owner,
+                    )
+                    .expect("commit isolated A0 History transaction through its production owner");
+                    drop(history_owner);
+                    let connection = rusqlite::Connection::open(root.join("history.sqlite"))
+                        .expect("read committed A0 legacy-boundary History owner");
+                    let history_id = connection
+                        .query_row(
+                            "SELECT id FROM dictations WHERE transaction_id = ?1",
+                            [dictation_origin],
+                            |row| row.get::<_, i64>(0),
+                        )
+                        .expect("committed A0 History row must retain its transaction origin");
+                    drop(connection);
+
+                    let new_origin =
+                        crate::store::LearnPairObservation::paste_session_with_dictation_origin(
+                            a0_fixture_input_str(input, "new_paste_session_id"),
+                            &scoped_key,
+                            dictation_origin,
+                        );
+                    let recorded = super::record_weak_candidate_only_audited(
+                        &root,
                         before,
                         after,
                         Some(&scope),
-                        Some(&new_origin),
-                        true,
+                        &new_origin,
                         None,
                     )
-                    .expect("record the new production paste-session receipt");
-                    let row = crate::store::get_learn_pair(&root, &key)
-                        .expect("read isolated A0 legacy pair")
-                        .expect("A0 legacy pair must exist");
+                    .expect("record one DB-owned new weak dictation candidate");
+                    assert_eq!(recorded, super::WeakCandidateResult::Pending { hits: 1 });
+                    let row = crate::store::get_learn_pair(&root, &scoped_key)
+                        .expect("read isolated A0 scoped-origin pair")
+                        .expect("A0 scoped-origin pair must exist");
+                    assert!(row.is_pending());
+                    assert!(row.auto_scoped);
+                    assert!(!row.is_live_promoted());
+                    assert_eq!(
+                        crate::store::promote_learn_pair_if_eligible_with_status(
+                            &root,
+                            &scoped_key,
+                            before,
+                            after,
+                            Some(&scope),
+                            ordinary_threshold as u32,
+                            true,
+                        )
+                        .expect("check the production weak-origin threshold gate"),
+                        crate::store::LearnPairPromotionStatus::Ineligible
+                    );
+                    let legacy_row = crate::store::get_learn_pair(&root, &legacy_key)
+                        .expect("read isolated A0 legacy pending pair")
+                        .expect("A0 legacy pending pair must remain separate");
+                    assert_eq!(legacy_row.hits, legacy_hits as u32);
+                    assert!(!legacy_row.is_live_promoted());
                     let connection = rusqlite::Connection::open(root.join("history.sqlite"))
                         .expect("reopen isolated A0 legacy receipt store");
+                    let receipt: (String, Option<String>, Option<String>, Option<i64>, bool) =
+                        connection
+                            .query_row(
+                                "SELECT channel, dictation_origin, rule_key, source_history_id, proof_eligible
+                                 FROM learn_observations WHERE rule_key = ?1",
+                                [&scoped_key],
+                                |receipt| {
+                                    Ok((
+                                        receipt.get(0)?,
+                                        receipt.get(1)?,
+                                        receipt.get(2)?,
+                                        receipt.get(3)?,
+                                        receipt.get(4)?,
+                                    ))
+                                },
+                            )
+                            .expect("read new A0 proof ownership fields");
+                    assert_eq!(
+                        receipt,
+                        (
+                            "paste".into(),
+                            Some(dictation_origin.to_owned()),
+                            Some(scoped_key.clone()),
+                            Some(history_id),
+                            true
+                        )
+                    );
                     let receipt_count_after_new_origin: i64 = connection
                         .query_row("SELECT COUNT(*) FROM learn_observations", [], |row| {
                             row.get(0)
                         })
-                        .expect("read receipts after new origin");
+                        .expect("count new A0 receipt");
                     drop(connection);
+                    let independent_dictation_origins =
+                        crate::store::count_independent_learn_pair_hits(&root, &scoped_key)
+                            .expect("count only independent DB-owned origins");
+                    assert_eq!(receipt_count_after_new_origin, 1);
+                    assert_eq!(independent_dictation_origins, 1);
                     let result = serde_json::json!({
-                        "receipts_before_new_origin": receipts_before_new_origin,
+                        "dictation_origin_id": dictation_origin,
+                        "history_id": history_id,
                         "hits_after": row.hits,
                         "live_promoted": row.is_live_promoted(),
                         "receipt_count_after_new_origin": receipt_count_after_new_origin,
-                        "legacy_origin_known": legacy_origin_known
+                        "independent_dictation_origins": independent_dictation_origins,
+                        "legacy_origin_known": legacy_origin_known,
+                        "receipt_channel": receipt.0,
+                        "receipt_source_history_id": receipt.3,
+                        "proof_eligible": receipt.4
                     });
                     let _ = std::fs::remove_dir_all(root);
                     result
@@ -8610,11 +10007,18 @@ mod tests {
             "scope": "deterministic isolated production-function observations; not native E2E, microphone, ASR quality, or independent human evidence",
             "contract": fixture["frozen_contract"],
             "native_smoke": fixture["native_smoke"],
+            "machine_gate": {
+                "all_targets_met": observed_cases.iter().all(|case| case["status"] == "target_met")
+            },
             "probes": observed_cases
         });
         println!(
             "VOICEFLOW_LEARNING_A0_BASELINE_JSON\t{}",
             serde_json::to_string(&report).expect("serialize observed A0 baseline")
+        );
+        assert!(
+            report["machine_gate"]["all_targets_met"] == true,
+            "A0 machine gate requires every observed probe to meet its frozen target"
         );
     }
 
@@ -8781,7 +10185,10 @@ mod tests {
         let after_failed_promotion = crate::store::get_learn_pair(&dir, &key).unwrap().unwrap();
         assert_eq!(after_failed_promotion.hits, 3);
         assert!(!after_failed_promotion.promoted);
-        assert!(!after_failed_promotion.auto_scoped);
+        assert!(after_failed_promotion.auto_scoped);
+        assert!(crate::store::list_pending_dictionary_effects(&dir)
+            .unwrap()
+            .is_empty());
 
         let connection = rusqlite::Connection::open(dir.join("history.sqlite")).unwrap();
         connection
@@ -8811,6 +10218,9 @@ mod tests {
         assert_eq!(after_retry.hits, 3);
         assert!(after_retry.is_live_promoted());
         assert!(after_retry.auto_scoped);
+        assert!(crate::store::list_pending_dictionary_effects(&dir)
+            .unwrap()
+            .is_empty());
         assert_eq!(
             crate::store::get_history_revisions(&dir, history_id)
                 .unwrap()
@@ -8893,6 +10303,10 @@ mod tests {
             promote_hits: 0,
             manual_scoped: false,
             auto_scoped: true,
+            match_policy: Default::default(),
+            binding_invalidated_at: None,
+            binding_invalidated_reason: None,
+            replacement_runs: 0,
         };
         let mut global_dictionary = vec!["VoiceFlow".to_owned()];
         assert!(!super::should_remove_dictionary_entry_after_undo(
@@ -9312,9 +10726,46 @@ mod tests {
             profile_id: Some("user.codex".into()),
             family: Some(crate::context::family_id(mapping.family).into()),
             native_bundle: mapping.bundle_id.clone(),
+            mapping_identity: Some(mapping.declared_identity_fingerprint()),
             ..crate::store::HistoryScene::default()
         };
         assert!(super::history_scope_matches_mapping(&scene, &mapping));
+        let current_settings = crate::store::Settings {
+            context_mappings: vec![mapping.clone()],
+            ..crate::store::Settings::default()
+        };
+        assert!(super::history_suggestion_scope_is_current(
+            &scene,
+            &current_settings
+        ));
+
+        let legacy_scene = crate::store::HistoryScene {
+            mapping_identity: None,
+            ..scene.clone()
+        };
+        assert!(!super::history_scope_matches_mapping(
+            &legacy_scene,
+            &mapping
+        ));
+        assert!(!super::history_suggestion_scope_is_current(
+            &legacy_scene,
+            &current_settings
+        ));
+
+        let mut moved_mapping = mapping.clone();
+        moved_mapping.executable = Some("CodexNext".into());
+        assert!(!super::history_scope_matches_mapping(
+            &scene,
+            &moved_mapping
+        ));
+        let moved_settings = crate::store::Settings {
+            context_mappings: vec![moved_mapping],
+            ..current_settings.clone()
+        };
+        assert!(!super::history_suggestion_scope_is_current(
+            &scene,
+            &moved_settings
+        ));
 
         let mut other_app = scene.clone();
         other_app.native_bundle = Some("com.apple.TextEdit".into());
@@ -9331,6 +10782,93 @@ mod tests {
             &missing_scope,
             &mapping
         ));
+    }
+
+    #[test]
+    fn stale_history_suggestion_cannot_be_confirmed_after_mapping_selector_changes() {
+        let mut mapping = test_mapping("codex");
+        mapping.family = crate::context::ContextFamily::General;
+        mapping.bundle_id = Some("com.openai.codex".into());
+        let scene = crate::store::HistoryScene {
+            profile_id: Some("user.codex".into()),
+            family: Some(crate::context::family_id(mapping.family).into()),
+            native_bundle: mapping.bundle_id.clone(),
+            mapping_identity: Some(mapping.declared_identity_fingerprint()),
+            ..crate::store::HistoryScene::default()
+        };
+        let original_settings = crate::store::Settings {
+            context_mappings: vec![mapping.clone()],
+            ..crate::store::Settings::default()
+        };
+        let original_scope =
+            super::current_history_scope_for_confirmation(&scene, &original_settings).unwrap();
+        let before = "TypeScrit";
+        let after = "TypeScript";
+        let suggestion = super::dictionary_suggestions(before, after)
+            .into_iter()
+            .next()
+            .expect("the original History mapping can suggest this correction");
+        let stale_pair_key = super::scoped_word_key_for(
+            &suggestion.before_span,
+            &suggestion.after,
+            Some(&original_scope),
+        );
+
+        let dir = temp_dir("stale-history-suggestion-confirmation");
+        assert!(matches!(
+            crate::store::upsert_learn_pair_with_scope(
+                &dir,
+                &stale_pair_key,
+                &suggestion.before_span,
+                &suggestion.after,
+                Some(&original_scope),
+            )
+            .unwrap(),
+            crate::store::LearnPairUpsert::Stored(_)
+        ));
+        assert!(crate::store::get_learn_pair(&dir, &stale_pair_key)
+            .unwrap()
+            .unwrap()
+            .is_pending());
+
+        mapping.executable = Some("CodexNext".into());
+        let changed_settings = crate::store::Settings {
+            context_mappings: vec![mapping],
+            ..original_settings
+        };
+        assert_eq!(
+            crate::store::invalidate_word_rule_mapping_bindings(
+                &dir,
+                &[(
+                    "codex".into(),
+                    crate::store::LearnPairBindingInvalidationReason::DeclaredIdentityChanged,
+                )],
+            )
+            .unwrap(),
+            1
+        );
+        let confirmation_scope =
+            super::current_history_scope_for_confirmation(&scene, &changed_settings);
+        assert_eq!(
+            confirmation_scope,
+            Err(super::HistoryConfirmationScopeError::MappingChanged)
+        );
+        if let Ok(scope) = confirmation_scope {
+            crate::store::ensure_learn_pair_promoted(
+                &dir,
+                &stale_pair_key,
+                &suggestion.before_span,
+                &suggestion.after,
+                Some(&scope),
+            )
+            .unwrap();
+        }
+        let row = crate::store::get_learn_pair(&dir, &stale_pair_key)
+            .unwrap()
+            .unwrap();
+        assert!(!row.promoted);
+        assert!(row.is_binding_invalidated());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -9632,6 +11170,11 @@ mod tests {
             id: id.to_owned(),
             label: "WeChat".into(),
             family: crate::context::ContextFamily::PersonalChat,
+            writing_task_id: None,
+            writing_preferences: Vec::new(),
+            preference_guidance_provider_approved: false,
+            preference_revision: 0,
+            deleted: false,
             mode_id: None,
             bundle_id: Some("com.tencent.xinWeChat".into()),
             executable: None,
@@ -9667,7 +11210,7 @@ mod tests {
     }
 
     #[test]
-    fn confirming_draft_does_not_approve_unreviewed_examples() {
+    fn confirming_draft_retains_examples_locally_without_cloud_approval() {
         let mut mapping = test_mapping("wechat");
         mapping.style_example_pairs = vec![
             crate::context::StyleExamplePair {
@@ -9679,14 +11222,45 @@ mod tests {
                 output: "未审核输出二".to_string(),
             },
         ];
-        assert!(!mapping.style_examples_approved);
+        mapping.style_examples_approved = true;
 
         super::confirm_style_example(&mut mapping, "确认输入", "确认输出");
 
-        assert!(mapping.style_examples_approved);
-        assert_eq!(mapping.style_example_pairs.len(), 1);
-        assert_eq!(mapping.style_example_pairs[0].input, "确认输入");
-        assert_eq!(mapping.style_example_pairs[0].output, "确认输出");
+        assert!(!mapping.style_examples_approved);
+        assert_eq!(mapping.style_example_pairs.len(), 3);
+        assert_eq!(mapping.style_example_pairs[0].input, "未审核输入一");
+        assert_eq!(mapping.style_example_pairs[2].input, "确认输入");
+        assert_eq!(mapping.style_example_pairs[2].output, "确认输出");
+        let persisted = serde_json::to_value(&mapping).expect("local mapping serializes");
+        assert_eq!(persisted["style_example_pairs"][2]["input"], "确认输入");
+        assert_eq!(persisted["style_examples_approved"], false);
+
+        let policy = crate::context::ContextPolicy {
+            style_examples_approved: mapping.style_examples_approved,
+            style_example_pairs: mapping.style_example_pairs.clone(),
+            ..crate::context::ContextPolicy::default()
+        };
+        let intent = crate::llm::CleanupIntent::implicit("待整理文字");
+        let prompt = crate::llm::CleanupPromptContext {
+            context: None,
+            policy: Some(&policy),
+            profile: None,
+            pairs_hint: None,
+            effort: crate::llm::CleanupEffort::Standard,
+            visible_context: None,
+            source_transcript: None,
+        };
+        let request = crate::llm::cleanup_request_facts(
+            "https://api.example.test/v1/chat/completions",
+            "test-model",
+            &intent,
+            &prompt,
+        )
+        .expect("cloud cleanup request is constructed without transport");
+        let serialized_request =
+            serde_json::to_string(&request.fields_constructed).expect("request fields serialize");
+        assert!(!serialized_request.contains("确认输入"));
+        assert!(!serialized_request.contains("确认输出"));
     }
 
     #[test]
@@ -10486,6 +12060,537 @@ mod tests {
     }
 
     #[test]
+    fn c1_passive_promotion_toast_undo_uses_persisted_scoped_key() {
+        let dir = temp_dir("c1-toast-undo-scoped-key");
+        let before = "VoiceFlo";
+        let after = "VoiceFlow";
+        let scope = crate::store::LearnPairScope {
+            family: Some("general".into()),
+            mapping_id: Some("fixture".into()),
+            native_bundle: Some("com.example.fixture".into()),
+            ..Default::default()
+        };
+        let legacy_key = super::pair_key(before, after);
+        let expected_scoped_key = super::scoped_word_key_for(before, after, Some(&scope));
+        let mut last_observation = None;
+        for index in 1..=3 {
+            let origin = format!("c1-toast-origin-{index}");
+            insert_test_dictation_origin(&dir, &origin);
+            let observation =
+                crate::store::LearnPairObservation::paste_session_with_dictation_origin(
+                    &format!("c1-toast-session-{index}"),
+                    &expected_scoped_key,
+                    &origin,
+                );
+            assert_eq!(
+                super::record_weak_candidate_only_audited(
+                    &dir,
+                    before,
+                    after,
+                    Some(&scope),
+                    &observation,
+                    None,
+                )
+                .unwrap(),
+                super::WeakCandidateResult::Pending { hits: index as u32 }
+            );
+            last_observation = Some(observation);
+        }
+        let pending = crate::store::get_learn_pair(&dir, &expected_scoped_key)
+            .unwrap()
+            .unwrap();
+        assert!(pending.is_pending());
+        assert!(pending.auto_scoped);
+        assert_eq!(pending.hits, 3);
+
+        // The explicit confirmation owner activates a local-only pair before the
+        // existing toast identity and scoped undo behavior are exercised.
+        crate::store::ensure_learn_pair_promoted(
+            &dir,
+            &expected_scoped_key,
+            before,
+            after,
+            Some(&scope),
+        )
+        .unwrap();
+        let confirmed = crate::store::get_learn_pair(&dir, &expected_scoped_key)
+            .unwrap()
+            .unwrap();
+        assert!(confirmed.is_live_promoted());
+        assert!(confirmed.auto_scoped);
+
+        let payload = super::promoted_pair_event_payload(
+            before,
+            after,
+            Some(&scope),
+            last_observation.as_ref().unwrap(),
+        );
+        let toast_key = payload["pair_key"].as_str().unwrap();
+        assert_eq!(toast_key, expected_scoped_key);
+        assert_ne!(toast_key, legacy_key);
+        assert_eq!(
+            crate::store::get_learn_pair(&dir, toast_key)
+                .unwrap()
+                .unwrap()
+                .pair_key,
+            expected_scoped_key
+        );
+
+        assert!(matches!(
+            crate::store::upsert_learn_pair_with_scope(
+                &dir,
+                &legacy_key,
+                before,
+                after,
+                Some(&scope),
+            )
+            .unwrap(),
+            crate::store::LearnPairUpsert::Stored(_)
+        ));
+        let legacy_before_undo = crate::store::get_learn_pair(&dir, &legacy_key)
+            .unwrap()
+            .unwrap();
+        assert!(legacy_before_undo.is_pending());
+        assert!(crate::store::tombstone_learn_pair(&dir, toast_key).unwrap());
+        let scoped_after_undo = crate::store::get_learn_pair(&dir, toast_key)
+            .unwrap()
+            .unwrap();
+        assert!(scoped_after_undo.ignored && scoped_after_undo.tombstoned_at.is_some());
+        let legacy_after_undo = crate::store::get_learn_pair(&dir, &legacy_key)
+            .unwrap()
+            .unwrap();
+        assert!(legacy_after_undo.is_pending());
+        assert_eq!(legacy_after_undo.hits, legacy_before_undo.hits);
+        assert!(crate::store::list_pending_dictionary_effects(&dir)
+            .unwrap()
+            .is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn c1_local_only_and_history_candidates_remain_local_on_confirmation() {
+        let dir = temp_dir("c1-local-confirmation-provenance");
+        let scope = crate::store::LearnPairScope {
+            family: Some("general".into()),
+            mapping_id: Some("fixture".into()),
+            native_bundle: Some("com.example.fixture".into()),
+            ..Default::default()
+        };
+        let mut settings = crate::store::Settings::default();
+        assert!(
+            settings.add_dictionary_source("GlobalManual", crate::store::DictionarySource::Manual)
+        );
+        crate::store::save_configuration(&dir, &settings).unwrap();
+
+        let paste_before = "VoiceFlo";
+        let paste_after = "VoiceFlow";
+        let paste_key = super::scoped_word_key_for(paste_before, paste_after, Some(&scope));
+        let paste_origin = "c1-local-confirm-paste-origin";
+        insert_test_dictation_origin(&dir, paste_origin);
+        let paste = crate::store::LearnPairObservation::paste_session_with_dictation_origin(
+            "c1-local-confirm-paste-session",
+            &paste_key,
+            paste_origin,
+        );
+        assert_eq!(
+            super::record_weak_candidate_only_audited(
+                &dir,
+                paste_before,
+                paste_after,
+                Some(&scope),
+                &paste,
+                None,
+            )
+            .unwrap(),
+            super::WeakCandidateResult::Pending { hits: 1 }
+        );
+
+        let history_before = "TypeScrit";
+        let history_after = "TypeScript";
+        let history_origin = "c1-history-confirm-origin";
+        let history_id = insert_test_dictation_origin(&dir, history_origin);
+        let history_revision =
+            crate::store::save_manual_history_revision(&dir, history_id, history_after)
+                .unwrap()
+                .revision_id
+                .unwrap();
+        let history_key = super::scoped_word_key_for(history_before, history_after, Some(&scope));
+        let history = crate::store::LearnPairObservation::history_edit_from_store(
+            &dir,
+            history_id,
+            history_revision,
+            &history_key,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            super::record_weak_candidate_only_audited(
+                &dir,
+                history_before,
+                history_after,
+                Some(&scope),
+                &history,
+                None,
+            )
+            .unwrap(),
+            super::WeakCandidateResult::Pending { hits: 1 }
+        );
+
+        for (key, before, after) in [
+            (&paste_key, paste_before, paste_after),
+            (&history_key, history_before, history_after),
+        ] {
+            let pending = crate::store::get_learn_pair(&dir, key).unwrap().unwrap();
+            assert!(pending.is_pending());
+            assert!(pending.auto_scoped);
+            assert!(!super::confirmation_adds_global_dictionary_word(
+                key,
+                before,
+                after,
+                Some(&pending),
+                false,
+            ));
+
+            // This is the same DB confirmation owner called by the command;
+            // auto_scoped provenance keeps it out of the global Settings owner.
+            let confirmation = if key == &history_key {
+                crate::store::ensure_local_only_learn_pair_promoted(
+                    &dir,
+                    key,
+                    before,
+                    after,
+                    Some(&scope),
+                )
+            } else {
+                crate::store::ensure_learn_pair_promoted(&dir, key, before, after, Some(&scope))
+            };
+            confirmation.unwrap();
+            let confirmed = crate::store::get_learn_pair(&dir, key).unwrap().unwrap();
+            assert!(confirmed.is_live_promoted());
+            assert!(confirmed.auto_scoped);
+        }
+        assert!(!super::confirmation_adds_global_dictionary_word(
+            &history_key,
+            history_before,
+            history_after,
+            None,
+            true,
+        ));
+        let unrecorded_history_key =
+            super::scoped_word_key_for("Canceled", "Canceled", Some(&scope));
+        crate::store::ensure_local_only_learn_pair_promoted(
+            &dir,
+            &unrecorded_history_key,
+            "Canceled",
+            "Canceled",
+            Some(&scope),
+        )
+        .unwrap();
+        let unrecorded_history = crate::store::get_learn_pair(&dir, &unrecorded_history_key)
+            .unwrap()
+            .unwrap();
+        assert!(unrecorded_history.is_live_promoted());
+        assert!(unrecorded_history.auto_scoped);
+        assert!(crate::store::list_pending_dictionary_effects(&dir)
+            .unwrap()
+            .is_empty());
+        let persisted: crate::store::Settings =
+            serde_json::from_slice(&std::fs::read(dir.join("settings.json")).unwrap()).unwrap();
+        assert_eq!(persisted.dictionary, vec!["GlobalManual"]);
+        assert!(persisted
+            .has_dictionary_source("GlobalManual", &crate::store::DictionarySource::Manual));
+        assert!(!crate::store::dictionary_contains_word(
+            &persisted.dictionary,
+            paste_after
+        ));
+        assert!(!crate::store::dictionary_contains_word(
+            &persisted.dictionary,
+            history_after
+        ));
+        assert!(!crate::store::dictionary_contains_word(
+            &persisted.dictionary,
+            "Canceled"
+        ));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn history_homophone_name_candidate_needs_confirmation_after_two_shared_origins() {
+        let dir = temp_dir("history-name-candidate-confirmation");
+        let before = "黎明";
+        let after = "李明";
+        let scope = crate::store::LearnPairScope {
+            family: Some("personal_chat".into()),
+            mapping_id: Some("messages".into()),
+            native_bundle: Some("com.apple.MobileSMS".into()),
+            ..Default::default()
+        };
+        let pair_key = super::scoped_word_key_for(before, after, Some(&scope));
+        let insert_history_source = |origin: &str| {
+            crate::store::insert_history(&dir, before, before, 0.1, false).unwrap();
+            let history_id = crate::store::get_history(&dir, 1).unwrap()[0].id;
+            let connection = rusqlite::Connection::open(dir.join("history.sqlite")).unwrap();
+            connection
+                .execute(
+                    "UPDATE dictations SET transaction_id = ?1 WHERE id = ?2",
+                    rusqlite::params![origin, history_id],
+                )
+                .unwrap();
+            history_id
+        };
+
+        // The passive observation and History edit refer to the same
+        // transaction. The database owner must count them as one origin.
+        let shared_history_id = insert_history_source("dictation-history-shared");
+        let passive = crate::store::LearnPairObservation::paste_session_with_dictation_origin(
+            "passive-history-shared-session",
+            &pair_key,
+            "dictation-history-shared",
+        );
+        assert_eq!(
+            super::record_weak_candidate_only_audited(
+                &dir,
+                before,
+                after,
+                Some(&scope),
+                &passive,
+                None,
+            )
+            .unwrap(),
+            super::WeakCandidateResult::Pending { hits: 1 }
+        );
+        let shared_revision =
+            crate::store::save_manual_history_revision(&dir, shared_history_id, after)
+                .unwrap()
+                .revision_id
+                .unwrap();
+        let shared_history = crate::store::LearnPairObservation::history_edit_from_store(
+            &dir,
+            shared_history_id,
+            shared_revision,
+            &pair_key,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            super::record_weak_candidate_only_audited(
+                &dir,
+                before,
+                after,
+                Some(&scope),
+                &shared_history,
+                None,
+            )
+            .unwrap(),
+            super::WeakCandidateResult::Pending { hits: 1 }
+        );
+        assert_eq!(
+            crate::store::count_independent_learn_pair_hits(&dir, &pair_key).unwrap(),
+            1
+        );
+
+        // A second History row is a distinct source. Although two independent
+        // origins meet the old name threshold, weak evidence stays pending.
+        let second_history_id = insert_history_source("dictation-history-distinct");
+        let second_revision =
+            crate::store::save_manual_history_revision(&dir, second_history_id, after)
+                .unwrap()
+                .revision_id
+                .unwrap();
+        let distinct_history = crate::store::LearnPairObservation::history_edit_from_store(
+            &dir,
+            second_history_id,
+            second_revision,
+            &pair_key,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            super::record_weak_candidate_only_audited(
+                &dir,
+                before,
+                after,
+                Some(&scope),
+                &distinct_history,
+                None,
+            )
+            .unwrap(),
+            super::WeakCandidateResult::Pending { hits: 2 }
+        );
+        let reverse_passive =
+            crate::store::LearnPairObservation::paste_session_with_dictation_origin(
+                "passive-after-history-session",
+                &pair_key,
+                "dictation-history-distinct",
+            );
+        assert_eq!(
+            super::record_weak_candidate_only_audited(
+                &dir,
+                before,
+                after,
+                Some(&scope),
+                &reverse_passive,
+                None,
+            )
+            .unwrap(),
+            super::WeakCandidateResult::Pending { hits: 2 }
+        );
+        assert_eq!(
+            crate::store::count_independent_learn_pair_hits(&dir, &pair_key).unwrap(),
+            super::promote_hits_for(super::LearnClass::Name)
+        );
+        assert_eq!(
+            crate::store::promote_learn_pair_if_eligible_with_status(
+                &dir,
+                &pair_key,
+                before,
+                after,
+                Some(&scope),
+                super::promote_hits_for(super::LearnClass::Name),
+                true,
+            )
+            .unwrap(),
+            crate::store::LearnPairPromotionStatus::Ineligible,
+            "two eligible paste/History receipts do not satisfy the research-only threshold SQL"
+        );
+        let pending = crate::store::get_learn_pair(&dir, &pair_key)
+            .unwrap()
+            .expect("History should persist a reviewable scoped candidate");
+        assert!(pending.is_pending());
+        assert!(pending.auto_scoped);
+        let applicable =
+            scope.applicable_promoted_records(&crate::store::list_learn_pairs(&dir).unwrap());
+        assert!(applicable.is_empty());
+        assert_eq!(
+            crate::lexicon::apply_promoted_replacements(before, &applicable, &[]),
+            before,
+            "an unapproved recipient change must not affect the next output"
+        );
+
+        // The explicit History confirmation command uses this same local-only
+        // DB owner after its current mapping/scope checks.
+        crate::store::ensure_local_only_learn_pair_promoted(
+            &dir,
+            &pair_key,
+            before,
+            after,
+            Some(&scope),
+        )
+        .unwrap();
+        let applicable =
+            scope.applicable_promoted_records(&crate::store::list_learn_pairs(&dir).unwrap());
+        assert_eq!(applicable.len(), 1);
+        assert_eq!(
+            crate::lexicon::apply_promoted_replacements(before, &applicable, &[]),
+            after,
+            "the confirmed scoped rule applies to a later output"
+        );
+        assert!(crate::store::list_pending_dictionary_effects(&dir)
+            .unwrap()
+            .is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn history_duplicate_keeps_existing_pending_word_rule_local() {
+        let dir = temp_dir("history-duplicate-keeps-pending-rule-local");
+        let before = "黎明";
+        let after = "李明";
+        let origin = "dictation-existing-ax-candidate";
+        let scope = crate::store::LearnPairScope {
+            family: Some("personal_chat".into()),
+            mapping_id: Some("messages".into()),
+            native_bundle: Some("com.apple.MobileSMS".into()),
+            ..Default::default()
+        };
+        let pair_key = super::scoped_word_key_for(before, after, Some(&scope));
+        crate::store::insert_history(&dir, before, before, 0.1, false).unwrap();
+        let history_id = crate::store::get_history(&dir, 1).unwrap()[0].id;
+        let connection = rusqlite::Connection::open(dir.join("history.sqlite")).unwrap();
+        connection
+            .execute(
+                "UPDATE dictations SET transaction_id = ?1 WHERE id = ?2",
+                rusqlite::params![origin, history_id],
+            )
+            .unwrap();
+        drop(connection);
+
+        let paste = crate::store::LearnPairObservation::paste_session_with_dictation_origin(
+            "existing-ax-candidate-session",
+            &pair_key,
+            origin,
+        );
+        let first = crate::store::upsert_learn_pair_with_observation(
+            &dir,
+            &pair_key,
+            before,
+            after,
+            Some(&scope),
+            Some(&paste),
+        )
+        .unwrap();
+        assert!(matches!(
+            first,
+            crate::store::LearnPairUpsert::Stored(row) if row.hits == 1 && !row.auto_scoped
+        ));
+
+        let revision = crate::store::save_manual_history_revision(&dir, history_id, after)
+            .unwrap()
+            .revision_id
+            .unwrap();
+        let history = crate::store::LearnPairObservation::history_edit_from_store(
+            &dir, history_id, revision, &pair_key,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(history.proof_eligible());
+        assert_eq!(
+            super::record_weak_candidate_only_audited(
+                &dir,
+                before,
+                after,
+                Some(&scope),
+                &history,
+                None,
+            )
+            .unwrap(),
+            super::WeakCandidateResult::Pending { hits: 1 }
+        );
+
+        let pending = crate::store::get_learn_pair(&dir, &pair_key)
+            .unwrap()
+            .expect("candidate owner remains present");
+        assert!(pending.is_pending());
+        assert!(pending.auto_scoped);
+        assert_eq!(pending.hits, 1);
+        assert_eq!(
+            crate::store::count_independent_learn_pair_hits(&dir, &pair_key).unwrap(),
+            1,
+            "the History receipt shares the paste transaction origin"
+        );
+
+        // The same explicit local-only confirmation used by History must not
+        // turn this old pending AX owner into a global Settings dictionary word.
+        crate::store::ensure_local_only_learn_pair_promoted(
+            &dir,
+            &pair_key,
+            before,
+            after,
+            Some(&scope),
+        )
+        .unwrap();
+        let confirmed = crate::store::get_learn_pair(&dir, &pair_key)
+            .unwrap()
+            .expect("confirmed scoped rule remains present");
+        assert!(confirmed.is_live_promoted());
+        assert!(confirmed.auto_scoped);
+        assert!(crate::store::list_pending_dictionary_effects(&dir)
+            .unwrap()
+            .is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn c0_legacy_hits_plus_one_known_origin_do_not_promote() {
         let dir = temp_dir("c0-legacy-plus-one-origin");
         crate::store::insert_history(&dir, "VoiceFlo", "VoiceFlo", 0.1, false).unwrap();
@@ -10502,13 +12607,15 @@ mod tests {
 
         let before = "VoiceFlo";
         let after = "VoiceFlow";
-        let key = super::pair_key(before, after);
         let scope = crate::store::LearnPairScope {
             family: Some("general".into()),
             mapping_id: Some("fixture".into()),
             native_bundle: Some("com.example.fixture".into()),
             ..Default::default()
         };
+        // These hits have no receipt, but the separately recorded proof must
+        // use the same v20 scoped rule identity; v19 rows are not rekeyed.
+        let key = super::scoped_word_key_for(before, after, Some(&scope));
         crate::store::upsert_learn_pair_with_scope(&dir, &key, before, after, Some(&scope))
             .unwrap();
         let connection = rusqlite::Connection::open(dir.join("history.sqlite")).unwrap();
@@ -10524,25 +12631,37 @@ mod tests {
             &key,
             origin,
         );
-        let result = super::record_learn_pair_with_observation_audited(
+        let result = super::record_weak_candidate_only_audited(
             &dir,
-            &mut Vec::new(),
             before,
             after,
             Some(&scope),
-            Some(&observation),
-            false,
+            &observation,
             None,
         )
         .unwrap();
-        assert_eq!(result, super::RecordPairResult::Pending { hits: 1 });
+        assert_eq!(result, super::WeakCandidateResult::Pending { hits: 3 });
         assert_eq!(
             crate::store::count_independent_learn_pair_hits(&dir, &key).unwrap(),
             1
         );
         let row = crate::store::get_learn_pair(&dir, &key).unwrap().unwrap();
         assert_eq!(row.hits, 3);
+        assert!(row.auto_scoped);
         assert!(!row.is_live_promoted());
+        assert_eq!(
+            crate::store::promote_learn_pair_if_eligible_with_status(
+                &dir,
+                &key,
+                before,
+                after,
+                Some(&scope),
+                super::promote_hits_for(super::LearnClass::Term),
+                true,
+            )
+            .unwrap(),
+            crate::store::LearnPairPromotionStatus::Ineligible
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 }

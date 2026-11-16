@@ -5,6 +5,7 @@
   --voice-hud-text: #e8e8e8;
   --voice-hud-muted: #a9a9a9;
   --voice-hud-focus: #d5d5d5;
+  --voice-hud-error: #f87171;
   --voice-ease: cubic-bezier(0.22, 1, 0.36, 1);
   --voice-enter-duration: 220ms;
   --voice-pill-width: 220px;
@@ -13,7 +14,7 @@
   --voice-center-width: 24px;
   --voice-content-gap: 8px;
   --voice-caption-gap: 4px;
-  --voice-hud-top-pad: 6px;
+  --voice-hud-top-pad: 0px;
 }
 
 *,
@@ -25,10 +26,10 @@
 .voice-pill-stage {
   position: relative;
   display: flex;
-  flex-direction: column;
+  flex-direction: column-reverse;
   align-items: center;
   justify-content: flex-start;
-  gap: var(--voice-caption-gap);
+  gap: 4px;
   width: 100%;
   height: 100%;
   padding-top: var(--voice-hud-top-pad);
@@ -36,6 +37,25 @@
   pointer-events: none;
   user-select: none;
   contain: size layout paint;
+}
+
+.voice-pill-stage--learning {
+  padding-bottom: 8px;
+}
+
+.voice-pill-stage--learning .voice-pill-stack {
+  padding-bottom: 0;
+}
+
+@keyframes voice-tray-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
 }
 
 .island-learn-toast {
@@ -56,6 +76,7 @@
   font-size: 12px;
   line-height: 1.2;
   pointer-events: auto;
+  animation: voice-tray-in 160ms var(--voice-ease) both;
 }
 
 .island-learn-toast__icon {
@@ -107,11 +128,10 @@
   flex: 0 0 auto;
   min-width: 30px;
   min-height: 28px;
-  padding: 2px 4px;
-  border-radius: 7px;
-  flex-shrink: 0;
-  border: 0;
+  padding: 2px 7px;
   border: 1px solid rgba(255, 255, 255, 0.09);
+  border-radius: 14px;
+  flex-shrink: 0;
   background: rgba(255, 255, 255, 0.045);
   color: #d7d7d7;
   font: inherit;
@@ -123,12 +143,20 @@
   color: var(--voice-hud-text);
 }
 
+.island-learn-toast__action:focus-visible {
+  outline: 2px solid var(--voice-hud-focus);
+  outline-offset: 1px;
+}
+
 .voice-pill-stack {
   display: flex;
+  flex: 0 0 auto;
   flex-direction: column;
   align-items: center;
-  gap: var(--voice-caption-gap);
+  justify-content: flex-end;
+  gap: 4px;
   width: 100%;
+  padding-bottom: 8px;
   opacity: 1;
   visibility: visible;
   /* Keep the animated stack isolated from the transparent WebView surface. */
@@ -136,6 +164,13 @@
   /* Opacity only — never scale the HUD stack; scaling the transparent overlay hitchs. */
   transform-origin: top center;
   transition: opacity var(--voice-enter-duration) var(--voice-ease), visibility 0s linear 0s;
+}
+
+.voice-pill-stack--with-details {
+  flex-direction: column-reverse;
+  justify-content: flex-start;
+  padding-bottom: 8px;
+  overflow: visible;
 }
 
 .voice-pill-stack--hidden {
@@ -149,79 +184,48 @@
   transition: none !important;
 }
 
-
-
-.voice-pill-stack--reduced{
+.voice-pill-stack--reduced {
   transition-duration: 80ms;
 }
 
+.voice-pill-stack--reduced .voice-pill,
 .voice-pill-stack--reduced .voice-pill__label,
-.voice-pill-stack--reduced .voice-pill__recovery-action {
+.voice-pill-stack--reduced .voice-pill__center-state,
+.voice-pill-stack--reduced .voice-pill__orb,
+.voice-pill-stack--reduced .voice-pill__level-ring,
+.voice-pill-stack--reduced .voice-pill__secondary,
+.voice-pill-stack--reduced .voice-pill__recovery-action,
+.voice-pill-stack--reduced .voice-pill__beam-layer--exit {
   animation: none;
   transition: none;
 }
 
-.voice-pill-stack--reduced .voice-pill__label--in{
+.voice-pill-stack--reduced .voice-pill__label--in,
+.voice-pill-stack--reduced .voice-pill__center-state--active {
   opacity: 1;
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 .voice-pill__beam-host {
   position: relative;
   isolation: isolate;
   flex: 0 0 auto;
-  width: var(--voice-pill-width);
-  height: var(--voice-pill-height);
+  width: 220px;
+  height: 48px;
   margin-inline: auto;
   overflow: visible;
 }
 
-
+.voice-pill__beam-fx,
+.voice-pill__beam-ghost {
+  width: 220px !important;
+  height: 48px !important;
+}
 
 .voice-pill__beam-fx {
   /* Library injects [data-beam] { position: relative }. Without a same-size
      overlay the empty ghost collapses to 0×0 and the rotate/line beam vanishes. */
   position: absolute !important;
   inset: 0 !important;
-  width: var(--voice-pill-width) !important;
-  height: var(--voice-pill-height) !important;
   pointer-events: none;
   z-index: 2;
 }
@@ -239,265 +243,56 @@
   transition: opacity var(--hud-motion-duration, 220ms) var(--voice-ease);
 }
 
-.voice-pill-stack--reduced .voice-pill__beam-layer--exit {
-  transition: none;
-}
-
 .voice-pill__beam-ghost {
-  width: var(--voice-pill-width);
-  height: var(--voice-pill-height);
-  border-radius: var(--voice-pill-radius);
+  border-radius: 24px;
 }
-
-
 
 .voice-pill {
   position: relative;
   z-index: 1;
   display: flex;
+  flex-direction: row;
   align-items: center;
-  justify-content: center;
-  width: var(--voice-pill-width);
-  height: var(--voice-pill-height);
+  justify-content: flex-start;
+  gap: 0;
+  width: 220px;
+  height: 48px;
   flex-shrink: 0;
-  padding: 0 14px;
+  padding: 0 8px 0 12px;
   overflow: hidden;
-  border: 1px solid var(--voice-hud-border);
-  border-radius: var(--voice-pill-radius);
-  background: linear-gradient(180deg, var(--voice-hud-top), var(--voice-hud-bottom));
+  border: 1px solid rgba(255, 255, 255, 0.09);
+  border-radius: 24px;
+  background: linear-gradient(128deg, #232323 0%, #202020 54%, #1d1d1d 100%);
   color: var(--voice-hud-text);
-  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.16), inset 0 1px 0 rgba(255, 255, 255, 0.12);
+  box-shadow: none;
   contain: layout paint;
-  transition: background var(--hud-motion-duration, 220ms) var(--voice-ease), border-color var(--hud-motion-duration, 220ms) var(--voice-ease), box-shadow var(--hud-motion-duration, 220ms) var(--voice-ease);
+  transition: background var(--hud-motion-duration, 220ms) var(--voice-ease), border-color var(--hud-motion-duration, 220ms) var(--voice-ease);
 }
-
-/* Static states use the pill's single neutral hairline instead of an overlay. */
-
 
 .voice-pill--expanded {
-  flex-direction: column;
-  align-items: stretch;
-  justify-content: center;
-  gap: 4px;
-  padding: 6px 14px;
+  flex-direction: row;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 0;
+  padding: 0 8px 0 12px;
   border-radius: var(--voice-pill-radius);
   text-align: left;
-}
-
-
-
-
-
-.voice-pill__recovery-message {
-  flex: 1 1 auto;
-  min-width: 0;
-  color: var(--voice-hud-text);
-  font-size: 11px;
-  font-weight: 500;
-  line-height: 1.2;
-  letter-spacing: 0;
-  overflow-wrap: anywhere;
-  white-space: normal;
-}
-
-.voice-pill__recovery-dismiss {
-  display: flex;
-  flex: 0 0 22px;
-  align-items: center;
-  justify-content: center;
-  width: 22px;
-  height: 22px;
-  margin: -2px -3px 0 0;
-  padding: 0;
-  border: 0;
-  border-radius: 6px;
-  background: transparent;
-  color: var(--voice-hud-muted);
-  font: inherit;
-  font-size: 17px;
-  line-height: 1;
-  cursor: pointer;
-}
-
-
-
-.voice-pill__recovery-action {
-  flex: 0 1 auto;
-  min-width: 74px;
-  max-width: 44%;
-  min-height: 26px;
-  padding: 4px 8px;
-  border: 0;
-  border-radius: 6px;
-  background: rgba(255, 255, 255, 0.1);
-  color: var(--voice-hud-text);
-  font: inherit;
-  font-size: 11px;
-  font-weight: 600;
-  line-height: 1.15;
-  letter-spacing: 0;
-  text-align: center;
-  overflow-wrap: anywhere;
-  white-space: normal;
-  cursor: pointer;
-  transition: background 150ms var(--voice-ease), color 150ms var(--voice-ease);
-}
-
-.voice-pill__recovery-action:hover:not(:disabled) {
-  background: rgba(255, 255, 255, 0.18);
-}
-
-.voice-pill__recovery-action:disabled {
-  cursor: default;
-  opacity: 0.78;
-}
-
-.voice-pill__recovery-action[aria-busy="true"]::after {
-  content: "…";
-  margin-left: 2px;
-}
-
-.voice-pill__recovery-error {
-  flex: 1 1 auto;
-  min-width: 0;
-  color: var(--voice-hud-text);
-  font-size: 10px;
-  font-weight: 500;
-  line-height: 1.2;
-  letter-spacing: 0;
-  overflow-wrap: anywhere;
-  white-space: normal;
-}
-
-
-
-.voice-pill__sr-only {
-  position: absolute;
-  width: 1px;
-  height: 1px;
-  overflow: hidden;
-  clip: rect(0, 0, 0, 0);
-  clip-path: inset(50%);
-  white-space: nowrap;
-}
-
-
-
-
-
-
-
-.voice-pill--expanded .voice-pill__label {
-  text-align: left;
-}
-
-.voice-pill__elapsed {
-  flex: 0 0 auto;
-  color: var(--voice-hud-muted);
-  font-size: 10px;
-  font-variant-numeric: tabular-nums;
-  line-height: 1;
-}
-
-
-
-
-
-
-
-
-
-
-
-
-
-.voice-pill--recording_limited,
-.voice-pill--rate_limited {
-  border-color: var(--voice-hud-border);
-  background: linear-gradient(180deg, var(--voice-hud-top), var(--voice-hud-bottom));
-}
-
-.voice-pill--degraded,
-.voice-pill--error,
-.voice-pill--unverified {
-  border-color: var(--voice-hud-border);
-  background: linear-gradient(180deg, var(--voice-hud-top), var(--voice-hud-bottom));
 }
 
 .voice-pill__indicator {
   position: relative;
-  display: none;
-  width: var(--voice-center-width);
-  height: var(--voice-center-width);
-  flex: 0 0 var(--voice-center-width);
+  display: flex;
+  flex: 0 0 24px;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
   overflow: visible;
 }
 
-.voice-pill--orb .voice-pill__indicator {
-  display: block;
-}
-
-.voice-pill__label-stack {
-  position: relative;
-  display: grid;
-  grid-template-columns: minmax(0, 1fr);
-  flex: 0 1 auto;
-  min-width: 0;
-}
-
-.voice-pill__label-stack > .voice-pill__label {
-  /* Both labels contribute width during a crossfade, without duplicating space. */
-  grid-area: 1 / 1;
-}
-
-.voice-pill--orb .voice-pill__label-stack {
-  transition: transform var(--hud-motion-duration, 220ms) var(--voice-ease);
-}
-
-.voice-pill-stack--reduced .voice-pill__label-stack {
-  transition: none;
-}
-
-.voice-pill--orb .voice-pill__indicator:has(> .voice-pill__center-state:not(.voice-pill__center-state--active)) + .voice-pill__label-stack {
-  /* Recenter while the orb fades; its later unmount replaces this offset. */
-  transform: translateX(calc((var(--voice-center-width) + var(--voice-content-gap)) / -2));
-}
-
-.voice-pill__label {
-  display: block;
-  flex: 0 1 auto;
-  min-width: 0;
-  padding-bottom: 1px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  text-align: center;
-  font-size: 12px;
-  font-weight: 500;
-  letter-spacing: 0;
-  color: var(--voice-hud-text);
-  line-height: 1.25;
-  opacity: 1;
-}
-
-@keyframes voice-label-in {
+@keyframes voice-center-in {
   from { opacity: 0; }
   to { opacity: 1; }
-}
-
-@keyframes voice-label-out {
-  from { opacity: 1; }
-  to { opacity: 0; }
-}
-
-.voice-pill__label--in {
-  opacity: 0;
-  animation: voice-label-in var(--hud-label-in-duration, 220ms) ease-in var(--hud-label-in-delay, 0ms) both;
-}
-
-.voice-pill__label--out {
-  pointer-events: none;
-  animation: voice-label-out var(--hud-label-out-duration, 150ms) ease-out both;
 }
 
 .voice-pill__center-state {
@@ -516,6 +311,17 @@
   opacity: 1;
   visibility: visible;
   transition: opacity var(--hud-motion-duration, 220ms) var(--voice-ease), visibility 0s;
+  animation: voice-center-in var(--hud-motion-duration, 220ms) var(--voice-ease) both;
+}
+
+.voice-pill__target-icon {
+  display: block;
+  width: 24px;
+  height: 24px;
+  flex: 0 0 24px;
+  object-fit: contain;
+  border-radius: 6px;
+  filter: grayscale(1);
 }
 
 .voice-pill__orb {
@@ -530,14 +336,13 @@
   transition: opacity var(--hud-motion-duration, 220ms) var(--voice-ease);
 }
 
-
-
 .voice-pill__orb canvas {
   position: absolute;
   left: 50%;
   top: 50%;
   display: block;
-  transform: translate(-50%, -50%) scale(0.375);
+  transform: translate(-50%, -50%);
+  transition: none !important;
 }
 
 .voice-pill__orb--dim {
@@ -555,213 +360,6 @@
   border-radius: 50%;
   pointer-events: none;
   transition: transform 90ms linear, opacity 90ms linear;
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .voice-pill,
-  .voice-pill * {
-    animation: none !important;
-    transition-duration: 0.08s !important;
-  }
-
-  .voice-pill__label--in{
-    opacity: 1 !important;
-  }
-
-  .voice-pill__level-ring {
-    transition: none;
-  }
-
-  .voice-pill__recovery-action {
-    transition: none;
-  }
-
-  .voice-pill__label-stack {
-    transition: none !important;
-  }
-
-  .voice-pill-stack{
-    transition-duration: 0.08s !important;
-  }
-
-  .voice-pill-stack--hidden {
-    transition-delay: 0s !important;
-  }
-
-  
-
-}
-
-.island-learn-toast__action {
-  min-height: 28px;
-  padding: 2px 7px;
-  border-radius: 14px;
-}
-.island-learn-toast__action:focus-visible {
-  outline: 2px solid var(--voice-hud-focus);
-  outline-offset: 1px;
-}
-
-/* Beam v10 primary HUD: keep the native capsule, Orb, text and action anchors
-   fixed while copy and the optional lower tray change. */
-:root {
-  --voice-hud-top-pad: 0px;
-}
-
-.voice-pill-stage {
-  flex-direction: column-reverse;
-  justify-content: flex-start;
-  gap: 4px;
-  padding-top: 0;
-}
-
-.voice-pill-stage--learning {
-  flex-direction: column-reverse;
-}
-
-.voice-pill-stack {
-  flex: 0 0 auto;
-  gap: 4px;
-  justify-content: flex-end;
-  padding-bottom: 8px;
-}
-
-.voice-pill-stack--with-details {
-  flex-direction: column-reverse;
-  justify-content: flex-start;
-  padding-bottom: 8px;
-  overflow: visible;
-}
-
-.voice-pill__beam-host {
-  width: 220px;
-  height: 48px;
-}
-
-.voice-pill__beam-fx,
-.voice-pill__beam-ghost {
-  width: 220px !important;
-  height: 48px !important;
-}
-
-.voice-pill__beam-ghost {
-  border-radius: 24px;
-}
-
-.voice-pill {
-  display: flex;
-  flex-direction: row;
-  align-items: center;
-  justify-content: flex-start;
-  gap: 0;
-  width: 220px;
-  height: 48px;
-  padding: 0 8px 0 12px;
-  border: 1px solid rgba(255, 255, 255, 0.09);
-  border-radius: 24px;
-  background: linear-gradient(128deg, #232323 0%, #202020 54%, #1d1d1d 100%);
-  box-shadow: none;
-  overflow: hidden;
-}
-
-/* The native material is visible only after the backend confirms it is ready.
-   The Settings preview shares the foreground tint over a local Glasswork sample;
-   only the AppKit window receives native glass. */
-:root[data-hud-appearance="liquid_glass"][data-hud-glass-visible="true"] .voice-pill,
-:root[data-native-glass-poc="true"] .voice-pill,
-.vf-hud-preview-hud[data-appearance="liquid_glass"] .voice-pill {
-  --voice-hud-text: #171717;
-  --voice-hud-muted: #303030;
-  --voice-hud-focus: #171717;
-  --voice-hud-border: rgba(23, 23, 23, 0.16);
-  --voice-glass-veil: rgba(255, 255, 255, 0.6);
-  --voice-glass-control: rgba(0, 0, 0, 0.08);
-  --voice-glass-control-hover: rgba(0, 0, 0, 0.13);
-  background: var(--voice-glass-veil) !important;
-  /* Preserve the one-pixel content inset without drawing a second rim. */
-  border-color: transparent !important;
-  box-shadow: none !important;
-}
-
-@media (prefers-color-scheme: dark) {
-  :root[data-hud-appearance="liquid_glass"][data-hud-glass-visible="true"] .voice-pill,
-  :root[data-native-glass-poc="true"] .voice-pill {
-    --voice-hud-text: #f5f5f5;
-    --voice-hud-muted: #ebebeb;
-    --voice-hud-focus: #f5f5f5;
-    --voice-hud-border: rgba(255, 255, 255, 0.2);
-    --voice-glass-veil: rgba(0, 0, 0, 0.6);
-    --voice-glass-control: rgba(255, 255, 255, 0.14);
-    --voice-glass-control-hover: rgba(255, 255, 255, 0.2);
-  }
-}
-
-.vf-hud-preview-hud[data-appearance="liquid_glass"] .voice-pill {
-  --voice-glass-veil: rgba(255, 255, 255, 0.38);
-}
-
-.vf-hud-preview[data-backdrop="dark"] .vf-hud-preview-hud[data-appearance="liquid_glass"] .voice-pill {
-  --voice-hud-text: #f5f5f5;
-  --voice-hud-muted: #ebebeb;
-  --voice-hud-focus: #f5f5f5;
-  --voice-hud-border: rgba(255, 255, 255, 0.2);
-  --voice-glass-veil: rgba(34, 36, 40, 0.28);
-  --voice-glass-control: rgba(255, 255, 255, 0.14);
-  --voice-glass-control-hover: rgba(255, 255, 255, 0.2);
-}
-
-:root[data-hud-appearance="liquid_glass"][data-hud-glass-visible="true"] .voice-pill .voice-pill__action,
-:root[data-native-glass-poc="true"] .voice-pill .voice-pill__action,
-.vf-hud-preview-hud[data-appearance="liquid_glass"] .voice-pill .voice-pill__action {
-  color: var(--voice-hud-text);
-  background: var(--voice-glass-control);
-}
-
-:root[data-hud-appearance="liquid_glass"][data-hud-glass-visible="true"] .voice-pill .voice-pill__action:hover:not(:disabled),
-:root[data-native-glass-poc="true"] .voice-pill .voice-pill__action:hover:not(:disabled),
-.vf-hud-preview-hud[data-appearance="liquid_glass"] .voice-pill .voice-pill__action:hover:not(:disabled) {
-  background: var(--voice-glass-control-hover);
-}
-
-:root[data-hud-appearance="liquid_glass"][data-hud-glass-visible="true"] .voice-pill__beam-layer,
-:root[data-hud-appearance="liquid_glass"][data-hud-glass-visible="true"] .voice-pill__beam-fx,
-:root[data-hud-appearance="liquid_glass"][data-hud-glass-visible="true"] .voice-pill__beam-ghost,
-:root[data-native-glass-poc="true"] .voice-pill__beam-layer,
-:root[data-native-glass-poc="true"] .voice-pill__beam-fx,
-:root[data-native-glass-poc="true"] .voice-pill__beam-ghost,
-.vf-hud-preview-hud[data-appearance="liquid_glass"] .voice-pill__beam-layer,
-.vf-hud-preview-hud[data-appearance="liquid_glass"] .voice-pill__beam-fx,
-.vf-hud-preview-hud[data-appearance="liquid_glass"] .voice-pill__beam-ghost {
-  display: none !important;
-}
-
-.voice-pill--expanded {
-  flex-direction: row;
-  align-items: center;
-  justify-content: flex-start;
-  gap: 0;
-  padding: 0 8px 0 12px;
-  text-align: left;
-}
-
-.voice-pill__indicator {
-  display: flex;
-  flex: 0 0 24px;
-  align-items: center;
-  justify-content: center;
-  width: 24px;
-  height: 24px;
-  overflow: visible;
-}
-
-.voice-pill__target-icon {
-  display: block;
-  width: 24px;
-  height: 24px;
-  flex: 0 0 24px;
-  object-fit: contain;
-  border-radius: 6px;
-  filter: grayscale(1);
 }
 
 .voice-pill__copy {
@@ -786,15 +384,22 @@
 }
 
 .voice-pill__label-stack {
+  position: relative;
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   flex: 1 1 auto;
   min-width: 0;
   text-align: left;
 }
 
-.voice-pill__label,
-.voice-pill__label--in,
-.voice-pill__label--out {
+.voice-pill__label-stack > .voice-pill__label {
+  /* Both labels contribute width during a crossfade, without duplicating space. */
+  grid-area: 1 / 1;
+}
+
+.voice-pill__label {
+  display: block;
+  flex: 0 1 auto;
   min-width: 0;
   max-width: 100%;
   padding: 0;
@@ -804,7 +409,30 @@
   white-space: nowrap;
   font-size: 12px;
   font-weight: 500;
+  letter-spacing: 0;
+  color: var(--voice-hud-text);
   line-height: 1.15;
+  opacity: 1;
+}
+
+@keyframes voice-label-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes voice-label-out {
+  from { opacity: 1; }
+  to { opacity: 0; }
+}
+
+.voice-pill__label--in {
+  opacity: 0;
+  animation: voice-label-in var(--hud-label-in-duration, 220ms) ease-in var(--hud-label-in-delay, 0ms) both;
+}
+
+.voice-pill__label--out {
+  pointer-events: none;
+  animation: voice-label-out var(--hud-label-out-duration, 150ms) ease-out both;
 }
 
 .voice-pill__elapsed {
@@ -887,8 +515,173 @@
   outline-offset: -2px;
 }
 
-.voice-pill__orb canvas {
-  transform: translate(-50%, -50%);
+/* Keep the live pill's tint constant across native material handoff. The
+   strong translucent tint limits how much the raw desktop can change the
+   capsule when AppKit removes its backdrop; the glass still supplies blur and
+   refraction while its owner is visible. */
+:root[data-hud-appearance="liquid_glass"] {
+  --voice-hud-text: #171717;
+  --voice-hud-muted: #303030;
+  --voice-hud-focus: #171717;
+  --voice-hud-border: rgba(23, 23, 23, 0.16);
+  --voice-hud-error: #b91c1c;
+  --voice-glass-live-tint: rgba(255, 255, 255, 0.92);
+  --voice-glass-veil: rgba(255, 255, 255, 0.6);
+  --voice-glass-shell: linear-gradient(128deg, #fafafa 0%, #f5f5f5 54%, #ededed 100%);
+  --voice-glass-control: rgba(0, 0, 0, 0.08);
+  --voice-glass-control-hover: rgba(0, 0, 0, 0.13);
+}
+
+:root[data-hud-appearance="liquid_glass"] .voice-pill {
+  background: var(--voice-glass-live-tint) !important;
+  /* Keep the one-pixel content inset without painting a synthetic rim. */
+  border-color: transparent !important;
+  box-shadow: none !important;
+  /* The fill stays the same on either side of native material visibility changes. */
+  transition: none;
+}
+
+:root[data-hud-appearance="liquid_glass"] .voice-pill__secondary {
+  background: var(--voice-glass-shell);
+  /* Keep the one-pixel content inset without painting a synthetic rim. */
+  border-color: transparent;
+}
+
+:root[data-hud-appearance="liquid_glass"] .voice-pill__secondary .voice-pill__details-icon {
+  color: var(--voice-hud-muted);
+}
+
+:root[data-hud-appearance="liquid_glass"] .voice-pill__secondary .voice-pill__details-action,
+:root[data-hud-appearance="liquid_glass"] .voice-pill__secondary .voice-pill__recovery-action {
+  border-color: var(--voice-hud-border);
+  background: var(--voice-glass-control);
+  color: var(--voice-hud-text);
+}
+
+:root[data-hud-appearance="liquid_glass"] .voice-pill__secondary .voice-pill__details-action:hover:not(:disabled),
+:root[data-hud-appearance="liquid_glass"] .voice-pill__secondary .voice-pill__recovery-action:hover:not(:disabled) {
+  background: var(--voice-glass-control-hover);
+}
+
+:root[data-hud-appearance="liquid_glass"] .voice-pill__secondary--recovery .voice-pill__recovery-error {
+  color: var(--voice-hud-error);
+}
+
+:root[data-hud-appearance="liquid_glass"] .island-learn-toast {
+  background: var(--voice-glass-shell);
+  border-color: transparent;
+  transition: none;
+}
+
+:root[data-hud-appearance="liquid_glass"] .island-learn-toast__icon {
+  color: var(--voice-hud-muted);
+}
+
+:root[data-hud-appearance="liquid_glass"] .island-learn-toast__action {
+  border-color: var(--voice-hud-border);
+  background: var(--voice-glass-control);
+  color: var(--voice-hud-text);
+}
+
+:root[data-hud-appearance="liquid_glass"] .island-learn-toast__action:hover:not(:disabled) {
+  background: var(--voice-glass-control-hover);
+}
+
+/* thinking-orbs draws monochrome grayscale on a transparent canvas. Mirror
+   its light ink for light Glass surfaces while preserving the canvas alpha. */
+:root[data-hud-appearance="liquid_glass"] .voice-pill__orb canvas,
+:root[data-native-glass-poc="true"] .voice-pill__orb canvas,
+.vf-hud-preview-hud[data-appearance="liquid_glass"] .voice-pill__orb canvas {
+  filter: invert(1);
+}
+
+.vf-hud-preview[data-backdrop="dark"] .vf-hud-preview-hud[data-appearance="liquid_glass"] .voice-pill__orb canvas {
+  filter: none;
+}
+
+/* The isolated POC and Settings preview keep their original glass tint. */
+:root[data-native-glass-poc="true"] .voice-pill,
+.vf-hud-preview-hud[data-appearance="liquid_glass"] .voice-pill {
+  --voice-hud-text: #171717;
+  --voice-hud-muted: #303030;
+  --voice-hud-focus: #171717;
+  --voice-hud-border: rgba(23, 23, 23, 0.16);
+  --voice-glass-veil: rgba(255, 255, 255, 0.6);
+  --voice-glass-control: rgba(0, 0, 0, 0.08);
+  --voice-glass-control-hover: rgba(0, 0, 0, 0.13);
+  background: var(--voice-glass-veil) !important;
+  /* Preserve the one-pixel content inset without drawing a second rim. */
+  border-color: transparent !important;
+  box-shadow: none !important;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root[data-hud-appearance="liquid_glass"] {
+    --voice-hud-text: #f5f5f5;
+    --voice-hud-muted: #ebebeb;
+    --voice-hud-focus: #f5f5f5;
+    --voice-hud-border: rgba(255, 255, 255, 0.2);
+    --voice-hud-error: #f87171;
+    --voice-glass-live-tint: rgba(25, 25, 25, 0.92);
+    --voice-glass-veil: rgba(0, 0, 0, 0.6);
+    --voice-glass-shell: linear-gradient(128deg, #252729 0%, #222428 54%, #202226 100%);
+    --voice-glass-control: rgba(255, 255, 255, 0.14);
+    --voice-glass-control-hover: rgba(255, 255, 255, 0.2);
+  }
+
+  :root[data-native-glass-poc="true"] .voice-pill {
+    --voice-hud-text: #f5f5f5;
+    --voice-hud-muted: #ebebeb;
+    --voice-hud-focus: #f5f5f5;
+    --voice-hud-border: rgba(255, 255, 255, 0.2);
+    --voice-glass-veil: rgba(0, 0, 0, 0.6);
+    --voice-glass-control: rgba(255, 255, 255, 0.14);
+    --voice-glass-control-hover: rgba(255, 255, 255, 0.2);
+  }
+
+  :root[data-hud-appearance="liquid_glass"] .voice-pill__orb canvas,
+  :root[data-native-glass-poc="true"] .voice-pill__orb canvas {
+    filter: none;
+  }
+}
+
+.vf-hud-preview-hud[data-appearance="liquid_glass"] .voice-pill {
+  --voice-glass-veil: rgba(255, 255, 255, 0.38);
+}
+
+.vf-hud-preview[data-backdrop="dark"] .vf-hud-preview-hud[data-appearance="liquid_glass"] .voice-pill {
+  --voice-hud-text: #f5f5f5;
+  --voice-hud-muted: #ebebeb;
+  --voice-hud-focus: #f5f5f5;
+  --voice-hud-border: rgba(255, 255, 255, 0.2);
+  --voice-glass-veil: rgba(34, 36, 40, 0.28);
+  --voice-glass-control: rgba(255, 255, 255, 0.14);
+  --voice-glass-control-hover: rgba(255, 255, 255, 0.2);
+}
+
+:root[data-hud-appearance="liquid_glass"] .voice-pill .voice-pill__action,
+:root[data-native-glass-poc="true"] .voice-pill .voice-pill__action,
+.vf-hud-preview-hud[data-appearance="liquid_glass"] .voice-pill .voice-pill__action {
+  color: var(--voice-hud-text);
+  background: var(--voice-glass-control);
+}
+
+:root[data-hud-appearance="liquid_glass"] .voice-pill .voice-pill__action:hover:not(:disabled),
+:root[data-native-glass-poc="true"] .voice-pill .voice-pill__action:hover:not(:disabled),
+.vf-hud-preview-hud[data-appearance="liquid_glass"] .voice-pill .voice-pill__action:hover:not(:disabled) {
+  background: var(--voice-glass-control-hover);
+}
+
+:root[data-hud-appearance="liquid_glass"] .voice-pill__beam-layer,
+:root[data-hud-appearance="liquid_glass"] .voice-pill__beam-fx,
+:root[data-hud-appearance="liquid_glass"] .voice-pill__beam-ghost,
+:root[data-native-glass-poc="true"] .voice-pill__beam-layer,
+:root[data-native-glass-poc="true"] .voice-pill__beam-fx,
+:root[data-native-glass-poc="true"] .voice-pill__beam-ghost,
+.vf-hud-preview-hud[data-appearance="liquid_glass"] .voice-pill__beam-layer,
+.vf-hud-preview-hud[data-appearance="liquid_glass"] .voice-pill__beam-fx,
+.vf-hud-preview-hud[data-appearance="liquid_glass"] .voice-pill__beam-ghost {
+  display: none !important;
 }
 
 .voice-pill__secondary {
@@ -907,6 +700,7 @@
   background: linear-gradient(128deg, #232323 0%, #202020 54%, #1d1d1d 100%);
   color: var(--voice-hud-text);
   pointer-events: auto;
+  animation: voice-tray-in 160ms var(--voice-ease) both;
 }
 
 .voice-pill__secondary--details {
@@ -978,56 +772,88 @@
   opacity: 0.55;
 }
 
-.voice-pill__details-error {
-  color: #d0d0d0;
+.voice-pill__details-error,
+.voice-pill__recovery-error {
+  color: var(--voice-hud-error);
   font-size: 10px;
+  font-weight: 500;
+  line-height: 1.2;
 }
 
 .voice-pill__details-text,
 .voice-pill__details-source,
 .voice-pill__recovery-message,
-.voice-pill__recovery-error {
+.voice-pill__recovery-error,
+.voice-pill__details-error {
   display: block;
   min-width: 0;
   max-width: 100%;
   overflow: hidden;
-  color: var(--voice-hud-text);
   font-size: 10px;
-  font-weight: 400;
-  line-height: 1.3;
   text-overflow: ellipsis;
   overflow-wrap: anywhere;
 }
 
+.voice-pill__details-text,
+.voice-pill__recovery-message {
+  color: var(--voice-hud-text);
+  font-weight: 400;
+  line-height: 1.25;
+}
+
+.voice-pill__details-source {
+  color: var(--voice-hud-muted);
+  font-weight: 400;
+  line-height: 1.2;
+  white-space: nowrap;
+}
+
 .voice-pill__secondary--details .voice-pill__details-text {
   max-height: 2.4em;
-  overflow: hidden;
   display: -webkit-box;
   -webkit-box-orient: vertical;
   -webkit-line-clamp: 2;
   line-height: 1.2;
 }
 
-.voice-pill__details-source,
-.voice-pill__recovery-error {
-  color: var(--voice-hud-muted);
+.voice-pill__secondary--details.voice-pill__secondary--has-error .voice-pill__details-text {
+  max-height: 1.2em;
+  -webkit-line-clamp: 1;
+}
+
+.voice-pill__details-error {
+  white-space: nowrap;
 }
 
 .voice-pill__secondary--recovery {
   gap: 6px;
 }
 
-.voice-pill__secondary--recovery .voice-pill__recovery-message {
+.voice-pill__recovery-copy {
+  display: flex;
   flex: 1 1 auto;
-  max-height: 2.6em;
+  flex-direction: column;
+  justify-content: center;
+  gap: 2px;
+  min-width: 0;
+  max-height: 42px;
+  overflow: hidden;
+}
+
+.voice-pill__secondary--recovery .voice-pill__recovery-message {
+  max-height: 2.5em;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
   white-space: normal;
 }
 
+.voice-pill__secondary--recovery.voice-pill__secondary--has-error .voice-pill__recovery-message {
+  max-height: 1.3em;
+  -webkit-line-clamp: 1;
+}
+
 .voice-pill__secondary--recovery .voice-pill__recovery-error {
-  position: absolute;
-  left: 12px;
-  right: 12px;
-  bottom: 5px;
   white-space: nowrap;
 }
 
@@ -1037,17 +863,53 @@
   max-width: 42%;
   min-height: 30px;
   padding: 5px 9px;
+  border: 0;
   border-radius: 8px;
   background: rgba(255, 255, 255, 0.1);
+  color: var(--voice-hud-text);
+  font: inherit;
   font-size: 10px;
+  font-weight: 600;
+  line-height: 1.15;
+  letter-spacing: 0;
+  text-align: center;
+  overflow-wrap: anywhere;
+  white-space: normal;
+  cursor: pointer;
+  transition: background 150ms var(--voice-ease), color 150ms var(--voice-ease);
+}
+
+.voice-pill__recovery-action:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.18);
+}
+
+.voice-pill__recovery-action:disabled {
+  cursor: default;
+  opacity: 0.78;
+}
+
+.voice-pill__recovery-action[aria-busy="true"]::after {
+  content: "…";
+  margin-left: 2px;
 }
 
 .voice-pill__recovery-dismiss {
+  display: flex;
   flex: 0 0 28px;
+  align-items: center;
+  justify-content: center;
   width: 28px;
   height: 28px;
   margin: 0;
+  padding: 0;
+  border: 0;
   border-radius: 14px;
+  background: transparent;
+  color: var(--voice-hud-muted);
+  font: inherit;
+  font-size: 17px;
+  line-height: 1;
+  cursor: pointer;
 }
 
 .voice-pill__sr-only {
@@ -1058,11 +920,39 @@
   margin: -1px;
   overflow: hidden;
   clip: rect(0, 0, 0, 0);
+  clip-path: inset(50%);
   white-space: nowrap;
   border: 0;
 }
 
 @media (prefers-reduced-motion: reduce) {
+  .voice-pill,
+  .voice-pill *,
+  .voice-pill__secondary,
+  .island-learn-toast {
+    animation: none !important;
+    transition-duration: 0.08s !important;
+  }
+
+  .voice-pill__label--in,
+  .voice-pill__center-state--active {
+    opacity: 1 !important;
+  }
+
+  .voice-pill__level-ring,
+  .voice-pill__recovery-action,
+  .voice-pill__label-stack {
+    transition: none !important;
+  }
+
+  .voice-pill-stack:not(.voice-pill-stack--hidden-now) {
+    transition-duration: 0.08s !important;
+  }
+
+  .voice-pill-stack--hidden {
+    transition-delay: 0s !important;
+  }
+
   .voice-pill__beam-layer,
   .voice-pill__beam-fx {
     display: none !important;

@@ -927,7 +927,11 @@ describe("History", () => {
     fireEvent.click(screen.getByRole("button", { name: "保存历史版本" }));
 
     await waitFor(() =>
-      expect(invokeMock).toHaveBeenCalledWith("suggest_dictionary_entries", { before: "知呼", after: "知乎" }),
+      expect(invokeMock).toHaveBeenCalledWith("suggest_dictionary_entries", {
+        historyId: item.id,
+        before: "知呼",
+        after: "知乎",
+      }),
     );
     expect(await screen.findByRole("button", { name: '确认 “知呼 → 知乎”' })).toBeInTheDocument();
   });
@@ -964,18 +968,48 @@ describe("History", () => {
       id: item.id,
       final_text: "知乎",
       revision_reason: "manual_edit",
+      editor_commit: expect.objectContaining({
+        version: 1,
+        editor_session_id: expect.any(String),
+        input_kinds: ["untrusted"],
+        composing_at_save: false,
+        save_action_trusted: false,
+      }),
     });
     expect(invokeMock).toHaveBeenNthCalledWith(2, "save_history_revision", {
       id: item.id,
       final_text: "知乎",
       revision_reason: "manual_edit",
+      editor_commit: expect.objectContaining({
+        version: 1,
+        editor_session_id: expect.any(String),
+        input_kinds: ["untrusted"],
+        composing_at_save: false,
+        save_action_trusted: false,
+      }),
     });
+    const firstCommitArgs = invokeMock.mock.calls[0][1] as { editor_commit?: unknown } | undefined;
+    const retryCommitArgs = invokeMock.mock.calls[1][1] as { editor_commit?: unknown } | undefined;
+    expect(retryCommitArgs?.editor_commit).toEqual(firstCommitArgs?.editor_commit);
     expect(reload).toHaveBeenCalledOnce();
   });
 
-  it("reports when a scoped dictionary candidate is still collecting edits", async () => {
+  it("waits for IME composition to finish before the user can save", () => {
+    render(<History items={[item]} reload={vi.fn()} hasMore={false} loading={false} onLoadMore={vi.fn()} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "编辑这条历史记录" }));
+    const editor = screen.getByRole("textbox", { name: "编辑整理结果" });
+    fireEvent.compositionStart(editor);
+    expect(screen.getByRole("button", { name: "保存历史版本" })).toBeDisabled();
+
+    fireEvent.compositionEnd(editor);
+    expect(screen.getByRole("button", { name: "保存历史版本" })).toBeEnabled();
+    expect(invokeMock).not.toHaveBeenCalled();
+  });
+
+  it("states that a scoped dictionary candidate requires explicit confirmation", async () => {
     invokeMock
-      .mockResolvedValueOnce({ revision_id: 42, changed: true, learning: { status: "pending", hits: 1, required: 2 } })
+      .mockResolvedValueOnce({ revision_id: 42, changed: true, learning: { status: "pending", hits: 1, required: 0 } })
       .mockResolvedValueOnce([]);
     render(<History items={[{ ...item, raw_text: "知呼", final_text: "知呼" }]} reload={vi.fn()} hasMore={false} loading={false} onLoadMore={vi.fn()} />);
 
@@ -983,28 +1017,8 @@ describe("History", () => {
     fireEvent.change(screen.getByRole("textbox", { name: "编辑整理结果" }), { target: { value: "知乎" } });
     fireEvent.click(screen.getByRole("button", { name: "保存历史版本" }));
 
-    expect(await screen.findByText("历史版本已保存；词典候选仍在收集中 (1/2)")).toHaveAttribute("role", "status");
+    expect(await screen.findByText("历史版本已保存；该词典候选仅在你明确确认后生效。")).toHaveAttribute("role", "status");
   });
-
-  it.each(["partial_settings_failure", "partial_dictionary_sync_failure"])(
-    "keeps a saved History revision retryable when dictionary synchronization is partial (%s)",
-    async (status) => {
-      invokeMock
-        .mockResolvedValueOnce({ revision_id: 43, changed: true, learning: { status } })
-        .mockResolvedValueOnce([]);
-      render(<History items={[{ ...item, raw_text: "知呼", final_text: "知呼" }]} reload={vi.fn()} hasMore={false} loading={false} onLoadMore={vi.fn()} />);
-
-      fireEvent.click(screen.getByRole("button", { name: "编辑这条历史记录" }));
-      const editor = screen.getByRole("textbox", { name: "编辑整理结果" });
-      fireEvent.change(editor, { target: { value: "知乎" } });
-      fireEvent.click(screen.getByRole("button", { name: "保存历史版本" }));
-
-      expect(await screen.findByText("历史版本已保存；个人词典同步未完成，请再次保存重试。"))
-        .toHaveAttribute("role", "status");
-      expect(screen.getByRole("textbox", { name: "编辑整理结果" })).toHaveValue("知乎");
-      expect(screen.queryByRole("alert")).not.toBeInTheDocument();
-    },
-  );
 
   it("shows backend dictionary capacity rejection and leaves the candidate available", async () => {
     invokeMock.mockImplementation(async (command) => {
@@ -1128,7 +1142,11 @@ describe("History", () => {
     fireEvent.click(screen.getByRole("button", { name: "保存历史版本" }));
 
     await waitFor(() =>
-      expect(invokeMock).toHaveBeenCalledWith("suggest_dictionary_entries", { before: "知呼", after: "知乎" }),
+      expect(invokeMock).toHaveBeenCalledWith("suggest_dictionary_entries", {
+        historyId: item.id,
+        before: "知呼",
+        after: "知乎",
+      }),
     );
     expect(screen.queryByText("可能的词典建议")).not.toBeInTheDocument();
   });

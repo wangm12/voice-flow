@@ -233,18 +233,94 @@ describe("ContextSettings", () => {
     expect(screen.getByLabelText("App 风格示例输入").closest("details")).toBe(disclosure);
     expect(screen.queryByRole("switch", { name: "允许读取辅助功能文字" })).not.toBeInTheDocument();
     revealPermissions();
-    for (const name of ["允许读取辅助功能文字", "允许本机 OCR", "允许自动云端视觉", "允许文字发送给服务商", "允许风格示例发送给整理服务商"]) {
+    for (const name of ["允许读取辅助功能文字", "允许本机 OCR", "允许自动云端视觉", "允许文字发送给服务商", "允许风格示例发送给整理服务商", "允许结构化偏好发送给云端整理服务商"]) {
       const grant = screen.getByRole("switch", { name });
       expect(grant.closest("details")).toBeNull();
       expect(grant).toHaveAttribute("aria-checked", "false");
     }
-    fireEvent.click(screen.getByText("高级映射选项"));
+    fireEvent.click(screen.getByText(/高级映射选项/));
     expect(disclosure).toHaveAttribute("open");
     fireEvent.change(screen.getByLabelText("可执行文件名"), { target: { value: "Cursor" } });
     fireEvent.click(screen.getByText("高级映射选项 · 已设置"));
     expect(disclosure).not.toHaveAttribute("open");
     expect(screen.getByLabelText("可执行文件名")).toHaveValue("Cursor");
     expect(screen.getByRole("switch", { name: "允许自动云端视觉" })).toHaveAttribute("aria-checked", "false");
+  });
+
+  it("saves task-scoped preferences separately from style-sample approval and supports pause and forget", async () => {
+    const base = invokeMock.getMockImplementation()!;
+    invokeMock.mockImplementation((command, args, options) => command === "save_context_mapping"
+      ? Promise.resolve([(args as { mapping: unknown }).mapping])
+      : base(command, args, options));
+
+    render(<ContextSettings />);
+    selectOption(await screen.findByRole("combobox", { name: "选择 App" }), "com.todesktop.230313mzl4w4u92");
+    fireEvent.click(screen.getByRole("button", { name: /任务级写作偏好/ }));
+    selectOption(screen.getByRole("combobox", { name: "写作任务 ID" }), "project_update");
+    selectOption(screen.getByRole("combobox", { name: "列表结构" }), "bullets");
+    fireEvent.click(screen.getByText("高级映射选项"));
+    selectOption(screen.getByRole("combobox", { name: "输入框类型" }), "document");
+    revealPermissions();
+    expect(screen.getByRole("switch", { name: "允许结构化偏好发送给云端整理服务商" })).toHaveAttribute("aria-checked", "false");
+    expect(screen.getByRole("switch", { name: "允许结构化偏好发送给云端整理服务商" })).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: "保存映射" }));
+
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("save_context_mapping", expect.objectContaining({
+      mapping: expect.objectContaining({
+        writing_task_id: "project_update",
+        writing_preferences: [{ task_id: "project_update", dimension: "list_structure", value: "bullets", status: "active", version: 1 }],
+        preference_guidance_provider_approved: false,
+        style_examples_approved: false,
+      }),
+    })));
+    expect(invokeMock.mock.calls.some(([command]) => command === "preview_writing_mode")).toBe(false);
+
+    fireEvent.click(screen.getByRole("button", { name: "编辑映射" }));
+    selectOption(screen.getByRole("combobox", { name: "列表结构 · 偏好状态" }), "paused");
+    fireEvent.click(screen.getByRole("button", { name: "更新映射" }));
+    await waitFor(() => expect(invokeMock).toHaveBeenLastCalledWith("save_context_mapping", expect.objectContaining({
+      mapping: expect.objectContaining({
+        writing_preferences: [{ task_id: "project_update", dimension: "list_structure", value: "bullets", status: "paused", version: 1 }],
+        preference_guidance_provider_approved: false,
+      }),
+    })));
+
+    fireEvent.click(screen.getByRole("button", { name: "编辑映射" }));
+    selectOption(screen.getByRole("combobox", { name: "列表结构 · 偏好状态" }), "forgotten");
+    fireEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: "忘记偏好" }));
+    fireEvent.click(screen.getByRole("button", { name: "更新映射" }));
+    await waitFor(() => expect(invokeMock).toHaveBeenLastCalledWith("save_context_mapping", expect.objectContaining({
+      mapping: expect.objectContaining({
+        writing_preferences: [{ task_id: "project_update", dimension: "list_structure", value: "bullets", status: "forgotten", version: 1 }],
+        preference_guidance_provider_approved: false,
+      }),
+    })));
+  });
+
+  it("does not accept a focused-field-only task selector without an App or site anchor", async () => {
+    render(<ContextSettings />);
+    fireEvent.click(await screen.findByRole("button", { name: /任务级写作偏好/ }));
+    selectOption(screen.getByRole("combobox", { name: "写作任务 ID" }), "project_update");
+    fireEvent.click(screen.getByText("高级映射选项"));
+    selectOption(screen.getByRole("combobox", { name: "输入框类型" }), "document");
+    fireEvent.click(screen.getByRole("button", { name: "保存映射" }));
+
+    expect(await screen.findByText("指定写作任务需要 App 或网站锚点，以及可验证的输入框类型或网站路径前缀")).toBeInTheDocument();
+    expect(invokeMock).not.toHaveBeenCalledWith("save_context_mapping", expect.anything());
+  });
+
+  it("shows fixed greeting and punctuation examples without calling a provider", async () => {
+    render(<ContextSettings />);
+    selectOption(await screen.findByRole("combobox", { name: "选择 App" }), "com.todesktop.230313mzl4w4u92");
+    fireEvent.click(screen.getByRole("button", { name: /任务级写作偏好/ }));
+    selectOption(screen.getByRole("combobox", { name: "写作任务 ID" }), "work_chat");
+    selectOption(screen.getByRole("combobox", { name: "短称呼形式" }), "respectful_greeting");
+    selectOption(screen.getByRole("combobox", { name: "陈述句句末标点" }), "no_terminal_period");
+
+    expect(screen.getByText("你好，Alex。 → 您好，Alex。")).toBeInTheDocument();
+    expect(screen.getByText("好的。 → 好的")).toBeInTheDocument();
+    expect(screen.getAllByText("固定示例，不会调用服务商或修改原文")).toHaveLength(2);
+    expect(invokeMock.mock.calls.some(([command]) => command === "preview_writing_mode")).toBe(false);
   });
 
   it("uses WeChat-style help for mapping examples", async () => {
@@ -362,7 +438,7 @@ describe("ContextSettings", () => {
     fireEvent.click(screen.getByRole("button", { name: "语气与个人偏好：草稿、保存和批准" }));
     fireEvent.click(screen.getByRole("button", { name: "上下文与看屏幕：分别选择来源和用途" }));
     expect(prompt).toHaveValue("我的未保存偏好");
-    for (const name of ["允许读取辅助功能文字", "允许本机 OCR", "允许自动云端视觉", "允许文字发送给服务商", "允许风格示例发送给整理服务商"]) {
+    for (const name of ["允许读取辅助功能文字", "允许本机 OCR", "允许自动云端视觉", "允许文字发送给服务商", "允许风格示例发送给整理服务商", "允许结构化偏好发送给云端整理服务商"]) {
       expect(screen.getByRole("switch", { name })).toHaveAttribute("aria-checked", "false");
     }
     expect(onChange).not.toHaveBeenCalled();
@@ -435,7 +511,7 @@ describe("ContextSettings", () => {
 
     await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("save_context_mapping", { replaceStyleExamples: true,
       mapping: {
-        id: "com.todesktop.230313mzl4w4u92",
+        id: expect.stringMatching(/^rule:/),
         label: "Cursor",
         family: "prompt_or_code",
         mode_id: "prompt_or_code",
@@ -444,6 +520,10 @@ describe("ContextSettings", () => {
         browser_host: null,
         browser_path_prefix: null,
         focused_field: null,
+        writing_task_id: null,
+        writing_preferences: [],
+        preference_guidance_provider_approved: false,
+        preference_revision: 0,
         source_permissions: {
           ax_text: false,
           local_ocr: false,
@@ -461,6 +541,223 @@ describe("ContextSettings", () => {
         dictionary_learn_enabled: true,
       },
     }));
+  });
+
+  it("clears preferences on a saved scope change and requires fresh entry for the new scope", async () => {
+    contextMappingsResponse = [{
+      id: "rule:cursor-chat",
+      label: "Cursor",
+      family: "work_chat",
+      mode_id: "work_chat",
+      bundle_id: "com.todesktop.230313mzl4w4u92",
+      executable: null,
+      browser_host: null,
+      browser_path_prefix: null,
+      focused_field: "chat",
+      writing_task_id: "work_chat",
+      writing_preferences: [{
+        task_id: "work_chat",
+        dimension: "greeting_tone",
+        value: "respectful_greeting",
+        status: "active",
+        version: 1,
+      }],
+      preference_guidance_provider_approved: true,
+      preference_revision: 4,
+      source_permissions: {},
+      style_example_input: "private sample input",
+      style_example_output: "Private sample output",
+      style_example_pairs: [{ input: "private sample input", output: "Private sample output" }],
+      style_examples_approved: true,
+      enabled: true,
+    }];
+    const base = invokeMock.getMockImplementation()!;
+    let mappingSaveCount = 0;
+    invokeMock.mockImplementation(async (command, args, options) => {
+      if (command === "save_context_mapping") {
+        const incoming = (args as { mapping: Record<string, unknown> }).mapping;
+        mappingSaveCount += 1;
+        const saved = mappingSaveCount === 1
+          ? { ...incoming, writing_preferences: [], preference_guidance_provider_approved: false, preference_revision: 5, style_examples_approved: false }
+          : { ...incoming, preference_revision: 6 };
+        contextMappingsResponse = [saved];
+        return [saved];
+      }
+      return base(command, args, options);
+    });
+    render(<ContextSettings />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "编辑映射" }));
+    revealPermissions();
+    const cloudPreferenceToggle = screen.getByRole("switch", { name: "允许结构化偏好发送给云端整理服务商" });
+    const cloudStyleExamplesToggle = screen.getByRole("switch", { name: "允许风格示例发送给整理服务商" });
+    expect(cloudPreferenceToggle).toBeChecked();
+    expect(cloudStyleExamplesToggle).toBeChecked();
+
+    selectOption(screen.getByRole("combobox", { name: "选择 App" }), "com.google.Chrome");
+    await waitFor(() => {
+      expect(cloudPreferenceToggle).not.toBeChecked();
+      expect(cloudStyleExamplesToggle).not.toBeChecked();
+    });
+    fireEvent.click(screen.getByRole("button", { name: "更新映射" }));
+
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("save_context_mapping", {
+      replaceStyleExamples: true,
+      mapping: expect.objectContaining({
+        id: "rule:cursor-chat",
+        bundle_id: "com.google.Chrome",
+        preference_guidance_provider_approved: false,
+        preference_revision: 4,
+        style_examples_approved: false,
+        style_example_pairs: [{ input: "private sample input", output: "Private sample output" }],
+      }),
+    }));
+    expect(await screen.findByText(/本次填写的偏好没有保存/)).toBeInTheDocument();
+    expect(screen.getByRole("switch", { name: "允许结构化偏好发送给云端整理服务商" })).not.toBeChecked();
+
+    const taskPreferences = screen.getByRole("button", { name: /任务级写作偏好/ });
+    if (taskPreferences.getAttribute("aria-expanded") !== "true") fireEvent.click(taskPreferences);
+    expect(screen.getByRole("combobox", { name: "短称呼形式" })).toHaveValue("");
+    selectOption(screen.getByRole("combobox", { name: "短称呼形式" }), "conversational_greeting");
+    fireEvent.click(screen.getByRole("button", { name: "更新映射" }));
+    await waitFor(() => expect(invokeMock).toHaveBeenLastCalledWith("save_context_mapping", {
+      replaceStyleExamples: true,
+      mapping: expect.objectContaining({
+        id: "rule:cursor-chat",
+        bundle_id: "com.google.Chrome",
+        writing_preferences: [{ task_id: "work_chat", dimension: "greeting_tone", value: "conversational_greeting", status: "active", version: 1 }],
+        preference_guidance_provider_approved: false,
+        preference_revision: 5,
+      }),
+    }));
+  });
+
+  it("clears the editor after deleting its mapping so a later save cannot replay its preferences", async () => {
+    const base = invokeMock.getMockImplementation()!;
+    contextMappingsResponse = [{
+      id: "rule:cursor-chat",
+      label: "Cursor",
+      family: "work_chat",
+      mode_id: "work_chat",
+      bundle_id: "com.todesktop.230313mzl4w4u92",
+      executable: null,
+      browser_host: null,
+      browser_path_prefix: null,
+      focused_field: "chat",
+      writing_task_id: "work_chat",
+      writing_preferences: [{
+        task_id: "work_chat",
+        dimension: "greeting_tone",
+        value: "respectful_greeting",
+        status: "active",
+        version: 1,
+      }],
+      preference_guidance_provider_approved: true,
+      preference_revision: 4,
+      source_permissions: {},
+      style_example_pairs: [],
+      enabled: true,
+    }];
+    invokeMock.mockImplementation(async (command, args, options) => {
+      if (command === "delete_context_mapping") {
+        contextMappingsResponse = [];
+        return [];
+      }
+      return base(command, args, options);
+    });
+
+    render(<ContextSettings />);
+    fireEvent.click(await screen.findByRole("button", { name: "编辑映射" }));
+    revealPermissions();
+    expect(screen.getByRole("switch", { name: "允许结构化偏好发送给云端整理服务商" })).toBeChecked();
+    fireEvent.click(screen.getByRole("button", { name: "删除应用映射 Cursor" }));
+    fireEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: "删除映射" }));
+
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("delete_context_mapping", { id: "rule:cursor-chat" }));
+    expect(screen.getByRole("switch", { name: "允许结构化偏好发送给云端整理服务商" })).not.toBeChecked();
+
+    selectOption(screen.getByRole("combobox", { name: "选择 App" }), "com.todesktop.230313mzl4w4u92");
+    fireEvent.click(screen.getByRole("button", { name: "保存映射" }));
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("save_context_mapping", {
+      replaceStyleExamples: true,
+      mapping: expect.objectContaining({
+        id: expect.stringMatching(/^rule:/),
+        writing_task_id: null,
+        writing_preferences: [],
+        preference_guidance_provider_approved: false,
+        preference_revision: 0,
+      }),
+    }));
+  });
+
+  it("rejects a restored edit draft when its saved mapping owner has disappeared", async () => {
+    contextMappingsResponse = [{
+      id: "rule:cursor-chat",
+      label: "Cursor",
+      family: "work_chat",
+      mode_id: "work_chat",
+      bundle_id: "com.todesktop.230313mzl4w4u92",
+      executable: null,
+      browser_host: null,
+      browser_path_prefix: null,
+      focused_field: "chat",
+      writing_task_id: "work_chat",
+      writing_preferences: [{
+        task_id: "work_chat",
+        dimension: "greeting_tone",
+        value: "respectful_greeting",
+        status: "active",
+        version: 1,
+      }],
+      preference_guidance_provider_approved: true,
+      preference_revision: 4,
+      source_permissions: {},
+      style_example_pairs: [],
+      enabled: true,
+    }];
+    const base = invokeMock.getMockImplementation()!;
+    invokeMock.mockImplementation(async (command, args, options) => {
+      if (command === "save_context_mapping") {
+        const mapping = (args as { mapping: Record<string, unknown> }).mapping;
+        contextMappingsResponse = [mapping];
+        return [mapping];
+      }
+      return base(command, args, options);
+    });
+    const view = render(<SessionDraftProvider><ContextSettings /></SessionDraftProvider>);
+    fireEvent.click(await screen.findByRole("button", { name: "编辑映射" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "更新映射" })).toBeEnabled());
+
+    contextMappingsResponse = [];
+    view.rerender(<SessionDraftProvider>{null}</SessionDraftProvider>);
+    view.rerender(<SessionDraftProvider><ContextSettings /></SessionDraftProvider>);
+    fireEvent.click(await screen.findByRole("button", { name: "更新映射" }));
+
+    expect(await screen.findByText("此映射已删除或不再可用，请重新选择规则后再保存。")).toBeInTheDocument();
+    expect(invokeMock).not.toHaveBeenCalledWith("save_context_mapping", expect.anything());
+
+    fireEvent.click(screen.getByRole("button", { name: "放弃草稿并新建规则" }));
+    await waitFor(() => expect(screen.getByRole("combobox", { name: "选择 App" })).toBeEnabled());
+    selectOption(screen.getByRole("combobox", { name: "选择 App" }), "com.todesktop.230313mzl4w4u92");
+    const taskPreferences = screen.getByRole("button", { name: /任务级写作偏好/ });
+    if (taskPreferences.getAttribute("aria-expanded") !== "true") fireEvent.click(taskPreferences);
+    expect(screen.getByRole("combobox", { name: "写作任务 ID" })).toHaveValue("");
+    expect(screen.getByRole("combobox", { name: "短称呼形式" })).toHaveValue("");
+    revealPermissions();
+    expect(screen.getByRole("switch", { name: "允许结构化偏好发送给云端整理服务商" })).not.toBeChecked();
+
+    fireEvent.click(screen.getByRole("button", { name: "保存映射" }));
+    await waitFor(() => expect(invokeMock).toHaveBeenLastCalledWith("save_context_mapping", expect.objectContaining({
+      mapping: expect.objectContaining({
+        id: expect.stringMatching(/^rule:/),
+        bundle_id: "com.todesktop.230313mzl4w4u92",
+        writing_task_id: null,
+        writing_preferences: [],
+        preference_guidance_provider_approved: false,
+      }),
+    })));
+    const savedMapping = (invokeMock.mock.lastCall?.[1] as { mapping: { id: string } }).mapping;
+    expect(savedMapping.id).not.toBe("rule:cursor-chat");
   });
 
   it("persists explicit scene Auto separately from inheriting the global intensity", async () => {
@@ -557,7 +854,7 @@ describe("ContextSettings", () => {
 
     await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("save_context_mapping", { replaceStyleExamples: true,
       mapping: {
-        id: "com.google.Chrome:mail.google.com",
+        id: expect.stringMatching(/^rule:/),
         label: "Google Chrome",
         family: "email",
         mode_id: "email",
@@ -566,6 +863,10 @@ describe("ContextSettings", () => {
         browser_host: "mail.google.com",
         browser_path_prefix: null,
         focused_field: null,
+        writing_task_id: null,
+        writing_preferences: [],
+        preference_guidance_provider_approved: false,
+        preference_revision: 0,
         source_permissions: {
           ax_text: false,
           local_ocr: false,
@@ -771,6 +1072,687 @@ describe("ContextSettings", () => {
       }),
     }));
   });
+
+  it("revokes the separate cloud sample grant when an approved example changes", async () => {
+    contextMappingsResponse = [{
+      id: "cursor",
+      label: "Cursor",
+      family: "general",
+      bundle_id: "com.todesktop.230313mzl4w4u92",
+      style_example_input: "old input",
+      style_example_output: "old output",
+      style_example_pairs: [{ input: "old input", output: "old output" }],
+      style_examples_approved: true,
+      enabled: true,
+    }];
+    render(<ContextSettings />);
+    revealPermissions();
+    selectOption(await screen.findByRole("combobox", { name: "选择 App" }), "com.todesktop.230313mzl4w4u92");
+
+    expect(screen.getByRole("switch", { name: "允许风格示例发送给整理服务商" })).toHaveAttribute("aria-checked", "true");
+    fireEvent.change(screen.getByRole("textbox", { name: "App 风格示例输入" }), { target: { value: "new input" } });
+    expect(screen.getByRole("switch", { name: "允许风格示例发送给整理服务商" })).toHaveAttribute("aria-checked", "false");
+    fireEvent.click(screen.getByRole("button", { name: "更新映射" }));
+
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("save_context_mapping", {
+      replaceStyleExamples: true,
+      mapping: expect.objectContaining({
+        style_example_input: "new input",
+        style_examples_approved: false,
+        style_example_pairs: [{ input: "old input", output: "old output" }],
+      }),
+    }));
+  });
+
+  it("does not display a list-only preference grant as cloud guidance approval", async () => {
+    contextMappingsResponse = [{
+      id: "editor",
+      label: "Editor",
+      family: "work_chat",
+      bundle_id: "com.example.editor",
+      writing_task_id: "work_chat",
+      writing_preferences: [{ task_id: "work_chat", dimension: "list_structure", value: "bullets", status: "active", version: 1 }],
+      preference_guidance_provider_approved: true,
+      enabled: true,
+    }];
+    render(<ContextSettings />);
+    revealPermissions();
+    selectOption(await screen.findByRole("combobox", { name: "选择 App" }), "com.example.editor");
+
+    expect(screen.getByRole("switch", { name: "允许结构化偏好发送给云端整理服务商" })).toHaveAttribute("aria-checked", "false");
+  });
+
+  it("reviews a structured candidate, refreshes its mapping revision, preserves other drafts, and keeps cloud/sample grants separate", async () => {
+    const mapping = {
+      id: "rule:cursor-work-chat",
+      label: "Cursor",
+      family: "work_chat",
+      mode_id: "work_chat",
+      bundle_id: "com.todesktop.230313mzl4w4u92",
+      executable: null,
+      browser_host: null,
+      browser_path_prefix: null,
+      focused_field: "chat",
+      writing_task_id: "work_chat",
+      writing_preferences: [{ task_id: "work_chat", dimension: "greeting_tone", value: "respectful_greeting", status: "active", version: 1 }],
+      preference_guidance_provider_approved: true,
+      preference_revision: 2,
+      source_permissions: {},
+      style_example_input: "private sample input",
+      style_example_output: "private sample output",
+      style_example_pairs: [{ input: "private sample input", output: "private sample output" }],
+      style_examples_approved: true,
+      enabled: true,
+      cleanup_intensity: "standard",
+    };
+    const candidate = {
+      candidate_id: "candidate:cursor-chat-punctuation",
+      candidate_generation: 1,
+      mapping_id: mapping.id,
+      mapping_revision: 2,
+      app_label: "Cursor",
+      task_id: "work_chat",
+      dimension: "terminal_punctuation",
+      value: "no_terminal_period",
+      has_text_sample: false,
+      distinct_origins: 3,
+      distinct_natural_days: 2,
+      distinct_sessions: 2,
+      qualified_at_ms: 1_800_000_001_000,
+    };
+    const updatedMapping = {
+      ...mapping,
+      writing_preferences: [
+        ...mapping.writing_preferences,
+        { task_id: "work_chat", dimension: "terminal_punctuation", value: "no_terminal_period", status: "active", version: 1 },
+      ],
+      preference_guidance_provider_approved: false,
+      preference_revision: 3,
+    };
+    contextMappingsResponse = [mapping];
+    const base = invokeMock.getMockImplementation()!;
+    invokeMock.mockImplementation(async (command, args, options) => {
+      if (command === "list_writing_preference_drafts") return [candidate];
+      if (command === "review_writing_preference_drafts") {
+        contextMappingsResponse = [updatedMapping];
+        return [{
+          candidate_id: candidate.candidate_id,
+          mapping_id: mapping.id,
+          decision: "approve",
+          status: "approved",
+          new_mapping_revision: 3,
+        }];
+      }
+      if (command === "save_context_mapping") {
+        contextMappingsResponse = [(args as { mapping: unknown }).mapping];
+        return contextMappingsResponse;
+      }
+      return base(command, args, options);
+    });
+
+    render(<ContextSettings />);
+    fireEvent.click(await screen.findByRole("button", { name: "编辑映射" }));
+    fireEvent.click(screen.getByText(/高级映射选项/));
+    fireEvent.click(screen.getByRole("button", { name: /任务级写作偏好/ }));
+    selectOption(screen.getByRole("combobox", { name: "整理强度" }), "light");
+    revealPermissions();
+    expect(screen.getByRole("switch", { name: "允许结构化偏好发送给云端整理服务商" })).toBeChecked();
+    expect(screen.getByRole("switch", { name: "允许风格示例发送给整理服务商" })).toBeChecked();
+
+    expect(invokeMock).not.toHaveBeenCalledWith("list_writing_preference_drafts");
+    fireEvent.click(screen.getByRole("button", { name: /待复核的写作偏好/ }));
+    await screen.findByRole("group", { name: /Cursor.*工作聊天.*陈述句句末标点/ });
+    expect(screen.getByText(/App: Cursor \(com\.todesktop\.230313mzl4w4u92\).*聊天输入框/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("checkbox", { name: /Cursor.*工作聊天.*陈述句句末标点/ }));
+    fireEvent.click(screen.getByRole("button", { name: /批准所选偏好/ }));
+
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("review_writing_preference_drafts", {
+      decisions: [{ candidate_id: candidate.candidate_id, candidate_generation: 1, expected_mapping_revision: 2, decision: "approve" }],
+    }));
+    await waitFor(() => expect(invokeMock.mock.calls.filter(([command]) => command === "get_context_mappings")).toHaveLength(3));
+    expect(screen.getByRole("combobox", { name: "整理强度" })).toHaveValue("light");
+    expect(screen.getByRole("combobox", { name: "陈述句句末标点" })).toHaveValue("no_terminal_period");
+    expect(screen.getByRole("switch", { name: "允许结构化偏好发送给云端整理服务商" })).not.toBeChecked();
+    expect(screen.getByRole("switch", { name: "允许风格示例发送给整理服务商" })).toBeChecked();
+
+    fireEvent.click(screen.getByRole("button", { name: "更新映射" }));
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("save_context_mapping", expect.objectContaining({
+      mapping: expect.objectContaining({
+        id: mapping.id,
+        preference_revision: 3,
+        writing_preferences: updatedMapping.writing_preferences,
+        preference_guidance_provider_approved: false,
+        style_examples_approved: true,
+        style_example_input: "private sample input",
+        cleanup_intensity: "light",
+      }),
+    })));
+  });
+
+  it("treats a family-only editor change during preference review as a scope conflict", async () => {
+    const mapping = {
+      id: "rule:family-review-race",
+      label: "Cursor",
+      family: "work_chat",
+      mode_id: "work_chat",
+      bundle_id: "com.todesktop.230313mzl4w4u92",
+      executable: null,
+      browser_host: null,
+      browser_path_prefix: null,
+      focused_field: "chat",
+      writing_task_id: "work_chat",
+      writing_preferences: [],
+      preference_guidance_provider_approved: false,
+      preference_revision: 2,
+      source_permissions: {},
+      style_example_pairs: [],
+      style_examples_approved: false,
+      enabled: true,
+    };
+    const candidate = {
+      candidate_id: "candidate:family-review-race",
+      candidate_generation: 1,
+      mapping_id: mapping.id,
+      mapping_revision: 2,
+      app_label: "Cursor",
+      task_id: "work_chat",
+      dimension: "terminal_punctuation",
+      value: "no_terminal_period",
+      has_text_sample: false,
+      distinct_origins: 3,
+      distinct_natural_days: 2,
+      distinct_sessions: 2,
+      qualified_at_ms: 1_800_000_001_000,
+    };
+    const updatedMapping = {
+      ...mapping,
+      writing_preferences: [{ task_id: "work_chat", dimension: "terminal_punctuation", value: "no_terminal_period", status: "active", version: 1 }],
+      preference_revision: 3,
+    };
+    let resolveReview!: (outcomes: unknown[]) => void;
+    contextMappingsResponse = [mapping];
+    const base = invokeMock.getMockImplementation()!;
+    invokeMock.mockImplementation((command, args, options) => {
+      if (command === "list_writing_preference_drafts") return Promise.resolve([candidate]);
+      if (command === "review_writing_preference_drafts") {
+        return new Promise((resolve) => { resolveReview = resolve; });
+      }
+      if (command === "save_context_mapping") return Promise.resolve([(args as { mapping: unknown }).mapping]);
+      return base(command, args, options);
+    });
+
+    render(<ContextSettings />);
+    fireEvent.click(await screen.findByRole("button", { name: "编辑映射" }));
+    const taskPreferences = screen.getByRole("button", { name: /任务级写作偏好/ });
+    if (taskPreferences.getAttribute("aria-expanded") !== "true") fireEvent.click(taskPreferences);
+    fireEvent.click(screen.getByRole("button", { name: /待复核的写作偏好/ }));
+    await screen.findByRole("group", { name: /Cursor.*工作聊天.*陈述句句末标点/ });
+    fireEvent.click(screen.getByRole("checkbox", { name: /Cursor.*工作聊天.*陈述句句末标点/ }));
+    fireEvent.click(screen.getByRole("button", { name: /批准所选偏好/ }));
+    await waitFor(() => expect(resolveReview).toBeDefined());
+
+    selectOption(screen.getByRole("combobox", { name: "应用映射语气" }), "email");
+    contextMappingsResponse = [updatedMapping];
+    await act(async () => resolveReview([{
+      candidate_id: candidate.candidate_id,
+      mapping_id: mapping.id,
+      decision: "approve",
+      status: "approved",
+      new_mapping_revision: 3,
+    }]));
+
+    expect(await screen.findByText(/批量复核期间此 App 规则的范围或任务已改变/)).toBeInTheDocument();
+    expect(screen.getByRole("combobox", { name: "应用映射语气" })).toHaveValue("email");
+    expect(screen.getByRole("combobox", { name: "陈述句句末标点" })).toHaveValue("");
+    fireEvent.click(screen.getByRole("button", { name: "更新映射" }));
+    expect(await screen.findByText("批量复核期间此 App 规则的偏好或授权草稿发生冲突。草稿仍保留；请重新加载获批规则后再保存。")).toBeInTheDocument();
+    expect(invokeMock).not.toHaveBeenCalledWith("save_context_mapping", expect.anything());
+  });
+
+  it("completes approval sync when one mapping was deleted and keeps the remaining mapping update", async () => {
+    const mappingA = {
+      id: "rule:deleted-during-review",
+      label: "Google Chrome",
+      family: "work_chat",
+      mode_id: "work_chat",
+      bundle_id: "com.google.Chrome",
+      executable: null,
+      browser_host: null,
+      browser_path_prefix: null,
+      focused_field: "chat",
+      writing_task_id: "work_chat",
+      writing_preferences: [],
+      preference_guidance_provider_approved: false,
+      preference_revision: 2,
+      source_permissions: {},
+      style_example_pairs: [],
+      style_examples_approved: false,
+      enabled: true,
+    };
+    const mappingB = {
+      ...mappingA,
+      id: "rule:still-present-during-review",
+      label: "Cursor",
+      bundle_id: "com.todesktop.230313mzl4w4u92",
+    };
+    const candidateA = {
+      candidate_id: "candidate:deleted-during-review",
+      candidate_generation: 1,
+      mapping_id: mappingA.id,
+      mapping_revision: 2,
+      app_label: mappingA.label,
+      task_id: "work_chat",
+      dimension: "terminal_punctuation",
+      value: "no_terminal_period",
+      has_text_sample: false as const,
+      distinct_origins: 3,
+      distinct_natural_days: 2,
+      distinct_sessions: 2,
+      qualified_at_ms: 1_800_000_001_000,
+    };
+    const candidateB = {
+      ...candidateA,
+      candidate_id: "candidate:still-present-during-review",
+      mapping_id: mappingB.id,
+      app_label: mappingB.label,
+      dimension: "greeting_tone" as const,
+      value: "respectful_greeting" as const,
+    };
+    const candidateAfterReload = {
+      ...candidateA,
+      candidate_id: "candidate:after-owner-deletion",
+      mapping_id: mappingB.id,
+      app_label: mappingB.label,
+      mapping_revision: 3,
+      dimension: "list_structure" as const,
+      value: "bullets" as const,
+    };
+    const updatedMappingB = {
+      ...mappingB,
+      writing_preferences: [{ task_id: "work_chat", dimension: "greeting_tone", value: "respectful_greeting", status: "active", version: 1 }],
+      preference_revision: 3,
+    };
+    let candidateLoadCount = 0;
+    contextMappingsResponse = [mappingA, mappingB];
+    const base = invokeMock.getMockImplementation()!;
+    invokeMock.mockImplementation(async (command, args, options) => {
+      if (command === "list_writing_preference_drafts") {
+        candidateLoadCount += 1;
+        return candidateLoadCount === 1 ? [candidateA, candidateB] : [candidateAfterReload];
+      }
+      if (command === "review_writing_preference_drafts") {
+        contextMappingsResponse = [updatedMappingB];
+        return [candidateA, candidateB].map((candidate) => ({
+          candidate_id: candidate.candidate_id,
+          mapping_id: candidate.mapping_id,
+          decision: "approve",
+          status: "approved",
+          new_mapping_revision: 3,
+        }));
+      }
+      if (command === "save_context_mapping") return [(args as { mapping: unknown }).mapping];
+      return base(command, args, options);
+    });
+
+    render(<SessionDraftProvider><ContextSettings /></SessionDraftProvider>);
+    const editButtons = await screen.findAllByRole("button", { name: "编辑映射" });
+    fireEvent.click(editButtons[1]);
+    const taskPreferences = screen.getByRole("button", { name: /任务级写作偏好/ });
+    if (taskPreferences.getAttribute("aria-expanded") !== "true") fireEvent.click(taskPreferences);
+    fireEvent.click(screen.getByRole("button", { name: /待复核的写作偏好/ }));
+    await screen.findByRole("group", { name: /Google Chrome.*工作聊天.*陈述句句末标点/ });
+    await screen.findByRole("group", { name: /Cursor.*工作聊天.*短称呼形式/ });
+    fireEvent.click(screen.getByRole("checkbox", { name: /Google Chrome.*工作聊天.*陈述句句末标点/ }));
+    fireEvent.click(screen.getByRole("checkbox", { name: /Cursor.*工作聊天.*短称呼形式/ }));
+    fireEvent.click(screen.getByRole("button", { name: /批准所选偏好/ }));
+
+    expect(await screen.findByText(/处理结果：批准 2 项/)).toBeInTheDocument();
+    expect(screen.queryByText(/偏好已批准，但 App 规则未能同步/)).not.toBeInTheDocument();
+    expect(screen.getByRole("combobox", { name: "短称呼形式" })).toHaveValue("respectful_greeting");
+    expect(invokeMock).not.toHaveBeenCalledWith("save_context_mapping", expect.anything());
+
+    fireEvent.click(screen.getByRole("button", { name: "刷新候选列表" }));
+    await screen.findByRole("group", { name: /Cursor.*工作聊天.*列表结构/ });
+    const candidateAfterDeletionCheckbox = screen.getByRole("checkbox", { name: /Cursor.*工作聊天.*列表结构/ });
+    fireEvent.click(candidateAfterDeletionCheckbox);
+    expect(screen.getByRole("button", { name: /批准所选偏好/ })).toBeEnabled();
+  });
+
+  it("joins equal App/task candidates by stable mapping ID and never merges A into an editor switched to B", async () => {
+    const mappingA = {
+      id: "rule:shared-chat",
+      label: "Shared Editor",
+      family: "work_chat",
+      mode_id: "work_chat",
+      bundle_id: "com.example.shared-editor",
+      executable: null,
+      browser_host: null,
+      browser_path_prefix: null,
+      focused_field: "chat",
+      writing_task_id: "work_chat",
+      writing_preferences: [{ task_id: "work_chat", dimension: "greeting_tone", value: "respectful_greeting", status: "active", version: 1 }],
+      preference_guidance_provider_approved: true,
+      preference_revision: 2,
+      source_permissions: {},
+      style_example_pairs: [],
+      style_examples_approved: false,
+      enabled: true,
+    };
+    const mappingB = {
+      ...mappingA,
+      id: "rule:shared-document",
+      focused_field: "document",
+      writing_preferences: [{ task_id: "work_chat", dimension: "terminal_punctuation", value: "terminal_period", status: "active", version: 1 }],
+      preference_guidance_provider_approved: false,
+      preference_revision: 4,
+    };
+    const candidate = {
+      candidate_id: "candidate:shared-chat-punctuation",
+      candidate_generation: 1,
+      mapping_id: mappingA.id,
+      mapping_revision: 2,
+      app_label: "Shared Editor",
+      task_id: "work_chat",
+      dimension: "terminal_punctuation",
+      value: "no_terminal_period",
+      has_text_sample: false,
+      distinct_origins: 3,
+      distinct_natural_days: 2,
+      distinct_sessions: 2,
+      qualified_at_ms: 1_800_000_001_000,
+    };
+    const updatedA = {
+      ...mappingA,
+      writing_preferences: [
+        ...mappingA.writing_preferences,
+        { task_id: "work_chat", dimension: "terminal_punctuation", value: "no_terminal_period", status: "active", version: 1 },
+      ],
+      preference_guidance_provider_approved: false,
+      preference_revision: 3,
+    };
+    let mappingReadCount = 0;
+    let resolveMappingRefresh: ((mappings: unknown[]) => void) | undefined;
+    contextMappingsResponse = [mappingA, mappingB];
+    const base = invokeMock.getMockImplementation()!;
+    invokeMock.mockImplementation(async (command, args, options) => {
+      if (command === "list_writing_preference_drafts") return [candidate];
+      if (command === "review_writing_preference_drafts") return [{
+        candidate_id: candidate.candidate_id,
+        mapping_id: mappingA.id,
+        decision: "approve",
+        status: "approved",
+        new_mapping_revision: 3,
+      }];
+      if (command === "get_context_mappings") {
+        mappingReadCount += 1;
+        if (mappingReadCount <= 2) return [mappingA, mappingB];
+        return new Promise((resolve) => { resolveMappingRefresh = resolve; });
+      }
+      return base(command, args, options);
+    });
+
+    render(<ContextSettings />);
+    const editButtons = await screen.findAllByRole("button", { name: "编辑映射" });
+    fireEvent.click(editButtons[0]);
+    const taskPreferences = screen.getByRole("button", { name: /任务级写作偏好/ });
+    if (taskPreferences.getAttribute("aria-expanded") !== "true") fireEvent.click(taskPreferences);
+    fireEvent.click(screen.getByRole("button", { name: /待复核的写作偏好/ }));
+    expect(await screen.findByText(/App: Shared Editor \(com\.example\.shared-editor\) · 输入框: 聊天输入框/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("checkbox", { name: /Shared Editor.*工作聊天.*陈述句句末标点/ }));
+    fireEvent.click(screen.getByRole("button", { name: /批准所选偏好/ }));
+    await waitFor(() => expect(mappingReadCount).toBe(3));
+    await waitFor(() => expect(resolveMappingRefresh).toBeDefined());
+
+    fireEvent.click(screen.getAllByRole("button", { name: "编辑映射" })[1]);
+    const refreshedTaskPreferences = screen.getByRole("button", { name: /任务级写作偏好/ });
+    if (refreshedTaskPreferences.getAttribute("aria-expanded") !== "true") fireEvent.click(refreshedTaskPreferences);
+    expect(screen.getByRole("combobox", { name: "陈述句句末标点" })).toHaveValue("terminal_period");
+    await act(async () => resolveMappingRefresh?.([updatedA, mappingB]));
+
+    expect(screen.getByRole("combobox", { name: "陈述句句末标点" })).toHaveValue("terminal_period");
+    expect(screen.queryByText(/此偏好维度有未保存草稿/)).not.toBeInTheDocument();
+  });
+
+  it("preserves a dirty preference and cloud grant draft until the user reloads the reviewed mapping", async () => {
+    const mapping = {
+      id: "rule:cursor-chat-dirty",
+      label: "Cursor",
+      family: "work_chat",
+      mode_id: "work_chat",
+      bundle_id: "com.todesktop.230313mzl4w4u92",
+      executable: null,
+      browser_host: null,
+      browser_path_prefix: null,
+      focused_field: "chat",
+      writing_task_id: "work_chat",
+      writing_preferences: [],
+      preference_guidance_provider_approved: false,
+      preference_revision: 2,
+      source_permissions: {},
+      style_example_pairs: [],
+      style_examples_approved: false,
+      enabled: true,
+    };
+    const candidate = {
+      candidate_id: "candidate:cursor-chat-punctuation-dirty",
+      candidate_generation: 1,
+      mapping_id: mapping.id,
+      mapping_revision: 2,
+      app_label: "Cursor",
+      task_id: "work_chat",
+      dimension: "terminal_punctuation",
+      value: "no_terminal_period",
+      has_text_sample: false,
+      distinct_origins: 3,
+      distinct_natural_days: 2,
+      distinct_sessions: 2,
+      qualified_at_ms: 1_800_000_001_000,
+    };
+    const updatedMapping = {
+      ...mapping,
+      writing_preferences: [{ task_id: "work_chat", dimension: "terminal_punctuation", value: "no_terminal_period", status: "active", version: 1 }],
+      preference_guidance_provider_approved: false,
+      preference_revision: 3,
+    };
+    contextMappingsResponse = [mapping];
+    const base = invokeMock.getMockImplementation()!;
+    invokeMock.mockImplementation(async (command, args, options) => {
+      if (command === "list_writing_preference_drafts") return [candidate];
+      if (command === "review_writing_preference_drafts") {
+        contextMappingsResponse = [updatedMapping];
+        return [{
+          candidate_id: candidate.candidate_id,
+          mapping_id: mapping.id,
+          decision: "approve",
+          status: "approved",
+          new_mapping_revision: 3,
+        }];
+      }
+      if (command === "save_context_mapping") return [(args as { mapping: unknown }).mapping];
+      return base(command, args, options);
+    });
+
+    render(<ContextSettings />);
+    fireEvent.click(await screen.findByRole("button", { name: "编辑映射" }));
+    const taskPreferences = screen.getByRole("button", { name: /任务级写作偏好/ });
+    if (taskPreferences.getAttribute("aria-expanded") !== "true") fireEvent.click(taskPreferences);
+    selectOption(screen.getByRole("combobox", { name: "陈述句句末标点" }), "terminal_period");
+    revealPermissions();
+    fireEvent.click(screen.getByRole("switch", { name: "允许结构化偏好发送给云端整理服务商" }));
+
+    fireEvent.click(screen.getByRole("button", { name: /待复核的写作偏好/ }));
+    await screen.findByRole("group", { name: /Cursor.*工作聊天.*陈述句句末标点/ });
+    fireEvent.click(screen.getByRole("checkbox", { name: /Cursor.*工作聊天.*陈述句句末标点/ }));
+    fireEvent.click(screen.getByRole("button", { name: /批准所选偏好/ }));
+
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("get_context_mappings"));
+    await waitFor(() => expect(screen.getByRole("combobox", { name: "陈述句句末标点" })).toHaveValue("terminal_period"));
+    expect(screen.getByRole("switch", { name: "允许结构化偏好发送给云端整理服务商" })).toBeChecked();
+    expect(screen.getByText(/此偏好维度有未保存草稿/)).toBeInTheDocument();
+    expect(screen.getByText(/云端偏好授权有未保存草稿/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "更新映射" }));
+    expect(invokeMock).not.toHaveBeenCalledWith("save_context_mapping", expect.anything());
+
+    fireEvent.click(screen.getAllByRole("button", { name: "重新加载获批的 App 规则" })[0]);
+    expect(screen.getByRole("combobox", { name: "陈述句句末标点" })).toHaveValue("no_terminal_period");
+    expect(screen.getByRole("switch", { name: "允许结构化偏好发送给云端整理服务商" })).not.toBeChecked();
+    expect(screen.queryByText(/此偏好维度有未保存草稿/)).not.toBeInTheDocument();
+  });
+
+  it("keeps the opened mapping revision across remount and reloads a late approval before save", async () => {
+    const mapping = {
+      id: "rule:remount-chat",
+      label: "Cursor",
+      family: "work_chat",
+      mode_id: "work_chat",
+      bundle_id: "com.todesktop.230313mzl4w4u92",
+      executable: null,
+      browser_host: null,
+      browser_path_prefix: null,
+      focused_field: "chat",
+      writing_task_id: "work_chat",
+      writing_preferences: [],
+      preference_guidance_provider_approved: false,
+      preference_revision: 2,
+      source_permissions: {},
+      style_example_pairs: [],
+      style_examples_approved: false,
+      enabled: true,
+    };
+    const candidate = {
+      candidate_id: "candidate:remount-chat-punctuation",
+      candidate_generation: 1,
+      mapping_id: mapping.id,
+      mapping_revision: 2,
+      app_label: "Cursor",
+      task_id: "work_chat",
+      dimension: "terminal_punctuation",
+      value: "no_terminal_period",
+      has_text_sample: false,
+      distinct_origins: 3,
+      distinct_natural_days: 2,
+      distinct_sessions: 2,
+      qualified_at_ms: 1_800_000_001_000,
+    };
+    const updatedMapping = {
+      ...mapping,
+      writing_preferences: [{ task_id: "work_chat", dimension: "terminal_punctuation", value: "no_terminal_period", status: "active", version: 1 }],
+      preference_revision: 3,
+    };
+    let mappingReadCount = 0;
+    let resolveMappingRefresh: ((mappings: unknown[]) => void) | undefined;
+    contextMappingsResponse = [mapping];
+    const base = invokeMock.getMockImplementation()!;
+    invokeMock.mockImplementation(async (command, args, options) => {
+      if (command === "list_writing_preference_drafts") return [candidate];
+      if (command === "review_writing_preference_drafts") {
+        contextMappingsResponse = [updatedMapping];
+        return [{ candidate_id: candidate.candidate_id, mapping_id: mapping.id, decision: "approve", status: "approved", new_mapping_revision: 3 }];
+      }
+      if (command === "get_context_mappings") {
+        mappingReadCount += 1;
+        if (mappingReadCount <= 2) return [mapping];
+        if (mappingReadCount === 3) return new Promise((resolve) => { resolveMappingRefresh = resolve; });
+        return contextMappingsResponse;
+      }
+      return base(command, args, options);
+    });
+
+    const view = render(<SessionDraftProvider><ContextSettings /></SessionDraftProvider>);
+    fireEvent.click((await screen.findAllByRole("button", { name: "编辑映射" }))[0]);
+    fireEvent.click(screen.getByRole("button", { name: /待复核的写作偏好/ }));
+    await screen.findByRole("group", { name: /Cursor.*工作聊天.*陈述句句末标点/ });
+    fireEvent.click(screen.getByRole("checkbox", { name: /Cursor.*工作聊天.*陈述句句末标点/ }));
+    fireEvent.click(screen.getByRole("button", { name: /批准所选偏好/ }));
+    await waitFor(() => expect(mappingReadCount).toBe(3));
+    await waitFor(() => expect(resolveMappingRefresh).toBeDefined());
+
+    view.rerender(<SessionDraftProvider><div /></SessionDraftProvider>);
+    await act(async () => resolveMappingRefresh?.([updatedMapping]));
+    view.rerender(<SessionDraftProvider><ContextSettings /></SessionDraftProvider>);
+    expect(await screen.findByText(/此 App 规则在当前草稿建立后已更新/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "更新映射" }));
+    expect(invokeMock).not.toHaveBeenCalledWith("save_context_mapping", expect.anything());
+
+    fireEvent.click(screen.getByRole("button", { name: "重新加载获批的 App 规则" }));
+    const taskPreferences = screen.getByRole("button", { name: /任务级写作偏好/ });
+    if (taskPreferences.getAttribute("aria-expanded") !== "true") fireEvent.click(taskPreferences);
+    expect(screen.getByRole("combobox", { name: "陈述句句末标点" })).toHaveValue("no_terminal_period");
+    expect(screen.queryByText(/此 App 规则在当前草稿建立后已更新/)).not.toBeInTheDocument();
+  });
+
+  it("keeps a stale form blocked when review IPC is lost after commit and a candidate refresh reads the new revision", async () => {
+    const mapping = {
+      id: "rule:lost-ipc-chat",
+      label: "Cursor",
+      family: "work_chat",
+      mode_id: "work_chat",
+      bundle_id: "com.todesktop.230313mzl4w4u92",
+      executable: null,
+      browser_host: null,
+      browser_path_prefix: null,
+      focused_field: "chat",
+      writing_task_id: "work_chat",
+      writing_preferences: [],
+      preference_guidance_provider_approved: false,
+      preference_revision: 2,
+      source_permissions: {},
+      style_example_pairs: [],
+      style_examples_approved: false,
+      enabled: true,
+    };
+    const candidate = {
+      candidate_id: "candidate:lost-ipc-chat-punctuation",
+      candidate_generation: 1,
+      mapping_id: mapping.id,
+      mapping_revision: 2,
+      app_label: "Cursor",
+      task_id: "work_chat",
+      dimension: "terminal_punctuation",
+      value: "no_terminal_period",
+      has_text_sample: false,
+      distinct_origins: 3,
+      distinct_natural_days: 2,
+      distinct_sessions: 2,
+      qualified_at_ms: 1_800_000_001_000,
+    };
+    const updatedMapping = {
+      ...mapping,
+      writing_preferences: [{ task_id: "work_chat", dimension: "terminal_punctuation", value: "no_terminal_period", status: "active", version: 1 }],
+      preference_revision: 3,
+    };
+    contextMappingsResponse = [mapping];
+    let reviewAttempted = false;
+    const base = invokeMock.getMockImplementation()!;
+    invokeMock.mockImplementation(async (command, args, options) => {
+      if (command === "list_writing_preference_drafts") return reviewAttempted ? [] : [candidate];
+      if (command === "review_writing_preference_drafts") {
+        reviewAttempted = true;
+        contextMappingsResponse = [updatedMapping];
+        throw new Error("IPC response lost after commit");
+      }
+      return base(command, args, options);
+    });
+
+    render(<ContextSettings />);
+    fireEvent.click(await screen.findByRole("button", { name: "编辑映射" }));
+    fireEvent.click(screen.getByRole("button", { name: /待复核的写作偏好/ }));
+    await screen.findByRole("group", { name: /Cursor.*工作聊天.*陈述句句末标点/ });
+    fireEvent.click(screen.getByRole("checkbox", { name: /Cursor.*工作聊天.*陈述句句末标点/ }));
+    fireEvent.click(screen.getByRole("button", { name: /批准所选偏好/ }));
+    const uncertainAlert = await screen.findByRole("alert");
+    fireEvent.click(within(uncertainAlert).getByRole("button", { name: "刷新候选列表" }));
+
+    expect(await screen.findByText(/此 App 规则在当前草稿建立后已更新/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "更新映射" }));
+    expect(invokeMock).not.toHaveBeenCalledWith("save_context_mapping", expect.anything());
+
+    fireEvent.click(screen.getByRole("button", { name: "重新加载获批的 App 规则" }));
+    const taskPreferences = screen.getByRole("button", { name: /任务级写作偏好/ });
+    if (taskPreferences.getAttribute("aria-expanded") !== "true") fireEvent.click(taskPreferences);
+    expect(screen.getByRole("combobox", { name: "陈述句句末标点" })).toHaveValue("no_terminal_period");
+  });
+
   it("keeps a dirty Prompt through unmount while reconciling newer saved modes", async () => {
     const onChange = vi.fn();
     const view = render(<SessionDraftProvider><ContextSettings writingModes={modes} onWritingModesChange={onChange} /></SessionDraftProvider>);

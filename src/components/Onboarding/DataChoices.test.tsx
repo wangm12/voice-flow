@@ -8,12 +8,28 @@ afterEach(cleanup);
 describe("optional onboarding choices", () => {
   it("shows saved independent choices and routes to their existing settings", () => {
     const onSettings = vi.fn();
-    render(<DataChoices settings={{ asr_provider: "on_device", cleanup_enabled: true, keep_success_audio: false, keep_audio_days: 7, keep_history_days: 365, context_enabled: false, dictionary_learn_enabled: true }} onSettings={onSettings} />);
+    render(<DataChoices settings={{ asr_provider: "on_device", cleanup_enabled: true, keep_success_audio: false, keep_audio_days: 7, keep_history_days: 365, context_enabled: false, dictionary_learn_enabled: true, local_edit_learning_enabled: false }} onSettings={onSettings} />);
     fireEvent.click(screen.getByText("隐私与数据选择"));
     expect(screen.getByText(/本机识别与云端整理是独立选择/)).toBeInTheDocument();
     expect(screen.getByText(/默认关闭。保留录音不等于批准训练/)).toBeInTheDocument();
+    expect(screen.getByText("已开启（未开启本机改字观察）")).toBeInTheDocument();
+    expect(screen.getByText(/可由「本机观察插入后的改动」开关授权/)).toBeInTheDocument();
+    expect(screen.getAllByText(/该 App 规则单独授权的辅助功能文字读取/)).toHaveLength(2);
     fireEvent.click(screen.getAllByRole("button", { name: "前往设置" })[4]);
     expect(onSettings).toHaveBeenCalledExactlyOnceWith("context");
+  });
+
+  it("reflects enabled local post-paste edit observation in dictionary learning summary", () => {
+    render(<DataChoices settings={{ dictionary_learn_enabled: true, local_edit_learning_enabled: true }} onSettings={vi.fn()} />);
+    fireEvent.click(screen.getByText("隐私与数据选择"));
+    expect(screen.getByText("已开启（含本机改字观察）")).toBeInTheDocument();
+  });
+
+  it("does not show a missing local observation flag as off", () => {
+    render(<DataChoices settings={{ dictionary_learn_enabled: true }} onSettings={vi.fn()} />);
+    fireEvent.click(screen.getByText("隐私与数据选择"));
+    expect(screen.getByText("已开启（本机改字观察状态未知）")).toBeInTheDocument();
+    expect(screen.queryByText("已开启（未开启本机改字观察）")).not.toBeInTheDocument();
   });
 
   it("distinguishes indefinite history from immediate audio cleanup", () => {

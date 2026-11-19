@@ -421,6 +421,42 @@ where
     .unwrap_or_else(|status| status)
 }
 
+/// Read a required-key provider's fixed account into the current process only.
+/// Groq and Custom keep their dedicated recovery paths so their legacy slots
+/// and custom-origin ownership checks remain exact.
+pub fn read_provider_api_key_with_user_interaction<F>(
+    provider: crate::providers::EngineProvider,
+    validate_after_gate: F,
+) -> InteractiveApiKeyRead
+where
+    F: FnOnce() -> Result<(), InteractiveApiKeyRead> + Send + 'static,
+{
+    if keychain_disabled()
+        || provider.is_groq()
+        || provider.is_custom()
+        || provider.allows_empty_key()
+    {
+        return InteractiveApiKeyRead::Unavailable;
+    }
+    let account = provider.keychain_account();
+    let (service, fallback) = match api_services() {
+        Ok(services) => services,
+        Err(_) => return InteractiveApiKeyRead::Unavailable,
+    };
+    guarded_interactive_read(validate_after_gate, || {
+        #[cfg(target_os = "macos")]
+        {
+            read_secret_interactively(service, fallback, account)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (service, fallback, account);
+            InteractiveApiKeyRead::Unavailable
+        }
+    })
+    .unwrap_or_else(|status| status)
+}
+
 /// Tests must never touch the real OS keychain by default (it can block on an
 /// interactive authorization prompt). Set `VOICEFLOW_TEST_KEYCHAIN_ENABLED=1`
 /// only for the ignored manual round-trip test.

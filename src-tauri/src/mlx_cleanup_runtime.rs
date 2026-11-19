@@ -22,10 +22,20 @@ const MODEL_REVISION: &str = modelstore::REVISION;
 const MAX_REQUEST_LINE_BYTES: usize = 1_000_000;
 const MAX_RESPONSE_LINE_BYTES: usize = 64 * 1024;
 pub(crate) const MAX_OUTPUT_TOKENS: usize = 2_048;
+pub(crate) const S1_MINI_MAX_OUTPUT_TOKENS: usize = 1_024;
+
+pub(crate) fn max_output_tokens_for_model(model_id: &str) -> usize {
+    if model_id == modelstore::S1_MINI_MLX_ID {
+        S1_MINI_MAX_OUTPUT_TOKENS
+    } else {
+        MAX_OUTPUT_TOKENS
+    }
+}
 const INFERENCE_TIMEOUT: Duration = Duration::from_secs(300);
 const MODEL_LOAD_TIMEOUT: Duration = Duration::from_secs(900);
 const OPERATION_TIMEOUT: Duration = Duration::from_secs(1_260);
 const CHILD_EXIT_TIMEOUT: Duration = Duration::from_secs(12);
+const MODEL_IDLE_UNLOAD_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 #[cfg(test)]
 type TestChildExitObserver = (u64, watch::Receiver<bool>);
 #[cfg(test)]
@@ -367,7 +377,7 @@ impl Request {
                     .map(|(role, content)| ChatMessage { role, content })
                     .collect(),
             ),
-            max_output_tokens: Some(MAX_OUTPUT_TOKENS),
+            max_output_tokens: Some(max_output_tokens_for_model(model_id)),
             stable_prefix_user_bytes,
         }
     }
@@ -393,7 +403,26 @@ impl Request {
         }
     }
 
+    #[cfg(test)]
     fn startup_warmup(
+        request_id: String,
+        session_id: Option<String>,
+        messages: Vec<(String, String)>,
+        stable_prefix_user_bytes: Option<usize>,
+    ) -> Self {
+        Self::startup_warmup_for(
+            MODEL_ID,
+            MODEL_REVISION,
+            request_id,
+            session_id,
+            messages,
+            stable_prefix_user_bytes,
+        )
+    }
+
+    fn startup_warmup_for(
+        model_id: &str,
+        model_revision: &str,
         request_id: String,
         session_id: Option<String>,
         messages: Vec<(String, String)>,
@@ -403,10 +432,10 @@ impl Request {
             protocol_version: PROTOCOL_VERSION,
             request_id,
             session_id,
-            model_version: Some(MODEL_REVISION.to_owned()),
+            model_version: Some(model_revision.to_owned()),
             language: None,
             op: "warmup".to_owned(),
-            model_id: Some(MODEL_ID.to_owned()),
+            model_id: Some(model_id.to_owned()),
             model_directory: None,
             messages: Some(
                 messages
@@ -416,7 +445,7 @@ impl Request {
             ),
             // The cache identity and admission use the production output cap.
             // The sidecar separately limits the internal evaluation to 1 token.
-            max_output_tokens: Some(MAX_OUTPUT_TOKENS),
+            max_output_tokens: Some(max_output_tokens_for_model(model_id)),
             stable_prefix_user_bytes,
         }
     }
@@ -614,6 +643,30 @@ struct ChildSession {
     model: Option<ResolvedCleanupModel>,
 }
 
+struct IdleUnloadTicket {
+    generation: u64,
+    child_generation: u64,
+    model_id: String,
+    model_revision: &'static str,
+    cancellation: CancellationToken,
+}
+
+fn idle_unload_ticket_for_resident(
+    generation: u64,
+    child_generation: u64,
+    model_id: &str,
+    model_revision: &'static str,
+    cancellation: CancellationToken,
+) -> IdleUnloadTicket {
+    IdleUnloadTicket {
+        generation,
+        child_generation,
+        model_id: model_id.to_owned(),
+        model_revision,
+        cancellation,
+    }
+}
+
 type OwnedCleanupSession = tokio::sync::OwnedMutexGuard<Option<ChildSession>>;
 
 /// The supervisor owns `Child` until `wait()` confirms exit. The model lease
@@ -671,6 +724,31 @@ impl Drop for ProcessOwner {
     }
 }
 
+pub(crate) type CleanupStatusObserver = Arc<dyn Fn(Option<String>) + Send + Sync>;
+
+fn notify_cleanup_observer(
+    observer_slot: &Mutex<Option<CleanupStatusObserver>>,
+    verified_model_id: Option<&str>,
+) {
+    let observer = observer_slot
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    if let Some(observer) = observer {
+        observer(verified_model_id.map(str::to_owned));
+    }
+}
+
+fn store_phase_and_notify(
+    phase: &AtomicU8,
+    next: u8,
+    observer_slot: &Mutex<Option<CleanupStatusObserver>>,
+) {
+    if phase.swap(next, Ordering::AcqRel) != next {
+        notify_cleanup_observer(observer_slot, None);
+    }
+}
+
 pub struct Runtime {
     models_root: PathBuf,
     manager: Manager,
@@ -680,11 +758,17 @@ pub struct Runtime {
     shutting_down: Arc<AtomicBool>,
     phase: Arc<AtomicU8>,
     model_resident: Arc<AtomicBool>,
+    status_observer: Arc<Mutex<Option<CleanupStatusObserver>>>,
     startup_warmup_generation: AtomicU64,
     startup_warmup_control_sequence: AtomicU64,
     startup_warmup_demands: AtomicUsize,
     startup_warmup_control: Mutex<Option<(u64, CancellationToken)>>,
     startup_warmup_in_flight_owners: Arc<AtomicUsize>,
+    idle_unload_generation: AtomicU64,
+    idle_unload_control: Mutex<Option<(u64, CancellationToken)>>,
+    idle_unload_pending_reschedule: Arc<Mutex<Option<std::sync::Weak<Runtime>>>>,
+    #[cfg(test)]
+    idle_unload_timeout: Duration,
     active_process: Arc<Mutex<Option<(u64, CancellationToken)>>>,
     generation_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     #[cfg(test)]
@@ -764,11 +848,17 @@ impl Runtime {
             shutting_down: Arc::new(AtomicBool::new(false)),
             phase: Arc::new(AtomicU8::new(PHASE_NOT_LOADED)),
             model_resident: Arc::new(AtomicBool::new(false)),
+            status_observer: Arc::new(Mutex::new(None)),
             startup_warmup_generation: AtomicU64::new(0),
             startup_warmup_control_sequence: AtomicU64::new(0),
             startup_warmup_demands: AtomicUsize::new(0),
             startup_warmup_control: Mutex::new(None),
             startup_warmup_in_flight_owners: Arc::new(AtomicUsize::new(0)),
+            idle_unload_generation: AtomicU64::new(0),
+            idle_unload_control: Mutex::new(None),
+            idle_unload_pending_reschedule: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            idle_unload_timeout: MODEL_IDLE_UNLOAD_TIMEOUT,
             active_process: Arc::new(Mutex::new(None)),
             generation_task: Mutex::new(None),
             #[cfg(test)]
@@ -871,6 +961,17 @@ impl Runtime {
             .arg("--models-root")
             .arg(&self.models_root);
         Ok(command)
+    }
+
+    pub(crate) fn set_status_observer(&self, observer: CleanupStatusObserver) {
+        *self
+            .status_observer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(observer);
+    }
+
+    fn set_phase(&self, next: u8) {
+        store_phase_and_notify(&self.phase, next, &self.status_observer);
     }
 
     pub(crate) fn status(&self) -> RuntimeStatus {
@@ -1003,7 +1104,7 @@ impl Runtime {
         {
             return Err(RuntimeError::ModelMismatch);
         }
-        let stable_prefix_user_bytes = (model_id == MODEL_ID)
+        let stable_prefix_user_bytes = modelstore::is_user_available_mlx_cleanup_model(model_id)
             .then_some(stable_prefix_user_bytes)
             .flatten();
         let request_id = self.next_id();
@@ -1151,6 +1252,7 @@ impl Runtime {
         result
     }
 
+    #[cfg(test)]
     pub(crate) async fn prewarm_startup(
         &self,
         messages: Vec<(String, String)>,
@@ -1158,6 +1260,30 @@ impl Runtime {
         variant: &'static str,
         still_current: Arc<dyn Fn() -> bool + Send + Sync>,
     ) -> Result<WarmupCompletion, RuntimeError> {
+        self.prewarm_startup_for(
+            MODEL_ID,
+            messages,
+            stable_prefix_user_bytes,
+            variant,
+            still_current,
+        )
+        .await
+    }
+
+    pub(crate) async fn prewarm_startup_for(
+        &self,
+        model_id: &str,
+        messages: Vec<(String, String)>,
+        stable_prefix_user_bytes: Option<usize>,
+        variant: &'static str,
+        still_current: Arc<dyn Fn() -> bool + Send + Sync>,
+    ) -> Result<WarmupCompletion, RuntimeError> {
+        if !modelstore::is_user_available_mlx_cleanup_model(model_id)
+            || self.model_revision(model_id).is_err()
+        {
+            return Err(RuntimeError::ModelMismatch);
+        }
+        self.invalidate_idle_unload();
         let request_id = self.next_id();
         let started = Instant::now();
         mlx_diagnostics::event(EventName::StartupWarmup, Severity::Info, Target::Runtime)
@@ -1189,7 +1315,7 @@ impl Runtime {
         let result = match tokio::time::timeout(
             OPERATION_TIMEOUT,
             self.complete_bounded(
-                MODEL_ID.to_owned(),
+                model_id.to_owned(),
                 messages,
                 stable_prefix_user_bytes,
                 None,
@@ -1337,6 +1463,7 @@ impl Runtime {
     }
 
     pub(crate) fn begin_foreground_model_demand(&self) {
+        self.invalidate_idle_unload();
         let control = self
             .startup_warmup_control
             .lock()
@@ -1410,10 +1537,12 @@ impl Runtime {
         trace: Option<crate::metrics::TraceHandle>,
         warmup_yield: Option<CancellationToken>,
     ) -> Result<OperationReply, RuntimeError> {
+        self.invalidate_idle_unload();
         let _phase_guard = RestorePhaseOnDrop {
             phase: Arc::clone(&self.phase),
             model_resident: Arc::clone(&self.model_resident),
             shutting_down: &self.shutting_down,
+            status_observer: Arc::clone(&self.status_observer),
         };
         self.ensure_running()?;
         if !self.platform_admitted() {
@@ -1532,19 +1661,12 @@ impl Runtime {
                     let model_is_resident = session
                         .as_ref()
                         .and_then(|child| child.model.as_ref())
-                        .is_some_and(|model| {
-                            model.id() == MODEL_ID
-                                && model.revision() == MODEL_REVISION
-                                && model.manifest_sha256() == modelstore::MANIFEST_SHA256
-                        });
-                    self.phase.store(
-                        if model_is_resident {
-                            PHASE_READY
-                        } else {
-                            PHASE_NOT_LOADED
-                        },
-                        Ordering::Release,
-                    );
+                        .is_some();
+                    self.set_phase(if model_is_resident {
+                        PHASE_READY
+                    } else {
+                        PHASE_NOT_LOADED
+                    });
                     return Err(error);
                 }
                 // A failed load or model admission can leave work in the child.
@@ -1553,10 +1675,10 @@ impl Runtime {
                 let close = self.retire_session(&mut session, CHILD_EXIT_TIMEOUT).await;
                 operation_guard.disarm();
                 if let Err(close_error) = close {
-                    self.phase.store(PHASE_STOPPING, Ordering::Release);
+                    self.set_phase(PHASE_STOPPING);
                     return Err(error_after_child_retirement(error, close_error));
                 }
-                self.phase.store(PHASE_NOT_LOADED, Ordering::Release);
+                self.set_phase(PHASE_NOT_LOADED);
                 return Err(error);
             }
         };
@@ -1574,7 +1696,7 @@ impl Runtime {
                     .process
                     .release_cleanup_gate();
                 operation_guard.disarm();
-                self.phase.store(PHASE_READY, Ordering::Release);
+                self.set_phase(PHASE_READY);
                 return Err(error);
             }
         }
@@ -1585,7 +1707,7 @@ impl Runtime {
                 .process
                 .release_cleanup_gate();
             operation_guard.disarm();
-            self.phase.store(PHASE_READY, Ordering::Release);
+            self.set_phase(PHASE_READY);
             return Err(RuntimeError::Cancelled);
         }
         if warmup_yield
@@ -1603,17 +1725,14 @@ impl Runtime {
                 .process
                 .release_cleanup_gate();
             operation_guard.disarm();
-            self.phase.store(PHASE_READY, Ordering::Release);
+            self.set_phase(PHASE_READY);
             return Err(RuntimeError::StartupWarmupYielded { child_generation });
         }
-        self.phase.store(
-            if operation == RuntimeOperation::StartupWarmup {
-                PHASE_PREWARMING
-            } else {
-                PHASE_CLEANING
-            },
-            Ordering::Release,
-        );
+        self.set_phase(if operation == RuntimeOperation::StartupWarmup {
+            PHASE_PREWARMING
+        } else {
+            PHASE_CLEANING
+        });
         let session_id = Some(self.next_id());
         let request = match operation {
             RuntimeOperation::Cleanup => {
@@ -1628,7 +1747,9 @@ impl Runtime {
                     source_language,
                 )
             }
-            RuntimeOperation::StartupWarmup => Request::startup_warmup(
+            RuntimeOperation::StartupWarmup => Request::startup_warmup_for(
+                &model_id,
+                self.model_revision(&model_id)?,
                 request_id.clone(),
                 session_id,
                 messages,
@@ -1659,6 +1780,8 @@ impl Runtime {
         let owner_process_cancel = process_cancel.clone();
         let owner_cancel_armed = request_guard.armed.clone();
         let shutting_down = Arc::clone(&self.shutting_down);
+        let owner_status_observer = Arc::clone(&self.status_observer);
+        let owner_pending_reschedule = Arc::clone(&self.idle_unload_pending_reschedule);
         let caller_request = request.clone();
         let owner_warmup_guard = (operation == RuntimeOperation::StartupWarmup).then(|| {
             StartupWarmupInFlightGuard::retain(Arc::clone(&self.startup_warmup_in_flight_owners))
@@ -1694,41 +1817,66 @@ impl Runtime {
             }
         }
         let owner = tokio::spawn(async move {
-            let _owner_warmup_guard = owner_warmup_guard;
-            let Some(child) = session.as_mut() else {
-                let _ = owner_sender.send(GenerationOwnerOutcome::Retired(
-                    RuntimeError::SidecarMissing,
-                ));
-                return;
-            };
-            let mut owner_retirement_guard =
-                CancelChildOnDrop::new(owner_process_cancel.clone(), Arc::clone(&owner_phase));
-            let outcome = exchange_generation_with_cancel(
-                child,
-                &request,
-                &cancel_request,
-                &owner_cancel,
-                owner_warmup_yield.as_ref(),
-            )
-            .await;
-            match outcome {
-                GenerationExchangeOutcome::Response(response) => {
-                    let fallback_response = (*response).clone();
-                    *owner_session_handoff.lock().await = Some(session);
-                    match owner_sender.send(GenerationOwnerOutcome::Response(response)) {
-                        Ok(()) => {
-                            #[cfg(test)]
-                            if let Some((reached, release)) = response_handoff_pause {
-                                reached.notify_one();
-                                release.notified().await;
-                            }
-                            tokio::select! {
-                                biased;
-                                acknowledgement = handoff_ack_receiver => {
-                                    if acknowledgement.is_ok() {
-                                        owner_cancel_armed.store(false, Ordering::Release);
-                                        owner_retirement_guard.disarm();
-                                    } else {
+            {
+                let Some(child) = session.as_mut() else {
+                    let _ = owner_sender.send(GenerationOwnerOutcome::Retired(
+                        RuntimeError::SidecarMissing,
+                    ));
+                    return;
+                };
+                let mut owner_retirement_guard =
+                    CancelChildOnDrop::new(owner_process_cancel.clone(), Arc::clone(&owner_phase));
+                let outcome = exchange_generation_with_cancel(
+                    child,
+                    &request,
+                    &cancel_request,
+                    &owner_cancel,
+                    owner_warmup_yield.as_ref(),
+                )
+                .await;
+                match outcome {
+                    GenerationExchangeOutcome::Response(response) => {
+                        let fallback_response = (*response).clone();
+                        *owner_session_handoff.lock().await = Some(session);
+                        match owner_sender.send(GenerationOwnerOutcome::Response(response)) {
+                            Ok(()) => {
+                                #[cfg(test)]
+                                if let Some((reached, release)) = response_handoff_pause {
+                                    reached.notify_one();
+                                    release.notified().await;
+                                }
+                                tokio::select! {
+                                    biased;
+                                    acknowledgement = handoff_ack_receiver => {
+                                        if acknowledgement.is_ok() {
+                                            owner_cancel_armed.store(false, Ordering::Release);
+                                            owner_retirement_guard.disarm();
+                                        } else {
+                                            owner_cancel_armed.store(false, Ordering::Release);
+                                            if let Some(session) = owner_session_handoff.lock().await.take() {
+                                                settle_unclaimed_response(
+                                                    session,
+                                                    &request,
+                                                    &fallback_response,
+                                                    owner_process_cancel.is_cancelled(),
+                                                    &UnclaimedResponseState {
+                                                        phase: &owner_phase,
+                                                        model_resident: &model_resident,
+                                                        shutting_down: &shutting_down,
+                                                        status_observer: &owner_status_observer,
+                                                    },
+                                                )
+                                                .await;
+                                            }
+                                            owner_retirement_guard.disarm();
+                                            #[cfg(test)]
+                                            if let Some((reached, release)) = settled_owner_pause {
+                                                reached.notify_one();
+                                                release.notified().await;
+                                            }
+                                        }
+                                    }
+                                    _ = owner_cancel.cancelled() => {
                                         owner_cancel_armed.store(false, Ordering::Release);
                                         if let Some(session) = owner_session_handoff.lock().await.take() {
                                             settle_unclaimed_response(
@@ -1736,98 +1884,119 @@ impl Runtime {
                                                 &request,
                                                 &fallback_response,
                                                 owner_process_cancel.is_cancelled(),
-                                                Arc::clone(&owner_phase),
-                                                Arc::clone(&model_resident),
-                                                Arc::clone(&shutting_down),
-                                            ).await;
+                                                &UnclaimedResponseState {
+                                                    phase: &owner_phase,
+                                                    model_resident: &model_resident,
+                                                    shutting_down: &shutting_down,
+                                                    status_observer: &owner_status_observer,
+                                                },
+                                            )
+                                            .await;
                                         }
                                         owner_retirement_guard.disarm();
-                                        #[cfg(test)]
-                                        if let Some((reached, release)) = settled_owner_pause {
-                                            reached.notify_one();
-                                            release.notified().await;
+                                    }
+                                    _ = owner_process_cancel.cancelled() => {
+                                        owner_cancel_armed.store(false, Ordering::Release);
+                                        if let Some(session) = owner_session_handoff.lock().await.take() {
+                                            settle_unclaimed_response(
+                                                session,
+                                                &request,
+                                                &fallback_response,
+                                                true,
+                                                &UnclaimedResponseState {
+                                                    phase: &owner_phase,
+                                                    model_resident: &model_resident,
+                                                    shutting_down: &shutting_down,
+                                                    status_observer: &owner_status_observer,
+                                                },
+                                            )
+                                            .await;
                                         }
+                                        owner_retirement_guard.disarm();
                                     }
-                                }
-                                _ = owner_cancel.cancelled() => {
-                                    owner_cancel_armed.store(false, Ordering::Release);
-                                    if let Some(session) = owner_session_handoff.lock().await.take() {
-                                        settle_unclaimed_response(
-                                            session,
-                                            &request,
-                                            &fallback_response,
-                                            owner_process_cancel.is_cancelled(),
-                                            Arc::clone(&owner_phase),
-                                            Arc::clone(&model_resident),
-                                            Arc::clone(&shutting_down),
-                                        ).await;
-                                    }
-                                    owner_retirement_guard.disarm();
-                                }
-                                _ = owner_process_cancel.cancelled() => {
-                                    owner_cancel_armed.store(false, Ordering::Release);
-                                    if let Some(session) = owner_session_handoff.lock().await.take() {
-                                        settle_unclaimed_response(
-                                            session,
-                                            &request,
-                                            &fallback_response,
-                                            true,
-                                            Arc::clone(&owner_phase),
-                                            Arc::clone(&model_resident),
-                                            Arc::clone(&shutting_down),
-                                        ).await;
-                                    }
-                                    owner_retirement_guard.disarm();
                                 }
                             }
-                        }
-                        Err(GenerationOwnerOutcome::Response(response)) => {
-                            owner_cancel_armed.store(false, Ordering::Release);
-                            if let Some(session) = owner_session_handoff.lock().await.take() {
-                                settle_unclaimed_response(
-                                    session,
-                                    &request,
-                                    &response,
-                                    owner_process_cancel.is_cancelled(),
-                                    Arc::clone(&owner_phase),
-                                    Arc::clone(&model_resident),
-                                    Arc::clone(&shutting_down),
-                                )
-                                .await;
+                            Err(GenerationOwnerOutcome::Response(_)) => {
+                                owner_cancel_armed.store(false, Ordering::Release);
+                                if let Some(session) = owner_session_handoff.lock().await.take() {
+                                    settle_unclaimed_response(
+                                        session,
+                                        &request,
+                                        &fallback_response,
+                                        owner_process_cancel.is_cancelled(),
+                                        &UnclaimedResponseState {
+                                            phase: &owner_phase,
+                                            model_resident: &model_resident,
+                                            shutting_down: &shutting_down,
+                                            status_observer: &owner_status_observer,
+                                        },
+                                    )
+                                    .await;
+                                }
+                                owner_retirement_guard.disarm();
                             }
-                            owner_retirement_guard.disarm();
-                        }
-                        Err(_) => unreachable!("only the response outcome is sent from this arm"),
-                    }
-                }
-                GenerationExchangeOutcome::SettledCancellation(primary_error) => {
-                    owner_cancel_armed.store(false, Ordering::Release);
-                    if let Some(child) = session.as_ref() {
-                        child.process.release_cleanup_gate();
-                    }
-                    if !shutting_down.load(Ordering::Acquire) {
-                        owner_phase.store(PHASE_READY, Ordering::Release);
-                    } else {
-                        owner_phase.store(PHASE_STOPPING, Ordering::Release);
-                    }
-                    model_resident.store(true, Ordering::Release);
-                    owner_retirement_guard.disarm();
-                    let _ = owner_sender
-                        .send(GenerationOwnerOutcome::SettledCancellation(primary_error));
-                }
-                GenerationExchangeOutcome::Retire(error) => {
-                    owner_cancel_armed.store(false, Ordering::Release);
-                    if let Some(child) = session.as_mut() {
-                        child.process.cancel.cancel();
-                        if child.process.wait_for_exit(CHILD_EXIT_TIMEOUT).await {
-                            *session = None;
-                            owner_phase.store(PHASE_NOT_LOADED, Ordering::Release);
-                        } else {
-                            owner_phase.store(PHASE_STOPPING, Ordering::Release);
+                            Err(_) => {
+                                unreachable!("only the response outcome is sent from this arm")
+                            }
                         }
                     }
-                    owner_retirement_guard.disarm();
-                    let _ = owner_sender.send(GenerationOwnerOutcome::Retired(error));
+                    GenerationExchangeOutcome::SettledCancellation(primary_error) => {
+                        owner_cancel_armed.store(false, Ordering::Release);
+                        if let Some(child) = session.as_ref() {
+                            child.process.release_cleanup_gate();
+                        }
+                        model_resident.store(true, Ordering::Release);
+                        store_phase_and_notify(
+                            &owner_phase,
+                            if shutting_down.load(Ordering::Acquire) {
+                                PHASE_STOPPING
+                            } else {
+                                PHASE_READY
+                            },
+                            &owner_status_observer,
+                        );
+                        drop(session);
+                        owner_retirement_guard.disarm();
+                        let _ = owner_sender
+                            .send(GenerationOwnerOutcome::SettledCancellation(primary_error));
+                    }
+                    GenerationExchangeOutcome::Retire(error) => {
+                        owner_cancel_armed.store(false, Ordering::Release);
+                        if let Some(child) = session.as_mut() {
+                            child.process.cancel.cancel();
+                            if child.process.wait_for_exit(CHILD_EXIT_TIMEOUT).await {
+                                *session = None;
+                                store_phase_and_notify(
+                                    &owner_phase,
+                                    PHASE_NOT_LOADED,
+                                    &owner_status_observer,
+                                );
+                            } else {
+                                store_phase_and_notify(
+                                    &owner_phase,
+                                    PHASE_STOPPING,
+                                    &owner_status_observer,
+                                );
+                            }
+                        }
+                        drop(session);
+                        owner_retirement_guard.disarm();
+                        let _ = owner_sender.send(GenerationOwnerOutcome::Retired(error));
+                    }
+                }
+            };
+            drop(owner_warmup_guard);
+            let pending_reschedule = owner_pending_reschedule
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take();
+            if let Some(weak) = pending_reschedule {
+                if owner_phase.load(Ordering::Acquire) == PHASE_READY
+                    && !shutting_down.load(Ordering::Acquire)
+                {
+                    if let Some(runtime) = weak.upgrade() {
+                        runtime.schedule_idle_unload();
+                    }
                 }
             }
         });
@@ -1840,7 +2009,7 @@ impl Runtime {
             Ok(outcome) => outcome,
             Err(_) => {
                 request_guard.disarm();
-                self.phase.store(PHASE_STOPPING, Ordering::Release);
+                self.set_phase(PHASE_STOPPING);
                 return Err(RuntimeError::RetainedPending);
             }
         };
@@ -1848,7 +2017,7 @@ impl Runtime {
             GenerationOwnerOutcome::Response(response) => {
                 let Some(owned_session) = session_handoff.lock().await.take() else {
                     request_guard.disarm();
-                    self.phase.store(PHASE_STOPPING, Ordering::Release);
+                    self.set_phase(PHASE_STOPPING);
                     return Err(RuntimeError::RetainedPending);
                 };
                 session = owned_session;
@@ -1927,7 +2096,7 @@ impl Runtime {
             let close = self.retire_session(&mut session, CHILD_EXIT_TIMEOUT).await;
             operation_guard.disarm();
             close?;
-            self.phase.store(PHASE_NOT_LOADED, Ordering::Release);
+            self.set_phase(PHASE_NOT_LOADED);
             return Err(RuntimeError::InvalidResponse);
         }
         if operation == RuntimeOperation::Cleanup {
@@ -2009,10 +2178,12 @@ impl Runtime {
                 }
             }
             terminal_event.emit();
-            let pre_generation_budget_rejection =
-                matches!(&error, RuntimeError::InputTooLarge { .. })
-                    && response.loaded_model_id.as_deref() == Some(model_id.as_str())
-                    && response.loaded_model_version.as_deref() == Some(expected_model_revision);
+            let pre_generation_budget_rejection = matches!(
+                &error,
+                RuntimeError::InputTooLarge { .. } | RuntimeError::SpecializedInputTooLarge
+            ) && response.loaded_model_id.as_deref()
+                == Some(model_id.as_str())
+                && response.loaded_model_version.as_deref() == Some(expected_model_revision);
             let safe_to_reuse_session = pre_generation_budget_rejection
                 || response.error.as_ref().is_some_and(|failure| {
                     matches!(
@@ -2039,14 +2210,11 @@ impl Runtime {
                     .release_cleanup_gate();
             }
             operation_guard.disarm();
-            self.phase.store(
-                if safe_to_reuse_session {
-                    PHASE_READY
-                } else {
-                    PHASE_NOT_LOADED
-                },
-                Ordering::Release,
-            );
+            self.set_phase(if safe_to_reuse_session {
+                PHASE_READY
+            } else {
+                PHASE_NOT_LOADED
+            });
             return Err(error);
         }
         if response.loaded_model_id.as_deref() != Some(model_id.as_str())
@@ -2055,7 +2223,7 @@ impl Runtime {
             let close = self.retire_session(&mut session, CHILD_EXIT_TIMEOUT).await;
             operation_guard.disarm();
             close?;
-            self.phase.store(PHASE_NOT_LOADED, Ordering::Release);
+            self.set_phase(PHASE_NOT_LOADED);
             return Err(RuntimeError::InvalidResponse);
         }
         if operation == RuntimeOperation::StartupWarmup {
@@ -2063,7 +2231,7 @@ impl Runtime {
                 let close = self.retire_session(&mut session, CHILD_EXIT_TIMEOUT).await;
                 operation_guard.disarm();
                 close?;
-                self.phase.store(PHASE_NOT_LOADED, Ordering::Release);
+                self.set_phase(PHASE_NOT_LOADED);
                 return Err(RuntimeError::InvalidResponse);
             };
             let cache_status = result
@@ -2104,7 +2272,7 @@ impl Runtime {
                     .process
                     .release_cleanup_gate();
                 operation_guard.disarm();
-                self.phase.store(PHASE_READY, Ordering::Release);
+                self.set_phase(PHASE_READY);
                 return Err(RuntimeError::InvalidResponse);
             }
             let still_current = still_current.as_ref().is_some_and(|check| check());
@@ -2122,7 +2290,7 @@ impl Runtime {
                 .process
                 .release_cleanup_gate();
             operation_guard.disarm();
-            self.phase.store(PHASE_READY, Ordering::Release);
+            self.set_phase(PHASE_READY);
             return Ok(OperationReply::StartupWarmup(WarmupCompletion {
                 request_id,
                 child_generation,
@@ -2168,14 +2336,14 @@ impl Runtime {
             let close = self.retire_session(&mut session, CHILD_EXIT_TIMEOUT).await;
             operation_guard.disarm();
             close?;
-            self.phase.store(PHASE_NOT_LOADED, Ordering::Release);
+            self.set_phase(PHASE_NOT_LOADED);
             return Err(RuntimeError::InvalidResponse);
         }
         let Some(result) = response.cleanup_result else {
             let close = self.retire_session(&mut session, CHILD_EXIT_TIMEOUT).await;
             operation_guard.disarm();
             close?;
-            self.phase.store(PHASE_NOT_LOADED, Ordering::Release);
+            self.set_phase(PHASE_NOT_LOADED);
             return Err(RuntimeError::InvalidResponse);
         };
         if result.completion != "stop"
@@ -2192,7 +2360,7 @@ impl Runtime {
                 .process
                 .release_cleanup_gate();
             operation_guard.disarm();
-            self.phase.store(PHASE_READY, Ordering::Release);
+            self.set_phase(PHASE_READY);
             return Err(RuntimeError::IncompleteGeneration);
         }
         session
@@ -2201,7 +2369,7 @@ impl Runtime {
             .process
             .release_cleanup_gate();
         operation_guard.disarm();
-        self.phase.store(PHASE_READY, Ordering::Release);
+        self.set_phase(PHASE_READY);
         Ok(OperationReply::Cleanup(Completion {
             request_id,
             child_generation,
@@ -2323,6 +2491,7 @@ impl Runtime {
     }
 
     pub async fn unload_model(&self, model_id: Option<&str>) -> Result<(), String> {
+        self.invalidate_idle_unload();
         let model_id = model_id.map(str::to_owned);
         let result = tokio::time::timeout(OPERATION_TIMEOUT, self.unload_bounded(model_id)).await;
         match result {
@@ -2332,6 +2501,26 @@ impl Runtime {
     }
 
     async fn unload_bounded(&self, model_id: Option<String>) -> Result<(), String> {
+        self.unload_bounded_with_ticket(model_id, None).await
+    }
+
+    async fn unload_if_idle(&self, ticket: IdleUnloadTicket) -> Result<(), String> {
+        match tokio::time::timeout(
+            OPERATION_TIMEOUT,
+            self.unload_bounded_with_ticket(Some(ticket.model_id.clone()), Some(&ticket)),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(RuntimeError::Timeout.to_string()),
+        }
+    }
+
+    async fn unload_bounded_with_ticket(
+        &self,
+        model_id: Option<String>,
+        ticket: Option<&IdleUnloadTicket>,
+    ) -> Result<(), String> {
         let cleanup_gate = Arc::clone(cleanup_operation_gate());
         let cleanup_guard = tokio::time::timeout(CHILD_EXIT_TIMEOUT, cleanup_gate.lock_owned())
             .await
@@ -2339,27 +2528,30 @@ impl Runtime {
         let mut session = tokio::time::timeout(CHILD_EXIT_TIMEOUT, self.session.lock())
             .await
             .map_err(|_| RuntimeError::RetainedPending.to_string())?;
+        if ticket.is_some_and(|ticket| !self.idle_unload_is_current(ticket, &session)) {
+            return Ok(());
+        }
         let Some(existing) = session.as_mut() else {
-            self.phase.store(PHASE_NOT_LOADED, Ordering::Release);
+            self.set_phase(PHASE_NOT_LOADED);
             return Ok(());
         };
         if existing.process.has_exited() {
             *session = None;
-            self.phase.store(PHASE_NOT_LOADED, Ordering::Release);
+            self.set_phase(PHASE_NOT_LOADED);
             return Ok(());
         }
         if existing.process.cancel.is_cancelled() {
             let exited = existing.process.wait_for_exit(CHILD_EXIT_TIMEOUT).await;
             if exited {
                 *session = None;
-                self.phase.store(PHASE_NOT_LOADED, Ordering::Release);
+                self.set_phase(PHASE_NOT_LOADED);
                 return Ok(());
             }
-            self.phase.store(PHASE_STOPPING, Ordering::Release);
+            self.set_phase(PHASE_STOPPING);
             return Err(RuntimeError::RetainedPending.to_string());
         }
         let Some(loaded_model) = existing.model.clone() else {
-            self.phase.store(PHASE_NOT_LOADED, Ordering::Release);
+            self.set_phase(PHASE_NOT_LOADED);
             return Ok(());
         };
         if model_id
@@ -2380,6 +2572,9 @@ impl Runtime {
             .process
             .cancel
             .clone();
+        if ticket.is_some_and(|ticket| !self.idle_unload_is_current(ticket, &session)) {
+            return Ok(());
+        }
         session
             .as_ref()
             .expect("session exists")
@@ -2402,7 +2597,7 @@ impl Runtime {
                 if let Err(close_error) = close {
                     return Err(close_error.to_string());
                 }
-                self.phase.store(PHASE_NOT_LOADED, Ordering::Release);
+                self.set_phase(PHASE_NOT_LOADED);
                 return Err(error.to_string());
             }
         };
@@ -2417,7 +2612,7 @@ impl Runtime {
             if let Err(close_error) = close {
                 return Err(close_error.to_string());
             }
-            self.phase.store(PHASE_NOT_LOADED, Ordering::Release);
+            self.set_phase(PHASE_NOT_LOADED);
             return Err("local cleanup model unload failed".to_owned());
         }
         let child = session.as_mut().expect("session remains after unload");
@@ -2431,15 +2626,204 @@ impl Runtime {
         child.process.release_cleanup_gate();
         operation_guard.disarm();
         self.model_resident.store(false, Ordering::Release);
-        self.phase.store(PHASE_NOT_LOADED, Ordering::Release);
+        self.set_phase(PHASE_NOT_LOADED);
         Ok(())
+    }
+
+    fn idle_unload_is_current_impl(
+        &self,
+        ticket: &IdleUnloadTicket,
+        session: &Option<ChildSession>,
+        require_no_warmup_in_flight: bool,
+    ) -> bool {
+        let active_child_generation = self
+            .active_process
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .map(|(id, _)| *id);
+        let session_child = session.as_ref();
+        let session_child_generation = session_child.map(|child| child.process.id);
+        let child_cancelled = session_child.is_none_or(|child| child.process.cancel.is_cancelled());
+        let model_matches = session_child
+            .and_then(|child| child.model.as_ref())
+            .is_some_and(|model| idle_unload_model_matches(ticket, model.id(), model.revision()));
+        idle_unload_is_current(
+            ticket.generation,
+            ticket.child_generation,
+            IdleUnloadState {
+                current_generation: self.idle_unload_generation.load(Ordering::Acquire),
+                session_child_generation,
+                active_child_generation,
+                shutting_down: self.shutting_down.load(Ordering::Acquire),
+                phase: self.phase.load(Ordering::Acquire),
+                model_resident: self.model_resident.load(Ordering::Acquire),
+                foreground_demands: self.startup_warmup_demands.load(Ordering::Acquire),
+                warmup_in_flight: if require_no_warmup_in_flight {
+                    self.startup_warmup_in_flight_owners.load(Ordering::Acquire)
+                } else {
+                    0
+                },
+                child_cancelled,
+                model_matches,
+                ticket_cancelled: ticket.cancellation.is_cancelled(),
+            },
+        )
+    }
+
+    fn idle_unload_is_current(
+        &self,
+        ticket: &IdleUnloadTicket,
+        session: &Option<ChildSession>,
+    ) -> bool {
+        self.idle_unload_is_current_impl(ticket, session, true)
+    }
+
+    fn invalidate_idle_unload(&self) {
+        *self
+            .idle_unload_pending_reschedule
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        let mut control = self
+            .idle_unload_control
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.idle_unload_generation.fetch_add(1, Ordering::AcqRel);
+        if let Some((_, cancellation)) = control.take() {
+            cancellation.cancel();
+        }
+    }
+
+    fn clear_idle_unload_control(&self, generation: u64) {
+        let mut control = self
+            .idle_unload_control
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if control
+            .as_ref()
+            .is_some_and(|(current, _)| *current == generation)
+        {
+            control.take();
+        }
+    }
+
+    async fn snapshot_idle_unload_ticket(
+        &self,
+        generation: u64,
+        cancellation: CancellationToken,
+    ) -> Option<IdleUnloadTicket> {
+        let session = tokio::select! {
+            _ = cancellation.cancelled() => return None,
+            result = tokio::time::timeout(CHILD_EXIT_TIMEOUT, self.session.lock()) => {
+                match result {
+                    Ok(session) => session,
+                    Err(_) => return None,
+                }
+            }
+        };
+        let child = session.as_ref()?;
+        let model = child.model.as_ref()?;
+        let ticket = idle_unload_ticket_for_resident(
+            generation,
+            child.process.id,
+            model.id(),
+            model.revision(),
+            cancellation,
+        );
+        self.idle_unload_is_current_impl(&ticket, &session, false)
+            .then_some(ticket)
+    }
+
+    pub(crate) fn schedule_idle_unload(self: &Arc<Self>) {
+        let timeout_duration = {
+            #[cfg(test)]
+            {
+                self.idle_unload_timeout
+            }
+            #[cfg(not(test))]
+            {
+                MODEL_IDLE_UNLOAD_TIMEOUT
+            }
+        };
+        let (generation, cancellation) = {
+            *self
+                .idle_unload_pending_reschedule
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+            let mut control = self
+                .idle_unload_control
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let generation = self
+                .idle_unload_generation
+                .fetch_add(1, Ordering::AcqRel)
+                .wrapping_add(1);
+            if let Some((_, previous)) = control.take() {
+                previous.cancel();
+            }
+            if self.shutting_down.load(Ordering::Acquire)
+                || !self.model_resident.load(Ordering::Acquire)
+                || self.startup_warmup_demands.load(Ordering::Acquire) != 0
+            {
+                return;
+            }
+            let phase = self.phase.load(Ordering::Acquire);
+            if phase != PHASE_READY {
+                drop(control);
+                if phase == PHASE_STOPPING {
+                    *self
+                        .idle_unload_pending_reschedule
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                        Some(Arc::downgrade(self));
+                }
+                return;
+            }
+            let cancellation = CancellationToken::new();
+            *control = Some((generation, cancellation.clone()));
+            (generation, cancellation)
+        };
+        let weak = Arc::downgrade(self);
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            cancellation.cancel();
+            self.clear_idle_unload_control(generation);
+            return;
+        };
+        handle.spawn(async move {
+            let Some(runtime) = weak.upgrade() else {
+                return;
+            };
+            let Some(ticket) = runtime
+                .snapshot_idle_unload_ticket(generation, cancellation.clone())
+                .await
+            else {
+                runtime.clear_idle_unload_control(generation);
+                return;
+            };
+            drop(runtime);
+            tokio::select! {
+                _ = cancellation.cancelled() => return,
+                _ = tokio::time::sleep(timeout_duration) => {}
+            }
+            if cancellation.is_cancelled() {
+                return;
+            }
+            let Some(runtime) = weak.upgrade() else {
+                return;
+            };
+            if let Err(error) = runtime.unload_if_idle(ticket).await {
+                log::debug!("idle local cleanup model unload failed: {error}");
+            }
+            runtime.clear_idle_unload_control(generation);
+        });
     }
 
     pub fn begin_shutdown(&self) {
         if self.shutting_down.swap(true, Ordering::AcqRel) {
             return;
         }
-        self.phase.store(PHASE_STOPPING, Ordering::Release);
+        self.invalidate_idle_unload();
+        self.set_phase(PHASE_STOPPING);
         if let Some((_, cancel)) = self
             .active_process
             .lock()
@@ -2473,7 +2857,7 @@ impl Runtime {
         child.process.cancel.cancel();
         if child.process.wait_for_exit(CHILD_EXIT_TIMEOUT).await {
             *session = None;
-            self.phase.store(PHASE_NOT_LOADED, Ordering::Release);
+            self.set_phase(PHASE_NOT_LOADED);
             true
         } else {
             false
@@ -2534,16 +2918,16 @@ impl Runtime {
             .is_some_and(|existing| existing.process.has_exited())
         {
             *session = None;
-            self.phase.store(PHASE_NOT_LOADED, Ordering::Release);
+            self.set_phase(PHASE_NOT_LOADED);
         }
         if let Some(existing) = session.as_mut() {
             if existing.process.cancel.is_cancelled() {
                 if !existing.process.wait_for_exit(CHILD_EXIT_TIMEOUT).await {
-                    self.phase.store(PHASE_STOPPING, Ordering::Release);
+                    self.set_phase(PHASE_STOPPING);
                     return Err(RuntimeError::RetainedPending);
                 }
                 *session = None;
-                self.phase.store(PHASE_NOT_LOADED, Ordering::Release);
+                self.set_phase(PHASE_NOT_LOADED);
             } else {
                 return Ok(());
             }
@@ -2621,6 +3005,7 @@ impl Runtime {
         let child_cancel = supervisor_cancel.clone();
         let phase = Arc::clone(&self.phase);
         let model_resident = Arc::clone(&self.model_resident);
+        let supervisor_status_observer = Arc::clone(&self.status_observer);
         let supervisor_registration = child_registration.clone();
         *self
             .active_process
@@ -2659,7 +3044,7 @@ impl Runtime {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .take();
             model_resident.store(false, Ordering::Release);
-            phase.store(PHASE_NOT_LOADED, Ordering::Release);
+            store_phase_and_notify(&phase, PHASE_NOT_LOADED, &supervisor_status_observer);
             supervisor_registration.retire_after_exit();
             let mut active = active
                 .lock()
@@ -2788,7 +3173,7 @@ impl Runtime {
                     && model.manifest_sha256() == model_descriptor.manifest_sha256
             })
         {
-            self.phase.store(PHASE_READY, Ordering::Release);
+            self.set_phase(PHASE_READY);
             mlx_diagnostics::event(EventName::CleanupModelLoad, Severity::Info, Target::Runtime)
                 .request_id(request_id)
                 .session_generation(session_generation)
@@ -2821,10 +3206,10 @@ impl Runtime {
                 Err(error) => {
                     let close = self.retire_session(session, CHILD_EXIT_TIMEOUT).await;
                     if let Err(close_error) = close {
-                        self.phase.store(PHASE_STOPPING, Ordering::Release);
+                        self.set_phase(PHASE_STOPPING);
                         return Err(error_after_child_retirement(error, close_error));
                     }
-                    self.phase.store(PHASE_NOT_LOADED, Ordering::Release);
+                    self.set_phase(PHASE_NOT_LOADED);
                     return Err(error);
                 }
             };
@@ -2835,10 +3220,10 @@ impl Runtime {
             {
                 let close = self.retire_session(session, CHILD_EXIT_TIMEOUT).await;
                 if let Err(close_error) = close {
-                    self.phase.store(PHASE_STOPPING, Ordering::Release);
+                    self.set_phase(PHASE_STOPPING);
                     return Err(close_error);
                 }
-                self.phase.store(PHASE_NOT_LOADED, Ordering::Release);
+                self.set_phase(PHASE_NOT_LOADED);
                 return Err(RuntimeError::InvalidResponse);
             }
             let child = session.as_mut().ok_or(RuntimeError::SidecarMissing)?;
@@ -2851,7 +3236,7 @@ impl Runtime {
                 .take();
             self.model_resident.store(false, Ordering::Release);
         }
-        self.phase.store(PHASE_LOADING, Ordering::Release);
+        self.set_phase(PHASE_LOADING);
         let validation_started = Instant::now();
         let manager = if model_id == MODEL_ID {
             self.manager.clone()
@@ -2926,6 +3311,7 @@ impl Runtime {
             span.finish();
         }
         let (model, inventory_facts) = resolved?;
+        notify_cleanup_observer(&self.status_observer, Some(model_id));
         let inventory_validation_seconds = validation_started.elapsed().as_secs_f64();
         mlx_diagnostics::event(
             EventName::CleanupModelInventoryReady,
@@ -3030,10 +3416,10 @@ impl Runtime {
                 request_guard.disarm();
                 let close = self.retire_session(session, CHILD_EXIT_TIMEOUT).await;
                 if let Err(close_error) = close {
-                    self.phase.store(PHASE_STOPPING, Ordering::Release);
+                    self.set_phase(PHASE_STOPPING);
                     return Err(close_error);
                 }
-                self.phase.store(PHASE_NOT_LOADED, Ordering::Release);
+                self.set_phase(PHASE_NOT_LOADED);
                 return Err(error);
             }
         };
@@ -3065,14 +3451,14 @@ impl Runtime {
                 .emit();
             let close = self.retire_session(session, CHILD_EXIT_TIMEOUT).await;
             if let Err(close_error) = close {
-                self.phase.store(PHASE_STOPPING, Ordering::Release);
+                self.set_phase(PHASE_STOPPING);
                 return Err(error_after_child_retirement(error, close_error));
             }
-            self.phase.store(PHASE_NOT_LOADED, Ordering::Release);
+            self.set_phase(PHASE_NOT_LOADED);
             return Err(error);
         }
         self.model_resident.store(true, Ordering::Release);
-        self.phase.store(PHASE_READY, Ordering::Release);
+        self.set_phase(PHASE_READY);
         mlx_diagnostics::event(EventName::CleanupModelLoad, Severity::Info, Target::Runtime)
             .request_id(request_id)
             .session_generation(session_generation)
@@ -3097,13 +3483,13 @@ impl Runtime {
         };
         child.process.cancel.cancel();
         if !child.process.wait_for_exit(deadline).await {
-            self.phase.store(PHASE_STOPPING, Ordering::Release);
+            self.set_phase(PHASE_STOPPING);
             return Err(RuntimeError::RetainedPending);
         }
         let id = child.process.id;
         *session = None;
         self.clear_active_child(id);
-        self.phase.store(PHASE_NOT_LOADED, Ordering::Release);
+        self.set_phase(PHASE_NOT_LOADED);
         Ok(())
     }
 
@@ -3120,6 +3506,61 @@ impl Runtime {
         }
     }
 }
+
+fn idle_unload_model_matches(
+    ticket: &IdleUnloadTicket,
+    loaded_model_id: &str,
+    loaded_model_revision: &str,
+) -> bool {
+    ticket.model_id == loaded_model_id && ticket.model_revision == loaded_model_revision
+}
+
+#[derive(Clone, Copy)]
+struct IdleUnloadState {
+    current_generation: u64,
+    session_child_generation: Option<u64>,
+    active_child_generation: Option<u64>,
+    shutting_down: bool,
+    phase: u8,
+    model_resident: bool,
+    foreground_demands: usize,
+    warmup_in_flight: usize,
+    child_cancelled: bool,
+    model_matches: bool,
+    ticket_cancelled: bool,
+}
+
+fn idle_unload_is_current(
+    ticket_generation: u64,
+    ticket_child_generation: u64,
+    state: IdleUnloadState,
+) -> bool {
+    ticket_generation == state.current_generation
+        && state.session_child_generation == Some(ticket_child_generation)
+        && state.active_child_generation == Some(ticket_child_generation)
+        && !state.shutting_down
+        && state.phase == PHASE_READY
+        && state.model_resident
+        && state.foreground_demands == 0
+        && state.warmup_in_flight == 0
+        && !state.child_cancelled
+        && state.model_matches
+        && !state.ticket_cancelled
+}
+
+impl Drop for Runtime {
+    fn drop(&mut self) {
+        if let Some((_, cancellation)) = self
+            .idle_unload_control
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        {
+            cancellation.cancel();
+        }
+    }
+}
+
 struct RequestTerminalLog {
     request_id: String,
     source_history_id: String,
@@ -3254,19 +3695,20 @@ struct RestorePhaseOnDrop<'a> {
     phase: Arc<AtomicU8>,
     model_resident: Arc<AtomicBool>,
     shutting_down: &'a AtomicBool,
+    status_observer: Arc<Mutex<Option<CleanupStatusObserver>>>,
 }
 
 impl Drop for RestorePhaseOnDrop<'_> {
     fn drop(&mut self) {
         if self.shutting_down.load(Ordering::Acquire) {
-            self.phase.store(PHASE_STOPPING, Ordering::Release);
+            store_phase_and_notify(&self.phase, PHASE_STOPPING, &self.status_observer);
         } else if self.phase.load(Ordering::Acquire) == PHASE_STOPPING {
             // A cancelled request keeps its cleanup process and cleanup gate owned by
             // the supervisor until the child has actually exited.
         } else if self.model_resident.load(Ordering::Acquire) {
-            self.phase.store(PHASE_READY, Ordering::Release);
+            store_phase_and_notify(&self.phase, PHASE_READY, &self.status_observer);
         } else {
-            self.phase.store(PHASE_NOT_LOADED, Ordering::Release);
+            store_phase_and_notify(&self.phase, PHASE_NOT_LOADED, &self.status_observer);
         }
     }
 }
@@ -3481,24 +3923,33 @@ fn completed_response_is_safe_to_reuse(request: &Request, response: &Response) -
             .is_some_and(|revision| response.loaded_model_version.as_deref() == Some(revision))
 }
 
+struct UnclaimedResponseState<'a> {
+    phase: &'a AtomicU8,
+    model_resident: &'a AtomicBool,
+    shutting_down: &'a AtomicBool,
+    status_observer: &'a Mutex<Option<CleanupStatusObserver>>,
+}
+
 async fn settle_unclaimed_response(
     mut session: OwnedCleanupSession,
     request: &Request,
     response: &Response,
     force_retire: bool,
-    phase: Arc<AtomicU8>,
-    model_resident: Arc<AtomicBool>,
-    shutting_down: Arc<AtomicBool>,
+    state: &UnclaimedResponseState<'_>,
 ) {
     if !force_retire && completed_response_is_safe_to_reuse(request, response) {
         if let Some(child) = session.as_ref() {
             child.process.release_cleanup_gate();
-            model_resident.store(true, Ordering::Release);
-            if shutting_down.load(Ordering::Acquire) {
-                phase.store(PHASE_STOPPING, Ordering::Release);
-            } else {
-                phase.store(PHASE_READY, Ordering::Release);
-            }
+            state.model_resident.store(true, Ordering::Release);
+            store_phase_and_notify(
+                state.phase,
+                if state.shutting_down.load(Ordering::Acquire) {
+                    PHASE_STOPPING
+                } else {
+                    PHASE_READY
+                },
+                state.status_observer,
+            );
         }
         return;
     }
@@ -3506,9 +3957,9 @@ async fn settle_unclaimed_response(
         child.process.cancel.cancel();
         if child.process.wait_for_exit(CHILD_EXIT_TIMEOUT).await {
             *session = None;
-            phase.store(PHASE_NOT_LOADED, Ordering::Release);
+            store_phase_and_notify(state.phase, PHASE_NOT_LOADED, state.status_observer);
         } else {
-            phase.store(PHASE_STOPPING, Ordering::Release);
+            store_phase_and_notify(state.phase, PHASE_STOPPING, state.status_observer);
         }
     }
 }
@@ -4639,6 +5090,7 @@ mod tests {
         );
         let encoded = serde_json::to_value(request).expect("serialize S1 cleanup request");
         assert_eq!(encoded["language"], "en");
+        assert_eq!(encoded["max_output_tokens"], S1_MINI_MAX_OUTPUT_TOKENS);
 
         let ordinary = Request::cleanup_for(
             modelstore::QWEN_35_2B_MLX_ID,
@@ -4650,6 +5102,7 @@ mod tests {
         );
         let ordinary = serde_json::to_value(ordinary).expect("serialize ordinary cleanup request");
         assert!(ordinary.get("language").is_none());
+        assert_eq!(ordinary["max_output_tokens"], MAX_OUTPUT_TOKENS);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -8252,6 +8705,27 @@ for line in sys.stdin:
     }
 
     #[test]
+    fn startup_warmup_request_binds_its_selected_model_pin() {
+        let model = modelstore::mlx_model(modelstore::QWEN_35_2B_MLX_ID)
+            .expect("the fixed warmup route has a pinned catalog model");
+        let request = Request::startup_warmup_for(
+            model.id,
+            model.revision,
+            "startup-model-bound-test".to_owned(),
+            Some("startup-model-bound-session".to_owned()),
+            vec![
+                ("system".to_owned(), "fixed system prompt".to_owned()),
+                ("user".to_owned(), "synthetic warmup transcript".to_owned()),
+            ],
+            Some(0),
+        );
+        let value = serde_json::to_value(request).expect("warmup request serializes");
+        assert_eq!(value["model_id"], model.id);
+        assert_eq!(value["model_version"], model.revision);
+        assert_eq!(value["stable_prefix_user_bytes"], 0);
+    }
+
+    #[test]
     fn response_runtime_facts_are_optional_and_typed() {
         let legacy: Response = serde_json::from_str(
             r#"{"protocol_version":1,"request_id":"request-1","session_id":null,"model_version":null,"op":"cleanup","status":"completed"}"#,
@@ -8371,6 +8845,246 @@ for line in sys.stdin:
             startup_warmup_pressure_error(Pressure::Critical),
             Some(RuntimeError::CriticalMemoryPressure)
         ));
+    }
+
+    #[test]
+    fn idle_unload_uses_actual_resident_model_after_a_rejected_route_request() {
+        let actual_resident_model = "qwen35-2b";
+        let rejected_requested_model = "gemma4-e4b";
+        let ticket = idle_unload_ticket_for_resident(
+            8,
+            14,
+            actual_resident_model,
+            "revision-a",
+            CancellationToken::new(),
+        );
+        assert_eq!(ticket.model_id, actual_resident_model);
+        assert_ne!(ticket.model_id, rejected_requested_model);
+        assert!(idle_unload_model_matches(
+            &ticket,
+            actual_resident_model,
+            "revision-a"
+        ));
+        assert!(!idle_unload_model_matches(
+            &ticket,
+            rejected_requested_model,
+            "revision-b"
+        ));
+    }
+
+    #[test]
+    fn idle_unload_requires_the_same_ready_child_and_no_active_work() {
+        assert_eq!(MODEL_IDLE_UNLOAD_TIMEOUT.as_secs(), 15 * 60);
+        let eligible = IdleUnloadState {
+            current_generation: 8,
+            session_child_generation: Some(14),
+            active_child_generation: Some(14),
+            shutting_down: false,
+            phase: PHASE_READY,
+            model_resident: true,
+            foreground_demands: 0,
+            warmup_in_flight: 0,
+            child_cancelled: false,
+            model_matches: true,
+            ticket_cancelled: false,
+        };
+        assert!(idle_unload_is_current(8, 14, eligible));
+        assert!(!idle_unload_is_current(
+            8,
+            14,
+            IdleUnloadState {
+                current_generation: 9,
+                ..eligible
+            }
+        ));
+        assert!(!idle_unload_is_current(
+            8,
+            14,
+            IdleUnloadState {
+                session_child_generation: Some(15),
+                active_child_generation: Some(15),
+                ..eligible
+            }
+        ));
+        assert!(!idle_unload_is_current(
+            8,
+            14,
+            IdleUnloadState {
+                foreground_demands: 1,
+                ..eligible
+            }
+        ));
+        assert!(!idle_unload_is_current(
+            8,
+            14,
+            IdleUnloadState {
+                warmup_in_flight: 1,
+                ..eligible
+            }
+        ));
+        assert!(!idle_unload_is_current(
+            8,
+            14,
+            IdleUnloadState {
+                phase: PHASE_CLEANING,
+                ..eligible
+            }
+        ));
+        assert!(!idle_unload_is_current(
+            8,
+            14,
+            IdleUnloadState {
+                ticket_cancelled: true,
+                ..eligible
+            }
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn schedule_idle_unload_unloads_after_warmup_handoff_and_cancelled_cleanup() {
+        static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
+        let suffix = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "voiceflow-idle-unload-runtime-{}-{suffix}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).expect("create idle-unload fixture");
+        let worker_path = root.join("idle-unload-worker.py");
+        let unloaded_flag = root.join("unloaded.flag");
+        let cleanup_started_flag = root.join("cleanup-started.flag");
+        let release_cleanup_flag = root.join("release-cleanup.flag");
+        let worker_source = format!(
+            r#"import json, pathlib, sys, time
+unloaded = pathlib.Path({unloaded:?})
+cleanup_started = pathlib.Path({cleanup_started:?})
+release_cleanup = pathlib.Path({release_cleanup:?})
+for line in sys.stdin:
+ req=json.loads(line)
+ base={{'protocol_version':1,'request_id':req['request_id'],'session_id':req.get('session_id'),'model_version':req.get('model_version'),'op':req['op'],'platform_supported':True}}
+ if req['op']=='hello': base.update(status='ready')
+ elif req['op']=='load': base.update(status='loaded',loaded_model_id=req['model_id'],loaded_model_version=req['model_version'])
+ elif req['op']=='warmup': base.update(status='completed',loaded_model_id=req['model_id'],loaded_model_version=req['model_version'],warmup_result={{'status':'evaluated','prompt_tokens':5,'generation_tokens':1,'completion':'stop','info_observed':True,'tool_call_observed':False,'completion_text_seen':True,'prompt_evaluation_observed':True,'observed_prompt_tokens':5,'stream_drained':True,'evaluation_synchronized':True,'evaluation_time_seconds':0.01,'prompt_time_seconds':0.01,'generation_time_seconds':0.01,'prompt_cache_status':'bypassed','cached_prefix_tokens':0,'computed_suffix_tokens':5}})
+ elif req['op']=='cleanup':
+  cleanup_started.write_text('1')
+  deadline = time.monotonic() + 5.0
+  while not release_cleanup.exists() and time.monotonic() < deadline:
+   time.sleep(0.005)
+  base.update(status='completed',loaded_model_id=req['model_id'],loaded_model_version=req['model_version'],cleanup_result={{'text':'idle-unload-ok','prompt_tokens':2,'generation_tokens':1,'prompt_time_seconds':0.01,'generation_time_seconds':0.01,'prompt_cache_status':'memory_hit','cached_prefix_tokens':2,'computed_suffix_tokens':0,'completion':'stop'}})
+ elif req['op']=='unload':
+  unloaded.write_text('1')
+  base.update(status='unloaded',loaded_model_id=None,loaded_model_version=None)
+ elif req['op']=='quit': break
+ sys.stdout.write(json.dumps(base,separators=(',',':'))+'\n'); sys.stdout.flush()
+"#,
+            unloaded = unloaded_flag.to_string_lossy(),
+            cleanup_started = cleanup_started_flag.to_string_lossy(),
+            release_cleanup = release_cleanup_flag.to_string_lossy(),
+        );
+        std::fs::write(&worker_path, worker_source).expect("write idle-unload worker");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&worker_path, std::fs::Permissions::from_mode(0o600))
+                .expect("restrict idle-unload worker");
+        }
+        let mut runtime_inner = Runtime::with_test_worker(
+            root.join("models"),
+            Manager::new(),
+            PathBuf::from("python3"),
+            vec!["-B".into(), worker_path.to_string_lossy().into_owned()],
+        );
+        runtime_inner.idle_unload_timeout = Duration::from_millis(60);
+        let runtime = Arc::new(runtime_inner);
+
+        runtime
+            .prewarm_startup(
+                vec![
+                    ("system".to_owned(), "synthetic warmup".to_owned()),
+                    ("user".to_owned(), "synthetic body".to_owned()),
+                ],
+                None,
+                "idle_unload_warmup",
+                Arc::new(|| true),
+            )
+            .await
+            .expect("warmup completes cleanly");
+
+        // Trigger Path A: schedule immediately while owner task hasn't dropped its in-flight guard yet.
+        runtime
+            .startup_warmup_in_flight_owners
+            .store(1, Ordering::Release);
+        runtime.schedule_idle_unload();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        runtime
+            .startup_warmup_in_flight_owners
+            .store(0, Ordering::Release);
+
+        let unloaded = tokio::time::timeout(Duration::from_secs(3), async {
+            while !unloaded_flag.exists() {
+                tokio::time::sleep(Duration::from_millis(15)).await;
+            }
+        })
+        .await;
+        assert!(
+            unloaded.is_ok(),
+            "idle unload must still fire after warmup handoff clears"
+        );
+
+        // Trigger Path B: cancel/drop a completion so PHASE_STOPPING delays schedule_idle_unload until owner settles.
+        let _ = std::fs::remove_file(&unloaded_flag);
+        let (reached2, release2) = (
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(tokio::sync::Notify::new()),
+        );
+        let mut runtime2_inner = Runtime::with_test_worker(
+            root.join("models"),
+            Manager::new(),
+            PathBuf::from("python3"),
+            vec!["-B".into(), worker_path.to_string_lossy().into_owned()],
+        );
+        runtime2_inner.idle_unload_timeout = Duration::from_millis(40);
+        runtime2_inner.test_response_handoff_pause =
+            Some((Arc::clone(&reached2), Arc::clone(&release2)));
+        let runtime2 = Arc::new(runtime2_inner);
+        let mut cleanup2 = Box::pin(runtime2.complete_with_source_history_and_prefix_traced(
+            vec![
+                ("system".to_owned(), "synthetic system".to_owned()),
+                ("user".to_owned(), "synthetic body".to_owned()),
+            ],
+            None,
+            None,
+            None,
+        ));
+        tokio::select! {
+            biased;
+            res = &mut cleanup2 => panic!("cleanup returned before worker pause: {res:?}"),
+            _ = async {
+                while !cleanup_started_flag.exists() {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            } => {}
+        }
+        std::fs::write(&release_cleanup_flag, "1").expect("release worker cleanup reply");
+        tokio::time::timeout(Duration::from_secs(3), reached2.notified())
+            .await
+            .expect("owner pauses at response handoff");
+        drop(cleanup2);
+        assert_eq!(runtime2.phase.load(Ordering::Acquire), PHASE_STOPPING);
+        runtime2.schedule_idle_unload();
+        release2.notify_one();
+        let unloaded2 = tokio::time::timeout(Duration::from_secs(3), async {
+            while !unloaded_flag.exists() {
+                tokio::time::sleep(Duration::from_millis(15)).await;
+            }
+        })
+        .await;
+        assert!(
+            unloaded2.is_ok(),
+            "idle unload must reschedule after PHASE_STOPPING owner settles to READY"
+        );
+        runtime.shutdown().await;
+        runtime2.shutdown().await;
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

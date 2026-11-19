@@ -12,6 +12,7 @@
     "allow-get-hud-appearance-status",
     "allow-get-delivery-settlement-snapshot",
     "allow-undo-learn-pair",
+    "allow-promote-learn-pair",
     "allow-hide-island-if-idle",
     "allow-set-island-learn-interactive",
     "allow-set-island-details-visible",

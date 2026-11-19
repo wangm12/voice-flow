@@ -21,6 +21,10 @@ export default defineConfig({
         find: "border-beam",
         replacement: localDependency("border-beam/dist/index.es.js"),
       },
+      {
+        find: "voice-glow",
+        replacement: localDependency("voice-glow/dist/index.es.js"),
+      },
     ],
   },
   server: { port: 5173, strictPort: true },

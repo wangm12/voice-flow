@@ -1871,7 +1871,9 @@ fn on_device_mlx_request_facts(
         .insert("temperature".into(), serde_json::json!(0));
     request.fields_constructed.insert(
         "max_output_tokens".into(),
-        serde_json::json!(crate::mlx_cleanup_runtime::MAX_OUTPUT_TOKENS),
+        serde_json::json!(crate::mlx_cleanup_runtime::max_output_tokens_for_model(
+            model
+        )),
     );
     request
         .fields_constructed
@@ -2788,6 +2790,8 @@ pub(crate) enum StartupWarmupKind {
 }
 
 pub(crate) fn startup_warmup_prompt(
+    provider: Option<crate::providers::EngineProvider>,
+    model: &str,
     effort: CleanupEffort,
     policy: Option<&ContextPolicy>,
     translation_target: Option<&str>,
@@ -2820,8 +2824,21 @@ pub(crate) fn startup_warmup_prompt(
         visible_context: None,
         source_transcript: None,
     };
-    let (messages, stable_prefix_user_bytes) =
+    let (mut messages, stable_prefix_user_bytes) =
         cleanup_messages_with_prefix_boundary(&intent, &prompt);
+    let allow_model_selected_paragraphs = policy.is_some_and(|policy| {
+        policy.cleanup_output_plan.is_some_and(|plan| {
+            plan.structure == crate::cleanup_prompt::StructureClass::ModelSelectedParagraphs
+        })
+    });
+    append_native_cleanup_recipe_instruction(
+        provider,
+        model,
+        &intent,
+        effort,
+        allow_model_selected_paragraphs,
+        &mut messages,
+    );
     StartupWarmupPrompt {
         messages: messages
             .into_iter()
@@ -4038,34 +4055,108 @@ fn preserves_protected_tokens(raw: &str, cleaned: &str) -> bool {
     preserves_protected_tokens_for_operation(raw, cleaned, None)
 }
 
-fn letter_script_counts(text: &str) -> (usize, usize) {
-    let mut cjk = 0usize;
-    let mut latin = 0usize;
-    for ch in text.chars() {
-        if is_cjk_character(ch) {
-            cjk += 1;
-        } else if ch.is_ascii_alphabetic() {
-            latin += 1;
+#[derive(Default, Clone, Copy)]
+struct ScriptHistogram {
+    han: usize,
+    kana: usize,
+    hangul: usize,
+    latin: usize,
+    cyrillic: usize,
+    arabic: usize,
+    devanagari: usize,
+    thai: usize,
+}
+
+impl ScriptHistogram {
+    fn from_text(text: &str) -> Self {
+        let mut hist = Self::default();
+        for ch in text.chars() {
+            if is_cjk_character(ch) {
+                hist.han += 1;
+            } else if matches!(ch, '\u{3040}'..='\u{309F}' | '\u{30A0}'..='\u{30FF}' | '\u{FF66}'..='\u{FF9D}')
+            {
+                hist.kana += 1;
+            } else if matches!(ch, '\u{AC00}'..='\u{D7AF}' | '\u{1100}'..='\u{11FF}' | '\u{3130}'..='\u{318F}')
+            {
+                hist.hangul += 1;
+            } else if ch.is_ascii_alphabetic()
+                || matches!(ch, '\u{00C0}'..='\u{024F}' | '\u{1E00}'..='\u{1EFF}')
+            {
+                hist.latin += 1;
+            } else if matches!(ch, '\u{0400}'..='\u{052F}') {
+                hist.cyrillic += 1;
+            } else if matches!(ch, '\u{0600}'..='\u{06FF}' | '\u{0750}'..='\u{077F}' | '\u{08A0}'..='\u{08FF}')
+            {
+                hist.arabic += 1;
+            } else if matches!(ch, '\u{0900}'..='\u{097F}') {
+                hist.devanagari += 1;
+            } else if matches!(ch, '\u{0E00}'..='\u{0E7F}') {
+                hist.thai += 1;
+            }
         }
+        hist
     }
-    (cjk, latin)
+
+    fn buckets(self) -> [usize; 7] {
+        [
+            self.han,
+            self.hangul,
+            self.latin,
+            self.cyrillic,
+            self.arabic,
+            self.devanagari,
+            self.thai,
+        ]
+    }
 }
 
 fn preserves_source_script(raw: &str, cleaned: &str, operation: CleanupOperation) -> bool {
     if operation == CleanupOperation::Translate {
         return true;
     }
-    let (raw_cjk, raw_latin) = letter_script_counts(raw);
-    let (out_cjk, out_latin) = letter_script_counts(cleaned);
-    let raw_letters = raw_cjk.saturating_add(raw_latin);
-    if raw_letters < 4 {
+    let raw_hist = ScriptHistogram::from_text(raw);
+    let out_hist = ScriptHistogram::from_text(cleaned);
+    let raw_buckets = raw_hist.buckets();
+    let out_buckets = out_hist.buckets();
+    // Japanese mixes Han (Kanji) and Kana: allow Kanji<->Kana conversion when
+    // the source already uses Kana, while rejecting unexpected Kana introduced into
+    // pure-Han Chinese output.
+    let raw_total: usize = raw_buckets.iter().sum::<usize>() + raw_hist.kana;
+    if raw_total < 4 {
         return true;
     }
-    if raw_cjk * 2 > raw_letters && out_latin > out_cjk && out_latin >= 4 {
+    if raw_hist.kana == 0 && out_hist.kana >= 4 && out_hist.kana > raw_hist.han {
         return false;
     }
-    if raw_latin * 2 > raw_letters && out_cjk > out_latin && out_cjk >= 4 {
-        return false;
+    for (i, &raw_count) in raw_buckets.iter().enumerate() {
+        let effective_raw = if i == 0 && raw_hist.kana > 0 {
+            raw_count + raw_hist.kana
+        } else {
+            raw_count
+        };
+        if effective_raw * 2 <= raw_total {
+            continue;
+        }
+        let out_same = if i == 0 && raw_hist.kana > 0 {
+            out_buckets[i] + out_hist.kana
+        } else {
+            out_buckets[i]
+        };
+        let extra_kana_other = if i != 0 || raw_hist.kana == 0 {
+            out_hist.kana
+        } else {
+            0
+        };
+        let out_other: usize = out_buckets
+            .iter()
+            .enumerate()
+            .filter(|(j, _)| *j != i)
+            .map(|(_, count)| *count)
+            .sum::<usize>()
+            + extra_kana_other;
+        if out_other > out_same && out_other >= 4 {
+            return false;
+        }
     }
     true
 }
@@ -7306,6 +7397,57 @@ data: [DONE]
             "把 VoiceFlow latency 降到 200ms。",
             CleanupOperation::Cleanup,
         ));
+        // Multilingual Phase 2B script preservation checks
+        assert!(preserves_source_script(
+            "今日の会議は3時からです",
+            "今日の会議は3時からです。",
+            CleanupOperation::Cleanup,
+        ));
+        assert!(!preserves_source_script(
+            "今日の会議は3時からです",
+            "Today's meeting starts at 3pm.",
+            CleanupOperation::Cleanup,
+        ));
+        assert!(preserves_source_script(
+            "오늘 회의는 세 시입니다",
+            "오늘 회의는 세 시입니다.",
+            CleanupOperation::Cleanup,
+        ));
+        assert!(!preserves_source_script(
+            "오늘 회의는 세 시입니다",
+            "Today's meeting is at three.",
+            CleanupOperation::Cleanup,
+        ));
+        assert!(preserves_source_script(
+            "Встреча начнётся в три часа",
+            "Встреча начнётся в три часа.",
+            CleanupOperation::Cleanup,
+        ));
+        assert!(!preserves_source_script(
+            "Встреча начнётся в три часа",
+            "The meeting will start at three.",
+            CleanupOperation::Cleanup,
+        ));
+        assert!(preserves_source_script(
+            "اجتماع اليوم الساعة الثالثة",
+            "اجتماع اليوم الساعة الثالثة.",
+            CleanupOperation::Cleanup,
+        ));
+        assert!(preserves_source_script(
+            "आज की बैठक तीन बजे है",
+            "आज की बैठक तीन बजे है।",
+            CleanupOperation::Cleanup,
+        ));
+        assert!(preserves_source_script(
+            "การประชุมวันนี้เริ่มบ่ายสามโมง",
+            "การประชุมวันนี้เริ่มบ่ายสามโมง",
+            CleanupOperation::Cleanup,
+        ));
+        assert!(preserves_source_script(
+            "C'est très important pour nous demain.",
+            "C'est très important pour nous demain.",
+            CleanupOperation::Cleanup,
+        ));
     }
 
     #[tokio::test]
@@ -8146,12 +8288,16 @@ data: [DONE]
         let mut policy = ContextPolicy::for_family(ContextFamily::PromptOrCode);
         policy.input_kind = crate::context::FocusKind::Code;
         let live = startup_warmup_prompt(
+            None,
+            "synthetic-model",
             CleanupEffort::Light,
             Some(&policy),
             None,
             StartupWarmupKind::CodeImplicitLive,
         );
         let reclean = startup_warmup_prompt(
+            None,
+            "synthetic-model",
             CleanupEffort::Command,
             Some(&policy),
             None,
@@ -8160,6 +8306,8 @@ data: [DONE]
         let mut general_policy = ContextPolicy::for_family(ContextFamily::General);
         general_policy.input_kind = crate::context::FocusKind::Unknown;
         let general = startup_warmup_prompt(
+            None,
+            "synthetic-model",
             CleanupEffort::Light,
             Some(&general_policy),
             None,
@@ -8211,6 +8359,62 @@ data: [DONE]
             live.messages[0].1.as_str(),
             "warmup and serialized production cleanup share the Code implicit system prefix"
         );
+
+        let mut ministral_general_policy = ContextPolicy::for_family(ContextFamily::General);
+        ministral_general_policy.input_kind = crate::context::FocusKind::Unknown;
+        ministral_general_policy.cleanup_output_plan =
+            crate::cleanup_prompt::EffectiveCleanupPlan::for_mode(
+                crate::cleanup_prompt::EditBudget::Light,
+                crate::cleanup_prompt::OutputMode::Auto,
+                crate::cleanup_prompt::AutoScene::General,
+                crate::cleanup_prompt::StructureClass::ModelSelectedParagraphs,
+            );
+        let ministral = startup_warmup_prompt(
+            Some(crate::providers::EngineProvider::OnDeviceMlx),
+            crate::modelstore::MINISTRAL_3_3B_INSTRUCT_MLX_ID,
+            CleanupEffort::Light,
+            Some(&ministral_general_policy),
+            None,
+            StartupWarmupKind::GeneralImplicitLive,
+        );
+        assert!(ministral.messages[0]
+            .1
+            .ends_with(MINISTRAL_LIGHT_CLEANUP_PARAGRAPHING_INSTRUCTION));
+        assert_eq!(ministral.stable_prefix_user_bytes, Some(0));
+        let ministral_intent = CleanupIntent::implicit("startup warmup");
+        let ministral_live_prompt = CleanupPromptContext {
+            context: None,
+            policy: Some(&ministral_general_policy),
+            profile: None,
+            pairs_hint: None,
+            effort: CleanupEffort::Light,
+            visible_context: None,
+            source_transcript: None,
+        };
+        let (mut ministral_live_messages, ministral_live_boundary) =
+            cleanup_messages_with_prefix_boundary(&ministral_intent, &ministral_live_prompt);
+        append_native_cleanup_recipe_instruction(
+            Some(crate::providers::EngineProvider::OnDeviceMlx),
+            crate::modelstore::MINISTRAL_3_3B_INSTRUCT_MLX_ID,
+            &ministral_intent,
+            CleanupEffort::Light,
+            true,
+            &mut ministral_live_messages,
+        );
+        assert_eq!(ministral_live_boundary, ministral.stable_prefix_user_bytes);
+        assert_eq!(ministral_live_messages[0].content, ministral.messages[0].1);
+
+        let ministral_history = startup_warmup_prompt(
+            Some(crate::providers::EngineProvider::OnDeviceMlx),
+            crate::modelstore::MINISTRAL_3_3B_INSTRUCT_MLX_ID,
+            CleanupEffort::Light,
+            Some(&policy),
+            None,
+            StartupWarmupKind::CodeHistoryReclean,
+        );
+        assert!(!ministral_history.messages[0]
+            .1
+            .contains(MINISTRAL_LIGHT_CLEANUP_PARAGRAPHING_INSTRUCTION));
         assert_eq!(
             live.messages[1].1.get(..live_boundary),
             direct_live_user.get(..live_boundary),
@@ -9382,5 +9586,19 @@ mod verified_local_request_fixtures {
             completion_route("https://api.groq.com/openai/v1/chat/completions")
                 == CompletionRoute::OpenAi
         );
+    }
+
+    #[test]
+    fn preserves_source_script_blocks_unrequested_kana_when_latin_is_dominant() {
+        assert!(!preserves_source_script(
+            "Test the アプリ today please.",
+            "テストアプリアプリ",
+            CleanupOperation::Cleanup,
+        ));
+        assert!(preserves_source_script(
+            "Test the アプリ today please.",
+            "Test the アプリ today please.",
+            CleanupOperation::Cleanup,
+        ));
     }
 }

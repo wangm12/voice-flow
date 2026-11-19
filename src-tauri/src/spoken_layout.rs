@@ -3441,8 +3441,7 @@ fn preserves_layout_views(source_view: &str, candidate_view: &str) -> bool {
     if !has_structural_layout(source_view) {
         return !has_structural_layout(candidate_view);
     }
-    if !preserves_explicit_layout_content(source_view, candidate_view)
-        || newline_count(source_view) != newline_count(candidate_view)
+    if newline_count(source_view) != newline_count(candidate_view)
         || list_prefix_count(source_view) != list_prefix_count(candidate_view)
     {
         return false;
@@ -3452,10 +3451,19 @@ fn preserves_layout_views(source_view: &str, candidate_view: &str) -> bool {
     if source_lines.len() != candidate_lines.len() {
         return false;
     }
+    if crate::cleanup_structure_guard::preserves_line_structure_with_inline_filler_cleanup(
+        source_view,
+        candidate_view,
+    ) {
+        return true;
+    }
     let preserve_indentation = source_lines.iter().any(|line| {
         let indent = line.len() - line.trim_start_matches([' ', '\t']).len();
         indent > 0
     });
+    if !preserves_explicit_layout_content(source_view, candidate_view) {
+        return false;
+    }
     if preserve_indentation {
         return source_view == candidate_view;
     }
@@ -5781,17 +5789,25 @@ fn cjk_len(text: &str) -> usize {
 }
 
 fn apply_line_commands_stage(text: &str) -> LayoutStage {
+    let literal_ranges: Vec<std::ops::Range<usize>> = code_literal_ranges(text)
+        .into_iter()
+        .chain(explicit_quote_ranges(text))
+        .collect();
     let mut out = String::with_capacity(text.len());
     let mut index = 0;
+    let mut last_consumed_end = 0;
     let mut consumed_syntax_ranges = Vec::new();
     while index < text.len() {
         if let Some((end, replacement)) = match_line_command_at(text, index) {
-            while out.ends_with(char::is_whitespace) {
-                out.pop();
-            }
+            let (consume_start, consume_end) =
+                line_command_consume_bounds(text, index, end, last_consumed_end, &literal_ranges);
+            let trim_len = index - consume_start;
+            debug_assert!(trim_len <= out.len());
+            out.truncate(out.len() - trim_len);
             out.push_str(replacement);
-            consumed_syntax_ranges.push(index..end);
-            index = skip_leading_whitespace(text, end);
+            consumed_syntax_ranges.push(consume_start..consume_end);
+            last_consumed_end = consume_end;
+            index = consume_end;
             continue;
         }
         let ch = text[index..].chars().next().expect("rest is non-empty");
@@ -5802,6 +5818,87 @@ fn apply_line_commands_stage(text: &str) -> LayoutStage {
         text: out,
         consumed_syntax_ranges,
     }
+}
+
+fn range_touches_literal(
+    literal_ranges: &[std::ops::Range<usize>],
+    start: usize,
+    end: usize,
+) -> bool {
+    literal_ranges
+        .iter()
+        .any(|literal| start < literal.end && literal.start < end)
+}
+
+fn is_pause_comma(ch: char) -> bool {
+    matches!(ch, ',' | '，')
+}
+
+fn line_command_consume_bounds(
+    text: &str,
+    start: usize,
+    end: usize,
+    last_consumed_end: usize,
+    literal_ranges: &[std::ops::Range<usize>],
+) -> (usize, usize) {
+    let mut ws_start = start;
+    while ws_start > last_consumed_end {
+        let Some((rel, ch)) = text[last_consumed_end..ws_start].char_indices().next_back() else {
+            break;
+        };
+        if !ch.is_whitespace() {
+            break;
+        }
+        let candidate = last_consumed_end + rel;
+        if range_touches_literal(literal_ranges, candidate, start) {
+            break;
+        }
+        ws_start = candidate;
+    }
+
+    let mut consume_start = ws_start;
+    if let Some((comma_rel, comma_ch)) =
+        text[last_consumed_end..ws_start].char_indices().next_back()
+    {
+        if is_pause_comma(comma_ch) {
+            let comma_start = last_consumed_end + comma_rel;
+            let mut before_comma_ws = comma_start;
+            while before_comma_ws > last_consumed_end {
+                let Some((rel, ch)) = text[last_consumed_end..before_comma_ws]
+                    .char_indices()
+                    .next_back()
+                else {
+                    break;
+                };
+                if !ch.is_whitespace() {
+                    break;
+                }
+                before_comma_ws = last_consumed_end + rel;
+            }
+            if !text[last_consumed_end..before_comma_ws].trim().is_empty()
+                && !range_touches_literal(literal_ranges, before_comma_ws, start)
+            {
+                consume_start = before_comma_ws;
+            }
+        }
+    }
+
+    let mut ws_end = skip_leading_whitespace(text, end);
+    if range_touches_literal(literal_ranges, end, ws_end) {
+        ws_end = end;
+    }
+    let mut consume_end = ws_end;
+    if let Some(comma_ch) = text[ws_end..].chars().next() {
+        if is_pause_comma(comma_ch) {
+            let after_comma = ws_end + comma_ch.len_utf8();
+            let after_comma_ws = skip_leading_whitespace(text, after_comma);
+            if !range_touches_literal(literal_ranges, end, after_comma_ws) {
+                consume_end = after_comma_ws;
+            }
+        }
+    }
+
+    (consume_start, consume_end)
 }
 
 fn match_line_command_at(text: &str, start: usize) -> Option<(usize, &'static str)> {
@@ -5818,17 +5915,16 @@ fn match_line_command_at(text: &str, start: usize) -> Option<(usize, &'static st
         }
         let end = start + from.len();
         if is_cjk_command(from) {
-            if !is_cjk_left_boundary(text, start) || !is_cjk_right_boundary(text, end) {
+            if from == "换行" {
+                if !is_cjk_pause_left_boundary(text, start)
+                    || !is_cjk_pause_right_boundary(text, end)
+                {
+                    continue;
+                }
+            } else if !is_cjk_left_boundary(text, start) || !is_cjk_right_boundary(text, end) {
                 continue;
             }
-            if negated_cjk_break(text, start) {
-                continue;
-            }
-            let after = text[end..].trim_start();
-            if ["符", "功能", "按钮", "选项", "命令", "指令", "这个功能"]
-                .iter()
-                .any(|word| after.starts_with(word))
-            {
+            if cjk_mention_or_negation_context(text, start, end) {
                 continue;
             }
         } else {
@@ -5855,6 +5951,138 @@ fn match_line_command_at(text: &str, start: usize) -> Option<(usize, &'static st
     None
 }
 
+fn is_cjk_pause_left_boundary(text: &str, start: usize) -> bool {
+    text[..start]
+        .chars()
+        .next_back()
+        .is_none_or(is_boundary_punct)
+}
+
+fn is_cjk_pause_right_boundary(text: &str, end: usize) -> bool {
+    text[end..].chars().next().is_none_or(is_boundary_punct)
+}
+
+fn cjk_mention_or_negation_context(text: &str, start: usize, end: usize) -> bool {
+    const BEFORE_DENIED: &[&str] = &[
+        "不要",
+        "不用",
+        "无需",
+        "不必",
+        "没有",
+        "不能",
+        "不会",
+        "不想",
+        "不该",
+        "别",
+        "不",
+        "没",
+        "未",
+        "说",
+        "写",
+        "打",
+        "打出",
+        "输入",
+        "输出",
+        "敲",
+        "发",
+        "叫",
+        "叫做",
+        "称为",
+        "意思是",
+        "是",
+        "为",
+        "成",
+        "改成",
+        "变成",
+        "换成",
+        "保留",
+        "显示",
+        "测试",
+        "识别",
+        "触发",
+        "执行",
+        "加",
+        "加上",
+        "添加",
+        "插入",
+        "删除",
+        "去掉",
+        "取消",
+        "一个",
+        "这个",
+        "那个",
+        "哪个",
+        "每个",
+        "每次",
+        "自动",
+        "手动",
+        "强制",
+        "默认",
+        "怎么",
+        "如何",
+        "为什么",
+        "把",
+        "将",
+        "对",
+        "关于",
+        "软",
+        "硬",
+    ];
+    const AFTER_DENIED: &[&str] = &[
+        "符",
+        "符号",
+        "字符",
+        "字",
+        "字样",
+        "词",
+        "词语",
+        "这两个字",
+        "两个字",
+        "二字",
+        "这个词",
+        "这个字",
+        "功能",
+        "按钮",
+        "选项",
+        "命令",
+        "指令",
+        "口令",
+        "这个功能",
+        "动作",
+        "操作",
+        "行为",
+        "问题",
+        "效果",
+        "逻辑",
+        "规则",
+        "方式",
+        "模式",
+        "设置",
+        "开关",
+        "键",
+        "处理",
+        "识别",
+        "的",
+        "了",
+        "吗",
+        "呢",
+        "吧",
+        "啊",
+        "时",
+        "的时候",
+        "后",
+        "之后",
+        "前",
+        "之前",
+    ];
+    let trim_before = |ch: char| ch.is_whitespace() || matches!(ch, ',' | '，' | ':' | '：' | '、');
+    let trim_after = |ch: char| ch.is_whitespace() || matches!(ch, ',' | '，' | '、');
+    let before = text[..start].trim_end_matches(trim_before);
+    let after = text[end..].trim_start_matches(trim_after);
+    BEFORE_DENIED.iter().any(|suffix| before.ends_with(suffix))
+        || AFTER_DENIED.iter().any(|prefix| after.starts_with(prefix))
+}
+
 fn starts_with_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
     haystack.len() >= needle.len()
         && haystack.is_char_boundary(needle.len())
@@ -5863,10 +6091,6 @@ fn starts_with_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
 
 fn is_cjk_command(from: &str) -> bool {
     from.chars().any(is_cjk_letter)
-}
-
-fn negated_cjk_break(text: &str, start: usize) -> bool {
-    text[..start].ends_with("不要") || text[..start].ends_with('不')
 }
 
 fn negated_english_break(text: &str, start: usize) -> bool {
@@ -6054,9 +6278,21 @@ mod tests {
     }
 
     #[test]
-    fn mid_sentence_chinese_line_break_does_not_need_spaces() {
-        assert_eq!(layout("请换行然后继续"), "请\n然后继续");
+    fn paused_chinese_line_break_splits_while_unpaused_inline_prose_stays_intact() {
+        assert_eq!(layout("请换行然后继续"), "请换行然后继续");
         assert_eq!(layout("先写完另起一行再改"), "先写完\n再改");
+        assert_eq!(layout("请，换行，然后继续"), "请\n然后继续");
+        assert_eq!(
+            layout("先写这一句。换行，再写下一句"),
+            "先写这一句。\n再写下一句"
+        );
+        let guarded = apply_after_punctuation_with_provenance(
+            "先写上面，换行，再写下面",
+            ContextFamily::General,
+            1.0,
+        );
+        assert!(guarded.source_preserved);
+        assert_eq!(guarded.text, "先写上面\n再写下面");
     }
 
     #[test]
@@ -6084,6 +6320,17 @@ mod tests {
         assert_eq!(layout("这里不要换行谢谢"), "这里不要换行谢谢");
         assert_eq!(layout("这里不换行"), "这里不换行");
         assert_eq!(layout("使用换行符即可"), "使用换行符即可");
+        assert_eq!(
+            layout("当我口语说换行 哪怕我想打,我的意思是让他写换行 ,他还是做了一个换行 的动作。"),
+            "当我口语说换行 哪怕我想打,我的意思是让他写换行 ,他还是做了一个换行 的动作。"
+        );
+        assert_eq!(
+            layout("当我口语说换行，哪怕我想打，我的意思是让他写换行，他还是做了一个换行的动作。"),
+            "当我口语说换行，哪怕我想打，我的意思是让他写换行，他还是做了一个换行的动作。"
+        );
+        assert_eq!(layout("我想打 换行 这两个字"), "我想打 换行 这两个字");
+        assert_eq!(layout("这里自动换行有问题"), "这里自动换行有问题");
+        assert_eq!(layout("怎么换行才对"), "怎么换行才对");
         assert_eq!(
             layout("please do not new line here"),
             "please do not new line here"

@@ -16,7 +16,7 @@ use crate::{
     fail_for_generation, hotkey, island_window, lock_recover, release_operation, start_claimed,
     stop_claimed, sync_modifier_hotkey_phase, AppState,
 };
-use tauri::State;
+use tauri::{Manager, State};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -46,6 +46,9 @@ pub(crate) enum PasteOwnerState {
 pub(crate) enum OperationLease {
     Idle,
     LiveDictation,
+    /// Keeps the dictation slot reserved while a short hybrid tap is canceled
+    /// and its following held press is transferred to a fresh generation.
+    HotkeyRestart,
     HistoryReclean,
     HistoryMutation,
     AudioRecovery,
@@ -524,15 +527,23 @@ pub(crate) fn claim_start_manager(
     manager: &mut DictationManager,
     lease: &mut OperationLease,
 ) -> Option<u64> {
-    if manager.phase != Phase::Idle
-        || manager
-            .delivery_settlement
-            .as_ref()
-            .is_some_and(|settlement| !settlement.snapshot().writers_closed)
+    if !start_manager_is_available(manager)
         || !claim_operation(lease, OperationLease::LiveDictation)
     {
         return None;
     }
+    Some(initialize_start_manager(manager))
+}
+
+fn start_manager_is_available(manager: &DictationManager) -> bool {
+    manager.phase == Phase::Idle
+        && manager
+            .delivery_settlement
+            .as_ref()
+            .is_none_or(|settlement| settlement.snapshot().writers_closed)
+}
+
+fn initialize_start_manager(manager: &mut DictationManager) -> u64 {
     manager.skip_llm_cleanup = false;
     manager.translation_target_language = None;
     manager.owned_replay_learning_suppressed = false;
@@ -554,7 +565,7 @@ pub(crate) fn claim_start_manager(
     manager.recording_translation_target_language = None;
     manager.stop_when_recording = false;
     clear_hotkey_session(manager);
-    Some(manager.session_generation)
+    manager.session_generation
 }
 
 fn claim_start_manager_with_mode(
@@ -569,6 +580,36 @@ fn claim_start_manager_with_mode(
         RecordingMode::Translation(language) => Some(language),
         _ => None,
     };
+    Some(generation)
+}
+
+fn claim_hybrid_restart_manager(
+    manager: &mut DictationManager,
+    lease: &mut OperationLease,
+    mode: RecordingMode,
+    source: HotkeySource,
+    gesture_id: u64,
+    expected_cancel_generation: u64,
+) -> Option<u64> {
+    if *lease != OperationLease::HotkeyRestart
+        || manager.session_generation != expected_cancel_generation
+        || !start_manager_is_available(manager)
+    {
+        return None;
+    }
+    *lease = OperationLease::LiveDictation;
+    let generation = initialize_start_manager(manager);
+    manager.recording_source = Some(mode.source());
+    manager.skip_llm_cleanup = matches!(mode, RecordingMode::Verbatim);
+    manager.translation_target_language = match mode {
+        RecordingMode::Translation(language) => Some(language),
+        _ => None,
+    };
+    manager.hotkey_session = Some(HotkeySession {
+        source,
+        gesture_id,
+        generation,
+    });
     Some(generation)
 }
 
@@ -1103,6 +1144,8 @@ pub(crate) struct CancelClaim {
     pub(crate) delivery_settlement: Option<std::sync::Arc<DeliverySettlementOwner>>,
     pub(crate) had_action: bool,
     pub(crate) text_action: Option<crate::TextActionIdentity>,
+    pub(crate) preview_transaction_id: Option<String>,
+    pub(crate) preview_target_pid: Option<i32>,
     pub(crate) onboarding_trial: Option<crate::onboarding::TrialSnapshot>,
     pub(crate) research_trace: Option<crate::research_trace::Trace>,
 }
@@ -1124,6 +1167,8 @@ fn claim_cancel_for_interrupt_manager(manager: &mut DictationManager) -> Option<
         delivery_settlement,
         had_action: false,
         text_action: None,
+        preview_transaction_id: None,
+        preview_target_pid: None,
         onboarding_trial,
         research_trace,
     })
@@ -1173,6 +1218,7 @@ fn claim_cancel_for_text_action(
     text_action: Option<crate::TextActionIdentity>,
     source: crate::metrics::StopSource,
 ) -> CancelClaim {
+    let (preview_transaction_id, preview_target_pid) = preview_window_restore_target(state);
     clear_selected_action(state);
     clear_screen_action(state);
     let had_selected_preview = state
@@ -1206,9 +1252,33 @@ fn claim_cancel_for_text_action(
         delivery_settlement,
         had_action,
         text_action,
+        preview_transaction_id,
+        preview_target_pid,
         onboarding_trial: manager.onboarding_trial.clone(),
         research_trace: manager.research_trace.clone(),
     }
+}
+
+fn preview_window_restore_target(state: &AppState) -> (Option<String>, Option<i32>) {
+    let Some(transaction_id) = crate::lock_recover(&state.preview_window_owner).clone() else {
+        return (None, None);
+    };
+    let selected_pid = crate::lock_recover(&state.selected_preview)
+        .as_ref()
+        .filter(|preview| preview.session.identity.transaction_id == transaction_id)
+        .map(|preview| preview.session.target_guard.pid);
+    let screen_pid = crate::lock_recover(&state.screen_preview)
+        .as_ref()
+        .filter(|preview| preview.session.identity.transaction_id == transaction_id)
+        .map(|preview| preview.session.target_guard.pid);
+    let retained_pid = crate::lock_recover(&state.preview_window_target_pid)
+        .as_ref()
+        .filter(|(owner, _)| owner == &transaction_id)
+        .map(|(_, pid)| *pid);
+    (
+        Some(transaction_id),
+        selected_pid.or(screen_pid).or(retained_pid),
+    )
 }
 
 pub(crate) fn record_terminal_capture_end_diagnostic(
@@ -1244,6 +1314,7 @@ fn claim_cancel_for_interrupt(state: &AppState) -> Option<CancelClaim> {
         claim_cancel_for_interrupt_manager(&mut manager)?
     };
 
+    let (preview_transaction_id, preview_target_pid) = preview_window_restore_target(state);
     let text_action = crate::cancel_active_text_action(state);
     clear_selected_action(state);
     clear_screen_action(state);
@@ -1266,6 +1337,8 @@ fn claim_cancel_for_interrupt(state: &AppState) -> Option<CancelClaim> {
     crate::dictionary_learn::invalidate_learning_observers(&state.learning_observer_epoch);
     claim.had_action = had_preview || text_action.is_some();
     claim.text_action = text_action;
+    claim.preview_transaction_id = preview_transaction_id;
+    claim.preview_target_pid = preview_target_pid;
     Some(claim)
 }
 
@@ -1388,7 +1461,9 @@ async fn finish_cancel_claim(
         release_operation(state, OperationLease::LiveDictation);
     }
     sync_modifier_hotkey_phase(Phase::Idle);
-    hotkey::unregister_cancel(app);
+    if !hotkey::hybrid_restart_handoff_pending() {
+        hotkey::unregister_cancel(app);
+    }
     emit_state(app, "idle");
     crate::onboarding::emit_state(app, state, "dictation://state", "idle", generation, trial);
     island_window::hide_overlay(app);
@@ -1486,6 +1561,9 @@ pub(crate) async fn execute_cancel_claim(
         if claim.phase == Phase::Recording && trace.capture_is_closed() {
             trace.terminal();
         }
+    }
+    if let Some(transaction_id) = claim.preview_transaction_id.as_deref() {
+        crate::restore_after_preview(app, state, claim.preview_target_pid, transaction_id).await;
     }
     if let Some(identity) = claim.text_action {
         crate::clear_text_action(state, &identity);
@@ -1587,6 +1665,7 @@ async fn execute_entry_claim(app: &tauri::AppHandle, state: &AppState, claim: En
             if let Err(error) = start_claimed(app, state, generation).await {
                 fail_for_generation(app, state, error.message, error.generation).await;
             }
+            finish_hotkey_start_task(generation);
         }
         EntryClaim::Stop(claim) => {
             let _ = stop_claimed(app, state, claim).await;
@@ -1616,8 +1695,68 @@ struct HotkeyInput {
 }
 
 #[derive(Clone, Copy)]
+struct HybridRestartInput {
+    source: HotkeySource,
+    cancelled_gesture_id: u64,
+    gesture_id: u64,
+    epoch: u64,
+}
+
+#[derive(Clone, Copy)]
+struct HybridCancellationRequest {
+    source: HotkeySource,
+    cancelled_gesture_id: u64,
+    next_gesture_id: Option<u64>,
+    epoch: u64,
+}
+
+#[derive(Clone, Copy)]
+struct HybridRestartReady {
+    source: HotkeySource,
+    cancelled_gesture_id: u64,
+    cancel_generation: u64,
+    epoch: u64,
+}
+
+#[derive(Clone, Copy)]
+struct PendingHybridRestart {
+    source: HotkeySource,
+    restart_source: HotkeySource,
+    cancelled_gesture_id: u64,
+    gesture_id: Option<u64>,
+    cancel_generation: u64,
+    epoch: u64,
+    buffered_trigger: Option<ModeTrigger>,
+}
+
+fn buffer_pending_hybrid_restart_input(
+    pending_restart: &mut Option<PendingHybridRestart>,
+    input: HotkeyInput,
+) -> bool {
+    let Some(pending) = pending_restart.as_mut() else {
+        return false;
+    };
+    if pending.restart_source == input.source
+        && pending.gesture_id == Some(input.gesture_id)
+        && pending.epoch == input.epoch
+        && matches!(input.trigger, ModeTrigger::Release | ModeTrigger::Cancel)
+    {
+        if input.trigger == ModeTrigger::Cancel || pending.buffered_trigger.is_none() {
+            pending.buffered_trigger = Some(input.trigger);
+        }
+        return true;
+    }
+    pending.source == input.source
+        && pending.cancelled_gesture_id == input.gesture_id
+        && input.trigger == ModeTrigger::Cancel
+}
+
+#[derive(Clone, Copy)]
 enum HotkeyInputMessage {
     Gesture(HotkeyInput),
+    HybridCancel(HotkeyInput),
+    HybridRestart(HybridRestartInput),
+    HybridRestartReady(HybridRestartReady),
     FullCancel,
     Interrupt,
 }
@@ -1639,6 +1778,63 @@ pub(crate) fn enqueue_hotkey(source: HotkeySource, trigger: ModeTrigger, gesture
             gesture_id,
             epoch: INPUT_EPOCH.load(std::sync::atomic::Ordering::SeqCst),
         }));
+    }
+}
+
+pub(crate) fn enqueue_hybrid_cancel(source: HotkeySource, gesture_id: u64) {
+    if let Some(sender) = HOTKEY_INPUT.get() {
+        let _ = sender.send(HotkeyInputMessage::HybridCancel(HotkeyInput {
+            source,
+            trigger: ModeTrigger::Cancel,
+            gesture_id,
+            epoch: INPUT_EPOCH.load(std::sync::atomic::Ordering::SeqCst),
+        }));
+    }
+}
+
+pub(crate) fn enqueue_hybrid_restart(
+    source: HotkeySource,
+    cancelled_gesture_id: u64,
+    gesture_id: u64,
+) {
+    if let Some(sender) = HOTKEY_INPUT.get() {
+        let _ = sender.send(HotkeyInputMessage::HybridRestart(HybridRestartInput {
+            source,
+            cancelled_gesture_id,
+            gesture_id,
+            epoch: INPUT_EPOCH.load(std::sync::atomic::Ordering::SeqCst),
+        }));
+    }
+}
+
+static HOTKEY_START_TASKS: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
+
+fn register_hotkey_start_task(generation: u64) {
+    let mut generations = HOTKEY_START_TASKS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !generations.contains(&generation) {
+        generations.push(generation);
+    }
+}
+
+fn finish_hotkey_start_task(generation: u64) {
+    HOTKEY_START_TASKS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .retain(|active| *active != generation);
+}
+
+async fn wait_for_hotkey_start_task(generation: u64) {
+    loop {
+        let pending = HOTKEY_START_TASKS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(&generation);
+        if !pending {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
 }
 
@@ -1675,15 +1871,204 @@ fn claim_cancel_from_fifo(
     }
 }
 
+fn dispatch_entry_claim(app: &tauri::AppHandle, claim: EntryClaim) {
+    if let EntryClaim::Start(generation) = &claim {
+        register_hotkey_start_task(*generation);
+    }
+    if matches!(&claim, EntryClaim::Ignore) {
+        return;
+    }
+    let handle = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let state = handle.state::<AppState>();
+        execute_entry_claim(&handle, &state, claim).await;
+    });
+}
+
+fn begin_hybrid_cancellation(
+    app: &tauri::AppHandle,
+    sender: &tokio::sync::mpsc::UnboundedSender<HotkeyInputMessage>,
+    pending_restart: &mut Option<PendingHybridRestart>,
+    request: HybridCancellationRequest,
+    claim: CancelClaim,
+) {
+    let ready = HybridRestartReady {
+        source: request.source,
+        cancelled_gesture_id: request.cancelled_gesture_id,
+        cancel_generation: claim.generation,
+        epoch: request.epoch,
+    };
+    *pending_restart = Some(PendingHybridRestart {
+        source: request.source,
+        restart_source: request.source,
+        cancelled_gesture_id: request.cancelled_gesture_id,
+        gesture_id: request.next_gesture_id,
+        cancel_generation: claim.generation,
+        epoch: request.epoch,
+        buffered_trigger: None,
+    });
+    let app = app.clone();
+    let sender = sender.clone();
+    tauri::async_runtime::spawn(async move {
+        let state = app.state::<AppState>();
+        let cancelled_start_generation = claim.recording_generation;
+        execute_cancel_claim(&app, &state, claim).await;
+        wait_for_hotkey_start_task(cancelled_start_generation).await;
+        let _ = sender.send(HotkeyInputMessage::HybridRestartReady(ready));
+    });
+}
+
+async fn finish_hybrid_cancellation(
+    app: &tauri::AppHandle,
+    state: &AppState,
+    sender: &tokio::sync::mpsc::UnboundedSender<HotkeyInputMessage>,
+    pending_restart: &mut Option<PendingHybridRestart>,
+    ready: HybridRestartReady,
+) {
+    let matches_ready = pending_restart.as_ref().is_some_and(|pending| {
+        pending.source == ready.source
+            && pending.cancelled_gesture_id == ready.cancelled_gesture_id
+            && pending.cancel_generation == ready.cancel_generation
+            && pending.epoch == ready.epoch
+    });
+    if !matches_ready {
+        return;
+    }
+    let pending = pending_restart.take().expect("matching restart is present");
+    let valid = pending.epoch == INPUT_EPOCH.load(std::sync::atomic::Ordering::SeqCst)
+        && !hotkey::is_suspended()
+        && state.exit_state.load(std::sync::atomic::Ordering::Acquire) == 0;
+    let Some(gesture_id) = pending.gesture_id else {
+        release_hybrid_restart_reservation(app, state).await;
+        return;
+    };
+    if !valid || pending.buffered_trigger == Some(ModeTrigger::Cancel) {
+        release_hybrid_restart_reservation(app, state).await;
+        return;
+    }
+    let Some(claim) = claim_hybrid_restart_start(state, pending, gesture_id).await else {
+        release_hybrid_restart_reservation(app, state).await;
+        return;
+    };
+    hotkey::set_hybrid_restart_handoff_pending(false);
+    dispatch_entry_claim(app, claim);
+    if pending.buffered_trigger == Some(ModeTrigger::Release) {
+        let _ = sender.send(HotkeyInputMessage::Gesture(HotkeyInput {
+            source: pending.restart_source,
+            trigger: ModeTrigger::Release,
+            gesture_id,
+            epoch: pending.epoch,
+        }));
+    }
+}
+
 pub(crate) fn install_hotkey_dispatcher(app: tauri::AppHandle) {
-    use tauri::Manager;
     let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
-    if HOTKEY_INPUT.set(sender).is_err() {
+    if HOTKEY_INPUT.set(sender.clone()).is_err() {
         return;
     }
     tauri::async_runtime::spawn(async move {
-        while let Some(input) = receiver.recv().await {
+        let mut pending_restart: Option<PendingHybridRestart> = None;
+        while let Some(mut input) = receiver.recv().await {
             let state = app.state::<AppState>();
+            match input {
+                HotkeyInputMessage::HybridCancel(hybrid_cancel) => {
+                    if buffer_pending_hybrid_restart_input(
+                        &mut pending_restart,
+                        HotkeyInput {
+                            source: hybrid_cancel.source,
+                            trigger: ModeTrigger::Cancel,
+                            gesture_id: hybrid_cancel.gesture_id,
+                            epoch: hybrid_cancel.epoch,
+                        },
+                    ) {
+                        continue;
+                    }
+                    if hybrid_cancel.epoch == INPUT_EPOCH.load(std::sync::atomic::Ordering::SeqCst)
+                        && !hotkey::is_suspended()
+                        && state.exit_state.load(std::sync::atomic::Ordering::Acquire) == 0
+                    {
+                        if let Some(claim) = claim_hybrid_restart_cancel(
+                            &state,
+                            hybrid_cancel.source,
+                            hybrid_cancel.gesture_id,
+                        )
+                        .await
+                        {
+                            begin_hybrid_cancellation(
+                                &app,
+                                &sender,
+                                &mut pending_restart,
+                                HybridCancellationRequest {
+                                    source: hybrid_cancel.source,
+                                    cancelled_gesture_id: hybrid_cancel.gesture_id,
+                                    next_gesture_id: None,
+                                    epoch: hybrid_cancel.epoch,
+                                },
+                                claim,
+                            );
+                        }
+                    }
+                    continue;
+                }
+                HotkeyInputMessage::HybridRestart(restart) => {
+                    if restart.epoch != INPUT_EPOCH.load(std::sync::atomic::Ordering::SeqCst)
+                        || hotkey::is_suspended()
+                        || state.exit_state.load(std::sync::atomic::Ordering::Acquire) != 0
+                    {
+                        continue;
+                    }
+                    if let Some(pending) = pending_restart.as_mut() {
+                        if pending.epoch == restart.epoch
+                            && (pending.gesture_id.is_none()
+                                || pending.gesture_id == Some(restart.cancelled_gesture_id))
+                        {
+                            pending.restart_source = restart.source;
+                            pending.gesture_id = Some(restart.gesture_id);
+                            pending.buffered_trigger = None;
+                        }
+                        continue;
+                    }
+                    if let Some(claim) = claim_hybrid_restart_cancel(
+                        &state,
+                        restart.source,
+                        restart.cancelled_gesture_id,
+                    )
+                    .await
+                    {
+                        begin_hybrid_cancellation(
+                            &app,
+                            &sender,
+                            &mut pending_restart,
+                            HybridCancellationRequest {
+                                source: restart.source,
+                                cancelled_gesture_id: restart.cancelled_gesture_id,
+                                next_gesture_id: Some(restart.gesture_id),
+                                epoch: restart.epoch,
+                            },
+                            claim,
+                        );
+                        continue;
+                    }
+                    input = HotkeyInputMessage::Gesture(HotkeyInput {
+                        source: restart.source,
+                        trigger: ModeTrigger::Press,
+                        gesture_id: restart.gesture_id,
+                        epoch: restart.epoch,
+                    });
+                }
+                HotkeyInputMessage::HybridRestartReady(ready) => {
+                    finish_hybrid_cancellation(&app, &state, &sender, &mut pending_restart, ready)
+                        .await;
+                    continue;
+                }
+                _ => {}
+            }
+            if let HotkeyInputMessage::Gesture(gesture) = input {
+                if buffer_pending_hybrid_restart_input(&mut pending_restart, gesture) {
+                    continue;
+                }
+            }
             let claim = {
                 let _gate = state.hotkey_gate.lock().await;
                 match input {
@@ -1702,15 +2087,7 @@ pub(crate) fn install_hotkey_dispatcher(app: tauri::AppHandle) {
                             && !hotkey::is_suspended()
                             && state.exit_state.load(std::sync::atomic::Ordering::Acquire) == 0 =>
                     {
-                        let mode = match input.source {
-                            HotkeySource::Dictation => RecordingMode::Dictation,
-                            HotkeySource::Verbatim => RecordingMode::Verbatim,
-                            HotkeySource::Translation => RecordingMode::Translation(
-                                lock_recover(&state.settings)
-                                    .translation_target_language
-                                    .clone(),
-                            ),
-                        };
+                        let mode = recording_mode_for_hotkey_source(&state, input.source);
                         let trial = crate::onboarding::snapshot(&state, "native_hotkey");
                         let claim = {
                             let mut lease = lock_recover(&state.operation_lease);
@@ -1748,16 +2125,13 @@ pub(crate) fn install_hotkey_dispatcher(app: tauri::AppHandle) {
                             claim
                         }
                     }
-                    HotkeyInputMessage::Gesture(_) => EntryClaim::Ignore,
+                    HotkeyInputMessage::Gesture(_)
+                    | HotkeyInputMessage::HybridCancel(_)
+                    | HotkeyInputMessage::HybridRestart(_)
+                    | HotkeyInputMessage::HybridRestartReady(_) => EntryClaim::Ignore,
                 }
             };
-            if !matches!(claim, EntryClaim::Ignore) {
-                let handle = app.clone();
-                tauri::async_runtime::spawn(async move {
-                    let state = handle.state::<AppState>();
-                    execute_entry_claim(&handle, &state, claim).await;
-                });
-            }
+            dispatch_entry_claim(&app, claim);
         }
     });
 }
@@ -1830,6 +2204,8 @@ fn claim_gesture_with_source(
                     delivery_settlement: manager.delivery_settlement.clone(),
                     had_action: false,
                     text_action: None,
+                    preview_transaction_id: None,
+                    preview_target_pid: None,
                     onboarding_trial: manager.onboarding_trial.clone(),
                     research_trace: manager.research_trace.clone(),
                 })
@@ -1847,6 +2223,100 @@ fn claim_gesture_with_source(
             }
         }
         _ => EntryClaim::Ignore,
+    }
+}
+
+fn recording_mode_for_hotkey_source(state: &AppState, source: HotkeySource) -> RecordingMode {
+    match source {
+        HotkeySource::Dictation => RecordingMode::Dictation,
+        HotkeySource::Verbatim => RecordingMode::Verbatim,
+        HotkeySource::Translation => RecordingMode::Translation(
+            lock_recover(&state.settings)
+                .translation_target_language
+                .clone(),
+        ),
+    }
+}
+
+async fn claim_hybrid_restart_cancel(
+    state: &AppState,
+    source: HotkeySource,
+    cancelled_gesture_id: u64,
+) -> Option<CancelClaim> {
+    let _gate = state.hotkey_gate.lock().await;
+    let mut lease = lock_recover(&state.operation_lease);
+    if *lease != OperationLease::LiveDictation {
+        return None;
+    }
+    let owns_session = {
+        let manager = lock_recover(&state.manager);
+        manager.hotkey_session.is_some_and(|owner| {
+            owner.source == source
+                && owner.gesture_id == cancelled_gesture_id
+                && owner.generation == manager.session_generation
+        })
+    };
+    if !owns_session {
+        return None;
+    }
+
+    hotkey::set_hybrid_restart_handoff_pending(true);
+    let claim = claim_cancel_with_source(state, crate::metrics::StopSource::Interrupt);
+    if *lease != OperationLease::LiveDictation {
+        hotkey::set_hybrid_restart_handoff_pending(false);
+        return None;
+    }
+    *lease = OperationLease::HotkeyRestart;
+    Some(claim)
+}
+
+async fn claim_hybrid_restart_start(
+    state: &AppState,
+    restart: PendingHybridRestart,
+    gesture_id: u64,
+) -> Option<EntryClaim> {
+    let _gate = state.hotkey_gate.lock().await;
+    if restart.epoch != INPUT_EPOCH.load(std::sync::atomic::Ordering::SeqCst)
+        || hotkey::is_suspended()
+        || state.exit_state.load(std::sync::atomic::Ordering::Acquire) != 0
+    {
+        return None;
+    }
+    let mode = recording_mode_for_hotkey_source(state, restart.restart_source);
+    let trial = crate::onboarding::snapshot(state, "native_hotkey");
+    let mut lease = lock_recover(&state.operation_lease);
+    let mut manager = lock_recover(&state.manager);
+    let generation = claim_hybrid_restart_manager(
+        &mut manager,
+        &mut lease,
+        mode,
+        restart.restart_source,
+        gesture_id,
+        restart.cancel_generation,
+    )?;
+    if !admit_started_settlement(&mut manager, &mut lease, &state.delivery_settlements) {
+        return None;
+    }
+    manager.onboarding_trial = trial.map(|mut trial| {
+        trial.recording_generation = generation;
+        trial
+    });
+    Some(EntryClaim::Start(generation))
+}
+
+async fn release_hybrid_restart_reservation(app: &tauri::AppHandle, state: &AppState) {
+    let _gate = state.hotkey_gate.lock().await;
+    let mut lease = lock_recover(&state.operation_lease);
+    let manager = lock_recover(&state.manager);
+    let released = *lease == OperationLease::HotkeyRestart && manager.phase == Phase::Idle;
+    if released {
+        release_operation_lease(&mut lease, OperationLease::HotkeyRestart);
+    }
+    hotkey::set_hybrid_restart_handoff_pending(false);
+    drop(manager);
+    drop(lease);
+    if released {
+        hotkey::unregister_cancel(app);
     }
 }
 
@@ -2651,6 +3121,8 @@ mod tests {
             delivery_settlement,
             had_action: had_action || phase != Phase::Idle,
             text_action: None,
+            preview_transaction_id: None,
+            preview_target_pid: None,
             onboarding_trial: manager.onboarding_trial.clone(),
             research_trace: manager.research_trace.clone(),
         }
@@ -2787,6 +3259,162 @@ mod tests {
         let claim = enter_recording(&mut manager, context::ContextSnapshot::general()).unwrap();
         assert!(claim.ended_during_start);
         assert_eq!(manager.phase, Phase::Stopping);
+    }
+
+    #[test]
+    fn hybrid_restart_handoff_waits_for_cancel_lease_and_replays_early_release() {
+        for timer_first in [false, true] {
+            let start = std::time::Instant::now();
+            let mut gesture = hotkey::ModeGesture::default();
+            let old_id = match gesture.pressed(hotkey::HYBRID_HOLD_LOCK, false, true, start)[0] {
+                hotkey::GestureAction::Trigger(ModeTrigger::Press, gesture_id) => gesture_id,
+                action => panic!("unexpected first press action: {action:?}"),
+            };
+            let mut manager = DictationManager::new();
+            let mut lease = OperationLease::Idle;
+            let old_generation = match claim_gesture(
+                &mut manager,
+                &mut lease,
+                RecordingMode::Dictation,
+                ModeTrigger::Press,
+                old_id,
+            ) {
+                EntryClaim::Start(generation) => generation,
+                _ => panic!("initial hybrid press must claim its live owner"),
+            };
+            enter_recording(&mut manager, context::ContextSnapshot::general());
+
+            let timeout = gesture.released(
+                hotkey::HYBRID_HOLD_LOCK,
+                false,
+                start + std::time::Duration::from_millis(60),
+            );
+            let hotkey::GestureAction::HybridTimeout {
+                gesture_id,
+                timeout_token,
+                deadline,
+            } = timeout[0]
+            else {
+                panic!("the first short press should wait for its double-tap deadline");
+            };
+            if timer_first {
+                assert_eq!(
+                    gesture.expire_hybrid_tap(gesture_id, timeout_token, deadline),
+                    Some(hotkey::GestureAction::HybridCancel { gesture_id: old_id })
+                );
+            }
+
+            let next_press_time = deadline
+                + if timer_first {
+                    std::time::Duration::from_millis(1)
+                } else {
+                    std::time::Duration::ZERO
+                };
+            let restart = gesture.pressed(hotkey::HYBRID_HOLD_LOCK, false, true, next_press_time);
+            let hotkey::GestureAction::RestartAfterCancel {
+                cancelled_gesture_id,
+                gesture_id: next_id,
+            } = restart[0]
+            else {
+                panic!("the next valid hold must wait for the old cancellation lease");
+            };
+            assert_eq!(cancelled_gesture_id, old_id);
+
+            assert_eq!(
+                manager.hotkey_session,
+                Some(HotkeySession {
+                    source: HotkeySource::Dictation,
+                    gesture_id: old_id,
+                    generation: old_generation,
+                })
+            );
+            assert_eq!(claim_cancel_manager(&mut manager, false), Phase::Recording);
+            let cancel_generation = manager.session_generation;
+            lease = OperationLease::HotkeyRestart;
+
+            let mut pending_restart = Some(PendingHybridRestart {
+                source: HotkeySource::Dictation,
+                restart_source: HotkeySource::Dictation,
+                cancelled_gesture_id: old_id,
+                gesture_id: Some(next_id),
+                cancel_generation,
+                epoch: 41,
+                buffered_trigger: None,
+            });
+            let release_actions = gesture.released(
+                hotkey::HYBRID_HOLD_LOCK,
+                false,
+                next_press_time + std::time::Duration::from_millis(220),
+            );
+            assert_eq!(
+                release_actions,
+                vec![hotkey::GestureAction::Trigger(
+                    ModeTrigger::Release,
+                    next_id,
+                )]
+            );
+            assert!(buffer_pending_hybrid_restart_input(
+                &mut pending_restart,
+                HotkeyInput {
+                    source: HotkeySource::Dictation,
+                    trigger: ModeTrigger::Release,
+                    gesture_id: next_id,
+                    epoch: 41,
+                },
+            ));
+            assert_eq!(
+                pending_restart
+                    .as_ref()
+                    .and_then(|pending| pending.buffered_trigger),
+                Some(ModeTrigger::Release)
+            );
+
+            // The async cancellation owner must not release the handoff slot.
+            release_operation_lease(&mut lease, OperationLease::LiveDictation);
+            assert_eq!(lease, OperationLease::HotkeyRestart);
+            assert!(claim_start_manager(&mut manager, &mut lease).is_none());
+
+            let next_generation = claim_hybrid_restart_manager(
+                &mut manager,
+                &mut lease,
+                RecordingMode::Dictation,
+                HotkeySource::Dictation,
+                next_id,
+                cancel_generation,
+            )
+            .expect("the new held gesture claims only after cancel settlement");
+            assert_ne!(next_generation, old_generation);
+            assert_eq!(lease, OperationLease::LiveDictation);
+            assert_eq!(
+                manager.hotkey_session,
+                Some(HotkeySession {
+                    source: HotkeySource::Dictation,
+                    gesture_id: next_id,
+                    generation: next_generation,
+                })
+            );
+
+            let pending_restart = pending_restart.take().expect("handoff input is buffered");
+            assert_eq!(pending_restart.gesture_id, Some(next_id));
+            assert_eq!(pending_restart.cancel_generation, cancel_generation);
+            if pending_restart.buffered_trigger == Some(ModeTrigger::Release) {
+                assert!(matches!(
+                    claim_gesture(
+                        &mut manager,
+                        &mut lease,
+                        RecordingMode::Dictation,
+                        ModeTrigger::Release,
+                        next_id,
+                    ),
+                    EntryClaim::Ignore
+                ));
+            }
+            assert!(manager.stop_when_recording);
+            let stop = enter_recording(&mut manager, context::ContextSnapshot::general())
+                .expect("buffered release stops after the restarted recorder begins");
+            assert_eq!(stop.recording_generation, next_generation);
+            assert_eq!(manager.phase, Phase::Stopping);
+        }
     }
 
     #[test]

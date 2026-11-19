@@ -1,5 +1,6 @@
 //! Ownership, observation, and conservative admission for VoiceFlow's two model sidecars.
 
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -7,6 +8,7 @@ use std::sync::{Mutex, OnceLock};
 
 const CAP_NUMERATOR: u128 = 4;
 const CAP_DENOMINATOR: u128 = 5;
+const MEMORY_BUDGET_PERCENT: u8 = 80;
 const ASR_COLD_RESERVE_BYTES: u64 = 2_415_919_104;
 // Provisional ASR reserves use pinned checkpoint size plus peak-work headroom.
 // They are conservative admission floors, not measured memory requirements.
@@ -54,6 +56,35 @@ pub(crate) enum HostMemoryPressure {
 pub(crate) enum LoadKind {
     Asr,
     Cleanup,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub(crate) struct DeviceMemoryBudget {
+    pub physical_memory_bytes: Option<u64>,
+    pub budget_bytes: Option<u64>,
+    pub budget_percent: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ModelMemoryEstimateSource {
+    AdmissionReserve,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+pub(crate) struct ModelMemoryEstimate {
+    pub bytes: u64,
+    pub source: ModelMemoryEstimateSource,
+}
+
+impl DeviceMemoryBudget {
+    fn from_physical_memory(physical_memory_bytes: Option<u64>) -> Self {
+        Self {
+            physical_memory_bytes,
+            budget_bytes: physical_memory_bytes.and_then(memory_cap_bytes),
+            budget_percent: MEMORY_BUDGET_PERCENT,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -719,6 +750,21 @@ fn cold_reserve(id: &str, revision: &str, kind: LoadKind) -> Result<u64, MemoryU
     }
 }
 
+pub(crate) fn asr_memory_reserve_estimate_bytes(id: &str, revision: &str) -> Option<u64> {
+    cold_reserve(id, revision, LoadKind::Asr).ok()
+}
+
+pub(crate) fn cleanup_memory_reserve_estimate_bytes(id: &str, revision: &str) -> Option<u64> {
+    cold_reserve(id, revision, LoadKind::Cleanup).ok()
+}
+
+pub(crate) fn admission_reserve_estimate(bytes: Option<u64>) -> Option<ModelMemoryEstimate> {
+    bytes.map(|bytes| ModelMemoryEstimate {
+        bytes,
+        source: ModelMemoryEstimateSource::AdmissionReserve,
+    })
+}
+
 pub(crate) fn static_model_memory_compatibility(
     id: &str,
     revision: &str,
@@ -752,6 +798,10 @@ fn static_reserve_memory_compatibility(
 
 fn memory_cap_bytes(physical: u64) -> Option<u64> {
     u64::try_from((physical as u128).checked_mul(CAP_NUMERATOR)? / CAP_DENOMINATOR).ok()
+}
+
+pub(crate) fn current_device_memory_budget() -> DeviceMemoryBudget {
+    DeviceMemoryBudget::from_physical_memory(physical_memory_bytes())
 }
 
 fn projected_cost(total: u64, current: u64, target: u64) -> Option<u64> {
@@ -1298,6 +1348,24 @@ mod tests {
         assert_eq!(projected_cost(u64::MAX, 1, 2), None);
         assert_eq!(projected_cost(1, 2, 3), None);
     }
+
+    #[test]
+    fn device_memory_budget_exposes_the_80_percent_physical_cap() {
+        let physical = 32 * 1024 * 1024 * 1024;
+        let budget = DeviceMemoryBudget::from_physical_memory(Some(physical));
+        assert_eq!(budget.physical_memory_bytes, Some(physical));
+        assert_eq!(budget.budget_bytes, Some(27_487_790_694));
+        assert_eq!(budget.budget_percent, 80);
+        assert_eq!(
+            DeviceMemoryBudget::from_physical_memory(None),
+            DeviceMemoryBudget {
+                physical_memory_bytes: None,
+                budget_bytes: None,
+                budget_percent: 80,
+            }
+        );
+    }
+
     #[test]
     fn pending_cost_uses_max_of_current_footprint_and_target_during_real_admission() {
         let root = test_root("pending-cost");

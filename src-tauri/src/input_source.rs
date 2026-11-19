@@ -38,35 +38,45 @@ pub fn should_hop_tis_to_main_queue(on_main_thread: bool) -> bool {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PassiveLearningInputSource {
     DirectAsciiKeyboardLayout,
+    InputMethodOrLayout,
     Unsupported,
     Unknown,
 }
 
-/// Classify only a known, direct Apple keyboard layout as suitable for the
-/// passive observer. Input methods, non-ASCII layouts, third-party layouts,
-/// and incomplete TIS facts are deliberately not evidence of a committed edit.
+fn is_non_text_input_palette(source_id: &str) -> bool {
+    let trimmed = source_id.trim();
+    trimmed.is_empty()
+        || trimmed.eq_ignore_ascii_case("com.apple.CharacterPaletteIM")
+        || trimmed.eq_ignore_ascii_case("com.apple.PressAndHold")
+        || trimmed.eq_ignore_ascii_case("com.apple.KeyboardViewer")
+}
+
+/// Classify active keyboard layouts and input methods (IMEs) for passive
+/// learning, while still failing closed on incomplete TIS facts or non-text
+/// utility palettes (e.g. Emoji picker). Uncommitted IME composition is guarded
+/// at sample time via `AXMarkedTextRange`.
 fn classify_passive_learning_input_source(
     is_keyboard_layout: Option<bool>,
     ascii_capable: Option<bool>,
     source_id: Option<&str>,
     localized_name: Option<&str>,
 ) -> PassiveLearningInputSource {
-    let Some(is_keyboard_layout) = is_keyboard_layout else {
+    let (Some(is_keyboard_layout), Some(ascii_capable), Some(source_id)) =
+        (is_keyboard_layout, ascii_capable, source_id)
+    else {
         return PassiveLearningInputSource::Unknown;
     };
-    if !is_keyboard_layout {
+    if is_non_text_input_palette(source_id) {
         return PassiveLearningInputSource::Unsupported;
     }
-    let (Some(ascii_capable), Some(source_id)) = (ascii_capable, source_id) else {
-        return PassiveLearningInputSource::Unknown;
-    };
-    if !ascii_capable || !source_id.starts_with("com.apple.keylayout.") {
-        return PassiveLearningInputSource::Unsupported;
+    if is_keyboard_layout
+        && ascii_capable
+        && source_id.starts_with("com.apple.keylayout.")
+        && !should_switch_input_source(source_id, localized_name.unwrap_or_default())
+    {
+        return PassiveLearningInputSource::DirectAsciiKeyboardLayout;
     }
-    if should_switch_input_source(source_id, localized_name.unwrap_or_default()) {
-        return PassiveLearningInputSource::Unsupported;
-    }
-    PassiveLearningInputSource::DirectAsciiKeyboardLayout
+    PassiveLearningInputSource::InputMethodOrLayout
 }
 
 pub(crate) fn passive_learning_input_source() -> PassiveLearningInputSource {
@@ -437,34 +447,56 @@ mod tests {
     }
 
     #[test]
-    fn passive_learning_fails_closed_for_ime_cjk_non_ascii_and_unknown_sources() {
+    fn passive_learning_allows_global_ime_and_non_ascii_layouts_while_failing_closed_on_unknown_and_palettes(
+    ) {
         for (kind, ascii, id, name, expected) in [
             (
                 Some(false),
                 Some(true),
                 Some("com.apple.inputmethod.SCIM.ITABC"),
                 Some("Pinyin"),
-                PassiveLearningInputSource::Unsupported,
+                PassiveLearningInputSource::InputMethodOrLayout,
             ),
             (
                 Some(true),
                 Some(true),
                 Some("com.apple.keylayout.Kotoeri"),
                 Some("Japanese"),
-                PassiveLearningInputSource::Unsupported,
+                PassiveLearningInputSource::InputMethodOrLayout,
             ),
             (
                 Some(true),
                 Some(false),
-                Some("com.apple.keylayout.NonAscii"),
-                Some("Non-ASCII"),
-                PassiveLearningInputSource::Unsupported,
+                Some("com.apple.keylayout.Russian"),
+                Some("Russian"),
+                PassiveLearningInputSource::InputMethodOrLayout,
             ),
             (
                 Some(true),
                 Some(true),
                 Some("org.example.keyboard.Custom"),
                 Some("Custom"),
+                PassiveLearningInputSource::InputMethodOrLayout,
+            ),
+            (
+                Some(false),
+                Some(false),
+                Some("com.sogou.inputmethod.sogou.pinyin"),
+                Some("搜狗拼音"),
+                PassiveLearningInputSource::InputMethodOrLayout,
+            ),
+            (
+                Some(false),
+                Some(true),
+                Some("com.apple.CharacterPaletteIM"),
+                Some("Emoji & Symbols"),
+                PassiveLearningInputSource::Unsupported,
+            ),
+            (
+                Some(false),
+                Some(true),
+                Some(""),
+                Some(""),
                 PassiveLearningInputSource::Unsupported,
             ),
             (
@@ -492,7 +524,7 @@ mod tests {
             assert_eq!(
                 classify_passive_learning_input_source(kind, ascii, id, name),
                 expected,
-                "source facts should fail closed: {id:?} {name:?}"
+                "source classification should preserve fail-closed metadata checks: {id:?} {name:?}"
             );
         }
     }

@@ -329,12 +329,25 @@ struct ChildSession {
 
 type OwnedAsrSession = tokio::sync::OwnedMutexGuard<Option<ChildSession>>;
 
+type AsrStatusObserver = Arc<dyn Fn() + Send + Sync>;
+
+fn notify_asr_status_observer(observer_slot: &Mutex<Option<AsrStatusObserver>>) {
+    let observer = observer_slot
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    if let Some(observer) = observer {
+        observer();
+    }
+}
+
 #[derive(Clone)]
 struct AsrOwnerContext {
     active_pid: Arc<AtomicU32>,
     status: Arc<Mutex<RuntimeSnapshot>>,
     loaded_attestation: Arc<Mutex<Option<crate::observations::LoadedAttestation>>>,
     models_root: PathBuf,
+    status_observer: Arc<Mutex<Option<AsrStatusObserver>>>,
     #[cfg(test)]
     fixture: bool,
     #[cfg(test)]
@@ -375,6 +388,7 @@ impl AsrOwnerContext {
                 );
             }
         }
+        notify_asr_status_observer(&self.status_observer);
 
         #[cfg(test)]
         if self.fixture {
@@ -411,6 +425,10 @@ impl AsrOwnerContext {
     }
 
     fn set_status(&self, name: &str, error: Option<String>) {
+        *self
+            .loaded_attestation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
         let mut status = self
             .status
             .lock()
@@ -419,7 +437,9 @@ impl AsrOwnerContext {
         status.runtime_version = None;
         status.loaded_model_id = None;
         status.loaded_model_version = None;
-        status.error = error;
+        status.error = error.map(|message| sanitize_runtime_error(&message));
+        drop(status);
+        notify_asr_status_observer(&self.status_observer);
     }
 
     #[cfg(test)]
@@ -3046,6 +3066,7 @@ pub struct OnDeviceRuntime {
     idle_generation: AtomicU64,
     idle_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     transcription_owners: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    status_observer: Arc<Mutex<Option<AsrStatusObserver>>>,
     #[cfg(test)]
     fixture: Option<FixtureConfig>,
     #[cfg(test)]
@@ -3150,6 +3171,7 @@ impl OnDeviceRuntime {
             idle_generation: AtomicU64::new(0),
             idle_task: Mutex::new(None),
             transcription_owners: Mutex::new(Vec::new()),
+            status_observer: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             fixture: None,
             #[cfg(test)]
@@ -3187,6 +3209,7 @@ impl OnDeviceRuntime {
             idle_generation: AtomicU64::new(0),
             idle_task: Mutex::new(None),
             transcription_owners: Mutex::new(Vec::new()),
+            status_observer: Arc::new(Mutex::new(None)),
             fixture: Some(config),
             fixture_reaped: Arc::new(Mutex::new(Vec::new())),
             fixture_retirement_gate: Mutex::new(None),
@@ -4301,6 +4324,7 @@ impl OnDeviceRuntime {
         snapshot.error = None;
         drop(snapshot);
         drop(loading);
+        self.notify_status_observer();
         Ok(Some(generation))
     }
 
@@ -4395,6 +4419,9 @@ impl OnDeviceRuntime {
             }
             *status = restored;
         }
+        drop(status);
+        drop(loading);
+        self.notify_status_observer();
     }
 
     fn request(&self, op: &str, model_id: Option<&str>, model_version: Option<&str>) -> Request {
@@ -5036,6 +5063,7 @@ impl OnDeviceRuntime {
             status: Arc::clone(&self.status),
             loaded_attestation: Arc::clone(&self.loaded_attestation),
             models_root: self.models_root.clone(),
+            status_observer: Arc::clone(&self.status_observer),
             #[cfg(test)]
             fixture: self.fixture.is_some(),
             #[cfg(test)]
@@ -5119,7 +5147,19 @@ impl OnDeviceRuntime {
             .status
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = snapshot.clone();
+        self.notify_status_observer();
         snapshot
+    }
+
+    pub(crate) fn set_status_observer(&self, observer: AsrStatusObserver) {
+        *self
+            .status_observer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(observer);
+    }
+
+    fn notify_status_observer(&self) {
+        notify_asr_status_observer(&self.status_observer);
     }
 
     fn schedule_idle_unload(&self, model_id: &str) {

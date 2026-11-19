@@ -129,23 +129,23 @@ export function dictationCompletionMessage(
   }
   switch (terminal.terminal_outcome.kind) {
     case "inserted":
-      return translate("听写已完成，文字已输入。剪贴板恢复情况和下一次录音是否可用均未确认。");
+      return translate("听写完成，文字已输入。");
     case "copy_only":
-      return translate("听写已完成，文字已复制，请手动粘贴。剪贴板恢复情况和下一次录音是否可用均未确认。");
+      return translate("听写完成，文字已复制，请手动粘贴。");
     case "paste_unverified":
-      return translate("听写已结束，但无法确认文字是否已输入。请检查目标输入框。剪贴板恢复情况和下一次录音是否可用均未确认。");
+      return translate("听写结束；是否已输入无法确认，请检查目标输入框。");
     case "history_only":
-      return translate("听写已保存到历史记录，文字未确认输入。下一次录音是否可用未确认。");
+      return translate("听写已保存到历史记录；未确认输入。");
     case "preview_only":
-      return translate("听写预览已完成。下一次录音是否可用未确认。");
+      return translate("听写预览已完成。");
     case "failed":
-      return translate("听写未完成，请检查 VoiceFlow。下一次录音是否可用未确认。");
+      return translate("听写未完成，请检查 VoiceFlow。");
     case "cancelled":
-      return translate("听写已取消。剪贴板写入已结束，下一次录音是否可用未确认。");
+      return translate("听写已取消。");
     case "timed_out":
-      return translate("听写已超时。文字交付未确认，下一次录音是否可用未确认。");
+      return translate("听写已超时；文字交付未确认。");
     case "completed_without_clipboard":
-      return translate("听写流程已结束，但未进行剪贴板交付。下一次录音是否可用未确认。");
+      return translate("听写流程已结束；未进行剪贴板交付。");
   }
 }
 

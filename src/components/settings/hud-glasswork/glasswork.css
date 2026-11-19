@@ -1,0 +1,153 @@
+/*
+ * @license MIT, Copyright (c) 2026 Kubai087
+ * Adapted from Glasswork/glass.css at 4f0b6744b898b3a9b98fbd913ab24fdb83c53162.
+ * Full MIT text and source pin: THIRD_PARTY_NOTICES.md (Glasswork).
+ */
+
+@property --m-tint { syntax: '<color>'; inherits: true; initial-value: #ffffff; }
+@property --m-k { syntax: '<number>'; inherits: true; initial-value: 1; }
+@property --m-thin { syntax: '<number>'; inherits: true; initial-value: 0.06; }
+@property --m-dense { syntax: '<number>'; inherits: true; initial-value: 0.22; }
+@property --m-blur { syntax: '<number>'; inherits: true; initial-value: 2; }
+@property --m-sat { syntax: '<number>'; inherits: true; initial-value: 1.8; }
+@property --m-bri { syntax: '<number>'; inherits: true; initial-value: 1.06; }
+@property --m-con { syntax: '<number>'; inherits: true; initial-value: 1; }
+@property --m-catch { syntax: '<number>'; inherits: true; initial-value: 1; }
+@property --m-bevel { syntax: '<number>'; inherits: true; initial-value: 1; }
+@property --m-shadow { syntax: '<number>'; inherits: true; initial-value: 1; }
+@property --density { syntax: '<number>'; inherits: true; initial-value: 0.35; }
+@property --keep { syntax: '<number>'; inherits: true; initial-value: 1; }
+@property --floor { syntax: '<number>'; inherits: true; initial-value: 0; }
+@property --ink { syntax: '<color>'; inherits: true; initial-value: rgba(0, 0, 0, 0.86); }
+@property --ink-2 { syntax: '<color>'; inherits: true; initial-value: rgba(60, 60, 67, 0.7); }
+@property --ink-solid { syntax: '<color>'; inherits: true; initial-value: #000000; }
+@property --ink-a { syntax: '<number>'; inherits: true; initial-value: 0.86; }
+@property --well { syntax: '<color>'; inherits: true; initial-value: rgba(0, 0, 0, 0.15); }
+
+/* ---------- Light glass (default) ---------- */
+
+.vf-glasswork-surface {
+  --u: 1px;
+  --m-tint: #ffffff;
+  --m-k: 1;
+  --m-thin: 0.06;
+  --m-dense: 0.22;
+  --m-blur: 2;
+  --m-sat: 1.8;
+  --m-bri: 1.06;
+  --m-con: 1;
+  --m-catch: 1;
+  --m-bevel: 1;
+  --m-shadow: 1;
+  --density: 0.35;
+  --keep: 1;
+  --floor: 0;
+  --ink: rgba(0, 0, 0, 0.86);
+  --ink-2: rgba(60, 60, 67, 0.7);
+  --ink-solid: #000000;
+  --ink-a: 0.86;
+  --well: rgba(0, 0, 0, 0.15);
+
+  --veil-k: min(1, var(--m-k));
+  --tint-a: min(0.95, max(var(--floor, 0), calc((var(--m-thin) + (var(--m-dense) - var(--m-thin)) * var(--density, 0.35)) * var(--m-k))));
+  --filter:
+    blur(calc(var(--m-blur) * var(--u, 1px)))
+    saturate(var(--m-sat))
+    contrast(calc(1 + (var(--m-con) - 1) * var(--veil-k)))
+    brightness(calc(1 + (var(--m-bri) - 1) * var(--veil-k)))
+    saturate(var(--keep, 1));
+
+  /* Capsules keep round ends across Safari, iOS, and Chromium. */
+  corner-shape: round;
+  color: var(--ink);
+  background: color-mix(in srgb, var(--m-tint) calc(var(--tint-a) * 100%), transparent);
+  -webkit-backdrop-filter: var(--filter);
+  backdrop-filter: var(--filter) var(--glass-lens,);
+  isolation: isolate;
+  box-shadow:
+    inset calc(1.5 * var(--u)) calc(1.5 * var(--u)) var(--u) calc(-1 * var(--u)) rgb(255 255 255 / calc(1 * var(--m-catch))),
+    inset calc(-1.5 * var(--u)) calc(-1.5 * var(--u)) var(--u) calc(-1 * var(--u)) rgb(255 255 255 / calc(0.6 * var(--m-catch))),
+    inset 0 0 0 calc(0.5 * var(--u)) rgb(255 255 255 / calc(0.3 * var(--m-catch))),
+    0 0 0 calc(0.5 * var(--u)) rgb(0 0 0 / calc(0.12 * var(--m-shadow))),
+    0 calc(4 * var(--u)) calc(16 * var(--u)) rgb(0 0 0 / calc(0.1 * var(--m-shadow))),
+    inset 0 calc(6 * var(--u)) calc(8 * var(--u)) calc(-6 * var(--u)) rgb(255 255 255 / calc(0.5 * var(--veil-k) * var(--m-bevel))),
+    inset calc(4 * var(--u)) 0 calc(8 * var(--u)) calc(-6 * var(--u)) rgb(255 255 255 / calc(0.22 * var(--veil-k) * var(--m-bevel))),
+    inset calc(-4 * var(--u)) 0 calc(8 * var(--u)) calc(-6 * var(--u)) rgb(255 255 255 / calc(0.12 * var(--veil-k) * var(--m-bevel))),
+    inset 0 calc(-6 * var(--u)) calc(8 * var(--u)) calc(-6 * var(--u)) rgb(0 0 0 / calc(0.06 * var(--veil-k) * var(--m-bevel)));
+  transition:
+    --m-tint 620ms ease, --m-k 620ms ease, --m-thin 620ms ease, --m-dense 620ms ease,
+    --m-blur 620ms ease, --m-sat 620ms ease, --m-bri 620ms ease, --m-con 620ms ease,
+    --m-catch 620ms ease, --m-bevel 620ms ease, --m-shadow 620ms ease,
+    --density 500ms ease, --keep 500ms ease, --floor 500ms ease,
+    --ink 620ms ease, --ink-2 620ms ease, --ink-solid 620ms ease, --ink-a 620ms ease,
+    --well 620ms ease,
+    box-shadow 620ms ease;
+}
+
+/* ---------- Dark glass ---------- */
+
+.vf-glasswork-surface[data-kind="dark"] {
+  --m-tint: #1e1e22;
+  --m-k: 1;
+  --m-thin: 0.16;
+  --m-dense: 0.38;
+  --m-blur: 2;
+  --m-sat: 1.6;
+  --m-bri: 0.8;
+  --m-con: 1;
+  --m-catch: 1;
+  --m-bevel: 1;
+  --m-shadow: 1;
+  --ink: rgba(255, 255, 255, 0.94);
+  --ink-2: rgba(235, 235, 245, 0.64);
+  --ink-solid: #ffffff;
+  --ink-a: 0.94;
+  --well: rgba(255, 255, 255, 0.22);
+
+  box-shadow:
+    inset var(--u) var(--u) calc(0.5 * var(--u)) calc(-0.5 * var(--u)) rgb(255 255 255 / calc(0.46 * var(--m-catch))),
+    inset calc(-1 * var(--u)) calc(-1 * var(--u)) calc(0.5 * var(--u)) calc(-0.5 * var(--u)) rgb(255 255 255 / calc(0.18 * var(--m-catch))),
+    inset 0 0 0 calc(0.5 * var(--u)) rgb(255 255 255 / calc(0.06 * var(--m-catch))),
+    0 0 0 calc(0.5 * var(--u)) rgb(0 0 0 / calc(0.28 * var(--m-shadow))),
+    0 calc(4 * var(--u)) calc(14 * var(--u)) rgb(0 0 0 / calc(0.22 * var(--m-shadow))),
+    inset 0 calc(6 * var(--u)) calc(8 * var(--u)) calc(-6 * var(--u)) rgb(255 255 255 / calc(0.18 * var(--veil-k) * var(--m-bevel))),
+    inset calc(4 * var(--u)) 0 calc(8 * var(--u)) calc(-6 * var(--u)) rgb(255 255 255 / calc(0.07 * var(--veil-k) * var(--m-bevel))),
+    inset calc(-4 * var(--u)) 0 calc(8 * var(--u)) calc(-6 * var(--u)) rgb(255 255 255 / calc(0.04 * var(--veil-k) * var(--m-bevel))),
+    inset 0 calc(-6 * var(--u)) calc(8 * var(--u)) calc(-6 * var(--u)) rgb(0 0 0 / calc(0.08 * var(--veil-k) * var(--m-bevel)));
+}
+
+/* Where the backdrop is drawn in WebGL (refract), the surface only adds its
+   tint, rim light, and bevel over the refracted canvas. */
+.vf-glasswork-surface[data-refract="webgl"] {
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+}
+
+.vf-glasswork-surface[data-reduced-transparency="true"] {
+  background: color-mix(in srgb, var(--m-tint) 96%, transparent);
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+}
+
+@media (prefers-reduced-transparency: reduce) {
+  .vf-glasswork-surface {
+    background: color-mix(in srgb, var(--m-tint) 96%, transparent);
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .vf-glasswork-surface {
+    transition: none;
+  }
+}
+
+@media (forced-colors: active) {
+  .vf-glasswork-surface {
+    border: 1px solid CanvasText;
+    background: Canvas;
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+  }
+}

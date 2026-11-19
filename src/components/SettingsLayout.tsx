@@ -40,11 +40,12 @@ export function SettingsGroup({ title, description, children }: { title: string;
 }
 
 /** Hiding a group preserves drafts and effects; input blur keeps its existing meaning. */
-export function SettingsDisclosure({ title, description, summary, children, defaultOpen = false, locked = false, error, variant = "surface", onExpandedChange }: {
-  title: string;
+export function SettingsDisclosure({ title, description, summary, children, open: controlledOpen, defaultOpen = false, locked = false, error, variant = "surface", onExpandedChange }: {
+  title: ReactNode;
   description?: string;
   summary?: ReactNode;
   children: ReactNode;
+  open?: boolean;
   defaultOpen?: boolean;
   locked?: boolean;
   error?: string | null;
@@ -52,13 +53,17 @@ export function SettingsDisclosure({ title, description, summary, children, defa
   onExpandedChange?: (expanded: boolean) => void;
 }) {
   const id = useId();
-  const [open, setOpen] = useState(defaultOpen);
+  const [uncontrolledOpen, setUncontrolledOpen] = useState(defaultOpen);
   const triggerRef = useRef<HTMLButtonElement>(null);
+  const open = controlledOpen ?? uncontrolledOpen;
   const expanded = open || locked || Boolean(error);
 
   useEffect(() => {
-    if (locked || error) setOpen(true);
-  }, [locked, error]);
+    if (locked || error) {
+      setUncontrolledOpen(true);
+      onExpandedChange?.(true);
+    }
+  }, [locked, error, onExpandedChange]);
 
   return (
     <section className={`vf-settings-disclosure vf-settings-disclosure--${variant} mt-6 ${variant === "surface" ? "rounded-xl border border-border bg-card" : ""}`}>
@@ -73,7 +78,7 @@ export function SettingsDisclosure({ title, description, summary, children, defa
           onClick={() => {
             if (locked || error) return;
             const nextExpanded = !expanded;
-            setOpen(nextExpanded);
+            setUncontrolledOpen(nextExpanded);
             onExpandedChange?.(nextExpanded);
             if (expanded) triggerRef.current?.focus({ preventScroll: true });
           }}

@@ -2719,4 +2719,61 @@ mod live_paired_eval {
         assert_eq!(providers::host_of(&endpoint), "dashscope.aliyuncs.com");
         assert!(endpoint.ends_with("/audio/transcriptions"));
     }
+
+    #[test]
+    fn guard_final_output_replay_and_adversarial_fixtures() {
+        let context = || crate::FinalizationContext {
+            scene: crate::ResolvedCleanupScene::observed(
+                crate::context::ContextFamily::General,
+                crate::context::FocusKind::Unknown,
+            ),
+            operation: crate::llm::CleanupOperation::Cleanup,
+            revision_source: None,
+            prepared_transcript: None,
+            revision_authorizations: &[],
+            promoted_pair_protections: &[],
+            list_revision_proof: None,
+            structure_safe_source: None,
+            output_projection_list_revision_proof: None,
+            layout_source: None,
+            exact_fallback: false,
+            allow_model_selected_paragraphs: false,
+        };
+
+        // Accepted replay cases: multilingual cleanups, self-corrections, lists with inline fillers
+        for (source, candidate) in [
+            ("Actually, we ship at 3pm.", "We ship at 3pm."),
+            ("我觉得那个明天可以发布", "我觉得明天可以发布。"),
+            (
+                "Send to Alice at 3pm, scratch that, send to Bob at 4pm",
+                "Send to Bob at 4pm.",
+            ),
+            ("不要发给张三，算了发给李四", "发给李四。"),
+            ("- 那个，今天上线\n- 嗯，明天复盘", "- 今天上线\n- 明天复盘"),
+        ] {
+            let (out, reason, _) =
+                crate::guard_final_output_with_reason(source, candidate, context());
+            assert_eq!(
+                out, candidate,
+                "expected replay cleanup acceptance for `{source}` -> `{candidate}` (reason: {reason:?})"
+            );
+            assert!(reason.is_none());
+        }
+
+        // Adversarial rejections: numbers, entities, polarity, unrequested translation
+        for (source, bad_candidate) in [
+            ("Deploy 42 servers today.", "Deploy 43 servers today."),
+            ("Send to Alice at 3pm.", "Send to Bob at 3pm."),
+            ("We should not deploy today.", "We should deploy today."),
+            ("今日の会議は3時からです", "Today's meeting starts at 3pm."),
+        ] {
+            let (out, reason, _) =
+                crate::guard_final_output_with_reason(source, bad_candidate, context());
+            assert_eq!(
+                out, source,
+                "expected adversarial rejection for `{source}` -> `{bad_candidate}`"
+            );
+            assert!(reason.is_some());
+        }
+    }
 }

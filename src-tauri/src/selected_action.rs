@@ -68,6 +68,8 @@ pub(crate) struct SelectedActionPreview {
     pub(crate) session: SelectedActionSession,
     pub(crate) session_generation: u64,
     pub(crate) context: context::ContextSnapshot,
+    /// Native-built preview DTO retained only for the owning preview window.
+    pub(crate) payload: serde_json::Value,
 }
 
 pub(crate) fn cancelled_preview_event_metadata(
@@ -106,7 +108,7 @@ pub(crate) fn clear_selected_preview(state: &AppState) {
         .take();
 }
 
-fn selected_preview_lease_is_current(state: &AppState, generation: u64) -> bool {
+pub(crate) fn selected_preview_lease_is_current(state: &AppState, generation: u64) -> bool {
     let current_generation = lock_recover(&state.manager).session_generation;
     let lease = *state
         .operation_lease
@@ -405,8 +407,10 @@ pub(crate) async fn confirm_selected_action_preview(
         return Err("Preview text is too long".into());
     }
     let preview = take_selected_preview_for_transaction(&state, &transaction_id)?;
+    let target_pid = Some(preview.session.target_guard.pid);
     let identity = preview.session.identity.clone();
     if !selected_preview_lease_is_current(&state, preview.session_generation) {
+        crate::restore_after_preview(&app, &state, target_pid, &identity.transaction_id).await;
         return Err("Selected-text preview is stale".into());
     }
     if let Err(error) = restore_preview_target_and_validate(
@@ -416,10 +420,10 @@ pub(crate) async fn confirm_selected_action_preview(
     )
     .await
     {
-        match error {
-            PreviewRestoreError::Stale => return Err("Selected-text preview is stale".into()),
+        let result = match error {
+            PreviewRestoreError::Stale => Err("Selected-text preview is stale".into()),
             PreviewRestoreError::Activation(_) | PreviewRestoreError::Target(_) => {
-                return copy_selected_action_preview_result(
+                copy_selected_action_preview_result(
                     &app,
                     &state,
                     &final_text,
@@ -428,13 +432,15 @@ pub(crate) async fn confirm_selected_action_preview(
                     &identity,
                     true,
                 )
-                .await;
+                .await
             }
-        }
+        };
+        crate::restore_after_preview(&app, &state, target_pid, &identity.transaction_id).await;
+        return result;
     }
 
     if let Err(error) = verify_source_snapshot(&app, &state, &preview.session).await {
-        return match error {
+        let result = match error {
             paste::PasteError::Cancelled => Err("Selected-text preview is stale".into()),
             _ => {
                 copy_selected_action_preview_result(
@@ -449,10 +455,12 @@ pub(crate) async fn confirm_selected_action_preview(
                 .await
             }
         };
+        crate::restore_after_preview(&app, &state, target_pid, &identity.transaction_id).await;
+        return result;
     }
 
     if !preview.session.delivery_replace_allowed {
-        return copy_selected_action_preview_result(
+        let result = copy_selected_action_preview_result(
             &app,
             &state,
             &final_text,
@@ -462,10 +470,14 @@ pub(crate) async fn confirm_selected_action_preview(
             false,
         )
         .await;
+        crate::restore_after_preview(&app, &state, target_pid, &identity.transaction_id).await;
+        return result;
     }
 
-    let cancellation = crate::text_action_cancellation(&state, &identity)
-        .ok_or_else(|| "Selected-text preview is stale".to_owned())?;
+    let Some(cancellation) = crate::text_action_cancellation(&state, &identity) else {
+        crate::restore_after_preview(&app, &state, target_pid, &identity.transaction_id).await;
+        return Err("Selected-text preview is stale".into());
+    };
     let paste_result = paste_selected_text(
         &app,
         &state,
@@ -477,7 +489,7 @@ pub(crate) async fn confirm_selected_action_preview(
         cancellation,
     )
     .await;
-    match paste_result {
+    let outcome_result = match paste_result {
         Ok(outcome) => {
             let result = delivery::DeliveryResult::from_insert_verified(outcome.verified);
             if outcome.verified {
@@ -557,7 +569,9 @@ pub(crate) async fn confirm_selected_action_preview(
             )
             .await
         }
-    }
+    };
+    crate::restore_after_preview(&app, &state, target_pid, &identity.transaction_id).await;
+    outcome_result
 }
 
 async fn copy_selected_action_preview_result(
@@ -756,7 +770,8 @@ pub(crate) async fn copy_selected_action_preview(
         return Err("Preview text is too long".into());
     }
     let preview = take_selected_preview_for_transaction(&state, &transaction_id)?;
-    copy_selected_action_preview_result(
+    let target_pid = Some(preview.session.target_guard.pid);
+    let result = copy_selected_action_preview_result(
         &app,
         &state,
         &final_text,
@@ -765,7 +780,9 @@ pub(crate) async fn copy_selected_action_preview(
         &preview.session.identity,
         false,
     )
-    .await
+    .await;
+    crate::restore_after_preview(&app, &state, target_pid, &transaction_id).await;
+    result
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -774,6 +791,10 @@ pub(crate) async fn cancel_selected_action_preview(
     state: State<'_, AppState>,
     transaction_id: String,
 ) -> Result<(), String> {
+    let target_pid = lock_recover(&state.selected_preview)
+        .as_ref()
+        .filter(|preview| preview.session.identity.transaction_id == transaction_id)
+        .map(|preview| preview.session.target_guard.pid);
     let Some(cancel) =
         dictation::cancel_text_action_by_id(&app, &state, &transaction_id, "selected").await
     else {
@@ -783,6 +804,7 @@ pub(crate) async fn cancel_selected_action_preview(
         return Err("Text action is committing; its result will be reported".into());
     };
     emit_selected_action_state(&app, "cancelled", event_generation, Some(action_sequence));
+    crate::restore_after_preview(&app, &state, target_pid, &transaction_id).await;
     Ok(())
 }
 
@@ -798,7 +820,7 @@ mod tests {
     fn diagnosed(posted: bool) -> PasteError {
         let diagnostic = crate::delivery_diagnostics::DeliveryDiagnostic {
             code: "paste_failed",
-            user_reason: "test",
+            user_reason: "test".into(),
             stage: "paste_shortcut",
             target_app: None,
             accessibility_available: true,
@@ -822,6 +844,7 @@ mod tests {
             paste_full_range_attempted: false,
             clipboard_restore_attempted: false,
             clipboard_restored: None,
+            secure_input_owner_name: None,
         };
         PasteError::Diagnosed {
             source: Box::new(PasteError::Input("x".into())),

@@ -266,7 +266,7 @@ describe("DictionarySettings", () => {
     expect(save).toHaveBeenCalledWith({ local_edit_learning_enabled: true });
   });
 
-  it("adds a reversible before→after rule for an explicitly selected running native app", async () => {
+  it("adds a reversible before→after rule globally, for a native app, or for a browser website", async () => {
     invokeMock.mockImplementation(async (command) => {
       if (command === "get_manual_learn_applications") {
         return [{ bundle_id: "com.openai.codex", label: "Codex" }];
@@ -274,7 +274,20 @@ describe("DictionarySettings", () => {
       return [];
     });
     render(<DictionarySettings settings={settings} save={vi.fn()} />);
-    fireEvent.change(await screen.findByRole("textbox", { name: "听写识别为" }), { target: { value: "L O M" } });
+
+    // Default: Global rule (recommended)
+    fireEvent.change(await screen.findByRole("textbox", { name: "听写识别为" }), { target: { value: "知呼" } });
+    fireEvent.change(screen.getByRole("textbox", { name: "应替换为" }), { target: { value: "知乎" } });
+    fireEvent.click(screen.getByRole("button", { name: "添加全局规则" }));
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("add_manual_scoped_learn_pair", {
+      beforeSurface: "知呼",
+      afterSurface: "知乎",
+      scopeMode: "global",
+    }));
+
+    // App-scoped local-only private rule
+    fireEvent.click(screen.getByRole("radio", { name: "仅指定 App（本机私密）" }));
+    fireEvent.change(screen.getByRole("textbox", { name: "听写识别为" }), { target: { value: "L O M" } });
     fireEvent.change(screen.getByRole("textbox", { name: "应替换为" }), { target: { value: "LLM" } });
     selectOption(await screen.findByRole("combobox", { name: "仅在此 App 生效" }), "com.openai.codex");
     fireEvent.click(screen.getByRole("button", { name: "添加专用纠正" }));
@@ -283,7 +296,19 @@ describe("DictionarySettings", () => {
       afterSurface: "LLM",
       bundleId: "com.openai.codex",
     }));
-    expect(screen.getByText(/规则只在所选 App 生效，不改全局个人词典，也不改历史记录/)).toBeInTheDocument();
+
+    // Website domain local-only private rule
+    fireEvent.click(screen.getByRole("radio", { name: "仅指定网站（本机私密）" }));
+    fireEvent.change(screen.getByRole("textbox", { name: "听写识别为" }), { target: { value: "githab" } });
+    fireEvent.change(screen.getByRole("textbox", { name: "应替换为" }), { target: { value: "GitHub" } });
+    fireEvent.change(screen.getByRole("textbox", { name: "仅在此网站域名生效" }), { target: { value: "github.com" } });
+    fireEvent.click(screen.getByRole("button", { name: "添加专用纠正" }));
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("add_manual_scoped_learn_pair", {
+      beforeSurface: "githab",
+      afterSurface: "GitHub",
+      browserHost: "github.com",
+      scopeMode: "host",
+    }));
   });
 
   it("explains when a manual correction already exists under another scope", async () => {
@@ -295,7 +320,8 @@ describe("DictionarySettings", () => {
       return [];
     });
     render(<DictionarySettings settings={settings} save={vi.fn()} />);
-    fireEvent.change(await screen.findByRole("textbox", { name: "听写识别为" }), { target: { value: "L O M" } });
+    fireEvent.click(await screen.findByRole("radio", { name: "仅指定 App（本机私密）" }));
+    fireEvent.change(screen.getByRole("textbox", { name: "听写识别为" }), { target: { value: "L O M" } });
     fireEvent.change(screen.getByRole("textbox", { name: "应替换为" }), { target: { value: "LLM" } });
     selectOption(await screen.findByRole("combobox", { name: "仅在此 App 生效" }), "com.openai.codex");
     fireEvent.click(screen.getByRole("button", { name: "添加专用纠正" }));
@@ -387,8 +413,9 @@ describe("DictionarySettings", () => {
     await screen.findByText(/wechat · 少用句号 · 你好/);
     fireEvent.click(screen.getByRole("button", { name: "确认" }));
     const dialog = screen.getByRole("dialog");
-    expect(dialog).toHaveTextContent("并允许用于后续整理请求");
-    expect(dialog).toHaveTextContent("现在不会发送");
+    expect(dialog).toHaveTextContent("仅保存在本机作为该 App 的风格样例");
+    expect(dialog).toHaveTextContent("不会发送给云端整理服务");
+    expect(dialog).toHaveTextContent("同时批准将此 App 的风格样例发送给当前整理服务");
     expect(dialog).toHaveTextContent("示例输入：你好。 → 期望输出：你好");
     expect(invokeMock.mock.calls.some(([command]) => command === "confirm_style_draft")).toBe(false);
     fireEvent.click(within(dialog).getByRole("button", { name: "取消" }));
@@ -477,6 +504,17 @@ describe("DictionarySettings", () => {
     expect(await screen.findByRole("group", { name: "知呼 → 知乎" })).toBeInTheDocument();
     expect(screen.getByText("适用范围： com.example.editor · editor-chat · work_chat")).toBeInTheDocument();
 
+    fireEvent.click(screen.getByRole("button", { name: "全局记住" }));
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("promote_learn_pair", {
+        pairKey: pendingPair.pair_key,
+        beforeSurface: "知呼",
+        afterSurface: "知乎",
+        scopeMode: "global",
+      }),
+    );
+
+    await waitFor(() => expect(screen.getByRole("button", { name: "确认" })).toBeEnabled());
     fireEvent.click(screen.getByRole("button", { name: "确认" }));
     await waitFor(() =>
       expect(invokeMock).toHaveBeenCalledWith("promote_learn_pair", {
@@ -570,6 +608,26 @@ describe("DictionarySettings", () => {
     expect(within(activeGroup!).queryByRole("button", { name: "置顶 知乎" })).not.toBeInTheDocument();
     expect(within(activeGroup!).getByRole("button", { name: "忘记" })).toBeInTheDocument();
     expect(invokeMock.mock.calls.some(([command]) => command === "pin_dictionary_term")).toBe(false);
+  });
+
+  it("treats promoted pairs with declared host or bundle scope as local-only even when scope flags are false", async () => {
+    const legacyScopedPair = {
+      ...promotedPair,
+      pair_key: "word:v2:host-scoped",
+      before_surface: "githab",
+      after_surface: "GitHub",
+      browser_host: "github.com",
+      auto_scoped: false,
+      manual_scoped: false,
+    };
+    invokeMock.mockImplementation(async (command) => command === "list_learn_pairs" ? [legacyScopedPair] : []);
+    render(<DictionarySettings settings={settings} save={vi.fn()} />);
+
+    expect(await screen.findByText("githab → GitHub")).toBeInTheDocument();
+    const activeGroup = screen.getByRole("heading", { name: /已生效替换/ }).closest("section");
+    expect(activeGroup).not.toBeNull();
+    expect(within(activeGroup!).getByText("仅本机词典规则；不会写入全局词条")).toBeInTheDocument();
+    expect(within(activeGroup!).queryByRole("button", { name: "置顶 GitHub" })).not.toBeInTheDocument();
   });
 
   it("shows mapping-invalidated rules as paused and uses the explicit rebind action", async () => {
@@ -724,6 +782,28 @@ describe("DictionarySettings", () => {
     await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
     expect(screen.queryByText(/wechat · 少用句号 · 你好/)).not.toBeInTheDocument();
     expect(attempts).toBe(2);
+    expect(invokeMock).toHaveBeenCalledWith("confirm_style_draft", {
+      draftKey: styleDraft.draft_key,
+      approveCloudSharing: false,
+    });
+  });
+
+  it("can opt into cloud sharing when confirming a style draft", async () => {
+    invokeMock.mockImplementation(async (command) => {
+      if (command === "list_learn_pairs" || command === "list_pinned_terms") return [];
+      if (command === "list_style_drafts") return [styleDraft];
+      return undefined;
+    });
+    render(<DictionarySettings settings={settings} save={vi.fn()} />);
+    expect(await screen.findByText(/wechat · 少用句号 · 你好/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "确认" }));
+    fireEvent.click(screen.getByRole("checkbox", { name: "同时批准将此 App 的风格样例发送给当前整理服务" }));
+    fireEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: "确认" }));
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("confirm_style_draft", {
+        draftKey: styleDraft.draft_key,
+        approveCloudSharing: true,
+      }));
   });
 
   it("refreshes failed App choices in place without losing the correction draft", async () => {
@@ -734,7 +814,8 @@ describe("DictionarySettings", () => {
       return base(command, args, options);
     });
     render(<DictionarySettings settings={settings} save={vi.fn()} />);
-    await screen.findByText("无法读取当前运行的 App；请重试后再添加。");
+    fireEvent.click(await screen.findByRole("radio", { name: "仅指定 App（本机私密）" }));
+    await screen.findByText("无法读取原生 App 列表；请重试后再添加。");
     fireEvent.change(screen.getByRole("textbox", { name: "听写识别为" }), { target: { value: "wrong" } });
     failed = false;
     fireEvent.click(screen.getByRole("button", { name: "刷新 App 列表" }));
@@ -743,7 +824,7 @@ describe("DictionarySettings", () => {
     selectOption(control, "com.apple.TextEdit");
     expect(control).toHaveValue("com.apple.TextEdit");
     expect(screen.getByRole("textbox", { name: "听写识别为" })).toHaveValue("wrong");
-    expect(screen.queryByText("无法读取当前运行的 App；请重试后再添加。")).not.toBeInTheDocument();
+    expect(screen.queryByText("无法读取原生 App 列表；请重试后再添加。")).not.toBeInTheDocument();
   });
 
 });

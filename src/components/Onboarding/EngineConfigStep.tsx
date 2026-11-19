@@ -1,7 +1,7 @@
 import { ModelCard } from "./ModelCard";
 import { Autocomplete } from "../Autocomplete";
 import { Select } from "../Select";
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { CloudCog, Lock } from "lucide-react";
 import { PasswordInput } from "../PasswordInput";
@@ -10,6 +10,8 @@ import { ValidationStatus } from "./ValidationStatus";
 import { iconProps, iconPropsSm } from "../../lib/icons";
 import { useI18n } from "../../lib/i18n";
 import { asrLanguageDescription } from "../../lib/engineWizard";
+import { SUPPORTED_LANGUAGES, coerceLanguageForModel, modelLanguageSupport } from "../../lib/languages";
+import { recommendOnboardingRoute } from "../../lib/onboardingRouteRecommendations";
 import { asrModelProfile, isProviderId, isRetiredOnDeviceModel, onDeviceMemoryCompatibilityCopy, providerById, providersFor, type DashscopeRegion, type ProviderId } from "../../lib/providers";
 import type { OnDeviceModelStatus } from "../../types/settings";
 
@@ -54,6 +56,7 @@ export function EngineConfigStep({
   onDeviceAction,
   onRefreshOnDeviceModels,
   strictOfflineBlocked,
+  strictOfflineEnabled,
   asrModel,
   onAsrModelChange,
   language,
@@ -79,6 +82,7 @@ export function EngineConfigStep({
   onDeviceAction: (id: string, action: "download" | "cancel") => void;
   onRefreshOnDeviceModels: () => void;
   strictOfflineBlocked: boolean;
+  strictOfflineEnabled: boolean;
   asrModel: string;
   onAsrModelChange: (value: string) => void;
   language: string;
@@ -106,7 +110,6 @@ export function EngineConfigStep({
   const modelOptions = provider?.asrModels ?? [];
   const selectedOnDeviceModel = onDeviceModels.find((model) => model.id === asrModel);
   const deviceMemoryIssue = onDeviceMemoryCompatibilityCopy(selectedOnDeviceModel?.memory_compatibility_error, t);
-  const modelLoadInProgress = onDeviceModels.some((model) => model.runtime_status === "loading");
   const hasSupportedDeviceModel = onDeviceModels.some((model) => model.id !== "sensevoice-small" && model.platform_supported);
   const providerOptions = Array.from(new Set<ProviderId>([
     ...providersFor("asr").map(({ id }) => id).filter((id) => id !== "custom" && id !== "local_whisper" && id !== "on_device"),
@@ -114,12 +117,21 @@ export function EngineConfigStep({
     "on_device",
   ]));
   const profile = asrModelProfile(asrProvider, asrModel);
-
-  useEffect(() => {
-    if (!modelLoadInProgress) return;
-    const timer = window.setInterval(() => void onRefreshOnDeviceModels(), 1000);
-    return () => window.clearInterval(timer);
-  }, [modelLoadInProgress, onRefreshOnDeviceModels]);
+  const systemLocale = typeof navigator === "undefined"
+    ? ""
+    : navigator.languages?.[0] || navigator.language || "";
+  const routeRecommendation = recommendOnboardingRoute(language, systemLocale);
+  const parakeetStatus = onDeviceModels.find((model) => model.id === "parakeet-tdt-0.6b-v3-8bit");
+  const qwenStatus = onDeviceModels.find((model) => model.id === "qwen3-asr-0.6b");
+  const canRecommendLocal = (model: OnDeviceModelStatus | undefined) => Boolean(model
+    && model.platform_supported
+    && (model.download_available || model.state === "ready"));
+  const chooseRecommendedRoute = (providerId: ProviderId, modelId: string) => {
+    const nextLanguage = coerceLanguageForModel(providerId, modelId, language);
+    onAsrProviderChange(providerId);
+    onAsrModelChange(modelId);
+    if (nextLanguage !== language) onLanguageChange(nextLanguage);
+  };
 
   const cancelModelLoad = async (id: string) => {
     setLoadCancelingId(id);
@@ -173,9 +185,72 @@ export function EngineConfigStep({
 
       <label className="mt-4 block text-xs font-medium text-secondary" htmlFor="onboarding-language">{t("识别语言")}
         <Select id="onboarding-language" value={language} disabled={validating} onValueChange={onLanguageChange} className="mt-1 h-9 w-full rounded-lg border border-border bg-elevated px-3 text-sm text-primary">
-          <option value="auto" disabled={profile?.languageSupport === "explicit_language_required"}>{t(profile?.languageSupport === "explicit_language_required" ? "自动（此模型不支持）" : "自动检测")}</option><option value="zh">{t("中文")}</option><option value="en">English</option>
+          {(() => {
+            const support = modelLanguageSupport(asrProvider, asrModel);
+            const items = SUPPORTED_LANGUAGES.filter((item) =>
+              support.allowedCodes.includes(item.code) || item.code === language,
+            );
+            return items.map((item) => {
+              const supported = support.allowedCodes.includes(item.code);
+              return (
+                <option
+                  key={item.code}
+                  value={item.code}
+                  disabled={!supported}
+                >
+                  {item.code === "auto"
+                    ? t(supported ? "自动检测" : "自动（此模型不支持）")
+                    : `${item.code === "zh" ? t("中文（简体）") : item.code === "zh-TW" ? t("繁體中文") : item.nativeName}${supported ? "" : ` (${t("当前模型不支持")})`}`}
+                </option>
+              );
+            });
+          })()}
         </Select>
       </label>
+      {routeRecommendation && (
+        <section className="mt-4 rounded-xl border border-border bg-elevated/45 p-3" aria-label={t("地区和语言路线建议")}>
+          <p className="text-xs font-semibold text-primary">{t("按系统地区和识别语言推荐")}</p>
+          <p className="mt-1 text-xs leading-5 text-secondary">{t("根据系统地区和识别语言给出建议；不会自动更改。")}</p>
+          {routeRecommendation.kind === "european_local" ? (
+            <>
+              <p className="mt-1 text-xs leading-5 text-secondary">
+                {t("Parakeet TDT v3 的模型卡列出 25 种欧洲语言，并使用自动检测；此 Mac 上的速度和识别质量尚未实测。")}
+              </p>
+              <div className="mt-3 flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  disabled={validating || !canRecommendLocal(parakeetStatus)}
+                  onClick={() => chooseRecommendedRoute("on_device", "parakeet-tdt-0.6b-v3-8bit")}
+                  className={compactButtonClass}
+                >{t("选择 Parakeet TDT v3 自动检测路线")}</button>
+                {!canRecommendLocal(parakeetStatus) && <span className="text-xs text-tertiary">{t("此设备上的 Parakeet 模型当前不可选择。")}</span>}
+              </div>
+            </>
+          ) : (
+            <>
+              <p className="mt-1 text-xs leading-5 text-secondary">
+                {t("可选 Qwen3-ASR 本机自动检测路线，或 Soniox 多语言云端路线；两条路线的速度和识别质量尚未在此设备实测。")}
+              </p>
+              <div className="mt-3 flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  disabled={validating || !canRecommendLocal(qwenStatus)}
+                  onClick={() => chooseRecommendedRoute("on_device", "qwen3-asr-0.6b")}
+                  className={compactButtonClass}
+                >{t("选择 Qwen3-ASR 本机路线")}</button>
+                <button
+                  type="button"
+                  disabled={validating || strictOfflineEnabled}
+                  onClick={() => chooseRecommendedRoute("soniox", providerById("soniox")?.defaultAsrModel ?? "stt-rt-v5")}
+                  className={compactButtonClass}
+                >{t("选择 Soniox 多语言云端路线")}</button>
+                {!canRecommendLocal(qwenStatus) && <span className="text-xs text-tertiary">{t("此设备上的 Qwen3-ASR 模型当前不可选择。")}</span>}
+              </div>
+              {strictOfflineEnabled && <p role="note" className="mt-2 text-xs text-warning-ink">{t("严格离线模式会阻止 Soniox 云端路线。")}</p>}
+            </>
+          )}
+        </section>
+      )}
       <p className="mt-2 text-xs text-secondary">{t("可以保存配置后继续，探测和试用均可稍后进行。完成引导不会自动发送测试音频或整理样例。")}</p>
       <details className="mt-3 text-xs leading-5 text-secondary">
         <summary className="cursor-pointer font-medium">{t("这些检查分别代表什么？")}</summary>
@@ -196,7 +271,12 @@ export function EngineConfigStep({
               value={asrProvider}
               disabled={validating}
               onValueChange={(value) => {
-                if (isProviderId(value)) onAsrProviderChange(value);
+                if (isProviderId(value)) {
+                  onAsrProviderChange(value);
+                  const nextDefaultModel = providerById(value)?.defaultAsrModel ?? "";
+                  const nextLang = coerceLanguageForModel(value, nextDefaultModel, language);
+                  if (nextLang !== language) onLanguageChange(nextLang);
+                }
               }}
               className="mt-2 h-9 w-full rounded-lg border border-border bg-elevated px-3 text-sm text-primary"
             >
@@ -258,7 +338,11 @@ export function EngineConfigStep({
                     aria-label={t("ASR 模型")}
                     value={asrModel}
                     disabled={validating}
-                    onValueChange={(value) => onAsrModelChange(value)}
+                    onValueChange={(value) => {
+                      onAsrModelChange(value);
+                      const nextLang = coerceLanguageForModel(asrProvider, value, language);
+                      if (nextLang !== language) onLanguageChange(nextLang);
+                    }}
                     className="mt-1 h-9 w-full rounded-lg border border-border bg-elevated px-3 text-sm text-primary"
                   >
                     {modelOptions.map((option) => (
@@ -322,6 +406,9 @@ export function EngineConfigStep({
             {selectedOnDeviceModel?.error_category === "disk_full" && <p className="mt-1 text-xs text-error-ink">{t("检查可用空间后重试下载。")}</p>}
             {selectedOnDeviceModel?.error && <p className="mt-1 text-xs text-tertiary">{selectedOnDeviceModel.error}</p>}
             {selectedOnDeviceModel?.id === "sensevoice-small" && <p className="mt-1 text-xs text-warning-ink">{t("SenseVoice 是旧版文件保留项；没有 MLX 推理支持，不能用于本机听写。")}</p>}
+            {selectedOnDeviceModel && !isRetiredOnDeviceModel(selectedOnDeviceModel.id) && (selectedOnDeviceModel.license_unreviewed || selectedOnDeviceModel.id === "qwen3-asr-1.7b") && (
+              <p role="note" className="mt-1 text-xs text-warning-ink">{t("转换权重仓库许可尚未完成审查，详见第三方许可说明。")}</p>
+            )}
             {selectedOnDeviceModel?.runtime_status === "loading"
               ? <p className="mt-1 text-xs text-warning-ink">{t("本机模型正在加载；加载完成后会单独显示运行时状态。")}</p>
               : selectedOnDeviceModel?.loaded

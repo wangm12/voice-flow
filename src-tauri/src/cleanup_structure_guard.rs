@@ -42,13 +42,15 @@ pub(crate) fn preserves_structure_safe(source: &str, candidate: &str) -> bool {
     if source == candidate {
         return true;
     }
+    let inline_filler_waivers = inline_filler_waiver_ranges(source, candidate).unwrap_or_default();
     if !crate::spoken_layout::preserves_required_layout(source, candidate)
-        || !crate::protected_span::preserves(
+        || !crate::protected_span::preserves_with_source_term_waivers(
             source,
             candidate,
             Some(crate::llm::CleanupOperation::Cleanup),
+            &inline_filler_waivers,
         )
-        || !exact_protected_span_values(source, candidate)
+        || !exact_protected_span_values(source, candidate, &inline_filler_waivers)
         || !exact_literal_ranges(source, candidate)
         || !exact_code_regions(source, candidate)
         || !exact_list_prefixes(source, candidate)
@@ -63,8 +65,13 @@ pub(crate) fn preserves_structure_safe(source: &str, candidate: &str) -> bool {
         return false;
     };
 
-    source_view.skeleton == candidate_view.skeleton
+    if source_view.skeleton == candidate_view.skeleton
         && punctuation_changes_are_one_sided(&source_view.punctuation, &candidate_view.punctuation)
+    {
+        return true;
+    }
+
+    !inline_filler_waivers.is_empty()
 }
 
 /// Prove model-selected paragraph breaks against a flat prepared source.
@@ -391,19 +398,26 @@ fn eligible_punctuation(
     }
 }
 
-fn punctuation_changes_are_one_sided(
+fn punctuation_changes_are_one_sided_inner(
     source: &[PunctuationEvent],
     candidate: &[PunctuationEvent],
+    allow_added_inline_commas: bool,
 ) -> bool {
     let source_inline = source
         .iter()
         .filter(|event| !event.line_terminal)
+        .copied()
         .collect::<Vec<_>>();
     let candidate_inline = candidate
         .iter()
         .filter(|event| !event.line_terminal)
+        .copied()
         .collect::<Vec<_>>();
-    if source_inline != candidate_inline {
+    if source_inline != candidate_inline
+        && (!allow_added_inline_commas
+            || source_inline.len() >= candidate_inline.len()
+            || !one_sided_subset(&source_inline, &candidate_inline))
+    {
         return false;
     }
 
@@ -423,6 +437,13 @@ fn punctuation_changes_are_one_sided(
         return source_terminal == candidate_terminal;
     }
     one_sided_subset(&source_terminal, &candidate_terminal)
+}
+
+fn punctuation_changes_are_one_sided(
+    source: &[PunctuationEvent],
+    candidate: &[PunctuationEvent],
+) -> bool {
+    punctuation_changes_are_one_sided_inner(source, candidate, false)
 }
 
 fn one_sided_subset<T: PartialEq>(source: &[T], candidate: &[T]) -> bool {
@@ -511,22 +532,555 @@ fn list_prefix_ranges(text: &str) -> Vec<Range<usize>> {
     ranges
 }
 
-fn exact_protected_span_values(source: &str, candidate: &str) -> bool {
+fn exact_protected_span_values(
+    source: &str,
+    candidate: &str,
+    inline_filler_waivers: &[Range<usize>],
+) -> bool {
+    let inline_filler_cleanup = !inline_filler_waivers.is_empty();
+    let source_waivers = crate::spoken_layout::clause_leading_hesitation_ranges(source);
     let source_spans =
-        crate::protected_span::protected_spans(source, Some(crate::llm::CleanupOperation::Cleanup));
+        crate::protected_span::protected_spans(source, Some(crate::llm::CleanupOperation::Cleanup))
+            .into_iter()
+            .filter(|span| {
+                span.kind != crate::protected_span::ProtectedSpanKind::Term
+                    || !inline_filler_waivers
+                        .iter()
+                        .any(|range| range.start == span.start_byte && range.end == span.end_byte)
+            })
+            .collect::<Vec<_>>();
     let candidate_spans = crate::protected_span::protected_spans(
         candidate,
         Some(crate::llm::CleanupOperation::Cleanup),
     );
-    source_spans.len() == candidate_spans.len()
-        && source_spans
-            .iter()
-            .zip(candidate_spans)
-            .all(|(source_span, candidate_span)| {
-                source_span.kind == candidate_span.kind
-                    && source.get(source_span.start_byte..source_span.end_byte)
-                        == candidate.get(candidate_span.start_byte..candidate_span.end_byte)
-            })
+    let source_lower = if inline_filler_cleanup {
+        Some(source.to_ascii_lowercase())
+    } else {
+        None
+    };
+
+    let mut s = 0usize;
+    let mut c = 0usize;
+    while s < source_spans.len() || c < candidate_spans.len() {
+        if s < source_spans.len() && c < candidate_spans.len() {
+            let source_span = source_spans[s];
+            let candidate_span = candidate_spans[c];
+            if source_span.kind == candidate_span.kind
+                && source.get(source_span.start_byte..source_span.end_byte)
+                    == candidate.get(candidate_span.start_byte..candidate_span.end_byte)
+            {
+                s += 1;
+                c += 1;
+                continue;
+            }
+        }
+        if inline_filler_cleanup
+            && s < source_spans.len()
+            && source_spans[s].kind == crate::protected_span::ProtectedSpanKind::Term
+            && (source_waivers.iter().any(|range| {
+                range.start == source_spans[s].start_byte && range.end == source_spans[s].end_byte
+            }) || crate::protected_span::is_waivable_sentence_initial_source_term(
+                source,
+                source_spans[s],
+            ))
+        {
+            s += 1;
+            continue;
+        }
+        if inline_filler_cleanup
+            && c < candidate_spans.len()
+            && candidate_spans[c].kind == crate::protected_span::ProtectedSpanKind::Term
+        {
+            let cand_span = candidate_spans[c];
+            let cand_token = &candidate[cand_span.start_byte..cand_span.end_byte];
+            let promoted_from_lowercase =
+                crate::protected_span::is_sentence_or_clause_start(candidate, cand_span.start_byte)
+                    && source_lower
+                        .as_deref()
+                        .is_some_and(|lower| lower.contains(&cand_token.to_ascii_lowercase()));
+            if promoted_from_lowercase {
+                c += 1;
+                continue;
+            }
+        }
+        return false;
+    }
+    true
+}
+
+pub(crate) fn preserves_line_structure_with_inline_filler_cleanup(
+    source: &str,
+    candidate: &str,
+) -> bool {
+    inline_filler_waiver_ranges(source, candidate).is_some()
+}
+
+fn inline_filler_waiver_ranges(source: &str, candidate: &str) -> Option<Vec<Range<usize>>> {
+    let src_lines: Vec<&str> = source.split_inclusive('\n').collect();
+    let cand_lines: Vec<&str> = candidate.split_inclusive('\n').collect();
+    if src_lines.len() != cand_lines.len() || src_lines.is_empty() {
+        return None;
+    }
+    let src_trailing_nl = source.ends_with('\n');
+    let cand_trailing_nl = candidate.ends_with('\n');
+    if src_trailing_nl != cand_trailing_nl {
+        return None;
+    }
+    let mut waivers = Vec::new();
+    let mut deleted_any_filler = false;
+    let mut line_start = 0usize;
+    for (src_line, cand_line) in src_lines.iter().zip(cand_lines.iter()) {
+        let src_nl = line_ending_slice(src_line);
+        let cand_nl = line_ending_slice(cand_line);
+        if src_nl != cand_nl {
+            return None;
+        }
+        let src_content = &src_line[..src_line.len() - src_nl.len()];
+        let cand_content = &cand_line[..cand_line.len() - cand_nl.len()];
+        let src_prefix_len = line_structural_prefix_len(src_content);
+        let cand_prefix_len = line_structural_prefix_len(cand_content);
+        if src_content[..src_prefix_len] != cand_content[..cand_prefix_len] {
+            return None;
+        }
+        let src_body = &src_content[src_prefix_len..];
+        let cand_body = &cand_content[cand_prefix_len..];
+        if src_body == cand_body {
+            line_start += src_line.len();
+            continue;
+        }
+        if let (Some(sv), Some(cv)) = (safe_view(src_body), safe_view(cand_body)) {
+            if sv.skeleton == cv.skeleton
+                && punctuation_changes_are_one_sided(&sv.punctuation, &cv.punctuation)
+            {
+                line_start += src_line.len();
+                continue;
+            }
+        }
+        let line_waivers = collect_line_spoken_filler_deletions(src_body, cand_body)?;
+        let body_offset = line_start + src_prefix_len;
+        waivers.extend(
+            line_waivers
+                .into_iter()
+                .map(|r| body_offset + r.start..body_offset + r.end),
+        );
+        deleted_any_filler = true;
+        line_start += src_line.len();
+    }
+    deleted_any_filler.then_some(waivers)
+}
+
+fn line_ending_slice(line: &str) -> &str {
+    if line.ends_with("\r\n") {
+        "\r\n"
+    } else if line.ends_with('\n') {
+        "\n"
+    } else {
+        ""
+    }
+}
+
+fn line_structural_prefix_len(content: &str) -> usize {
+    let indentation = content.len() - content.trim_start().len();
+    let rest = &content[indentation..];
+    if rest.starts_with("- ") || rest.starts_with("* ") {
+        return indentation + 2;
+    }
+    if rest.starts_with("• ") {
+        return indentation + "• ".len();
+    }
+    let digits = rest.chars().take_while(|ch| ch.is_ascii_digit()).count();
+    if digits > 0
+        && rest
+            .get(digits..)
+            .is_some_and(|suffix| suffix.starts_with(". ") || suffix.starts_with(") "))
+    {
+        return indentation + digits + 2;
+    }
+    indentation
+}
+
+fn collect_line_spoken_filler_deletions(
+    src_body: &str,
+    cand_body: &str,
+) -> Option<Vec<Range<usize>>> {
+    // Strip curated spoken filler tokens/phrases from src_body step-by-step only
+    // when they match deleted spans needed to produce cand_body, then validate
+    // the stripped source line against cand_body via safe_view so line-terminal
+    // questions and unsafe punctuation remain rejected while safe punctuation
+    // additions (e.g. "。" or inline "，") remain allowed.
+    if cand_body.is_empty() || src_body == cand_body {
+        return None;
+    }
+    const INLINE_FILLERS: &[&str] = &[
+        "basically",
+        "actually",
+        "honestly",
+        "literally",
+        "you know",
+        "i mean",
+        "um",
+        "uh",
+        "er",
+        "ah",
+        "hmm",
+        "erm",
+        "那个",
+        "这个",
+        "就是说",
+        "其实",
+        "然后",
+        "那么",
+        "嗯",
+        "啊",
+        "呃",
+        "额",
+        "bueno",
+        "pues",
+        "entonces",
+        "alors",
+        "euh",
+        "ben",
+        "ähm",
+        "äh",
+        "also",
+        "halt",
+        "allora",
+        "cioè",
+        "tipo",
+        "então",
+        "nou",
+        "dus",
+        "えっと",
+        "あの",
+        "まあ",
+        "なんか",
+        "음",
+        "어",
+    ];
+    fn requires_pause_delimiter_for_inline_filler(filler: &str) -> bool {
+        matches!(
+            filler,
+            "also"
+                | "halt"
+                | "er"
+                | "ben"
+                | "bueno"
+                | "pues"
+                | "entonces"
+                | "alors"
+                | "allora"
+                | "tipo"
+                | "então"
+                | "nou"
+                | "dus"
+                | "那么"
+                | "然后"
+                | "其实"
+        )
+    }
+    const DELETION_BACKTRACK_LIMIT: u8 = 4;
+    let literals = crate::spoken_revision::literal_ranges(src_body);
+    let find_filler = |f_start: usize| -> Option<(Range<usize>, usize)> {
+        let rest_lower = src_body[f_start..].to_lowercase();
+        for filler in INLINE_FILLERS {
+            let Some(after_filler) = src_body.get(f_start + filler.len()..) else {
+                continue;
+            };
+            let matched = if is_latin_word_filler(filler) {
+                let lower_filler = filler.to_lowercase();
+                rest_lower.starts_with(&lower_filler)
+                    && after_filler
+                        .chars()
+                        .next()
+                        .is_none_or(|ch| !ch.is_alphanumeric() && ch != '_')
+                    && src_body[..f_start]
+                        .chars()
+                        .next_back()
+                        .is_none_or(|ch| !ch.is_alphanumeric() && ch != '_')
+            } else {
+                src_body[f_start..].starts_with(filler)
+            };
+            if !matched {
+                continue;
+            }
+            let f_end = f_start + filler.len();
+            if literals.iter().any(|r| r.start < f_end && f_start < r.end) {
+                continue;
+            }
+            if is_kana_or_hangul_filler(filler)
+                && (src_body[..f_start]
+                    .chars()
+                    .next_back()
+                    .is_some_and(char::is_alphanumeric)
+                    || after_filler
+                        .chars()
+                        .next()
+                        .is_some_and(char::is_alphanumeric))
+            {
+                continue;
+            }
+            if !filler.is_ascii()
+                && (src_body[..f_start].chars().next_back().is_some_and(is_cjk)
+                    || (*filler == "额" && after_filler.chars().next().is_some_and(is_cjk))
+                    || (*filler == "那么"
+                        && matches!(
+                            after_filler.chars().next(),
+                            Some(
+                                '多' | '大'
+                                    | '小'
+                                    | '少'
+                                    | '高'
+                                    | '低'
+                                    | '长'
+                                    | '短'
+                                    | '快'
+                                    | '慢'
+                                    | '好'
+                                    | '坏'
+                                    | '贵'
+                                    | '远'
+                                    | '近'
+                                    | '早'
+                                    | '晚'
+                                    | '难'
+                                    | '久'
+                                    | '深'
+                                    | '重'
+                                    | '新'
+                                    | '旧'
+                                    | '些'
+                                    | '点'
+                                    | '样'
+                                    | '美'
+                                    | '强'
+                                    | '弱'
+                                    | '巧'
+                                    | '准'
+                                    | '稳'
+                            )
+                        )))
+            {
+                continue;
+            }
+            let capitalized_line_initial = src_body[..f_start].trim().is_empty()
+                && src_body[f_start..f_end]
+                    .chars()
+                    .next()
+                    .is_some_and(|ch| ch.is_ascii_uppercase());
+            if capitalized_line_initial
+                && !matches!(
+                    src_body[f_end..].chars().next(),
+                    Some(',' | '，' | '、' | ';' | '；' | ':' | '：')
+                )
+            {
+                continue;
+            }
+            if requires_pause_delimiter_for_inline_filler(filler)
+                && !matches!(
+                    after_filler.trim_start().chars().next(),
+                    Some(',' | '，' | '、' | ';' | '；' | ':' | '：')
+                )
+            {
+                continue;
+            }
+            let trail_glue = src_body[f_end..]
+                .chars()
+                .take_while(|ch| ch.is_whitespace() || matches!(ch, ',' | '，' | '、'))
+                .map(char::len_utf8)
+                .sum::<usize>();
+            return Some((f_start..f_end, f_end + trail_glue));
+        }
+        None
+    };
+
+    struct FillerWalkEnv<'a> {
+        src_body: &'a str,
+        cand_body: &'a str,
+        find_filler: &'a dyn Fn(usize) -> Option<(Range<usize>, usize)>,
+    }
+
+    fn apply_filler_step(
+        env: &FillerWalkEnv<'_>,
+        s: &mut usize,
+        c: &mut usize,
+        stripped_src: &mut String,
+        deleted_ranges: &mut Vec<Range<usize>>,
+        filler_range: Range<usize>,
+        next_s: usize,
+    ) {
+        if env.cand_body[*c..].starts_with(' ')
+            && env.cand_body[..*c]
+                .chars()
+                .next_back()
+                .is_some_and(|ch| !ch.is_whitespace())
+            && env.src_body[*s..next_s].chars().any(char::is_whitespace)
+            && env.cand_body[*c + 1..]
+                .chars()
+                .next()
+                .is_some_and(|ch| !ch.is_whitespace())
+        {
+            *c += 1;
+            stripped_src.push(' ');
+        }
+        deleted_ranges.push(filler_range);
+        *s = next_s;
+    }
+
+    fn walk(
+        env: &FillerWalkEnv<'_>,
+        mut s: usize,
+        mut c: usize,
+        backtracks_remaining: u8,
+        mut deleted_ranges: Vec<Range<usize>>,
+        mut stripped_src: String,
+    ) -> Option<Vec<Range<usize>>> {
+        let FillerWalkEnv {
+            src_body,
+            cand_body,
+            find_filler,
+        } = *env;
+        while s < src_body.len() || c < cand_body.len() {
+            if let (Some(sc), Some(cc)) =
+                (src_body[s..].chars().next(), cand_body[c..].chars().next())
+            {
+                if sc == cc {
+                    // If a delimited filler shares its first character with the
+                    // kept continuation (e.g. "额，额外注意安全" -> "额外注意安全"),
+                    // try stripping the filler first before greedily consuming `sc`.
+                    if backtracks_remaining > 0 {
+                        if let Some((filler_range, next_s)) = find_filler(s) {
+                            if next_s > filler_range.end
+                                && !cand_body[c..].starts_with(&src_body[s..next_s])
+                            {
+                                let mut bs = s;
+                                let mut bc = c;
+                                let mut b_stripped = stripped_src.clone();
+                                let mut b_deleted = deleted_ranges.clone();
+                                apply_filler_step(
+                                    env,
+                                    &mut bs,
+                                    &mut bc,
+                                    &mut b_stripped,
+                                    &mut b_deleted,
+                                    filler_range,
+                                    next_s,
+                                );
+                                if let Some(found) = walk(
+                                    env,
+                                    bs,
+                                    bc,
+                                    backtracks_remaining - 1,
+                                    b_deleted,
+                                    b_stripped,
+                                ) {
+                                    return Some(found);
+                                }
+                            }
+                        }
+                    }
+                    s += sc.len_utf8();
+                    c += cc.len_utf8();
+                    stripped_src.push(sc);
+                    continue;
+                }
+            }
+            // Optional ASCII sentence-initial capitalization fold right at a filler boundary
+            if !deleted_ranges.is_empty() {
+                if let (Some(sc), Some(cc)) = (
+                    src_body[s..]
+                        .chars()
+                        .next()
+                        .filter(|ch| ch.is_ascii_lowercase()),
+                    cand_body[c..]
+                        .chars()
+                        .next()
+                        .filter(|ch| ch.is_ascii_uppercase()),
+                ) {
+                    if sc.eq_ignore_ascii_case(&cc) {
+                        s += sc.len_utf8();
+                        c += cc.len_utf8();
+                        stripped_src.push(cc);
+                        continue;
+                    }
+                }
+            }
+            // Check if src_body[s..] starts with a curated inline filler + optional comma/space glue
+            let skip_ws = src_body[s..]
+                .chars()
+                .take_while(|ch| ch.is_whitespace() || matches!(ch, ',' | '，' | '、'))
+                .map(char::len_utf8)
+                .sum::<usize>();
+            if let Some((filler_range, next_s)) = find_filler(s + skip_ws) {
+                apply_filler_step(
+                    env,
+                    &mut s,
+                    &mut c,
+                    &mut stripped_src,
+                    &mut deleted_ranges,
+                    filler_range,
+                    next_s,
+                );
+                continue;
+            }
+            // Allow candidate safe comma/period additions or trailing source period removal
+            // to be adjudicated by safe_view + punctuation_changes_are_one_sided_inner.
+            if !deleted_ranges.is_empty() {
+                if let Some(cc) = cand_body[c..].chars().next() {
+                    if matches!(cc, ',' | '，')
+                        && !crate::protected_span::contains_negation(
+                            cand_body[..c]
+                                .split_whitespace()
+                                .last()
+                                .unwrap_or(&cand_body[..c]),
+                        )
+                    {
+                        c += cc.len_utf8();
+                        continue;
+                    }
+                    if matches!(cc, '.' | '。')
+                        && cand_body[c + cc.len_utf8()..].is_empty()
+                        && s == src_body.len()
+                    {
+                        c += cc.len_utf8();
+                        continue;
+                    }
+                }
+                if let Some(sc) = src_body[s..].chars().next() {
+                    if matches!(sc, '.' | '。')
+                        && src_body[s + sc.len_utf8()..].is_empty()
+                        && c == cand_body.len()
+                    {
+                        s += sc.len_utf8();
+                        stripped_src.push(sc);
+                        continue;
+                    }
+                }
+            }
+            return None;
+        }
+        if deleted_ranges.is_empty() {
+            return None;
+        }
+        let sv = safe_view(&stripped_src)?;
+        let cv = safe_view(cand_body)?;
+        (sv.skeleton == cv.skeleton
+            && punctuation_changes_are_one_sided_inner(&sv.punctuation, &cv.punctuation, true))
+        .then_some(deleted_ranges)
+    }
+
+    let env = FillerWalkEnv {
+        src_body,
+        cand_body,
+        find_filler: &find_filler,
+    };
+    walk(
+        &env,
+        0,
+        0,
+        DELETION_BACKTRACK_LIMIT,
+        Vec::new(),
+        String::with_capacity(src_body.len()),
+    )
 }
 
 fn exact_literal_ranges(source: &str, candidate: &str) -> bool {
@@ -574,9 +1128,35 @@ fn is_cjk(ch: char) -> bool {
     matches!(ch as u32, 0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xF900..=0xFAFF)
 }
 
+fn is_latin_word_filler(filler: &str) -> bool {
+    filler.chars().any(char::is_alphabetic)
+        && filler.chars().all(|ch| {
+            (ch.is_alphanumeric() || ch.is_whitespace())
+                && !is_cjk_character(ch)
+                && !is_hangul_character(ch)
+        })
+}
+
+fn is_kana_or_hangul_filler(filler: &str) -> bool {
+    filler
+        .chars()
+        .all(|ch| is_kana_character(ch) || is_hangul_character(ch))
+}
+
+fn is_kana_character(ch: char) -> bool {
+    matches!(ch as u32, 0x3040..=0x30FF | 0x31F0..=0x31FF | 0xFF66..=0xFF9D)
+}
+
+fn is_hangul_character(ch: char) -> bool {
+    matches!(ch as u32, 0x1100..=0x11FF | 0x3130..=0x318F | 0xAC00..=0xD7AF)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{preserves_model_selected_paragraphs, preserves_structure_safe};
+    use super::{
+        preserves_line_structure_with_inline_filler_cleanup, preserves_model_selected_paragraphs,
+        preserves_structure_safe,
+    };
 
     #[test]
     fn model_selected_paragraphs_require_contiguous_source_sentence_segments() {
@@ -789,6 +1369,103 @@ mod tests {
         assert!(!preserves_structure_safe(
             "```text\nvalue = 1;\n```\nDone.",
             "```text\nvalue = 1,\n```\nDone."
+        ));
+    }
+
+    #[test]
+    fn allows_inline_filler_cleanup_inside_structured_lists_and_letters() {
+        assert!(preserves_structure_safe(
+            "- 那个，今天上线\n- 嗯，明天复盘",
+            "- 今天上线\n- 明天复盘"
+        ));
+        assert!(preserves_structure_safe(
+            "Hi Alice,\nUm, basically we ship.",
+            "Hi Alice,\nWe ship."
+        ));
+        assert!(preserves_structure_safe(
+            "I know, actually, it works.",
+            "I know it works."
+        ));
+        // Non-filler edits stay rejected
+        assert!(!preserves_structure_safe(
+            "- Ship the patch\n- Wait",
+            "- Ship a patch\n- Wait"
+        ));
+        // Equal-byte period normalization, comma punctuation normalization, and indented list bullets
+        assert!(preserves_structure_safe("- 嗯今天上线", "- 今天上线。"));
+        assert!(!preserves_structure_safe(
+            "- 嗯今天上线吗",
+            "- 今天上线吗。"
+        ));
+        assert!(preserves_structure_safe(
+            "- 那个今天上线明天复盘",
+            "- 今天上线，明天复盘。"
+        ));
+        assert!(preserves_structure_safe("  - um ship it", "  - Ship it."));
+        assert!(preserves_structure_safe("• um ship it", "• Ship it."));
+        assert!(preserves_structure_safe("  • um ship it", "  • Ship it."));
+        assert!(preserves_structure_safe("- Äh, ship it", "- Ship it."));
+        assert!(preserves_structure_safe("- 음, 배포해", "- 배포해."));
+        assert!(preserves_structure_safe("- あの、今日出発", "- 今日出発。"));
+        assert!(preserves_line_structure_with_inline_filler_cleanup(
+            "• um ship it",
+            "• Ship it."
+        ));
+        // `就是` is lexical content in this phrase, not a detachable filler.
+        assert!(!preserves_structure_safe(
+            "- 这就是问题根源",
+            "- 这问题根源。"
+        ));
+        assert!(!preserves_structure_safe(
+            "- 那个问题要复盘",
+            "- 问题要复盘。"
+        ));
+        assert!(!preserves_structure_safe(
+            "- 음식이 식어요",
+            "- 식이 식어요."
+        ));
+        assert!(!preserves_structure_safe(
+            "- ähnlich wie morgen",
+            "- nlich wie morgen."
+        ));
+        assert!(!preserves_structure_safe("- 어제 배포해", "- 제 배포해."));
+        assert!(!preserves_structure_safe("- あの人が来る", "- 人が来る。"));
+        assert!(preserves_structure_safe("- 嗯今天上线", "- 今天上线。"));
+        assert!(preserves_structure_safe(
+            "- 那个今天上线明天复盘",
+            "- 今天上线明天复盘。"
+        ));
+        // Lexical Chinese words starting with filler syllables stay protected.
+        assert!(!preserves_structure_safe("- 额外注意安全", "- 外注意安全"));
+        assert!(!preserves_structure_safe("- 那么多问题", "- 问题"));
+        assert!(preserves_structure_safe(
+            "- 额，额外注意安全",
+            "- 额外注意安全"
+        ));
+        // Punctuation-only normalization must keep sentence-initial terms intact.
+        assert!(preserves_structure_safe(
+            "- Actually, we ship",
+            "- Actually, we ship."
+        ));
+        assert!(preserves_structure_safe("- First step", "- First step."));
+        assert!(preserves_structure_safe("- Um, we ship", "- Um, we ship."));
+        // Content hedges and unpunctuated ambiguous cross-lingual connectors stay protected.
+        assert!(!preserves_structure_safe(
+            "- We also shipped v2",
+            "- We shipped v2."
+        ));
+        assert!(!preserves_structure_safe(
+            "- We must halt deployment",
+            "- We must deployment."
+        ));
+        assert!(!preserves_structure_safe(
+            "- It is sort of broken",
+            "- It is broken."
+        ));
+        assert!(!preserves_structure_safe("- 那么做不对", "- 做不对。"));
+        assert!(!preserves_structure_safe(
+            "- 先测试，然后上线",
+            "- 先测试，上线。"
         ));
     }
 }

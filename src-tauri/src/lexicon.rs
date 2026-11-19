@@ -11,6 +11,8 @@ pub const MAX_ASR_PROMPT_TOKENS: usize = 200;
 const ASR_NO_TRANSLATE: &str = "不要翻译。";
 const ASR_EMPTY_SEED: &str = "不要翻译。这个 API 的 latency 太高了。";
 const GPT_TRANSCRIBE_SCENE: &str = "今天下午在看文档。中英混合听写";
+const GPT_TRANSCRIBE_NEUTRAL_SCENE: &str =
+    "Transcribe accurately in the spoken language; preserve proper nouns and technical terms.";
 const MAX_CLEANUP_PAIRS: usize = 8;
 const MAX_CLEANUP_PAIR_CHARS: usize = 400;
 const MAX_CONTEXT_TERMS: usize = 64;
@@ -19,6 +21,7 @@ const MAX_CONTEXT_TERMS: usize = 64;
 pub enum AsrPromptShape {
     WhisperTranscript,
     ContextTerms,
+    InstantVocabulary,
     GptTranscribeKeywords,
     MistralContextBias,
 }
@@ -36,6 +39,9 @@ pub fn asr_prompt_shape_for(
     let model = model.trim().to_ascii_lowercase();
     if model == "gpt-transcribe" || model.starts_with("gpt-transcribe-") {
         return AsrPromptShape::GptTranscribeKeywords;
+    }
+    if provider == crate::providers::EngineProvider::DashScope {
+        return AsrPromptShape::InstantVocabulary;
     }
     if model.contains("qwen")
         || model.contains("sensevoice")
@@ -104,6 +110,7 @@ impl LexiconPair {
     }
 
     fn from_record(row: &LearnPairRecord) -> Self {
+        let is_global_rule = row.is_live_promoted() && row.is_provider_egress_eligible_word_pair();
         let is_legacy_unscoped_rule = row.match_policy
             == crate::store::LearnPairMatchPolicy::IgnoreCase
             && row.pair_key
@@ -116,7 +123,7 @@ impl LexiconPair {
             after: row.after_surface.clone(),
             match_policy: row.match_policy,
             rule_key: Some(row.pair_key.clone()),
-            expansion_policy: if is_legacy_unscoped_rule {
+            expansion_policy: if is_global_rule || is_legacy_unscoped_rule {
                 PairExpansionPolicy::LegacyHeuristics
             } else {
                 PairExpansionPolicy::AliasOnly
@@ -276,7 +283,7 @@ pub fn scene_allows_learn(
     !is_default_learn_off_target(bundle_id, browser_host)
 }
 
-fn mapping_matching_target<'a>(
+pub(crate) fn mapping_matching_target<'a>(
     mappings: &'a [AppMapping],
     bundle_id: Option<&str>,
     browser_host: Option<&str>,
@@ -1132,6 +1139,7 @@ pub fn build_asr_prompt_shaped(
     build_asr_prompt_bundle(dictionary, policy, pairs, scope, shape, screen).prompt
 }
 
+#[cfg(test)]
 pub fn build_asr_prompt_bundle(
     dictionary: &[String],
     _policy: Option<&ContextPolicy>,
@@ -1156,7 +1164,34 @@ pub fn build_asr_prompt_bundle(
     )
 }
 
+#[cfg(test)]
 pub fn build_asr_prompt_bundle_with_permissions(
+    dictionary: &[String],
+    policy: Option<&ContextPolicy>,
+    pairs: &[LearnPairRecord],
+    scope: Option<&PromptScope>,
+    shape: AsrPromptShape,
+    screen: Option<&ScreenTextContext>,
+    screen_permissions: crate::context::ContextSourcePermissions,
+) -> AsrPromptBundle {
+    build_asr_prompt_bundle_with_permissions_and_language(
+        dictionary,
+        policy,
+        pairs,
+        scope,
+        shape,
+        screen,
+        screen_permissions,
+        Some("zh"),
+        &[],
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "Keep ASR lexicon prompt builder inputs explicit across language, permissions, and scope."
+)]
+pub fn build_asr_prompt_bundle_with_permissions_and_language(
     dictionary: &[String],
     _policy: Option<&ContextPolicy>,
     pairs: &[LearnPairRecord],
@@ -1164,13 +1199,13 @@ pub fn build_asr_prompt_bundle_with_permissions(
     shape: AsrPromptShape,
     screen: Option<&ScreenTextContext>,
     screen_permissions: crate::context::ContextSourcePermissions,
+    language: Option<&str>,
+    preferred_languages: &[String],
 ) -> AsrPromptBundle {
+    let chinese_session = crate::languages::is_chinese_session(language, preferred_languages);
     let ranked = collect_ranked_terms(dictionary, pairs, scope);
-    if matches!(
-        shape,
-        AsrPromptShape::GptTranscribeKeywords | AsrPromptShape::MistralContextBias
-    ) {
-        let mut keywords = keywords_for_asr(&ranked, MAX_CONTEXT_TERMS);
+    let build_keywords = |ranked: &[RankedTerm]| -> Vec<String> {
+        let mut keywords = keywords_for_asr(ranked, MAX_CONTEXT_TERMS);
         if let Some(screen) = screen {
             for term in screen.asr_terms(screen_permissions) {
                 if keywords.len() >= MAX_CONTEXT_TERMS {
@@ -1185,15 +1220,34 @@ pub fn build_asr_prompt_bundle_with_permissions(
                 }
             }
         }
+        keywords
+    };
+    if matches!(
+        shape,
+        AsrPromptShape::GptTranscribeKeywords
+            | AsrPromptShape::MistralContextBias
+            | AsrPromptShape::InstantVocabulary
+    ) {
+        let keywords = build_keywords(&ranked);
         return AsrPromptBundle {
-            prompt: (shape == AsrPromptShape::GptTranscribeKeywords)
-                .then(|| GPT_TRANSCRIBE_SCENE.to_owned()),
+            prompt: (shape == AsrPromptShape::GptTranscribeKeywords).then(|| {
+                if chinese_session {
+                    GPT_TRANSCRIBE_SCENE.to_owned()
+                } else {
+                    GPT_TRANSCRIBE_NEUTRAL_SCENE.to_owned()
+                }
+            }),
             keywords,
         };
     }
+    let keywords = if shape == AsrPromptShape::ContextTerms {
+        build_keywords(&ranked)
+    } else {
+        Vec::new()
+    };
     AsrPromptBundle {
-        prompt: weave_shaped_prompt(ranked, shape, screen, screen_permissions),
-        keywords: Vec::new(),
+        prompt: weave_shaped_prompt(ranked, shape, screen, screen_permissions, chinese_session),
+        keywords,
     }
 }
 
@@ -1202,18 +1256,27 @@ fn weave_shaped_prompt(
     shape: AsrPromptShape,
     screen: Option<&ScreenTextContext>,
     screen_permissions: crate::context::ContextSourcePermissions,
+    chinese_session: bool,
 ) -> Option<String> {
     let glue_tokens = match shape {
-        AsrPromptShape::WhisperTranscript => estimate_prompt_tokens("今天下午在看文档。不要翻译。"),
+        AsrPromptShape::WhisperTranscript => {
+            if chinese_session {
+                estimate_prompt_tokens("今天下午在看文档。不要翻译。")
+            } else {
+                0
+            }
+        }
         AsrPromptShape::ContextTerms
+        | AsrPromptShape::InstantVocabulary
         | AsrPromptShape::GptTranscribeKeywords
         | AsrPromptShape::MistralContextBias => 0,
     };
     let budget = MAX_ASR_PROMPT_TOKENS.saturating_sub(glue_tokens);
     if budget == 0 {
         return match shape {
-            AsrPromptShape::WhisperTranscript => Some(ASR_EMPTY_SEED.to_owned()),
+            AsrPromptShape::WhisperTranscript => chinese_session.then(|| ASR_EMPTY_SEED.to_owned()),
             AsrPromptShape::ContextTerms
+            | AsrPromptShape::InstantVocabulary
             | AsrPromptShape::GptTranscribeKeywords
             | AsrPromptShape::MistralContextBias => None,
         };
@@ -1279,21 +1342,29 @@ fn weave_shaped_prompt(
             hints.push(term.term);
         }
     }
-    fit_woven_prompt(hints, shape)
+    fit_woven_prompt(hints, shape, chinese_session)
 }
 
-fn fit_woven_prompt(mut terms: Vec<String>, shape: AsrPromptShape) -> Option<String> {
+fn fit_woven_prompt(
+    mut terms: Vec<String>,
+    shape: AsrPromptShape,
+    chinese_session: bool,
+) -> Option<String> {
     match shape {
         AsrPromptShape::WhisperTranscript => {
             while !terms.is_empty() {
-                let woven = weave_whisper_transcript(&terms);
+                let woven = if chinese_session {
+                    weave_whisper_transcript(&terms)
+                } else {
+                    weave_neutral_whisper_transcript(&terms)
+                };
                 if estimate_prompt_tokens(&woven) <= MAX_ASR_PROMPT_TOKENS {
                     crate::learning_research::usage(&terms, true);
                     return Some(woven);
                 }
                 terms.remove(0);
             }
-            Some(ASR_EMPTY_SEED.to_owned())
+            chinese_session.then(|| ASR_EMPTY_SEED.to_owned())
         }
         AsrPromptShape::ContextTerms => {
             if terms.len() > MAX_CONTEXT_TERMS {
@@ -1310,9 +1381,19 @@ fn fit_woven_prompt(mut terms: Vec<String>, shape: AsrPromptShape) -> Option<Str
             }
             None
         }
-        AsrPromptShape::MistralContextBias => None,
-        AsrPromptShape::GptTranscribeKeywords => Some(GPT_TRANSCRIBE_SCENE.to_owned()),
+        AsrPromptShape::InstantVocabulary | AsrPromptShape::MistralContextBias => None,
+        AsrPromptShape::GptTranscribeKeywords => Some(if chinese_session {
+            GPT_TRANSCRIBE_SCENE.to_owned()
+        } else {
+            GPT_TRANSCRIBE_NEUTRAL_SCENE.to_owned()
+        }),
     }
+}
+
+fn weave_neutral_whisper_transcript(terms: &[String]) -> String {
+    // Use a bare term list so non-Chinese or unbiased-auto sessions receive
+    // no English carrier sentence biasing recognition toward English.
+    terms.join(", ")
 }
 
 fn weave_whisper_transcript(terms: &[String]) -> String {
@@ -3216,5 +3297,135 @@ mod fuzzy_regressions {
             let (output, _, _) = apply_explicit_replacements_with_facts(input, &pairs, &[]);
             assert_eq!(output, input);
         }
+    }
+
+    #[test]
+    fn dashscope_shape_populates_instant_vocabulary_keywords() {
+        let bundle = build_asr_prompt_bundle_with_permissions_and_language(
+            &["VoiceFlow".into(), "Claude Code".into()],
+            None,
+            &[],
+            None,
+            AsrPromptShape::InstantVocabulary,
+            None,
+            crate::context::ContextSourcePermissions::default(),
+            Some("auto"),
+            &[],
+        );
+        assert!(bundle.prompt.is_none());
+        assert_eq!(bundle.keywords, vec!["Claude Code", "VoiceFlow"]);
+    }
+
+    #[test]
+    fn seed_prompt_respects_language_and_preferred_languages() {
+        let dict = vec!["VoiceFlow".to_owned()];
+        let auto_unbiased = build_asr_prompt_bundle_with_permissions_and_language(
+            &dict,
+            None,
+            &[],
+            None,
+            AsrPromptShape::WhisperTranscript,
+            None,
+            crate::context::ContextSourcePermissions::default(),
+            Some("auto"),
+            &[],
+        );
+        assert_eq!(
+            auto_unbiased.prompt.as_deref(),
+            Some("VoiceFlow"),
+            "unbiased auto session must emit bare dictionary terms without Chinese or English glue: {:?}",
+            auto_unbiased.prompt
+        );
+
+        let english_only = build_asr_prompt_bundle_with_permissions_and_language(
+            &dict,
+            None,
+            &[],
+            None,
+            AsrPromptShape::WhisperTranscript,
+            None,
+            crate::context::ContextSourcePermissions::default(),
+            Some("en"),
+            &[],
+        );
+        assert_eq!(
+            english_only.prompt.as_deref(),
+            Some("VoiceFlow"),
+            "English session must emit bare dictionary terms without Chinese or English glue: {:?}",
+            english_only.prompt
+        );
+
+        let zh_preferred = build_asr_prompt_bundle_with_permissions_and_language(
+            &dict,
+            None,
+            &[],
+            None,
+            AsrPromptShape::WhisperTranscript,
+            None,
+            crate::context::ContextSourcePermissions::default(),
+            Some("auto"),
+            &["zh".into(), "en".into()],
+        );
+        assert!(
+            zh_preferred
+                .prompt
+                .as_deref()
+                .is_some_and(|p| p.contains("今天下午在开会")),
+            "zh-preferred session should keep Chinese Whisper seed: {:?}",
+            zh_preferred.prompt
+        );
+    }
+
+    #[test]
+    fn confirmed_global_rule_gets_legacy_heuristics_while_scoped_rule_stays_alias_only() {
+        let dir = std::env::temp_dir().join(format!(
+            "voiceflow-lexicon-global-policy-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let global_scope = crate::store::LearnPairScope::default();
+        let global_key = crate::store::scoped_word_rule_key(
+            "知呼",
+            "知乎",
+            &global_scope,
+            crate::store::word_rule_match_policy("知呼", "知乎"),
+        )
+        .into_string();
+        let global_row =
+            crate::store::ensure_manual_global_learn_pair(&dir, &global_key, "知呼", "知乎")
+                .unwrap();
+        let global_pair = LexiconPair::from_record(&global_row);
+        assert_eq!(
+            global_pair.expansion_policy,
+            PairExpansionPolicy::LegacyHeuristics
+        );
+
+        let local_scope = crate::store::LearnPairScope {
+            family: None,
+            mapping_id: None,
+            browser_host: Some("notes.example.com".into()),
+            native_bundle: None,
+        };
+        let local_key = crate::store::scoped_word_rule_key(
+            "知呼",
+            "知乎",
+            &local_scope,
+            crate::store::word_rule_match_policy("知呼", "知乎"),
+        )
+        .into_string();
+        let local_row = crate::store::ensure_manual_scoped_learn_pair(
+            &dir,
+            &local_key,
+            "知呼",
+            "知乎",
+            &local_scope,
+        )
+        .unwrap();
+        let local_pair = LexiconPair::from_record(&local_row);
+        assert_eq!(local_pair.expansion_policy, PairExpansionPolicy::AliasOnly);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

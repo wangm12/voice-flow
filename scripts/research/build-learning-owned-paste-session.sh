@@ -4,7 +4,8 @@ umask 077
 
 SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-EXTERNAL_SOURCE="/Users/mingjie/Documents/voice-dictation-research/tools/voice-harness/macos"
+RESEARCH_CHECKOUT="${VOICEFLOW_RESEARCH_CHECKOUT:-/Users/mingjie/Documents/voice-dictation-research}"
+EXTERNAL_SOURCE="$RESEARCH_CHECKOUT/tools/voice-harness/macos"
 RECIPE_SOURCE="$SCRIPT_DIR/learning-native-paste-session/Recipe.json"
 INFO_PLIST_SOURCE="$SCRIPT_DIR/learning-native-paste-session/Info.plist"
 HELPER_SOURCE="$SCRIPT_DIR/learning-owned-paste-session.swift"

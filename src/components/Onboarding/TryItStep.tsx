@@ -148,10 +148,17 @@ export function TryItStep({
   const dictationStatus = recording
     ? activationMode === "hold_to_talk"
       ? t("正在录音… 松开快捷键结束")
-      : t("正在录音… 再按一次快捷键结束")
+      : activationMode === "hybrid_hold_lock"
+        ? t("正在录音…松开快捷键结束；双击锁定后再按一次结束")
+        : t("正在录音… 再按一次快捷键结束")
     : processing && activeTrialRef.current === "dictation"
       ? t("正在处理… 请稍候")
       : t("等待你按语音输入快捷键开始");
+  const hotkeyError = error === "input_monitoring_required"
+    ? t("Fn 快捷键需要输入监控权限。请在系统设置的隐私与安全性中为 VoiceFlow 开启输入监控。")
+    : error === "modifier_event_tap_unavailable"
+      ? t("Fn 按键监听暂不可用；请检查输入监控权限后重试。")
+      : error;
   const selectedActionStatus = selectedActionState === "waiting_for_selection"
     ? t("请选择一段文字后重试")
     : selectedActionState === "listening" || (recording && activeTrialRef.current === "selected_action")
@@ -265,7 +272,7 @@ export function TryItStep({
         )}
       </section>}
       {recoverableResult !== null && <textarea readOnly aria-label={t("可恢复的试用结果")} value={recoverableResult} rows={3} className="mt-3 w-full rounded-lg border border-border bg-base p-3 text-sm" />}
-      {error && <p role="alert" className="mt-3 text-xs text-error-ink">{error}</p>}
+      {hotkeyError && <p role="alert" className="mt-3 text-xs text-error-ink">{hotkeyError}</p>}
       {errorDetail && <details className="mt-2 text-xs text-tertiary"><summary className="cursor-pointer">{t("试用错误详情：")}</summary><pre className="mt-1 whitespace-pre-wrap break-words">{errorDetail}</pre></details>}
       <div className="mt-4 flex flex-wrap gap-2">
         {(recording || processing) && <button type="button" className={secondaryButtonClass} onClick={() => void cancel()}>{t("取消本次试用")}</button>}

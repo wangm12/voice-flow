@@ -3,6 +3,7 @@ import { finishHints } from "../../lib/activationCopy";
 import { iconPropsSm, iconPropsLg } from "../../lib/icons";
 import { useI18n } from "../../lib/i18n";
 import { readinessLabel, readinessStageLabels, type ReadinessFact } from "../../lib/onboardingReadiness";
+import { languageDisplayLabel } from "../../lib/languages";
 import { ghostButtonClass, secondaryButtonClass } from "../../lib/theme";
 import type { OnboardingSettingsPage } from "./DataChoices";
 
@@ -50,7 +51,7 @@ export function FinishStep({
         <p>{t("选定麦克风")}：{String(settings.input_device || t("默认（跟随系统）"))}</p>
         <p>{t("当前实际设备")}：{String(settings.effective_input_device || t("尚未测试"))}</p>
         <p>{t("转写服务")}：{String(settings.asr_provider ?? "groq")} / {String(settings.asr_model ?? "")}</p>
-        <p>{t("识别语言")}：{settings.language === "zh" ? t("中文") : settings.language === "en" ? "English" : t("自动检测")}</p>
+        <p>{t("识别语言")}：{languageDisplayLabel(typeof settings.language === "string" ? settings.language : undefined, t)}</p>
         <dl className="mt-3 space-y-1">{Object.entries(readinessStageLabels).filter(([stage]) => settings.asr_provider === "on_device" || !["files_validated", "runtime_capability", "model_loaded"].includes(stage)).map(([stage, label]) => {
           const fact = facts.find((item) => item.stage === stage);
           return <div key={stage} className="flex flex-wrap justify-between gap-2"><dt>{t(label)}</dt><dd>{readinessLabel(fact?.state ?? "not_tested", t)}</dd></div>;

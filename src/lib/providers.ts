@@ -192,9 +192,9 @@ export const PROVIDERS: readonly ProviderDefinition[] = [
         label: "Nova 3",
         note: "默认",
         asrProfile: {
-          languageSupport: "auto_detect_or_fixed_language",
+          languageSupport: "candidate_language_hints",
           requestNote: "Deepgram Listen：16 kHz 单声道 PCM WAV 作为原始请求体发送。",
-          capabilityNote: "此预设未启用 Deepgram 的多语言模式。",
+          capabilityNote: "所选常用语言全部属于多语言热切换范围时启用 language=multi；包含中文等语言或未设常用语言时使用 detect_language。",
         },
       },
       {
@@ -327,7 +327,7 @@ export const PROVIDERS: readonly ProviderDefinition[] = [
         note: "实时流式 · 可选",
         asrProfile: {
           languageSupport: "candidate_language_hints",
-          requestNote: "选择后使用 WebSocket，在录音期间持续发送麦克风音频。VoiceFlow 按保存的识别语言发送候选提示：自动模式为中文和 English，固定模式为所选语言；提示不会限制识别。当前不发送自定义上下文或术语。",
+          requestNote: "选择后使用 WebSocket，在录音期间持续发送麦克风音频。VoiceFlow 按保存的识别语言发送候选提示：未设置常用语言的自动模式不偏置任何语言，设置常用语言或固定语言时发送对应候选；提示不会限制识别。",
           responseNote: "临时识别结果只属于当前会话；VoiceFlow 只把最终结果交给整理与历史记录。",
           limitNote: "费用按完整实时音频流时长计算，包括静音；完整音频恢复重放可能再次产生整段费用。",
           availabilityNote: "VoiceFlow 的真实 Soniox 录音连接尚未验证。",
@@ -360,7 +360,7 @@ export const PROVIDERS: readonly ProviderDefinition[] = [
           requestNote: "专用 AssemblyAI 接口，不是 OpenAI-compatible。总音频不超过 120 秒且允许 AI 整理时使用 Dictation；AI Off、本地-only 或更长录音改用同 provider 的原始 Sync。",
           responseNote: "Dictation 的 text 是独立 ASR 原稿；llm_response 仅作整理候选，llm_error 表示整理失败。候选通过本地最终保护检查后才采用，并跳过第二次 LLM 请求。",
           limitNote: "Dictation 与每次 Sync 请求最多 120 秒。更长录音会用有界重叠分段完整覆盖全稿，再进行一次全稿整理，不逐段改写。",
-          capabilityNote: "Dictation 与 Sync 都显式发送 language_codes：auto 为 zh + en，固定语言为单项。Sync 只用 keyterms_prompt 提供术语（最多 100 项 / 8000 字符），不使用会覆盖语言字段的通用 prompt。",
+          capabilityNote: "固定语言或已选常用语言时发送 language_codes；纯自动模式下 Sync 省略 language_codes 并启用 language_detection，Dictation 则不传语言限制以无偏向自动识别。Sync 只用 keyterms_prompt 提供术语（最多 100 项 / 8000 字符），不使用会覆盖语言字段的通用 prompt。",
           contextNote: "Dictation 与 Sync 共用同一 provider 和一把 Keychain key；两个 endpoint 均固定。",
           availabilityNote: "保存密钥只表示凭据已配置，不表示服务访问已验证。",
         },
@@ -526,7 +526,11 @@ export const PROVIDERS: readonly ProviderDefinition[] = [
       {
         value: "qwen3-asr-1.7b",
         label: "Qwen3-ASR 1.7B",
-        asrProfile: { languageSupport: "auto_detect_or_fixed_language" },
+        note: "转换产物许可待审",
+        asrProfile: {
+          languageSupport: "auto_detect_or_fixed_language",
+          availabilityNote: "转换权重仓库许可尚未完成审查，详见第三方许可说明。",
+        },
       },
       {
         value: "parakeet-tdt-0.6b-v3-8bit",

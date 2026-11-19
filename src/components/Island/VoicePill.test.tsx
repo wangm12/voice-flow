@@ -2,7 +2,7 @@ import { act, cleanup, fireEvent, render, screen } from "@testing-library/react"
 import type { ComponentProps } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { VoicePill, type VoicePillRecoveryAction } from "./VoicePill";
-import { HUD_LISTENING_BEAM, HUD_THINKING_BEAM } from "./hudOrb";
+import { DEFAULT_HUD_VISUALS, HUD_VOICE_BEAM, resolveVoiceBeamConfig } from "./hudOrb";
 import { I18nProvider } from "../../lib/i18n";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
@@ -89,8 +89,31 @@ describe("VoicePill", () => {
     },
   );
 
-  it("keeps the ordinary microphone glyph while waiting for the first frame without an app avatar", () => {
-    renderPill({ state: "recording", audioCaptureStatus: "waiting_first_frame" });
+  it("keeps startup waiting quiet under 250ms and surfaces waiting_first_frame after 250ms", () => {
+    const { rerender } = renderPill({
+      state: "recording",
+      audioCaptureStatus: "waiting_first_frame",
+      stageElapsedMs: 120,
+      audioDeviceName: "AirPods Pro",
+    });
+
+    expect(document.querySelector(".voice-pill__label")).toHaveTextContent("Recording");
+    expect(document.querySelector(".voice-pill__subtitle")).toHaveTextContent("AirPods Pro");
+    expect(screen.queryByText("Waiting for microphone")).not.toBeInTheDocument();
+
+    rerender(
+      <I18nProvider initialLanguage="en">
+        <VoicePill
+          state="recording"
+          audioCaptureStatus="waiting_first_frame"
+          stageElapsedMs={250}
+          audioDeviceName="AirPods Pro"
+          contextLabel={null}
+          waveformLevels={[]}
+          reduced
+        />
+      </I18nProvider>,
+    );
 
     expect(document.querySelector(".voice-pill__target-icon")).not.toBeInTheDocument();
     expect(document.querySelector(".voice-pill__indicator svg")).toHaveAttribute("data-glyph", "mic");
@@ -99,8 +122,28 @@ describe("VoicePill", () => {
     expect(screen.getByText("No audio has arrived yet")).toBeInTheDocument();
   });
 
-  it("uses the ordinary microphone glyph when the first-frame wait arrives before recording starts", () => {
-    renderPill({ state: "starting", audioCaptureStatus: "waiting_first_frame" });
+  it("keeps starting quiet under 250ms and reveals delayed wait notice at 250ms", () => {
+    const { rerender } = renderPill({
+      state: "starting",
+      audioCaptureStatus: "waiting_first_frame",
+      stageElapsedMs: 0,
+    });
+
+    expect(document.querySelector(".voice-pill__label")).toHaveTextContent("Recording");
+    expect(screen.queryByText("Waiting for microphone")).not.toBeInTheDocument();
+
+    rerender(
+      <I18nProvider initialLanguage="en">
+        <VoicePill
+          state="starting"
+          audioCaptureStatus="waiting_first_frame"
+          stageElapsedMs={250}
+          contextLabel={null}
+          waveformLevels={[]}
+          reduced
+        />
+      </I18nProvider>,
+    );
 
     expect(document.querySelector(".voice-pill__indicator svg")).toHaveAttribute("data-glyph", "mic");
     expect(document.querySelector(".voice-pill__subtitle svg")).not.toBeInTheDocument();
@@ -112,6 +155,7 @@ describe("VoicePill", () => {
     renderPill({
       state: "recording",
       audioCaptureStatus: "waiting_first_frame",
+      stageElapsedMs: 300,
       recordingTargetIcon: "data:image/png;base64,aGVsbG8=",
     });
 
@@ -122,8 +166,13 @@ describe("VoicePill", () => {
     expect(screen.getByText("No audio has arrived yet")).toBeInTheDocument();
   });
 
-  it("shows the waiting-for-audio source honestly and keeps the original stop square", () => {
-    renderPill({ state: "recording", audioCaptureStatus: "waiting_first_frame", sessionGeneration: 42 });
+  it("shows the waiting-for-audio source honestly after 250ms and keeps the original stop square", () => {
+    renderPill({
+      state: "recording",
+      audioCaptureStatus: "waiting_first_frame",
+      stageElapsedMs: 250,
+      sessionGeneration: 42,
+    });
 
     expect(screen.getByText("Waiting for microphone")).toBeInTheDocument();
     expect(screen.getByText("No audio has arrived yet")).toBeInTheDocument();
@@ -135,8 +184,8 @@ describe("VoicePill", () => {
     expect(icon?.querySelector("rect")).toHaveAttribute("height", "10");
   });
 
-  it("animates the mono listening beam only while captured audio is fresh", () => {
-    expect(HUD_LISTENING_BEAM).toEqual({ size: "md", colorVariant: "mono", strength: 1, duration: 1.96, brightness: 1.3 });
+  it("drives the colorful pill voice beam only while captured audio is fresh and mic input is healthy", () => {
+    expect(HUD_VOICE_BEAM).toEqual(resolveVoiceBeamConfig(DEFAULT_HUD_VISUALS));
     const now = Date.now();
     const { rerender } = renderPill({
       state: "recording",
@@ -144,14 +193,39 @@ describe("VoicePill", () => {
       waveformLevels: [0.7],
       lastAudioLevelAtMs: now - 100,
       clockNowMs: 0,
+      beamTheme: "auto",
       reduced: false,
     });
-    expect(document.querySelector('[data-beam-size="md"]')).toHaveAttribute("data-beam-active", "true");
+    const voiceBeam = document.querySelector('[data-voice-beam="mock"]');
+    expect(voiceBeam).toHaveAttribute("data-voice-active", "true");
+    expect(voiceBeam).toHaveAttribute("data-voice-type", "pill");
+    expect(voiceBeam).toHaveAttribute("data-voice-color", "colorful");
+    expect(voiceBeam).toHaveAttribute("data-voice-theme", "auto");
+    expect(Number(voiceBeam?.getAttribute("data-voice-level"))).toBeGreaterThan(0);
 
+    // Microphone error suppresses the voice glow even if an earlier audio sample was recent.
     rerender(
       <I18nProvider initialLanguage="en">
         <VoicePill
           state="recording"
+          audioCaptureStatus="device_error"
+          contextLabel={null}
+          waveformLevels={[0.7]}
+          lastAudioLevelAtMs={now - 100}
+          clockNowMs={0}
+          reduced={false}
+        />
+      </I18nProvider>,
+    );
+    expect(document.querySelector('[data-voice-beam="mock"]')).toHaveAttribute("data-voice-active", "false");
+    expect(document.querySelector('[data-voice-beam="mock"]')).toHaveAttribute("data-voice-level", "0");
+
+    // Stale audio (> 750ms) also turns the voice glow off and clears the level.
+    rerender(
+      <I18nProvider initialLanguage="en">
+        <VoicePill
+          state="recording"
+          audioCaptureStatus="receiving_audio"
           contextLabel={null}
           waveformLevels={[0.7]}
           lastAudioLevelAtMs={Date.now() - 1_000}
@@ -160,32 +234,126 @@ describe("VoicePill", () => {
         />
       </I18nProvider>,
     );
-    expect(document.querySelector('[data-beam-size="md"]')).toHaveAttribute("data-beam-active", "false");
+    expect(document.querySelector('[data-voice-beam="mock"]')).toHaveAttribute("data-voice-active", "false");
+    expect(document.querySelector('[data-voice-beam="mock"]')).toHaveAttribute("data-voice-level", "0");
+
+    // Simulated Demo Voice and custom studio preset drive VoiceBeam even when real mic samples are empty.
+    rerender(
+      <I18nProvider initialLanguage="en">
+        <VoicePill
+          state="recording"
+          audioCaptureStatus="receiving_audio"
+          contextLabel={null}
+          waveformLevels={[]}
+          lastAudioLevelAtMs={null}
+          previewDemoLevel={0.75}
+          visuals={{ colorVariant: "forest", voiceStyle: "prism", voiceIntensity: 1.25 }}
+          clockNowMs={0}
+          reduced={false}
+        />
+      </I18nProvider>,
+    );
+    const prismBeam = document.querySelector('[data-voice-beam="mock"]');
+    const pill = document.querySelector(".voice-pill");
+    const waveLayer = document.querySelector(".voice-pill > .voice-pill__voice-beam-layer");
+    const copyBlock = document.querySelector(".voice-pill__copy");
+    expect(waveLayer).not.toBeNull();
+    expect(pill).not.toBeNull();
+    expect(copyBlock).not.toBeNull();
+    expect(waveLayer?.compareDocumentPosition(copyBlock!) ?? 0).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
+    expect(prismBeam).toHaveAttribute("data-voice-active", "true");
+    expect(prismBeam).toHaveAttribute("data-voice-color", "forest");
+    expect(prismBeam).toHaveAttribute("data-voice-band-core", "#e6fff2");
+    expect(prismBeam).toHaveAttribute("data-voice-band-mid", "#2ecc71");
+    expect(prismBeam).toHaveAttribute("data-voice-flow", "84");
+    expect(Number(prismBeam?.getAttribute("data-voice-level"))).toBeGreaterThan(0.5);
   });
 
-  it("uses one processing label and one cancel affordance across every backend phase", () => {
-    expect(HUD_THINKING_BEAM).toEqual({ size: "line", colorVariant: "mono", strength: 0.65, duration: 3.1, brightness: 1.3 });
-    const phases = ["finalizing_audio", "asr", "soniox_recovery", "cascade_accurate", "cleanup", "delivery", "waiting_retry"] as const;
-    const { rerender } = renderPill({ state: "processing", phase: phases[0], reduced: false, sessionGeneration: 8 });
+  it("applies processing style and hue rotation for non-native BorderBeam color palettes independently from voice color", () => {
+    renderPill({
+      state: "processing",
+      phase: "cleanup",
+      visuals: { colorVariant: "mono", processingColorVariant: "forest", processingStyle: "brilliant_sweep" },
+      reduced: false,
+      sessionGeneration: 9,
+    });
+    const layer = document.querySelector<HTMLElement>(".voice-pill__processing-beam-layer");
+    const lineBeam = document.querySelector('[data-beam-size="line"]');
+    expect(lineBeam).toHaveAttribute("data-beam-color", "ocean");
+    expect(lineBeam).toHaveAttribute("data-beam-duration", "1.45");
+    expect(lineBeam).toHaveAttribute("data-beam-brightness", "1.55");
+    expect(layer?.style.filter).toBe("hue-rotate(-95deg)");
+  });
 
-    for (const phase of phases) {
+  it("collapses normal processing sub-phases to Processing and runs the colorful line beam", () => {
+    const phases = [
+      ["finalizing_audio", "Processing", "true"],
+      ["asr", "Processing", "true"],
+      ["soniox_recovery", "Processing", "true"],
+      ["cascade_accurate", "Processing", "true"],
+      ["cleanup", "Processing", "true"],
+      ["delivery", "Processing", "true"],
+      ["waiting_retry", "Rate limit retry", "false"],
+    ] as const;
+    const { rerender } = renderPill({ state: "processing", phase: phases[0][0], reduced: false, sessionGeneration: 8 });
+    const lineBeam = document.querySelector('[data-beam-size="line"]');
+    expect(lineBeam).toHaveAttribute("data-beam-color", "colorful");
+    expect(lineBeam).toHaveAttribute("data-beam-duration", "2.4");
+    expect(lineBeam).toHaveAttribute("data-beam-theme", "dark");
+    expect(lineBeam).toHaveAttribute("data-beam-active", "true");
+
+    for (const [phase, confirmedLabel, expectedBeamActive] of phases) {
+      rerender(
+        <I18nProvider initialLanguage="en">
+          <VoicePill state="processing" phase={phase} contextLabel={null} waveformLevels={[]} reduced={false} sessionGeneration={8} />
+        </I18nProvider>,
+      );
+      expect(document.querySelector(".voice-pill__label")).toHaveTextContent("Processing");
+      expect(document.querySelector('[data-beam-size="line"]')).toHaveAttribute("data-beam-active", "true");
+
       rerender(
         <I18nProvider initialLanguage="en">
           <VoicePill state="processing" phase={phase} phaseConfirmed contextLabel={null} waveformLevels={[]} reduced={false} sessionGeneration={8} />
         </I18nProvider>,
       );
-      expect(document.querySelector(".voice-pill__label")).toHaveTextContent("Processing");
+      expect(document.querySelector(".voice-pill__label")).toHaveTextContent(confirmedLabel);
       expect(screen.getByRole("button", { name: "Cancel dictation" })).toBeInTheDocument();
       expect(document.querySelector("[data-orb-state='working']")).toHaveAttribute("data-orb-speed", "1.00");
-      expect(document.querySelector('[data-beam-size="line"]')).toHaveAttribute("data-beam-active", "true");
+      expect(document.querySelector('[data-beam-size="line"]')).toHaveAttribute("data-beam-active", expectedBeamActive);
       expect(document.querySelector(".voice-pill__elapsed")).not.toBeInTheDocument();
       expect(document.querySelector(".voice-pill__subtitle")).not.toBeInTheDocument();
     }
   });
 
-  it("pauses motion for reduced-motion users", () => {
-    renderPill({ state: "processing", phase: "asr", reduced: true });
+  it("pauses motion and hides active beams for reduced-motion users while honoring beamTheme", () => {
+    const { rerender } = renderPill({
+      state: "recording",
+      audioCaptureStatus: "receiving_audio",
+      waveformLevels: [0.8],
+      lastAudioLevelAtMs: Date.now(),
+      beamTheme: "auto",
+      reduced: true,
+      sessionGeneration: 8,
+    });
+    expect(document.querySelector('[data-voice-beam="mock"]')).toHaveAttribute("data-voice-active", "false");
+    expect(document.querySelector('[data-voice-beam="mock"]')).toHaveAttribute("data-voice-theme", "auto");
+    expect(document.querySelector('[data-voice-beam="mock"]')).toHaveAttribute("data-voice-level", "0");
+
+    rerender(
+      <I18nProvider initialLanguage="en">
+        <VoicePill state="processing" phase="asr" beamTheme="auto" contextLabel={null} waveformLevels={[]} reduced sessionGeneration={9} />
+      </I18nProvider>,
+    );
     expect(document.querySelector('[data-beam-size="line"]')).toHaveAttribute("data-beam-active", "false");
+    expect(document.querySelector('[data-beam-size="line"]')).toHaveAttribute("data-beam-theme", "auto");
+
+    rerender(
+      <I18nProvider initialLanguage="en">
+        <VoicePill state="rate_limited" phase="waiting_retry" phaseConfirmed beamTheme="light" contextLabel={null} waveformLevels={[]} reduced={false} sessionGeneration={9} />
+      </I18nProvider>,
+    );
+    expect(document.querySelector('[data-beam-size="line"]')).toHaveAttribute("data-beam-active", "false");
+    expect(document.querySelector('[data-beam-size="line"]')).toHaveAttribute("data-beam-theme", "light");
   });
 
   it("provides a real generation-bound microphone settings action in the detail tray", () => {
@@ -449,5 +617,74 @@ describe("VoicePill", () => {
 
     act(() => { vi.advanceTimersByTime(220); });
     expect(document.querySelector("[data-orb-state='working']")).not.toBeInTheDocument();
+  });
+
+  it("updates intra-processing transitions steadily without opacity-hole crossfade while toggling line beam on rate limits", () => {
+    vi.useFakeTimers();
+    const { rerender } = renderPill({ state: "recording", reduced: false, sessionGeneration: 10 });
+    expect(document.querySelectorAll(".voice-pill__label")).toHaveLength(1);
+    expect(document.querySelector('[data-beam-size="line"]')).toHaveAttribute("data-beam-active", "false");
+
+    rerender(
+      <I18nProvider initialLanguage="en">
+        <VoicePill state="processing" phase="finalizing_audio" phaseConfirmed={false} contextLabel={null} waveformLevels={[]} reduced={false} sessionGeneration={10} />
+      </I18nProvider>,
+    );
+    expect(document.querySelector('[data-voice-beam="mock"]')).toHaveAttribute("data-voice-active", "false");
+    expect(document.querySelector(".voice-pill__voice-beam-layer")).toHaveClass("voice-pill__voice-beam-layer--exit");
+    expect(document.querySelectorAll(".voice-pill__label")).toHaveLength(1);
+    expect(document.querySelector(".voice-pill__label")).toHaveTextContent("Processing");
+    expect(document.querySelector(".voice-pill__label")).toHaveClass("voice-pill__label--in");
+    expect(document.querySelector(".voice-pill__label--out")).not.toBeInTheDocument();
+    expect(document.querySelector('[data-beam-size="line"]')).toHaveAttribute("data-beam-active", "true");
+    expect(document.querySelector(".voice-pill__processing-beam-layer")).not.toHaveClass("voice-pill__processing-beam-layer--exit");
+
+    act(() => { vi.advanceTimersByTime(220); });
+    const processingLabelNode = document.querySelector(".voice-pill__label");
+    expect(processingLabelNode).not.toHaveClass("voice-pill__label--in");
+
+    for (const [phase, chunkProgress] of [
+      ["asr", null],
+      ["asr", { done: 2, total: 4 }],
+      ["cleanup", null],
+    ] as const) {
+      rerender(
+        <I18nProvider initialLanguage="en">
+          <VoicePill
+            state="processing"
+            phase={phase}
+            phaseConfirmed
+            chunkProgress={chunkProgress}
+            contextLabel={null}
+            waveformLevels={[]}
+            reduced={false}
+            sessionGeneration={10}
+          />
+        </I18nProvider>,
+      );
+      expect(document.querySelectorAll(".voice-pill__label")).toHaveLength(1);
+      expect(document.querySelector(".voice-pill__label")).toBe(processingLabelNode);
+      expect(document.querySelector(".voice-pill__label")).toHaveTextContent("Processing");
+      expect(document.querySelector(".voice-pill__label")).not.toHaveClass("voice-pill__label--in");
+      expect(document.querySelector(".voice-pill__label--out")).not.toBeInTheDocument();
+      expect(document.querySelector('[data-beam-size="line"]')).toHaveAttribute("data-beam-active", "true");
+    }
+
+    rerender(
+      <I18nProvider initialLanguage="en">
+        <VoicePill
+          state="rate_limited"
+          phase="waiting_retry"
+          phaseConfirmed
+          contextLabel={null}
+          waveformLevels={[]}
+          reduced={false}
+          sessionGeneration={10}
+        />
+      </I18nProvider>,
+    );
+    expect(document.querySelector(".voice-pill__label")).toHaveTextContent("Rate limit retry");
+    expect(document.querySelector('[data-beam-size="line"]')).toHaveAttribute("data-beam-active", "false");
+    expect(document.querySelector(".voice-pill__processing-beam-layer")).toHaveClass("voice-pill__processing-beam-layer--exit");
   });
 });

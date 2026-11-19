@@ -69,10 +69,9 @@ fn is_false(value: &bool) -> bool {
     !value
 }
 
-/// C1 rule identity, canonical casing, and pair-key conflict behavior remain
-/// unresolved; V3 admission preserves that gap instead of projecting it.
-pub(crate) const LEARNING_PHASE_V3_KNOWN_GAPS: &[&str] =
-    &["c1_rule_identity_casing_and_pair_key_conflicts_unresolved"];
+/// C1 rule identity (`word:v2:<sha256>`) and cross-scope key isolation are now
+/// aligned with production across controlled candidate and V3 phase harnesses.
+pub(crate) const LEARNING_PHASE_V3_KNOWN_GAPS: &[&str] = &[];
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -706,7 +705,7 @@ fn learns_term(phase: &LearningPhaseV3, term_fixture_id: &str) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn id(value: u32) -> String {
@@ -968,7 +967,7 @@ mod tests {
         )
     }
 
-    fn fixture_plan() -> LearningPhasePlanV3 {
+    pub(crate) fn fixture_plan() -> LearningPhasePlanV3 {
         let term_fixture_id = id(1);
         let scope_a = scope("mapping-a", "com.example.editor.a");
         let scope_b = scope("mapping-b", "com.example.editor.b");
@@ -1052,7 +1051,7 @@ mod tests {
         let mut changed = plan.clone();
         changed.phases[0].ttl_ms += 1;
         assert_ne!(identity, changed.identity_sha256().unwrap());
-        assert!(LEARNING_PHASE_V3_KNOWN_GAPS
+        assert!(!LEARNING_PHASE_V3_KNOWN_GAPS
             .contains(&"c1_rule_identity_casing_and_pair_key_conflicts_unresolved"));
     }
 

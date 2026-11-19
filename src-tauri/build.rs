@@ -47,6 +47,8 @@ fn main() {
             ),
         }
     }
+    command_acl::validate_preview_commands_in_app_manifest()
+        .expect("preview capability commands must be included in the app manifest");
     tauri_build::try_build(
         tauri_build::Attributes::new()
             .app_manifest(tauri_build::AppManifest::new().commands(command_acl::COMMANDS)),

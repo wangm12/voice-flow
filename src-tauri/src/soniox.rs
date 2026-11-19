@@ -29,9 +29,10 @@ pub const SONIOX_MODEL: &str = "stt-rt-v5";
 
 const SAMPLE_RATE: u64 = 16_000;
 const CHANNEL_COUNT: u16 = 1;
-const QUEUE_CAPACITY: usize = 32;
+const QUEUE_CAPACITY: usize = 48;
 const AUDIO_FRAME_SAMPLES: usize = 4_096;
 const REPLAY_FRAME_SAMPLES: usize = 1_600;
+const MAX_CATCHUP_FACTOR: u64 = 4;
 const MAX_STREAM_SAMPLES: u64 = 300 * 60 * SAMPLE_RATE;
 const MAX_TRANSCRIPT_CHARS: usize = 1_000_000;
 const MAX_FINAL_TOKENS: usize = 100_000;
@@ -60,12 +61,13 @@ pub struct SonioxStreamFailure {
     pub audio_seconds_sent: f64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct SonioxStreamOptions {
     pub api_key: String,
-    /// Saved app language (`auto`, `zh`, or `en`). Unknown values leave the
-    /// provider's own automatic language detection enabled.
+    /// Saved app language (`auto`, `zh`, `en`, or another canonical BCP-47 code).
     pub language: Option<String>,
+    /// Optional preferred spoken languages used as candidate hints when `language == "auto"`.
+    pub preferred_languages: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -122,6 +124,8 @@ impl From<&ProducerFailure> for SonioxAudioSendError {
 #[derive(Default)]
 struct ProducerState {
     next_sample: u64,
+    queued_samples: u64,
+    pending_pcm: Vec<u8>,
     sealed: bool,
     closed: bool,
     failure: Option<ProducerFailure>,
@@ -197,21 +201,25 @@ impl SonioxAudioSender {
             return Err((&failure).into());
         }
 
-        let accepted_start = state.next_sample;
-        for part in samples.chunks(AUDIO_FRAME_SAMPLES) {
-            let mut pcm = Vec::with_capacity(part.len() * 2);
-            for sample in part {
-                pcm.extend_from_slice(&sample_to_i16(*sample).to_le_bytes());
-            }
-            let sample_count = part.len() as u64;
+        let frame_bytes = AUDIO_FRAME_SAMPLES * 2;
+        state.pending_pcm.reserve(samples.len() * 2);
+        for sample in samples {
+            state
+                .pending_pcm
+                .extend_from_slice(&sample_to_i16(*sample).to_le_bytes());
+        }
+        state.next_sample += input_count;
+
+        while state.pending_pcm.len() >= frame_bytes {
+            let pcm: Vec<u8> = state.pending_pcm.drain(..frame_bytes).collect();
             let frame = AudioFrame {
-                start_sample: state.next_sample,
-                sample_count,
+                start_sample: state.queued_samples,
+                sample_count: AUDIO_FRAME_SAMPLES as u64,
                 bytes: Arc::from(pcm),
             };
             match self.queue.try_send(frame) {
                 Ok(()) => {
-                    state.next_sample += sample_count;
+                    state.queued_samples += AUDIO_FRAME_SAMPLES as u64;
                 }
                 Err(mpsc::error::TrySendError::Full(_)) => {
                     let failure = ProducerFailure::QueueFull;
@@ -237,7 +245,6 @@ impl SonioxAudioSender {
             failed: state.failure.is_some(),
             closed: state.closed,
         };
-        debug_assert_eq!(state.next_sample - accepted_start, input_count);
         Ok(status)
     }
 
@@ -255,7 +262,7 @@ impl SonioxAudioSender {
 
     /// Queues complete-WAV replay audio with bounded async backpressure.
     /// Unlike the microphone callback path, recovery may wait briefly for
-    /// sender capacity while preserving real-time audio cadence.
+    /// sender capacity with bounded <= 4x real-time catch-up cadence.
     async fn send_samples_bounded(
         &self,
         start_sample: u64,
@@ -347,6 +354,7 @@ impl SonioxAudioSender {
         }
         permit.send(frame);
         state.next_sample += input_count;
+        state.queued_samples += input_count;
         Ok(())
     }
 
@@ -380,6 +388,7 @@ impl SonioxAudioSender {
 }
 
 pub struct SonioxStreamSession {
+    queue_sender: Option<mpsc::Sender<AudioFrame>>,
     finish_sender: Option<mpsc::Sender<u64>>,
     result_task: Option<JoinHandle<Result<Transcript, SonioxStreamFailure>>>,
     state: Arc<Mutex<ProducerState>>,
@@ -526,20 +535,54 @@ impl SonioxStreamSession {
     /// Seals the producer at the exact expected sample count, drains every
     /// accepted frame, sends an empty binary finalize frame, and waits for the
     /// server's explicit `finished: true` response.
-    pub async fn finish(
+    pub async fn finish(self, expected_samples: u64) -> Result<Transcript, SonioxStreamFailure> {
+        self.finish_with_timeouts(expected_samples, SEND_TIMEOUT, CONFIG_TIMEOUT)
+            .await
+    }
+
+    async fn finish_with_timeouts(
         mut self,
         expected_samples: u64,
+        send_timeout: Duration,
+        config_timeout: Duration,
     ) -> Result<Transcript, SonioxStreamFailure> {
-        {
+        let pending_tail = {
             let mut state = lock_state(&self.state);
             state.sealed = true;
+            if state.failure.is_none()
+                && expected_samples == state.next_sample
+                && !state.pending_pcm.is_empty()
+            {
+                let pcm = std::mem::take(&mut state.pending_pcm);
+                let sample_count = (pcm.len() / 2) as u64;
+                let frame = AudioFrame {
+                    start_sample: state.queued_samples,
+                    sample_count,
+                    bytes: Arc::from(pcm),
+                };
+                state.queued_samples += sample_count;
+                Some(frame)
+            } else {
+                None
+            }
+        };
+
+        let mut send_timed_out = false;
+        if let (Some(queue), Some(frame)) = (self.queue_sender.take(), pending_tail) {
+            if timeout(send_timeout, queue.send(frame)).await.is_err() {
+                send_timed_out = true;
+                self.stop.cancel();
+            }
+        } else {
+            self.queue_sender.take();
         }
 
         if let Some(sender) = self.finish_sender.take() {
-            if timeout(CONFIG_TIMEOUT, sender.send(expected_samples))
+            if timeout(config_timeout, sender.send(expected_samples))
                 .await
                 .is_err()
             {
+                send_timed_out = true;
                 self.stop.cancel();
             }
         }
@@ -559,6 +602,15 @@ impl SonioxStreamSession {
                 Err(timeout_failure("finish_timeout", 0))
             }
         };
+        let outcome = if send_timed_out
+            && matches!(
+                &outcome,
+                Err(failure) if !failure.replayable && failure.failure_code == "cancelled"
+            ) {
+            Err(timeout_failure("finish_send_timeout", 0))
+        } else {
+            outcome
+        };
         self.cancel_on_drop = false;
         outcome
     }
@@ -576,12 +628,13 @@ fn new_session_shell() -> (
     let stop = CancellationToken::new();
     let failure_notify = Arc::new(Notify::new());
     let sender = SonioxAudioSender {
-        queue: queue_sender,
+        queue: queue_sender.clone(),
         state: state.clone(),
         stop: stop.clone(),
         failure_notify,
     };
     let session = SonioxStreamSession {
+        queue_sender: Some(queue_sender),
         finish_sender: Some(finish_sender),
         result_task: None,
         state,
@@ -636,7 +689,10 @@ async fn open_socket_and_config(
         "sample_rate": SAMPLE_RATE,
         "num_channels": CHANNEL_COUNT,
     });
-    if let Some(hints) = language_hints(options.language.as_deref()) {
+    if let Some(hints) = crate::languages::soniox_language_hints(
+        options.language.as_deref(),
+        &options.preferred_languages,
+    ) {
         config["language_hints"] = json!(hints);
     }
     if crate::observations::enabled() {
@@ -681,8 +737,8 @@ impl Drop for SonioxStreamSession {
 /// This function performs one provider attempt only. Callers may invoke it at
 /// most once after a replayable live failure, with `is_replay` set to true; it
 /// never retries, concatenates prefixes, changes providers, or changes the
-/// provider endpoint. A replay is paced at approximately the audio's duration
-/// to preserve the streaming API's intended input cadence.
+/// provider endpoint. Outbound WebSocket frames are paced with bounded
+/// <= 4x real-time catch-up cadence to avoid unpaced burst overload.
 pub async fn transcribe_complete_wav(
     wav: Vec<u8>,
     options: SonioxStreamOptions,
@@ -776,14 +832,6 @@ where
             _ = cancellation.cancelled() => return Err(cancelled_failure(sent_samples)),
             _ = after_frame_queued(frame_index) => {}
         }
-        if (frame_index + 1) * REPLAY_FRAME_SAMPLES < samples.len() {
-            tokio::select! {
-                biased;
-                _ = policy_cancellation.cancelled() => return Err(cancelled_failure(sent_samples)),
-                _ = cancellation.cancelled() => return Err(cancelled_failure(sent_samples)),
-                _ = tokio::time::sleep(Duration::from_millis(100)) => {}
-            }
-        }
     }
     tokio::select! {
         biased;
@@ -864,6 +912,11 @@ struct ActorFailure {
     sent_samples: u64,
 }
 
+fn catchup_pacing_delay(sample_count: u64) -> Duration {
+    let micros = sample_count.saturating_mul(1_000_000) / (SAMPLE_RATE * MAX_CATCHUP_FACTOR);
+    Duration::from_micros(micros)
+}
+
 impl SonioxStreamFailure {
     fn with_audio_seconds(mut self, audio_seconds_sent: f64) -> Self {
         self.audio_seconds_sent = audio_seconds_sent;
@@ -886,15 +939,16 @@ async fn run_stream_actor_inner(
     let mut keepalive = interval_at(started + KEEPALIVE_INTERVAL, KEEPALIVE_INTERVAL);
     keepalive.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut last_outbound = started;
+    let mut next_frame_at = started;
     let mut final_deadline: Option<TokioInstant> = None;
     let mut expected_samples: Option<u64> = None;
     let mut finalize_sent = false;
     let mut sent_samples = 0u64;
-    let mut next_audio_send_at: Option<TokioInstant> = None;
-    let mut pending_audio: Option<AudioFrame> = None;
     let mut transcript_builder = TranscriptBuilder::default();
 
     loop {
+        let now = TokioInstant::now();
+        let pacing_wait = !finalize_sent && now < next_frame_at;
         let stream_deadline = final_deadline.unwrap_or(maximum_deadline);
         tokio::select! {
             biased;
@@ -932,7 +986,7 @@ async fn run_stream_actor_inner(
                     return Err(ActorFailure { failure, sent_samples });
                 };
                 expected_samples = Some(expected);
-                let accepted = lock_state(&state).next_sample;
+                let accepted = lock_state(&state).queued_samples;
                 if expected == 0 {
                     return Err(ActorFailure {
                         failure: local_failure(AsrError::EmptyResult, false, "empty_audio", sent_samples),
@@ -956,58 +1010,50 @@ async fn run_stream_actor_inner(
                 }
                 queue.close();
             }
-            _ = tokio::time::sleep_until(
-                next_audio_send_at.unwrap_or_else(TokioInstant::now),
-            ), if pending_audio.is_some() => {
-                let Some(frame) = pending_audio.take() else {
-                    continue;
-                };
-                if frame.start_sample != sent_samples {
-                    let failure = coverage_failure(sent_samples);
-                    return Err(ActorFailure { failure, sent_samples });
-                }
-                let next_sent = sent_samples.checked_add(frame.sample_count);
-                if next_sent.is_none_or(|next| next > MAX_STREAM_SAMPLES) {
-                    let failure = local_failure(
-                        AsrError::Other("Soniox stream exceeded the supported duration".to_owned()),
-                        false,
-                        "duration_limit",
-                        sent_samples,
-                    );
-                    return Err(ActorFailure { failure, sent_samples });
-                }
-                let message = Message::Binary(frame.bytes.to_vec().into());
-                match send_message(&mut sink, message, &stop, &cancellation).await {
-                    Ok(()) => {
-                        sent_samples = next_sent.unwrap_or(sent_samples);
-                        last_outbound = TokioInstant::now();
-                        let frame_duration = Duration::from_secs_f64(
-                            frame.sample_count as f64 / SAMPLE_RATE as f64,
-                        );
-                        next_audio_send_at = Some(TokioInstant::now() + frame_duration);
-                    }
-                    Err(SendFailure::Stopped) => {
-                        let failure = lock_state(&state)
-                            .failure
-                            .as_ref()
-                            .map(|failure| producer_failure(failure, sent_samples))
-                            .unwrap_or_else(|| cancelled_failure(sent_samples));
-                        return Err(ActorFailure { failure, sent_samples });
-                    }
-                    Err(SendFailure::Timeout) => {
-                        let failure = timeout_failure("send_timeout", sent_samples);
-                        return Err(ActorFailure { failure, sent_samples });
-                    }
-                    Err(SendFailure::WebSocket(error)) => {
-                        let failure = websocket_transport_failure(*error, sent_samples);
-                        return Err(ActorFailure { failure, sent_samples });
-                    }
-                }
-            }
-            frame = queue.recv(), if !finalize_sent && pending_audio.is_none() => {
+            _ = tokio::time::sleep_until(next_frame_at), if pacing_wait => {}
+            frame = queue.recv(), if !finalize_sent && !pacing_wait => {
                 match frame {
                     Some(frame) => {
-                        pending_audio = Some(frame);
+                        if frame.start_sample != sent_samples {
+                            let failure = coverage_failure(sent_samples);
+                            return Err(ActorFailure { failure, sent_samples });
+                        }
+                        let next_sent = sent_samples.checked_add(frame.sample_count);
+                        if next_sent.is_none_or(|next| next > MAX_STREAM_SAMPLES) {
+                            let failure = local_failure(
+                                AsrError::Other("Soniox stream exceeded the supported duration".to_owned()),
+                                false,
+                                "duration_limit",
+                                sent_samples,
+                            );
+                            return Err(ActorFailure { failure, sent_samples });
+                        }
+                        let message = Message::Binary(frame.bytes.to_vec().into());
+                        match send_message(&mut sink, message, &stop, &cancellation).await {
+                            Ok(()) => {
+                                sent_samples = next_sent.unwrap_or(sent_samples);
+                                let sent_at = TokioInstant::now();
+                                next_frame_at =
+                                    sent_at + catchup_pacing_delay(frame.sample_count);
+                                last_outbound = sent_at;
+                            }
+                            Err(SendFailure::Stopped) => {
+                                let failure = lock_state(&state)
+                                    .failure
+                                    .as_ref()
+                                    .map(|failure| producer_failure(failure, sent_samples))
+                                    .unwrap_or_else(|| cancelled_failure(sent_samples));
+                                return Err(ActorFailure { failure, sent_samples });
+                            }
+                            Err(SendFailure::Timeout) => {
+                                let failure = timeout_failure("send_timeout", sent_samples);
+                                return Err(ActorFailure { failure, sent_samples });
+                            }
+                            Err(SendFailure::WebSocket(error)) => {
+                                let failure = websocket_transport_failure(*error, sent_samples);
+                                return Err(ActorFailure { failure, sent_samples });
+                            }
+                        }
                     }
                     None if expected_samples.is_some() => {
                         if sent_samples != expected_samples.unwrap_or_default() {
@@ -1299,19 +1345,6 @@ impl TranscriptBuilder {
             tokens: self.tokens,
             limits: RateLimits::default(),
         }
-    }
-}
-
-fn language_hints(language: Option<&str>) -> Option<Vec<&'static str>> {
-    match language
-        .map(str::trim)
-        .map(str::to_ascii_lowercase)
-        .as_deref()
-    {
-        None | Some("") | Some("auto") => Some(vec!["zh", "en"]),
-        Some("zh") => Some(vec!["zh"]),
-        Some("en") => Some(vec!["en"]),
-        _ => None,
     }
 }
 
@@ -1640,6 +1673,7 @@ mod tests {
             SonioxStreamOptions {
                 api_key: "local-test-only-dummy-key".to_owned(),
                 language: Some("en".to_owned()),
+                preferred_languages: Vec::new(),
             },
             CancellationToken::new(),
             None,
@@ -1665,5 +1699,161 @@ mod tests {
         let failure = result.expect_err("policy cancellation is an error");
         assert_eq!(failure.failure_code, "cancelled");
         server.await.unwrap();
+    }
+
+    #[test]
+    fn soniox_sender_coalesces_samples_into_4096_frames_and_unbiased_auto_omits_hints() {
+        assert_eq!(QUEUE_CAPACITY, 48);
+        assert_eq!(AUDIO_FRAME_SAMPLES, 4096);
+        assert_eq!(
+            crate::languages::soniox_language_hints(Some("auto"), &[]),
+            None
+        );
+        assert_eq!(
+            crate::languages::soniox_language_hints(Some("auto"), &["ja".into(), "en".into()]),
+            Some(vec!["ja", "en"])
+        );
+
+        let (session, sender, mut queue, _finish) = new_session_shell();
+        sender.try_send_samples(0, &vec![0.1; 1000]).unwrap();
+        assert!(
+            queue.try_recv().is_err(),
+            "partial frame waits in coalescing buffer"
+        );
+        sender.try_send_samples(1000, &vec![0.1; 2000]).unwrap();
+        assert!(queue.try_recv().is_err(), "3000 samples still below 4096");
+        sender.try_send_samples(3000, &vec![0.1; 2000]).unwrap();
+
+        let full = queue
+            .try_recv()
+            .expect("5000 samples emits one full 4096 frame");
+        assert_eq!(full.start_sample, 0);
+        assert_eq!(full.sample_count, 4096);
+        assert_eq!(full.bytes.len(), 4096 * 2);
+        assert!(
+            queue.try_recv().is_err(),
+            "remaining 904 samples wait for tail flush"
+        );
+
+        let pcm = {
+            let mut state = lock_state(&session.state);
+            state.sealed = true;
+            std::mem::take(&mut state.pending_pcm)
+        };
+        assert_eq!(pcm.len(), 904 * 2);
+        session.stop.cancel();
+    }
+
+    #[tokio::test]
+    async fn soniox_stream_session_finish_flushes_partial_tail_and_rejects_mismatch() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = accept_async(stream).await.unwrap();
+            let config = socket.next().await.unwrap().unwrap();
+            assert!(matches!(config, Message::Text(_)));
+
+            let full = socket.next().await.unwrap().unwrap();
+            assert!(matches!(full, Message::Binary(ref bytes) if bytes.len() == 4096 * 2));
+            let tail = socket.next().await.unwrap().unwrap();
+            assert!(matches!(tail, Message::Binary(ref bytes) if bytes.len() == 904 * 2));
+            let eof = socket.next().await.unwrap().unwrap();
+            assert!(matches!(eof, Message::Binary(ref bytes) if bytes.is_empty()));
+
+            let payload = serde_json::json!({
+                "tokens": [
+                    { "text": "partial tail ok", "is_final": true }
+                ],
+                "finished": true
+            });
+            socket
+                .send(Message::Text(payload.to_string().into()))
+                .await
+                .unwrap();
+        });
+
+        let (session, sender) = SonioxStreamSession::connect_inner(
+            SonioxStreamOptions {
+                api_key: "local-test-only-dummy-key".to_owned(),
+                language: Some("en".to_owned()),
+                preferred_languages: Vec::new(),
+            },
+            CancellationToken::new(),
+            None,
+            false,
+            CancellationToken::new(),
+            &endpoint,
+        )
+        .await
+        .unwrap();
+
+        sender.try_send_samples(0, &vec![0.1; 5000]).unwrap();
+        let transcript = session.finish(5000).await.expect("tail flushes cleanly");
+        assert_eq!(transcript.text, "partial tail ok");
+        server.await.unwrap();
+
+        let listener2 = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint2 = format!("ws://{}", listener2.local_addr().unwrap());
+        let server2 = tokio::spawn(async move {
+            let (stream, _) = listener2.accept().await.unwrap();
+            let mut socket = accept_async(stream).await.unwrap();
+            let _ = socket.next().await;
+        });
+        let (session2, sender2) = SonioxStreamSession::connect_inner(
+            SonioxStreamOptions {
+                api_key: "local-test-only-dummy-key".to_owned(),
+                language: Some("en".to_owned()),
+                preferred_languages: Vec::new(),
+            },
+            CancellationToken::new(),
+            None,
+            false,
+            CancellationToken::new(),
+            &endpoint2,
+        )
+        .await
+        .unwrap();
+        sender2.try_send_samples(0, &vec![0.1; 1200]).unwrap();
+        let failure = session2
+            .finish(1500)
+            .await
+            .expect_err("mismatched expected_samples must fail");
+        assert_eq!(failure.failure_code, "coverage_failure");
+        server2.await.unwrap();
+    }
+
+    #[test]
+    fn soniox_catchup_pacing_respects_four_x_budget() {
+        assert_eq!(catchup_pacing_delay(4_096), Duration::from_millis(64));
+        assert_eq!(catchup_pacing_delay(1_600), Duration::from_millis(25));
+        assert_eq!(catchup_pacing_delay(0), Duration::ZERO);
+    }
+
+    #[tokio::test]
+    async fn soniox_finish_send_timeout_remains_replayable() {
+        let (mut session, sender, queue_rx, _finish_rx) = new_session_shell();
+        // Saturate queue + keep 100 samples in pending_pcm so finish hits send timeout.
+        let sample_count = QUEUE_CAPACITY * 4096 + 100;
+        sender
+            .try_send_samples(0, &vec![0.1; sample_count])
+            .expect("queue fills cleanly with trailing pending_pcm");
+        let stop = session.stop.clone();
+        session.result_task = Some(tokio::spawn(async move {
+            stop.cancelled().await;
+            let _keep_rx = queue_rx;
+            Err(cancelled_failure(0))
+        }));
+
+        let failure = session
+            .finish_with_timeouts(
+                sample_count as u64,
+                Duration::from_millis(20),
+                Duration::from_millis(20),
+            )
+            .await
+            .expect_err("send timeout must fail");
+        assert_eq!(failure.failure_code, "finish_send_timeout");
+        assert!(failure.replayable);
     }
 }

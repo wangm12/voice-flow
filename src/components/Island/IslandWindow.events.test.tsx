@@ -127,7 +127,7 @@ describe("IslandWindow HUD partials", () => {
     Object.defineProperty(window, "matchMedia", {
       writable: true,
       value: vi.fn().mockImplementation((query: string) => ({
-        matches: true,
+        matches: query !== "(prefers-reduced-motion: reduce)",
         media: query,
         addEventListener: vi.fn(),
         removeEventListener: vi.fn(),
@@ -192,9 +192,10 @@ describe("IslandWindow HUD partials", () => {
     expect(document.querySelector(".voice-pill__subtitle")?.getAttribute("title")).toContain("默认输入：System Default Headset");
   });
 
-  it("shows the opened microphone and current input status, ignoring stale device events", async () => {
+  it("shows the opened microphone and current input status, suppressing brief waiting notices under 250ms", async () => {
     await renderHud();
     await waitFor(() => expect(handlers.has("audio://capture")).toBe(true));
+    vi.useFakeTimers();
     act(() => {
       handlers.get("dictation://state")!({
         payload: { state: "starting", session_generation: 7 },
@@ -207,8 +208,15 @@ describe("IslandWindow HUD partials", () => {
         },
       });
     });
+    expect(document.querySelector(".voice-pill__label")).toHaveTextContent("录音中");
+    expect(document.querySelector(".voice-pill__subtitle")).toHaveTextContent("AirPods Pro");
+
+    act(() => {
+      vi.advanceTimersByTime(250);
+    });
     expect(document.querySelector(".voice-pill__label")).toHaveTextContent("等待麦克风");
     expect(document.querySelector(".voice-pill__subtitle")).toHaveTextContent("尚未收到音频");
+    vi.useRealTimers();
 
     act(() => {
       handlers.get("dictation://state")!({ payload: { state: "recording", session_generation: 7 } });
@@ -882,7 +890,8 @@ describe("IslandWindow HUD partials", () => {
     expect(invokeMock.mock.calls.every(([command]) =>
       command === "set_island_details_visible"
         || command === "get_delivery_settlement_snapshot"
-        || command === "get_hud_appearance_status",
+        || command === "get_hud_appearance_status"
+        || command === "get_settings",
     )).toBe(true);
   });
 
@@ -1116,6 +1125,59 @@ describe("IslandWindow HUD partials", () => {
     expect(document.querySelector(".voice-pill__label")).toHaveTextContent("处理中");
     expect(status).not.toContain("正在识别");
     expect(status).not.toContain("正在听取操作");
+    expect(document.querySelector('[data-beam-size="line"]')).toHaveAttribute("data-beam-active", "true");
+
+    act(() => {
+      handlers.get("dictation://progress")!({
+        payload: { session_generation: 32, chunks_done: 2, total: 5, progress: 0.4 },
+      });
+    });
+    expect(document.querySelector(".voice-pill__label")).toHaveTextContent("处理中");
+    expect(document.querySelector(".voice-pill__label")).not.toHaveTextContent("2/5");
+
+    act(() => {
+      handlers.get("dictation://state")!({
+        payload: { state: "processing", phase: "soniox_recovery", phase_confirmed: true, session_generation: 32 },
+      });
+    });
+    expect(document.querySelector(".voice-pill__label")).toHaveTextContent("处理中");
+
+    act(() => {
+      handlers.get("dictation://state")!({
+        payload: { state: "processing", phase: "waiting_retry", phase_confirmed: true, session_generation: 32 },
+      });
+    });
+    expect(document.querySelector(".voice-pill__label")).toHaveTextContent("限流重试");
+    expect(document.querySelector('[data-beam-size="line"]')).toHaveAttribute("data-beam-active", "false");
+  });
+
+  it("keeps Processing steady across cleanup and chunk transitions while resetting across generations", async () => {
+    await renderHud();
+    act(() => {
+      handlers.get("dictation://state")!({
+        payload: { state: "processing", phase: "asr", phase_confirmed: true, total_chunks: 4, completed_chunks: 1, session_generation: 40 },
+      });
+    });
+    expect(document.querySelector(".voice-pill__label")).toHaveTextContent("处理中");
+    expect(document.querySelector(".voice-pill__label")).not.toHaveTextContent("1/4");
+    expect(document.querySelector('[data-beam-size="line"]')).toHaveAttribute("data-beam-active", "true");
+
+    act(() => {
+      handlers.get("dictation://state")!({
+        payload: { state: "processing", phase: "cleanup", phase_confirmed: true, session_generation: 40 },
+      });
+    });
+    expect(document.querySelector(".voice-pill__label")).toHaveTextContent("处理中");
+    expect(document.querySelector(".voice-pill__label")).not.toHaveTextContent("1/4");
+    expect(document.querySelector('[data-beam-size="line"]')).toHaveAttribute("data-beam-active", "true");
+
+    act(() => {
+      handlers.get("dictation://state")!({
+        payload: { state: "processing", phase: "asr", phase_confirmed: true, session_generation: 41 },
+      });
+    });
+    expect(document.querySelector(".voice-pill__label")).toHaveTextContent("处理中");
+    expect(document.querySelector(".voice-pill__label")).not.toHaveTextContent("1/4");
   });
 
   it("keeps a preview_ready text action out of History after unverified dictation", async () => {
@@ -1172,6 +1234,185 @@ describe("IslandWindow HUD partials", () => {
     await waitFor(() =>
       expect(invokeMock).toHaveBeenCalledWith("set_island_learn_interactive", { interactive: false }),
     );
+  });
+
+  it("renders a 1-click candidate capsule with Global, App-local, and dismiss actions", async () => {
+    invokeMock.mockResolvedValue(undefined);
+    await renderHud();
+    await waitFor(() => expect(handlers.has("learn_pairs://candidate")).toBe(true));
+    const stateEvent = handlers.get("dictation://state")!;
+    act(() => stateEvent({ payload: { state: "idle", session_generation: 1 } }));
+
+    act(() => {
+      handlers.get("learn_pairs://candidate")!({
+        payload: {
+          session_generation: 1,
+          pair_key: "word:v2:candidate-wechat",
+          before: "知呼",
+          after: "知乎",
+          native_bundle: "com.tencent.xinWeChat",
+        },
+      });
+    });
+
+    const toast = await findLearnToast();
+    expect(toast).toHaveTextContent("记住「知呼 → 知乎」？");
+    expect(screen.getByRole("button", { name: "全局记住" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "仅此 App" })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "全局记住" }));
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("promote_learn_pair", {
+        pairKey: "word:v2:candidate-wechat",
+        beforeSurface: "知呼",
+        afterSurface: "知乎",
+        scopeMode: "global",
+      }),
+    );
+
+    act(() => stateEvent({ payload: { state: "idle", session_generation: 2 } }));
+    act(() => {
+      handlers.get("learn_pairs://candidate")!({
+        payload: {
+          session_generation: 2,
+          pair_key: "word:v2:candidate-site",
+          before: "githab",
+          after: "GitHub",
+          browser_host: "github.com",
+        },
+      });
+    });
+    const siteToast = await findLearnToast();
+    expect(siteToast).toHaveTextContent("github.com");
+    fireEvent.click(screen.getByRole("button", { name: "仅此网站" }));
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("promote_learn_pair", {
+        pairKey: "word:v2:candidate-site",
+        beforeSurface: "githab",
+        afterSurface: "GitHub",
+        scopeMode: "local",
+      }),
+    );
+
+    // Unknown-scope candidates must omit the local-scope button so HUD confirmation cannot fail-closed.
+    act(() => stateEvent({ payload: { state: "idle", session_generation: 3 } }));
+    act(() => {
+      handlers.get("learn_pairs://candidate")!({
+        payload: {
+          session_generation: 3,
+          pair_key: "word:v2:candidate-unknown-scope",
+          before: "tensorflo",
+          after: "TensorFlow",
+        },
+      });
+    });
+    const unscopedToast = await findLearnToast();
+    expect(unscopedToast).toHaveTextContent("记住「tensorflo → TensorFlow」？");
+    expect(screen.getByRole("button", { name: "全局记住" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "仅此 App" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "仅此网站" })).not.toBeInTheDocument();
+  });
+
+  it("auto-dismisses a candidate capsule after 8s unless hovered", async () => {
+    invokeMock.mockResolvedValue(undefined);
+    await renderHud();
+    await waitFor(() => expect(handlers.has("learn_pairs://candidate")).toBe(true));
+    act(() => handlers.get("dictation://state")!({
+      payload: { state: "idle", session_generation: 1 },
+    }));
+
+    act(() => {
+      handlers.get("learn_pairs://candidate")!({
+        payload: {
+          session_generation: 1,
+          pair_key: "word:v2:candidate-timeout",
+          before: "知呼",
+          after: "知乎",
+        },
+      });
+    });
+
+    const toast = await findLearnToast();
+    vi.useFakeTimers();
+    try {
+      fireEvent.mouseEnter(toast);
+      act(() => {
+        vi.advanceTimersByTime(10_000);
+      });
+      expect(learnToast()).not.toBeNull();
+      expect(invokeMock).not.toHaveBeenCalledWith("hide_island_if_idle");
+
+      fireEvent.mouseLeave(toast);
+      act(() => {
+        vi.advanceTimersByTime(7_999);
+      });
+      expect(learnToast()).not.toBeNull();
+
+      act(() => {
+        vi.advanceTimersByTime(1);
+      });
+      expect(learnToast()).toBeNull();
+      expect(invokeMock).toHaveBeenCalledWith("hide_island_if_idle");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("clears a stale candidate capsule when a new dictation starts", async () => {
+    invokeMock.mockResolvedValue(undefined);
+    await renderHud();
+    await waitFor(() => expect(handlers.has("learn_pairs://candidate")).toBe(true));
+    act(() => handlers.get("dictation://state")!({
+      payload: { state: "idle", session_generation: 1 },
+    }));
+
+    act(() => {
+      handlers.get("learn_pairs://candidate")!({
+        payload: {
+          session_generation: 1,
+          pair_key: "word:v2:candidate-stale",
+          before: "知呼",
+          after: "知乎",
+        },
+      });
+    });
+    expect(await findLearnToast()).toHaveTextContent("记住「知呼 → 知乎」？");
+
+    act(() => {
+      handlers.get("dictation://state")!({
+        payload: { state: "starting", session_generation: 2 },
+      });
+    });
+    expect(learnToast()).toBeNull();
+    expect(invokeMock).not.toHaveBeenCalledWith("hide_island_if_idle");
+  });
+
+  it("rejects delayed candidate events from an older session while starting and after newer idle", async () => {
+    invokeMock.mockResolvedValue(undefined);
+    await renderHud();
+    await waitFor(() => expect(handlers.has("learn_pairs://candidate")).toBe(true));
+    const stateEvent = handlers.get("dictation://state")!;
+    const candidateEvent = handlers.get("learn_pairs://candidate")!;
+
+    act(() => stateEvent({ payload: { state: "idle", session_generation: 40 } }));
+    act(() => stateEvent({ payload: { state: "starting", session_generation: 41 } }));
+    act(() => candidateEvent({ payload: {
+      session_generation: 40,
+      pair_key: "word:v2:late-before-idle",
+      before: "old",
+      after: "older",
+    } }));
+    expect(learnToast()).toBeNull();
+
+    act(() => stateEvent({ payload: { state: "idle", session_generation: 41 } }));
+    act(() => candidateEvent({ payload: {
+      session_generation: 40,
+      pair_key: "word:v2:late-after-idle",
+      before: "old",
+      after: "older",
+    } }));
+    expect(learnToast()).toBeNull();
+    expect(invokeMock).not.toHaveBeenCalledWith("set_island_learn_interactive", { interactive: true });
   });
 
   it("undoes both style and intensity pair keys", async () => {
@@ -1327,4 +1568,194 @@ describe("IslandWindow HUD partials", () => {
     expect(invokeMock.mock.calls.filter(([command]) => command === "undo_learn_pair")).toHaveLength(4);
   });
 
+  it("keeps Processing steady across context refreshes and delivery while running the colorful line beam", async () => {
+    await renderHud();
+    await waitFor(() => expect(handlers.has("hud-appearance://status")).toBe(true));
+
+    act(() => {
+      handlers.get("dictation://state")!({
+        payload: { state: "recording", session_generation: 50 },
+      });
+    });
+    expect(document.querySelector(".voice-pill__label")).toHaveTextContent("录音中");
+    expect(document.querySelector('[data-voice-beam="mock"]')).toHaveAttribute("data-voice-active", "false");
+    expect(document.querySelector('[data-beam-size="line"]')).toHaveAttribute("data-beam-active", "false");
+
+    act(() => {
+      handlers.get("audio://level")!({
+        payload: { session_generation: 50, level: 0.6, frame_fresh: true },
+      });
+    });
+    const voiceBeam = document.querySelector('[data-voice-beam="mock"]');
+    expect(voiceBeam).toHaveAttribute("data-voice-active", "true");
+    expect(voiceBeam).toHaveAttribute("data-voice-type", "pill");
+    expect(voiceBeam).toHaveAttribute("data-voice-color", "colorful");
+    expect(voiceBeam).toHaveAttribute("data-voice-theme", "dark");
+    expect(Number(voiceBeam?.getAttribute("data-voice-level"))).toBeGreaterThan(0);
+
+    act(() => {
+      handlers.get("hud-appearance://status")!({
+        payload: { requested: "liquid_glass", effective: "liquid_glass", fallback_reason: null, pending: false },
+      });
+    });
+    expect(document.querySelector('[data-voice-beam="mock"]')).toHaveAttribute("data-voice-theme", "auto");
+    expect(document.querySelector('[data-voice-beam="mock"]')).toHaveAttribute("data-voice-active", "true");
+
+    act(() => {
+      handlers.get("hud-appearance://status")!({
+        payload: { requested: "classic", effective: "classic", fallback_reason: null, pending: false },
+      });
+    });
+    expect(document.querySelector('[data-voice-beam="mock"]')).toHaveAttribute("data-voice-theme", "dark");
+
+    act(() => {
+      handlers.get("dictation://state")!({
+        payload: { state: "processing", phase: "finalizing_audio", phase_confirmed: false, session_generation: 50 },
+      });
+    });
+    expect(document.querySelector(".voice-pill__label")).toHaveTextContent("处理中");
+    expect(document.querySelector('[data-voice-beam="mock"]')).toHaveAttribute("data-voice-active", "false");
+    expect(document.querySelector('[data-beam-size="line"]')).toHaveAttribute("data-beam-color", "colorful");
+    expect(document.querySelector('[data-beam-size="line"]')).toHaveAttribute("data-beam-theme", "dark");
+    expect(document.querySelector('[data-beam-size="line"]')).toHaveAttribute("data-beam-active", "true");
+
+    act(() => {
+      handlers.get("hud-appearance://status")!({
+        payload: { requested: "liquid_glass", effective: "liquid_glass", fallback_reason: null, pending: false },
+      });
+    });
+    expect(document.querySelector('[data-beam-size="line"]')).toHaveAttribute("data-beam-theme", "auto");
+    expect(document.querySelector('[data-beam-size="line"]')).toHaveAttribute("data-beam-active", "true");
+
+    act(() => {
+      handlers.get("hud-appearance://status")!({
+        payload: { requested: "classic", effective: "classic", fallback_reason: null, pending: false },
+      });
+    });
+    expect(document.querySelector('[data-beam-size="line"]')).toHaveAttribute("data-beam-theme", "dark");
+
+    act(() => {
+      handlers.get("dictation://state")!({
+        payload: { state: "processing", phase: "asr", phase_confirmed: true, session_generation: 50 },
+      });
+    });
+    expect(document.querySelector(".voice-pill__label")).toHaveTextContent("处理中");
+    expect(document.querySelector('[data-beam-size="line"]')).toHaveAttribute("data-beam-active", "true");
+
+    act(() => {
+      handlers.get("dictation://state")!({
+        payload: {
+          state: "processing",
+          phase: "cleanup",
+          phase_confirmed: false,
+          session_generation: 50,
+          context_source: { source: "ax", label: "AX text" },
+        },
+      });
+    });
+    expect(document.querySelector(".voice-pill__label")).toHaveTextContent("处理中");
+    expect(document.querySelector(".voice-pill")?.getAttribute("aria-label") ?? "").toContain("辅助功能文字");
+
+    act(() => {
+      handlers.get("dictation://state")!({
+        payload: { state: "processing", phase: "cleanup", phase_confirmed: true, session_generation: 50 },
+      });
+    });
+    expect(document.querySelector(".voice-pill__label")).toHaveTextContent("处理中");
+
+    act(() => {
+      handlers.get("dictation://state")!({
+        payload: {
+          state: "processing",
+          phase: "cleanup",
+          phase_confirmed: false,
+          session_generation: 50,
+          context_source: { source: "ocr", label: "On-device OCR" },
+        },
+      });
+    });
+    expect(document.querySelector(".voice-pill__label")).toHaveTextContent("处理中");
+    expect(document.querySelector(".voice-pill")?.getAttribute("aria-label") ?? "").toContain("本机 OCR");
+
+    act(() => {
+      handlers.get("dictation://state")!({
+        payload: { state: "processing", phase: "delivery", phase_confirmed: true, session_generation: 50 },
+      });
+    });
+    expect(document.querySelector(".voice-pill__label")).toHaveTextContent("处理中");
+    expect(document.querySelector('[data-beam-size="line"]')).toHaveAttribute("data-beam-active", "true");
+
+    // Rate-limit retry transition stays labeled "限流重试" and pauses the line beam.
+    act(() => {
+      handlers.get("quota://rate_limited")!({ payload: { session_generation: 50 } });
+    });
+    expect(document.querySelector(".voice-pill__label")).toHaveTextContent("限流重试");
+    expect(document.querySelector('[data-beam-size="line"]')).toHaveAttribute("data-beam-active", "false");
+    act(() => {
+      handlers.get("dictation://state")!({
+        payload: { state: "processing", phase: "waiting_retry", session_generation: 50 },
+      });
+    });
+    expect(document.querySelector(".voice-pill__label")).toHaveTextContent("限流重试");
+    expect(document.querySelector('[data-beam-size="line"]')).toHaveAttribute("data-beam-active", "false");
+
+    // New generation reactivates Processing and colorful line beam cleanly without exposing chunk ratios.
+    act(() => {
+      handlers.get("dictation://state")!({
+        payload: { state: "processing", phase: "asr", phase_confirmed: true, completed_chunks: 2, total_chunks: 4, session_generation: 51 },
+      });
+    });
+    expect(document.querySelector(".voice-pill__label")).toHaveTextContent("处理中");
+    expect(document.querySelector(".voice-pill__label")).not.toHaveTextContent("2/4");
+    expect(document.querySelector('[data-beam-size="line"]')).toHaveAttribute("data-beam-active", "true");
+    act(() => {
+      handlers.get("dictation://state")!({
+        payload: { state: "processing", phase: "delivery", phase_confirmed: true, session_generation: 51 },
+      });
+    });
+    expect(document.querySelector(".voice-pill__label")).toHaveTextContent("处理中");
+    expect(document.querySelector(".voice-pill__label")).not.toHaveTextContent("2/4");
+  });
+
+  it("syncs HUD color palette, voice style, and processing style live from get_settings and settings://changed", async () => {
+    invokeMock.mockImplementation(async (command) => {
+      if (command === "get_settings") {
+        return {
+          hud_color_variant: "ocean",
+          hud_processing_color_variant: "sunset",
+          hud_voice_style: "aurora",
+          hud_processing_style: "quiet_trace",
+          hud_voice_intensity: 1.2,
+        };
+      }
+      if (command === "get_hud_appearance_status") {
+        return { requested: "classic", effective: "classic", fallback_reason: null, pending: false };
+      }
+      return undefined;
+    });
+    await renderHud();
+    await waitFor(() => expect(document.querySelector('[data-voice-beam="mock"]')).toHaveAttribute("data-voice-color", "ocean"));
+    expect(document.querySelector('[data-voice-beam="mock"]')).toHaveAttribute("data-voice-flow", "72");
+    expect(document.querySelector('[data-beam-size="line"]')).toHaveAttribute("data-beam-color", "sunset");
+    expect(document.querySelector('[data-beam-size="line"]')).toHaveAttribute("data-beam-duration", "3.4");
+
+    act(() => {
+      handlers.get("settings://changed")?.({
+        payload: {
+          hud_color_variant: "mono",
+          hud_processing_color_variant: "candy",
+          hud_voice_style: "prism",
+          hud_processing_style: "brilliant_sweep",
+          hud_voice_intensity: 0.9,
+        },
+      });
+    });
+
+    expect(document.querySelector('[data-voice-beam="mock"]')).toHaveAttribute("data-voice-color", "mono");
+    expect(document.querySelector('[data-voice-beam="mock"]')).toHaveAttribute("data-voice-band-core", "#ffffff");
+    expect(document.querySelector('[data-voice-beam="mock"]')).toHaveAttribute("data-voice-flow", "84");
+    expect(document.querySelector('[data-beam-size="line"]')).toHaveAttribute("data-beam-color", "ocean");
+    expect(document.querySelector('[data-beam-size="line"]')).toHaveAttribute("data-beam-duration", "1.45");
+    expect(document.querySelector<HTMLElement>(".voice-pill__processing-beam-layer")?.style.filter).toBe("hue-rotate(80deg)");
+  });
 });

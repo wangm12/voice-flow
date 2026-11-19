@@ -20,7 +20,7 @@ export function ActivationModeSelector({
   const name = useId();
   return (
     <div className="space-y-2" role="radiogroup" aria-label={t("录音方式")} aria-describedby={descriptionId}>
-      <div className="vf-activation-options grid grid-cols-2 gap-1 rounded-lg bg-card p-1">
+      <div className="vf-activation-options grid grid-cols-1 gap-1 rounded-lg bg-card p-1 sm:grid-cols-3">
         {ACTIVATION_MODES.map((mode) => {
           const active = value === mode.id;
           return (

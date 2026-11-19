@@ -32,6 +32,7 @@ pub struct OnDeviceModelInfo {
     pub file_count: usize,
     pub platform_supported: bool,
     pub download_available: bool,
+    pub license_unreviewed: bool,
     pub language_note: String,
 }
 
@@ -52,9 +53,12 @@ pub struct OnDeviceModelStatus {
     pub runtime_status: String,
     pub loaded: bool,
     pub download_available: bool,
+    pub license_unreviewed: bool,
     pub language_note: String,
     /// Static physical-memory compatibility only; runtime pressure is separate.
     pub memory_compatibility_error: Option<String>,
+    /// Conservative cold-load admission reserve; this is not a measured peak.
+    pub memory_estimate: Option<crate::model_resources::ModelMemoryEstimate>,
 }
 
 #[derive(Debug, Clone)]
@@ -105,15 +109,19 @@ impl AsrProvider for OnDeviceAsrProvider {
                     None,
                 );
             }
+            let coerced_language = options.language.as_deref().map(|raw| {
+                crate::languages::coerce_language_for_model(
+                    crate::providers::EngineProvider::OnDevice,
+                    &asr_model,
+                    raw,
+                )
+            });
             let language = if manifest
                 .is_some_and(|model| model.language_policy == MlxLanguagePolicy::AutoOnly)
             {
                 None
             } else {
-                options
-                    .language
-                    .as_deref()
-                    .filter(|language| *language != "auto")
+                coerced_language.filter(|language| *language != "auto")
             };
             crate::ondevice_runtime::shared_runtime(&models_root)
                 .transcribe(
@@ -267,6 +275,7 @@ pub fn list_models(models_root: &Path) -> Vec<OnDeviceModelInfo> {
         file_count: 2,
         platform_supported: false,
         download_available: false,
+        license_unreviewed: false,
         language_note: "Retained legacy files; not offered for new downloads.".to_owned(),
     }];
     models.extend(MLX_MODELS.iter().map(|manifest| OnDeviceModelInfo {
@@ -279,6 +288,7 @@ pub fn list_models(models_root: &Path) -> Vec<OnDeviceModelInfo> {
         file_count: manifest.files.len(),
         platform_supported: platform_supported(),
         download_available: manifest.download_available,
+        license_unreviewed: manifest.license_unreviewed,
         language_note: manifest.language_note.to_owned(),
     }));
     models

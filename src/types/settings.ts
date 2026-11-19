@@ -14,6 +14,17 @@ export type ProviderKeyView = {
 export type CredentialReadState = "configured" | "missing" | "unavailable";
 export type ProviderCredentialPurpose = "asr" | "cleanup";
 export type HudAppearance = "classic" | "liquid_glass";
+export type HudColorVariant =
+  | "colorful"
+  | "ocean"
+  | "sunset"
+  | "forest"
+  | "candy"
+  | "ice"
+  | "gold"
+  | "mono";
+export type HudVoiceStyle = "ripple" | "aurora" | "prism" | "whisper";
+export type HudProcessingStyle = "flow_line" | "brilliant_sweep" | "quiet_trace";
 
 export type ProviderCredentialReadStatus =
   | "session_configured"
@@ -55,6 +66,7 @@ export type Settings = {
   local_whisper_base_url?: string;
   provider_keys?: Partial<Record<ProviderId, ProviderKeyView>>;
   language: string;
+  preferred_languages?: string[];
   ui_language: UiLanguagePreference;
   theme: "system" | "light" | "dark";
   dictionary: string[];
@@ -82,6 +94,7 @@ export type Settings = {
   hotkey: string;
   activation_mode: ActivationMode;
   hotkey_error?: string | null;
+  hotkey_notice?: string | null;
   context_enabled: boolean;
   browser_access_enabled: boolean;
   context_mappings: ContextMapping[];
@@ -108,6 +121,11 @@ export type Settings = {
   debug_mode?: boolean;
   fuzzy_dictionary_enabled?: boolean;
   hud_appearance?: HudAppearance;
+  hud_color_variant?: HudColorVariant;
+  hud_processing_color_variant?: HudColorVariant;
+  hud_voice_style?: HudVoiceStyle;
+  hud_processing_style?: HudProcessingStyle;
+  hud_voice_intensity?: number;
 
 };
 
@@ -127,8 +145,16 @@ export type OnDeviceModelStatus = {
   runtime_status: string;
   loaded: boolean;
   download_available?: boolean;
+  license_unreviewed?: boolean;
   language_note?: string;
   memory_compatibility_error?: string | null;
+  memory_estimate?: { bytes: number; source: "admission_reserve" } | null;
+};
+
+export type DeviceMemoryBudget = {
+  physical_memory_bytes: number | null;
+  budget_bytes: number | null;
+  budget_percent: number;
 };
 
 export type CleanupModelStatus = {
@@ -147,6 +173,8 @@ export type CleanupModelStatus = {
   managed: boolean;
   partial_managed: boolean;
   platform_supported?: boolean | null;
+  language?: string;
+  memory_estimate?: { bytes: number; source: "admission_reserve" } | null;
 };
 
 export type LocalCleanupModelStatus = {
@@ -171,6 +199,8 @@ export type LocalCleanupModelStatus = {
   selectable?: boolean;
   compatible: boolean;
   compatibility_error: string | null;
+  language?: string;
+  memory_estimate?: { bytes: number; source: "admission_reserve" } | null;
 };
 
 export type MlxCleanupModelStatus = {
@@ -196,6 +226,7 @@ export type MlxCleanupModelStatus = {
   selectable: boolean;
   compatible: boolean;
   compatibility_error: string | null;
+  memory_estimate?: { bytes: number; source: "admission_reserve" } | null;
 };
 
 export type LocalCleanupStatus = {
@@ -207,8 +238,8 @@ export type LocalCleanupStatus = {
 
 export type SaveSettings = (
   patch: Partial<Settings>,
-  options?: { persist?: boolean; immediate?: boolean },
-) => void;
+  options?: { persist?: boolean; immediate?: boolean; rethrow?: boolean },
+) => Promise<void> | void;
 
 export type AudioInputDevice = {
   name: string;

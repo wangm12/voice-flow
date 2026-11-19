@@ -5,6 +5,7 @@ import { cleanupIntentForRoute, cleanupIntentPatch, initialCleanupIntent, type O
 import { CleanupGuide } from "./CleanupGuide";
 import { DataChoices, type OnboardingSettingsPage } from "./DataChoices";
 import type { MicrophoneStatus } from "../MicrophoneCheck";
+import { useLocalModelsStatus } from "../../hooks/useLocalModelsStatus";
 import { usePermissionGuide } from "./usePermissionGuide";
 import { useOnboardingTrialLease } from "./useOnboardingTrialLease";
 import { currentReadiness, isNativeGeneration, matchesTrialIdentity, matchesTrialMetadata, readinessFact, parseOnboardingPermissions, sameOnboardingPermissions, invalidatePermissionReadiness, type OnboardingPermissions, type PermissionReadback, type ReadinessFact, type TrialReceipt } from "../../lib/onboardingReadiness";
@@ -24,6 +25,7 @@ import { useI18n } from "../../lib/i18n";
 import { friendlySettingsError } from "../../lib/settingsError";
 import { ghostButtonClass } from "../../lib/theme";
 import { draftFromSettings, hasSupportedAsrLanguage, probePayload } from "../../lib/engineWizard";
+import { coerceLanguageForModel } from "../../lib/languages";
 import {
   asrModelProfile,
   dashscopeEndpointForRegion,
@@ -198,16 +200,18 @@ export function Onboarding({
     sequence: number;
     promise: Promise<OnDeviceModelStatus[]>;
   } | null>(null);
+  const asrProviderRef = useRef(asrProvider);
+  asrProviderRef.current = asrProvider;
   const configuredAsrKey = asrProvider === "groq"
     ? Boolean(savedSettings.api_key_configured)
     : Boolean(savedSettings.provider_keys?.[asrProvider]?.configured || (asrProvider === "custom" && savedSettings.asr_api_key_configured));
   const asrKeyHint = asrProvider === "groq"
-    ? String(settings.api_key_hint ?? "")
-    : String(settings.provider_keys?.[asrProvider]?.hint ?? (asrProvider === "custom" ? settings.asr_api_key_hint : "") ?? "");
+    ? String(savedSettings.api_key_hint ?? "")
+    : String(savedSettings.provider_keys?.[asrProvider]?.hint ?? (asrProvider === "custom" ? savedSettings.asr_api_key_hint : "") ?? "");
   const selectedOnDeviceModel = onDeviceModels.find((model) => model.id === asrModel);
   const onDeviceReady = asrProvider === "on_device" && selectedOnDeviceModel?.inference_ready === true;
   const asrConfigured = Boolean(asrModel.trim()) && (Boolean(key.trim()) || configuredAsrKey || Boolean(providerById(asrProvider)?.allowsEmptyKey && isLoopbackUrl(String(asrProvider === "local_whisper" ? savedSettings.local_whisper_base_url ?? providerById(asrProvider)?.defaultBaseUrl : savedSettings.custom_base_url ?? savedSettings.asr_base_url ?? providerById(asrProvider)?.defaultBaseUrl))));
-  const currentAsrLanguageSupported = hasSupportedAsrLanguage(asrModelProfile(asrProvider, asrModel), language);
+  const currentAsrLanguageSupported = hasSupportedAsrLanguage(asrModelProfile(asrProvider, asrModel), language, asrProvider, asrModel);
   const strictOfflineEnabled = settings.strict_offline_enabled === true;
   const strictOfflineAsrAllowed = asrProvider === "on_device";
   const strictOfflineBlocked = strictOfflineEnabled && !strictOfflineAsrAllowed;
@@ -377,7 +381,7 @@ export function Onboarding({
         setValid(result);
         if (testedNativeGeneration) recordFact(readinessFact("provider_probe", result === "valid" ? "passed" : "failed", "validate_api_key:authentication_only", testedNativeGeneration, sessionId));
       } else if (asrProvider !== "on_device") {
-        const engineSettings = settings as unknown as EngineSettingsSnapshot;
+        const engineSettings = savedSettings as unknown as EngineSettingsSnapshot;
         const draft = draftFromSettings(engineSettings);
         draft.asrProvider = asrProvider;
         draft.asrModel = asrModel;
@@ -459,16 +463,24 @@ export function Onboarding({
   }, [refreshOnDeviceModels]);
 
   useEffect(() => {
-    let active = true;
     onDeviceComponentActiveRef.current = true;
     void refreshOnDeviceModels();
-    const subscription = listen<OnDeviceModelStatus>("ondevice://download", (event) => {
-      if (!active || !onDeviceComponentActiveRef.current) return;
-      const downloadStatus = event.payload;
+    return () => {
+      onDeviceComponentActiveRef.current = false;
+      onDeviceStatusRefreshSequenceRef.current += 1;
+      onDeviceStatusRequestRef.current = null;
+    };
+  }, [refreshOnDeviceModels]);
+
+  useLocalModelsStatus({
+    onOnDeviceAsrStatus: (downloadStatus) => {
+      if (!onDeviceComponentActiveRef.current) return;
       if (selectedOnDeviceModelIdRef.current === downloadStatus.id) setModelReceipt(null);
       setOnDeviceModels((current) => {
         const previous = current.find((model) => model.id === downloadStatus.id);
-        const nextStatus = previous
+        const keepPreviousRuntime = downloadStatus.state === "downloading"
+          || (!downloadStatus.inference_ready && downloadStatus.runtime_status === "not_checked");
+        const nextStatus = previous && keepPreviousRuntime
           ? {
               ...downloadStatus,
               runtime_status: previous.runtime_status,
@@ -476,20 +488,19 @@ export function Onboarding({
               loaded: downloadStatus.state === "ready" && previous.loaded,
             }
           : downloadStatus;
-        return [...current.filter((model) => model.id !== downloadStatus.id), nextStatus];
+        return current.some((model) => model.id === downloadStatus.id)
+          ? current.map((model) => model.id === downloadStatus.id ? nextStatus : model)
+          : [...current, nextStatus];
       });
       if (downloadStatus.state !== "downloading" && selectedOnDeviceModelIdRef.current === downloadStatus.id) {
         void refreshOnDeviceModels(downloadStatus.id, true);
       }
-    });
-    return () => {
-      active = false;
-      onDeviceComponentActiveRef.current = false;
-      onDeviceStatusRefreshSequenceRef.current += 1;
-      onDeviceStatusRequestRef.current = null;
-      void subscription.then((unlisten) => unlisten()).catch(() => undefined);
-    };
-  }, [refreshOnDeviceModels]);
+    },
+    onOnDeviceRuntimeChanged: () => {
+      if (!onDeviceComponentActiveRef.current) return;
+      void refreshOnDeviceModels();
+    },
+  });
 
   const runOnDeviceAction = async (id: string, action: "download" | "cancel") => {
     setOnDeviceActionId(id);
@@ -693,7 +704,11 @@ export function Onboarding({
           return;
         }
         if (!currentAsrLanguageSupported) {
-          setEngineError(t("此模型要求固定使用中文或 English；自动语言检测不可用。请在录音设置中更改识别语言。"));
+          setEngineError(
+            asrProvider === "on_device" && asrModel === "cohere-transcribe-2b"
+              ? t("此模型要求固定使用中文或 English；自动语言检测不可用。请在录音设置中更改识别语言。")
+              : t("当前所选识别语言不受当前转写模型支持，请改选支持列表中的语言。"),
+          );
           setStep(2);
           return;
         }
@@ -759,7 +774,7 @@ export function Onboarding({
                 const provider = route === "local" ? "on_device" : savedAsrProvider(savedSettings) === "on_device" ? "groq" : savedAsrProvider(savedSettings);
                 const model = provider === savedSettings.asr_provider && savedSettings.asr_model ? savedSettings.asr_model : defaultModel(provider, "asr");
                 setCleanupIntent((current) => cleanupIntentForRoute(current, asrProvider, provider));
-                setAsrProvider(provider); setAsrModel(model); selectedOnDeviceModelIdRef.current = model; setValid(null); setKey(""); invalidateConfiguration();
+                setAsrProvider(provider); setAsrModel(model); selectedOnDeviceModelIdRef.current = model; setLanguage((current) => coerceLanguageForModel(provider, model, current)); setValid(null); setKey(""); invalidateConfiguration();
               }} onSettings={(page) => void leaveForSettings(page)} />}
               {step === 1 && (
                 <PermissionsStep
@@ -795,6 +810,7 @@ export function Onboarding({
                   onAsrModelChange={(value) => {
                     selectedOnDeviceModelIdRef.current = value;
                     setAsrModel(value);
+                    setLanguage((current) => coerceLanguageForModel(asrProviderRef.current, value, current));
                     invalidateConfiguration(); setValidating(false);
                     setValid(null);
                     setEngineError(null);
@@ -809,12 +825,15 @@ export function Onboarding({
                   keyHint={asrKeyHint}
                   configuredAsrKey={configuredAsrKey}
                   onAsrProviderChange={(value) => {
-                    setCleanupIntent((current) => cleanupIntentForRoute(current, asrProvider, value));
+                    const previousProvider = asrProviderRef.current;
+                    asrProviderRef.current = value;
+                    setCleanupIntent((current) => cleanupIntentForRoute(current, previousProvider, value));
                     setAsrProvider(value);
                     invalidateConfiguration(); setValidating(false);
                     const nextModel = defaultModel(value, "asr");
                     selectedOnDeviceModelIdRef.current = nextModel;
                     setAsrModel(nextModel);
+                    setLanguage((current) => coerceLanguageForModel(value, nextModel, current));
                     setValid(null);
                     setEngineError(null);
                     setKey("");
@@ -827,6 +846,7 @@ export function Onboarding({
                   onDeviceAction={(id, action) => void runOnDeviceAction(id, action)}
                   onRefreshOnDeviceModels={refreshOnDeviceModelsFromUi}
                   strictOfflineBlocked={strictOfflineBlocked}
+                  strictOfflineEnabled={strictOfflineEnabled}
                   keyValue={key}
                   onKeyChange={(value) => {
                     setKey(value);

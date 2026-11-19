@@ -1,0 +1,17 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "preview",
+  "description": "Capability for the selected-text and screen-action preview window.",
+  "windows": [
+    "preview"
+  ],
+  "permissions": [
+    "allow-get-action-preview-bootstrap",
+    "allow-confirm-selected-action-preview",
+    "allow-copy-selected-action-preview",
+    "allow-cancel-selected-action-preview",
+    "allow-confirm-screen-action-preview",
+    "allow-copy-screen-action-preview",
+    "allow-cancel-screen-action-preview"
+  ]
+}

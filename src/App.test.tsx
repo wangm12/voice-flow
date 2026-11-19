@@ -2,7 +2,6 @@ import { closeSelect, openSelect, selectOption } from "./test/selectOption";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
-import type { SelectedActionPreview, TextActionOutcome } from "./components/SelectedPreviewDialog";
 import type { HistoryItem } from "./components/History/History";
 import App, { recoveryDestinationView } from "./App";
 
@@ -24,27 +23,11 @@ describe("HUD and recovery destinations", () => {
     expect(recoveryDestinationView("general")).toBe("general");
     expect(recoveryDestinationView("engine")).toBe("engine");
     expect(recoveryDestinationView("permissions")).toBe("permissions");
+    expect(recoveryDestinationView("smart")).toBe("writing");
+    expect(recoveryDestinationView("writing")).toBe("writing");
     expect(recoveryDestinationView("../../history")).toBeNull();
   });
 });
-
-let selectedActionOutcome: TextActionOutcome = "replaced";
-const selectedPreviewPayload: SelectedActionPreview = {
-  transaction_id: "tx-selected-1",
-  action_sequence: 1,
-  kind: "selected",
-  operation: "rewrite",
-  target_kind: "selection",
-  target_label: "current_field",
-  source_text: "原文",
-  instruction: "请整理",
-  delivery_mode: "replace_or_copy",
-  delivery_notice: "copy_if_target_changed",
-  selected_text: "原文",
-  transcript: "请整理",
-  final_text: "整理后的文本",
-  replace_allowed: true,
-};
 
 const settings = {
   schema_version: 4,
@@ -91,7 +74,6 @@ function captureNativeEvents() {
 
 describe("settings navigation", () => {
   beforeEach(() => {
-    selectedActionOutcome = "replaced";
     listenMock.mockImplementation((_event: string, _handler: unknown) => Promise.resolve(vi.fn()));
     invokeMock.mockImplementation(async (command) => {
       if (command === "get_settings") return settings;
@@ -101,8 +83,6 @@ describe("settings navigation", () => {
       if (command === "get_context_mappings") return [];
       if (command === "get_context_override") return null;
       if (command === "get_available_applications") return [];
-      if (command === "confirm_selected_action_preview" || command === "confirm_screen_action_preview") return selectedActionOutcome;
-      if (command === "copy_selected_action_preview" || command === "copy_screen_action_preview") return "copied";
       return undefined;
     });
   });
@@ -116,11 +96,11 @@ describe("settings navigation", () => {
 
   it("keeps Prompt and snippet drafts when navigating away and back without saving", async () => {
     render(<App />);
-    fireEvent.click(await screen.findByRole("button", { name: "语气" }));
+    fireEvent.click(await screen.findByRole("button", { name: "写作与整理" }));
     fireEvent.click(screen.getByRole("button", { name: /编辑 Prompt/ }));
     fireEvent.change(screen.getByRole("textbox", { name: "语气 Prompt" }), { target: { value: "保留跨页面草稿" } });
     fireEvent.click(screen.getByRole("button", { name: "系统设置" }));
-    fireEvent.click(screen.getByRole("button", { name: "语气" }));
+    fireEvent.click(screen.getByRole("button", { name: "写作与整理" }));
     fireEvent.click(screen.getByRole("button", { name: /编辑 Prompt/ }));
     expect(screen.getByRole("textbox", { name: "语气 Prompt" })).toHaveValue("保留跨页面草稿");
     fireEvent.click(screen.getByRole("button", { name: "语音片段" }));
@@ -245,7 +225,8 @@ describe("settings navigation", () => {
 
     render(<App />);
     fireEvent.click(await screen.findByRole("button", { name: "API Key" }));
-    const readButton = await screen.findByRole("button", { name: "从钥匙串重新读取" });
+    const groqRow = document.querySelector<HTMLElement>('[data-provider="groq"]')!;
+    const readButton = await within(groqRow).findByRole("button", { name: "从钥匙串重新读取" });
     fireEvent.click(readButton);
     await waitFor(() => expect(invokeMock).toHaveBeenCalledWith(
       "read_provider_credential_from_keychain",
@@ -260,7 +241,8 @@ describe("settings navigation", () => {
     });
 
     fireEvent.click(screen.getByRole("button", { name: "API Key" }));
-    expect(await screen.findByRole("button", { name: "从钥匙串重新读取" })).toBeInTheDocument();
+    const returningGroqRow = document.querySelector<HTMLElement>('[data-provider="groq"]')!;
+    expect(await within(returningGroqRow).findByRole("button", { name: "从钥匙串重新读取" })).toBeInTheDocument();
     expect(invokeMock).toHaveBeenCalledWith("cancel_provider_credential_read", { requestId: request.requestId });
   });
 
@@ -397,15 +379,34 @@ describe("settings navigation", () => {
     expect(screen.getByText("自动粘贴")).toBeInTheDocument();
   });
 
-  it("splits smart formatting and tone into separate settings pages", async () => {
+  it("combines smart formatting and tone into one page while keeping legacy route aliases", async () => {
+    const base = invokeMock.getMockImplementation()!;
+    invokeMock.mockImplementation((command, args, options) => command === "get_settings"
+      ? Promise.resolve({
+        ...settings,
+        writing_modes: [...settings.writing_modes, {
+          id: "personal_chat",
+          label: "个人聊天",
+          family: "personal_chat",
+          prompt: "保留口语。",
+          builtin: true,
+        }],
+      })
+      : base(command, args, options));
     render(<App />);
 
-    fireEvent.click(await screen.findByRole("button", { name: "智能整理" }));
-    expect(await screen.findByRole("heading", { name: "智能整理" })).toBeInTheDocument();
-    expect(screen.queryByRole("heading", { name: "语气" })).not.toBeInTheDocument();
+    const navigation = await screen.findByRole("navigation", { name: "设置页面" });
+    expect(within(navigation).getAllByRole("button", { name: "写作与整理" })).toHaveLength(1);
+    expect(within(navigation).queryByRole("button", { name: "智能整理" })).not.toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: "语气" }));
-    expect(await screen.findByRole("heading", { name: "语气" })).toBeInTheDocument();
+    fireEvent.click(within(navigation).getByRole("button", { name: "写作与整理" }));
+    expect(await screen.findByRole("heading", { name: "写作与整理" })).toBeInTheDocument();
+    expect(screen.getByRole("combobox", { name: "输出模式" })).toHaveValue("auto");
+    expect(screen.getByRole("button", { name: "个人聊天" })).toHaveAttribute("aria-pressed", "false");
+    expect(screen.getByText("单次快捷键指令 → App 专属规则 → 场景语气卡 → 全局默认档位")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "个人聊天" }));
+    expect(screen.getByRole("button", { name: "个人聊天" })).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByText("App / 网站映射")).toBeInTheDocument();
   });
 
   it("shows and lets the user choose the input device in system settings", async () => {
@@ -496,27 +497,31 @@ describe("settings navigation", () => {
     expect(screen.getByRole("button", { name: "开始麦克风测试" })).toBeEnabled();
   });
 
-  it("puts automatic context and output formatting on the smart formatting page", async () => {
+  it("keeps automatic context, output formatting and writing modes on the merged page", async () => {
     render(<App />);
 
-    fireEvent.click(await screen.findByRole("button", { name: "智能整理" }));
+    fireEvent.click(await screen.findByRole("button", { name: "写作与整理" }));
 
-    await waitFor(() => expect(screen.getByRole("heading", { name: "智能整理" })).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByRole("heading", { name: "写作与整理" })).toBeInTheDocument());
     expect(screen.queryByRole("button", { name: "上下文" })).not.toBeInTheDocument();
     expect(screen.getByRole("combobox", { name: "输出模式" })).toHaveValue("auto");
+    const targetLanguage = screen.getByRole("combobox", { name: "翻译目标语言" });
+    expect(targetLanguage).toHaveValue("en");
+    selectOption(targetLanguage, "ja");
+    expect(screen.getByRole("combobox", { name: "输出模式" })).toHaveValue("auto");
     expect(screen.getByRole("switch", { name: "App 上下文适配" })).toBeInTheDocument();
-    expect(screen.queryByRole("textbox", { name: "语气 Prompt" })).not.toBeInTheDocument();
-    expect(screen.queryByText("App / 网站映射")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "个人聊天" })).toBeInTheDocument();
+    expect(screen.getByText("App / 网站映射")).toBeInTheDocument();
     expect(screen.getByText("自动根据当前 App、输入框和你说的内容选择整理方式；手动模式会覆盖自动判断。")).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: "语气" }));
-    expect(await screen.findByRole("heading", { name: "语气" })).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: /编辑 Prompt/ }));
     expect(screen.getByRole("textbox", { name: "语气 Prompt" })).toBeInTheDocument();
-    expect(screen.getByText("App / 网站映射")).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "录音与输出" }));
     await waitFor(() => expect(screen.getByRole("heading", { name: "录音与输出" })).toBeInTheDocument());
+    expect(screen.queryByRole("combobox", { name: "快捷翻译目标语言" })).not.toBeInTheDocument();
+    expect(screen.getByText(/翻译目标统一在“写作与整理”的输出模式中设置/)).toBeInTheDocument();
+
     expect(screen.queryByRole("combobox", { name: "输出模式" })).not.toBeInTheDocument();
   });
 
@@ -569,384 +574,11 @@ describe("settings navigation", () => {
     }));
   });
 
-  it("opens the selected-text preview dialog from the native event", async () => {
-    let previewHandler: ((event: { payload: SelectedActionPreview }) => void) | undefined;
-    listenMock.mockImplementation((event: string, handler: (event: { payload: SelectedActionPreview }) => void) => {
-      if (event === "selected-action://preview") previewHandler = handler;
-      return Promise.resolve(vi.fn());
-    });
-
-    render(<App />);
-    await waitFor(() => expect(previewHandler).toBeDefined());
-
-    previewHandler?.({ payload: selectedPreviewPayload });
-
-    expect(await screen.findByRole("dialog", { name: "文字操作预览" })).toBeInTheDocument();
-    expect(screen.getByRole("textbox", { name: "VoiceFlow 生成结果" })).toHaveValue("整理后的文本");
-  });
-
-  it("sends a manually edited preview with its transaction ID and reports the backend outcome", async () => {
-    let previewHandler: ((event: { payload: SelectedActionPreview }) => void) | undefined;
-    listenMock.mockImplementation((event: string, handler: (event: { payload: SelectedActionPreview }) => void) => {
-      if (event === "selected-action://preview") previewHandler = handler;
-      return Promise.resolve(vi.fn());
-    });
-
-    render(<App />);
-    await waitFor(() => expect(previewHandler).toBeDefined());
-    previewHandler?.({ payload: selectedPreviewPayload });
-
-    fireEvent.change(await screen.findByRole("textbox", { name: "VoiceFlow 生成结果" }), {
-      target: { value: "我手动修订后的内容" },
-    });
-    fireEvent.click(screen.getByRole("button", { name: "确认" }));
-    fireEvent.click(screen.getByRole("button", { name: "确认" }));
-
-    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("confirm_selected_action_preview", {
-      transaction_id: "tx-selected-1",
-      final_text: "我手动修订后的内容",
-    }));
-    expect(invokeMock.mock.calls.filter(([command]) => command === "confirm_selected_action_preview")).toHaveLength(1);
-    expect(await screen.findByRole("status")).toHaveTextContent("结果已替换并验证");
-    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
-  });
-
-  it("copies explicitly and prevents a late preview event from reviving a canceled transaction", async () => {
-    let previewHandler: ((event: { payload: SelectedActionPreview }) => void) | undefined;
-    listenMock.mockImplementation((event: string, handler: (event: { payload: SelectedActionPreview }) => void) => {
-      if (event === "selected-action://preview") previewHandler = handler;
-      return Promise.resolve(vi.fn());
-    });
-
-    render(<App />);
-    await waitFor(() => expect(previewHandler).toBeDefined());
-    previewHandler?.({ payload: selectedPreviewPayload });
-    fireEvent.click(await screen.findByRole("button", { name: "只复制" }));
-    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("copy_selected_action_preview", {
-      transaction_id: "tx-selected-1",
-      final_text: "整理后的文本",
-    }));
-    expect(await screen.findByRole("status")).toHaveTextContent("结果已复制");
-
-    previewHandler?.({ payload: selectedPreviewPayload });
-    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
-  });
-
-  it("cancels only the displayed transaction and suppresses its late preview event", async () => {
-    let previewHandler: ((event: { payload: SelectedActionPreview }) => void) | undefined;
-    listenMock.mockImplementation((event: string, handler: (event: { payload: SelectedActionPreview }) => void) => {
-      if (event === "selected-action://preview") previewHandler = handler;
-      return Promise.resolve(vi.fn());
-    });
-
-    render(<App />);
-    await waitFor(() => expect(previewHandler).toBeDefined());
-    previewHandler?.({ payload: selectedPreviewPayload });
-    fireEvent.click(await screen.findByRole("button", { name: "取消" }));
-
-    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("cancel_selected_action_preview", {
-      transaction_id: "tx-selected-1",
-    }));
-    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
-    previewHandler?.({ payload: selectedPreviewPayload });
-    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
-  });
-
-  it("reports an unconfirmed cancellation without reopening the preview or leaking native errors", async () => {
-    const base = invokeMock.getMockImplementation()!;
-    let rejectCancellation: (() => void) | undefined;
-    invokeMock.mockImplementation((command, args, options) => {
-      if (command === "cancel_selected_action_preview") {
-        return new Promise((_resolve, reject) => { rejectCancellation = () => reject(new Error("private native error")); });
-      }
-      return base(command, args, options);
-    });
-    const events = captureNativeEvents();
-    render(<App />);
-    await waitFor(() => expect(events.has("selected-action://preview")).toBe(true));
-    events.emit("selected-action://preview", selectedPreviewPayload);
-    const cancelButton = await screen.findByRole("button", { name: "取消" });
-
-    await act(async () => {
-      fireEvent.click(cancelButton);
-      fireEvent.click(cancelButton);
-    });
-    await waitFor(() => expect(rejectCancellation).toBeDefined());
-    await act(async () => rejectCancellation?.());
-
-    expect(await screen.findByRole("alert")).toHaveTextContent("无法确认取消，请等待当前操作结束。");
-    expect(screen.queryByText("private native error")).not.toBeInTheDocument();
-    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
-    expect(invokeMock.mock.calls.filter(([command]) => command === "cancel_selected_action_preview")).toHaveLength(1);
-    events.emit("selected-action://preview", selectedPreviewPayload);
-    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
-  });
-
-  it("clears an unconfirmed-cancel notice when that transaction later becomes terminal", async () => {
-    const base = invokeMock.getMockImplementation()!;
-    invokeMock.mockImplementation((command, args, options) => command === "cancel_selected_action_preview"
-      ? Promise.reject(new Error("private native error"))
-      : base(command, args, options));
-    const events = captureNativeEvents();
-    render(<App />);
-    await waitFor(() => expect(events.has("selected-action://preview")).toBe(true));
-    events.emit("selected-action://preview", selectedPreviewPayload);
-    fireEvent.click(await screen.findByRole("button", { name: "取消" }));
-    expect(await screen.findByText("无法确认取消，请等待当前操作结束。")).toBeVisible();
-
-    events.emit("selected-action://lifecycle", {
-      action_sequence: 1,
-      transaction_id: "tx-selected-1",
-      state: "cancelled",
-    });
-    await waitFor(() => expect(screen.queryByText("无法确认取消，请等待当前操作结束。")).not.toBeInTheDocument());
-    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
-  });
-
-  it("does not show a stale cancellation rejection over a newer preview", async () => {
-    const base = invokeMock.getMockImplementation()!;
-    let rejectCancellation: (() => void) | undefined;
-    invokeMock.mockImplementation((command, args, options) => {
-      if (command === "cancel_selected_action_preview") {
-        return new Promise((_resolve, reject) => { rejectCancellation = () => reject(new Error("private native error")); });
-      }
-      return base(command, args, options);
-    });
-    const events = captureNativeEvents();
-    render(<App />);
-    await waitFor(() => expect(events.has("selected-action://preview")).toBe(true));
-    events.emit("selected-action://preview", selectedPreviewPayload);
-    fireEvent.click(await screen.findByRole("button", { name: "取消" }));
-    await waitFor(() => expect(rejectCancellation).toBeDefined());
-
-    const nextPreview: SelectedActionPreview = {
-      ...selectedPreviewPayload,
-      transaction_id: "tx-selected-2",
-      action_sequence: 2,
-      final_text: "下一条预览",
-    };
-    events.emit("selected-action://lifecycle", {
-      action_sequence: 2,
-      transaction_id: "tx-selected-2",
-      state: "started",
-    });
-    events.emit("selected-action://preview", nextPreview);
-    expect(await screen.findByRole("dialog")).toBeInTheDocument();
-
-    await act(async () => rejectCancellation?.());
-    expect(screen.getByRole("dialog")).toBeInTheDocument();
-    expect(screen.getByRole("textbox", { name: "VoiceFlow 生成结果" })).toHaveValue("下一条预览");
-    expect(screen.queryByText("无法确认取消，请等待当前操作结束。")).not.toBeInTheDocument();
-  });
-
-  it("does not report cancellation failure after the same transaction reaches a terminal lifecycle state", async () => {
-    const base = invokeMock.getMockImplementation()!;
-    let rejectCancellation: (() => void) | undefined;
-    invokeMock.mockImplementation((command, args, options) => {
-      if (command === "cancel_selected_action_preview") {
-        return new Promise((_resolve, reject) => { rejectCancellation = () => reject(new Error("late cancellation reply")); });
-      }
-      return base(command, args, options);
-    });
-    const events = captureNativeEvents();
-    render(<App />);
-    await waitFor(() => expect(events.has("selected-action://preview")).toBe(true));
-    events.emit("selected-action://preview", selectedPreviewPayload);
-    fireEvent.click(await screen.findByRole("button", { name: "取消" }));
-    await waitFor(() => expect(rejectCancellation).toBeDefined());
-
-    events.emit("selected-action://lifecycle", {
-      action_sequence: 1,
-      transaction_id: "tx-selected-1",
-      state: "completed",
-    });
-    await act(async () => rejectCancellation?.());
-
-    expect(screen.queryByText("无法确认取消，请等待当前操作结束。")).not.toBeInTheDocument();
-    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
-  });
-
-  it("cancels the matching selected preview while confirmation is unresolved and does not replay its late reply", async () => {
-    const base = invokeMock.getMockImplementation()!;
-    let finishConfirmation: ((outcome: TextActionOutcome) => void) | undefined;
-    invokeMock.mockImplementation((command, args, options) => {
-      if (command === "confirm_selected_action_preview") {
-        return new Promise<TextActionOutcome>((resolve) => { finishConfirmation = resolve; });
-      }
-      if (command === "cancel_selected_action_preview") return Promise.reject(new Error("private native cancellation failure"));
-      return base(command, args, options);
-    });
-    const events = captureNativeEvents();
-    render(<App />);
-    await waitFor(() => expect(events.has("selected-action://preview")).toBe(true));
-    events.emit("selected-action://preview", selectedPreviewPayload);
-    fireEvent.click(await screen.findByRole("button", { name: "确认" }));
-    await waitFor(() => expect(finishConfirmation).toBeDefined());
-    fireEvent.click(screen.getByRole("button", { name: "取消" }));
-
-    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("cancel_selected_action_preview", {
-      transaction_id: "tx-selected-1",
-    }));
-    expect(invokeMock.mock.calls.filter(([command]) => command === "confirm_selected_action_preview")).toHaveLength(1);
-    expect(invokeMock.mock.calls.filter(([command]) => command === "cancel_selected_action_preview")).toHaveLength(1);
-    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
-    expect(await screen.findByText("无法确认取消，请等待当前操作结束。")).toBeVisible();
-
-    await act(async () => finishConfirmation?.("replaced"));
-    expect(await screen.findByText("结果已替换并验证")).toBeVisible();
-    expect(screen.queryByText("无法确认取消，请等待当前操作结束。")).not.toBeInTheDocument();
-    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
-    expect(screen.getAllByText("结果已替换并验证")).toHaveLength(1);
-    events.emit("selected-action://preview", selectedPreviewPayload);
-    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
-    expect(invokeMock.mock.calls.filter(([command]) => command === "confirm_selected_action_preview")).toHaveLength(1);
-  });
-
-  it("keeps a canceled selected confirmation closed when the backend rejects its pending reply", async () => {
-    const base = invokeMock.getMockImplementation()!;
-    let rejectConfirmation: (() => void) | undefined;
-    invokeMock.mockImplementation((command, args, options) => {
-      if (command === "confirm_selected_action_preview") {
-        return new Promise((_resolve, reject) => { rejectConfirmation = () => reject(new Error("preview_cancelled")); });
-      }
-      return base(command, args, options);
-    });
-    const events = captureNativeEvents();
-    render(<App />);
-    await waitFor(() => expect(events.has("selected-action://preview")).toBe(true));
-    events.emit("selected-action://preview", selectedPreviewPayload);
-    fireEvent.click(await screen.findByRole("button", { name: "确认" }));
-    await waitFor(() => expect(rejectConfirmation).toBeDefined());
-    fireEvent.click(screen.getByRole("button", { name: "取消" }));
-
-    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("cancel_selected_action_preview", {
-      transaction_id: "tx-selected-1",
-    }));
-    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
-    await act(async () => rejectConfirmation?.());
-    events.emit("selected-action://preview", selectedPreviewPayload);
-    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
-    expect(screen.queryByText("结果已替换并验证")).not.toBeInTheDocument();
-    expect(invokeMock.mock.calls.filter(([command]) => command === "confirm_selected_action_preview")).toHaveLength(1);
-    expect(invokeMock.mock.calls.filter(([command]) => command === "cancel_selected_action_preview")).toHaveLength(1);
-  });
-
-  it("routes cancellation to a screen transaction while screen copy is unresolved", async () => {
-    const base = invokeMock.getMockImplementation()!;
-    let finishCopy: (() => void) | undefined;
-    invokeMock.mockImplementation((command, args, options) => {
-      if (command === "copy_screen_action_preview") {
-        return new Promise((_resolve, reject) => { finishCopy = () => reject(new Error("preview_cancelled")); });
-      }
-      return base(command, args, options);
-    });
-    const events = captureNativeEvents();
-    const screenPreview: SelectedActionPreview = {
-      ...selectedPreviewPayload,
-      transaction_id: "tx-screen-1",
-      kind: "screen",
-      operation: "screen_assist",
-      target_kind: "screen",
-      target_label: "captured_screen",
-      source_text: "",
-      selected_text: "",
-      delivery_mode: "clipboard_only",
-      delivery_notice: "clipboard_only",
-      replace_allowed: false,
-    };
-    render(<App />);
-    await waitFor(() => expect(events.has("selected-action://preview")).toBe(true));
-    events.emit("selected-action://preview", screenPreview);
-    fireEvent.click(await screen.findByRole("button", { name: "只复制" }));
-    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("copy_screen_action_preview", {
-      transaction_id: "tx-screen-1",
-      final_text: screenPreview.final_text,
-    }));
-    expect(finishCopy).toBeDefined();
-    fireEvent.click(screen.getByRole("button", { name: "取消" }));
-
-    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("cancel_screen_action_preview", {
-      transaction_id: "tx-screen-1",
-    }));
-    expect(invokeMock.mock.calls.filter(([command]) => command === "copy_screen_action_preview")).toHaveLength(1);
-    expect(invokeMock.mock.calls.filter(([command]) => command === "cancel_screen_action_preview")).toHaveLength(1);
-    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
-
-    await act(async () => finishCopy?.());
-    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
-    expect(screen.queryByText("结果已复制")).not.toBeInTheDocument();
-    expect(screen.queryByText("preview_cancelled")).not.toBeInTheDocument();
-    events.emit("selected-action://preview", screenPreview);
-    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
-    expect(invokeMock.mock.calls.filter(([command]) => command === "copy_screen_action_preview")).toHaveLength(1);
-  });
-
-  it("orders previews by action sequence and tombstones a terminal same-sequence preview", async () => {
-    const events = captureNativeEvents();
-    render(<App />);
-    await waitFor(() => {
-      expect(events.has("selected-action://preview")).toBe(true);
-      expect(events.has("selected-action://lifecycle")).toBe(true);
-    });
-
-    events.emit("selected-action://preview", selectedPreviewPayload);
-    expect(await screen.findByRole("dialog", { name: "文字操作预览" })).toBeInTheDocument();
-    const latestPreview = {
-      ...selectedPreviewPayload,
-      transaction_id: "tx-selected-2",
-      action_sequence: 2,
-      final_text: "最新结果",
-    };
-    events.emit("selected-action://lifecycle", {
-      action_sequence: 2,
-      transaction_id: "tx-selected-2",
-      state: "started",
-    });
-    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
-    events.emit("selected-action://preview", selectedPreviewPayload);
-    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
-
-    events.emit("selected-action://preview", latestPreview);
-    expect(await screen.findByRole("dialog", { name: "文字操作预览" })).toBeInTheDocument();
-    expect(screen.getByRole("textbox", { name: "VoiceFlow 生成结果" })).toHaveValue("最新结果");
-    events.emit("selected-action://lifecycle", {
-      action_sequence: 1,
-      transaction_id: "tx-selected-1",
-      state: "cancelled",
-    });
-    expect(screen.getByRole("dialog")).toBeInTheDocument();
-
-    events.emit("selected-action://lifecycle", {
-      action_sequence: 2,
-      transaction_id: "tx-selected-2",
-      state: "completed",
-    });
-    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
-    events.emit("selected-action://preview", latestPreview);
-    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
-  });
-
-  it("cancels a matching sequence terminally so its late preview cannot reopen", async () => {
-    const events = captureNativeEvents();
-    render(<App />);
-    await waitFor(() => expect(events.has("selected-action://preview")).toBe(true));
-    events.emit("selected-action://preview", selectedPreviewPayload);
-    expect(await screen.findByRole("dialog", { name: "文字操作预览" })).toBeInTheDocument();
-
-    events.emit("selected-action://lifecycle", {
-      action_sequence: 1,
-      transaction_id: "tx-selected-1",
-      state: "cancelled",
-    });
-    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
-    events.emit("selected-action://preview", selectedPreviewPayload);
-    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
-  });
-
-  it("localizes only the safe action error code and blocks its late preview", async () => {
+  it("localizes safe action errors without attaching a main-window preview listener", async () => {
     const events = captureNativeEvents();
     render(<App />);
     await waitFor(() => expect(events.has("selected-action://error")).toBe(true));
+    expect(events.has("selected-action://preview")).toBe(false);
     events.emit("selected-action://error", {
       action_sequence: 3,
       transaction_id: "tx-denied",
@@ -962,11 +594,6 @@ describe("settings navigation", () => {
       state: "failed",
     });
     expect(screen.getByRole("alert")).toHaveTextContent("缺少执行此操作所需的权限。");
-    events.emit("selected-action://preview", {
-      ...selectedPreviewPayload,
-      transaction_id: "tx-denied",
-      action_sequence: 3,
-    });
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
   });
 
@@ -987,23 +614,6 @@ describe("settings navigation", () => {
       code: "provider_failed",
     });
     expect(screen.getByRole("alert")).toHaveTextContent("文字服务暂时无法完成操作。");
-  });
-
-  it("reports an unverified backend completion without claiming replacement", async () => {
-    selectedActionOutcome = "unverified";
-    let previewHandler: ((event: { payload: SelectedActionPreview }) => void) | undefined;
-    listenMock.mockImplementation((event: string, handler: (event: { payload: SelectedActionPreview }) => void) => {
-      if (event === "selected-action://preview") previewHandler = handler;
-      return Promise.resolve(vi.fn());
-    });
-
-    render(<App />);
-    await waitFor(() => expect(previewHandler).toBeDefined());
-    previewHandler?.({ payload: selectedPreviewPayload });
-    fireEvent.click(await screen.findByRole("button", { name: "确认" }));
-
-    await waitFor(() => expect(screen.getByRole("status")).toHaveTextContent("结果未能验证，请检查目标。"));
-    expect(screen.queryByText("结果已替换并验证")).not.toBeInTheDocument();
   });
 
   it("refreshes dictionary when backend settings change", async () => {
@@ -1064,9 +674,9 @@ describe("settings navigation", () => {
     const recordingMode = await screen.findByRole("combobox", { name: "录音方式" });
     expect(recordingMode).toHaveTextContent("点按切换");
     selectOption(recordingMode, "hold_to_talk");
-    expect(invokeMock).toHaveBeenCalledWith("update_settings_patch", { patch: { activation_mode: "hold_to_talk" } });
-    expect(recordingMode).toHaveTextContent("点按切换");
-    expect(recordingMode).toBeDisabled();
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("update_settings_patch", { patch: { activation_mode: "hold_to_talk" } }));
+    expect(recordingMode).toHaveTextContent("按住说话");
     await act(async () => acknowledge());
     await waitFor(() => expect(recordingMode).toHaveTextContent("按住说话"));
     expect(recordingMode).toBeEnabled();

@@ -1400,10 +1400,14 @@ describe("EngineSettings form", () => {
     expect(within(modelsPanel()).getByText("本机 MLX 模型操作失败，请重试。")).toHaveAttribute("role", "alert");
   });
 
-  it("keeps model-status polling alive after a transient read failure and exposes recovery", async () => {
+  it("does not poll active model status on timers and recovers from read failures via local-models://status or manual refresh", async () => {
     vi.useFakeTimers();
-    let statusReads = 0;
-    const status = {
+    let storeReads = 0;
+    let onDeviceReads = 0;
+    let mlxReads = 0;
+    let ggufReads = 0;
+    let unifiedStatusListener: ((event: { payload: unknown }) => void) | null = null;
+    const activeStoreStatus = {
       id: "qwen3_8_27b_mlx_6bit",
       label: "Qwen 3.8 27B · MLX 6-bit",
       repository: "lmstudio-community/Qwen3.8-27B-MLX-6bit",
@@ -1420,36 +1424,109 @@ describe("EngineSettings form", () => {
       partial_managed: false,
       platform_supported: true,
     };
+    const readyStoreStatus = {
+      ...activeStoreStatus,
+      state: "ready",
+      operation: null,
+      bytes_done: 22_804_836_386,
+      managed: true,
+    };
+
+    vi.mocked(listen).mockImplementation(async (event, handler) => {
+      if (event === "local-models://status") {
+        unifiedStatusListener = handler as (event: { payload: unknown }) => void;
+      }
+      return () => undefined;
+    });
     vi.mocked(invoke).mockImplementation(async (command) => {
-      if (command === "list_on_device_models") return [];
+      if (command === "list_on_device_models") {
+        onDeviceReads += 1;
+        return [{
+          id: "qwen3-asr-0.6b",
+          label: "Qwen3 ASR 0.6B",
+          state: "ready",
+          inference_ready: false,
+          platform_supported: true,
+          runtime_status: "loading",
+          loaded: false,
+          downloaded_bytes: 100,
+          bytes: 100,
+          download_available: true,
+        }];
+      }
+      if (command === "list_mlx_cleanup_models") {
+        mlxReads += 1;
+        return mlxCleanupModels([{ state: "downloading", operation: "download", bytes_done: 10 }]);
+      }
+      if (command === "list_local_cleanup_models") {
+        ggufReads += 1;
+        return localCleanupModels([{ state: "downloading", operation: "download", bytes_done: 10 }]);
+      }
       if (command === "get_cleanup_model_store_status") {
-        statusReads += 1;
-        if (statusReads === 2) throw new Error("status read failed");
-        return status;
+        storeReads += 1;
+        if (storeReads === 1) throw new Error("status read failed");
+        return activeStoreStatus;
       }
       return undefined;
     });
-    renderEngine();
-    activatePage("本地模型");
-    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
-    expect(statusReads).toBe(1);
-    expect(within(modelsPanel()).getByRole("button", { name: "取消模型操作" })).toBeEnabled();
-    expect(within(modelsPanel()).queryByRole("button", { name: "刷新模型状态" })).not.toBeInTheDocument();
 
-    await act(async () => {
-      vi.advanceTimersByTime(900);
-      await Promise.resolve();
-      await Promise.resolve();
-    });
-    expect(statusReads).toBe(2);
-    expect(within(modelsPanel()).getByRole("button", { name: "刷新模型状态" })).toBeEnabled();
-    expect(within(modelsPanel()).getByRole("button", { name: "取消模型操作" })).toBeEnabled();
+    try {
+      renderEngine();
+      activatePage("本地模型");
+      await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+      expect(storeReads).toBe(1);
+      expect(onDeviceReads).toBe(1);
+      expect(mlxReads).toBe(1);
+      expect(ggufReads).toBe(1);
+      expect(within(modelsPanel()).getByText("无法读取 VoiceFlow 本机 MLX 模型状态，请重试。")).toBeVisible();
+      expect(within(modelsPanel()).getByRole("button", { name: "刷新模型状态" })).toBeEnabled();
 
-    fireEvent.click(within(modelsPanel()).getByRole("button", { name: "刷新模型状态" }));
-    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
-    expect(statusReads).toBe(3);
-    expect(within(modelsPanel()).queryByRole("button", { name: "刷新模型状态" })).not.toBeInTheDocument();
-    expect(within(modelsPanel()).getByRole("button", { name: "取消模型操作" })).toBeEnabled();
+      // Active operations must rely on backend push events instead of periodic polling.
+      await act(async () => {
+        vi.advanceTimersByTime(3000);
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      expect(storeReads).toBe(1);
+      expect(onDeviceReads).toBe(1);
+      expect(mlxReads).toBe(1);
+      expect(ggufReads).toBe(1);
+
+      expect(unifiedStatusListener).not.toBeNull();
+      act(() => {
+        unifiedStatusListener?.({ payload: { domain: "cleanup_store", status: activeStoreStatus } });
+      });
+      expect(within(modelsPanel()).queryByText("无法读取 VoiceFlow 本机 MLX 模型状态，请重试。")).not.toBeInTheDocument();
+      expect(within(modelsPanel()).queryByRole("button", { name: "刷新模型状态" })).not.toBeInTheDocument();
+      expect(within(modelsPanel()).getByRole("button", { name: "取消模型操作" })).toBeEnabled();
+
+      await act(async () => {
+        vi.advanceTimersByTime(3000);
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      expect(storeReads).toBe(1);
+
+      act(() => {
+        unifiedStatusListener?.({ payload: { domain: "cleanup_store", status: readyStoreStatus } });
+      });
+      expect(within(modelsPanel()).getByRole("button", { name: "删除模型: Qwen 3.8 27B" })).toBeEnabled();
+
+      // Confirm manual refresh works when cleanup store fails after an operation/read error.
+      act(() => {
+        unifiedStatusListener?.({
+          payload: {
+            domain: "cleanup_store",
+            status: { ...readyStoreStatus, platform_supported: null },
+          },
+        });
+      });
+      fireEvent.click(within(modelsPanel()).getByRole("button", { name: "刷新模型状态" }));
+      await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+      expect(storeReads).toBe(2);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it.each([
@@ -1695,7 +1772,8 @@ describe("EngineSettings form", () => {
       { readProviderCredential, cancelProviderCredentialRead },
     );
     activatePage("API Key", { expandCredentialRows: false });
-    const action = screen.getByRole("button", { name: "从钥匙串重新读取" });
+    const groqRow = document.querySelector<HTMLElement>('[data-provider="groq"]')!;
+    const action = within(groqRow).getByRole("button", { name: "从钥匙串重新读取" });
 
     fireEvent.click(action);
     await waitFor(() => expect(readProviderCredential).toHaveBeenCalledTimes(1));
@@ -1718,7 +1796,8 @@ describe("EngineSettings form", () => {
       { readProviderCredential, cancelProviderCredentialRead },
     );
     activatePage("API Key");
-    fireEvent.click(screen.getByRole("button", { name: "从钥匙串重新读取" }));
+    const groqRow = document.querySelector<HTMLElement>('[data-provider="groq"]')!;
+    fireEvent.click(within(groqRow).getByRole("button", { name: "从钥匙串重新读取" }));
     await waitFor(() => expect(readProviderCredential).toHaveBeenCalledTimes(1));
     const requestId = readProviderCredential.mock.calls[0][1];
 
@@ -1726,8 +1805,8 @@ describe("EngineSettings form", () => {
     selectOption(screen.getByRole("combobox", { name: "转写服务" }), "assemblyai");
 
     await waitFor(() => expect(cancelProviderCredentialRead).toHaveBeenCalledWith(requestId));
-    const groqRow = document.querySelector<HTMLElement>('[data-provider="groq"]')!;
-    expect(await within(groqRow).findByText("离开 API Key 页面后，读取请求已取消；请重新发起读取。")).toBeInTheDocument();
+    const returningGroqRow = document.querySelector<HTMLElement>('[data-provider="groq"]')!;
+    expect(await within(returningGroqRow).findByText("离开 API Key 页面后，读取请求已取消；请重新发起读取。")).toBeInTheDocument();
   });
 
   it("keeps an unchecked Groq credential neutral until Keychain confirms it is missing", async () => {
@@ -1791,11 +1870,65 @@ describe("EngineSettings form", () => {
       { readProviderCredential },
     );
     activatePage("API Key");
-
-    fireEvent.click(screen.getByRole("button", { name: "从钥匙串重新读取" }));
     const groqRow = document.querySelector<HTMLElement>('[data-provider="groq"]')!;
+    fireEvent.click(within(groqRow).getByRole("button", { name: "从钥匙串重新读取" }));
     expect(await within(groqRow).findByText("钥匙串密钥已在本次打开期间读取；重启后可能需要再次授权。")).toBeInTheDocument();
     expect(screen.queryByText(/session-key|gsk_/i)).not.toBeInTheDocument();
+  });
+
+  it("offers a foreground Keychain reread for required cloud providers without exposing the key", async () => {
+    const readProviderCredential = vi.fn().mockResolvedValue({
+      status: "session_configured",
+      settings: null,
+    });
+    renderEngine({
+      asr_provider: "openai",
+      cleanup_enabled: false,
+      provider_keys: { openai: { configured: false, keychain_state: "missing" } },
+    }, { readProviderCredential });
+    activatePage("API Key", { expandCredentialRows: false });
+    const row = document.querySelector<HTMLElement>('[data-provider="openai"]')!;
+    const action = within(row).getByRole("button", { name: "从钥匙串重新读取" });
+    fireEvent.click(action);
+
+    await waitFor(() => expect(readProviderCredential).toHaveBeenCalledTimes(1));
+    const requestId = readProviderCredential.mock.calls[0][1];
+    expect(readProviderCredential).toHaveBeenCalledWith("openai", requestId);
+    expect(await within(row).findByRole("status")).toHaveTextContent(
+      "服务商密钥已在本次打开期间读取；重启后可能需要再次授权。",
+    );
+    expect(document.body).not.toHaveTextContent("synthetic-session-only-key");
+  });
+
+  it("keeps a pending Keychain read through a brief window blur and cancels after the grace", async () => {
+    vi.useFakeTimers();
+    const readProviderCredential = vi.fn((_provider: string, _requestId: string) =>
+      new Promise<{ status: "cancelled"; settings: null }>(() => undefined));
+    const cancelProviderCredentialRead = vi.fn().mockResolvedValue(true);
+    renderEngine(
+      { api_key_configured: false, api_key_hint: null, provider_keys: {} },
+      { readProviderCredential, cancelProviderCredentialRead },
+    );
+    activatePage("API Key");
+    const groqRow = document.querySelector<HTMLElement>('[data-provider="groq"]')!;
+    fireEvent.click(within(groqRow).getByRole("button", { name: "从钥匙串重新读取" }));
+    expect(readProviderCredential).toHaveBeenCalledTimes(1);
+    const requestId = readProviderCredential.mock.calls[0][1];
+    vi.spyOn(document, "hasFocus").mockReturnValue(false);
+
+    fireEvent.blur(window);
+    await act(async () => { await vi.advanceTimersByTimeAsync(9_000); });
+    expect(cancelProviderCredentialRead).not.toHaveBeenCalled();
+    fireEvent.focus(window);
+    await act(async () => { await vi.advanceTimersByTimeAsync(2_000); });
+    expect(cancelProviderCredentialRead).not.toHaveBeenCalled();
+
+    fireEvent.blur(window);
+    await act(async () => { await vi.advanceTimersByTimeAsync(10_000); });
+    expect(cancelProviderCredentialRead).toHaveBeenCalledWith(requestId);
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "钥匙串读取超时；当前设置未更改。",
+    );
   });
 
   it("offers a Custom reread for an unavailable saved route and keeps the credential out of UI text", async () => {
@@ -1874,8 +2007,8 @@ describe("EngineSettings form", () => {
       { readProviderCredential },
     );
     activatePage("API Key");
-    fireEvent.click(screen.getByRole("button", { name: "从钥匙串重新读取" }));
     const groqRow = document.querySelector<HTMLElement>('[data-provider="groq"]')!;
+    fireEvent.click(within(groqRow).getByRole("button", { name: "从钥匙串重新读取" }));
     expect(await within(groqRow).findByText("已取消钥匙串授权；当前设置未更改。")).toBeInTheDocument();
     expect(within(groqRow).getByText("待确认")).toBeInTheDocument();
     expect(within(groqRow).queryByText(/已保存|可持久使用/)).not.toBeInTheDocument();
@@ -1916,19 +2049,216 @@ describe("EngineSettings form", () => {
     expect(within(row!).queryByText("The official model card declares Apache-2.0; the license for this fixed MLX conversion remains unreviewed.")).not.toBeInTheDocument();
   });
 
-  it("offers Qwen3-ASR 1.7B for download and hides retired local models with no files", async () => {
+  it("discloses unreviewed conversion-artifact licensing on qwen3-asr-1.7b while keeping download and selection enabled", async () => {
+    vi.mocked(invoke).mockImplementation(async (command) => command === "list_on_device_models" ? [
+      {
+        id: "qwen3-asr-1.7b",
+        label: "Qwen3 ASR 1.7B",
+        state: "missing",
+        inference_ready: false,
+        platform_supported: true,
+        runtime_status: "runtime_ready",
+        loaded: false,
+        downloaded_bytes: 0,
+        bytes: 1_900_000_000,
+        download_available: true,
+        license_unreviewed: true,
+      },
+    ] : undefined);
+    const view = renderEngine({ asr_provider: "on_device", asr_model: "qwen3-asr-0.6b" });
+    activatePage("本地模型");
+    await within(modelsPanel()).findByText("Qwen3 ASR 1.7B");
+    let row = within(modelsPanel()).getByText("Qwen3 ASR 1.7B").closest<HTMLElement>("[data-model-row]");
+    expect(row).not.toBeNull();
+    expect(within(row!).getByText("转换权重仓库许可尚未完成审查，详见第三方许可说明。")).toBeVisible();
+    expect(within(row!).getByRole("button", { name: "下载模型" })).toBeEnabled();
+
+    view.unmount();
+    vi.mocked(invoke).mockImplementation(async (command) => {
+      if (command === "list_on_device_models") {
+        return [{
+          id: "qwen3-asr-1.7b",
+          label: "Qwen3 ASR 1.7B",
+          state: "ready",
+          inference_ready: true,
+          platform_supported: true,
+          runtime_status: "runtime_ready",
+          loaded: false,
+          downloaded_bytes: 1_900_000_000,
+          bytes: 1_900_000_000,
+          download_available: true,
+          license_unreviewed: true,
+        }];
+      }
+      if (command === "get_on_device_memory_budget") {
+        return { budget_percent: 80, physical_memory_bytes: 64 * 1024 ** 3, budget_bytes: 50 * 1024 ** 3 };
+      }
+      return undefined;
+    });
+    renderEngine({ asr_provider: "on_device", asr_model: "qwen3-asr-0.6b" });
+    activatePage("本地模型");
+    await within(modelsPanel()).findByText("Qwen3 ASR 1.7B");
+    row = within(modelsPanel()).getByText("Qwen3 ASR 1.7B").closest<HTMLElement>("[data-model-row]");
+    expect(row).not.toBeNull();
+    expect(within(row!).getByText("转换权重仓库许可尚未完成审查，详见第三方许可说明。")).toBeVisible();
+    expect(within(row!).getByRole("button", { name: "设为当前使用模型" })).toBeEnabled();
+  });
+
+  it("shows local ASR architecture and size characteristics and hides retired models with no files", async () => {
     vi.mocked(invoke).mockImplementation(async (command) => command === "list_on_device_models" ? [
       { id: "qwen3-asr-0.6b", label: "Qwen3 ASR 0.6B", state: "ready", inference_ready: true, platform_supported: true, runtime_status: "runtime_ready", loaded: false, downloaded_bytes: 100, bytes: 100 },
       { id: "qwen3-asr-1.7b", label: "Qwen3 ASR 1.7B", state: "missing", inference_ready: false, platform_supported: true, runtime_status: "runtime_ready", loaded: false, downloaded_bytes: 0, bytes: 100, download_available: true },
+      { id: "parakeet-tdt-0.6b-v3-8bit", label: "Parakeet TDT v3", state: "missing", inference_ready: false, platform_supported: true, runtime_status: "runtime_ready", loaded: false, downloaded_bytes: 0, bytes: 100, download_available: true },
+      { id: "firered-asr2-aed-mlx", label: "FireRedASR2-AED", state: "missing", inference_ready: false, platform_supported: true, runtime_status: "runtime_ready", loaded: false, downloaded_bytes: 0, bytes: 100, download_available: true },
+      { id: "fun-asr-nano-2512-mlx", label: "Fun-ASR-Nano 2512", state: "missing", inference_ready: false, platform_supported: true, runtime_status: "runtime_ready", loaded: false, downloaded_bytes: 0, bytes: 100, download_available: true },
       { id: "cohere-transcribe-2b", label: "Cohere Transcribe 2B", state: "missing", inference_ready: false, platform_supported: true, runtime_status: "runtime_ready", loaded: false, downloaded_bytes: 0, bytes: 100, download_available: false },
     ] : undefined);
-    renderEngine({ asr_provider: "on_device", asr_model: "qwen3-asr-0.6b" }, {}, "en");
-    activatePage("Local models");
+    renderEngine({ asr_provider: "on_device", asr_model: "qwen3-asr-0.6b" });
+    activatePage("本地模型");
     await within(modelsPanel()).findByText("Qwen3 ASR 0.6B");
+    const qwen06 = within(modelsPanel()).getByText("Qwen3 ASR 0.6B").closest<HTMLElement>("[data-model-row]")!;
     const qwen17 = within(modelsPanel()).getByText("Qwen3 ASR 1.7B").closest<HTMLElement>("[data-model-row]")!;
-    expect(within(qwen17).getByRole("button", { name: "Download model" })).toBeEnabled();
+    const parakeet = within(modelsPanel()).getByText("Parakeet TDT v3").closest<HTMLElement>("[data-model-row]")!;
+    const firered = within(modelsPanel()).getByText("FireRedASR2-AED").closest<HTMLElement>("[data-model-row]")!;
+    const funAsr = within(modelsPanel()).getByText("Fun-ASR-Nano 2512").closest<HTMLElement>("[data-model-row]")!;
+    expect(within(qwen06).getByText(/速度特点: 自回归语音识别 · 0\.6B · 较小本机模型档/)).toBeVisible();
+    expect(within(qwen17).getByRole("button", { name: "下载模型" })).toBeEnabled();
+    expect(within(qwen17).getByText(/速度特点: 自回归语音识别 · 1\.7B · 较大本机模型档/)).toBeVisible();
+    expect(within(parakeet).getByText(/速度特点: FastConformer \+ TDT 解码 · 0\.6B/)).toBeVisible();
+    expect(within(firered).getByText(/速度特点: Attention-based Encoder-Decoder \(AED\)/)).toBeVisible();
+    expect(within(funAsr).getByText(/速度特点: ASR 架构特点未核实 · 800M · 运行时 prompt: auto \/ zh \/ en/)).toBeVisible();
     expect(within(modelsPanel()).queryByText("Cohere Transcribe 2B")).not.toBeInTheDocument();
     expect(within(modelsPanel()).queryByText("License unreviewed")).not.toBeInTheDocument();
+  });
+
+  it("shows the 80% memory cap and directly activates a ready ASR model without saving typed keys", async () => {
+    const physicalMemory = 32 * 1024 ** 3;
+    const budgetBytes = Math.floor(physicalMemory * 0.8);
+    vi.mocked(invoke).mockImplementation(async (command) => {
+      if (command === "list_on_device_models") return [{
+        id: "qwen3-asr-0.6b", label: "Qwen3 ASR 0.6B", state: "ready", inference_ready: true,
+        platform_supported: true, runtime_status: "runtime_ready", loaded: false,
+        downloaded_bytes: 1_500_000_000, bytes: 1_500_000_000, download_available: true,
+        language_note: "Auto or fixed Chinese/English.", memory_compatibility_error: null,
+        memory_estimate: { bytes: 2_415_919_104, source: "admission_reserve" },
+      }];
+      if (command === "get_on_device_memory_budget") return {
+        physical_memory_bytes: physicalMemory, budget_bytes: budgetBytes, budget_percent: 80,
+      };
+      return undefined;
+    });
+    const commitEngine = vi.fn().mockResolvedValue(undefined);
+    renderEngine({}, { commitEngine });
+    activatePage("API Key");
+    const openAiRow = credentialPanel().querySelector<HTMLElement>('[data-provider="openai"]')!;
+    const openAiInput = within(openAiRow).getByLabelText("OpenAI API Key");
+    fireEvent.change(openAiInput, { target: { value: "fixture-unsaved-openai-key" } });
+
+    activatePage("本地模型");
+    const panel = modelsPanel();
+    const progress = await within(panel).findByLabelText("80% hw.memsize 内存准入预算");
+    expect(progress).toHaveAttribute("max", String(physicalMemory));
+    expect(progress).toHaveAttribute("value", String(budgetBytes));
+    const row = within(panel).getByText("Qwen3 ASR 0.6B").closest<HTMLElement>("[data-model-row]")!;
+    expect(within(row).getByText(/模型加载准入预留；估算值，不是实测峰值/)).toBeVisible();
+    expect(within(row).getByText(/速度特点: 自回归语音识别 · 0\.6B · 较小本机模型档/)).toBeVisible();
+    expect(within(row).getByText("此 Mac 上的模型速度尚未实测。")).toBeVisible();
+    fireEvent.click(within(row).getByRole("button", { name: "设为当前使用模型" }));
+    await waitFor(() => expect(commitEngine).toHaveBeenCalledWith({
+      asr_provider: "on_device",
+      asr_model: "qwen3-asr-0.6b",
+    }));
+    expect(openAiInput).toHaveValue("fixture-unsaved-openai-key");
+  });
+
+  it("directly activates a verified MLX cleanup model with a cleanup-only patch", async () => {
+    const commitEngine = vi.fn().mockResolvedValue(undefined);
+    vi.mocked(invoke).mockImplementation(async (command) => {
+      if (command === "list_on_device_models") return [];
+      if (command === "list_mlx_cleanup_models") return [{
+        id: "qwen3_5_2b_mlx_4bit", label: "Qwen3.5 2B · MLX 4-bit", repository: "mlx-community/Qwen3.5-2B-MLX-4bit",
+        revision: "rev-qwen-mlx-2b", bytes: 2_000_000_000, language: "Multilingual; product language coverage pending verification",
+        state: "ready", operation: null, bytes_done: 2_000_000_000, bytes_total: 2_000_000_000,
+        error: null, last_operation: null, last_operation_error: null, managed: true, partial_managed: false,
+        verified: true, qualified: false, download_available: true, downloadable: false, selectable: true,
+        compatible: true, compatibility_error: null,
+        memory_estimate: { bytes: 6 * 1024 ** 3, source: "admission_reserve" },
+      }];
+      return undefined;
+    });
+    renderEngine({ cleanup_enabled: false }, { commitEngine });
+    activatePage("本地模型");
+    const row = await within(modelsPanel()).findByText("Qwen3.5 2B · MLX 4-bit").then((title) => title.closest<HTMLElement>("[data-model-row]")!);
+    expect(within(row).getByText(/适用语言: 语言覆盖尚未核实/)).toBeVisible();
+    expect(within(row).getByText(/内存占用估算: 6.0 GB/)).toBeVisible();
+    expect(within(row).getByText(/速度特点: 文本生成整理路线 · 2B · MLX/)).toBeVisible();
+    fireEvent.click(within(row).getByRole("button", { name: "设为当前使用模型" }));
+    await waitFor(() => expect(commitEngine).toHaveBeenCalledWith({
+      cleanup_enabled: true,
+      cleanup_provider: "on_device_mlx",
+      cleanup_model: "qwen3_5_2b_mlx_4bit",
+    }));
+  });
+
+  it("directly activates a verified selectable GGUF cleanup model with a cleanup-only patch", async () => {
+    const commitEngine = vi.fn().mockResolvedValue(undefined);
+    const readyModel = localCleanupModels([{
+      state: "installed", operation: null, managed: true, verified: true, selectable: true,
+      compatible: true, download_available: true, language: "Multilingual",
+      memory_estimate: { bytes: 3 * 1024 ** 3, source: "admission_reserve" },
+    }]);
+    vi.mocked(invoke).mockImplementation(async (command) => {
+      if (command === "list_on_device_models") return [];
+      if (command === "list_local_cleanup_models") return readyModel;
+      return undefined;
+    });
+    renderEngine({ cleanup_enabled: false }, { commitEngine });
+    activatePage("本地模型");
+    const row = await within(modelsPanel()).findByText("Qwen3.5 2B · Q4_K_M").then((title) => title.closest<HTMLElement>("[data-model-row]")!);
+    expect(within(row).getByText(/适用语言: Multilingual/)).toBeVisible();
+    expect(within(row).getByText(/内存占用估算: 3.0 GB/)).toBeVisible();
+    expect(within(row).getByText(/速度特点: 文本生成整理路线 · 2B · llama\.cpp/)).toBeVisible();
+    fireEvent.click(within(row).getByRole("button", { name: "设为当前使用模型" }));
+    await waitFor(() => expect(commitEngine).toHaveBeenCalledWith({
+      cleanup_enabled: true,
+      cleanup_provider: "on_device_llama_cpp",
+      cleanup_model: "qwen3.5-2b",
+    }));
+  });
+
+  it("keeps a verified legacy MLX card directly activatable within its reserve budget", async () => {
+    const commitEngine = vi.fn().mockResolvedValue(undefined);
+    const physicalMemory = 64 * 1024 ** 3;
+    vi.mocked(invoke).mockImplementation(async (command) => {
+      if (command === "list_on_device_models") return [];
+      if (command === "get_cleanup_model_store_status") return {
+        id: "qwen3_8_27b_mlx_6bit", label: "Qwen 3.8 27B · MLX 6-bit", repository: "lmstudio-community/Qwen3.8-27B-MLX-6bit",
+        revision: "legacy-rev", state: "ready", operation: null, source_kind: "download",
+        bytes_done: 22_804_836_386, bytes_total: 22_804_836_386, error: null, last_operation: "download",
+        last_operation_error: null, managed: true, partial_managed: false, platform_supported: true,
+        language: "Multilingual", memory_estimate: { bytes: 27_648_851_968, source: "admission_reserve" },
+      };
+      if (command === "get_on_device_memory_budget") return {
+        physical_memory_bytes: physicalMemory,
+        budget_bytes: Math.floor(physicalMemory * 0.8),
+        budget_percent: 80,
+      };
+      return undefined;
+    });
+    renderEngine({}, { commitEngine });
+    activatePage("本地模型");
+    const row = document.querySelector<HTMLElement>("#local-cleanup-model")!;
+    expect(await within(row).findByText(/适用语言: Multilingual/)).toBeVisible();
+    expect(within(row).getByText(/内存占用估算: 25.8 GB/)).toBeVisible();
+    expect(within(row).getByText(/速度特点: 旧版路线；模型结构与速度特点未核实 · 27B · MLX/)).toBeVisible();
+    const activation = within(row).getByRole("button", { name: "设为当前使用模型" });
+    await waitFor(() => expect(activation).toBeEnabled());
+    fireEvent.click(activation);
+    await waitFor(() => expect(commitEngine).toHaveBeenCalledWith({
+      cleanup_enabled: true,
+      cleanup_provider: "on_device_mlx",
+      cleanup_model: "qwen3_8_27b_mlx_6bit",
+    }));
   });
 
   it("distinguishes the saved local ASR model from a pending model choice", async () => {
@@ -2547,5 +2877,107 @@ describe("EngineSettings form", () => {
     const currentRoutes = screen.getByLabelText("当前生效路线");
     expect(currentRoutes).toHaveTextContent(/当前使用 · VoiceFlow MLX/);
     expect(within(currentRoutes).queryByText("严格离线模式已阻止此路线")).not.toBeInTheDocument();
+  });
+
+  it("allows saving an auto-only ASR route when settings.language is a fixed language like zh", async () => {
+    renderEngine({
+      language: "zh",
+      asr_provider: "groq",
+      asr_model: "whisper-large-v3-turbo",
+      provider_keys: {
+        ...settings.provider_keys,
+        dashscope: { configured: true, hint: "••••dash" },
+        siliconflow: { configured: true, hint: "••••sili" },
+      },
+    });
+
+    const serviceSection = screen.getByRole("combobox", { name: "转写服务" }).closest(".vf-service-asr-section")! as HTMLElement;
+    selectOption(within(serviceSection).getByRole("combobox", { name: "转写服务" }), "dashscope");
+    expect(within(serviceSection).queryByText("此模型要求固定使用中文或 English")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "保存并使用" })).toBeEnabled();
+
+    selectOption(within(serviceSection).getByRole("combobox", { name: "转写服务" }), "siliconflow");
+    expect(within(serviceSection).queryByText("此模型要求固定使用中文或 English")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "保存并使用" })).toBeEnabled();
+  });
+
+  it("preserves prior runtime readiness and catalog order on terminal on_device_asr status and allows autoAllowed model activation", async () => {
+    let onDeviceReads = 0;
+    let unifiedStatusListener: ((event: { payload: unknown }) => void) | null = null;
+    const catalog = [
+      {
+        id: "qwen3-asr-0.6b",
+        label: "Qwen3 ASR 0.6B",
+        state: "ready",
+        inference_ready: true,
+        platform_supported: true,
+        runtime_status: "loaded",
+        loaded: true,
+        downloaded_bytes: 100,
+        bytes: 100,
+        download_available: true,
+      },
+      {
+        id: "parakeet-tdt-0.6b-v3-8bit",
+        label: "Parakeet TDT v3 0.6B",
+        state: "ready",
+        inference_ready: true,
+        platform_supported: true,
+        runtime_status: "runtime_ready",
+        loaded: false,
+        downloaded_bytes: 120,
+        bytes: 120,
+        download_available: true,
+      },
+    ];
+    vi.mocked(listen).mockImplementation(async (event, handler) => {
+      if (event === "local-models://status") {
+        unifiedStatusListener = handler as (event: { payload: unknown }) => void;
+      }
+      return () => undefined;
+    });
+    vi.mocked(invoke).mockImplementation(async (command) => {
+      if (command === "list_on_device_models") {
+        onDeviceReads += 1;
+        return catalog;
+      }
+      if (command === "list_mlx_cleanup_models" || command === "list_local_cleanup_models") return [];
+      return undefined;
+    });
+
+    renderEngine({ language: "zh", asr_provider: "groq", asr_model: "whisper-large-v3-turbo" });
+    activatePage("本地模型");
+
+    const panel = modelsPanel();
+    await within(panel).findByText("Qwen3 ASR 0.6B");
+    await waitFor(() => expect(onDeviceReads).toBe(1));
+    expect(unifiedStatusListener).not.toBeNull();
+
+    act(() => {
+      unifiedStatusListener?.({
+        payload: {
+          domain: "on_device_asr",
+          status: {
+            id: "qwen3-asr-0.6b",
+            label: "Qwen3 ASR 0.6B",
+            state: "ready",
+            inference_ready: false,
+            platform_supported: true,
+            runtime_status: "not_checked",
+            loaded: false,
+            downloaded_bytes: 100,
+            bytes: 100,
+            download_available: true,
+          },
+        },
+      });
+    });
+
+    await waitFor(() => expect(onDeviceReads).toBe(2));
+    const qwenRow = within(panel).getByText("Qwen3 ASR 0.6B").closest<HTMLElement>("[data-model-row]")!;
+    const parakeetRow = within(panel).getByText("Parakeet TDT v3 0.6B").closest<HTMLElement>("[data-model-row]")!;
+    expect(qwenRow.compareDocumentPosition(parakeetRow) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(within(qwenRow).getByRole("button", { name: "设为当前使用模型" })).toBeEnabled();
+    expect(within(parakeetRow).getByRole("button", { name: "设为当前使用模型" })).toBeEnabled();
   });
 });

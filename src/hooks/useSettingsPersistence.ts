@@ -49,9 +49,13 @@ export function useSettingsPersistence({
     setSettings((current) => current ? { ...current, ...confirmed } : current);
   }, [setSettings]);
 
-  const persistPatch = useCallback((patch: Partial<Settings>, versions: FieldVersions) => {
-    if (Object.keys(patch).length === 0) return;
-    saveQueue.current = saveQueue.current
+  const persistPatch = useCallback((
+    patch: Partial<Settings>,
+    versions: FieldVersions,
+    options?: { rethrow?: boolean },
+  ) => {
+    if (Object.keys(patch).length === 0) return Promise.resolve();
+    const run = saveQueue.current
       .catch(() => undefined)
       .then(async () => {
         try {
@@ -65,6 +69,15 @@ export function useSettingsPersistence({
           publishUnsavedFields();
           if (pendingRevision.current.size === 0) setSaveError(null);
         } catch (reason) {
+          if (options?.rethrow) {
+            for (const [field, version] of versions) {
+              if (pendingRevision.current.get(field) === version) {
+                pendingRevision.current.delete(field);
+              }
+            }
+            publishUnsavedFields();
+            throw reason;
+          }
           // A rejected older write must never be retried over a newer value
           // that is already queued or in flight for the same field.
           for (const [field, version] of versions) {
@@ -76,6 +89,8 @@ export function useSettingsPersistence({
           setSaveError(formatError(reason));
         }
       });
+    saveQueue.current = run.catch(() => undefined);
+    return run;
   }, [commitPersistedPatch, formatError, publishUnsavedFields]);
 
   const flushPendingSave = useCallback(() => {
@@ -105,7 +120,9 @@ export function useSettingsPersistence({
     for (const field of Object.keys(patch) as SettingsField[]) {
       fieldRevision.current.set(field, revision);
     }
-    setSettings((current) => current ? { ...current, ...patch } : current);
+    if (!options?.rethrow) {
+      setSettings((current) => current ? { ...current, ...patch } : current);
+    }
     if (options?.persist === false) return;
 
     if (pendingRevision.current.size === 0) setSaveError(null);
@@ -125,8 +142,7 @@ export function useSettingsPersistence({
         window.clearTimeout(saveTimer.current);
         saveTimer.current = null;
       }
-      persistPatch(immediatePatch, versionsFor(immediatePatch));
-      return;
+      return persistPatch(immediatePatch, versionsFor(immediatePatch), { rethrow: options?.rethrow });
     }
     if (saveTimer.current) window.clearTimeout(saveTimer.current);
     saveTimer.current = window.setTimeout(() => {

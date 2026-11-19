@@ -1,6 +1,7 @@
 //! Fn/Globe and held-combination release observation. The listener reads only
 //! flags and physical key state, never characters or typed text.
-use crate::dictation::{HotkeySource, ModeTrigger};
+use crate::dictation::HotkeySource;
+use crate::hotkey::ModeGesture;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use tauri::AppHandle;
@@ -11,54 +12,8 @@ struct FnConfig {
     mode: String,
 }
 
-#[derive(Default)]
-struct FnGesture {
-    key_down: bool,
-    chorded: bool,
-    blocked_until_release: bool,
-    gesture_id: u64,
-}
-
-impl FnGesture {
-    fn press(&mut self, mode: &str, chorded: bool) -> Option<(ModeTrigger, u64)> {
-        if self.key_down || self.blocked_until_release {
-            return None;
-        }
-        self.key_down = true;
-        self.chorded = chorded;
-        self.gesture_id = crate::hotkey::next_gesture_id();
-        (mode == "hold_to_talk" && !chorded).then_some((ModeTrigger::Press, self.gesture_id))
-    }
-    fn chord(&mut self, mode: &str) -> Option<(ModeTrigger, u64)> {
-        if !self.key_down || self.chorded {
-            return None;
-        }
-        self.chorded = true;
-        (mode == "hold_to_talk").then_some((ModeTrigger::Cancel, self.gesture_id))
-    }
-    fn release(&mut self, mode: &str) -> Option<(ModeTrigger, u64)> {
-        self.blocked_until_release = false;
-        if !std::mem::take(&mut self.key_down) || std::mem::take(&mut self.chorded) {
-            return None;
-        }
-        Some((
-            if mode == "hold_to_talk" {
-                ModeTrigger::Release
-            } else {
-                ModeTrigger::Toggle
-            },
-            self.gesture_id,
-        ))
-    }
-    fn reset(&mut self) {
-        self.blocked_until_release |= self.key_down;
-        self.key_down = false;
-        self.chorded = false;
-    }
-}
-
 static CONFIG: OnceLock<Arc<Mutex<Option<FnConfig>>>> = OnceLock::new();
-static GESTURE: OnceLock<Arc<Mutex<FnGesture>>> = OnceLock::new();
+static GESTURE: OnceLock<Arc<Mutex<ModeGesture>>> = OnceLock::new();
 static LISTENER: OnceLock<()> = OnceLock::new();
 static TAP_PORT: AtomicUsize = AtomicUsize::new(0);
 static SLEEP_OBSERVER: OnceLock<()> = OnceLock::new();
@@ -87,9 +42,9 @@ fn lock_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 fn config_store() -> Arc<Mutex<Option<FnConfig>>> {
     CONFIG.get_or_init(|| Arc::new(Mutex::new(None))).clone()
 }
-fn gesture_store() -> Arc<Mutex<FnGesture>> {
+fn gesture_store() -> Arc<Mutex<ModeGesture>> {
     GESTURE
-        .get_or_init(|| Arc::new(Mutex::new(FnGesture::default())))
+        .get_or_init(|| Arc::new(Mutex::new(ModeGesture::default())))
         .clone()
 }
 
@@ -118,7 +73,7 @@ pub fn is_paste_suppressed() -> bool {
     PASTE_SUPPRESS.load(Ordering::SeqCst) > 0
 }
 pub fn set_dictation_active(active: bool) {
-    if !active {
+    if !active && !crate::hotkey::hybrid_restart_handoff_pending() {
         reset_state();
         crate::hotkey::reset_pressed_state();
     }
@@ -151,9 +106,20 @@ pub fn is_fn_only(hotkey: &str) -> bool {
 #[cfg(target_os = "macos")]
 #[link(name = "CoreGraphics", kind = "framework")]
 unsafe extern "C" {
+    fn CGPreflightListenEventAccess() -> bool;
     fn CGEventSourceKeyState(state_id: i32, key: u16) -> bool;
     fn CGEventSourceFlagsState(state_id: i32) -> u64;
     fn CGEventTapEnable(tap: *const std::ffi::c_void, enable: bool);
+}
+
+#[cfg(target_os = "macos")]
+pub fn input_monitoring_is_allowed() -> bool {
+    unsafe { CGPreflightListenEventAccess() }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn input_monitoring_is_allowed() -> bool {
+    false
 }
 
 #[cfg(target_os = "macos")]
@@ -186,6 +152,9 @@ pub async fn wait_for_key_release() {
 
 #[cfg(target_os = "macos")]
 pub fn ensure_listener(_app: AppHandle) -> Result<(), String> {
+    if !input_monitoring_is_allowed() {
+        return Err("input_monitoring_required".into());
+    }
     if LISTENER.get().is_some() {
         return Ok(());
     }
@@ -229,35 +198,39 @@ pub fn ensure_listener(_app: AppHandle) -> Result<(), String> {
             let code = event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE) as u16;
             let fn_down = flags & (1 << 23) != 0;
             let store = gesture_store();
-            let mut state = lock_recover(&store);
-            let action = if matches!(event_type, CGEventType::FlagsChanged) && code == 63 {
-                if fn_down {
-                    let has_modifiers =
-                        flags & ((1 << 17) | (1 << 18) | (1 << 19) | (1 << 20)) != 0;
-                    state.press(&config.mode, has_modifiers || other_keys_down())
+            let now = std::time::Instant::now();
+            let actions = {
+                let mut state = lock_recover(&store);
+                if matches!(event_type, CGEventType::FlagsChanged) && code == 63 {
+                    if fn_down {
+                        let has_modifiers =
+                            flags & ((1 << 17) | (1 << 18) | (1 << 19) | (1 << 20)) != 0;
+                        state.pressed(&config.mode, has_modifiers || other_keys_down(), false, now)
+                    } else {
+                        state.released(&config.mode, true, now)
+                    }
+                } else if code != 63
+                    && fn_down
+                    && (matches!(event_type, CGEventType::KeyDown)
+                        || matches!(event_type, CGEventType::FlagsChanged))
+                {
+                    state.chorded(&config.mode)
                 } else {
-                    state.release(&config.mode)
+                    Vec::new()
                 }
-            } else if fn_down
-                && (matches!(event_type, CGEventType::KeyDown)
-                    || matches!(event_type, CGEventType::FlagsChanged))
-            {
-                state.chord(&config.mode)
-            } else {
-                None
             };
-            if let Some((trigger, id)) = action {
-                crate::dictation::enqueue_hotkey(config.source, trigger, id);
+            for timeout in crate::hotkey::dispatch_gesture_triggers(config.source, actions) {
+                crate::hotkey::schedule_mode_hybrid_timeout(store.clone(), config.source, timeout);
             }
             None
         },
     )
-    .map_err(|_| "无法安装按键监听，请在系统设置中开启 VoiceFlow 的辅助功能权限".to_owned())?;
+    .map_err(|_| "modifier_event_tap_unavailable".to_owned())?;
     unsafe {
         let source = tap
             .mach_port
             .create_runloop_source(0)
-            .map_err(|_| "无法创建按键监听 run loop source".to_owned())?;
+            .map_err(|_| "modifier_event_tap_unavailable".to_owned())?;
         CFRunLoop::get_main().add_source(&source, kCFRunLoopCommonModes);
         TAP_PORT.store(
             tap.mach_port.as_concrete_TypeRef() as usize,
@@ -286,7 +259,7 @@ pub fn register(app: &AppHandle, source: HotkeySource, mode: &str) -> Result<(),
     Ok(())
 }
 pub fn arm_after_release() {
-    *lock_recover(&gesture_store()) = FnGesture::default();
+    *lock_recover(&gesture_store()) = ModeGesture::default();
 }
 pub fn reset_state() {
     lock_recover(&gesture_store()).reset();
@@ -338,6 +311,15 @@ pub fn install_sleep_observer() {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct HandoffFlagGuard;
+
+    impl Drop for HandoffFlagGuard {
+        fn drop(&mut self) {
+            crate::hotkey::set_hybrid_restart_handoff_pending(false);
+        }
+    }
+
     #[test]
     fn distinguishes_fn_from_deprecated_modifiers() {
         for key in ["Alt", "Control", "Shift", "CmdOrControl", "Fn", "Globe"] {
@@ -347,48 +329,46 @@ mod tests {
         assert!(!is_fn_only("Alt"));
         assert!(!is_modifier_only("CmdOrControl+Alt+Space"));
     }
+
     #[test]
-    fn fn_tap_only_fires_on_clean_release_and_deduplicates_repeat() {
-        let mut state = FnGesture::default();
-        assert!(state.press("tap", false).is_none());
-        assert!(state.press("tap", false).is_none());
-        let first = state.release("tap").unwrap();
-        assert_eq!(first.0, ModeTrigger::Toggle);
-        assert!(state.release("tap").is_none());
-        state.press("tap", false);
-        assert_ne!(first.1, state.release("tap").unwrap().1);
-    }
-    #[test]
-    fn fn_tap_chords_never_toggle() {
-        for preexisting_chord in [false, true] {
-            let mut state = FnGesture::default();
-            state.press("tap", preexisting_chord);
-            state.chord("tap");
-            assert!(state.release("tap").is_none());
-        }
-    }
-    #[test]
-    fn fn_hold_short_release_stops_and_chord_cancels_once() {
-        let mut state = FnGesture::default();
-        let (_, id) = state.press("hold_to_talk", false).unwrap();
-        assert_eq!(
-            state.release("hold_to_talk"),
-            Some((ModeTrigger::Release, id))
+    fn idle_phase_preserves_a_held_fn_gesture_during_hybrid_restart_handoff() {
+        let _handoff_test_lock = crate::hotkey::HYBRID_HANDOFF_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _clear_handoff_flag = HandoffFlagGuard;
+        let now = std::time::Instant::now();
+        *lock_recover(&gesture_store()) = ModeGesture::default();
+        let pressed = lock_recover(&gesture_store()).pressed(
+            crate::hotkey::HYBRID_HOLD_LOCK,
+            false,
+            true,
+            now,
         );
-        let (_, id) = state.press("hold_to_talk", false).unwrap();
-        assert_eq!(state.chord("hold_to_talk"), Some((ModeTrigger::Cancel, id)));
-        assert!(state.chord("hold_to_talk").is_none());
-        assert!(state.release("hold_to_talk").is_none());
-        assert!(state.press("hold_to_talk", true).is_none());
-    }
-    #[test]
-    fn reset_waits_for_release_and_discards_old_gesture() {
-        let mut state = FnGesture::default();
-        state.press("hold_to_talk", false);
-        state.reset();
-        assert!(state.press("hold_to_talk", false).is_none());
-        assert!(state.release("hold_to_talk").is_none());
-        assert!(state.press("hold_to_talk", false).is_some());
+        let gesture_id = match pressed.first() {
+            Some(crate::hotkey::GestureAction::Trigger(
+                crate::dictation::ModeTrigger::Press,
+                gesture_id,
+            )) => *gesture_id,
+            action => panic!("expected a Fn hold press action, got {action:?}"),
+        };
+
+        crate::hotkey::set_hybrid_restart_handoff_pending(true);
+        set_dictation_active(false);
+        let released = lock_recover(&gesture_store()).released(
+            crate::hotkey::HYBRID_HOLD_LOCK,
+            false,
+            now + std::time::Duration::from_millis(220),
+        );
+        crate::hotkey::set_hybrid_restart_handoff_pending(false);
+        reset_state();
+
+        assert_eq!(
+            released,
+            vec![crate::hotkey::GestureAction::Trigger(
+                crate::dictation::ModeTrigger::Release,
+                gesture_id,
+            )]
+        );
     }
     #[test]
     fn nested_paste_suppression_keeps_the_outer_window() {

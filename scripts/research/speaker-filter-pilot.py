@@ -33,17 +33,15 @@ import wave
 
 
 REPO = Path(__file__).resolve().parents[2]
-DEFAULT_CORPUS = Path(
-    "/Users/mingjie/Documents/voice-dictation-research/corpora/public-pilot/"
-    "ascend-737e9800-v1"
+RESEARCH_CHECKOUT = Path(
+    os.environ.get("VOICEFLOW_RESEARCH_CHECKOUT")
+    or "/Users/mingjie/Documents/voice-dictation-research"
 )
-DEFAULT_CANDIDATES = Path(
-    "/Users/mingjie/Documents/voice-dictation-research/corpora/public-pilot/"
-    "ascend-737e9800-pilot-candidates-v2"
+DEFAULT_CORPUS = RESEARCH_CHECKOUT / "corpora/public-pilot/ascend-737e9800-v1"
+DEFAULT_CANDIDATES = (
+    RESEARCH_CHECKOUT / "corpora/public-pilot/ascend-737e9800-pilot-candidates-v2"
 )
-DEFAULT_OUTPUT_ROOT = Path(
-    "/Users/mingjie/Documents/voice-dictation-research/speaker-filter/2026-10-25"
-)
+DEFAULT_OUTPUT_ROOT = RESEARCH_CHECKOUT / "speaker-filter/2026-10-25"
 SOURCE_URL = "https://huggingface.co/datasets/CAiRE/ASCEND"
 SOURCE_REVISION = "737e9800ae31be9932ba8464c80366559bd28424"
 SOURCE_LICENSE = "CC-BY-SA-4.0"

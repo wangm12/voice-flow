@@ -94,7 +94,7 @@ impl PasteVerificationFact {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct DeliveryDiagnostic {
     pub(crate) code: &'static str,
-    pub(crate) user_reason: &'static str,
+    pub(crate) user_reason: std::borrow::Cow<'static, str>,
     pub(crate) stage: &'static str,
     /// The target app bundle identifier is useful for diagnosis and contains
     /// no page, window, or focused-field content.
@@ -124,6 +124,8 @@ pub(crate) struct DeliveryDiagnostic {
     pub(crate) paste_full_range_attempted: bool,
     pub(crate) clipboard_restore_attempted: bool,
     pub(crate) clipboard_restored: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) secure_input_owner_name: Option<String>,
 }
 
 impl DeliveryDiagnostic {

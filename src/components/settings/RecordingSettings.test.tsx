@@ -1,6 +1,6 @@
 import { selectOption } from "../../test/selectOption";
 import { invoke } from "@tauri-apps/api/core";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { GuideAcknowledgement } from "../../lib/onboardingGuides";
 import type { Settings } from "../../types/settings";
@@ -113,34 +113,26 @@ describe("RecordingSettings", () => {
     invokeMock.mockReset();
   });
 
-  it("saves a mode independently and commits page values only after native success", async () => {
-    let acknowledge!: () => void;
-    nativeHandlers.updateSettingsPatch = () => new Promise<void>((resolve) => { acknowledge = resolve; });
+  it("routes mode updates immediately through shared settings persistence without direct IPC", () => {
     const save = vi.fn();
     render(<RecordingSettings settings={{ ...settings, api_key_configured: false }} save={save} />);
     expect(screen.getByText(/按住 .*Space 说话，松开后结束并转成文字/)).toBeVisible();
     expect(screen.getByText("Esc 取消。")).toBeVisible();
     selectOption(screen.getByRole("combobox", { name: "录音方式" }), "tap");
-    expect(invokeMock).toHaveBeenCalledWith("update_settings_patch", { patch: { activation_mode: "tap" } });
-    expect(save).not.toHaveBeenCalled();
-    expect(screen.getByRole("combobox", { name: "录音方式" })).toHaveTextContent("按住说话");
-    expect(screen.getByRole("button", { name: "recapture-dictation" })).toBeDisabled();
-    acknowledge();
-    await waitFor(() => expect(save).toHaveBeenCalledWith({ activation_mode: "tap" }, { persist: false }));
+    expect(save).toHaveBeenCalledWith({ activation_mode: "tap" }, { immediate: true });
+    selectOption(screen.getByRole("combobox", { name: "录音方式" }), "hybrid_hold_lock");
+    expect(save).toHaveBeenCalledWith({ activation_mode: "hybrid_hold_lock" }, { immediate: true });
+    expect(invokeMock.mock.calls.filter(([command]) => command === "update_settings_patch")).toEqual([]);
     expect(screen.getByRole("button", { name: "recapture-dictation" })).toBeEnabled();
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   });
 
-  it("retains the previous mode when native save fails", async () => {
-    nativeHandlers.updateSettingsPatch = async () => { throw new Error("write failed"); };
+  it("renders inline mode error when shared persistence fails", () => {
     const save = vi.fn();
-    render(<RecordingSettings settings={settings} save={save} />);
-    selectOption(screen.getByRole("combobox", { name: "录音方式" }), "tap");
-    expect(invokeMock).toHaveBeenCalledWith("update_settings_patch", { patch: { activation_mode: "tap" } });
-    expect(await screen.findByRole("alert")).toHaveTextContent("write failed");
+    render(<RecordingSettings settings={settings} save={save} saveFailure={{ fields: ["activation_mode"], message: "write failed" }} />);
+    expect(screen.getByRole("alert")).toHaveTextContent("write failed");
     expect(screen.getByRole("combobox", { name: "录音方式" })).toHaveTextContent("按住说话");
     expect(screen.getByRole("button", { name: "recapture-dictation" })).toBeEnabled();
-    expect(save).not.toHaveBeenCalled();
   });
 
   it("blocks binding and mode changes while dictation is busy", () => {
@@ -149,26 +141,49 @@ describe("RecordingSettings", () => {
     expect(screen.getByRole("button", { name: "recapture-dictation" })).toBeDisabled();
   });
 
-  it("opens keyboard settings only after an explicit Fn action", () => {
-    nativeHandlers.openPrivacySettings = async (args) => { expect(args).toEqual({ pane: "keyboard" }); };
+  it("opens keyboard and Input Monitoring settings only after explicit Fn actions", () => {
+    nativeHandlers.openPrivacySettings = async (args) => {
+      expect(args).toEqual(expect.objectContaining({ pane: expect.any(String) }));
+      expect(["keyboard", "input_monitoring"]).toContain((args as { pane: string }).pane);
+    };
     render(<RecordingSettings settings={{ ...settings, hotkey: "Fn" }} save={vi.fn()} />);
     expect(invokeMock).toHaveBeenCalledWith("get_guide_acknowledgements");
     // No permission, capture, selection or provider operation is allowed on mount.
     expect(invokeMock.mock.calls.filter(([command]) => command !== "get_guide_acknowledgements")).toEqual([]);
     fireEvent.click(screen.getByRole("button", { name: "打开键盘设置" }));
     expect(invokeMock).toHaveBeenCalledWith("open_privacy_settings", { pane: "keyboard" });
-    expect(invokeMock.mock.calls.filter(([command]) => command === "open_privacy_settings")).toHaveLength(1);
+    fireEvent.click(screen.getByRole("button", { name: "打开输入监控设置" }));
+    expect(invokeMock).toHaveBeenCalledWith("open_privacy_settings", { pane: "input_monitoring" });
+    expect(invokeMock.mock.calls.filter(([command]) => command === "open_privacy_settings")).toHaveLength(2);
   });
 
-  it("sets the translation shortcut and target without changing the global output mode", () => {
+  it("shows the Carbon release fallback as a nonblocking notice and opens Input Monitoring only on click", () => {
+    nativeHandlers.openPrivacySettings = async (args) => { expect(args).toEqual({ pane: "input_monitoring" }); };
+    render(<RecordingSettings settings={{ ...settings, hotkey_notice: "combo_release_uses_carbon_fallback" }} save={vi.fn()} />);
+    expect(screen.getByText(/组合快捷键仍可使用/)).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(invokeMock.mock.calls.filter(([command]) => command === "open_privacy_settings")).toEqual([]);
+    fireEvent.click(screen.getByRole("button", { name: "打开输入监控设置" }));
+    expect(invokeMock).toHaveBeenCalledWith("open_privacy_settings", { pane: "input_monitoring" });
+  });
+
+  it("shows an unbound shortcut badge outside the collapsed More shortcuts section", () => {
+    render(<RecordingSettings settings={{ ...settings, selected_actions_enabled: true, selected_action_hotkey: "" }} save={vi.fn()} />);
+    expect(screen.getByText("有快捷键尚未绑定")).toBeVisible();
+    expect(screen.getByRole("button", { name: /更多快捷键/ })).toHaveAttribute("aria-expanded", "false");
+  });
+
+  it("routes the translation target to Writing while keeping shortcut binding here", () => {
     const save = vi.fn();
-    render(<RecordingSettings settings={settings} save={save} />);
+    const onOpenMappings = vi.fn();
+    render(<RecordingSettings settings={settings} save={save} onOpenMappings={onOpenMappings} />);
     fireEvent.click(screen.getByRole("button", { name: /更多快捷键/ }));
     fireEvent.click(screen.getByRole("button", { name: "recapture-translation_action" }));
     expect(save).toHaveBeenCalledWith({ translation_hotkey: "Command+Shift+Space" }, { persist: false });
-    selectOption(screen.getByLabelText("快捷翻译目标语言"), "ja");
-    expect(save).toHaveBeenCalledWith({ translation_target_language: "ja" });
-    expect(save.mock.calls.every(([patch]) => !("output_mode" in patch) && !("activation_mode" in patch))).toBe(true);
+    expect(screen.queryByRole("combobox", { name: "快捷翻译目标语言" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "更改" }));
+    expect(onOpenMappings).toHaveBeenCalledOnce();
+    expect(save.mock.calls.every(([patch]) => !("translation_target_language" in patch) && !("output_mode" in patch) && !("activation_mode" in patch))).toBe(true);
   });
 
   it("saves a separate optional skip cleanup shortcut", () => {
@@ -261,5 +276,63 @@ describe("RecordingSettings", () => {
       />,
     );
     expect(screen.queryByText("训练建议把音频保留至少 90 天或 1 年。")).toBeNull();
+  });
+
+  it("caps preferred spoken languages at 4, supports clearing, and saves immediately on hint-capable models", () => {
+    const save = vi.fn();
+    const { rerender } = render(
+      <RecordingSettings
+        settings={{ ...settings, asr_provider: "soniox", asr_model: "stt-rt-v5", preferred_languages: ["zh", "en", "ja", "ko"] }}
+        save={save}
+      />,
+    );
+    expect(screen.getByRole("group", { name: "常用口述语言（可选）" })).toBeInTheDocument();
+    const spanish = screen.getByRole("button", { name: "Español" });
+    expect(spanish).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: "清空（无偏向自动检测）" }));
+    expect(save).toHaveBeenCalledWith({ preferred_languages: [] }, { immediate: true });
+
+    rerender(
+      <RecordingSettings
+        settings={{ ...settings, asr_provider: "soniox", asr_model: "stt-rt-v5", preferred_languages: [] }}
+        save={save}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "日本語" }));
+    expect(save).toHaveBeenCalledWith({ preferred_languages: ["ja"] }, { immediate: true });
+  });
+
+  it("hides preferred language chips on non-hint models and warns on unsupported language selection", () => {
+    render(
+      <RecordingSettings
+        settings={{
+          ...settings,
+          asr_provider: "on_device",
+          asr_model: "qwen3-asr-1.7b",
+          language: "ar",
+        }}
+        save={vi.fn()}
+      />,
+    );
+    expect(screen.queryByRole("group", { name: "常用口述语言（可选）" })).toBeNull();
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "当前所选识别语言不受当前转写模型支持，请改选支持列表中的语言。",
+    );
+    expect(screen.getByRole("combobox", { name: "识别语言" })).toHaveTextContent("当前模型不支持");
+
+    render(
+      <RecordingSettings
+        settings={{
+          ...settings,
+          asr_provider: "deepgram",
+          asr_model: "nova-3",
+          language: "auto",
+          preferred_languages: [],
+        }}
+        save={vi.fn()}
+      />,
+    );
+    expect(screen.queryByRole("button", { name: "العربية" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "粵語" })).toBeNull();
   });
 });

@@ -2,7 +2,7 @@ import "./App.css";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { emit, listen } from "@tauri-apps/api/event";
-import { AudioLines, BookMarked, Bug, CloudCog, Cpu, FileText, History as HistoryIcon, KeyRound, Monitor, PanelsTopLeft, PenLine, ShieldCheck, SlidersHorizontal, Sparkles } from "lucide-react";
+import { AudioLines, BookMarked, Bug, CloudCog, Cpu, FileText, History as HistoryIcon, KeyRound, Monitor, PanelsTopLeft, PenLine, ShieldCheck, SlidersHorizontal } from "lucide-react";
 import { History, type HistoryItem } from "./components/History/History";
 import { Onboarding } from "./components/Onboarding/Onboarding";
 import { ContextSettings } from "./components/ContextSettings";
@@ -11,12 +11,8 @@ import { SettingsAlert } from "./components/SettingsLayout";
 import {
   isSelectedActionError,
   isSelectedActionLifecycle,
-  isSelectedActionPreview,
-  SelectedPreviewDialog,
   type SelectedActionError,
-  type SelectedActionPreview,
   type TextActionErrorCode,
-  type TextActionOutcome,
 } from "./components/SelectedPreviewDialog";
 import { PermissionsSettings, type Permissions } from "./components/PermissionsSettings";
 import { SnippetsSettings } from "./components/SnippetsSettings";
@@ -31,16 +27,15 @@ import { useSettingsPersistence } from "./hooks/useSettingsPersistence";
 import { useSettingsScrollbar } from "./hooks/useSettingsScrollbar";
 import { resolveUiLanguage, type UiLanguagePreference, useI18n } from "./lib/i18n";
 import { closedLidMicrophoneErrorMessage } from "./lib/deliveryCopy";
-import { friendlySettingsError } from "./lib/settingsError";
+import { friendlySettingsError, isDictionaryPartialSyncError } from "./lib/settingsError";
 import { SessionDraftProvider } from "./lib/sessionDraft";
 import { isEngineConnected } from "./lib/engineWizard";
+import { providerById, type ProviderId } from "./lib/providers";
 import { colors, radius, buttonClass, compactButtonClass, ghostButtonClass, focusRingClass } from "./lib/theme";
 import type { AudioInputDevice, ProviderCredentialPurpose, ProviderCredentialReadResult, Settings } from "./types/settings";
 
 type HistoryPage = { items: HistoryItem[]; has_more: boolean };
-type RuntimeErrorNotice =
-  | { kind: "dictation"; message: string }
-  | { kind: "preview_cancel"; message: string; actionSequence: number; transactionId: string };
+type RuntimeErrorNotice = { kind: "dictation"; message: string };
 type View = "general" | "engine" | "dictionary" | "history" | "smart" | "writing" | "permissions" | "system" | "hud" | "snippets" | "debug";
 export function recoveryDestinationView(destination: string): View | null {
   if (destination === "history") return "history";
@@ -48,27 +43,11 @@ export function recoveryDestinationView(destination: string): View | null {
   if (destination === "engine") return "engine";
   if (destination === "permissions") return "permissions";
   if (destination === "system") return "system";
+  if (destination === "smart" || destination === "writing") return "writing";
   return null;
 }
 
-function isDictionarySettingsPartialFailure(reason: unknown): boolean {
-  const message = typeof reason === "string"
-    ? reason
-    : reason instanceof Error
-      ? reason.message
-      : reason && typeof reason === "object" && "message" in reason && typeof reason.message === "string"
-        ? reason.message
-        : "";
-  return message.startsWith("learning_dictionary_partial:");
-}
-
 const brandIconSrc = "/voiceflow-icon-ui.svg";
-const actionOutcomeLabels: Record<TextActionOutcome, string> = {
-  replaced: "结果已替换并验证",
-  unverified: "结果未能验证，请检查目标。",
-  copied: "结果已复制",
-  copied_target_changed: "目标或来源已变化，结果已复制",
-};
 const actionErrorLabels: Record<TextActionErrorCode | "failed", string> = {
   no_source: "没有可处理的来源文本。",
   unsupported_instruction: "无法完成这个文字操作。请重试或取消。",
@@ -88,8 +67,7 @@ const navigationGroups: { label: string; items: { id: View; label: string; icon:
     items: [
       { id: "general", label: "录音与输出", icon: AudioLines },
       { id: "hud", label: "HUD 配置", icon: PanelsTopLeft },
-      { id: "smart", label: "智能整理", icon: Sparkles },
-      { id: "writing", label: "语气", icon: PenLine },
+      { id: "writing", label: "写作与整理", icon: PenLine },
     ],
   },
   {
@@ -160,7 +138,7 @@ function AppContent() {
   const contextualRouteFocus = useRef(false);
   const navigateView = useCallback((next: View) => {
     if (next === "engine") setEnginePage("service");
-    setView(next);
+    setView(next === "smart" ? "writing" : next);
     setRouteNavigationRevision((revision) => revision + 1);
   }, []);
   const openContextualRoute = (next: View) => {
@@ -205,50 +183,16 @@ function AppContent() {
   const [learnUndoBusy, setLearnUndoBusy] = useState(false);
   const learnToastRef = useRef(learnToast);
   learnToastRef.current = learnToast;
-  const [selectedPreview, setSelectedPreview] = useState<SelectedActionPreview | null>(null);
-  const [selectedPreviewDraft, setSelectedPreviewDraft] = useState("");
-  const [selectedPreviewBusy, setSelectedPreviewBusy] = useState(false);
-  const [selectedPreviewError, setSelectedPreviewError] = useState<string | null>(null);
-  const [textActionOutcome, setTextActionOutcome] = useState<TextActionOutcome | null>(null);
   const [selectedActionError, setSelectedActionError] = useState<DisplayedActionError | null>(null);
-  const selectedPreviewRef = useRef<SelectedActionPreview | null>(null);
-  const selectedPreviewDraftRef = useRef("");
-  const previewCommandTransactionRef = useRef<string | null>(null);
-  const closedPreviewTransactionsRef = useRef(new Set<string>());
-  const terminalActionTransactionsRef = useRef(new Set<string>());
   const latestActionSequenceRef = useRef(0);
   const latestActionTransactionRef = useRef<string | null>(null);
-  const pendingPreviewCancellationRef = useRef<{ actionSequence: number; transactionId: string; statusObserved: boolean } | null>(null);
   const selectedActionErrorRef = useRef<DisplayedActionError | null>(null);
-  const selectedPreviewRestoreRef = useRef<HTMLElement | null>(null);
   const permissionCheckInFlight = useRef(false);
   const audioDeviceCheckInFlight = useRef(false);
   const formatSettingsError = useCallback((reason: unknown) => friendlySettingsError(reason, t), [t]);
-  const rememberClosedPreview = useCallback((transactionId: string) => {
-    const closed = closedPreviewTransactionsRef.current;
-    closed.add(transactionId);
-    if (closed.size > 128) {
-      const oldest = closed.values().next().value;
-      if (oldest) closed.delete(oldest);
-    }
-  }, []);
-  const rememberTerminalAction = useCallback((actionSequence: number, transactionId: string) => {
-    const terminal = terminalActionTransactionsRef.current;
-    terminal.add(`${actionSequence}\u0000${transactionId}`);
-    if (terminal.size > 128) {
-      const oldest = terminal.values().next().value;
-      if (oldest) terminal.delete(oldest);
-    }
-    rememberClosedPreview(transactionId);
-  }, [rememberClosedPreview]);
   const updateSelectedActionError = useCallback((error: DisplayedActionError | null) => {
     selectedActionErrorRef.current = error;
     setSelectedActionError(error);
-  }, []);
-  const clearPreviewCancellationNotice = useCallback((actionSequence: number, transactionId: string) => {
-    setRuntimeError((current) => current?.kind === "preview_cancel"
-      && current.actionSequence === actionSequence
-      && current.transactionId === transactionId ? null : current);
   }, []);
   const {
     save,
@@ -303,18 +247,6 @@ function AppContent() {
 
   useEffect(() => {
     let active = true;
-    const actionKey = (actionSequence: number, transactionId: string) => `${actionSequence}\u0000${transactionId}`;
-    const clearVisiblePreview = () => {
-      const current = selectedPreviewRef.current;
-      if (!current) return;
-      rememberClosedPreview(current.transaction_id);
-      selectedPreviewRef.current = null;
-      selectedPreviewDraftRef.current = "";
-      setSelectedPreview(null);
-      setSelectedPreviewDraft("");
-      setSelectedPreviewError(null);
-      setSelectedPreviewBusy(previewCommandTransactionRef.current !== null);
-    };
     const acceptSequence = (actionSequence: number, transactionId: string) => {
       const latest = latestActionSequenceRef.current;
       if (actionSequence < latest) return false;
@@ -327,65 +259,16 @@ function AppContent() {
 
       latestActionSequenceRef.current = actionSequence;
       latestActionTransactionRef.current = transactionId;
-      setRuntimeError((current) => current?.kind === "preview_cancel" && current.actionSequence < actionSequence ? null : current);
-      clearVisiblePreview();
-      setSelectedPreviewError(null);
-      setTextActionOutcome(null);
       if (selectedActionErrorRef.current && selectedActionErrorRef.current.action_sequence < actionSequence) {
         updateSelectedActionError(null);
       }
       return true;
     };
-    const previewSubscription = listen<unknown>("selected-action://preview", (event) => {
-      if (!active || !isSelectedActionPreview(event.payload)) return;
-      const nextPreview = event.payload;
-      if (!acceptSequence(nextPreview.action_sequence, nextPreview.transaction_id)) return;
-      if (closedPreviewTransactionsRef.current.has(nextPreview.transaction_id)
-        || terminalActionTransactionsRef.current.has(actionKey(nextPreview.action_sequence, nextPreview.transaction_id))) return;
-      const current = selectedPreviewRef.current;
-      if (current?.transaction_id === nextPreview.transaction_id) return;
-      if (!current) {
-        selectedPreviewRestoreRef.current = document.activeElement instanceof HTMLElement ? document.activeElement : null;
-      } else {
-        rememberClosedPreview(current.transaction_id);
-      }
-      selectedPreviewRef.current = nextPreview;
-      selectedPreviewDraftRef.current = nextPreview.final_text;
-      setSelectedPreview(nextPreview);
-      setSelectedPreviewDraft(nextPreview.final_text);
-      setSelectedPreviewError(null);
-      setSelectedPreviewBusy(previewCommandTransactionRef.current !== null);
-      setTextActionOutcome(null);
-      updateSelectedActionError(null);
-    });
     const lifecycleSubscription = listen<unknown>("selected-action://lifecycle", (event) => {
       if (!active || !isSelectedActionLifecycle(event.payload)) return;
       const lifecycle = event.payload;
       if (!acceptSequence(lifecycle.action_sequence, lifecycle.transaction_id)) return;
-      const lifecycleIsTerminal = lifecycle.state === "cancelled"
-        || lifecycle.state === "completed"
-        || lifecycle.state === "failed";
-      const pendingCancellation = pendingPreviewCancellationRef.current;
-      if (lifecycleIsTerminal
-        && pendingCancellation?.actionSequence === lifecycle.action_sequence
-        && pendingCancellation.transactionId === lifecycle.transaction_id) {
-        pendingCancellation.statusObserved = true;
-      }
-      if (lifecycleIsTerminal) clearPreviewCancellationNotice(lifecycle.action_sequence, lifecycle.transaction_id);
-      const actionKeyValue = actionKey(lifecycle.action_sequence, lifecycle.transaction_id);
-      if (lifecycle.state === "started") {
-        if (terminalActionTransactionsRef.current.has(actionKeyValue)) return;
-        const current = selectedPreviewRef.current;
-        if (current && current.action_sequence < lifecycle.action_sequence) clearVisiblePreview();
-        return;
-      }
-
-      rememberTerminalAction(lifecycle.action_sequence, lifecycle.transaction_id);
-      const current = selectedPreviewRef.current;
-      const supersedesCurrent = current !== null && lifecycle.action_sequence > current.action_sequence;
-      const matchesCurrent = current?.action_sequence === lifecycle.action_sequence
-        && current.transaction_id === lifecycle.transaction_id;
-      if (supersedesCurrent || matchesCurrent) clearVisiblePreview();
+      if (lifecycle.state === "started") return;
 
       const displayedError = selectedActionErrorRef.current;
       const sameDisplayedError = displayedError?.action_sequence === lifecycle.action_sequence
@@ -406,28 +289,15 @@ function AppContent() {
       if (!active || !isSelectedActionError(event.payload)) return;
       const actionError = event.payload;
       if (!acceptSequence(actionError.action_sequence, actionError.transaction_id)) return;
-      const pendingCancellation = pendingPreviewCancellationRef.current;
-      if (pendingCancellation?.actionSequence === actionError.action_sequence
-        && pendingCancellation.transactionId === actionError.transaction_id) {
-        pendingCancellation.statusObserved = true;
-      }
-      clearPreviewCancellationNotice(actionError.action_sequence, actionError.transaction_id);
-      rememberTerminalAction(actionError.action_sequence, actionError.transaction_id);
-      const current = selectedPreviewRef.current;
-      if (current && (actionError.action_sequence > current.action_sequence
-        || (current.action_sequence === actionError.action_sequence && current.transaction_id === actionError.transaction_id))) {
-        clearVisiblePreview();
-      }
-      setTextActionOutcome(null);
       updateSelectedActionError(actionError);
     });
     return () => {
       active = false;
-      for (const subscription of [previewSubscription, lifecycleSubscription, errorSubscription]) {
+      for (const subscription of [lifecycleSubscription, errorSubscription]) {
         void subscription.then((unlisten) => unlisten()).catch(() => undefined);
       }
     };
-  }, [clearPreviewCancellationNotice, rememberClosedPreview, rememberTerminalAction, updateSelectedActionError]);
+  }, [updateSelectedActionError]);
 
   useEffect(() => {
     let active = true;
@@ -662,56 +532,6 @@ function AppContent() {
     };
   }, []);
 
-  const closeSelectedPreview = useCallback((transactionId: string) => {
-    if (selectedPreviewRef.current?.transaction_id !== transactionId) return false;
-    selectedPreviewRef.current = null;
-    selectedPreviewDraftRef.current = "";
-    setSelectedPreview(null);
-    setSelectedPreviewDraft("");
-    setSelectedPreviewError(null);
-    setSelectedPreviewBusy(false);
-    return true;
-  }, []);
-  const cancelSelectedPreview = useCallback(async () => {
-    const preview = selectedPreviewRef.current;
-    if (!preview) return;
-    const transactionId = preview.transaction_id;
-    const attempt = {
-      actionSequence: preview.action_sequence,
-      transactionId,
-      statusObserved: false,
-    };
-    pendingPreviewCancellationRef.current = attempt;
-    rememberTerminalAction(preview.action_sequence, transactionId);
-    closeSelectedPreview(transactionId);
-    try {
-      await invoke(
-        preview.kind === "screen" ? "cancel_screen_action_preview" : "cancel_selected_action_preview",
-        { transaction_id: transactionId },
-      );
-    } catch {
-      if (pendingPreviewCancellationRef.current === attempt
-        && !attempt.statusObserved
-        && latestActionSequenceRef.current === attempt.actionSequence
-        && latestActionTransactionRef.current === transactionId) {
-        const notice: RuntimeErrorNotice = {
-          kind: "preview_cancel",
-          message: t("无法确认取消，请等待当前操作结束。"),
-          actionSequence: attempt.actionSequence,
-          transactionId,
-        };
-        setRuntimeError(notice);
-        window.setTimeout(() => {
-          setRuntimeError((current) => current === notice ? null : current);
-        }, 6_000);
-      }
-    } finally {
-      if (pendingPreviewCancellationRef.current === attempt) {
-        pendingPreviewCancellationRef.current = null;
-      }
-    }
-  }, [closeSelectedPreview, rememberTerminalAction, t]);
-
   if (loadingError) {
     return (
       <main className={`flex min-h-screen items-center justify-center ${colors.bg.base} p-8 ${colors.text.primary}`}>
@@ -735,7 +555,7 @@ function AppContent() {
         }}
         onSkipToSettings={(page) => {
           setShowOnboarding(false);
-          const routes = { recording: "general", context: "writing", engine: "engine", dictionary: "dictionary", permissions: "permissions", system: "system", history: "history", writing: "writing" } as const;
+          const routes = { recording: "general", context: "writing", engine: "engine", dictionary: "dictionary", permissions: "permissions", system: "system", history: "history", writing: "writing", smart: "writing" } as const;
           if (page) navigateView(routes[page]);
           const startedAtRevision = captureSettingsRevision();
           void invoke<Settings>("get_settings")
@@ -785,7 +605,9 @@ function AppContent() {
         : false);
     const requestIsSupported = provider === "groq"
       ? purpose === undefined
-      : provider === "custom" && purposeIsActive;
+      : provider === "custom"
+        ? purposeIsActive
+        : purpose === undefined && providerById(provider as ProviderId)?.allowsEmptyKey === false;
     if (!requestIsSupported || viewRef.current !== "engine" || enginePageRef.current !== "api_key" || !snapshot) {
       return { status: "stale", settings: null } satisfies ProviderCredentialReadResult;
     }
@@ -821,56 +643,6 @@ function AppContent() {
     }
     await invoke("cancel_provider_credential_read", { requestId });
   };
-  const submitSelectedPreview = async (action: "confirm" | "copy") => {
-    const preview = selectedPreviewRef.current;
-    if (!preview || !selectedPreviewDraftRef.current.trim() || previewCommandTransactionRef.current) return;
-    const transactionId = preview.transaction_id;
-    const command = action === "copy"
-      ? (preview.kind === "screen" ? "copy_screen_action_preview" : "copy_selected_action_preview")
-      : (preview.kind === "screen" ? "confirm_screen_action_preview" : "confirm_selected_action_preview");
-    previewCommandTransactionRef.current = transactionId;
-    setSelectedPreviewBusy(true);
-    setSelectedPreviewError(null);
-    try {
-      const outcome = await invoke<TextActionOutcome>(command, {
-        transaction_id: transactionId,
-        final_text: selectedPreviewDraftRef.current,
-      });
-      const validOutcome = action === "copy"
-        ? outcome === "copied"
-        : outcome === "replaced" || outcome === "unverified" || outcome === "copied" || outcome === "copied_target_changed";
-      if (!validOutcome) throw new Error("Unexpected text action result");
-
-      const pendingCancellation = pendingPreviewCancellationRef.current;
-      if (pendingCancellation?.actionSequence === preview.action_sequence
-        && pendingCancellation.transactionId === transactionId) {
-        pendingCancellation.statusObserved = true;
-      }
-      clearPreviewCancellationNotice(preview.action_sequence, transactionId);
-      const current = selectedPreviewRef.current;
-      if (current?.transaction_id === transactionId) {
-        rememberTerminalAction(preview.action_sequence, transactionId);
-        closeSelectedPreview(transactionId);
-        setTextActionOutcome(outcome);
-      } else if (current === null
-        && latestActionSequenceRef.current === preview.action_sequence
-        && latestActionTransactionRef.current === transactionId) {
-        // A late success after the dialog closes still needs a truthful outcome.
-        setTextActionOutcome(outcome);
-      }
-    } catch {
-      if (selectedPreviewRef.current?.transaction_id === transactionId) {
-        setSelectedPreviewError(t("无法完成这个文字操作。请重试或取消。"));
-      }
-    } finally {
-      if (previewCommandTransactionRef.current === transactionId) {
-        previewCommandTransactionRef.current = null;
-      }
-      setSelectedPreviewBusy(false);
-    }
-  };
-  const confirmSelectedPreview = () => void submitSelectedPreview("confirm");
-  const copySelectedPreview = () => void submitSelectedPreview("copy");
   const undoLearning = async () => {
     if (!learnToast || learnUndoBusy) return;
     const toast = learnToast;
@@ -881,7 +653,7 @@ function AppContent() {
       if (learnToastRef.current === toast) setLearnToast(null);
     } catch (reason) {
       if (learnToastRef.current === toast) {
-        setLearnUndoError(t(isDictionarySettingsPartialFailure(reason)
+        setLearnUndoError(t(isDictionaryPartialSyncError(reason)
           ? "学习规则已撤销，但个人词典同步未完成；请重试。"
           : "撤销未完成，请重试。"));
       }
@@ -897,8 +669,7 @@ function AppContent() {
     setSnippetsSaveError(null);
     try {
       await flushPendingSave();
-      await invoke("update_settings_patch", { patch: { snippets } });
-      setSettings((current) => current ? { ...current, snippets } : current);
+      await save({ snippets }, { immediate: true, rethrow: true });
       setSnippetsSaveRevision((current) => current + 1);
     } catch (reason) {
       setSnippetsSaveError(t("片段未能保存，输入已保留，请重试。"));
@@ -964,26 +735,19 @@ function AppContent() {
             )}
             {runtimeError && (
               <SettingsAlert>
-                {runtimeError.kind === "preview_cancel" ? (
-                  runtimeError.message
-                ) : (
-                  <>
-                    {t("语音输入失败：")}
-                    {runtimeError.message.startsWith("Microphone permission is required")
-                      ? t("请在系统权限中允许 VoiceFlow 使用麦克风后重试。")
-                      : closedLidMicrophoneErrorMessage(runtimeError.message, t)
-                        ?? runtimeError.message}
-                    {runtimeError.message.startsWith("Microphone permission is required") && (
-                      <button type="button" onClick={() => setView("permissions")} className="ml-2 font-medium underline underline-offset-2">
-                        {t("打开系统权限")}
-                      </button>
-                    )}
-                  </>
+                {t("语音输入失败：")}
+                {runtimeError.message.startsWith("Microphone permission is required")
+                  ? t("请在系统权限中允许 VoiceFlow 使用麦克风后重试。")
+                  : closedLidMicrophoneErrorMessage(runtimeError.message, t)
+                    ?? runtimeError.message}
+                {runtimeError.message.startsWith("Microphone permission is required") && (
+                  <button type="button" onClick={() => setView("permissions")} className="ml-2 font-medium underline underline-offset-2">
+                    {t("打开系统权限")}
+                  </button>
                 )}
               </SettingsAlert>
             )}
             {selectedActionError && <p role="alert" className="mb-4 rounded-lg border border-error/30 bg-error/5 px-4 py-3 text-sm text-error-ink">{t(actionErrorLabels[selectedActionError.code])}</p>}
-            {textActionOutcome && <p role="status" aria-live="polite" className="mb-4 rounded-lg border border-border bg-elevated px-4 py-3 text-sm text-primary">{t(actionOutcomeLabels[textActionOutcome])}</p>}
             {learnToast && (
               <div role="status" className="mb-4 flex items-center gap-3 rounded-lg border border-border bg-elevated px-4 py-3 text-sm text-primary">
                 <span className="min-w-0 flex-1">{learnUndoError ?? `${t("已学")} ${learnToast.before}→${learnToast.after}`}</span>
@@ -993,14 +757,29 @@ function AppContent() {
             )}
             <AnimatedContent key={view} className="w-full">
               {view === "history" ? <History items={history} reload={() => reloadHistory()} hasMore={historyHasMore} loading={historyLoading} onLoadMore={loadMoreHistory} error={historyError} onRetry={() => reloadHistory()} onQueryChange={searchHistory} />
-                : view === "smart" ? <ContextSettings onOpenPermissions={() => openContextualRoute("permissions")} onOpenMappings={() => openContextualRoute("writing")} saveFailure={saveFailure} automationOnly writingModes={settings.writing_modes} onWritingModesChange={(writingModes) => save({ writing_modes: writingModes })} outputMode={settings.output_mode} translationTargetLanguage={settings.translation_target_language} onOutputModeChange={(outputMode) => save({ output_mode: outputMode })} onTranslationTargetLanguageChange={(language) => save({ translation_target_language: language })} cleanupIntensity={settings.cleanup_intensity ?? "auto"} onCleanupIntensityChange={(cleanup_intensity) => save({ cleanup_intensity })} windowOcrEnabled={settings.window_ocr_enabled ?? false} onWindowOcrEnabledChange={(window_ocr_enabled) => save({ window_ocr_enabled })} visionProvider={settings.vision_provider ?? ""} visionModel={settings.vision_model ?? ""} onVisionProviderChange={(vision_provider) => save({ vision_provider })} onVisionModelChange={(vision_model) => save({ vision_model })} accurateAsrProvider={settings.accurate_asr_provider ?? "groq"} accurateAsrModel={settings.accurate_asr_model ?? ""} accurateAsrBaseUrl={settings.accurate_asr_base_url ?? ""} onAccurateAsrProviderChange={(accurate_asr_provider) => save({ accurate_asr_provider })} onAccurateAsrModelChange={(accurate_asr_model) => save({ accurate_asr_model })} onAccurateAsrBaseUrlChange={(accurate_asr_base_url) => save({ accurate_asr_base_url })} />
-                  : view === "writing" ? <ContextSettings onOpenPermissions={() => openContextualRoute("permissions")} onOpenDictionary={() => openContextualRoute("dictionary")} saveFailure={saveFailure} writingModes={settings.writing_modes} onWritingModesChange={(writingModes) => save({ writing_modes: writingModes })} />
+                : view === "smart" || view === "writing" ? <ContextSettings onOpenPermissions={() => openContextualRoute("permissions")} onOpenMappings={() => openContextualRoute("writing")} onOpenDictionary={() => openContextualRoute("dictionary")} saveFailure={saveFailure} combined writingModes={settings.writing_modes} onWritingModesChange={(writingModes) => save({ writing_modes: writingModes })} outputMode={settings.output_mode} translationTargetLanguage={settings.translation_target_language} onOutputModeChange={(outputMode) => save({ output_mode: outputMode })} onTranslationTargetLanguageChange={(language) => save({ translation_target_language: language })} cleanupIntensity={settings.cleanup_intensity ?? "auto"} onCleanupIntensityChange={(cleanup_intensity) => save({ cleanup_intensity })} windowOcrEnabled={settings.window_ocr_enabled ?? false} onWindowOcrEnabledChange={(window_ocr_enabled) => save({ window_ocr_enabled })} visionProvider={settings.vision_provider ?? ""} visionModel={settings.vision_model ?? ""} onVisionProviderChange={(vision_provider) => save({ vision_provider })} onVisionModelChange={(vision_model) => save({ vision_model })} accurateAsrProvider={settings.accurate_asr_provider ?? "groq"} accurateAsrModel={settings.accurate_asr_model ?? ""} accurateAsrBaseUrl={settings.accurate_asr_base_url ?? ""} onAccurateAsrProviderChange={(accurate_asr_provider) => save({ accurate_asr_provider })} onAccurateAsrModelChange={(accurate_asr_model) => save({ accurate_asr_model })} onAccurateAsrBaseUrlChange={(accurate_asr_base_url) => save({ accurate_asr_base_url })} />
                     : view === "snippets" ? <SnippetsSettings snippets={settings.snippets} saving={snippetsSaving} saveError={snippetsSaveError} saveRevision={snippetsSaveRevision} onDismissSaveError={() => setSnippetsSaveError(null)} onChange={commitSnippets} />
                       : view === "dictionary" ? <DictionarySettings settings={settings} save={save} onOpenHistory={() => openContextualRoute("history")} onOpenPreferences={() => openContextualRoute("writing")} />
                         : view === "permissions" ? <PermissionsSettings permissions={permissions} checking={permissionsChecking} checkError={permissionsError} onRefresh={refreshPermissions} />
                           : import.meta.env.DEV && view === "debug" ? <DebugSettings settings={settings} save={save} />
                           : view === "system" ? <SystemSettings settings={settings} audioInputDevice={audioInputDevice} audioInputDevices={audioInputDevices} save={save} uncommittedFields={unsavedFields} onUiLanguageChange={changeInterfaceLanguage} />
-                            : view === "hud" ? <HudAppearanceSettings settings={settings} save={save} saving={unsavedFields.includes("hud_appearance") && !saveError} />
+                            : view === "hud" ? (
+                                <HudAppearanceSettings
+                                  settings={settings}
+                                  save={save}
+                                  saving={
+                                    !saveError
+                                    && [
+                                      "hud_appearance",
+                                      "hud_color_variant",
+                                      "hud_processing_color_variant",
+                                      "hud_voice_style",
+                                      "hud_processing_style",
+                                      "hud_voice_intensity",
+                                    ].some((field) => unsavedFields.includes(field as keyof Settings))
+                                  }
+                                />
+                              )
                             : view === "engine" ? <EngineSettings settings={settings} page={enginePage} onPageChange={setEnginePage} removeProviderKey={removeProviderKey} commitEngine={commitEngine} readProviderCredential={readProviderCredential} cancelProviderCredentialRead={cancelProviderCredentialRead} />
                               : <RecordingSettings settings={settings} save={save} saveFailure={saveFailure} dictationBusy={dictationBusy} onOpenPermissions={() => openContextualRoute("permissions")} onOpenMappings={() => openContextualRoute("writing")} />}
             </AnimatedContent>
@@ -1008,22 +787,6 @@ function AppContent() {
         </section>
       </div>
       {whatsNew && !showOnboarding && <WhatsNewDialog payload={whatsNew} onDismiss={() => { save({ whats_new_last_seen_version: whatsNew.version }); setWhatsNew(null); }} />}
-      {selectedPreview && (
-        <SelectedPreviewDialog
-          preview={selectedPreview}
-          draft={selectedPreviewDraft}
-          onDraftChange={(value) => {
-            selectedPreviewDraftRef.current = value;
-            setSelectedPreviewDraft(value);
-          }}
-          onCancel={() => void cancelSelectedPreview()}
-          onCopy={() => void copySelectedPreview()}
-          onConfirm={() => void confirmSelectedPreview()}
-          busy={selectedPreviewBusy}
-          error={selectedPreviewError}
-          restoreFocusRef={selectedPreviewRestoreRef}
-        />
-      )}
     </main>
   );
 }

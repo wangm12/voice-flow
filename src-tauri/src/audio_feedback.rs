@@ -104,9 +104,8 @@ fn feedback_filename(sound: FeedbackSound) -> &'static str {
 /// cannot leave a spawned child without an owner. Playback stays off the caller.
 fn spawn_feedback_process(
     command: Command,
-    cue: Option<CaptureCueHandle>,
 ) -> std::io::Result<std::thread::JoinHandle<std::io::Result<(u32, ExitStatus)>>> {
-    spawn_feedback_process_with_wait(command, cue, |mut child| {
+    spawn_feedback_process_with_wait(command, None, |mut child, _| {
         let pid = child.id();
         child.wait().map(|status| (pid, status))
     })
@@ -118,19 +117,14 @@ fn spawn_feedback_process_with_wait<W>(
     wait_child: W,
 ) -> std::io::Result<std::thread::JoinHandle<std::io::Result<(u32, ExitStatus)>>>
 where
-    W: FnOnce(std::process::Child) -> std::io::Result<(u32, ExitStatus)> + Send + 'static,
+    W: FnOnce(std::process::Child, Option<CaptureCueHandle>) -> std::io::Result<(u32, ExitStatus)>
+        + Send
+        + 'static,
 {
     std::thread::Builder::new()
         .name("voice-flow-feedback".into())
         .spawn(move || {
-            if let Some(cue) = &cue {
-                cue.begin();
-            }
-            let result = command.spawn().and_then(wait_child);
-            let success = matches!(&result, Ok((_, status)) if status.success());
-            if let Some(cue) = &cue {
-                cue.finish(success);
-            }
+            let result = command.spawn().and_then(|child| wait_child(child, cue));
             match &result {
                 Err(error) => log::warn!("feedback playback failed: {error}"),
                 Ok((_, status)) if !status.success() => {
@@ -158,7 +152,7 @@ impl FeedbackPlayer for AfplayPlayer {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        if let Err(error) = spawn_feedback_process(command, None) {
+        if let Err(error) = spawn_feedback_process(command) {
             log::warn!("feedback playback could not start: {error}");
         }
     }
@@ -224,6 +218,62 @@ pub fn clear_test_player() {
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
 }
 
+fn cue_wav_duration(path: &Path) -> std::time::Duration {
+    let Ok(reader) = hound::WavReader::open(path) else {
+        return std::time::Duration::from_millis(120);
+    };
+    let spec = reader.spec();
+    let sample_rate = u64::from(spec.sample_rate.max(1));
+    let channels = u64::from(spec.channels.max(1));
+    let frames = u64::from(reader.len()) / channels;
+    let ms = frames
+        .saturating_mul(1_000)
+        .div_ceil(sample_rate)
+        .clamp(20, 250);
+    std::time::Duration::from_millis(ms)
+}
+
+fn spawn_start_feedback_process(
+    command: Command,
+    cue: Option<CaptureCueHandle>,
+    cue_duration: std::time::Duration,
+) -> std::io::Result<std::thread::JoinHandle<std::io::Result<(u32, ExitStatus)>>> {
+    let max_cue_mask = (cue_duration + std::time::Duration::from_millis(240))
+        .min(std::time::Duration::from_millis(300));
+    spawn_feedback_process_with_wait(command, cue, move |mut child, cue| {
+        let pid = child.id();
+        if let Some(cue) = cue {
+            cue.begin();
+            let started = std::time::Instant::now();
+            loop {
+                match child.try_wait() {
+                    Ok(Some(status)) => {
+                        cue.finish(status.success());
+                        return Ok((pid, status));
+                    }
+                    Ok(None) => {
+                        let elapsed = started.elapsed();
+                        if elapsed >= max_cue_mask {
+                            // Unmask the mic once the cue window finishes even if
+                            // `afplay` continues tearing down its audio graph.
+                            cue.finish(true);
+                            return child.wait().map(|status| (pid, status));
+                        }
+                        let step =
+                            (max_cue_mask - elapsed).min(std::time::Duration::from_millis(10));
+                        std::thread::sleep(step);
+                    }
+                    Err(error) => {
+                        cue.finish(false);
+                        return Err(error);
+                    }
+                }
+            }
+        }
+        child.wait().map(|status| (pid, status))
+    })
+}
+
 pub fn play_start(app: &AppHandle, enabled: bool, user_volume: f32, cue: Option<CaptureCueHandle>) {
     #[cfg(test)]
     if PLAYER_OVERRIDE
@@ -247,6 +297,7 @@ pub fn play_start(app: &AppHandle, enabled: bool, user_volume: f32, cue: Option<
         log::warn!("feedback wav missing: {}", path.display());
         return;
     }
+    let cue_duration = cue_wav_duration(&path);
     let mut command = Command::new("afplay");
     command
         .arg("-v")
@@ -255,7 +306,7 @@ pub fn play_start(app: &AppHandle, enabled: bool, user_volume: f32, cue: Option<
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    if let Err(error) = spawn_feedback_process(command, cue) {
+    if let Err(error) = spawn_start_feedback_process(command, cue, cue_duration) {
         log::warn!("feedback playback could not start: {error}");
     }
 }
@@ -283,7 +334,7 @@ mod tests {
             .stdin(Stdio::from(OwnedFd::from(input)))
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        let waiter = spawn_feedback_process(command, None).unwrap();
+        let waiter = spawn_feedback_process(command).unwrap();
         assert!(!waiter.is_finished());
         drop(hold_open);
         let (pid, status) = waiter.join().unwrap().unwrap();
@@ -315,10 +366,17 @@ mod tests {
             .stderr(Stdio::null());
         let (wait_started_tx, wait_started_rx) = std::sync::mpsc::channel();
         let waiter =
-            spawn_feedback_process_with_wait(command, Some(cue.clone()), move |mut child| {
+            spawn_feedback_process_with_wait(command, Some(cue.clone()), move |mut child, cue| {
+                if let Some(cue) = &cue {
+                    cue.begin();
+                }
                 wait_started_tx.send(()).unwrap();
                 let pid = child.id();
-                child.wait().map(|status| (pid, status))
+                let result = child.wait().map(|status| (pid, status));
+                if let Some(cue) = &cue {
+                    cue.finish(matches!(&result, Ok((_, status)) if status.success()));
+                }
+                result
             })
             .unwrap();
         wait_started_rx.recv().unwrap();
@@ -335,13 +393,38 @@ mod tests {
         let failed = CaptureCueHandle::test_handle(16_000);
         let mut command = Command::new("/usr/bin/false");
         command.stdout(Stdio::null()).stderr(Stdio::null());
-        let (_, status) = spawn_feedback_process(command, Some(failed.clone()))
-            .unwrap()
-            .join()
-            .unwrap()
-            .unwrap();
+        let (_, status) = spawn_start_feedback_process(
+            command,
+            Some(failed.clone()),
+            std::time::Duration::from_millis(200),
+        )
+        .unwrap()
+        .join()
+        .unwrap()
+        .unwrap();
         assert!(!status.success());
-        assert_eq!(failed.test_observation().1, None);
+        assert_eq!(failed.test_observation(), (None, None));
+
+        let slow_teardown = CaptureCueHandle::test_handle(16_000);
+        let (input, hold_open) = UnixStream::pair().unwrap();
+        let mut command = Command::new("/bin/cat");
+        command
+            .stdin(Stdio::from(OwnedFd::from(input)))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let waiter = spawn_start_feedback_process(
+            command,
+            Some(slow_teardown.clone()),
+            std::time::Duration::from_millis(30),
+        )
+        .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(320));
+        // Cue mask window ended at the 300ms cap even while `cat` remained alive.
+        assert_eq!(slow_teardown.test_observation().0, Some(0));
+        assert!(slow_teardown.test_is_finished());
+        drop(hold_open);
+        let (_, status) = waiter.join().unwrap().unwrap();
+        assert!(status.success());
 
         let wait_failed = CaptureCueHandle::test_handle(16_000);
         let mut command = Command::new("/bin/cat");
@@ -349,29 +432,42 @@ mod tests {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        let result =
-            spawn_feedback_process_with_wait(command, Some(wait_failed.clone()), |mut child| {
+        let result = spawn_feedback_process_with_wait(
+            command,
+            Some(wait_failed.clone()),
+            |mut child, cue| {
+                if let Some(cue) = &cue {
+                    cue.begin();
+                }
                 let _pid = child.id();
                 let _status = child.wait()?;
+                if let Some(cue) = &cue {
+                    cue.finish(false);
+                }
                 Err(std::io::Error::other(
                     "injected wait result failure after real child reap",
                 ))
-            })
-            .unwrap()
-            .join()
-            .unwrap();
+            },
+        )
+        .unwrap()
+        .join()
+        .unwrap();
         assert!(result.is_err());
-        assert_eq!(wait_failed.test_observation().1, None);
+        assert_eq!(wait_failed.test_observation(), (None, None));
 
         let missing = CaptureCueHandle::test_handle(16_000);
         let mut command = Command::new("/voice-flow-missing-feedback-fixture");
         command.stdout(Stdio::null()).stderr(Stdio::null());
-        assert!(spawn_feedback_process(command, Some(missing.clone()))
-            .unwrap()
-            .join()
-            .unwrap()
-            .is_err());
-        assert_eq!(missing.test_observation().1, None);
+        assert!(spawn_start_feedback_process(
+            command,
+            Some(missing.clone()),
+            std::time::Duration::from_millis(50),
+        )
+        .unwrap()
+        .join()
+        .unwrap()
+        .is_err());
+        assert_eq!(missing.test_observation(), (None, None));
     }
 
     #[test]

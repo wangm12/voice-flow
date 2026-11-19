@@ -3,6 +3,7 @@ pub(crate) const COMMANDS: &[&str] = &[
     "stop_dictation_from_hud",
     "cancel_dictation_from_hud",
     "get_settings",
+    "get_action_preview_bootstrap",
     "get_hud_appearance_status",
     "read_provider_credential_from_keychain",
     "cancel_provider_credential_read",
@@ -73,6 +74,7 @@ pub(crate) const COMMANDS: &[&str] = &[
     "cancel_local_cleanup_model_download",
     "delete_local_cleanup_model",
     "list_on_device_models",
+    "get_on_device_memory_budget",
     "download_on_device_model",
     "cancel_on_device_download",
     "cancel_on_device_model_load",
@@ -118,10 +120,38 @@ pub(crate) const COMMANDS: &[&str] = &[
     "close_permission_guide",
 ];
 
+/// Exact command subset assigned to the independent preview window capability.
+pub(crate) const PREVIEW_COMMANDS: &[&str] = &[
+    "get_action_preview_bootstrap",
+    "confirm_selected_action_preview",
+    "copy_selected_action_preview",
+    "cancel_selected_action_preview",
+    "confirm_screen_action_preview",
+    "copy_screen_action_preview",
+    "cancel_screen_action_preview",
+];
+
+pub(crate) fn validate_preview_commands_in_app_manifest() -> Result<(), &'static str> {
+    if PREVIEW_COMMANDS
+        .iter()
+        .all(|command| COMMANDS.contains(command))
+    {
+        Ok(())
+    } else {
+        Err("preview capability commands must be registered in the shared app manifest")
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::COMMANDS;
+    use super::{COMMANDS, PREVIEW_COMMANDS};
     use std::collections::BTreeSet;
+
+    #[test]
+    fn preview_commands_are_registered_in_the_application_manifest() {
+        assert!(super::validate_preview_commands_in_app_manifest().is_ok());
+    }
+
     const MAIN: &[&str] = &[
         "get_settings",
         "get_hud_appearance_status",
@@ -193,6 +223,7 @@ mod tests {
         "cancel_local_cleanup_model_download",
         "delete_local_cleanup_model",
         "list_on_device_models",
+        "get_on_device_memory_budget",
         "download_on_device_model",
         "cancel_on_device_download",
         "cancel_on_device_model_load",
@@ -203,12 +234,6 @@ mod tests {
         "save_history_revision",
         "get_history_revisions",
         "reclean_history",
-        "confirm_selected_action_preview",
-        "copy_selected_action_preview",
-        "cancel_selected_action_preview",
-        "confirm_screen_action_preview",
-        "copy_screen_action_preview",
-        "cancel_screen_action_preview",
         "delete_history",
         "check_permissions",
         "get_audio_input_devices",
@@ -235,6 +260,7 @@ mod tests {
         "get_hud_appearance_status",
         "get_delivery_settlement_snapshot",
         "undo_learn_pair",
+        "promote_learn_pair",
         "hide_island_if_idle",
         "set_island_learn_interactive",
         "set_island_details_visible",
@@ -311,26 +337,44 @@ mod tests {
     fn source_capabilities_are_exact_and_window_bound() {
         let main = json("capabilities/default.json");
         let island = json("capabilities/island.json");
+        let preview = json("capabilities/preview.json");
         let conf = json("tauri.conf.json");
         assert_eq!(main["identifier"], "default");
         assert_eq!(island["identifier"], "island");
+        assert_eq!(preview["identifier"], "preview");
         assert!(source_local(&main));
         assert!(source_local(&island));
+        assert!(source_local(&preview));
         assert!(main.get("remote").is_none());
         assert!(island.get("remote").is_none());
         assert!(main.get("webviews").is_none());
         assert!(island.get("webviews").is_none());
+        assert!(preview.get("remote").is_none());
+        assert!(preview.get("webviews").is_none());
         assert_eq!(main["windows"], serde_json::json!(["main"]));
         assert_eq!(island["windows"], serde_json::json!(["island"]));
+        assert_eq!(preview["windows"], serde_json::json!(["preview"]));
         let labels: BTreeSet<_> = conf["app"]["windows"]
             .as_array()
             .unwrap()
             .iter()
             .map(|x| x["label"].as_str().unwrap())
             .collect();
-        assert_eq!(labels, ["main", "island"].into_iter().collect());
+        assert_eq!(labels, ["main", "island", "preview"].into_iter().collect());
+        let preview_config = conf["app"]["windows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|window| window["label"] == "preview")
+            .unwrap();
+        assert_eq!(preview_config["create"], false);
+        assert_eq!(preview_config["width"], 480);
+        assert_eq!(preview_config["height"], 300);
+        assert_eq!(preview_config["alwaysOnTop"], true);
+        assert_eq!(preview_config["visibleOnAllWorkspaces"], true);
         let mp = perms(&main);
         let ip = perms(&island);
+        let pp = perms(&preview);
         let expected_m: BTreeSet<String> = MAIN
             .iter()
             .map(|x| format!("allow-{}", x.replace('_', "-")))
@@ -360,27 +404,48 @@ mod tests {
                 .map(str::to_owned),
             )
             .collect();
+        let expected_p: BTreeSet<String> = PREVIEW_COMMANDS
+            .iter()
+            .map(|x| format!("allow-{}", x.replace('_', "-")))
+            .collect();
         assert_eq!(mp, expected_m);
         assert_eq!(ip, expected_i);
+        assert_eq!(pp, expected_p);
+        assert!(pp.iter().all(|p| {
+            !p.starts_with("core:event:")
+                && !p.starts_with("core:window:")
+                && !p.starts_with("dialog:")
+        }));
         let ms: BTreeSet<_> = MAIN.iter().copied().collect();
         let is: BTreeSet<_> = ISLAND.iter().copied().collect();
-        assert_eq!(ms.len(), 104);
-        assert_eq!(is.len(), 15);
+        let ps: BTreeSet<_> = PREVIEW_COMMANDS.iter().copied().collect();
+        assert_eq!(ms.len(), 99);
+        assert_eq!(is.len(), 16);
+        assert_eq!(ps.len(), 7);
         assert_eq!(
             ms.intersection(&is).copied().collect::<BTreeSet<_>>(),
             [
                 "get_hud_appearance_status",
                 "get_settings",
+                "promote_learn_pair",
                 "undo_learn_pair"
             ]
             .into_iter()
             .collect()
         );
+        assert!(ms.is_disjoint(&ps));
+        assert!(is.is_disjoint(&ps));
         assert_eq!(
-            ms.union(&is).copied().collect::<BTreeSet<_>>(),
+            ms.union(&is)
+                .copied()
+                .collect::<BTreeSet<_>>()
+                .union(&ps)
+                .copied()
+                .collect::<BTreeSet<_>>(),
             COMMANDS.iter().copied().collect()
         );
-        assert_eq!(ms.union(&is).count(), 116);
+        assert_eq!(ms.union(&is).count(), 111);
+        assert_eq!(ms.len() + is.len() + ps.len(), 122);
         for command in [
             "export_learning_transfer",
             "preview_learning_transfer",
@@ -409,7 +474,16 @@ mod tests {
         ] {
             assert!(!is.contains(c));
         }
-        assert!(mp.iter().chain(ip.iter()).all(|p| !p.contains('*')));
+        for c in PREVIEW_COMMANDS {
+            assert!(ps.contains(c), "{c} must be available to preview");
+            assert!(!ms.contains(c), "{c} must not be available to main");
+            assert!(!is.contains(c), "{c} must not be available to island");
+        }
+        assert!(mp
+            .iter()
+            .chain(ip.iter())
+            .chain(pp.iter())
+            .all(|p| !p.contains('*')));
     }
     #[test]
     fn generated_acl_outputs_bind_registered_commands() {
@@ -417,7 +491,7 @@ mod tests {
         let app = acl["__app-acl__"]["permissions"]
             .as_object()
             .expect("generated app permissions");
-        assert_eq!(app.len(), 232);
+        assert_eq!(app.len(), 236);
         for c in COMMANDS {
             let allow = &app[&format!("allow-{}", c.replace('_', "-"))]["commands"];
             let deny = &app[&format!("deny-{}", c.replace('_', "-"))]["commands"];
@@ -433,10 +507,14 @@ mod tests {
             .keys()
             .map(String::as_str)
             .collect();
-        assert_eq!(resolved_keys, ["default", "island"].into_iter().collect());
+        assert_eq!(
+            resolved_keys,
+            ["default", "island", "preview"].into_iter().collect()
+        );
         for (id, file) in [
             ("default", "capabilities/default.json"),
             ("island", "capabilities/island.json"),
+            ("preview", "capabilities/preview.json"),
         ] {
             let src = json(file);
             let generated = &resolved[id];

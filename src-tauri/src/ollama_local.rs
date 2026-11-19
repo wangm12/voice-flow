@@ -7,23 +7,24 @@
 use reqwest::{redirect::Policy, Client, Method, StatusCode, Url};
 use serde::Serialize;
 use serde_json::{json, Value};
-use std::sync::OnceLock;
-use std::time::Duration;
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 pub const MODEL: &str = "qwen3.5:4b";
 
 const MODEL_WITH_LOCAL_SUFFIX: &str = "qwen3.5:4b:local";
 const MAX_STATUS_BODY_BYTES: usize = 512 * 1024;
 const MAX_CHAT_BODY_BYTES: usize = 2 * 1024 * 1024;
-// A conservative UTF-8 byte ceiling, not a token-count estimate. With at
-// most 64 messages, this leaves half of the 8k context for the model's chat
-// template, message framing, and separators under byte-fallback tokenization.
-const MAX_INPUT_BYTES: usize = 4096;
+const MAX_INPUT_BYTES: usize = 12_288;
+const PREFLIGHT_CACHE_TTL: Duration = Duration::from_secs(60);
 const MAX_MESSAGES: usize = 64;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const METADATA_TIMEOUT: Duration = Duration::from_secs(8);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(180);
-const NUM_CTX: u32 = 8192;
+// 12,288 UTF-8 bytes can reach ~6k-12k dense CJK/ASCII tokens; keep NUM_CTX well
+// above MAX_INPUT_BYTES + NUM_PREDICT so Ollama never head-truncates the system prompt.
+const NUM_CTX: u32 = 16_384;
 const NUM_PREDICT: u32 = 2048;
 
 #[derive(Debug, Clone, Serialize)]
@@ -228,7 +229,35 @@ pub async fn status(base_url: &str, requested_model: &str) -> LocalCleanupStatus
     }
 }
 
+type PreflightCache = Mutex<HashMap<(String, String), (Instant, Preflight)>>;
+
+fn preflight_cache() -> &'static PreflightCache {
+    static CACHE: OnceLock<PreflightCache> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn invalidate_preflight_cache(base: &Url) {
+    let cache_key = (base.as_str().to_owned(), MODEL.to_owned());
+    preflight_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(&cache_key);
+}
+
 async fn preflight(base: &Url) -> Result<Preflight, FailureKind> {
+    let cache_key = (base.as_str().to_owned(), MODEL.to_owned());
+    {
+        let mut guard = preflight_cache()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.retain(|_, (cached_at, _)| cached_at.elapsed() < PREFLIGHT_CACHE_TTL);
+        if let Some((_, cached)) = guard.get(&cache_key) {
+            return Ok(Preflight {
+                model_for_chat: cached.model_for_chat,
+            });
+        }
+    }
+
     let version_url =
         endpoint_from_base(base, "/api/version").ok_or(FailureKind::InvalidEndpoint)?;
     let version_response = get_json(&version_url, MAX_STATUS_BODY_BYTES)
@@ -264,17 +293,15 @@ async fn preflight(base: &Url) -> Result<Preflight, FailureKind> {
         .and_then(Value::as_array)
         .ok_or(FailureKind::UnsupportedServer)?;
 
-    // Fail closed if Ollama advertises any remote mapping. This check happens
-    // before `/api/show` or any request containing user text.
-    if models.iter().any(has_remote_mapping) {
-        return Err(FailureKind::ModelRemote);
-    }
-
-    let installed = models
+    let target_model = models
         .iter()
-        .any(|model| model.get("name").and_then(Value::as_str) == Some(MODEL));
-    if !installed {
-        return Err(FailureKind::ModelMissing);
+        .find(|model| model.get("name").and_then(Value::as_str) == Some(MODEL))
+        .ok_or(FailureKind::ModelMissing)?;
+
+    // Reject only when the active local cleanup model itself advertises a
+    // remote mapping; unrelated cloud models installed in Ollama stay allowed.
+    if has_remote_mapping(target_model) {
+        return Err(FailureKind::ModelRemote);
     }
 
     if !use_local_suffix && cloud_disabled != Some(true) {
@@ -292,13 +319,26 @@ async fn preflight(base: &Url) -> Result<Preflight, FailureKind> {
         return Err(FailureKind::ModelRemote);
     }
 
-    Ok(Preflight {
+    let result = Preflight {
         model_for_chat: if use_local_suffix {
             MODEL_WITH_LOCAL_SUFFIX
         } else {
             MODEL
         },
-    })
+    };
+    preflight_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(
+            cache_key,
+            (
+                Instant::now(),
+                Preflight {
+                    model_for_chat: result.model_for_chat,
+                },
+            ),
+        );
+    Ok(result)
 }
 
 fn has_remote_mapping(value: &Value) -> bool {
@@ -463,9 +503,13 @@ pub async fn complete_at_endpoint(
     });
     let response = post_json(&chat_url, &body, MAX_CHAT_BODY_BYTES)
         .await
-        .map_err(map_chat_error)?;
+        .map_err(|err| {
+            invalidate_preflight_cache(&base);
+            map_chat_error(err)
+        })?;
 
     if has_remote_mapping(&response) || response.get("message").is_some_and(has_remote_mapping) {
+        invalidate_preflight_cache(&base);
         return Err(FailureKind::ModelRemote.message().to_owned());
     }
     if !is_normal_completion(&response) {
@@ -571,5 +615,89 @@ fn map_chat_error(error: CallError) -> String {
         CallError::Http => FailureKind::UnsupportedServer.message().to_owned(),
         CallError::BodyTooLarge => "Ollama returned too much cleanup data. Try again.".to_owned(),
         CallError::InvalidJson => FailureKind::UnsupportedServer.message().to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    #[test]
+    fn validate_messages_accepts_up_to_12288_bytes_and_rejects_above() {
+        assert_eq!(MAX_INPUT_BYTES, 12_288);
+        let ok_10k = vec![("user".to_owned(), "a".repeat(10_000))];
+        assert!(validate_messages(&ok_10k).is_ok());
+
+        let ok_exact = vec![("user".to_owned(), "a".repeat(12_288))];
+        assert!(validate_messages(&ok_exact).is_ok());
+
+        let too_large = vec![("user".to_owned(), "a".repeat(12_289))];
+        assert!(validate_messages(&too_large).is_err());
+    }
+
+    #[tokio::test]
+    async fn preflight_ignores_unrelated_remote_models_and_caches_for_60s() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_bg = hits.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                hits_bg.fetch_add(1, Ordering::Relaxed);
+                let mut buf = [0u8; 4096];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let body = if req.contains("GET /api/version ") {
+                    r#"{"version":"0.35.0"}"#
+                } else if req.contains("GET /api/tags ") {
+                    r#"{"models":[{"name":"llama3:cloud","remote_model":"llama3"},{"name":"qwen3.5:4b"}]}"#
+                } else if req.contains("POST /api/show ") {
+                    r#"{"details":{"family":"qwen3.5"}}"#
+                } else {
+                    r#"{}"#
+                };
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes()).await;
+            }
+        });
+
+        let base_url = format!("http://{addr}");
+        let first = status(&base_url, MODEL).await;
+        assert!(
+            first.available,
+            "unrelated remote model must not block target {MODEL}: {first:?}"
+        );
+        let after_first = hits.load(Ordering::Relaxed);
+        assert!(after_first >= 3);
+
+        let second = status(&base_url, MODEL).await;
+        assert!(second.available);
+        assert_eq!(
+            hits.load(Ordering::Relaxed),
+            after_first,
+            "second preflight within 60s should hit cache without network requests"
+        );
+        server.abort();
+    }
+
+    #[test]
+    fn ollama_local_context_window_fits_max_input_plus_output_budget() {
+        assert_eq!(MAX_INPUT_BYTES, 12_288);
+        assert_eq!(NUM_CTX, 16_384);
+        assert!(
+            u64::from(NUM_CTX) >= (MAX_INPUT_BYTES as u64) + u64::from(NUM_PREDICT),
+            "NUM_CTX must cover worst-case 1-byte/token dense input plus NUM_PREDICT output"
+        );
     }
 }

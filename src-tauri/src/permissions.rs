@@ -130,6 +130,7 @@ pub fn open_privacy_settings(pane: &str) -> Result<(), String> {
             "accessibility" => "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_Accessibility",
             "microphone" => "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_Microphone",
             "screen" => "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_ScreenCapture",
+            "input_monitoring" => "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_ListenEvent",
             "keyboard" => "x-apple.systempreferences:com.apple.Keyboard-Settings.extension",
             _ => return Err(format!("unknown pane: {pane}")),
         };

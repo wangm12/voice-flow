@@ -1,5 +1,6 @@
 import type { Settings } from "../types/settings";
 import type { JsonObject } from "./customCleanupParameters";
+import { languageDisplayLabel, languageSupportedByModel } from "./languages";
 import {
   defaultModel,
   dashscopeEndpointForRegion,
@@ -281,29 +282,37 @@ export function asrLanguageDescription(
         : t("此模型只使用自动语言检测。");
     case "auto_detect_or_fixed_language":
       return fixed
-        ? `${t("当前按单一固定语言转写：")} ${language === "zh" ? t("中文") : t("English")}`
+        ? `${t("当前按单一固定语言转写：")} ${languageDisplayLabel(language, t)}`
         : t("此模型可自动检测，也可按单一支持的语言转写。");
     case "optional_fixed_language":
       return fixed
-        ? `${t("当前按单一固定语言转写：")} ${language === "zh" ? t("中文") : t("English")}`
+        ? `${t("当前按单一固定语言转写：")} ${languageDisplayLabel(language, t)}`
         : t("此模型可自动检测，也可指定一种固定语言。");
     case "explicit_language_required":
-      return language === "zh" || language === "en"
-        ? `${t("此模型要求固定语言：")} ${language === "zh" ? t("中文") : t("English")}`
-        : t("此模型要求固定使用中文或 English；自动语言检测不可用。请在录音设置中更改识别语言。");
+      return fixed
+        ? `${t("此模型要求固定语言：")} ${languageDisplayLabel(language, t)}`
+        : t("此模型要求固定使用一种语言；自动语言检测不可用。请在录音设置中更改识别语言。");
     case "explicit_language_list":
       return language === "auto"
-        ? t("自动设置会显式请求中文和 English 的语言列表；这不是服务端自动检测。")
-        : `${t("当前明确发送单一识别语言：")} ${language === "zh" ? t("中文") : t("English")}`;
+        ? t("自动检测未设置常用语言时会使用无偏向的多语言自动检测；若选择了常用语言，则会发送对应的语言范围。")
+        : `${t("当前明确发送单一识别语言：")} ${languageDisplayLabel(language, t)}`;
     case "candidate_language_hints":
       return fixed
-        ? t("当前语言会作为候选提示发送，不会锁定识别语言。")
-        : t("自动检测；固定语言可作为候选提示，不会锁定识别语言。");
+        ? `${t("当前语言会作为候选提示发送，不会锁定识别语言：")} ${languageDisplayLabel(language, t)}`
+        : t("自动检测；若设置了常用语言，将仅把常用语言作为候选提示，不会锁定识别语言。");
     case "unsupported":
       return t("此模型不接受语言参数；当前选择不会发送。");
   }
 }
 
-export function hasSupportedAsrLanguage(profile: AsrModelProfile | undefined, language: string): boolean {
-  return profile?.languageSupport !== "explicit_language_required" || language === "zh" || language === "en";
+export function hasSupportedAsrLanguage(
+  profile: AsrModelProfile | undefined,
+  language: string,
+  provider?: ProviderId | string,
+  model?: string,
+): boolean {
+  if (provider) {
+    return languageSupportedByModel(provider, model, language);
+  }
+  return profile?.languageSupport !== "explicit_language_required" || language !== "auto";
 }

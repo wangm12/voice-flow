@@ -56,6 +56,75 @@ final class CleanupTokenBudgetTests: XCTestCase {
     }
   }
 
+  func testPrefixCacheIdentityPinsEachEnabledModelAndEveryGenerationOption() throws {
+    let parameters = GenerateParameters(
+      maxTokens: 2_048,
+      temperature: 0,
+      topP: 1,
+      topK: 0,
+      prefillStepSize: PromptPrefixBoundary.step
+    )
+    let routes = [
+      CleanupModelRoute.qwen35TwoB,
+      CleanupModelRoute.qwen35FourB,
+      CleanupModelRoute.gemma4E4b,
+      CleanupModelRoute.ministral3ThreeB,
+      CleanupModelRoute.qwen38TwentySevenB,
+    ]
+    let identities = try routes.map { route in
+      try XCTUnwrap(
+        PromptCacheKeyIdentity.make(
+          route: route,
+          parameters: parameters,
+          runtimeVersion: sidecarRuntimeVersion,
+          sdkIdentity: PromptCacheSDKIdentity.current
+        )
+      )
+    }
+    XCTAssertEqual(Set(identities).count, routes.count)
+    XCTAssertTrue(identities.allSatisfy { $0.contains("|revision=") && $0.contains("|manifest=") })
+    XCTAssertTrue(
+      identities.allSatisfy { $0.contains("|sdk=\(PromptCacheSDKIdentity.current)|") }
+    )
+
+    var changedParameters = parameters
+    changedParameters.topK = 4
+    XCTAssertNotEqual(
+      identities[0],
+      PromptCacheKeyIdentity.make(
+        route: routes[0],
+        parameters: changedParameters,
+        runtimeVersion: sidecarRuntimeVersion,
+        sdkIdentity: PromptCacheSDKIdentity.current
+      )
+    )
+    XCTAssertNotEqual(
+      identities[0],
+      PromptCacheKeyIdentity.make(
+        route: routes[0],
+        parameters: parameters,
+        runtimeVersion: sidecarRuntimeVersion,
+        sdkIdentity: "mlx-swift=synthetic"
+      )
+    )
+    XCTAssertNil(
+      PromptCacheKeyIdentity.make(
+        route: CleanupModelRoute.qwen35NineB,
+        parameters: parameters,
+        runtimeVersion: sidecarRuntimeVersion,
+        sdkIdentity: PromptCacheSDKIdentity.current
+      )
+    )
+    XCTAssertNil(
+      PromptCacheKeyIdentity.make(
+        route: CleanupModelRoute.gemma4E2b,
+        parameters: parameters,
+        runtimeVersion: sidecarRuntimeVersion,
+        sdkIdentity: PromptCacheSDKIdentity.current
+      )
+    )
+  }
+
   func testMemoryPressureMonitorPreservesUnknownAndRecordsCriticalTransitions() {
     let monitor = CleanupMemoryPressureMonitor(startMonitoring: false)
     XCTAssertEqual(monitor.current, .unknown)
@@ -342,7 +411,7 @@ final class CleanupTokenBudgetTests: XCTestCase {
     XCTAssertNil(PromptCacheTokenInput.suffix([11, 12], after: 2))
   }
 
-  func testRecordingLanguageModelBuildsExactlyTheDeclaredShortOr512TokenPrefix() throws {
+  func testDynamicHeterogeneousLanguageModelBuildsExactlyTheDeclaredPrefix() throws {
     let cases = [
       (prefixTokens: 128, actualTokens: 129, windowSize: 128),
       (prefixTokens: 511, actualTokens: 512, windowSize: 511),
@@ -397,15 +466,105 @@ final class CleanupTokenBudgetTests: XCTestCase {
           .cacheSignature(cache.cache, expectedPrefixTokens: testCase.prefixTokens),
         cache.stateSignature
       )
-      XCTAssertEqual(cache.cache.count, 64)
+      XCTAssertEqual(cache.cache.count, 3)
       XCTAssertTrue(cache.cache.contains { $0 is MambaCache })
       XCTAssertTrue(cache.cache.contains { $0 is KVCacheSimple })
+      XCTAssertTrue(cache.cache.contains { $0 is RotatingKVCache })
       XCTAssertTrue(
         cache.cache.filter { $0 is KVCacheSimple }.allSatisfy {
           $0.offset == testCase.prefixTokens
         }
       )
+      XCTAssertTrue(
+        cache.cache.filter { $0 is RotatingKVCache }.allSatisfy {
+          $0.offset == testCase.prefixTokens
+        }
+      )
+      XCTAssertTrue(cache.cache.filter { $0 is MambaCache }.allSatisfy { $0.offset == 0 })
     }
+  }
+
+  func testVerifiedLegacyActiveSnapshotIsRetiredDuringDurableRecovery() throws {
+    let modelsRoot = temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: modelsRoot) }
+    let cacheParent = modelsRoot
+      .appendingPathComponent("cleanup", isDirectory: true)
+      .appendingPathComponent(".voiceflow-mlx-cache", isDirectory: true)
+    let cacheRoot = cacheParent.appendingPathComponent("prompt-prefix", isDirectory: true)
+    let active = cacheRoot.appendingPathComponent("active", isDirectory: true)
+    try FileManager.default.createDirectory(
+      at: cacheParent,
+      withIntermediateDirectories: true,
+      attributes: [.posixPermissions: 0o700]
+    )
+    try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: cacheParent.path)
+    try FileManager.default.createDirectory(
+      at: cacheRoot,
+      withIntermediateDirectories: false,
+      attributes: [.posixPermissions: 0o700]
+    )
+    try FileManager.default.createDirectory(
+      at: active,
+      withIntermediateDirectories: false,
+      attributes: [.posixPermissions: 0o700]
+    )
+    let snapshot = Data("owner-private legacy v2 snapshot".utf8)
+    let snapshotURL = active.appendingPathComponent("prefix.safetensors")
+    try snapshot.write(to: snapshotURL)
+    try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: snapshotURL.path)
+    let manifest: [String: Any] = [
+      "schemaVersion": 2,
+      "key": String(repeating: "a", count: 64),
+      "prefixTokenCount": 512,
+      "prefixTokenSHA256": String(repeating: "b", count: 64),
+      "stateSignature": String(repeating: "c", count: 64),
+      "stateBytes": 128,
+      "snapshotBytes": snapshot.count,
+      "snapshotSHA256": PromptPrefixCache.sha256(snapshot),
+    ]
+    let manifestURL = active.appendingPathComponent("manifest.json")
+    try JSONSerialization.data(withJSONObject: manifest).write(to: manifestURL)
+    try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: manifestURL.path)
+
+    XCTAssertNil(PromptPrefixCache(modelsRoot: modelsRoot).recoverInterruptedSwap())
+    XCTAssertFalse(FileManager.default.fileExists(atPath: active.path))
+  }
+
+  func testLegacyActiveSymlinkIsNotFollowedOrRemoved() throws {
+    let modelsRoot = temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: modelsRoot) }
+    let cacheParent = modelsRoot
+      .appendingPathComponent("cleanup", isDirectory: true)
+      .appendingPathComponent(".voiceflow-mlx-cache", isDirectory: true)
+    let cacheRoot = cacheParent.appendingPathComponent("prompt-prefix", isDirectory: true)
+    try FileManager.default.createDirectory(
+      at: cacheParent,
+      withIntermediateDirectories: true,
+      attributes: [.posixPermissions: 0o700]
+    )
+    try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: cacheParent.path)
+    try FileManager.default.createDirectory(
+      at: cacheRoot,
+      withIntermediateDirectories: false,
+      attributes: [.posixPermissions: 0o700]
+    )
+    let target = temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: target) }
+    try FileManager.default.createDirectory(
+      at: target,
+      withIntermediateDirectories: false
+    )
+    let outsideSentinel = target.appendingPathComponent("sentinel")
+    try Data("preserve".utf8).write(to: outsideSentinel)
+    try FileManager.default.createSymbolicLink(
+      at: cacheRoot.appendingPathComponent("active", isDirectory: true),
+      withDestinationURL: target
+    )
+
+    let activeSymlink = cacheRoot.appendingPathComponent("active", isDirectory: true)
+    XCTAssertEqual(PromptPrefixCache(modelsRoot: modelsRoot).recoverInterruptedSwap(), "snapshot_corrupt")
+    XCTAssertEqual(try FileManager.default.destinationOfSymbolicLink(atPath: activeSymlink.path), target.path)
+    XCTAssertTrue(FileManager.default.fileExists(atPath: outsideSentinel.path))
   }
 
   func testShortResidentLeavesDurableSentinelUntouchedAndHonorsMemoryCaps() throws {
@@ -433,7 +592,7 @@ final class CleanupTokenBudgetTests: XCTestCase {
     let model = RecordingHybridLanguageModel()
     let parameters = GenerateParameters(maxTokens: 8, temperature: 0, prefillStepSize: 512)
     var firstResident: PromptPrefixCache.Resident?
-    for index in 0..<3 {
+    for index in 0..<5 {
       let prefix = (0..<128).map { $0 + index * 1_000 }
       let actual = prefix + [500_001, 500_002]
       let candidate = try XCTUnwrap(
@@ -530,9 +689,38 @@ final class CleanupTokenBudgetTests: XCTestCase {
     let savedBytes = try firstOwner.persist(resident)
     XCTAssertGreaterThan(savedBytes, 0)
     XCTAssertLessThanOrEqual(savedBytes, 512 * 1_024 * 1_024)
+    let cacheRoot = modelsRoot
+      .appendingPathComponent("cleanup", isDirectory: true)
+      .appendingPathComponent(".voiceflow-mlx-cache", isDirectory: true)
+      .appendingPathComponent("prompt-prefix", isDirectory: true)
+    let slotName = PromptPrefixCache.sha256(Data("voiceflow-prefix-slot-v1|cache-roundtrip-key".utf8))
+    let slot = cacheRoot
+      .appendingPathComponent("slots", isDirectory: true)
+      .appendingPathComponent(slotName, isDirectory: true)
+    let snapshotURL = slot.appendingPathComponent("prefix.safetensors")
+    let snapshotBytes = try XCTUnwrap(
+      try FileManager.default.attributesOfItem(atPath: snapshotURL.path)[.size] as? NSNumber
+    ).uint64Value
+    let expectedLayout = try XCTUnwrap(PromptCacheLayout.make(model: model, parameters: parameters))
+    XCTAssertTrue(
+      PromptPrefixCache.validPromptCacheHeader(
+        snapshotURL,
+        expectedKey: candidate.key,
+        expectedTokenCount: candidate.tokenCount,
+        expectedTokenDigest: candidate.tokenDigest,
+        expectedSnapshotBytes: snapshotBytes,
+        expectedLayout: expectedLayout
+      )
+    )
     let secondOwner = PromptPrefixCache(modelsRoot: modelsRoot)
     let restored = try XCTUnwrap(
-      try secondOwner.restore(candidate, requestStarted: ProcessInfo.processInfo.systemUptime))
+      try secondOwner.restore(
+        candidate,
+        requestStarted: ProcessInfo.processInfo.systemUptime,
+        model: model,
+        parameters: parameters
+      )
+    )
     XCTAssertEqual(restored.key, resident.key)
     XCTAssertEqual(restored.tokenCount, 512)
     XCTAssertEqual(restored.stateSignature, resident.stateSignature)
@@ -547,8 +735,8 @@ final class CleanupTokenBudgetTests: XCTestCase {
       .appendingPathComponent("cleanup", isDirectory: true)
       .appendingPathComponent(".voiceflow-mlx-cache", isDirectory: true)
     let promptCacheRoot = cacheParent.appendingPathComponent("prompt-prefix", isDirectory: true)
-    let active = promptCacheRoot.appendingPathComponent("active", isDirectory: true)
-    let snapshot = active.appendingPathComponent("prefix.safetensors")
+    let active = slot
+    let snapshot = snapshotURL
     let manifest = active.appendingPathComponent("manifest.json")
     XCTAssertEqual(
       try XCTUnwrap(
@@ -606,9 +794,15 @@ final class CleanupTokenBudgetTests: XCTestCase {
       .appendingPathComponent("cleanup", isDirectory: true)
       .appendingPathComponent(".voiceflow-mlx-cache", isDirectory: true)
       .appendingPathComponent("prompt-prefix", isDirectory: true)
-    let active = promptCacheRoot.appendingPathComponent("active", isDirectory: true)
-    let previous = promptCacheRoot.appendingPathComponent("previous", isDirectory: true)
-    let stage = promptCacheRoot.appendingPathComponent("stage", isDirectory: true)
+    let slotName = PromptPrefixCache.sha256(
+      Data("voiceflow-prefix-slot-v1|interrupted-publish-key".utf8)
+    )
+    let slots = promptCacheRoot.appendingPathComponent("slots", isDirectory: true)
+    let staging = promptCacheRoot.appendingPathComponent(".staging", isDirectory: true)
+    let previousRoot = promptCacheRoot.appendingPathComponent(".previous", isDirectory: true)
+    let active = slots.appendingPathComponent(slotName, isDirectory: true)
+    let previous = previousRoot.appendingPathComponent(slotName, isDirectory: true)
+    let stage = staging.appendingPathComponent(slotName, isDirectory: true)
     try FileManager.default.moveItem(at: active, to: previous)
     try FileManager.default.createDirectory(
       at: stage,
@@ -622,7 +816,103 @@ final class CleanupTokenBudgetTests: XCTestCase {
     XCTAssertFalse(FileManager.default.fileExists(atPath: previous.path))
     XCTAssertFalse(FileManager.default.fileExists(atPath: stage.path))
     XCTAssertNotNil(
-      try nextOwner.restore(candidate, requestStarted: ProcessInfo.processInfo.systemUptime)
+      try nextOwner.restore(
+        candidate,
+        requestStarted: ProcessInfo.processInfo.systemUptime,
+        model: RecordingHybridLanguageModel(),
+        parameters: GenerateParameters(maxTokens: 4, temperature: 0, prefillStepSize: 512)
+      )
+    )
+  }
+
+  func testFiveDurableCandidatesUseTrueKeyedLRU() throws {
+    let modelsRoot = temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: modelsRoot) }
+    let owner = PromptPrefixCache(modelsRoot: modelsRoot)
+    let model = RecordingHybridLanguageModel()
+    let parameters = GenerateParameters(maxTokens: 4, temperature: 0, prefillStepSize: 512)
+    var candidates: [PromptCacheCandidate] = []
+
+    for index in 0..<4 {
+      let prefix = Array(index * 1_000..<(index * 1_000 + 512))
+      let candidate = try XCTUnwrap(
+        PromptCacheCandidate.make(prefixTokens: prefix, keyIdentity: "lru-model-\(index)")
+      )
+      candidates.append(candidate)
+      let (resident, metrics) = owner.resolveBaseForTesting(
+        model: model,
+        actualTokens: prefix + [900_000 + index],
+        candidate: candidate,
+        parameters: parameters
+      )
+      XCTAssertNotNil(resident)
+      XCTAssertEqual(metrics.status, "built")
+    }
+
+    let first = candidates[0]
+    let (recent, hitMetrics) = owner.resolveBaseForTesting(
+      model: model,
+      actualTokens: Array(0..<512) + [900_000],
+      candidate: first,
+      parameters: parameters
+    )
+    XCTAssertNotNil(recent)
+    XCTAssertEqual(hitMetrics.status, "snapshot_hit")
+
+    let fifthPrefix = Array(5_000..<5_512)
+    let fifth = try XCTUnwrap(
+      PromptCacheCandidate.make(prefixTokens: fifthPrefix, keyIdentity: "lru-model-4")
+    )
+    let (fifthResident, fifthMetrics) = owner.resolveBaseForTesting(
+      model: model,
+      actualTokens: fifthPrefix + [900_004],
+      candidate: fifth,
+      parameters: parameters
+    )
+    XCTAssertNotNil(fifthResident)
+    XCTAssertEqual(fifthMetrics.status, "built")
+
+    let indexURL = modelsRoot
+      .appendingPathComponent("cleanup", isDirectory: true)
+      .appendingPathComponent(".voiceflow-mlx-cache", isDirectory: true)
+      .appendingPathComponent("prompt-prefix", isDirectory: true)
+      .appendingPathComponent("index.json")
+    let indexData = try Data(contentsOf: indexURL)
+    let index = try XCTUnwrap(
+      JSONDecoder().decode(PromptCacheIndexManifest.self, from: indexData)
+    )
+    XCTAssertEqual(index.keys, [fifth.key, candidates[0].key, candidates[3].key, candidates[2].key])
+    XCTAssertFalse(index.keys.contains(candidates[1].key))
+    XCTAssertEqual(owner.residentCountForTesting, PromptPrefixCache.maximumResidentCount)
+    let slotsURL = indexURL.deletingLastPathComponent().appendingPathComponent("slots")
+    XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: slotsURL.path).count, 4)
+  }
+
+  func testRestoreRejectsSnapshotForDifferentLoadedCacheLayerCount() throws {
+    let modelsRoot = temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: modelsRoot) }
+    let candidate = PromptCacheCandidate(
+      tokenCount: 512,
+      key: "model-bound-roundtrip-key",
+      tokenDigest: "model-bound-roundtrip-digest"
+    )
+    let parameters = GenerateParameters(maxTokens: 4, temperature: 0, prefillStepSize: 512)
+    let owner = PromptPrefixCache(modelsRoot: modelsRoot)
+    let resident = try owner.build(
+      model: RecordingHybridLanguageModel(),
+      actualTokens: Array(0..<530),
+      candidate: candidate,
+      parameters: parameters
+    )
+    _ = try owner.persist(resident)
+
+    XCTAssertThrowsError(
+      try PromptPrefixCache(modelsRoot: modelsRoot).restore(
+        candidate,
+        requestStarted: ProcessInfo.processInfo.systemUptime,
+        model: TwoLayerSimpleLanguageModel(),
+        parameters: parameters
+      )
     )
   }
 
@@ -642,12 +932,13 @@ final class CleanupTokenBudgetTests: XCTestCase {
       parameters: GenerateParameters(maxTokens: 4, temperature: 0, prefillStepSize: 512)
     )
     _ = try owner.persist(resident)
-    let snapshot =
-      modelsRoot
+    let component = PromptPrefixCache.sha256(Data("voiceflow-prefix-slot-v1|corrupt-snapshot-key".utf8))
+    let snapshot = modelsRoot
       .appendingPathComponent("cleanup", isDirectory: true)
       .appendingPathComponent(".voiceflow-mlx-cache", isDirectory: true)
       .appendingPathComponent("prompt-prefix", isDirectory: true)
-      .appendingPathComponent("active", isDirectory: true)
+      .appendingPathComponent("slots", isDirectory: true)
+      .appendingPathComponent(component, isDirectory: true)
       .appendingPathComponent("prefix.safetensors")
     let originalBytes = try Data(contentsOf: snapshot)
     let originalLastByte = try XCTUnwrap(originalBytes.last)
@@ -663,7 +954,9 @@ final class CleanupTokenBudgetTests: XCTestCase {
     XCTAssertThrowsError(
       try PromptPrefixCache(modelsRoot: modelsRoot).restore(
         candidate,
-        requestStarted: ProcessInfo.processInfo.systemUptime
+        requestStarted: ProcessInfo.processInfo.systemUptime,
+        model: RecordingHybridLanguageModel(),
+        parameters: GenerateParameters(maxTokens: 4, temperature: 0, prefillStepSize: 512)
       )
     )
   }
@@ -693,13 +986,17 @@ final class CleanupTokenBudgetTests: XCTestCase {
     let bytes = try XCTUnwrap(
       try FileManager.default.attributesOfItem(atPath: url.path)[.size] as? NSNumber
     )
+    let expectedLayout = try XCTUnwrap(
+      PromptCacheLayout(caches: [KVCacheSimple(), MambaCache(), RotatingKVCache(maxSize: 1_024)])
+    )
     XCTAssertFalse(
       PromptPrefixCache.validPromptCacheHeader(
         url,
         expectedKey: "test-key",
         expectedTokenCount: 512,
         expectedTokenDigest: "test-digest",
-        expectedSnapshotBytes: bytes.uint64Value
+        expectedSnapshotBytes: bytes.uint64Value,
+        expectedLayout: expectedLayout
       )
     )
     XCTAssertFalse(
@@ -708,9 +1005,90 @@ final class CleanupTokenBudgetTests: XCTestCase {
         expectedKey: "test-key",
         expectedTokenCount: 512,
         expectedTokenDigest: "test-digest",
-        expectedSnapshotBytes: 512 * 1_024 * 1_024 + 1
+        expectedSnapshotBytes: 512 * 1_024 * 1_024 + 1,
+        expectedLayout: expectedLayout
       )
     )
+  }
+
+  func testRotatingCacheHeaderValidatesAllFiveMetadataValuesBeforeRestore() throws {
+    let root = temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+    try FileManager.default.createDirectory(
+      at: root,
+      withIntermediateDirectories: true,
+      attributes: [.posixPermissions: 0o700]
+    )
+    let tokenCount = 1_536
+    let expectedLayout = try XCTUnwrap(
+      PromptCacheLayout(caches: [RotatingKVCache(maxSize: 1_024, keep: 2, step: 256)])
+    )
+    let state = MLXArray.ones([1, 1, 1_535, 1])
+    let mutations: [(String, ([String: String]) -> [String: String])] = [
+      ("valid", { $0 }),
+      ("keep", { metadata in var value = metadata; value["0.0.0"] = "3"; return value }),
+      ("max-size", { metadata in var value = metadata; value["0.0.1"] = "1023"; return value }),
+      ("step", { metadata in var value = metadata; value["0.0.2"] = "128"; return value }),
+      ("offset", { metadata in var value = metadata; value["0.0.3"] = "1535"; return value }),
+      ("index", { metadata in var value = metadata; value["0.0.4"] = "1024"; return value }),
+      ("count", { metadata in var value = metadata; value.removeValue(forKey: "0.0.4"); return value }),
+      ("canonical-int", { metadata in var value = metadata; value["0.0.4"] = "01535"; return value }),
+    ]
+
+    for (index, testCase) in mutations.enumerated() {
+      let cache = RotatingKVCache(maxSize: 1_024, keep: 2, step: 256)
+      cache.state = [state, state]
+      cache.metaState = ["2", "1024", "256", String(tokenCount), "1535"]
+      let snapshotURL = root.appendingPathComponent("rotating-\(index).safetensors")
+      try savePromptCache(
+        url: snapshotURL,
+        cache: [cache],
+        metadata: [
+          "voiceflow_schema": String(PromptPrefixCache.schemaVersion),
+          "voiceflow_key": "rotating-key",
+          "voiceflow_prefix_tokens": String(tokenCount),
+          "voiceflow_prefix_token_sha256": "rotating-digest",
+        ]
+      )
+      if index > 0 {
+        let original = try Data(contentsOf: snapshotURL)
+        var oldHeaderLength: UInt64 = 0
+        for (byteIndex, byte) in original.prefix(8).enumerated() {
+          oldHeaderLength |= UInt64(byte) << (byteIndex * 8)
+        }
+        let headerStart = 8
+        let payloadStart = headerStart + Int(oldHeaderLength)
+        var header = try XCTUnwrap(
+          JSONSerialization.jsonObject(
+            with: original.subdata(in: headerStart..<payloadStart)
+          ) as? [String: Any]
+        )
+        let metadata = try XCTUnwrap(header["__metadata__"] as? [String: String])
+        header["__metadata__"] = testCase.1(metadata)
+        let headerData = try JSONSerialization.data(withJSONObject: header, options: [.sortedKeys])
+        var rewritten = Data(capacity: 8 + headerData.count + original.count - payloadStart)
+        var newHeaderLength = UInt64(headerData.count).littleEndian
+        withUnsafeBytes(of: &newHeaderLength) { rewritten.append(contentsOf: $0) }
+        rewritten.append(headerData)
+        rewritten.append(original.dropFirst(payloadStart))
+        try rewritten.write(to: snapshotURL, options: .atomic)
+      }
+      let snapshotBytes = try XCTUnwrap(
+        try FileManager.default.attributesOfItem(atPath: snapshotURL.path)[.size] as? NSNumber
+      ).uint64Value
+      XCTAssertEqual(
+        PromptPrefixCache.validPromptCacheHeader(
+          snapshotURL,
+          expectedKey: "rotating-key",
+          expectedTokenCount: tokenCount,
+          expectedTokenDigest: "rotating-digest",
+          expectedSnapshotBytes: snapshotBytes,
+          expectedLayout: expectedLayout
+        ),
+        index == 0,
+        "rotating metadata case \(testCase.0)"
+      )
+    }
   }
 
   func testCleanupResponseCanEncodeBoundedContentFreeRuntimeFacts() throws {
@@ -862,22 +1240,16 @@ final class CleanupTokenBudgetTests: XCTestCase {
   }
 }
 
-private final class RecordingHybridLanguageModel: Module, LanguageModel {
+private final class RecordingHybridLanguageModel: Module, LanguageModel, KVCacheDimensionProvider {
+  var kvHeads: [Int] { [0, 1, 1, 1, 1] }
+
   private(set) var preparedDimensions: [Int] = []
   private(set) var seedTokenCounts: [Int] = []
   private(set) var consumedChunks: [Int] = []
   private(set) var unconsumedTokens: [[Int]] = []
 
   func newCache(parameters: GenerateParameters?) -> [KVCache] {
-    var caches: [KVCache] = []
-    for index in 0..<64 {
-      if index.isMultiple(of: 4) {
-        caches.append(MambaCache())
-      } else {
-        caches.append(KVCacheSimple())
-      }
-    }
-    return caches
+    [MambaCache(), KVCacheSimple(), RotatingKVCache(maxSize: 1_024, keep: 2, step: 256)]
   }
 
   func prepare(_ input: LMInput, cache: [KVCache], windowSize: Int?) throws -> PrepareResult {
@@ -891,15 +1263,16 @@ private final class RecordingHybridLanguageModel: Module, LanguageModel {
       let nextOffset = consumed + step
       for layer in cache {
         if let kv = layer as? KVCacheSimple {
-          kv.state = [
-            MLXArray.ones([1, 1, nextOffset, 1]),
-            MLXArray.ones([1, 1, nextOffset, 1]) * MLXArray(Float(2)),
-          ]
+          let keys = MLXArray.ones([1, 1, step, 1])
+          _ = kv.update(keys: keys, values: keys * MLXArray(Float(2)))
         } else if let mamba = layer as? MambaCache {
           mamba.state = [
             MLXArray.ones([1, 2]),
             MLXArray.ones([1, 2]) * MLXArray(Float(3)),
           ]
+        } else if let rotating = layer as? RotatingKVCache {
+          let keys = MLXArray.ones([1, 1, step, 1])
+          _ = rotating.update(keys: keys, values: keys * MLXArray(Float(4)))
         }
       }
       consumed = nextOffset
@@ -911,6 +1284,24 @@ private final class RecordingHybridLanguageModel: Module, LanguageModel {
 
   func callAsFunction(_ input: LMInput.Text, cache: [KVCache]?, state: LMOutput.State?) -> LMOutput
   {
+    LMOutput(logits: callAsFunction(input.tokens, cache: cache))
+  }
+
+  func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
+    MLXArray.zeros([1, inputs.size, 1])
+  }
+}
+
+private final class TwoLayerSimpleLanguageModel: Module, LanguageModel {
+  func newCache(parameters: GenerateParameters?) -> [KVCache] {
+    [KVCacheSimple(), KVCacheSimple()]
+  }
+
+  func prepare(_ input: LMInput, cache: [KVCache], windowSize: Int?) throws -> PrepareResult {
+    .tokens(input.text)
+  }
+
+  func callAsFunction(_ input: LMInput.Text, cache: [KVCache]?, state: LMOutput.State?) -> LMOutput {
     LMOutput(logits: callAsFunction(input.tokens, cache: cache))
   }
 

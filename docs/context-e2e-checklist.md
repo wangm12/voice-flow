@@ -527,7 +527,7 @@ Clipboard 不是 LLM context，而是 delivery safety context。
 - Raw AX labels and browser paths are consumed only during local classification. They do not enter `ContextSnapshot`, History, HUD labels, or provider prompts; only the coarse field kind may be retained with a policy for safe retry behavior.
 - Permission changes cancel pending prefetch, clear captured evidence, and advance an in-memory policy revision. Evidence from before a revoke stays unusable after a later regrant; stale captures and responses cannot update the current HUD. The original audio stays available to the normal context-free ASR / cleanup fallback. Provider, credential, and model selection remain the user's configured choices.
 - Manual selected-text actions authorize only the selected text for that action. They do not attach automatic nearby AX content. The independent manual look-at-screen hotkey keeps its explicit per-action permission and preview; its grant does not enable automatic context.
-- `style_examples_approved` is a separate default-off provider permission. Legacy style pairs remain in Settings but are omitted until reviewed and approved. Automatic three-hit short-style observations enter pending `style_drafts`; confirming a draft approves only that reviewed pair, not other unreviewed examples. Global and per-App learning switches and source permissions still apply. Secure fields and protected banking / HR / SSO / password-manager presets remain blocked.
+- `style_examples_approved` is a separate default-off provider permission. Legacy style pairs remain in Settings but are omitted until reviewed and approved. Automatic three-hit short-style observations enter pending `style_drafts`; confirming a draft saves that reviewed pair locally by default and enables `style_examples_approved` only if the user explicitly opts in at confirmation or in the App rule, never approving other unreviewed examples. Global and per-App learning switches and source permissions still apply. Secure fields and protected banking / HR / SSO / password-manager presets remain blocked.
 - HUD source badge reports only the actually projected source (`none`, `ax`, `ocr`, or `cloud_vision`) with a fixed label and optional user-authored rule label. It never carries evidence text, URL, title, PID, or target identity. History stores no source evidence or image metadata.
 
 ### Automated regression coverage
@@ -611,7 +611,7 @@ Region selection / crop UI is not implemented. The supported image scope is one 
 
 ## 可选录音与启动验收
 
-- [ ] 「编辑哪种语气」只选择编辑对象；试跑旁标明当前草稿或已保存配置。在「语气」输入脱敏样例：默认无请求；点击试跑才处理，未保存修改会对比 saved / draft，模型、本地-only、provider fallback 和 guard fallback 分别标记。关闭或修改 Prompt / 样例后，迟到结果不会出现，也没有 History / App 写入。
+- [ ] 「编辑哪种语气」只选择编辑对象；试跑旁标明当前草稿或已保存配置。在「写作与整理」（兼容旧「语气」入口）输入脱敏样例：默认无请求；点击试跑才处理，未保存修改会对比 saved / draft，模型、本地-only、provider fallback 和 guard fallback 分别标记。关闭或修改 Prompt / 样例后，迟到结果不会出现，也没有 History / App 写入。
 - [ ] 录音与输出里设置翻译快捷键和目标语言；全局输出保持原模式。按它启动时 HUD 显示目标语言，结束后普通热键恢复原模式。取消 / 启动失败不留下翻译模式；用另一枚键结束现有录音不切换模式，松开非启动键不结束按住录音。
 - [ ] 翻译键与主键 / 选中操作 / 看屏幕 / 跳过整理键的别名冲突被拒绝，Backspace / Delete 清空、Esc 保留。主键变更或注册失败后所有辅助热键可继续使用；设置翻译键不修改全局按法。
 - [ ] 当前场景整理关闭、路由不可用或需要密钥的 provider 缺少凭据时，翻译键在采集前报错；On Device MLX 和 loopback Ollama 可走无密钥本机路由。严格离线不发云请求。provider 失败和保护拒绝继续显示现有回退状态，不标成已翻译成功。
@@ -622,7 +622,7 @@ Region selection / crop UI is not implemented. The supported image scope is one 
 - [ ] 麦克风连续三次录音：同设备复用，Idle 不产生 spool、预取或上传；关闭选项和权限撤销释放设备。
 - [ ] 合盖切换到指定输入设备；不存在的设备明确报错；开启／关闭盖后下一会话重新选择。
 - [ ] 普通及跳过整理热键短按、按住、Idle release、取消和重新注册行为正确；AssemblyAI raw Sync 和共同 LLM 禁用可从本次请求验证。
-- [ ] 250ms 尾部音频、取消即时性、自动上限、设备断开和 Soniox 完整恢复。
+- [ ] 自适应（默认 ≤200ms，含显式高缓冲配置）尾部音频、取消即时性、自动上限、设备断开和 Soniox 完整恢复。
 - [ ] 冷启动及第二实例 CLI 动作、登录 --background 不显示或抢焦点；手动打开显示设置；系统登录启动状态与 UI 一致。
 - [ ] Secure Input + 已确认复制、剪贴板写入失败、输入状态不确定的文案分别正确。
 - [ ] macOS 打包后存在反馈 WAV、唯一 release-notes 来源、MLX sidecar、Metal 资源和第三方声明；开始／结束提示音及更新说明可用。

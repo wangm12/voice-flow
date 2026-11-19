@@ -19,6 +19,7 @@ VoiceFlow 的设置界面以 macOS 原生感、安静的中性色和清晰分组
 | 语义 | 深色基准 | 浅色基准 | 用途 |
 | --- | --- | --- | --- |
 | base | oklch(0.204627 0 0) | oklch(0.985104 0 0) | 页面主画布 |
+| surface-inset | oklch(0.245000 0 0) | oklch(0.942000 0 0) | 内嵌代码块、试用对比框背景 |
 | card | oklch(0.276848 0 0) | oklch(1 0 0) | 设置分组表面 |
 | elevated | oklch(0.305191 0 0) | oklch(0.958147 0 0) | 输入框、次级控件表面 |
 | primary text | oklch(0.943089 0 0) | oklch(0.243535 0 0) | 标题和主要内容 |
@@ -104,7 +105,7 @@ Liquid Glass 应能看出背景透过单一玻璃表面产生的折射、轻微�
 
 - 实际 HUD 的玻璃由 macOS AppKit NSGlassEffectView 在原有 HUD WebView 后方绘制。WebView 仍负责文字、按钮和鼠标交互；玻璃材质仅提供底层表面。
 - 原生玻璃使用 220 × 48 pt、24 pt 圆角，保持胶囊与生产 VoicePill 对齐。整个胶囊只出现一个玻璃边缘。
-- WebView 文字与操作按钮使用对应前景和轻遮罩维持可读性；Liquid Glass 规则把 CSS 胶囊边框设为透明，不叠第二道描边或第二层玻璃。主胶囊在浅色下用 92% 不透明的白色 tint，深色下用 92% 不透明、基色为 `#191919` 的石墨 tint；原生材质显示和隐藏时沿用同一个 tint，避免收起过程换成更亮的实心壳；其余 8% 保留原生折射或背景内容的视觉贡献。
+- WebView 文字与操作按钮使用对应前景与 Glasswork `glass.css` 控制槽维持可读性；Liquid Glass 规则把 CSS 胶囊外边框设为透明，并在原生玻璃可见时按 `glass.css` 默认密度使用 `12%` `#ffffff`（浅色）或 `24%` `#1e1e22`（深色）tint 与方向性内高光 / 6px 内斜边，配合 `corner-shape: round` 与单一 AppKit 外轮廓，让折射和桌面背景自然透出；玻璃隐藏或系统开启降低透明度时回退至 `96%` 实色底（无边缘阴影），详情/恢复面板与词典提示保持不透明表面以保证对比度。
 - 原生材质跟随已有的 HUD 操作、详情和恢复提示 owner。粘贴前的焦点交接只改变 key / mouse 归属，不提前撤掉仍可见胶囊的玻璃材质；确认粘贴后的收起规则不变。
 - macOS 26 之前、系统开启“降低透明度”或原生安装失败时，实际 HUD 回退到 Classic。用户偏好仍可保留，但界面不得把未生效的偏好显示成已生效。
 - 实际材质应只在 HUD 可见且原生确认已安装时显示；暖面板空闲、隐藏状态和终态收起时不显示玻璃层。
@@ -113,11 +114,11 @@ Liquid Glass 应能看出背景透过单一玻璃表面产生的折射、轻微�
 
 设置页预览用于观察胶囊在明暗样例背景和状态中的视觉效果，不等同于实际 AppKit 材质：
 
-- 背景由本地合成样例生成；预览不读取桌面、活动窗口或窗口像素，也不请求屏幕录制权限。
-- 折射预览使用固定上游版本的 Glasswork 单表面 WebGL2 shader；来源和 MIT 许可见 [THIRD_PARTY_NOTICES.md](../../THIRD_PARTY_NOTICES.md)，适配代码见 [GlassworkRenderer.ts](../../src/components/settings/hud-glasswork/GlassworkRenderer.ts)。
-- WebGL2 不可用、上下文丢失或系统降低透明度时使用 CSS 材质回退；降低透明度时改用不透明表面，不能依赖模糊来区分控件。
+- 背景采用纯色舞台（「浅色」`#f2f3f5` /「深色」`#121212`），明暗切换遵循与 Glasswork 一致的 `620ms ease` 平滑过渡；预览不读取桌面、活动窗口或窗口像素，也不请求屏幕录制权限。
+- 预览胶囊底座严格采用 Glasswork 的四声明材质（[glasswork.css](../../src/components/settings/hud-glasswork/glasswork.css) + [GlassworkAdapt.ts](../../src/components/settings/hud-glasswork/GlassworkAdapt.ts) 采样确保文字对比度 `>= 4.5:1`）：Chromium 下由 [GlassworkLens.ts](../../src/components/settings/hud-glasswork/GlassworkLens.ts) 提供 `--glass-lens` 九宫格边缘折射（全部编码为 `data:` PNG 以遵守 Tauri CSP），Safari / macOS `WKWebView` 等由 [GlassworkRenderer.ts](../../src/components/settings/hud-glasswork/GlassworkRenderer.ts) 单表面 WebGL2 shader 绘制边缘折射与色散；来源与 MIT 许可见 [THIRD_PARTY_NOTICES.md](../../THIRD_PARTY_NOTICES.md)。生产 `VoicePill` 覆盖层底色保持透明，不叠第二层半透明玻璃。
+- WebGL2 不可用或上下文丢失时退回 CSS `backdrop-filter` 材质，开启系统「降低透明度」时改用 `96%` 实色底与 `backdrop-filter: none`，不能依赖模糊来区分控件。
 - 预览复用生产 VoicePill 的几何和内容布局，但浏览器合成与 NSGlassEffectView 不同，因此不应承诺像素级一致。预览应明确标为模拟效果。
-- 深色预览采用中性石墨背景和轻灰玻璃色；浅色和深色都要检查文字、状态图标、停止按钮、胶囊边缘和背景细节。
+- 深色预览采用 Glasswork `#1e1e22` 烟灰玻璃基调；浅色和深色都要检查文字、状态图标、停止按钮、胶囊边缘和背景细节。
 
 ### 实作检查清单
 
@@ -136,7 +137,9 @@ Liquid Glass 应能看出背景透过单一玻璃表面产生的折射、轻微�
 | 页面标题、分组、设置行、状态提示 | [SettingsLayout.tsx](../../src/components/SettingsLayout.tsx) |
 | Select、按钮、焦点环 | [Select.tsx](../../src/components/Select.tsx)、[theme.ts](../../src/lib/theme.ts) |
 | HUD 胶囊尺寸和组件 | [voicePillTokens.ts](../../src/components/Island/voicePillTokens.ts)、[VoicePill.tsx](../../src/components/Island/VoicePill.tsx) |
-| HUD 和 Glass 预览 | [HudAppearanceSettings.css](../../src/components/settings/HudAppearanceSettings.css)、[HudGlassPreview.tsx](../../src/components/settings/HudGlassPreview.tsx)、[island.css](../../src/island.css) |
+| 写作与整理设置拆分 | [ContextSettings.tsx](../../src/components/ContextSettings.tsx) 协调 [context/](../../src/components/context/contextShared.ts)（`SmartCleanupSettings.tsx`、`WritingToneSettings.tsx`、`AppMappingEditor.tsx`） |
+| 模型配置页与性能诊断 | [EngineSettings.tsx](../../src/components/settings/EngineSettings.tsx) 协调 [engine/](../../src/components/settings/engine/engineHelpers.ts) 四页签、`useLocalModelsStatus` 事件订阅（无定时轮询）及共用 [LatencyMetricsViewer.tsx](../../src/components/settings/LatencyMetricsViewer.tsx) |
+| HUD 和 Glass 预览 | [HudAppearanceSettings.css](../../src/components/settings/HudAppearanceSettings.css)、[HudGlassPreview.tsx](../../src/components/settings/HudGlassPreview.tsx)、[glasswork.css](../../src/components/settings/hud-glasswork/glasswork.css)、[island.css](../../src/island.css) |
 | 原生玻璃材质和能力回退 | [native_glass.rs](../../src-tauri/src/native_glass.rs) |
 | 当前 HUD 行为与隐私说明 | [end-to-end-workflows.md](../end-to-end-workflows.md)、[privacy.md](../privacy.md) |
 

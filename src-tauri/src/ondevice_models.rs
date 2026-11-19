@@ -36,6 +36,7 @@ pub struct MlxModelManifest {
     pub language_policy: MlxLanguagePolicy,
     pub language_note: &'static str,
     pub download_available: bool,
+    pub license_unreviewed: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -290,6 +291,7 @@ pub const MLX_MODELS: &[MlxModelManifest] = &[
         language_policy: MlxLanguagePolicy::AutoOrExplicit,
         language_note: "Auto or fixed Chinese/English.",
         download_available: true,
+        license_unreviewed: false,
     },
     MlxModelManifest {
         id: QWEN_ASR_17_ID,
@@ -301,6 +303,7 @@ pub const MLX_MODELS: &[MlxModelManifest] = &[
         language_policy: MlxLanguagePolicy::AutoOrExplicit,
         language_note: "Auto or fixed Chinese/English.",
         download_available: true,
+        license_unreviewed: true,
     },
     MlxModelManifest {
         id: PARAKEET_ASR_8BIT_ID,
@@ -312,6 +315,7 @@ pub const MLX_MODELS: &[MlxModelManifest] = &[
         language_policy: MlxLanguagePolicy::AutoOnly,
         language_note: "Auto only; the model card lists 25 European languages. The runtime does not report detected language.",
         download_available: true,
+        license_unreviewed: false,
     },
     MlxModelManifest {
         id: FIRERED_ASR2_AED_ID,
@@ -323,6 +327,7 @@ pub const MLX_MODELS: &[MlxModelManifest] = &[
         language_policy: MlxLanguagePolicy::AutoOnly,
         language_note: "Mandarin, Chinese dialects/accents, English, and code-switching per upstream. The runtime has no language control or detected-language result.",
         download_available: true,
+        license_unreviewed: false,
     },
     MlxModelManifest {
         id: FUN_ASR_NANO_2512_ID,
@@ -334,6 +339,7 @@ pub const MLX_MODELS: &[MlxModelManifest] = &[
         language_policy: MlxLanguagePolicy::AutoOrExplicit,
         language_note: "Auto or fixed Chinese/English prompt; no detected-language result. The pinned runtime prompt supports Chinese and English.",
         download_available: true,
+        license_unreviewed: false,
     },
     MlxModelManifest {
         id: COHERE_TRANSCRIBE_ID,
@@ -345,6 +351,7 @@ pub const MLX_MODELS: &[MlxModelManifest] = &[
         language_policy: MlxLanguagePolicy::ExplicitChineseOrEnglish,
         language_note: "Legacy selection only; requires fixed Chinese/English.",
         download_available: false,
+        license_unreviewed: true,
     },
 ];
 

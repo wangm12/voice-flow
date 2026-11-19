@@ -142,4 +142,42 @@ describe("useSettingsPersistence", () => {
     await act(async () => debouncedWrite.resolve());
     await waitFor(() => expect(result.current.persistence.unsavedFields).toEqual([]));
   });
+
+  it("does not mutate confirmed state or re-queue rejected edits when rethrow is enabled", async () => {
+    invokeMock
+      .mockRejectedValueOnce(new Error("snippet validation failed"))
+      .mockResolvedValueOnce(undefined);
+    const { result } = renderHook(() => usePersistenceHarness());
+
+    await expect(
+      result.current.persistence.save(
+        { snippets: [{ id: "1", trigger: "bad", expansion: "reject", enabled: true }] },
+        { immediate: true, rethrow: true },
+      ),
+    ).rejects.toThrow("snippet validation failed");
+
+    expect(result.current.settings?.snippets).toEqual([]);
+    expect(result.current.persistence.unsavedFields).toEqual([]);
+
+    act(() => {
+      result.current.persistence.save({ input_device: "Mic B" });
+    });
+    await new Promise((resolve) => setTimeout(resolve, 350));
+
+    expect(invokeMock).toHaveBeenNthCalledWith(2, "update_settings_patch", {
+      patch: { input_device: "Mic B" },
+    });
+  });
+
+  it("surfaces saveError when a non-rethrow immediate save fails", async () => {
+    invokeMock.mockRejectedValueOnce(new Error("timeout https://api.groq.com/v1"));
+    const { result } = renderHook(() => usePersistenceHarness());
+
+    await act(async () => {
+      await result.current.persistence.save({ input_gain: 1.5 }, { immediate: true });
+    });
+
+    expect(result.current.persistence.saveError).toBe("Error: timeout https://api.groq.com/v1");
+    expect(result.current.persistence.unsavedFields).toEqual(["input_gain"]);
+  });
 });

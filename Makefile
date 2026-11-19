@@ -32,20 +32,30 @@ build-signed:
 	@command -v cargo >/dev/null 2>&1 || { echo "cargo not found. Install Rust from https://rustup.rs" >&2; exit 1; }
 	@set -euo pipefail; \
 	bundle_dmg_dir="$(CURDIR)/src-tauri/target/release/bundle/dmg"; \
+	bundle_macos_dir="$(CURDIR)/src-tauri/target/release/bundle/macos"; \
+	./scripts/detach-voiceflow-dmg.sh; \
 	rm -rf "$$bundle_dmg_dir"; \
+	rm -f "$$bundle_macos_dir"/rw.*.dmg; \
 	signing_env="$$(./scripts/resolve-dmg-signing.sh)"; \
 	eval "$$signing_env"; \
-	./scripts/detach-voiceflow-dmg.sh; \
+	want_dmg=0; \
+	case ",$(BUNDLES)," in *,dmg,*) want_dmg=1 ;; esac; \
 	if [ -n "$${APPLE_SIGNING_IDENTITY:-}" ] && [ -n "$${APPLE_TEAM_ID:-}" ]; then \
 		echo "==> Signing VoiceFlow with: $$APPLE_SIGNING_IDENTITY"; \
 		APPLE_SIGNING_IDENTITY="$$APPLE_SIGNING_IDENTITY" \
 		APPLE_TEAM_ID="$$APPLE_TEAM_ID" \
-		npm run tauri build -- --bundles $(BUNDLES); \
+		npm run tauri build -- --bundles app; \
+		if [ "$$want_dmg" -eq 1 ]; then \
+			APPLE_SIGNING_IDENTITY="$$APPLE_SIGNING_IDENTITY" \
+			./scripts/build-dmg.sh "$$bundle_macos_dir/VoiceFlow.app" "$$bundle_dmg_dir/VoiceFlow.dmg"; \
+			./scripts/stage-dmg.sh "$$bundle_dmg_dir" "$(RELEASE_DMG)"; \
+		fi; \
 	else \
 		echo "warning: building explicitly allowed unsigned VoiceFlow bundles" >&2; \
 		unset APPLE_SIGNING_IDENTITY APPLE_TEAM_ID DEVELOPER_IDENTITY DEVELOPMENT_TEAM; \
-		npm run tauri build -- --bundles $(BUNDLES); \
-		./scripts/stage-dmg.sh "$$bundle_dmg_dir" "$(UNSIGNED_RELEASE_DMG)"; \
-		exit 0; \
-	fi; \
-	./scripts/stage-dmg.sh "$$bundle_dmg_dir" "$(RELEASE_DMG)"
+		npm run tauri build -- --bundles app; \
+		if [ "$$want_dmg" -eq 1 ]; then \
+			./scripts/build-dmg.sh "$$bundle_macos_dir/VoiceFlow.app" "$$bundle_dmg_dir/VoiceFlow-unsigned.dmg"; \
+			./scripts/stage-dmg.sh "$$bundle_dmg_dir" "$(UNSIGNED_RELEASE_DMG)"; \
+		fi; \
+	fi

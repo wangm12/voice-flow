@@ -416,7 +416,7 @@ pub(crate) struct StopOptions {
 impl Default for StopOptions {
     fn default() -> Self {
         Self {
-            extra_ms: 250,
+            extra_ms: 200,
             vad_enabled: false,
             cancellation: tokio_util::sync::CancellationToken::new(),
         }
@@ -490,6 +490,35 @@ struct StreamResampler {
     generated_pending: VecDeque<f32>,
 }
 
+const RESAMPLER_CHUNK_SIZE: usize = 1024;
+
+fn resampler_pool() -> &'static Mutex<HashMap<u32, Vec<rubato::SincFixedIn<f32>>>> {
+    static POOL: OnceLock<Mutex<HashMap<u32, Vec<rubato::SincFixedIn<f32>>>>> = OnceLock::new();
+    POOL.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn build_or_reuse_sinc_resampler(from_rate: u32) -> Result<rubato::SincFixedIn<f32>, String> {
+    if let Some(mut cached) = resampler_pool()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_mut(&from_rate)
+        .and_then(Vec::pop)
+    {
+        cached.reset();
+        return Ok(cached);
+    }
+    let params = rubato::SincInterpolationParameters {
+        sinc_len: 256,
+        f_cutoff: 0.95,
+        oversampling_factor: 128,
+        interpolation: rubato::SincInterpolationType::Linear,
+        window: rubato::WindowFunction::BlackmanHarris2,
+    };
+    let ratio = TARGET_RATE as f64 / from_rate as f64;
+    rubato::SincFixedIn::new(ratio, 1.0, params, RESAMPLER_CHUNK_SIZE, 1)
+        .map_err(|error| format!("failed to initialize audio resampler: {error}"))
+}
+
 impl StreamResampler {
     fn new(from_rate: u32) -> Result<Self, String> {
         if from_rate == TARGET_RATE {
@@ -503,17 +532,8 @@ impl StreamResampler {
                 generated_pending: VecDeque::new(),
             });
         }
-        let chunk_size = 1024;
-        let params = rubato::SincInterpolationParameters {
-            sinc_len: 256,
-            f_cutoff: 0.95,
-            oversampling_factor: 128,
-            interpolation: rubato::SincInterpolationType::Linear,
-            window: rubato::WindowFunction::BlackmanHarris2,
-        };
-        let ratio = TARGET_RATE as f64 / from_rate as f64;
-        let resampler = rubato::SincFixedIn::new(ratio, 1.0, params, chunk_size, 1)
-            .map_err(|error| format!("failed to initialize audio resampler: {error}"))?;
+        let chunk_size = RESAMPLER_CHUNK_SIZE;
+        let resampler = build_or_reuse_sinc_resampler(from_rate)?;
         Ok(Self {
             resampler: Some(resampler),
             pending: Vec::with_capacity(chunk_size * 2),
@@ -602,6 +622,20 @@ impl StreamResampler {
         let out = self.generated_pending.drain(..needed).collect::<Vec<_>>();
         self.output_samples_returned = self.output_samples_returned.saturating_add(out.len());
         Ok(out)
+    }
+}
+
+impl Drop for StreamResampler {
+    fn drop(&mut self) {
+        if let Some(mut resampler) = self.resampler.take() {
+            resampler.reset();
+            if let Ok(mut pool) = resampler_pool().lock() {
+                let entries = pool.entry(self.from_rate).or_default();
+                if entries.len() < 4 {
+                    entries.push(resampler);
+                }
+            }
+        }
     }
 }
 
@@ -730,6 +764,8 @@ struct CaptureResult {
     session_dir: PathBuf,
     spool_finalizer: SpoolFinalizer,
     tail_flush: CaptureSpoolFlushReceipt,
+    prefetch_baseline: Option<usize>,
+    prefetch_protected_len: usize,
 }
 
 struct CaptureWorker {
@@ -743,6 +779,8 @@ struct CaptureWorker {
     rate_drift_latched: Arc<AtomicBool>,
     rate_drift: Arc<Mutex<RateDriftTracker>>,
     limit_reached: Arc<AtomicBool>,
+    last_speech_elapsed_ms: Arc<AtomicU64>,
+    speech_seen: Arc<AtomicBool>,
     started_at: std::time::Instant,
     session_id: String,
     spool_control: SpoolControl,
@@ -1046,6 +1084,22 @@ impl CaptureCueHandle {
     pub(crate) fn test_observation(&self) -> (Option<usize>, Option<(usize, usize)>) {
         let state = self.snapshot();
         (state.pending_start, state.confirmed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_is_finished(&self) -> bool {
+        self.continuity
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .cue_end_time
+            .is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_set_confirmed(&self, start: usize, end: usize) {
+        let mut state = self.continuity.lock().unwrap_or_else(|e| e.into_inner());
+        state.cue_window.pending_start = None;
+        state.cue_window.confirmed = Some((start, end));
     }
 
     fn freeze(&self) -> CueWindowState {
@@ -1368,6 +1422,10 @@ impl CaptureWorker {
         }));
         let limit_reached = Arc::new(AtomicBool::new(false));
         let worker_limit_reached = limit_reached.clone();
+        let last_speech_elapsed_ms = Arc::new(AtomicU64::new(0));
+        let worker_last_speech_elapsed_ms = last_speech_elapsed_ms.clone();
+        let speech_seen = Arc::new(AtomicBool::new(false));
+        let worker_speech_seen = speech_seen.clone();
         let spool_writer = match spool_io {
             Some((io, registry)) => SpoolWriter::new_with_lease_and_io_and_registry(
                 root,
@@ -1412,6 +1470,11 @@ impl CaptureWorker {
                 let mut warmup_sent = false;
                 let allow_prefetch = !preserve_full_audio;
                 let mut fanout = CaptureFanout::default();
+                let mut prefetch_baseline: Option<usize> = None;
+                let mut prefetch_cursor = 0usize;
+                let mut onset_scan_cursor = 0usize;
+                let mut prefetch_dispatched_end = 0usize;
+                let mut masked_fanout: Vec<f32> = Vec::new();
                 let worker_cue = CaptureCueHandle {
                     continuity: worker_continuity.clone(),
                     native_rate: input_rate,
@@ -1424,6 +1487,90 @@ impl CaptureWorker {
                 let mut spool_writer = Some(spool_writer);
                 let mut finish_reply = None;
                 let mut cancelled = false;
+                let dispatch_fanout =
+                    |batch: &CaptureFanoutBatch,
+                     soniox_audio: &Option<crate::soniox::SonioxAudioSender>,
+                     allow_prefetch: bool,
+                     masked_fanout: &mut Vec<f32>,
+                     prefetch_baseline: &mut Option<usize>,
+                     prefetch_cursor: &mut usize,
+                     onset_scan_cursor: &mut usize,
+                     prefetch_dispatched_end: &mut usize,
+                     warmup_pending: &mut Vec<f32>,
+                     warmup_sent: &mut bool,
+                     prefetch_chunker: &mut Chunker,
+                     prefetch_tx: &PrefetchInbox| {
+                        if let Some(sender) = soniox_audio {
+                            let _ = sender.try_send_samples(
+                                u64::try_from(batch.source_start).expect(
+                                    "capture source cursor is bounded by the recording limit",
+                                ),
+                                &batch.samples,
+                            );
+                        }
+                        if batch.source_start == masked_fanout.len() {
+                            masked_fanout.extend_from_slice(&batch.samples);
+                        } else if batch.source_start < masked_fanout.len() {
+                            let overlap = masked_fanout.len() - batch.source_start;
+                            if batch.samples.len() > overlap {
+                                masked_fanout.extend_from_slice(&batch.samples[overlap..]);
+                            }
+                        }
+                        if !allow_prefetch {
+                            return;
+                        }
+                        if prefetch_baseline.is_none() {
+                            match crate::silence::scan_deterministic_speech_onset(
+                                masked_fanout,
+                                *onset_scan_cursor,
+                            ) {
+                                Ok(onset) => {
+                                    let base = onset.saturating_sub(crate::silence::PAD_SAMPLES);
+                                    *prefetch_baseline = Some(base);
+                                    *prefetch_cursor = base;
+                                }
+                                Err(next) => {
+                                    *onset_scan_cursor = next;
+                                }
+                            }
+                        }
+                        if prefetch_baseline.is_some() && *prefetch_cursor < masked_fanout.len() {
+                            let slice = &masked_fanout[*prefetch_cursor..];
+                            *prefetch_cursor = masked_fanout.len();
+                            if !*warmup_sent {
+                                let remaining = warmup_samples.saturating_sub(warmup_pending.len());
+                                warmup_pending
+                                    .extend_from_slice(&slice[..slice.len().min(remaining)]);
+                                if warmup_pending.len() == warmup_samples {
+                                    let warmup = AudioChunk {
+                                        index: 0,
+                                        identity:
+                                            crate::chunker::AudioChunkIdentity::from_samples_at(
+                                                0,
+                                                warmup_pending,
+                                            ),
+                                        samples: std::mem::take(warmup_pending),
+                                        source_start_sample: 0,
+                                        start_secs: 0.0,
+                                        end_secs: crate::prefetch_asr::WARMUP_CHUNK_SECS as f32,
+                                    };
+                                    if prefetch_tx.try_send(PrefetchMessage::Warmup(warmup)) {
+                                        *warmup_sent = true;
+                                        *prefetch_dispatched_end =
+                                            (*prefetch_dispatched_end).max(warmup_samples);
+                                    }
+                                }
+                            }
+                            for chunk in prefetch_chunker.push(slice) {
+                                let end = chunk
+                                    .source_start_sample
+                                    .saturating_add(chunk.samples.len());
+                                if prefetch_tx.try_send(PrefetchMessage::Chunk(chunk)) {
+                                    *prefetch_dispatched_end = (*prefetch_dispatched_end).max(end);
+                                }
+                            }
+                        }
+                    };
 
                 loop {
                     if finish_reply.is_none() {
@@ -1452,30 +1599,22 @@ impl CaptureWorker {
                         if finish_reply.is_some() {
                             break;
                         }
-                        if let Some(batch) = fanout.take_ready(&data, worker_cue.snapshot(), false) {
-                            if let Some(sender) = &soniox_audio {
-                                let _ = sender.try_send_samples(u64::try_from(batch.source_start).expect("capture source cursor is bounded by the recording limit"), &batch.samples);
-                            }
-                            if allow_prefetch && !warmup_sent {
-                                let remaining = warmup_samples.saturating_sub(warmup_pending.len());
-                                warmup_pending.extend_from_slice(&batch.samples[..batch.samples.len().min(remaining)]);
-                                if warmup_pending.len() == warmup_samples {
-                                    let warmup = AudioChunk {
-                                        index: 0,
-                                        identity: crate::chunker::AudioChunkIdentity::from_samples_at(0, &warmup_pending),
-                                        samples: std::mem::take(&mut warmup_pending),
-                                        source_start_sample: 0,
-                                        start_secs: 0.0,
-                                        end_secs: crate::prefetch_asr::WARMUP_CHUNK_SECS as f32,
-                                    };
-                                    warmup_sent = prefetch_tx.try_send(PrefetchMessage::Warmup(warmup));
-                                }
-                            }
-                            if allow_prefetch {
-                                for chunk in prefetch_chunker.push(&batch.samples) {
-                                    let _ = prefetch_tx.try_send(PrefetchMessage::Chunk(chunk));
-                                }
-                            }
+                        if let Some(batch) = fanout.take_ready(&data, worker_cue.snapshot(), false)
+                        {
+                            dispatch_fanout(
+                                &batch,
+                                &soniox_audio,
+                                allow_prefetch,
+                                &mut masked_fanout,
+                                &mut prefetch_baseline,
+                                &mut prefetch_cursor,
+                                &mut onset_scan_cursor,
+                                &mut prefetch_dispatched_end,
+                                &mut warmup_pending,
+                                &mut warmup_sent,
+                                &mut prefetch_chunker,
+                                &prefetch_tx,
+                            );
                         }
                         continue;
                     };
@@ -1513,6 +1652,19 @@ impl CaptureWorker {
                             if produced.is_empty() {
                                 continue;
                             }
+                            let block_rms =
+                                (produced.iter().map(|sample| sample * sample).sum::<f32>()
+                                    / produced.len() as f32)
+                                    .sqrt();
+                            if block_rms.is_finite()
+                                && block_rms >= crate::silence::DETERMINISTIC_ONSET_RMS
+                            {
+                                worker_last_speech_elapsed_ms.store(
+                                    worker_started_at.elapsed().as_millis() as u64,
+                                    Ordering::Release,
+                                );
+                                worker_speech_seen.store(true, Ordering::Release);
+                            }
                             let accepted =
                                 produced.len().min(max_samples.saturating_sub(data.len()));
                             if accepted > 0 {
@@ -1529,29 +1681,20 @@ impl CaptureWorker {
                             );
                             let cue_state = worker_cue.snapshot();
                             if let Some(batch) = fanout.take_ready(&data, cue_state, false) {
-                                if let Some(sender) = &soniox_audio {
-                                    let _ = sender.try_send_samples(u64::try_from(batch.source_start).expect("capture source cursor is bounded by the recording limit"), &batch.samples);
-                                }
-                                if allow_prefetch && !warmup_sent {
-                                    let remaining = warmup_samples.saturating_sub(warmup_pending.len());
-                                    warmup_pending.extend_from_slice(&batch.samples[..batch.samples.len().min(remaining)]);
-                                    if warmup_pending.len() == warmup_samples {
-                                        let warmup = AudioChunk {
-                                            index: 0,
-                                            identity: crate::chunker::AudioChunkIdentity::from_samples_at(0, &warmup_pending),
-                                            samples: std::mem::take(&mut warmup_pending),
-                                            source_start_sample: 0,
-                                            start_secs: 0.0,
-                                            end_secs: crate::prefetch_asr::WARMUP_CHUNK_SECS as f32,
-                                        };
-                                        warmup_sent = prefetch_tx.try_send(PrefetchMessage::Warmup(warmup));
-                                    }
-                                }
-                                if allow_prefetch {
-                                    for chunk in prefetch_chunker.push(&batch.samples) {
-                                        let _ = prefetch_tx.try_send(PrefetchMessage::Chunk(chunk));
-                                    }
-                                }
+                                dispatch_fanout(
+                                    &batch,
+                                    &soniox_audio,
+                                    allow_prefetch,
+                                    &mut masked_fanout,
+                                    &mut prefetch_baseline,
+                                    &mut prefetch_cursor,
+                                    &mut onset_scan_cursor,
+                                    &mut prefetch_dispatched_end,
+                                    &mut warmup_pending,
+                                    &mut warmup_sent,
+                                    &mut prefetch_chunker,
+                                    &prefetch_tx,
+                                );
                             }
                             if hit_limit {
                                 let newly_limited = close_intentional_limit(
@@ -1562,12 +1705,11 @@ impl CaptureWorker {
                                 );
                                 if newly_limited {
                                     if let Some(app) = app.as_ref() {
-                                        let _ = auto_stop_tx
-                                            .send(EngineCmd::AutoStop {
-                                                stream_id,
-                                                session_generation,
-                                                app: app.clone(),
-                                            });
+                                        let _ = auto_stop_tx.send(EngineCmd::AutoStop {
+                                            stream_id,
+                                            session_generation,
+                                            app: app.clone(),
+                                        });
                                     }
                                 }
                             }
@@ -1611,29 +1753,20 @@ impl CaptureWorker {
                     }
                     // Finish always resolves an unfinished Pending window to raw fallback.
                     if let Some(batch) = fanout.take_ready(&data, worker_cue.snapshot(), true) {
-                        if let Some(sender) = &soniox_audio {
-                            let _ = sender.try_send_samples(u64::try_from(batch.source_start).expect("capture source cursor is bounded by the recording limit"), &batch.samples);
-                        }
-                        if allow_prefetch && !warmup_sent {
-                            let remaining = warmup_samples.saturating_sub(warmup_pending.len());
-                            warmup_pending.extend_from_slice(&batch.samples[..batch.samples.len().min(remaining)]);
-                            if warmup_pending.len() == warmup_samples {
-                                let warmup = AudioChunk {
-                                    index: 0,
-                                    identity: crate::chunker::AudioChunkIdentity::from_samples_at(0, &warmup_pending),
-                                    samples: std::mem::take(&mut warmup_pending),
-                                    source_start_sample: 0,
-                                    start_secs: 0.0,
-                                    end_secs: crate::prefetch_asr::WARMUP_CHUNK_SECS as f32,
-                                };
-                                let _ = prefetch_tx.try_send(PrefetchMessage::Warmup(warmup));
-                            }
-                        }
-                        if allow_prefetch {
-                            for chunk in prefetch_chunker.push(&batch.samples) {
-                                let _ = prefetch_tx.try_send(PrefetchMessage::Chunk(chunk));
-                            }
-                        }
+                        dispatch_fanout(
+                            &batch,
+                            &soniox_audio,
+                            allow_prefetch,
+                            &mut masked_fanout,
+                            &mut prefetch_baseline,
+                            &mut prefetch_cursor,
+                            &mut onset_scan_cursor,
+                            &mut prefetch_dispatched_end,
+                            &mut warmup_pending,
+                            &mut warmup_sent,
+                            &mut prefetch_chunker,
+                            &prefetch_tx,
+                        );
                     }
                     let (spool_finalizer, tail_flush) = spool_writer
                         .take()
@@ -1664,6 +1797,8 @@ impl CaptureWorker {
                         session_dir: worker_session_dir.clone(),
                         spool_finalizer,
                         tail_flush,
+                        prefetch_baseline,
+                        prefetch_protected_len: prefetch_dispatched_end,
                     });
                 }
             })
@@ -1679,6 +1814,8 @@ impl CaptureWorker {
             rate_drift_latched,
             rate_drift,
             limit_reached,
+            last_speech_elapsed_ms,
+            speech_seen,
             started_at,
             session_id,
             spool_control,
@@ -4122,20 +4259,66 @@ enum TailCommand<T> {
     Stop(bool),
 }
 
+const ADAPTIVE_TAIL_MAX_MS: u64 = 200;
+const ADAPTIVE_TAIL_QUIET_EXIT_MS: u64 = 80;
+const ADAPTIVE_TAIL_MIN_FLOOR_MS: u64 = 40;
+
+#[cfg(test)]
 fn wait_tail_commands<T>(
     options: &StopOptions,
     rx: &mpsc::Receiver<T>,
     pending: &mut std::collections::VecDeque<T>,
+    classify: impl FnMut(T) -> TailCommand<T>,
+) -> bool {
+    wait_tail_commands_inner(
+        options,
+        options.extra_ms.min(2000),
+        None,
+        rx,
+        pending,
+        classify,
+    )
+}
+
+fn wait_tail_commands_inner<T>(
+    options: &StopOptions,
+    max_ms: u64,
+    silence_monitor: Option<(&std::time::Instant, &AtomicU64, &AtomicBool)>,
+    rx: &mpsc::Receiver<T>,
+    pending: &mut std::collections::VecDeque<T>,
     mut classify: impl FnMut(T) -> TailCommand<T>,
 ) -> bool {
-    let deadline = std::time::Instant::now() + Duration::from_millis(options.extra_ms.min(2000));
+    let loop_started = std::time::Instant::now();
+    let deadline = loop_started + Duration::from_millis(max_ms);
     while std::time::Instant::now() < deadline {
         if options.cancellation.is_cancelled() {
             return false;
         }
+        while let Ok(command) = rx.try_recv() {
+            match classify(command) {
+                TailCommand::Pending(command) => pending.push_back(command),
+                TailCommand::Stop(completed) => {
+                    return completed && !options.cancellation.is_cancelled()
+                }
+            }
+        }
+        if let Some((started_at, last_speech_elapsed_ms, speech_seen)) = silence_monitor {
+            if loop_started.elapsed() >= Duration::from_millis(ADAPTIVE_TAIL_MIN_FLOOR_MS)
+                && speech_seen.load(Ordering::Acquire)
+            {
+                let now_ms = started_at.elapsed().as_millis() as u64;
+                let last_ms = last_speech_elapsed_ms.load(Ordering::Acquire);
+                if now_ms.saturating_sub(last_ms) >= ADAPTIVE_TAIL_QUIET_EXIT_MS {
+                    break;
+                }
+            }
+        }
         let wait = deadline
             .saturating_duration_since(std::time::Instant::now())
-            .min(Duration::from_millis(25));
+            .min(Duration::from_millis(15));
+        if wait.is_zero() {
+            break;
+        }
         match rx.recv_timeout(wait) {
             Ok(command) => match classify(command) {
                 TailCommand::Pending(command) => pending.push_back(command),
@@ -4159,82 +4342,106 @@ fn wait_recording_tail(
     if rec.stream.is_none() {
         return !options.cancellation.is_cancelled();
     }
-    wait_tail_commands(options, rx, pending, |command| match command {
-        EngineCmd::Cancel { reply } => {
-            let _ = reply.send(());
-            TailCommand::Stop(false)
-        }
-        EngineCmd::StreamError {
-            stream_id,
-            app,
-            message,
-        } => {
-            if !stream_failure_matches(rec.stream_id, stream_id) {
-                return TailCommand::Pending(EngineCmd::StreamError {
-                    stream_id,
-                    app,
-                    message,
-                });
+    let started_at = rec.capture.started_at;
+    let last_speech_elapsed_ms = rec.capture.last_speech_elapsed_ms.clone();
+    let speech_seen = rec.capture.speech_seen.clone();
+    // Honor explicit DebugSettings extra buffer > 200ms without quiet cut-off;
+    // for default/smaller budgets (<= 200ms), use adaptive quiet early-exit.
+    let (tail_max_ms, monitor) = if options.extra_ms <= ADAPTIVE_TAIL_MAX_MS {
+        (
+            options.extra_ms,
+            Some((
+                &started_at,
+                last_speech_elapsed_ms.as_ref(),
+                speech_seen.as_ref(),
+            )),
+        )
+    } else {
+        (options.extra_ms.min(2000), None)
+    };
+    wait_tail_commands_inner(
+        options,
+        tail_max_ms,
+        monitor,
+        rx,
+        pending,
+        |command| match command {
+            EngineCmd::Cancel { reply } => {
+                let _ = reply.send(());
+                TailCommand::Stop(false)
             }
-            fail_recording(rec, &app, &message);
-            TailCommand::Stop(true)
-        }
-        EngineCmd::CaptureError {
-            stream_id,
-            session_generation,
-            app,
-            message,
-        } => {
-            if !capture_session_matches(
-                rec.stream_id,
-                rec.session_generation,
+            EngineCmd::StreamError {
                 stream_id,
-                Some(session_generation),
-            ) {
-                return TailCommand::Pending(EngineCmd::CaptureError {
-                    stream_id,
-                    session_generation,
-                    app,
-                    message,
-                });
+                app,
+                message,
+            } => {
+                if !stream_failure_matches(rec.stream_id, stream_id) {
+                    return TailCommand::Pending(EngineCmd::StreamError {
+                        stream_id,
+                        app,
+                        message,
+                    });
+                }
+                fail_recording(rec, &app, &message);
+                TailCommand::Stop(true)
             }
-            fail_recording(rec, &app, &message);
-            TailCommand::Stop(true)
-        }
-        EngineCmd::AutoStop {
-            stream_id,
-            session_generation,
-            app,
-        } => {
-            let expected_stream_id = rec.stream_id;
-            let expected_generation = rec.session_generation;
-            if !dispatch_auto_stop_if_current(
-                expected_stream_id,
-                expected_generation,
+            EngineCmd::CaptureError {
                 stream_id,
                 session_generation,
-                || {
-                    close_capture_continuity(rec);
-                    drop(rec.stream.take());
-                    let _ = app.emit(
-                        "audio://limit",
-                        serde_json::json!({
-                            "max_recording_secs": MAX_RECORDING_SECS,
-                            "session_generation": rec.session_generation,
-                        }),
-                    );
-                },
-            ) {
-                return TailCommand::Pending(EngineCmd::AutoStop {
+                app,
+                message,
+            } => {
+                if !capture_session_matches(
+                    rec.stream_id,
+                    rec.session_generation,
+                    stream_id,
+                    Some(session_generation),
+                ) {
+                    return TailCommand::Pending(EngineCmd::CaptureError {
+                        stream_id,
+                        session_generation,
+                        app,
+                        message,
+                    });
+                }
+                fail_recording(rec, &app, &message);
+                TailCommand::Stop(true)
+            }
+            EngineCmd::AutoStop {
+                stream_id,
+                session_generation,
+                app,
+            } => {
+                let expected_stream_id = rec.stream_id;
+                let expected_generation = rec.session_generation;
+                if !dispatch_auto_stop_if_current(
+                    expected_stream_id,
+                    expected_generation,
                     stream_id,
                     session_generation,
-                    app,
-                });
+                    || {
+                        close_capture_continuity(rec);
+                        drop(rec.stream.take());
+                        let _ = app.emit(
+                            "audio://limit",
+                            serde_json::json!({
+                                "max_recording_secs": MAX_RECORDING_SECS,
+                                "session_generation": rec.session_generation,
+                            }),
+                        );
+                    },
+                ) {
+                    return TailCommand::Pending(EngineCmd::AutoStop {
+                        stream_id,
+                        session_generation,
+                        app,
+                    });
+                }
+                TailCommand::Stop(true)
             }
-            TailCommand::Stop(true)
-        }
-        command => TailCommand::Pending(command),
-    })
+            command => TailCommand::Pending(command),
+        },
+    )
 }
 
 // Holding this gate until the push finishes lets stop detach before flushing;
@@ -5439,6 +5646,37 @@ fn preserve_partial_recording(mut rec: ActiveRec) {
     }
 }
 
+fn finalize_captured_samples(
+    mut captured_samples: Vec<f32>,
+    cue_range: Option<(usize, usize)>,
+    preserve_full_audio: bool,
+    vad_enabled: bool,
+    prefetch_baseline: Option<usize>,
+    prefetch_protected_len: usize,
+) -> Vec<f32> {
+    mask_cue_range(&mut captured_samples, cue_range, 0);
+    if preserve_full_audio {
+        captured_samples
+    } else if !vad_enabled {
+        if let Some(base) = prefetch_baseline {
+            let speech = crate::silence::speech_ranges(&captured_samples);
+            if speech.first().is_some_and(|&(start, _)| start < base) {
+                crate::vad::filter_speech(&captured_samples, false)
+            } else {
+                crate::silence::trim_and_compress_preserving_prefix(
+                    &captured_samples,
+                    base,
+                    prefetch_protected_len,
+                )
+            }
+        } else {
+            crate::vad::filter_speech(&captured_samples, false)
+        }
+    } else {
+        crate::vad::filter_speech(&captured_samples, vad_enabled)
+    }
+}
+
 fn finalize(rec: ActiveRec, vad_enabled: bool) -> Result<FinishedCapture, AudioError> {
     close_capture_continuity(&rec);
     let cue_range = rec
@@ -5464,13 +5702,14 @@ fn finalize(rec: ActiveRec, vad_enabled: bool) -> Result<FinishedCapture, AudioE
     drop(stream); // no callback can append after the stream is dropped.
     let capture = capture.finish().map_err(AudioError::Device)?;
     let CaptureResult {
-        samples: mut captured_samples,
+        samples: captured_samples,
         processing_error,
         session_dir,
         spool_finalizer,
         tail_flush,
+        prefetch_baseline,
+        prefetch_protected_len,
     } = capture;
-    mask_cue_range(&mut captured_samples, cue_range, 0);
     if let Some(error) = processing_error {
         let _ = spool_finalizer.resolve(SpoolDisposition::Degraded);
         return Err(AudioError::Device(error));
@@ -5478,11 +5717,14 @@ fn finalize(rec: ActiveRec, vad_enabled: bool) -> Result<FinishedCapture, AudioE
     if let Some(error) = spool_finalizer.failure() {
         log::warn!("audio spool finalization was partial: {error}");
     }
-    let samples = if preserve_full_audio {
-        captured_samples
-    } else {
-        crate::vad::filter_speech(&captured_samples, vad_enabled)
-    };
+    let samples = finalize_captured_samples(
+        captured_samples,
+        cue_range,
+        preserve_full_audio,
+        vad_enabled,
+        prefetch_baseline,
+        prefetch_protected_len,
+    );
     if samples.is_empty() {
         let _ = spool_finalizer.resolve(SpoolDisposition::Completed);
         emit_capture_state(
@@ -5834,20 +6076,39 @@ fn normalized_audio_level(samples: &[f32]) -> f32 {
     }
     let mut sum_squares: f32 = 0.0;
     let mut peak: f32 = 0.0;
+    let mut finite_count = 0usize;
     for sample in samples {
+        if !sample.is_finite() {
+            continue;
+        }
         sum_squares += sample * sample;
         peak = peak.max(sample.abs());
+        finite_count += 1;
     }
-    let rms = (sum_squares / samples.len() as f32).sqrt();
+    if finite_count == 0 {
+        return 0.0;
+    }
+    let rms = (sum_squares / finite_count as f32).sqrt();
     let amplitude = rms * 0.8 + peak * 0.2;
+    if !amplitude.is_finite() {
+        return 0.0;
+    }
     const NOISE_FLOOR: f32 = 0.008;
     const SPEECH_CEILING: f32 = 0.20;
     ((amplitude - NOISE_FLOOR) / (SPEECH_CEILING - NOISE_FLOOR)).clamp(0.0, 1.0)
 }
 
 fn smooth_audio_level(previous: f32, current: f32) -> f32 {
-    let previous = previous.clamp(0.0, 1.0);
-    let current = current.clamp(0.0, 1.0);
+    let previous = if previous.is_finite() {
+        previous.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let current = if current.is_finite() {
+        current.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
     let response = if current > previous { 0.48 } else { 0.20 };
     previous + (current - previous) * response
 }
@@ -5948,7 +6209,8 @@ mod tests {
     }
 
     static CAPTURE_START_GATE: OnceLock<Mutex<Option<CaptureStartGate>>> = OnceLock::new();
-    static CAPTURE_TEST_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    pub(super) static CAPTURE_TEST_SERIAL: tokio::sync::Mutex<()> =
+        tokio::sync::Mutex::const_new(());
 
     #[test]
     fn stop_lid_check_rejects_only_the_actual_builtin_capture_and_preserves_first_error() {
@@ -6253,7 +6515,7 @@ mod tests {
         condition.notify_all();
     }
 
-    fn wait_for_audio_owners() {
+    pub(super) fn wait_for_audio_owners() {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
         while super::CAPTURE_OWNER_REGISTRY
             .get_or_init(Default::default)
@@ -8433,6 +8695,8 @@ mod tests {
                     tail_flush: super::CaptureSpoolFlushReceipt::failed(
                         "overflow test has no spool owner".into(),
                     ),
+                    prefetch_baseline: None,
+                    prefetch_protected_len: 0,
                 });
             }
         });
@@ -8447,6 +8711,8 @@ mod tests {
             rate_drift_latched: Arc::new(AtomicBool::new(false)),
             rate_drift: Arc::new(Mutex::new(RateDriftTracker::default())),
             limit_reached: Arc::new(AtomicBool::new(false)),
+            last_speech_elapsed_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            speech_seen: Arc::new(AtomicBool::new(false)),
             started_at: std::time::Instant::now(),
             session_id: "overflow-finish-test".into(),
             spool_control,
@@ -8599,6 +8865,8 @@ mod tests {
                     tail_flush: super::CaptureSpoolFlushReceipt::failed(
                         "rate drift fixture has no spool owner".into(),
                     ),
+                    prefetch_baseline: None,
+                    prefetch_protected_len: 0,
                 });
             }
         });
@@ -8630,6 +8898,8 @@ mod tests {
             rate_drift_latched: drift_latched,
             rate_drift: Arc::new(Mutex::new(RateDriftTracker::default())),
             limit_reached: Arc::new(AtomicBool::new(false)),
+            last_speech_elapsed_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            speech_seen: Arc::new(AtomicBool::new(false)),
             started_at: std::time::Instant::now(),
             session_id: "rate-drift-finish-test".into(),
             spool_control,
@@ -8719,6 +8989,8 @@ mod tests {
                     tail_flush: super::CaptureSpoolFlushReceipt::failed(
                         "stale gap fixture has no spool owner".into(),
                     ),
+                    prefetch_baseline: None,
+                    prefetch_protected_len: 0,
                 });
             }
         });
@@ -8733,6 +9005,8 @@ mod tests {
             rate_drift_latched: Arc::new(AtomicBool::new(false)),
             rate_drift: Arc::new(Mutex::new(RateDriftTracker::default())),
             limit_reached: Arc::new(AtomicBool::new(false)),
+            last_speech_elapsed_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            speech_seen: Arc::new(AtomicBool::new(false)),
             started_at: std::time::Instant::now(),
             session_id: "stale-gap-finish-test".into(),
             spool_control,
@@ -8773,6 +9047,8 @@ mod tests {
             rate_drift_latched: Arc::new(AtomicBool::new(false)),
             rate_drift: Arc::new(Mutex::new(RateDriftTracker::default())),
             limit_reached: Arc::new(AtomicBool::new(false)),
+            last_speech_elapsed_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            speech_seen: Arc::new(AtomicBool::new(false)),
             started_at: capture_started_at,
             session_id: "epoch-close-test".into(),
             spool_control: SpoolControl {
@@ -9241,5 +9517,218 @@ mod tail_and_idle_regressions {
             assert_eq!(slot.lock().unwrap().take(), Some(vec![session]));
             assert!(with_capture_session(&slot, |samples| samples.push(99)).is_none());
         }
+    }
+
+    #[test]
+    fn capture_worker_prefetch_identity_matches_finalize_with_confirmed_cue_and_leading_silence() {
+        let _serial = super::tests::CAPTURE_TEST_SERIAL.blocking_lock();
+        super::tests::wait_for_audio_owners();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "voiceflow-cue-prefetch-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let session_id = format!("cue-prefetch-align-{nanos}");
+        let (session_dir, lease) =
+            crate::store::begin_audio_spool_session(&root, &session_id).expect("spool session");
+        let (prefetch_tx, mut prefetch_rx) = crate::prefetch_asr::PrefetchAsrSession::channel();
+        let (event_tx, _event_rx) = mpsc::channel();
+        let capture = CaptureWorker::new(
+            root.clone(),
+            session_dir.clone(),
+            lease,
+            TARGET_RATE,
+            false,
+            super::MAX_RECORDING_SECS * TARGET_RATE as usize,
+            15,
+            1.0,
+            prefetch_tx,
+            None,
+            false,
+            921,
+            922,
+            event_tx,
+            None,
+            None,
+            None,
+        )
+        .expect("capture worker starts");
+        let cue = CaptureCueHandle {
+            continuity: Arc::clone(&capture.continuity),
+            native_rate: TARGET_RATE,
+        };
+        // Loud speaker cue bleed [0..3200) + leading silence [3200..8000) + 22s speech (> 15s + 5s max chunker window).
+        cue.test_set_confirmed(0, 3_200);
+        let mut pcm = Vec::with_capacity(3_200 + 4_800 + TARGET_RATE as usize * 22);
+        pcm.extend(std::iter::repeat_n(0.4f32, 3_200));
+        pcm.extend(std::iter::repeat_n(0.0f32, 4_800));
+        pcm.extend(std::iter::repeat_n(0.25f32, TARGET_RATE as usize * 22));
+        let blocks_before_spool_barrier = 12usize;
+        let total_capture_blocks = pcm.chunks(TARGET_RATE as usize).count();
+        assert!(blocks_before_spool_barrier < super::SPOOL_OWNER_QUEUE_CAPACITY);
+        assert!(
+            total_capture_blocks - blocks_before_spool_barrier <= super::SPOOL_OWNER_QUEUE_CAPACITY,
+            "the second fixture batch must fit the bounded spool admission queue"
+        );
+        for (block_index, block) in pcm.chunks(TARGET_RATE as usize).enumerate() {
+            if block_index == blocks_before_spool_barrier {
+                let manifest_path = session_dir.join("manifest.json");
+                let expected_chunk_index = blocks_before_spool_barrier - 1;
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                loop {
+                    let chunk_is_committed = if manifest_path.exists() {
+                        let manifest_bytes = std::fs::read(&manifest_path)
+                            .expect("capture spool manifest remains readable");
+                        let manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes)
+                            .expect("capture spool manifest remains valid JSON");
+                        manifest["chunks"].as_array().is_some_and(|chunks| {
+                            chunks.iter().any(|chunk| {
+                                chunk["index"].as_u64() == Some(expected_chunk_index as u64)
+                                    && chunk["status"] == "written"
+                            })
+                        })
+                    } else {
+                        false
+                    };
+                    if chunk_is_committed {
+                        break;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "spool chunk {expected_chunk_index} was not committed before the second capture batch"
+                    );
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+            capture
+                .tx
+                .send(CaptureCommand::Samples(block.to_vec()))
+                .expect("send capture block");
+        }
+        let result = capture.finish().expect("capture worker finishes");
+        assert!(
+            result
+                .prefetch_baseline
+                .is_some_and(|base| (3_200..=8_000).contains(&base)),
+            "expected prefetch_baseline after 3200-sample cue and within 8000-sample silence, got {:?}",
+            result.prefetch_baseline
+        );
+        let prefetched_identities: Vec<_> = std::iter::from_fn(|| prefetch_rx.try_recv().ok())
+            .filter_map(|msg| match msg {
+                crate::prefetch_asr::PrefetchMessage::Chunk(chunk) => Some(chunk.identity),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !prefetched_identities.is_empty(),
+            "worker should emit at least one prefetched chunk"
+        );
+        let final_samples = finalize_captured_samples(
+            result.samples,
+            cue.freeze().confirmed,
+            false,
+            false,
+            result.prefetch_baseline,
+            result.prefetch_protected_len,
+        );
+        let mut final_chunker = crate::chunker::Chunker::new(crate::chunker::ChunkerConfig {
+            chunk_length_secs: 15,
+        });
+        let mut final_chunks = final_chunker.push(&final_samples);
+        if let Some(last) = final_chunker.finish() {
+            final_chunks.push(last);
+        }
+        for (idx, identity) in prefetched_identities.iter().enumerate() {
+            assert_eq!(
+                final_chunks.get(idx).map(|chunk| &chunk.identity),
+                Some(identity),
+                "prefetched chunk {idx} must match finalize chunk identity despite cue bleed + leading silence"
+            );
+        }
+        assert!(result.spool_finalizer.resolve(SpoolDisposition::Completed));
+        result
+            .spool_finalizer
+            .wait_closed_blocking()
+            .expect("spool writer closes before the isolated test root is removed");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn soft_first_word_below_onset_threshold_triggers_vad_fallback() {
+        // 300ms silence + 300ms soft first word (~0.002 RMS, below 0.003 onset
+        // threshold but above vad's 0.001 speech threshold) + 500ms loud speech.
+        let mut samples = Vec::new();
+        samples.extend(std::iter::repeat_n(0.0f32, 4_800));
+        samples.extend(std::iter::repeat_n(0.002f32, 4_800));
+        samples.extend(std::iter::repeat_n(0.25f32, 8_000));
+        let base = 9_600usize;
+        let speech = crate::silence::speech_ranges(&samples);
+        assert!(
+            speech.first().is_some_and(|&(start, _)| start < base),
+            "speech_ranges should see the soft first word before onset base"
+        );
+        let trimmed = finalize_captured_samples(samples, None, false, false, Some(base), 0);
+        // Should preserve the ~0.002 soft first word (total speech ~12,800 samples >= 12,000),
+        // rather than slicing strictly from `base` (which would leave <= 8,000 samples).
+        assert!(
+            trimmed.len() >= 11_000,
+            "expected soft first word to be preserved, got len={}",
+            trimmed.len()
+        );
+    }
+
+    #[test]
+    fn wait_tail_commands_inner_enforces_min_floor_quiet_exit_and_explicit_extra_ms() {
+        // 1) Quiet exit triggers after 40ms floor + 80ms quiet without waiting 200ms.
+        let (_tx, rx) = mpsc::channel::<u8>();
+        let started_at = std::time::Instant::now() - Duration::from_millis(200);
+        let last_speech_ms = AtomicU64::new(0);
+        let speech_seen = AtomicBool::new(true);
+        let mut pending = Default::default();
+        let begin = std::time::Instant::now();
+        assert!(wait_tail_commands_inner(
+            &StopOptions {
+                extra_ms: 200,
+                ..StopOptions::default()
+            },
+            200,
+            Some((&started_at, &last_speech_ms, &speech_seen)),
+            &rx,
+            &mut pending,
+            TailCommand::Pending,
+        ));
+        let elapsed = begin.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(super::ADAPTIVE_TAIL_MIN_FLOOR_MS.saturating_sub(5)),
+            "must enforce min floor before quiet early exit, got {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(160),
+            "should exit early when already quiet, got {elapsed:?}"
+        );
+
+        // 2) Explicit extra_ms > ADAPTIVE_TAIL_MAX_MS is honored without adaptive early-cut.
+        let (_tx2, rx2) = mpsc::channel::<u8>();
+        let mut pending2 = Default::default();
+        let explicit_begin = std::time::Instant::now();
+        assert!(wait_tail_commands_inner(
+            &StopOptions {
+                extra_ms: 280,
+                ..StopOptions::default()
+            },
+            280,
+            None,
+            &rx2,
+            &mut pending2,
+            TailCommand::Pending,
+        ));
+        assert!(
+            explicit_begin.elapsed() >= Duration::from_millis(260),
+            "explicit extra_ms > 200ms should not be cut short"
+        );
     }
 }

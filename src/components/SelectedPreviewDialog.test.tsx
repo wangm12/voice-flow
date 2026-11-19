@@ -468,4 +468,61 @@ describe("SelectedPreviewDialog", () => {
     expect(screen.getByText(label)).toBeInTheDocument();
     expect(screen.queryByText(preview.target_label)).not.toBeInTheDocument();
   });
+
+  it("submits confirm on Cmd+Enter inside the dialog and skips when empty or busy", () => {
+    const onConfirm = vi.fn();
+    const { rerender } = render(
+      <SelectedPreviewDialog
+        preview={preview}
+        draft="Edited text"
+        onDraftChange={() => undefined}
+        onCancel={() => undefined}
+        onCopy={() => undefined}
+        onConfirm={onConfirm}
+      />,
+    );
+
+    const textbox = screen.getByRole("textbox", { name: "VoiceFlow 生成结果" });
+    fireEvent.keyDown(textbox, { key: "Enter", metaKey: true });
+    expect(onConfirm).toHaveBeenCalledTimes(1);
+
+    rerender(
+      <SelectedPreviewDialog
+        preview={preview}
+        draft="   "
+        onDraftChange={() => undefined}
+        onCancel={() => undefined}
+        onCopy={() => undefined}
+        onConfirm={onConfirm}
+      />,
+    );
+    fireEvent.keyDown(textbox, { key: "Enter", metaKey: true });
+    expect(onConfirm).toHaveBeenCalledTimes(1);
+
+    rerender(
+      <SelectedPreviewDialog
+        preview={preview}
+        draft="Edited text"
+        onDraftChange={() => undefined}
+        onCancel={() => undefined}
+        onCopy={() => undefined}
+        onConfirm={onConfirm}
+        busy
+      />,
+    );
+    fireEvent.keyDown(screen.getByRole("dialog"), { key: "Enter", metaKey: true });
+    expect(onConfirm).toHaveBeenCalledTimes(1);
+
+    fireEvent.keyDown(screen.getByRole("dialog"), {
+      key: "Enter",
+      metaKey: true,
+      isComposing: true,
+    });
+    fireEvent.keyDown(screen.getByRole("dialog"), {
+      key: "Enter",
+      metaKey: true,
+      keyCode: 229,
+    });
+    expect(onConfirm).toHaveBeenCalledTimes(1);
+  });
 });

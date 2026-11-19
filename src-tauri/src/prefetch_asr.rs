@@ -38,6 +38,10 @@ impl PrefetchRequestIdentity {
         // digest; the credential itself is never stored in the result.
         hash_field(&mut hasher, &options.api_key);
         hash_optional_field(&mut hasher, options.language.as_deref());
+        hasher.update((options.preferred_languages.len() as u64).to_le_bytes());
+        for pref in &options.preferred_languages {
+            hash_field(&mut hasher, pref);
+        }
         hash_optional_field(&mut hasher, options.prompt.as_deref());
         hash_field(&mut hasher, &options.model);
         hasher.update((options.keywords.len() as u64).to_le_bytes());

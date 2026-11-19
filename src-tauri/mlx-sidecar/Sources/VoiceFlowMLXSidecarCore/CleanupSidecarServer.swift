@@ -122,6 +122,58 @@ enum PromptCacheSDKIdentity {
   }
 }
 
+enum PromptCacheKeyIdentity {
+  static func make(
+    route: CleanupModelRoute,
+    parameters: GenerateParameters,
+    runtimeVersion: String,
+    sdkIdentity: String
+  ) -> String? {
+    guard route.usesPinnedPrefixCache,
+      let repository = route.prefixCacheRepository,
+      let manifest = route.prefixCacheManifestSHA256
+    else {
+      return nil
+    }
+    func optional<Value>(_ value: Value?) -> String {
+      guard let value else { return "none" }
+      return String(describing: value)
+    }
+    return [
+      "voiceflow-prefix-cache-v3",
+      "model=\(route.modelId)",
+      "repository=\(repository)",
+      "revision=\(route.revision)",
+      "manifest=\(manifest)",
+      "cache-recipe=\(route.promptRecipe)",
+      "route-maximum-prompt=\(optional(route.maximumPromptTokens))",
+      "route-maximum-generation=\(optional(route.maximumGenerationTokens))",
+      "runtime=\(runtimeVersion)",
+      "sdk=\(sdkIdentity)",
+      "template=standard-chat",
+      "additional-context=enable-thinking-false",
+      "prefill=\(parameters.prefillStepSize)",
+      "max-output=\(optional(parameters.maxTokens))",
+      "temperature=\(parameters.temperature)",
+      "top-p=\(parameters.topP)",
+      "top-k=\(parameters.topK)",
+      "min-p=\(parameters.minP)",
+      "max-kv=\(optional(parameters.maxKVSize))",
+      "kv-bits=\(optional(parameters.kvBits))",
+      "kv-group=\(parameters.kvGroupSize)",
+      "quantized-kv-start=\(parameters.quantizedKVStart)",
+      "kv-scheme=\(optional(parameters.kvScheme))",
+      "seed=\(optional(parameters.seed))",
+      "repetition=\(optional(parameters.repetitionPenalty))",
+      "repetition-context=\(parameters.repetitionContextSize)",
+      "presence=\(optional(parameters.presencePenalty))",
+      "presence-context=\(parameters.presenceContextSize)",
+      "frequency=\(optional(parameters.frequencyPenalty))",
+      "frequency-context=\(parameters.frequencyContextSize)",
+    ].joined(separator: "|")
+  }
+}
+
 struct PromptCacheMetrics: Sendable {
   var status: String
   var reason: String?
@@ -415,14 +467,185 @@ private struct PromptCacheSnapshotManifest: Codable {
   let snapshotSHA256: String
 }
 
-/// Holds at most two immutable system-prefix caches. Each operation gets an
+struct PromptCacheIndexManifest: Codable {
+  let schemaVersion: Int
+  /// Most-recently-used first. The list is bounded to the four durable slots.
+  let keys: [String]
+}
+
+enum PromptCacheLayerKind: String, Equatable {
+  case kvSimple = "kv_simple"
+  case rotating = "rotating"
+  case mamba
+}
+
+struct PromptCacheLayerLayout: Equatable {
+  let kind: PromptCacheLayerKind
+  let expectedKVHeads: Int?
+  let rotatingKeep: Int?
+  let rotatingMaximumSize: Int?
+  let rotatingStep: Int?
+
+  static func make(_ cache: KVCache, expectedKVHeads: Int? = nil) -> Self? {
+    if cache is MambaCache {
+      return Self(
+        kind: .mamba,
+        expectedKVHeads: nil,
+        rotatingKeep: nil,
+        rotatingMaximumSize: nil,
+        rotatingStep: nil
+      )
+    }
+    if let rotating = cache as? RotatingKVCache {
+      let metadata = rotating.metaState
+      guard metadata.count == 5,
+        let keep = canonicalInt(metadata[0]),
+        let maximumSize = canonicalInt(metadata[1]),
+        let step = canonicalInt(metadata[2]),
+        maximumSize > 0,
+        keep >= 0,
+        keep < maximumSize,
+        step > 0
+      else {
+        return nil
+      }
+      return Self(
+        kind: .rotating,
+        expectedKVHeads: expectedKVHeads,
+        rotatingKeep: keep,
+        rotatingMaximumSize: maximumSize,
+        rotatingStep: step
+      )
+    }
+    if cache is KVCacheSimple {
+      return Self(
+        kind: .kvSimple,
+        expectedKVHeads: expectedKVHeads,
+        rotatingKeep: nil,
+        rotatingMaximumSize: nil,
+        rotatingStep: nil
+      )
+    }
+    return nil
+  }
+
+  var snapshotClassNames: Set<String> {
+    switch kind {
+    case .kvSimple: return ["KVCache", "KVCacheSimple"]
+    case .rotating: return ["RotatingKVCache"]
+    case .mamba: return ["MambaCache"]
+    }
+  }
+
+  var serializedMetadataCount: Int {
+    switch kind {
+    case .kvSimple: return 1
+    case .rotating: return 5
+    case .mamba: return 2
+    }
+  }
+
+  var signatureIdentity: String {
+    switch kind {
+    case .kvSimple:
+      return "kv_simple"
+    case .mamba:
+      return "mamba:slots=2:present=0,1"
+    case .rotating:
+      return "rotating:keep=\(rotatingKeep ?? -1):max=\(rotatingMaximumSize ?? -1):step=\(rotatingStep ?? -1)"
+    }
+  }
+
+  func expectedSequenceLength(prefixTokens: Int) -> Int? {
+    guard prefixTokens > 0 else { return nil }
+    switch kind {
+    case .kvSimple:
+      return prefixTokens
+    case .rotating:
+      guard let maximumSize = rotatingMaximumSize else { return nil }
+      let (maximumPrefillLength, overflow) = maximumSize.addingReportingOverflow(
+        PromptPrefixBoundary.step - 1
+      )
+      guard !overflow else { return nil }
+      return min(prefixTokens, maximumPrefillLength)
+    case .mamba:
+      return nil
+    }
+  }
+
+  func matches(_ cache: KVCache) -> Bool {
+    switch kind {
+    case .kvSimple: return cache is KVCacheSimple
+    case .rotating: return cache is RotatingKVCache
+    case .mamba: return cache is MambaCache
+    }
+  }
+
+  func validatesRotatingMetadata(_ metadata: [String], prefixTokens: Int) -> Bool {
+    guard kind == .rotating,
+      metadata.count == 5,
+      let keep = Self.canonicalInt(metadata[0]),
+      let maximumSize = Self.canonicalInt(metadata[1]),
+      let step = Self.canonicalInt(metadata[2]),
+      let offset = Self.canonicalInt(metadata[3]),
+      let index = Self.canonicalInt(metadata[4]),
+      let expectedSequenceLength = expectedSequenceLength(prefixTokens: prefixTokens)
+    else {
+      return false
+    }
+    return keep == rotatingKeep
+      && maximumSize == rotatingMaximumSize
+      && step == rotatingStep
+      && offset == prefixTokens
+      && index == expectedSequenceLength
+  }
+
+  static func canonicalInt(_ value: String) -> Int? {
+    guard let parsed = Int(value), String(parsed) == value else { return nil }
+    return parsed
+  }
+}
+
+struct PromptCacheLayout: Equatable {
+  let layers: [PromptCacheLayerLayout]
+
+  init?(caches: [KVCache], kvHeads: [Int]? = nil) {
+    guard !caches.isEmpty else { return nil }
+    let layers = caches.enumerated().compactMap { index, cache in
+      PromptCacheLayerLayout.make(
+        cache,
+        expectedKVHeads: kvHeads.flatMap { $0.indices.contains(index) ? $0[index] : nil }
+      )
+    }
+    guard layers.count == caches.count else { return nil }
+    self.layers = layers
+  }
+
+  static func make(
+    model: any LanguageModel,
+    parameters: GenerateParameters
+  ) -> Self? {
+    Self(
+      caches: model.newCache(parameters: parameters),
+      kvHeads: (model as? any KVCacheDimensionProvider)?.kvHeads
+    )
+  }
+
+  static func make(caches: [KVCache], model: any LanguageModel) -> Self? {
+    Self(caches: caches, kvHeads: (model as? any KVCacheDimensionProvider)?.kvHeads)
+  }
+}
+
+/// Holds up to four immutable system-prefix caches. Each operation gets an
 /// official MLX cache copy; user/transcript tokens are never part of saved state.
 final class PromptPrefixCache: @unchecked Sendable {
-  static let schemaVersion = 2
+  static let schemaVersion = 3
   static let maximumResidentCount = 2
+  static let maximumDurableCount = 4
   private static let maximumSnapshotBytes: UInt64 = 512 * 1_024 * 1_024
   private static let maximumResidentStateBytes = maximumSnapshotBytes - 1_048_576
   private static let manifestMaximumBytes = 64 * 1_024
+  private static let indexMaximumBytes = 16 * 1_024
   private static let snapshotName = "prefix.safetensors"
   private static let manifestName = "manifest.json"
 
@@ -616,12 +839,16 @@ final class PromptPrefixCache: @unchecked Sendable {
     var base = residents.first(where: { $0.key == candidate.key })
 
     if let resident = base {
+      touchResident(resident.key)
       metrics.status = "memory_hit"
       metrics.reason = nil
       metrics.snapshotBytes = resident.snapshotBytes
       metrics.lookupSeconds = max(0, ProcessInfo.processInfo.systemUptime - lookupStarted)
       metrics.cachedPrefixTokens = candidate.tokenCount
       metrics.computedSuffixTokens = actualTokens.count - candidate.tokenCount
+      if !memoryOnly, let reason = touchDurableIndex(candidate.key) {
+        metrics.reason = reason
+      }
     } else if memoryOnly {
       // Short prefixes are transient residents only. Do not inspect, recover,
       // or replace the durable 512-token snapshot for this request.
@@ -631,7 +858,12 @@ final class PromptPrefixCache: @unchecked Sendable {
       metrics.reason = recoveryReason
     } else {
       do {
-        base = try restore(candidate, requestStarted: lookupStarted)
+        base = try restore(
+          candidate,
+          requestStarted: lookupStarted,
+          model: model,
+          parameters: parameters
+        )
         if let restored = base {
           installResident(restored)
           metrics.status = "snapshot_hit"
@@ -705,7 +937,7 @@ final class PromptPrefixCache: @unchecked Sendable {
           installResident(stored)
           base = stored
         }
-      } catch SnapshotError.tooLarge(let bytes) where memoryOnly {
+      } catch SnapshotError.tooLarge where memoryOnly {
         metrics.status = "bypassed"
         metrics.reason = "snapshot_too_large"
         metrics.cachedPrefixTokens = 0
@@ -749,6 +981,12 @@ final class PromptPrefixCache: @unchecked Sendable {
     }
   }
 
+  private func touchResident(_ key: String) {
+    guard let index = residents.firstIndex(where: { $0.key == key }) else { return }
+    let resident = residents.remove(at: index)
+    residents.append(resident)
+  }
+
   private enum SnapshotError: Error {
     case tooLarge(UInt64)
     case miss(String)
@@ -772,7 +1010,10 @@ final class PromptPrefixCache: @unchecked Sendable {
     else {
       throw SnapshotError.miss("unsupported_cache_state")
     }
-    var cache = model.newCache(parameters: parameters)
+    let cache = model.newCache(parameters: parameters)
+    guard let layout = PromptCacheLayout.make(caches: cache, model: model) else {
+      throw SnapshotError.miss("unsupported_cache_state")
+    }
     // The short in-memory path uses its exact prefix as the prepare window;
     // durable prefixes retain the existing 512-token chunking unchanged.
     // One actual next token remains unconsumed so the state lands exactly on
@@ -784,7 +1025,11 @@ final class PromptPrefixCache: @unchecked Sendable {
       windowSize: isShortMemoryOnly ? candidate.tokenCount : PromptPrefixBoundary.step
     )
     eval(cache.flatMap(\.state))
-    guard let signature = cacheSignature(cache, expectedPrefixTokens: candidate.tokenCount),
+    guard let signature = cacheSignature(
+      cache,
+      expectedPrefixTokens: candidate.tokenCount,
+      expectedLayout: layout
+    ),
       let stateBytes = stateByteCount(cache)
     else {
       throw SnapshotError.miss("unsupported_cache_state")
@@ -804,18 +1049,25 @@ final class PromptPrefixCache: @unchecked Sendable {
 
   func restore(
     _ candidate: PromptCacheCandidate,
-    requestStarted: TimeInterval
+    requestStarted: TimeInterval,
+    model: any LanguageModel,
+    parameters: GenerateParameters
   ) throws -> Resident? {
-    let active = root.appendingPathComponent("active", isDirectory: true)
-    let snapshot = active.appendingPathComponent(Self.snapshotName)
-    let manifestURL = active.appendingPathComponent(Self.manifestName)
+    guard let layout = PromptCacheLayout.make(model: model, parameters: parameters) else {
+      throw SnapshotError.miss("unsupported_cache_state")
+    }
+    let keys = try readDurableKeys()
+    guard keys.contains(candidate.key) else { throw SnapshotError.miss("snapshot_missing") }
+    let slot = slotDirectory(for: candidate.key)
+    let snapshot = slot.appendingPathComponent(Self.snapshotName)
+    let manifestURL = slot.appendingPathComponent(Self.manifestName)
     let cacheParent = root.deletingLastPathComponent()
     guard fileExists(cacheParent) else { throw SnapshotError.miss("snapshot_missing") }
     guard validPrivateDirectory(cacheParent) else { throw SnapshotError.miss("snapshot_corrupt") }
     guard fileExists(root) else { throw SnapshotError.miss("snapshot_missing") }
     guard validPrivateDirectory(root) else { throw SnapshotError.miss("snapshot_corrupt") }
-    guard fileExists(active) else { throw SnapshotError.miss("snapshot_missing") }
-    guard validPrivateDirectory(active) else { throw SnapshotError.miss("snapshot_corrupt") }
+    guard fileExists(slot) else { throw SnapshotError.miss("snapshot_missing") }
+    guard validPrivateDirectory(slot) else { throw SnapshotError.miss("snapshot_corrupt") }
     guard fileExists(manifestURL) else { throw SnapshotError.miss("snapshot_missing") }
     guard validPrivateFile(manifestURL),
       (try? fileSize(manifestURL)).map({ $0 <= Self.manifestMaximumBytes }) == true,
@@ -848,7 +1100,8 @@ final class PromptPrefixCache: @unchecked Sendable {
         expectedKey: candidate.key,
         expectedTokenCount: candidate.tokenCount,
         expectedTokenDigest: candidate.tokenDigest,
-        expectedSnapshotBytes: snapshotBytes
+        expectedSnapshotBytes: snapshotBytes,
+        expectedLayout: layout
       )
     else {
       throw SnapshotError.miss("snapshot_corrupt")
@@ -858,10 +1111,17 @@ final class PromptPrefixCache: @unchecked Sendable {
       metadata["voiceflow_key"] == candidate.key,
       metadata["voiceflow_prefix_tokens"] == String(candidate.tokenCount),
       metadata["voiceflow_prefix_token_sha256"] == candidate.tokenDigest,
-      cacheSignature(cache, expectedPrefixTokens: candidate.tokenCount) == manifest.stateSignature,
+      cacheSignature(
+        cache,
+        expectedPrefixTokens: candidate.tokenCount,
+        expectedLayout: layout
+      ) == manifest.stateSignature,
       stateByteCount(cache) == manifest.stateBytes
     else {
       throw SnapshotError.miss("snapshot_corrupt")
+    }
+    if let reason = touchDurableIndex(candidate.key) {
+      throw SnapshotError.miss(reason)
     }
     return Resident(
       key: candidate.key,
@@ -880,12 +1140,23 @@ final class PromptPrefixCache: @unchecked Sendable {
     guard Self.permitsResidentState(bytes: resident.stateBytes) else {
       throw SnapshotError.tooLarge(resident.stateBytes)
     }
+    guard Self.validCandidateKey(resident.key) else {
+      throw SnapshotError.miss("unsupported_cache_state")
+    }
     try ensurePrivateDirectory(root.deletingLastPathComponent())
     try ensurePrivateDirectory(root)
-    let stage = root.appendingPathComponent("stage", isDirectory: true)
-    let active = root.appendingPathComponent("active", isDirectory: true)
-    let previous = root.appendingPathComponent("previous", isDirectory: true)
-    try removeIfPresent(stage)
+    try ensurePrivateDirectory(slotsRoot)
+    try ensurePrivateDirectory(stagingRoot)
+    try ensurePrivateDirectory(previousRoot)
+    if let recoveryReason = recoverInterruptedSwap() {
+      throw SnapshotError.miss(recoveryReason)
+    }
+    let existingKeys = try durableKeysForUpdate()
+    let component = slotComponent(for: resident.key)
+    let stage = stagingRoot.appendingPathComponent(component, isDirectory: true)
+    let slot = slotsRoot.appendingPathComponent(component, isDirectory: true)
+    let previous = previousRoot.appendingPathComponent(component, isDirectory: true)
+    try removePrivateDirectoryIfPresent(stage)
     try FileManager.default.createDirectory(
       at: stage,
       withIntermediateDirectories: false,
@@ -894,7 +1165,7 @@ final class PromptPrefixCache: @unchecked Sendable {
     var published = false
     defer {
       if !published {
-        try? removeIfPresent(stage)
+        try? removePrivateDirectoryIfPresent(stage)
       }
     }
     guard chmod(stage.path, 0o700) == 0 else {
@@ -922,7 +1193,7 @@ final class PromptPrefixCache: @unchecked Sendable {
     }
     let snapshotBytes = try fileSize(snapshot)
     guard snapshotBytes <= Self.maximumSnapshotBytes else {
-      try removeIfPresent(stage)
+      try removePrivateDirectoryIfPresent(stage)
       throw SnapshotError.tooLarge(snapshotBytes)
     }
     let manifest = PromptCacheSnapshotManifest(
@@ -939,7 +1210,7 @@ final class PromptPrefixCache: @unchecked Sendable {
     encoder.outputFormatting = [.sortedKeys]
     let manifestData = try encoder.encode(manifest)
     guard manifestData.count <= Self.manifestMaximumBytes else {
-      try removeIfPresent(stage)
+      try removePrivateDirectoryIfPresent(stage)
       throw SnapshotError.tooLarge(snapshotBytes)
     }
     let manifestURL = stage.appendingPathComponent(Self.manifestName)
@@ -947,20 +1218,34 @@ final class PromptPrefixCache: @unchecked Sendable {
     guard chmod(manifestURL.path, 0o600) == 0 else {
       throw posixError("chmod prompt cache manifest")
     }
-    try removeIfPresent(previous)
-    if fileExists(active) {
-      try FileManager.default.moveItem(at: active, to: previous)
+    try removePrivateDirectoryIfPresent(previous)
+    let replacingExistingSlot = fileExists(slot)
+    if replacingExistingSlot {
+      guard validPrivateDirectory(slot) else { throw SnapshotError.miss("snapshot_corrupt") }
+      try FileManager.default.moveItem(at: slot, to: previous)
     }
     do {
-      try FileManager.default.moveItem(at: stage, to: active)
+      try FileManager.default.moveItem(at: stage, to: slot)
       published = true
     } catch {
-      if fileExists(previous), !fileExists(active) {
-        try? FileManager.default.moveItem(at: previous, to: active)
+      if fileExists(previous), !fileExists(slot) {
+        try? FileManager.default.moveItem(at: previous, to: slot)
       }
       throw error
     }
-    try removeIfPresent(previous)
+    let nextKeys = ([resident.key] + existingKeys.filter { $0 != resident.key })
+      .prefix(Self.maximumDurableCount)
+    do {
+      try writeDurableKeys(Array(nextKeys))
+    } catch {
+      try? removePrivateDirectoryIfPresent(slot)
+      if replacingExistingSlot, fileExists(previous), !fileExists(slot) {
+        try? FileManager.default.moveItem(at: previous, to: slot)
+      }
+      throw error
+    }
+    try removePrivateDirectoryIfPresent(previous)
+    try pruneUnindexedSlots(keeping: Set(nextKeys.map(slotComponent(for:))))
     return snapshotBytes
   }
 
@@ -970,47 +1255,317 @@ final class PromptPrefixCache: @unchecked Sendable {
     guard validPrivateDirectory(parent) else { return "snapshot_corrupt" }
     guard fileExists(root) else { return nil }
     guard validPrivateDirectory(root) else { return "snapshot_corrupt" }
-
-    let active = root.appendingPathComponent("active", isDirectory: true)
-    let stage = root.appendingPathComponent("stage", isDirectory: true)
-    let previous = root.appendingPathComponent("previous", isDirectory: true)
     do {
-      if !fileExists(active), fileExists(previous) {
-        guard validPrivateDirectory(previous) else { return "snapshot_corrupt" }
-        try FileManager.default.moveItem(at: previous, to: active)
-      } else if fileExists(active), fileExists(previous) {
-        try removeIfPresent(previous)
+      if let legacyReason = retireVerifiedLegacyActiveSlot() {
+        return legacyReason
       }
-      try removeIfPresent(stage)
+      if fileExists(slotsRoot), !validPrivateDirectory(slotsRoot) {
+        return "snapshot_corrupt"
+      }
+      if fileExists(stagingRoot), !validPrivateDirectory(stagingRoot) {
+        return "snapshot_corrupt"
+      }
+      if fileExists(previousRoot), !validPrivateDirectory(previousRoot) {
+        return "snapshot_corrupt"
+      }
+      if !fileExists(slotsRoot), fileExists(previousRoot) {
+        try ensurePrivateDirectory(slotsRoot)
+      }
+      if fileExists(previousRoot) {
+        for previous in try FileManager.default.contentsOfDirectory(
+          at: previousRoot,
+          includingPropertiesForKeys: nil
+        ) {
+          guard Self.validSlotComponent(previous.lastPathComponent),
+            validPrivateDirectory(previous)
+          else {
+            return "snapshot_corrupt"
+          }
+          let slot = slotsRoot.appendingPathComponent(
+            previous.lastPathComponent,
+            isDirectory: true
+          )
+          if fileExists(slot) {
+            guard validPrivateDirectory(slot) else { return "snapshot_corrupt" }
+            try removePrivateDirectoryIfPresent(previous)
+          } else {
+            try FileManager.default.moveItem(at: previous, to: slot)
+          }
+        }
+      }
+      if fileExists(stagingRoot) {
+        for stage in try FileManager.default.contentsOfDirectory(
+          at: stagingRoot,
+          includingPropertiesForKeys: nil
+        ) {
+          guard Self.validSlotComponent(stage.lastPathComponent),
+            validPrivateDirectory(stage)
+          else {
+            return "snapshot_corrupt"
+          }
+          try removePrivateDirectoryIfPresent(stage)
+        }
+      }
+      let indexStage = root.appendingPathComponent("index.stage")
+      if fileExists(indexStage) {
+        guard validPrivateFile(indexStage) else { return "snapshot_corrupt" }
+        try FileManager.default.removeItem(at: indexStage)
+      }
+      if let keys = try? readDurableKeys() {
+        try pruneUnindexedSlots(keeping: Set(keys.map(slotComponent(for:))))
+      }
       return nil
     } catch {
       return "snapshot_corrupt"
     }
   }
 
+  /// Remove only the exact owner-private v2 active slot written by the prior
+  /// single-route cache. Unknown contents, ownership, permissions, links, or
+  /// digests fail closed and remain untouched.
+  private func retireVerifiedLegacyActiveSlot() -> String? {
+    let active = root.appendingPathComponent("active", isDirectory: true)
+    guard fileExists(active) else { return nil }
+    guard validPrivateDirectory(active) else { return "snapshot_corrupt" }
+    let snapshot = active.appendingPathComponent(Self.snapshotName)
+    let manifestURL = active.appendingPathComponent(Self.manifestName)
+    do {
+      let entries = try FileManager.default.contentsOfDirectory(
+        at: active,
+        includingPropertiesForKeys: nil
+      ).map(\.lastPathComponent).sorted()
+      guard entries == [Self.manifestName, Self.snapshotName],
+        validPrivateFile(manifestURL),
+        validPrivateFile(snapshot),
+        try fileSize(manifestURL) <= Self.manifestMaximumBytes,
+        let manifestData = try? Data(contentsOf: manifestURL),
+        let manifest = try? JSONDecoder().decode(PromptCacheSnapshotManifest.self, from: manifestData),
+        manifest.schemaVersion == 2,
+        manifest.key.utf8.count == 64,
+        manifest.key.utf8.allSatisfy({ ($0 >= 48 && $0 <= 57) || ($0 >= 97 && $0 <= 102) }),
+        manifest.prefixTokenCount >= PromptPrefixBoundary.step,
+        manifest.prefixTokenCount % PromptPrefixBoundary.step == 0,
+        Self.isSHA256(manifest.prefixTokenSHA256),
+        Self.isSHA256(manifest.stateSignature),
+        manifest.stateBytes <= Self.maximumResidentStateBytes
+      else {
+        return "snapshot_corrupt"
+      }
+      let snapshotBytes = try fileSize(snapshot)
+      guard snapshotBytes == manifest.snapshotBytes,
+        snapshotBytes <= Self.maximumSnapshotBytes,
+        try sha256File(snapshot) == manifest.snapshotSHA256
+      else {
+        return "snapshot_corrupt"
+      }
+      try removePrivateDirectoryIfPresent(active)
+      return nil
+    } catch {
+      return "snapshot_corrupt"
+    }
+  }
+
+  private static func isSHA256(_ value: String) -> Bool {
+    value.utf8.count == 64
+      && value.utf8.allSatisfy {
+        ($0 >= 48 && $0 <= 57) || ($0 >= 97 && $0 <= 102)
+      }
+  }
+
+  private var slotsRoot: URL {
+    root.appendingPathComponent("slots", isDirectory: true)
+  }
+
+  private var stagingRoot: URL {
+    root.appendingPathComponent(".staging", isDirectory: true)
+  }
+
+  private var previousRoot: URL {
+    root.appendingPathComponent(".previous", isDirectory: true)
+  }
+
+  private func slotComponent(for key: String) -> String {
+    Self.sha256(Data("voiceflow-prefix-slot-v1|\(key)".utf8))
+  }
+
+  private static func validCandidateKey(_ key: String) -> Bool {
+    !key.isEmpty && key.utf8.count <= 256
+      && key.utf8.allSatisfy {
+        ($0 >= 48 && $0 <= 57) || ($0 >= 65 && $0 <= 90) || ($0 >= 97 && $0 <= 122)
+          || $0 == 45 || $0 == 95
+      }
+  }
+
+  private static func validSlotComponent(_ value: String) -> Bool {
+    value.utf8.count == 64
+      && value.utf8.allSatisfy {
+        ($0 >= 48 && $0 <= 57) || ($0 >= 97 && $0 <= 102)
+      }
+  }
+
+  private func slotDirectory(for key: String) -> URL {
+    slotsRoot.appendingPathComponent(slotComponent(for: key), isDirectory: true)
+  }
+
+  private func readDurableKeys() throws -> [String] {
+    let indexURL = root.appendingPathComponent("index.json")
+    guard fileExists(indexURL) else { return [] }
+    guard validPrivateFile(indexURL),
+      (try? fileSize(indexURL)).map({ $0 <= Self.indexMaximumBytes }) == true,
+      let data = try? Data(contentsOf: indexURL),
+      let manifest = try? JSONDecoder().decode(PromptCacheIndexManifest.self, from: data),
+      manifest.schemaVersion == Self.schemaVersion,
+      manifest.keys.count <= Self.maximumDurableCount,
+      Set(manifest.keys).count == manifest.keys.count,
+      manifest.keys.allSatisfy(Self.validCandidateKey)
+    else {
+      throw SnapshotError.miss("snapshot_corrupt")
+    }
+    return manifest.keys
+  }
+
+  private func durableKeysForUpdate() throws -> [String] {
+    do {
+      return try readDurableKeys()
+    } catch SnapshotError.miss("snapshot_corrupt") {
+      let indexURL = root.appendingPathComponent("index.json")
+      guard fileExists(indexURL), validPrivateFile(indexURL) else {
+        throw SnapshotError.miss("snapshot_corrupt")
+      }
+      return []
+    }
+  }
+
+  private func writeDurableKeys(_ keys: [String]) throws {
+    guard keys.count <= Self.maximumDurableCount,
+      Set(keys).count == keys.count,
+      keys.allSatisfy(Self.validCandidateKey)
+    else {
+      throw SnapshotError.miss("snapshot_corrupt")
+    }
+    let indexURL = root.appendingPathComponent("index.json")
+    let stageURL = root.appendingPathComponent("index.stage")
+    if fileExists(indexURL), !validPrivateFile(indexURL) {
+      throw SnapshotError.miss("snapshot_corrupt")
+    }
+    if fileExists(stageURL) {
+      guard validPrivateFile(stageURL) else { throw SnapshotError.miss("snapshot_corrupt") }
+      try FileManager.default.removeItem(at: stageURL)
+    }
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.sortedKeys]
+    let data = try encoder.encode(
+      PromptCacheIndexManifest(schemaVersion: Self.schemaVersion, keys: keys)
+    )
+    guard data.count <= Self.indexMaximumBytes,
+      FileManager.default.createFile(
+        atPath: stageURL.path,
+        contents: data,
+        attributes: [.posixPermissions: 0o600]
+      ),
+      chmod(stageURL.path, 0o600) == 0
+    else {
+      throw posixError("write private prompt cache index")
+    }
+    guard rename(stageURL.path, indexURL.path) == 0 else {
+      throw posixError("publish prompt cache index")
+    }
+  }
+
+  private func touchDurableIndex(_ key: String) -> String? {
+    do {
+      var keys = try readDurableKeys()
+      guard let index = keys.firstIndex(of: key) else { return nil }
+      keys.remove(at: index)
+      keys.insert(key, at: 0)
+      try writeDurableKeys(keys)
+      return nil
+    } catch {
+      return "snapshot_write_failed"
+    }
+  }
+
+  private func pruneUnindexedSlots(keeping components: Set<String>) throws {
+    guard fileExists(slotsRoot) else { return }
+    guard validPrivateDirectory(slotsRoot) else { throw SnapshotError.miss("snapshot_corrupt") }
+    for slot in try FileManager.default.contentsOfDirectory(at: slotsRoot, includingPropertiesForKeys: nil) {
+      guard Self.validSlotComponent(slot.lastPathComponent), validPrivateDirectory(slot) else {
+        throw SnapshotError.miss("snapshot_corrupt")
+      }
+      if !components.contains(slot.lastPathComponent) {
+        try removePrivateDirectoryIfPresent(slot)
+      }
+    }
+  }
+
+  private func removePrivateDirectoryIfPresent(_ url: URL) throws {
+    guard fileExists(url) else { return }
+    guard validPrivateDirectory(url) else { throw SnapshotError.miss("snapshot_corrupt") }
+    try FileManager.default.removeItem(at: url)
+  }
+
   func cacheSignature(_ cache: [KVCache], expectedPrefixTokens: Int) -> String? {
-    guard cache.count == 64 else { return nil }
+    guard let layout = PromptCacheLayout(caches: cache) else { return nil }
+    return cacheSignature(
+      cache,
+      expectedPrefixTokens: expectedPrefixTokens,
+      expectedLayout: layout
+    )
+  }
+
+  func cacheSignature(
+    _ cache: [KVCache],
+    expectedPrefixTokens: Int,
+    expectedLayout: PromptCacheLayout
+  ) -> String? {
+    guard expectedPrefixTokens > 0,
+      cache.count == expectedLayout.layers.count,
+      !cache.isEmpty
+    else {
+      return nil
+    }
     var entries: [String] = []
     entries.reserveCapacity(cache.count)
-    for layer in cache {
-      let kind: String
-      let expectedOffset: Int
-      if layer is MambaCache {
-        kind = "mamba"
-        expectedOffset = 0
-      } else if layer is KVCacheSimple {
-        kind = "kv_simple"
-        expectedOffset = expectedPrefixTokens
-      } else {
+    for (index, layer) in cache.enumerated() {
+      let layerLayout = expectedLayout.layers[index]
+      let expectedOffset = layerLayout.kind == .mamba ? 0 : expectedPrefixTokens
+      guard layerLayout.matches(layer),
+        layer.offset == expectedOffset,
+        layer.state.count == 2
+      else {
         return nil
       }
-      guard layer.offset == expectedOffset, layer.state.count == 2 else { return nil }
       let state = layer.state
       guard state.allSatisfy({ !$0.shape.isEmpty && $0.nbytes > 0 }) else { return nil }
+      switch layerLayout.kind {
+      case .kvSimple, .rotating:
+        guard let sequenceLength = layerLayout.expectedSequenceLength(
+          prefixTokens: expectedPrefixTokens
+        ),
+          state.allSatisfy({ array in
+            array.shape.count == 4
+              && array.shape[0] == 1
+              && (layerLayout.expectedKVHeads == nil || array.shape[1] == layerLayout.expectedKVHeads)
+              && array.shape[2] == sequenceLength
+          }),
+          state[0].shape == state[1].shape
+        else {
+          return nil
+        }
+        if layerLayout.kind == .rotating,
+          !layerLayout.validatesRotatingMetadata(layer.metaState, prefixTokens: expectedPrefixTokens)
+        {
+          return nil
+        }
+      case .mamba:
+        guard layer.metaState == ["2", "0,1"], state.allSatisfy({ $0.shape.count >= 2 }) else {
+          return nil
+        }
+      }
       let shapeAndDtype = state.map { array in
         "\(array.dtype):\(array.shape.map(String.init).joined(separator: "x"))"
       }.joined(separator: ",")
-      entries.append("\(kind):\(layer.offset):\(shapeAndDtype)")
+      entries.append("\(layerLayout.signatureIdentity):\(layer.offset):\(shapeAndDtype)")
     }
     return Self.sha256(Data(entries.joined(separator: "|").utf8))
   }
@@ -1105,10 +1660,13 @@ final class PromptPrefixCache: @unchecked Sendable {
     expectedKey: String,
     expectedTokenCount: Int,
     expectedTokenDigest: String,
-    expectedSnapshotBytes: UInt64
+    expectedSnapshotBytes: UInt64,
+    expectedLayout: PromptCacheLayout
   ) -> Bool {
     let maximumHeaderBytes = 1_048_576
-    guard expectedSnapshotBytes >= 8,
+    guard expectedTokenCount > 0,
+      !expectedLayout.layers.isEmpty,
+      expectedSnapshotBytes >= 8,
       expectedSnapshotBytes <= maximumSnapshotBytes,
       let handle = try? FileHandle(forReadingFrom: url)
     else { return false }
@@ -1139,37 +1697,49 @@ final class PromptPrefixCache: @unchecked Sendable {
     guard userMetadataKeys == Set(expectedMetadata.keys),
       expectedMetadata.allSatisfy({ rawMetadata[$0.key] == $0.value })
     else { return false }
-
     var classes: [Int: String] = [:]
     var cacheInfo: [Int: [Int: String]] = [:]
+    let layerCount = expectedLayout.layers.count
     for (key, value) in rawMetadata {
       let parts = key.split(separator: ".", omittingEmptySubsequences: false)
       guard parts.first == "1" || parts.first == "2" || parts.first == "0" else { return false }
-      if parts.first == "2", parts.count == 2, let index = Int(parts[1]), (0..<64).contains(index) {
+      if parts.first == "2", parts.count == 2, let index = Int(parts[1]), (0..<layerCount).contains(index) {
         classes[index] = value
       } else if parts.first == "0", parts.count == 3,
-        let layer = Int(parts[1]), (0..<64).contains(layer),
-        let slot = Int(parts[2]), (0..<2).contains(slot)
+        let layer = Int(parts[1]), (0..<layerCount).contains(layer),
+        let slot = Int(parts[2]),
+        (0..<expectedLayout.layers[layer].serializedMetadataCount).contains(slot)
       {
         cacheInfo[layer, default: [:]][slot] = value
       } else if parts.first != "1" {
         return false
       }
     }
-    guard classes.count == 64, cacheInfo.count == 64 else { return false }
-    for layer in 0..<64 {
+    guard classes.count == layerCount, cacheInfo.count == layerCount else { return false }
+    for layer in 0..<layerCount {
       guard let kind = classes[layer],
-        let info = cacheInfo[layer]
+        let info = cacheInfo[layer],
+        expectedLayout.layers.indices.contains(layer)
       else { return false }
-      if kind == "KVCache" || kind == "KVCacheSimple" {
-        guard info.count == 1, info[0] == "" else { return false }
-      } else if kind == "MambaCache" {
+      let layerLayout = expectedLayout.layers[layer]
+      guard
+        layerLayout.snapshotClassNames.contains(kind),
+        info.count == layerLayout.serializedMetadataCount
+      else { return false }
+      switch layerLayout.kind {
+      case .kvSimple:
+        guard info[0] == "" else { return false }
+      case .mamba:
         guard info.count == 2, info[0] == "2", info[1] == "0,1" else { return false }
-      } else {
-        return false
+      case .rotating:
+        let metadata = (0..<5).compactMap { info[$0] }
+        guard metadata.count == 5,
+          layerLayout.validatesRotatingMetadata(metadata, prefixTokens: expectedTokenCount)
+        else {
+          return false
+        }
       }
     }
-
     struct TensorRange {
       let start: UInt64
       let end: UInt64
@@ -1178,8 +1748,8 @@ final class PromptPrefixCache: @unchecked Sendable {
     var shapesByLayer: [Int: [[Int]]] = [:]
     var tensorCount = 0
     let payloadBytes = expectedSnapshotBytes - 8 - headerLength
-    for layer in 0..<64 {
-      guard let kind = classes[layer] else { return false }
+    for layer in 0..<layerCount {
+      guard classes[layer] != nil else { return false }
       for slot in 0..<2 {
         let tensorKey = "\(layer).\(slot)"
         guard let descriptor = root[tensorKey] as? [String: Any],
@@ -1205,21 +1775,36 @@ final class PromptPrefixCache: @unchecked Sendable {
         }
         let (expectedBytes, overflow) = elements.multipliedReportingOverflow(by: bytesPerElement)
         guard !overflow, expectedBytes == end - start else { return false }
-        if kind == "KVCache" || kind == "KVCacheSimple" {
-          guard shape.count == 4, shape[0] == 1, shape[2] == expectedTokenCount else {
+        let layerLayout = expectedLayout.layers[layer]
+        switch layerLayout.kind {
+        case .kvSimple, .rotating:
+          guard let expectedSequenceLength = layerLayout.expectedSequenceLength(
+            prefixTokens: expectedTokenCount
+          ),
+            shape.count == 4,
+            shape[0] == 1,
+            layerLayout.expectedKVHeads == nil || shape[1] == layerLayout.expectedKVHeads,
+            shape[2] == expectedSequenceLength
+          else {
             return false
           }
-        } else if shape.count < 2 {
-          return false
+        case .mamba:
+          guard shape.count >= 2 else { return false }
         }
         shapesByLayer[layer, default: []].append(shape)
         ranges.append(TensorRange(start: start, end: end))
         tensorCount += 1
       }
     }
-    let allowedKeys = Set(["__metadata__"] + (0..<64).flatMap { ["\($0).0", "\($0).1"] })
-    guard Set(root.keys) == allowedKeys, tensorCount == 128 else { return false }
-    for layer in 0..<64 where classes[layer] == "KVCache" || classes[layer] == "KVCacheSimple" {
+    let tensorKeys = (0..<layerCount).flatMap { layer in
+      (0..<2).map { slot in "\(layer).\(slot)" }
+    }
+    let allowedKeys = Set(["__metadata__"] + tensorKeys)
+    guard Set(root.keys) == allowedKeys, tensorCount == layerCount * 2 else { return false }
+    for layer in 0..<layerCount
+      where expectedLayout.layers[layer].kind == .kvSimple
+        || expectedLayout.layers[layer].kind == .rotating
+    {
       guard let shapes = shapesByLayer[layer], shapes.count == 2, shapes[0] == shapes[1] else {
         return false
       }
@@ -1614,10 +2199,13 @@ struct CleanupModelRoute: Equatable, Sendable {
   let promptRecipe: String
   let promptContract: CleanupPromptContract
   let prefixCacheManifestSHA256: String?
+  let prefixCacheRepository: String?
   let maximumPromptTokens: Int?
   let maximumGenerationTokens: Int?
 
-  var usesPinnedPrefixCache: Bool { prefixCacheManifestSHA256 != nil }
+  var usesPinnedPrefixCache: Bool {
+    prefixCacheManifestSHA256 != nil && prefixCacheRepository != nil
+  }
 
   static let qwen38TwentySevenBManifestSHA256 =
     "f67d38ec1261b4d693cee8c006d2c56007e6919a290508266705ba4f571c9ed2"
@@ -1627,6 +2215,7 @@ struct CleanupModelRoute: Equatable, Sendable {
     promptRecipe: "voiceflow-qwen35-prefix-v2",
     promptContract: .standardChat,
     prefixCacheManifestSHA256: qwen38TwentySevenBManifestSHA256,
+    prefixCacheRepository: "lmstudio-community/Qwen3.8-27B-MLX-6bit",
     maximumPromptTokens: nil,
     maximumGenerationTokens: nil
   )
@@ -1635,7 +2224,8 @@ struct CleanupModelRoute: Equatable, Sendable {
     revision: "93760be4f1f69842a46bc13dbdc0f19e291392a3",
     promptRecipe: "voiceflow-qwen35-chat-cleanup-v1",
     promptContract: .standardChat,
-    prefixCacheManifestSHA256: nil,
+    prefixCacheManifestSHA256: "d889464330fc5091ed4398905b5f09a39ac28a15300555dae2ab6b0d5b38e242",
+    prefixCacheRepository: "mlx-community/Qwen3.5-2B-MLX-4bit",
     maximumPromptTokens: nil,
     maximumGenerationTokens: nil
   )
@@ -1644,7 +2234,8 @@ struct CleanupModelRoute: Equatable, Sendable {
     revision: "32f3e8ecf65426fc3306969496342d504bfa13f3",
     promptRecipe: "voiceflow-qwen35-chat-cleanup-v1",
     promptContract: .standardChat,
-    prefixCacheManifestSHA256: nil,
+    prefixCacheManifestSHA256: "18393f839aade07b606c1f3b50d32314dfd5363b034f1d5f7735b1fc6104b5f6",
+    prefixCacheRepository: "mlx-community/Qwen3.5-4B-MLX-4bit",
     maximumPromptTokens: nil,
     maximumGenerationTokens: nil
   )
@@ -1654,6 +2245,7 @@ struct CleanupModelRoute: Equatable, Sendable {
     promptRecipe: "voiceflow-qwen35-chat-cleanup-v1",
     promptContract: .standardChat,
     prefixCacheManifestSHA256: nil,
+    prefixCacheRepository: nil,
     maximumPromptTokens: nil,
     maximumGenerationTokens: nil
   )
@@ -1664,6 +2256,7 @@ struct CleanupModelRoute: Equatable, Sendable {
     promptRecipe: "voiceflow-gemma4-chat-cleanup-v1",
     promptContract: .standardChat,
     prefixCacheManifestSHA256: nil,
+    prefixCacheRepository: nil,
     maximumPromptTokens: nil,
     maximumGenerationTokens: nil
   )
@@ -1672,7 +2265,8 @@ struct CleanupModelRoute: Equatable, Sendable {
     revision: "da76496efe4486235e6e0aa9315203e27b957bcd",
     promptRecipe: "voiceflow-gemma4-chat-cleanup-v1",
     promptContract: .standardChat,
-    prefixCacheManifestSHA256: nil,
+    prefixCacheManifestSHA256: "f29888227b0d076a257463fb3f414c0916b298145a283bc4352bf6bc7a54e55e",
+    prefixCacheRepository: "Anotos/Gemma-4-E4B-it-Text-MLX-4bit",
     maximumPromptTokens: nil,
     maximumGenerationTokens: nil
   )
@@ -1681,7 +2275,8 @@ struct CleanupModelRoute: Equatable, Sendable {
     revision: "a962dcb09eee4169c890e544c9eb938f1113fdee",
     promptRecipe: "voiceflow-ministral3-chat-cleanup-v1",
     promptContract: .standardChat,
-    prefixCacheManifestSHA256: nil,
+    prefixCacheManifestSHA256: "9c190f28458ff6cd6e1d17fe90913d445cbe745728803364e948cb1e87c16ab2",
+    prefixCacheRepository: "mlx-community/Ministral-3-3B-Instruct-2512-4bit",
     maximumPromptTokens: nil,
     maximumGenerationTokens: nil
   )
@@ -1691,6 +2286,7 @@ struct CleanupModelRoute: Equatable, Sendable {
     promptRecipe: CleanupS1MiniPromptContract.promptRecipe,
     promptContract: .s1Mini,
     prefixCacheManifestSHA256: nil,
+    prefixCacheRepository: nil,
     maximumPromptTokens: 1_000,
     maximumGenerationTokens: 1_024
   )
@@ -1771,9 +2367,6 @@ enum CleanupModelRouteCatalog {
 /// Cleanup has its own process and model slot so loading or cancelling this
 /// language model cannot replace or terminate the ASR sidecar.
 public actor CleanupSidecarServer {
-  private static let modelID = CleanupModelRoute.qwen38TwentySevenB.modelId
-  private static let modelRevision = CleanupModelRoute.qwen38TwentySevenB.revision
-  private static let modelManifestSHA256 = CleanupModelRoute.qwen38TwentySevenBManifestSHA256
   private static let maximumInputBytes = 1_048_576
   private static let maximumResponseBytes = SidecarIO.maximumCleanupResponsePayloadBytes
   private static let maximumMessageBytes = 512 * 1_024
@@ -2218,12 +2811,13 @@ public actor CleanupSidecarServer {
       let cachePlanStarted = ProcessInfo.processInfo.systemUptime
       let candidateResult = await promptCacheCandidate(
         request: request,
+        route: loadedModelRoute,
+        parameters: parameters,
         system: messages[0].content,
         user: messages[1].content,
         preparedHasMask: preparedHasMask,
         fullPromptTokens: fullPromptTokens,
-        modelContainer: modelContainer,
-        maxOutputTokens: maxTokens
+        modelContainer: modelContainer
       )
       cachePlanTimings = candidateResult.probeTimings.diagnostic()
       let generationPlan: PromptCacheGeneration
@@ -2285,7 +2879,6 @@ public actor CleanupSidecarServer {
       // includes prepare, cache lookup/restore/build, and prefill below.
       let streamStarted = ProcessInfo.processInfo.systemUptime
       var text = ""
-      var promptTokens = 0
       var generationTokens = 0
       var promptTime = 0.0
       var generationTime = 0.0
@@ -2310,7 +2903,6 @@ public actor CleanupSidecarServer {
             }
           }
         case .info(let info):
-          promptTokens = info.promptTokenCount
           generationTokens = info.generationTokenCount
           promptTime = info.promptTime
           generationTime = info.generateTime
@@ -2471,12 +3063,13 @@ public actor CleanupSidecarServer {
       )
       let candidateResult = await promptCacheCandidate(
         request: request,
+        route: loadedModelRoute,
+        parameters: productionParameters,
         system: messages[0].content,
         user: messages[1].content,
         preparedHasMask: preparedHasMask,
         fullPromptTokens: fullPromptTokens,
-        modelContainer: modelContainer,
-        maxOutputTokens: Self.maximumOutputTokens
+        modelContainer: modelContainer
       )
       let planReadyAt = ProcessInfo.processInfo.systemUptime
       let generationPlan: PromptCacheGeneration
@@ -2667,15 +3260,16 @@ public actor CleanupSidecarServer {
 
   private func promptCacheCandidate(
     request: SidecarRequest,
+    route: CleanupModelRoute,
+    parameters: GenerateParameters,
     system: String,
     user: String,
     preparedHasMask: Bool,
     fullPromptTokens: [Int],
-    modelContainer: ModelContainer,
-    maxOutputTokens: Int
+    modelContainer: ModelContainer
   ) async -> PromptCacheCandidateResult {
     var probeTimings = PromptCacheCandidateProbeTimings()
-    guard loadedModelRoute?.usesPinnedPrefixCache == true else {
+    guard route.usesPinnedPrefixCache else {
       return PromptCacheCandidateResult(
         candidate: nil,
         reason: "model_cache_disabled",
@@ -2744,8 +3338,18 @@ public actor CleanupSidecarServer {
       }
     }
     let sdkIdentity = PromptCacheSDKIdentity.current
-    let keyIdentity =
-      "voiceflow-qwen35-prefix-v2|model=\(Self.modelID)|revision=\(Self.modelRevision)|manifest=\(Self.modelManifestSHA256)|runtime=\(sidecarRuntimeVersion)|\(sdkIdentity)|template=chat-enable-thinking-false|prefill=512|max-output=\(maxOutputTokens)|temperature=0|top-p=1|top-k=0|min-p=0|repetition=none|presence=none|frequency=none|max-kv=none|kv-bits=none|"
+    guard let keyIdentity = PromptCacheKeyIdentity.make(
+      route: route,
+      parameters: parameters,
+      runtimeVersion: sidecarRuntimeVersion,
+      sdkIdentity: sdkIdentity
+    ) else {
+      return PromptCacheCandidateResult(
+        candidate: nil,
+        reason: "model_cache_disabled",
+        probeTimings: probeTimings
+      )
+    }
     if let safeBoundary = PromptPrefixBoundary.commonPrefixLength(probeTokenIds),
       let prefixLength = PromptPrefixBoundary.alignedCommonPrefixLength(
         actual: fullPromptTokens,

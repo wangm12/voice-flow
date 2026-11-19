@@ -1188,11 +1188,14 @@ async fn transcribe_complete_audio_inner(
     let capabilities = request
         .provider
         .capabilities_for_model(&request.options.model);
-    let direct_audio_limit = capabilities
+    let mut direct_audio_limit = capabilities
         .max_audio_duration_secs
         .map(|seconds| seconds as f64)
         .unwrap_or(asr::MAX_DIRECT_REQUEST_DURATION_SECS as f64)
         .min(asr::MAX_DIRECT_REQUEST_DURATION_SECS as f64);
+    if capabilities.protocol == asr::AsrProtocol::OnDevice {
+        direct_audio_limit = direct_audio_limit.min(30.0);
+    }
     if duration <= direct_audio_limit {
         let transcript = execute_asr_request(
             &state.gate,
@@ -1244,6 +1247,8 @@ async fn transcribe_complete_audio_inner(
 
     let chunk_length_secs = if direct_audio_limit <= 20.0 {
         15
+    } else if direct_audio_limit <= 30.0 {
+        chunk_length_secs.min(25)
     } else {
         chunk_length_secs
     };
@@ -1416,13 +1421,21 @@ async fn retry_dictation_inner(
         scene.family.as_deref(),
         scene.browser_host.as_deref(),
     );
-    let asr_prompt = lexicon::build_asr_prompt_bundle(
+    let asr_prompt = lexicon::build_asr_prompt_bundle_with_permissions_and_language(
         &asr_dictionary,
         scene.policy.as_ref(),
         &pairs,
         Some(&scope),
         lexicon::asr_prompt_shape_for(settings.asr_provider, &settings.asr_model),
         None,
+        crate::context::ContextSourcePermissions {
+            ax_text: true,
+            local_ocr: true,
+            cloud_vision: true,
+            context_text_to_providers: true,
+        },
+        Some(&settings.language),
+        &settings.preferred_languages,
     );
     let mut retry_policy = scene.policy.clone().unwrap_or_default();
     apply_current_style_approval(&mut retry_policy, scene.profile_id.as_deref(), &settings);
@@ -1432,7 +1445,8 @@ async fn retry_dictation_inner(
         &state.models_root,
         asr::AsrOptions {
             api_key: String::new(),
-            language: None,
+            language: asr::normalize_language(Some(settings.language.as_str())).map(str::to_owned),
+            preferred_languages: settings.preferred_languages.clone(),
             prompt: asr_prompt.prompt,
             keywords: asr_prompt.keywords,
             model: String::new(),

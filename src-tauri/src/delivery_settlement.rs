@@ -468,27 +468,41 @@ impl DeliverySettlementRegistrySnapshot {
             .unwrap_or(DeliveryOutcomeKind::Failed);
         if chinese {
             match outcome {
-                DeliveryOutcomeKind::Inserted => "听写已完成，文字已输入。剪贴板恢复情况和下一次录音是否可用均未确认。".into(),
-                DeliveryOutcomeKind::CopyOnly => "听写已完成，文字已复制，请手动粘贴。剪贴板恢复情况和下一次录音是否可用均未确认。".into(),
-                DeliveryOutcomeKind::PasteUnverified => "听写已结束，但无法确认文字是否已输入。请检查目标输入框。剪贴板恢复情况和下一次录音是否可用均未确认。".into(),
-                DeliveryOutcomeKind::HistoryOnly => "听写已保存到历史记录，文字未确认输入。下一次录音是否可用未确认。".into(),
-                DeliveryOutcomeKind::PreviewOnly => "听写预览已完成。下一次录音是否可用未确认。".into(),
-                DeliveryOutcomeKind::Failed => "听写未完成，请检查 VoiceFlow。下一次录音是否可用未确认。".into(),
-                DeliveryOutcomeKind::Cancelled => "听写已取消。剪贴板写入已结束，下一次录音是否可用未确认。".into(),
-                DeliveryOutcomeKind::TimedOut => "听写已超时。文字交付未确认，下一次录音是否可用未确认。".into(),
-                DeliveryOutcomeKind::CompletedWithoutClipboard => "听写流程已结束，但未进行剪贴板交付。下一次录音是否可用未确认。".into(),
+                DeliveryOutcomeKind::Inserted => "听写完成，文字已输入。".into(),
+                DeliveryOutcomeKind::CopyOnly => "听写完成，文字已复制，请手动粘贴。".into(),
+                DeliveryOutcomeKind::PasteUnverified => {
+                    "听写结束；是否已输入无法确认，请检查目标输入框。".into()
+                }
+                DeliveryOutcomeKind::HistoryOnly => "听写已保存到历史记录；未确认输入。".into(),
+                DeliveryOutcomeKind::PreviewOnly => "听写预览已完成。".into(),
+                DeliveryOutcomeKind::Failed => "听写未完成，请检查 VoiceFlow。".into(),
+                DeliveryOutcomeKind::Cancelled => "听写已取消。".into(),
+                DeliveryOutcomeKind::TimedOut => "听写已超时；文字交付未确认。".into(),
+                DeliveryOutcomeKind::CompletedWithoutClipboard => {
+                    "听写流程已结束；未进行剪贴板交付。".into()
+                }
             }
         } else {
             match outcome {
-                DeliveryOutcomeKind::Inserted => "Dictation finished; text was inserted. Clipboard restoration and availability of another recording are unverified.".into(),
-                DeliveryOutcomeKind::CopyOnly => "Dictation finished; text was copied for manual paste. Clipboard restoration and availability of another recording are unverified.".into(),
-                DeliveryOutcomeKind::PasteUnverified => "Dictation ended, but insertion could not be confirmed. Check the target field. Clipboard restoration and availability of another recording are unverified.".into(),
-                DeliveryOutcomeKind::HistoryOnly => "Dictation was saved to History; insertion was not confirmed. Availability of another recording is unverified.".into(),
-                DeliveryOutcomeKind::PreviewOnly => "The dictation preview finished. Availability of another recording is unverified.".into(),
-                DeliveryOutcomeKind::Failed => "Dictation did not finish. Check VoiceFlow. Availability of another recording is unverified.".into(),
-                DeliveryOutcomeKind::Cancelled => "Dictation was cancelled. Clipboard writing has ended; availability of another recording is unverified.".into(),
-                DeliveryOutcomeKind::TimedOut => "Dictation timed out. Text delivery was not confirmed; availability of another recording is unverified.".into(),
-                DeliveryOutcomeKind::CompletedWithoutClipboard => "Dictation finished without clipboard delivery. Availability of another recording is unverified.".into(),
+                DeliveryOutcomeKind::Inserted => "Dictation complete. Text inserted.".into(),
+                DeliveryOutcomeKind::CopyOnly => {
+                    "Dictation complete. Text copied; paste it manually.".into()
+                }
+                DeliveryOutcomeKind::PasteUnverified => {
+                    "Dictation ended. Insertion is unconfirmed; check the target field.".into()
+                }
+                DeliveryOutcomeKind::HistoryOnly => {
+                    "Dictation saved to History; insertion is unconfirmed.".into()
+                }
+                DeliveryOutcomeKind::PreviewOnly => "Dictation preview complete.".into(),
+                DeliveryOutcomeKind::Failed => "Dictation did not finish. Check VoiceFlow.".into(),
+                DeliveryOutcomeKind::Cancelled => "Dictation cancelled.".into(),
+                DeliveryOutcomeKind::TimedOut => {
+                    "Dictation timed out. Text delivery is unconfirmed.".into()
+                }
+                DeliveryOutcomeKind::CompletedWithoutClipboard => {
+                    "Dictation finished without clipboard delivery.".into()
+                }
             }
         }
     }
@@ -1067,8 +1081,10 @@ mod tests {
                 .map(|outcome| outcome.kind),
             Some(DeliveryOutcomeKind::Inserted)
         );
-        assert!(closed.accessible_value("en").contains("text was inserted"));
-        assert!(closed.accessible_value("en").contains("unverified"));
+        assert_eq!(
+            closed.accessible_value("en"),
+            "Dictation complete. Text inserted."
+        );
 
         let mut identity_missing = closed;
         identity_missing
@@ -1078,7 +1094,7 @@ mod tests {
             .transaction_id = None;
         let missing_identity_value = identity_missing.accessible_value("en");
         assert!(missing_identity_value.contains("could not confirm"));
-        assert!(!missing_identity_value.contains("text was inserted"));
+        assert!(!missing_identity_value.contains("Text inserted"));
     }
 
     #[test]
@@ -1124,7 +1140,7 @@ mod tests {
             "last=id={transaction_a_id};outcome=inserted;admission_sealed=1;writers_closed=1"
         )));
         assert_eq!(applied_a.value, "VoiceFlow dictation is in progress.");
-        assert!(!applied_a.value.contains("text was inserted"));
+        assert!(!applied_a.value.contains("Text inserted"));
 
         transaction_b.seal(DeliveryTerminalOutcome::completed("done", "paste", None));
         drop(writer_b);
@@ -1140,7 +1156,7 @@ mod tests {
             assert!(applied.identifier.contains(&format!(
                 "last=id={transaction_b_id};outcome=inserted;admission_sealed=1;writers_closed=1"
             )));
-            assert!(applied.value.contains("text was inserted"));
+            assert_eq!(applied.value, "Dictation complete. Text inserted.");
         }
     }
 

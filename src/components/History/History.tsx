@@ -2,7 +2,7 @@ import { Select } from "../Select";
 import { invoke } from "@tauri-apps/api/core";
 import { Check, CheckCircle2, CircleHelp, CircleX, Copy, Download, Eraser, History as HistoryIcon, LoaderCircle, Pencil, RotateCcw, Save, Trash2, TriangleAlert, Wand2 } from "lucide-react";
 import { Fragment, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { friendlyDictionaryLearningError, settingsErrorMessage } from "../../lib/settingsError";
+import { friendlyDictionaryLearningError, friendlySettingsError, settingsErrorMessage } from "../../lib/settingsError";
 import { secondaryButtonClass, compactButtonClass, dangerActionButtonClass, ghostButtonClass, inputClass, colors, radius, focusRingClass } from "../../lib/theme";
 import { ActionMenu } from "../ActionMenu";
 import { IconButton } from "../IconButton";
@@ -11,6 +11,7 @@ import { deliveryReasonLabels } from "../../lib/deliveryCopy";
 import { cleanupCandidateLabel, cleanupGuardReasonLabel } from "../../lib/cleanupRejection";
 import { ConfirmDialog } from "../ConfirmDialog";
 import { SettingsAlert, SettingsPageHeader, SettingsShell } from "../SettingsLayout";
+import type { PreviewContextSource, PreviewProvenanceReceipt, PreviewSourceKind } from "../SelectedPreviewDialog";
 
 export type HistoryItem = {
   id: number;
@@ -18,6 +19,7 @@ export type HistoryItem = {
   raw_text: string;
   asr_text?: string | null;
   engine?: string | null;
+  preview_receipt?: PreviewProvenanceReceipt | null;
   provider_cleaned_candidate?: string | null;
   cleanup_rejected_candidate?: string | null;
   cleanup_guard_reason?: string | null;
@@ -97,6 +99,22 @@ const cleanupAttemptLabels: Record<string, string> = {
   final_guard: "最终整理结果未通过保真检查",
 };
 
+const previewSourceLabels: Record<PreviewSourceKind, string> = {
+  selected_text: "选中文本",
+  current_field: "当前文本框",
+  empty_composer: "空白回复输入框",
+  screenshot: "窗口截图",
+  dictation: "听写",
+};
+
+const previewContextLabels: Record<PreviewContextSource, string> = {
+  ax: "辅助功能文字",
+  ocr: "本机 OCR",
+  cloud_vision: "云端视觉",
+  ax_nearby_text: "附近回复文字",
+  screenshot: "截图",
+};
+
 const cleanupFailureLabels: Record<string, string> = {
   network_failure: "网络连接失败",
   request_timeout: "整理请求超时",
@@ -105,7 +123,7 @@ const cleanupFailureLabels: Record<string, string> = {
   remote_rate_limited: "整理服务限流",
   remote_server_error: "整理服务暂时不可用",
   credentials_unavailable: "缺少整理服务凭据",
-  local_pair_egress_blocked: "本机词对改变了待发文本，已跳过云端整理并保留本机结果",
+  local_pair_egress_blocked: "私密词对保护 · 仅本机整理（本机私密词对改变了待发文本，已跳过云端整理并保留本机结果）",
   empty_completion: "整理服务没有返回可用内容",
   other_provider_failure: "整理请求失败",
   native_input_too_large: "本机整理输入超出支持范围",
@@ -174,6 +192,7 @@ export function History({ items, reload, hasMore, loading, onLoadMore, error, on
   const [dataMessage, setDataMessage] = useState<string | null>(null);
   const [pendingExport, setPendingExport] = useState<"records" | "audio" | null>(null);
   const [confirmClear, setConfirmClear] = useState(false);
+  const [includeLearnedRules, setIncludeLearnedRules] = useState(false);
   const [clearing, setClearing] = useState(false);
   const [clearError, setClearError] = useState<string | null>(null);
   const clearingRef = useRef(false);
@@ -265,6 +284,7 @@ export function History({ items, reload, hasMore, loading, onLoadMore, error, on
 
   const clearAll = () => {
     setClearError(null);
+    setIncludeLearnedRules(false);
     setConfirmClear(true);
   };
 
@@ -276,11 +296,11 @@ export function History({ items, reload, hasMore, loading, onLoadMore, error, on
     setDataError(null);
     setDataMessage(null);
     try {
-      await invoke("clear_all_data");
+      await invoke("clear_all_data", { includeLearnedRules });
       setConfirmClear(false);
       reload();
     } catch (reason) {
-      setClearError(t("清空失败：") + String(reason));
+      setClearError(t("清空失败：") + friendlySettingsError(reason, t));
     } finally {
       clearingRef.current = false;
       setClearing(false);
@@ -332,14 +352,25 @@ export function History({ items, reload, hasMore, loading, onLoadMore, error, on
       <ConfirmDialog
         open={confirmClear}
         title={t("清空全部数据")}
-        description={t("这会删除全部历史文字及迁移备份、恢复音频、训练音频和本地用量。Keychain 中的 API Key 会保留。删除后无法恢复，确定继续吗？")}
+        description={t("这会删除全部历史文字及迁移备份、恢复音频、训练音频、待确认草稿与本地用量。已确认的词典学习规则与 Keychain 中的 API Key 会保留。删除后无法恢复，确定继续吗？")}
         confirmLabel={t(clearing ? "正在清空…" : "清空全部数据")}
         cancelLabel={t("取消")}
         busy={clearing}
         error={clearError}
         onCancel={() => setConfirmClear(false)}
         onConfirm={() => void confirmClearAll()}
-      />
+      >
+        <label className="mt-4 flex cursor-pointer items-start gap-2.5 text-[13px] leading-5 text-primary">
+          <input
+            type="checkbox"
+            className="mt-1 h-4 w-4 shrink-0 rounded border-border"
+            checked={includeLearnedRules}
+            disabled={clearing}
+            onChange={(event) => setIncludeLearnedRules(event.target.checked)}
+          />
+          <span>{t("同时清除已确认的词典学习规则")}</span>
+        </label>
+      </ConfirmDialog>
     </SettingsShell>
   );
 }
@@ -538,11 +569,17 @@ function HistoryRow({ item, reload, editorSessionId, windowed = false, onDeleteS
     }
   };
 
-  const confirmDictionaryCandidate = async (candidate: DictionarySuggestion) => {
+  const confirmDictionaryCandidate = async (candidate: DictionarySuggestion, scopeMode?: "global") => {
     setBusy(true);
     setError(null);
     try {
-      await invoke("promote_learn_pair", {
+      await invoke("promote_learn_pair", scopeMode ? {
+        pairKey: candidate.pair_key,
+        beforeSurface: candidate.before_span,
+        afterSurface: candidate.after,
+        historyId: item.id,
+        scopeMode,
+      } : {
         pairKey: candidate.pair_key,
         beforeSurface: candidate.before_span,
         afterSurface: candidate.after,
@@ -605,11 +642,11 @@ function HistoryRow({ item, reload, editorSessionId, windowed = false, onDeleteS
           </div>
         ) : <p className="line-clamp-2 whitespace-pre-wrap break-words text-sm leading-5 text-primary">{item.final_text || item.raw_text || t("识别失败")}</p>}
         <p className="mt-1 flex flex-wrap items-center gap-x-1.5 gap-y-1 text-xs text-tertiary"><span>{relativeTime(item.created_at, t, language)} · {formatDuration(item.duration, language)} {t("秒")}</span>{item.engine && <><span aria-hidden="true">·</span><span>{item.engine}</span></>}{cleanupLabel && <><span aria-hidden="true">·</span><span>{cleanupLabel}</span></>}{(item.revision_count ?? 0) > 0 && <><span aria-hidden="true">·</span><span>{item.revision_count} {t("个版本")}</span></>}</p>
-        {showRaw && (item.asr_text || item.provider_cleaned_candidate || item.cleanup_rejected_candidate || item.raw_text) && <div className="mt-2 space-y-1 rounded-lg bg-elevated px-3 py-2 text-xs">{item.asr_text != null && <><p className="text-tertiary">{t("ASR 识别原文")}</p><p className="whitespace-pre-wrap text-secondary">{item.asr_text}</p></>}{item.provider_cleaned_candidate != null && <><p className="pt-1 text-tertiary">{t("服务商整理候选")}</p><p className="whitespace-pre-wrap text-secondary">{item.provider_cleaned_candidate}</p></>}{item.cleanup_rejected_candidate != null && <details className="pt-1 text-secondary"><summary className="cursor-pointer text-tertiary">{t(cleanupCandidateLabel(item.cleanup_guard_reason))}</summary><p className="mt-1 text-warning-ink">{t("保真检查原因：")}{t(cleanupGuardReasonLabel(item.cleanup_guard_reason))}</p><p className="mt-1 whitespace-pre-wrap break-words">{item.cleanup_rejected_candidate}</p></details>}{item.raw_text && <><p className="pt-1 text-tertiary">{t("清理前")}</p><p className="whitespace-pre-wrap text-secondary">{item.raw_text}</p></>}{item.final_text || item.raw_text ? <><p className="pt-1 text-tertiary">{t("清理后")}</p><p className="text-tertiary">{t("当前版本")}</p><p className="whitespace-pre-wrap text-primary">{item.final_text || item.raw_text}</p></> : null}</div>}
+        {showRaw && (item.asr_text || item.provider_cleaned_candidate || item.cleanup_rejected_candidate || item.raw_text) && <div className="mt-2 space-y-1 rounded-lg bg-elevated px-3 py-2 text-xs">{item.preview_receipt && <PreviewReceiptBadges receipt={item.preview_receipt} t={t} language={language} />}{item.asr_text != null && <><p className="text-tertiary">{t("ASR 识别原文")}</p><p className="whitespace-pre-wrap text-secondary">{item.asr_text}</p></>}{item.provider_cleaned_candidate != null && <><p className="pt-1 text-tertiary">{t("服务商整理候选")}</p><p className="whitespace-pre-wrap text-secondary">{item.provider_cleaned_candidate}</p></>}{item.cleanup_rejected_candidate != null && <details className="pt-1 text-secondary"><summary className="cursor-pointer text-tertiary">{t(cleanupCandidateLabel(item.cleanup_guard_reason))}</summary><p className="mt-1 text-warning-ink">{t("保真检查原因：")}{t(cleanupGuardReasonLabel(item.cleanup_guard_reason))}</p><p className="mt-1 whitespace-pre-wrap break-words">{item.cleanup_rejected_candidate}</p></details>}{item.raw_text && <><p className="pt-1 text-tertiary">{t("清理前")}</p><p className="whitespace-pre-wrap text-secondary">{item.raw_text}</p></>}{item.final_text || item.raw_text ? <><p className="pt-1 text-tertiary">{t("清理后")}</p><p className="text-tertiary">{t("当前版本")}</p><p className="whitespace-pre-wrap text-primary">{item.final_text || item.raw_text}</p></> : null}</div>}
         {showRaw && (item.cleanup_attempt_kind != null || item.cleanup_failure_reason != null || item.cleanup_final_guard_reason != null || (item.cleanup_transformations != null && item.cleanup_transformations.length > 0)) && <div className="mt-2 space-y-1 rounded-lg bg-elevated px-3 py-2 text-xs break-words"><p className="font-medium text-secondary">{t("整理过程")}</p>{item.cleanup_attempt_kind != null && <p className="text-secondary">{t("请求状态：")}{cleanupFactLabel(item.cleanup_attempt_kind, cleanupAttemptLabels, t, "整理状态未确认")}</p>}{item.cleanup_failure_reason != null && <p className="text-secondary">{t("整理原因：")}{cleanupFactLabel(item.cleanup_failure_reason, cleanupFailureLabels, t, "整理失败原因未确认")}</p>}{item.cleanup_final_guard_reason != null && <p className="text-secondary">{t("最终保真检查：")}{t(cleanupGuardReasonLabel(item.cleanup_final_guard_reason))}</p>}{item.cleanup_transformations != null && item.cleanup_transformations.length > 0 && <p className="text-secondary">{t("响应调整：")}{item.cleanup_transformations.map((code) => cleanupFactLabel(code, cleanupTransformationLabels, t, "其他响应调整")).join(language === "en" ? ", " : "、")}</p>}</div>}
         {showRevisions && revisions && <RevisionList rawText={item.raw_text} revisions={revisions} t={t} />}
         {reason && <p className={`mt-1 text-xs ${status.detailClass}`}>{reason}</p>}
-        {dictionaryCandidates.length > 0 && !editing && <div className="mt-2 flex flex-wrap items-center gap-1.5 text-xs"><span className="text-tertiary">{t("可能的词典建议")}</span>{dictionaryCandidates.map((candidate) => <button key={candidate.pair_key} type="button" className={compactButtonClass} disabled={busy} onClick={() => void confirmDictionaryCandidate(candidate)}>{t("确认")} “{candidate.before_span} → {candidate.after}”</button>)}</div>}
+        {dictionaryCandidates.length > 0 && !editing && <div className="mt-2 flex flex-wrap items-center gap-1.5 text-xs"><span className="text-tertiary">{t("可能的词典建议")}</span>{dictionaryCandidates.map((candidate) => <span key={candidate.pair_key} className="inline-flex flex-wrap items-center gap-1.5"><button type="button" className={compactButtonClass} disabled={busy} onClick={() => void confirmDictionaryCandidate(candidate, "global")}>{t("全局记住")} “{candidate.before_span} → {candidate.after}”</button><button type="button" className={compactButtonClass} disabled={busy} title={t("仅在当前 App / 网站本机生效")} onClick={() => void confirmDictionaryCandidate(candidate)}>{t("确认")} “{candidate.before_span} → {candidate.after}”</button></span>)}</div>}
       </div>
       <div ref={actionsRef} className="vf-history-actions ml-auto flex shrink-0 flex-wrap items-center justify-end gap-1">
         {editing ? (
@@ -654,6 +691,31 @@ function HistoryRow({ item, reload, editorSessionId, windowed = false, onDeleteS
       <span role="status" className="sr-only">{copied ? t("已复制") : ""}</span>
     </div>
   );
+}
+
+function PreviewReceiptBadges({
+  receipt,
+  t,
+  language,
+}: {
+  receipt: PreviewProvenanceReceipt;
+  t: (source: string) => string;
+  language: "zh" | "en";
+}) {
+  return <div data-testid="history-preview-receipt" className="mb-2 flex flex-wrap gap-1.5 border-b border-border pb-2" aria-label={t("来源事实")}>
+    <span className="rounded-full border border-border bg-card px-2 py-1 text-secondary">{t("来源")}: {t(previewSourceLabels[receipt.source_kind])}</span>
+    {receipt.char_count !== null && <span className="rounded-full border border-border bg-card px-2 py-1 text-secondary">{receipt.char_count} {t("字")}</span>}
+    {receipt.word_count !== null && <span className="rounded-full border border-border bg-card px-2 py-1 text-secondary">{receipt.word_count} {t("词")}</span>}
+    <span className="rounded-full border border-border bg-card px-2 py-1 text-secondary">{t(receipt.screen_captured === null ? "截屏状态未知" : receipt.screen_captured ? "已截屏" : "未截屏")}</span>
+    <span className="rounded-full border border-border bg-card px-2 py-1 text-secondary">
+      {receipt.context_source === null
+        ? t("上下文未记录")
+        : receipt.context_source.length === 0
+          ? t("未附加上下文")
+          : `${t("附加上下文")}: ${receipt.context_source.map((source) => t(previewContextLabels[source])).join(language === "en" ? ", " : "、")}`}
+    </span>
+    {receipt.provider_label && <span className="rounded-full border border-border bg-card px-2 py-1 text-secondary">{t("服务商")}: {receipt.provider_label}</span>}
+  </div>;
 }
 
 function RevisionList({ rawText, revisions, t }: { rawText: string; revisions: HistoryRevision[]; t: (source: string) => string }) {
@@ -772,6 +834,15 @@ function displayReason(item: HistoryItem, t: (source: string) => string): string
     item.status !== "unverified"
   ) {
     return `${t(deliveryReasonLabels[item.fallback_reason])}；${t("已复制到剪贴板，请手动粘贴")}`;
+  }
+  if (item.fallback_reason === "secure_input_owner_unmatched" && item.delivery_user_reason) {
+    const messages = [
+      item.degraded_reason ? degradedReasonLabels[item.degraded_reason] : undefined,
+      item.delivery_user_reason,
+    ].filter(
+      (message, index, all): message is string => Boolean(message) && all.indexOf(message) === index,
+    );
+    return messages.map((message) => t(message)).join(" · ");
   }
   // Prefer the bounded reason code over legacy prose, which may have promised
   // a clipboard copy before the delivery owner proved where the text went.

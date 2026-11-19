@@ -13,23 +13,16 @@ import { LearningTransferSettings } from "./LearningTransferSettings";
 import { SettingsAlert, SettingsDisclosure, SettingsGroup, SettingsPageHeader, SettingsRow, SettingsShell } from "./SettingsLayout";
 import { MAX_DICTIONARY_FILE_BYTES, mergeDictionary, parseDictionaryText } from "../lib/dictionaryImport";
 import { useI18n } from "../lib/i18n";
-import { friendlyDictionaryLearningError } from "../lib/settingsError";
+import {
+  friendlyDictionaryLearningError,
+  isDictionaryPartialSyncError,
+  settingsErrorMessage,
+} from "../lib/settingsError";
 import { buttonClass, compactButtonClass, inputClass } from "../lib/theme";
 import { Toggle } from "./Toggle";
 import type { SaveSettings, Settings } from "../types/settings";
 
 const controlClass = inputClass;
-const DICTIONARY_PARTIAL_FAILURE_PREFIX = "learning_dictionary_partial:";
-
-function isDictionaryPartialFailure(reason: unknown): boolean {
-  let message = "";
-  if (typeof reason === "string") message = reason;
-  else if (reason instanceof Error) message = reason.message;
-  else if (reason && typeof reason === "object" && "message" in reason && typeof reason.message === "string") {
-    message = reason.message;
-  }
-  return message.startsWith(DICTIONARY_PARTIAL_FAILURE_PREFIX);
-}
 
 type LearnPair = {
   pair_key: string;
@@ -118,11 +111,14 @@ export function DictionarySettings({ settings, save, onOpenHistory, onOpenPrefer
   const [manualApplicationsFailed, setManualApplicationsFailed] = useState(false);
   const [manualBefore, setManualBefore] = useSessionDraftState("dictionary:manualBefore", "");
   const [manualAfter, setManualAfter] = useSessionDraftState("dictionary:manualAfter", "");
+  const [manualScopeMode, setManualScopeMode] = useSessionDraftState<"global" | "app" | "host">("dictionary:manualScopeMode", "global");
   const [manualBundle, setManualBundle] = useSessionDraftState("dictionary:manualBundle", "");
+  const [manualHost, setManualHost] = useSessionDraftState("dictionary:manualHost", "");
   const [styleDrafts, setStyleDrafts] = useState<StyleDraft[]>([]);
   const [pinnedTerms, setPinnedTerms] = useState<string[]>([]);
   const [aggregateUsage, setAggregateUsage] = useState<LearnedTermUsage[]>([]);
   const [pendingStyleDraft, setPendingStyleDraft] = useState<StyleDraft | null>(null);
+  const [approveStyleCloudSharing, setApproveStyleCloudSharing] = useState(false);
   const [learningError, setLearningError] = useState<string | null>(null);
   const [learningActionError, setLearningActionError] = useState<string | null>(null);
   const [learningLoaded, setLearningLoaded] = useState(false);
@@ -180,12 +176,13 @@ export function DictionarySettings({ settings, save, onOpenHistory, onOpenPrefer
       if (dictionaryError) {
         setLearningActionError(dictionaryError);
       } else {
+        const rawMessage = settingsErrorMessage(reason);
         const message = command === "add_manual_scoped_learn_pair"
-          ? reason === "manual_pair_scope_conflict"
+          ? rawMessage === "manual_pair_scope_conflict"
             ? "同一纠正已在其他范围登记；请先在已生效替换中忘记旧规则，再添加。"
-            : reason === "manual_pair_binding_invalidated"
+            : rawMessage === "manual_pair_binding_invalidated"
               ? "这条纠正已因 App mapping 变化暂停；请在“已暂停的 App 专用纠正”中明确重新绑定。"
-            : reason === "manual_pair_scope_unknown"
+            : rawMessage === "manual_pair_scope_unknown"
               ? "所选 App 已不在运行，或当前范围无法确认；请重新选择后重试。"
               : "专用纠正未能保存；现有规则没有被覆盖，请重试。"
           : command === "rebind_invalidated_learn_pair"
@@ -286,15 +283,26 @@ export function DictionarySettings({ settings, save, onOpenHistory, onOpenPrefer
 
   const addManualPair = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    if (!manualBundle || !manualBefore.trim() || !manualAfter.trim() || learningBusyRef.current) return;
-    const added = await runLearningAction("add_manual_scoped_learn_pair", {
+    if (!manualBefore.trim() || !manualAfter.trim() || learningBusyRef.current) return;
+    if (manualScopeMode === "app" && !manualBundle) return;
+    if (manualScopeMode === "host" && !manualHost.trim()) return;
+    const args: Record<string, unknown> = {
       beforeSurface: manualBefore.trim(),
       afterSurface: manualAfter.trim(),
-      bundleId: manualBundle,
-    });
+    };
+    if (manualScopeMode === "global") {
+      args.scopeMode = "global";
+    } else if (manualScopeMode === "host") {
+      args.browserHost = manualHost.trim();
+      args.scopeMode = "host";
+    } else {
+      args.bundleId = manualBundle;
+    }
+    const added = await runLearningAction("add_manual_scoped_learn_pair", args);
     if (added) {
       setManualBefore("");
       setManualAfter("");
+      if (manualScopeMode === "host") setManualHost("");
     }
   };
 
@@ -328,9 +336,9 @@ export function DictionarySettings({ settings, save, onOpenHistory, onOpenPrefer
       setDictionaryMessage(details);
     } catch (reason) {
       setDictionaryFailed(true);
-      setDictionaryMessage(isDictionaryPartialFailure(reason)
+      setDictionaryMessage(isDictionaryPartialSyncError(reason)
         ? t("词条来源已记录，但个人词典未能同步。请重新导入以重试。")
-        : t("导入失败：") + (reason instanceof Error ? reason.message : String(reason)));
+        : t("导入失败：") + settingsErrorMessage(reason));
     } finally {
       importingRef.current = false;
       setDictionaryImporting(false);
@@ -371,7 +379,7 @@ export function DictionarySettings({ settings, save, onOpenHistory, onOpenPrefer
       await importText(text, fileName);
     } catch (reason) {
       setDictionaryFailed(true);
-      setDictionaryMessage(t("导入失败：") + (reason instanceof Error ? reason.message : String(reason)));
+      setDictionaryMessage(t("导入失败：") + settingsErrorMessage(reason));
     }
   }, [importText, t]);
 
@@ -433,9 +441,9 @@ export function DictionarySettings({ settings, save, onOpenHistory, onOpenPrefer
       })
       .catch((reason) => {
         setDictionaryFailed(true);
-        setDictionaryMessage(isDictionaryPartialFailure(reason)
+        setDictionaryMessage(isDictionaryPartialSyncError(reason)
           ? t("词条来源已记录，但个人词典未能同步。再次添加此词条可重试。")
-          : t("词条添加失败：") + (reason instanceof Error ? reason.message : String(reason)));
+          : t("词条添加失败：") + settingsErrorMessage(reason));
       })
       .finally(() => { addingWordRef.current = false; setAddingWord(false); });
   };
@@ -536,14 +544,62 @@ export function DictionarySettings({ settings, save, onOpenHistory, onOpenPrefer
                 setBatchReviewStatus(null);
               }} aria-label={`${t("选择待确认词条")} ${pair.before_surface} → ${pair.after_surface}`} />{t("选择")}</label>}
               <span className="min-w-0 flex-1 break-words text-primary">{pair.before_surface} <span className="text-secondary">→</span> <strong className="font-medium">{pair.after_surface}</strong><span className="mt-1 block text-xs text-secondary">{t("适用范围：")} {[pair.native_bundle, pair.browser_host, pair.mapping_id, pair.family].filter(Boolean).join(" · ") || t("范围未知")}</span><span className="mt-1 block text-xs tabular-nums text-secondary">{pair.hits} {t("次纠正记录")}</span></span>
-              <button type="button" disabled={learningBusy} onClick={() => void runLearningAction("promote_learn_pair", { pairKey: pair.pair_key, beforeSurface: pair.before_surface, afterSurface: pair.after_surface })} className={compactButtonClass}>{t("确认")}</button>
+              {isWordRule(pair) && (
+                <button
+                  type="button"
+                  disabled={learningBusy}
+                  onClick={() => void runLearningAction("promote_learn_pair", {
+                    pairKey: pair.pair_key,
+                    beforeSurface: pair.before_surface,
+                    afterSurface: pair.after_surface,
+                    scopeMode: "global",
+                  })}
+                  className={compactButtonClass}
+                >{t("全局记住")}</button>
+              )}
+              <button
+                type="button"
+                disabled={learningBusy}
+                title={isWordRule(pair) ? t("仅在当前 App / 网站本机生效") : undefined}
+                onClick={() => void runLearningAction("promote_learn_pair", { pairKey: pair.pair_key, beforeSurface: pair.before_surface, afterSurface: pair.after_surface })}
+                className={compactButtonClass}
+              >{t("确认")}</button>
               <button type="button" disabled={learningBusy} onClick={() => void runLearningAction("ignore_learn_pair", { pairKey: pair.pair_key })} className={`${compactButtonClass} enabled:hover:bg-error/10 enabled:hover:text-error-ink`}>{t("忽略")}</button>
             </div>
           ))}
         </SettingsGroup>
       )}
-      <SettingsGroup title={t("手动添加 App 专用纠正")} description={t("明确选择一个正在运行的原生 App；规则只在所选 App 生效，不改全局个人词典，也不改历史记录。可随时忘记撤销。") }>
+      <SettingsGroup title={t("手动添加纠错规则")} description={t("可添加全局规则（推荐，同步到热词提示与云端整理），或仅针对指定 App / 网站添加本机私密规则。可随时忘记撤销。")}>
         <form onSubmit={(event) => void addManualPair(event)} className="grid gap-3 px-5 py-4 sm:grid-cols-2">
+          <div role="radiogroup" aria-label={t("规则生效范围")} className="flex flex-wrap gap-3 text-sm sm:col-span-2">
+            <label className="inline-flex cursor-pointer items-center gap-1.5 text-primary">
+              <input
+                type="radio"
+                name="manual-rule-scope"
+                checked={manualScopeMode === "global"}
+                onChange={() => setManualScopeMode("global")}
+              />
+              <span>{t("全局规则（推荐，允许云端热词提示与整理）")}</span>
+            </label>
+            <label className="inline-flex cursor-pointer items-center gap-1.5 text-primary">
+              <input
+                type="radio"
+                name="manual-rule-scope"
+                checked={manualScopeMode === "app"}
+                onChange={() => setManualScopeMode("app")}
+              />
+              <span>{t("仅指定 App（本机私密）")}</span>
+            </label>
+            <label className="inline-flex cursor-pointer items-center gap-1.5 text-primary">
+              <input
+                type="radio"
+                name="manual-rule-scope"
+                checked={manualScopeMode === "host"}
+                onChange={() => setManualScopeMode("host")}
+              />
+              <span>{t("仅指定网站（本机私密）")}</span>
+            </label>
+          </div>
           <label className="grid gap-1.5 text-sm text-secondary">
             <span>{t("听写识别为")}</span>
             <input aria-label={t("听写识别为")} className={controlClass} value={manualBefore} onChange={(event) => setManualBefore(event.target.value)} maxLength={256} />
@@ -552,26 +608,55 @@ export function DictionarySettings({ settings, save, onOpenHistory, onOpenPrefer
             <span>{t("应替换为")}</span>
             <input aria-label={t("应替换为")} className={controlClass} value={manualAfter} onChange={(event) => setManualAfter(event.target.value)} maxLength={256} />
           </label>
-          <label className="grid gap-1.5 text-sm text-secondary sm:col-span-2">
-            <span>{t("仅在此 App 生效")}</span>
-            <Select aria-label={t("仅在此 App 生效")} className={controlClass} value={manualBundle} onValueChange={setManualBundle} disabled={manualApplicationsLoading || manualApplicationsFailed || manualApplications == null || manualApplications.length === 0}>
-              <option value="">{t("选择一个正在运行的原生 App")}</option>
-              {(manualApplications ?? []).map((application) => <option key={application.bundle_id} value={application.bundle_id}>{application.label}</option>)}
-            </Select>
-          </label>
-          {manualApplicationsFailed ? <p role="alert" className="text-xs text-error-ink sm:col-span-2">{t("无法读取当前运行的 App；请重试后再添加。")}</p> : manualApplications?.length === 0 ? <p role="status" className="text-xs text-secondary sm:col-span-2">{t("目前没有可选的运行中原生 App。")}</p> : null}
+          {manualScopeMode === "app" && (
+            <>
+              <label className="grid gap-1.5 text-sm text-secondary sm:col-span-2">
+                <span>{t("仅在此 App 生效")}</span>
+                <Select aria-label={t("仅在此 App 生效")} className={controlClass} value={manualBundle} onValueChange={setManualBundle} disabled={manualApplicationsLoading || manualApplicationsFailed || manualApplications == null || manualApplications.length === 0}>
+                  <option value="">{t("选择一个已安装或正在运行的原生 App")}</option>
+                  {(manualApplications ?? []).map((application) => <option key={application.bundle_id} value={application.bundle_id}>{application.label}</option>)}
+                </Select>
+              </label>
+              {manualApplicationsFailed ? <p role="alert" className="text-xs text-error-ink sm:col-span-2">{t("无法读取原生 App 列表；请重试后再添加。")}</p> : manualApplications?.length === 0 ? <p role="status" className="text-xs text-secondary sm:col-span-2">{t("目前没有可选的原生 App。")}</p> : null}
+            </>
+          )}
+          {manualScopeMode === "host" && (
+            <label className="grid gap-1.5 text-sm text-secondary sm:col-span-2">
+              <span>{t("仅在此网站域名生效")}</span>
+              <input
+                aria-label={t("仅在此网站域名生效")}
+                className={controlClass}
+                value={manualHost}
+                onChange={(event) => setManualHost(event.target.value)}
+                placeholder="github.com"
+                maxLength={256}
+              />
+            </label>
+          )}
           <div className="flex flex-wrap justify-between gap-2 sm:col-span-2">
-            <button type="button" disabled={manualApplicationsLoading} aria-busy={manualApplicationsLoading} onClick={() => void refreshManualApplications()} className={compactButtonClass}>{t(manualApplicationsLoading ? "正在刷新…" : "刷新 App 列表")}</button>
-            <button type="submit" disabled={learningBusy || manualApplicationsLoading || manualApplicationsFailed || !manualBundle || !manualBefore.trim() || !manualAfter.trim()} className={buttonClass}>{learningBusy ? t("保存中…") : t("添加专用纠正")}</button>
+            {manualScopeMode === "app" ? (
+              <button type="button" disabled={manualApplicationsLoading} aria-busy={manualApplicationsLoading} onClick={() => void refreshManualApplications()} className={compactButtonClass}>{t(manualApplicationsLoading ? "正在刷新…" : "刷新 App 列表")}</button>
+            ) : <span />}
+            <button
+              type="submit"
+              disabled={
+                learningBusy
+                || !manualBefore.trim()
+                || !manualAfter.trim()
+                || (manualScopeMode === "app" && (manualApplicationsLoading || manualApplicationsFailed || !manualBundle))
+                || (manualScopeMode === "host" && !manualHost.trim())
+              }
+              className={buttonClass}
+            >{learningBusy ? t("保存中…") : t(manualScopeMode === "global" ? "添加全局规则" : "添加专用纠正")}</button>
           </div>
         </form>
       </SettingsGroup>
       {styleDrafts.length > 0 && (
-        <SettingsGroup title={t("待确认口癖")} description={t("确认会把这组样例保存在本机；如需发送给云端整理服务商，请在“语气”的 App 规则中单独批准。")}>
+        <SettingsGroup title={t("待确认口癖")} description={t("确认默认只把这组样例保存在本机；可在确认弹窗勾选，或稍后在“写作与整理”的 App 规则中单独批准发送给云端整理服务商。")}>
           {styleDrafts.map((draft) => (
             <div key={draft.draft_key} className="flex flex-wrap items-center gap-3 px-5 py-4 text-sm">
               <span className="min-w-0 flex-1 text-primary">{draft.mapping_id} · {t(draft.style_key === "fewer_periods" ? "少用句号" : draft.style_key === "more_questions" ? "爱用问号" : "标点密度")} · {draft.excerpt}</span>
-              <button type="button" disabled={learningBusy} onClick={() => { setLearningActionError(null); setPendingStyleDraft(draft); }} className={compactButtonClass}>{t("确认")}</button>
+              <button type="button" disabled={learningBusy} onClick={() => { setLearningActionError(null); setApproveStyleCloudSharing(false); setPendingStyleDraft(draft); }} className={compactButtonClass}>{t("确认")}</button>
               <button type="button" disabled={learningBusy} onClick={() => void runLearningAction("dismiss_style_draft", { draftKey: draft.draft_key })} className={`${compactButtonClass} enabled:hover:bg-error/10 enabled:hover:text-error-ink`}>{t("忽略")}</button>
             </div>
           ))}
@@ -610,7 +695,7 @@ export function DictionarySettings({ settings, save, onOpenHistory, onOpenPrefer
       <SettingsGroup title={t("已生效替换")} description={`${activePromotedPairs.length} ${t("条")}`}>
         {activePromotedPairs.length > 0 ? activePromotedPairs.map((pair) => {
           const pinned = pinnedTerms.includes(pair.after_surface);
-          const localOnly = pair.manual_scoped || pair.auto_scoped;
+          const localOnly = pair.manual_scoped || pair.auto_scoped || Boolean(pair.native_bundle || pair.browser_host || pair.mapping_id || pair.family);
           return (
             <div key={pair.pair_key} className="flex flex-wrap items-center gap-3 px-5 py-4 text-sm">
               <span className="min-w-0 flex-1 text-primary">
@@ -618,7 +703,8 @@ export function DictionarySettings({ settings, save, onOpenHistory, onOpenPrefer
                 <span className="ml-2 text-xs text-tertiary">{pair.hits} {t("次纠正记录")}</span>
                 {pair.promote_hits === 2 ? <span className="ml-2 text-xs text-tertiary">{t("人名")}</span> : null}
                 {pair.native_bundle ? <span className="mt-1 block text-xs text-secondary">{t("适用 App：")} {manualApplications?.find((application) => application.bundle_id === pair.native_bundle)?.label ?? pair.native_bundle}</span> : null}
-                {localOnly ? <span className="mt-1 block text-xs text-secondary">{t("仅本机词典规则；不会写入全局词条")}</span> : null}
+                {pair.browser_host ? <span className="mt-1 block text-xs text-secondary">{t("适用网站：")} {pair.browser_host}</span> : null}
+                {localOnly ? <span className="mt-1 block text-xs text-secondary">{t("仅本机词典规则；不会写入全局词条")}</span> : <span className="mt-1 block text-xs text-secondary">{t("全局规则 · 允许云端热词提示与整理")}</span>}
               </span>
               {!localOnly && <button type="button" disabled={learningBusy} aria-label={`${pinned ? t("取消置顶") : t("置顶")} ${pair.after_surface}`} onClick={() => void runLearningAction("pin_dictionary_term", { word: pair.after_surface, pinned: !pinned })} className={compactButtonClass}>{pinned ? t("已置顶") : t("置顶")}</button>}
               <button type="button" disabled={learningBusy} onClick={() => void runLearningAction("undo_learn_pair", { pairKey: pair.pair_key })} className={`${compactButtonClass} enabled:hover:bg-error/10 enabled:hover:text-error-ink`}>{t("忘记")}</button>
@@ -669,18 +755,37 @@ export function DictionarySettings({ settings, save, onOpenHistory, onOpenPrefer
         open={pendingStyleDraft != null}
         title={t("确认口癖样例")}
         danger={false}
-        description={`${t("将这组纠错前后文字保存为该 App 的风格样例，并允许用于后续整理请求。现在不会发送；可在语气的 App 规则中撤销批准。")}${pendingStyleDraft ? ` ${t("示例输入")}：${pendingStyleDraft.before_excerpt} → ${t("期望输出")}：${pendingStyleDraft.after_excerpt}` : ""}`}
+        description={`${t("将这组纠错前后文字仅保存在本机作为该 App 的风格样例；除非勾选下方授权，否则不会发送给云端整理服务。可在语气的 App 规则中随时调整。")}${pendingStyleDraft ? ` ${t("示例输入")}：${pendingStyleDraft.before_excerpt} → ${t("期望输出")}：${pendingStyleDraft.after_excerpt}` : ""}`}
         confirmLabel={t("确认")}
         cancelLabel={t("取消")}
         busy={learningBusy}
         error={learningActionError}
-        onCancel={() => setPendingStyleDraft(null)}
+        onCancel={() => { setApproveStyleCloudSharing(false); setPendingStyleDraft(null); }}
         onConfirm={() => {
           if (pendingStyleDraft) {
-            void runLearningAction("confirm_style_draft", { draftKey: pendingStyleDraft.draft_key }).then((success) => { if (success) setPendingStyleDraft(null); });
+            void runLearningAction("confirm_style_draft", {
+              draftKey: pendingStyleDraft.draft_key,
+              approveCloudSharing: approveStyleCloudSharing,
+            }).then((success) => {
+              if (success) {
+                setApproveStyleCloudSharing(false);
+                setPendingStyleDraft(null);
+              }
+            });
           }
         }}
-      />
+      >
+        <label className="mt-4 flex cursor-pointer items-start gap-2.5 text-[13px] leading-5 text-primary">
+          <input
+            type="checkbox"
+            className="mt-1 h-4 w-4 shrink-0 rounded border-border"
+            checked={approveStyleCloudSharing}
+            disabled={learningBusy}
+            onChange={(event) => setApproveStyleCloudSharing(event.target.checked)}
+          />
+          <span>{t("同时批准将此 App 的风格样例发送给当前整理服务")}</span>
+        </label>
+      </ConfirmDialog>
       <ConfirmDialog
         open={pendingDeleteWord != null}
         title={t("删除词条")}

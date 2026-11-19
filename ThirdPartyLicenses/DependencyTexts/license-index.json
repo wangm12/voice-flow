@@ -43,9 +43,9 @@
       "sha256": "40b44d4ddfd83d6751574d0b9d21702c9b168393fdf1794390a219ba0400e9a0"
     },
     "package_lock": {
-      "bytes": 162439,
+      "bytes": 161873,
       "path": "package-lock.json",
-      "sha256": "0794e9eb8c027251ec732fa26642600cc536ab42af913939cd07825eed736d34"
+      "sha256": "681e70654021cb074dc090419aaeaa87c444cf2bae4dc99e3674d46435bf838c"
     },
     "pinned_upstream_fetch": {
       "cumulative_network_body_bytes": 277348,
@@ -1319,80 +1319,6 @@
     {
       "ecosystem": "npm",
       "exact_source_revision_binding": {
-        "registry_git_head": "e7a68fa63755603b9fa12d28e077eea645551d24",
-        "registry_integrity": "sha512-CUlb5Hqi2oZbcZf4VUyUH53XWPPdtpw43EUpCza5HWZJwxEoDowFzNUDt1tRUXA8Uq+XPn17Ysfptip33sG4eQ==",
-        "registry_metadata_sha256": "d5892bfebb1acc306e26362331b720a30a22a81acf04e3f4626ee8d696e701c2",
-        "registry_url": "https://registry.npmjs.org/%40tauri-apps%2Fplugin-clipboard-manager/2.3.2",
-        "repository_url": "https://github.com/tauri-apps/plugins-workspace",
-        "status": "exact_revision_verified"
-      },
-      "graph_role": "production_or_optional_nondev_lock_entry",
-      "installed_license_expression": "MIT OR Apache-2.0",
-      "license_expression": "MIT OR Apache-2.0",
-      "lock_identity": {
-        "integrity": "sha512-CUlb5Hqi2oZbcZf4VUyUH53XWPPdtpw43EUpCza5HWZJwxEoDowFzNUDt1tRUXA8Uq+XPn17Ysfptip33sG4eQ==",
-        "lock_path": "node_modules/@tauri-apps/plugin-clipboard-manager",
-        "version": "2.3.2"
-      },
-      "name": "@tauri-apps/plugin-clipboard-manager",
-      "package_metadata_sha256": "b2f7f21dda33db8e4aa13ebdad80aa0f727652cac3efb2e40acb057dce195808",
-      "source": "npm:registry.npmjs.org",
-      "source_revision": "e7a68fa63755603b9fa12d28e077eea645551d24",
-      "text_status": "license_text_found",
-      "texts": [
-        {
-          "bytes": 888,
-          "classification_evidence": {
-            "referenced_license_families": [
-              "Apache-2.0"
-            ]
-          },
-          "kind": "spdx_metadata",
-          "output_path": "ThirdPartyLicenses/DependencyTexts/by-sha256/eb8a6c84630461b352badcab1dbe5d0168c56d377358b2b8c86b51003272d5ef.txt",
-          "sha256": "eb8a6c84630461b352badcab1dbe5d0168c56d377358b2b8c86b51003272d5ef",
-          "source_basename": "LICENSE.spdx",
-          "source_path": "node_modules/@tauri-apps/plugin-clipboard-manager/LICENSE.spdx"
-        },
-        {
-          "bytes": 10173,
-          "classification_evidence": {
-            "complete_license_families": [
-              "Apache-2.0"
-            ],
-            "referenced_license_families": []
-          },
-          "kind": "license_text",
-          "output_path": "ThirdPartyLicenses/DependencyTexts/by-sha256/0cec06e0e55fbc3dc5cee4fca9b607f66cb8f4e4dbcf3b3c013594dd156732e9.txt",
-          "sha256": "0cec06e0e55fbc3dc5cee4fca9b607f66cb8f4e4dbcf3b3c013594dd156732e9",
-          "source_basename": "LICENSE_APACHE-2.0",
-          "source_path": "LICENSE_APACHE-2.0",
-          "source_revision": "e7a68fa63755603b9fa12d28e077eea645551d24",
-          "source_url": "https://raw.githubusercontent.com/tauri-apps/plugins-workspace/e7a68fa63755603b9fa12d28e077eea645551d24/LICENSE_APACHE-2.0"
-        },
-        {
-          "bytes": 1089,
-          "classification_evidence": {
-            "complete_license_families": [
-              "MIT"
-            ],
-            "referenced_license_families": []
-          },
-          "kind": "license_text",
-          "output_path": "ThirdPartyLicenses/DependencyTexts/by-sha256/89ff9689dcf9dd53968785d05a26f7898bb169dbfcada8d032b3e68cf0d55607.txt",
-          "sha256": "89ff9689dcf9dd53968785d05a26f7898bb169dbfcada8d032b3e68cf0d55607",
-          "source_basename": "LICENSE_MIT",
-          "source_path": "LICENSE_MIT",
-          "source_revision": "e7a68fa63755603b9fa12d28e077eea645551d24",
-          "source_url": "https://raw.githubusercontent.com/tauri-apps/plugins-workspace/e7a68fa63755603b9fa12d28e077eea645551d24/LICENSE_MIT"
-        }
-      ],
-      "unresolved_reason": null,
-      "upstream_repository": "https://github.com/tauri-apps/plugins-workspace",
-      "version": "2.3.2"
-    },
-    {
-      "ecosystem": "npm",
-      "exact_source_revision_binding": {
         "registry_git_head": "03afae6d7275030a708eaedd39f0e604ccb901f3",
         "registry_integrity": "sha512-pX0IGm1I3I6wc+zeKYcq1GSqogK6okCNX5fOdaNU5ab1AjGS6l1E5wFNjEb7meg7ZFSp0JUs+0jQGQNyOvLrsg==",
         "registry_metadata_sha256": "a92d2a94f47f203ed7f19916e989d020cec9f88b729f4b0af164d9dd18eaafbb",
@@ -1463,80 +1389,6 @@
       "unresolved_reason": null,
       "upstream_repository": "https://github.com/tauri-apps/plugins-workspace",
       "version": "2.7.2"
-    },
-    {
-      "ecosystem": "npm",
-      "exact_source_revision_binding": {
-        "registry_git_head": "9883f396dcdc16b04b8313f9cbb6aeef04bfb694",
-        "registry_integrity": "sha512-UReHNXrLvpEjylE4jb4oCYiy96uRykPUthoCQCmRXYrd5hs5X9DrW+qOn7GLW57EJN4tdK8bgK5twBTz2NOxzA==",
-        "registry_metadata_sha256": "b18b585fb8ce0bbdbee8724924f56876b8f94e093006a48d02dcb2458a4353ad",
-        "registry_url": "https://registry.npmjs.org/%40tauri-apps%2Fplugin-global-shortcut/2.3.2",
-        "repository_url": "https://github.com/tauri-apps/plugins-workspace",
-        "status": "exact_revision_verified"
-      },
-      "graph_role": "production_or_optional_nondev_lock_entry",
-      "installed_license_expression": "MIT OR Apache-2.0",
-      "license_expression": "MIT OR Apache-2.0",
-      "lock_identity": {
-        "integrity": "sha512-UReHNXrLvpEjylE4jb4oCYiy96uRykPUthoCQCmRXYrd5hs5X9DrW+qOn7GLW57EJN4tdK8bgK5twBTz2NOxzA==",
-        "lock_path": "node_modules/@tauri-apps/plugin-global-shortcut",
-        "version": "2.3.2"
-      },
-      "name": "@tauri-apps/plugin-global-shortcut",
-      "package_metadata_sha256": "5494c22dab859d96b34ca3de3e1b386b6e4e077a6cb41d2637da6818a303ca7d",
-      "source": "npm:registry.npmjs.org",
-      "source_revision": "9883f396dcdc16b04b8313f9cbb6aeef04bfb694",
-      "text_status": "license_text_found",
-      "texts": [
-        {
-          "bytes": 888,
-          "classification_evidence": {
-            "referenced_license_families": [
-              "Apache-2.0"
-            ]
-          },
-          "kind": "spdx_metadata",
-          "output_path": "ThirdPartyLicenses/DependencyTexts/by-sha256/eb8a6c84630461b352badcab1dbe5d0168c56d377358b2b8c86b51003272d5ef.txt",
-          "sha256": "eb8a6c84630461b352badcab1dbe5d0168c56d377358b2b8c86b51003272d5ef",
-          "source_basename": "LICENSE.spdx",
-          "source_path": "node_modules/@tauri-apps/plugin-global-shortcut/LICENSE.spdx"
-        },
-        {
-          "bytes": 10173,
-          "classification_evidence": {
-            "complete_license_families": [
-              "Apache-2.0"
-            ],
-            "referenced_license_families": []
-          },
-          "kind": "license_text",
-          "output_path": "ThirdPartyLicenses/DependencyTexts/by-sha256/0cec06e0e55fbc3dc5cee4fca9b607f66cb8f4e4dbcf3b3c013594dd156732e9.txt",
-          "sha256": "0cec06e0e55fbc3dc5cee4fca9b607f66cb8f4e4dbcf3b3c013594dd156732e9",
-          "source_basename": "LICENSE_APACHE-2.0",
-          "source_path": "LICENSE_APACHE-2.0",
-          "source_revision": "9883f396dcdc16b04b8313f9cbb6aeef04bfb694",
-          "source_url": "https://raw.githubusercontent.com/tauri-apps/plugins-workspace/9883f396dcdc16b04b8313f9cbb6aeef04bfb694/LICENSE_APACHE-2.0"
-        },
-        {
-          "bytes": 1089,
-          "classification_evidence": {
-            "complete_license_families": [
-              "MIT"
-            ],
-            "referenced_license_families": []
-          },
-          "kind": "license_text",
-          "output_path": "ThirdPartyLicenses/DependencyTexts/by-sha256/89ff9689dcf9dd53968785d05a26f7898bb169dbfcada8d032b3e68cf0d55607.txt",
-          "sha256": "89ff9689dcf9dd53968785d05a26f7898bb169dbfcada8d032b3e68cf0d55607",
-          "source_basename": "LICENSE_MIT",
-          "source_path": "LICENSE_MIT",
-          "source_revision": "9883f396dcdc16b04b8313f9cbb6aeef04bfb694",
-          "source_url": "https://raw.githubusercontent.com/tauri-apps/plugins-workspace/9883f396dcdc16b04b8313f9cbb6aeef04bfb694/LICENSE_MIT"
-        }
-      ],
-      "unresolved_reason": null,
-      "upstream_repository": "https://github.com/tauri-apps/plugins-workspace",
-      "version": "2.3.2"
     },
     {
       "ecosystem": "npm",
@@ -2176,6 +2028,40 @@
       "unresolved_reason": null,
       "upstream_repository": "https://github.com/facebook/react",
       "version": "1.6.0"
+    },
+    {
+      "ecosystem": "npm",
+      "graph_role": "production_or_optional_nondev_lock_entry",
+      "installed_license_expression": "MIT",
+      "license_expression": "MIT",
+      "lock_identity": {
+        "integrity": "sha512-PLw6BMo9WCwniSGjlpX3gr5ReponCDFLis37Q8XLfHMyMfv2DNTNzYS0kkYZKS2ohzdaGq1T5jxCyqwA1jqbIQ==",
+        "lock_path": "node_modules/voice-glow",
+        "version": "0.3.0"
+      },
+      "name": "voice-glow",
+      "package_metadata_sha256": "d1b84f262932592493b0107b1feff7215389f7cd0595b0e8b232a2ee5517c79d",
+      "source": "npm:registry.npmjs.org",
+      "text_status": "license_text_found",
+      "texts": [
+        {
+          "bytes": 1070,
+          "classification_evidence": {
+            "complete_license_families": [
+              "MIT"
+            ],
+            "referenced_license_families": []
+          },
+          "kind": "license_text",
+          "output_path": "ThirdPartyLicenses/DependencyTexts/by-sha256/915a283980628a0ca9e7b423ebafc6f3a0fa1e630ff17d34e59034808d92011c.txt",
+          "sha256": "915a283980628a0ca9e7b423ebafc6f3a0fa1e630ff17d34e59034808d92011c",
+          "source_basename": "LICENSE",
+          "source_path": "node_modules/voice-glow/LICENSE"
+        }
+      ],
+      "unresolved_reason": null,
+      "upstream_repository": "https://github.com/Jakubantalik/Libraries.dev",
+      "version": "0.3.0"
     },
     {
       "ecosystem": "rust",
@@ -22079,8 +21965,8 @@
     "canonical_objc2_mit_choice_records": 15,
     "first_party_undeclared_license_records": 1,
     "network_license_fetch_body_bytes": 277348,
-    "npm_nondev_records": 58,
-    "records_with_full_license_text": 458,
+    "npm_nondev_records": 57,
+    "records_with_full_license_text": 457,
     "records_with_pinned_source_text": 28,
     "records_without_full_license_text": 7,
     "rust_build_only_graph_records": 19,

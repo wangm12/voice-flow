@@ -364,10 +364,24 @@ describe("History", () => {
     render(<History items={[item]} reload={reload} hasMore={false} loading={false} onLoadMore={vi.fn()} />);
 
     fireEvent.click(screen.getByRole("button", { name: "清空全部数据" }));
-    expect(screen.getByRole("dialog")).toHaveTextContent("Keychain 中的 API Key 会保留");
+    expect(screen.getByRole("dialog")).toHaveTextContent("待确认草稿与本地用量");
+    expect(screen.getByRole("dialog")).toHaveTextContent("已确认的词典学习规则与 Keychain 中的 API Key 会保留");
     fireEvent.click(screen.getByRole("dialog").querySelector("button:last-child")!);
 
-    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("clear_all_data"));
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("clear_all_data", { includeLearnedRules: false }));
+    expect(reload).toHaveBeenCalledOnce();
+  });
+
+  it("opts into clearing confirmed learned rules when the checkbox is checked", async () => {
+    invokeMock.mockResolvedValue(undefined);
+    const reload = vi.fn();
+    render(<History items={[item]} reload={reload} hasMore={false} loading={false} onLoadMore={vi.fn()} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "清空全部数据" }));
+    fireEvent.click(screen.getByRole("checkbox", { name: "同时清除已确认的词典学习规则" }));
+    fireEvent.click(screen.getByRole("dialog").querySelector("button:last-child")!);
+
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("clear_all_data", { includeLearnedRules: true }));
     expect(reload).toHaveBeenCalledOnce();
   });
 
@@ -489,6 +503,51 @@ describe("History", () => {
   it("shows the selected ASR provider and model provenance", () => {
     render(<History items={[{ ...item, engine: "deepgram:nova-3" }]} reload={vi.fn()} hasMore={false} loading={false} onLoadMore={vi.fn()} />);
     expect(screen.getByText("deepgram:nova-3")).toBeInTheDocument();
+  });
+
+  it("shows only the actual native source facts retained on a dictation History row", () => {
+    render(<History items={[{
+      ...item,
+      preview_receipt: {
+        source_kind: "dictation",
+        char_count: 11,
+        word_count: 2,
+        screen_captured: true,
+        context_source: ["ocr"],
+        provider_label: "Groq",
+      },
+    }]} reload={vi.fn()} hasMore={false} loading={false} onLoadMore={vi.fn()} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "更多操作" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "查看原文" }));
+    const receipt = screen.getByTestId("history-preview-receipt");
+    expect(receipt).toHaveTextContent("听写");
+    expect(receipt).toHaveTextContent("11 字");
+    expect(receipt).toHaveTextContent("2 词");
+    expect(receipt).toHaveTextContent("已截屏");
+    expect(receipt).toHaveTextContent("本机 OCR");
+    expect(receipt).toHaveTextContent("Groq");
+  });
+
+  it("keeps missing legacy screenshot and context evidence unknown", () => {
+    render(<History items={[{
+      ...item,
+      preview_receipt: {
+        source_kind: "dictation",
+        char_count: 11,
+        word_count: 2,
+        screen_captured: null,
+        context_source: null,
+        provider_label: null,
+      },
+    }]} reload={vi.fn()} hasMore={false} loading={false} onLoadMore={vi.fn()} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "更多操作" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "查看原文" }));
+    const receipt = screen.getByTestId("history-preview-receipt");
+    expect(receipt).toHaveTextContent("截屏状态未知");
+    expect(receipt).toHaveTextContent("上下文未记录");
+    expect(receipt).not.toHaveTextContent("未截屏");
   });
 
   it("shows provider output separately from local transcript preparation", () => {
@@ -1190,5 +1249,112 @@ describe("History", () => {
         historyId: item.id,
       }),
     );
+  });
+
+  it("supports promoting a candidate globally and shows private local-pair egress protection label", async () => {
+    invokeMock.mockImplementation(async (command) => {
+      if (command === "suggest_dictionary_entries") return [zhihuSuggestion];
+      if (command === "get_settings") return { dictionary: [] };
+      return undefined;
+    });
+    render(
+      <History
+        items={[{
+          ...item,
+          raw_text: "知呼",
+          final_text: "知乎",
+          cleanup_attempt_kind: "not_called",
+          cleanup_failure_reason: "local_pair_egress_blocked",
+        }]}
+        reload={vi.fn()}
+        hasMore={false}
+        loading={false}
+        onLoadMore={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "更多操作" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "查看原文" }));
+    expect(
+      screen.getByText(/私密词对保护 · 仅本机整理（本机私密词对改变了待发文本，已跳过云端整理并保留本机结果）/),
+    ).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "编辑这条历史记录" }));
+    fireEvent.change(screen.getByRole("textbox", { name: "编辑整理结果" }), { target: { value: "知乎" } });
+    fireEvent.click(screen.getByRole("button", { name: "保存历史版本" }));
+    fireEvent.click(await screen.findByRole("button", { name: '全局记住 “知呼 → 知乎”' }));
+
+    await waitFor(() =>
+      expect(invokeMock).toHaveBeenCalledWith("promote_learn_pair", {
+        pairKey: zhihuSuggestion.pair_key,
+        beforeSurface: "知呼",
+        afterSurface: "知乎",
+        historyId: item.id,
+        scopeMode: "global",
+      }),
+    );
+  });
+
+  it("renders owner-specific secure_input_owner_unmatched copy in Chinese and English and unwraps structured clear_all_data errors", async () => {
+    const secureClipboardItem: HistoryItem = {
+      ...item,
+      id: 901,
+      status: "copied",
+      delivery_method: "clipboard",
+      fallback_reason: "secure_input_owner_unmatched",
+      delivery_user_reason: "系统安全输入由「1Password」持有，听写文字已保留在剪贴板；请按 ⌘V 粘贴",
+    };
+    const secureHistoryItem: HistoryItem = {
+      ...item,
+      id: 902,
+      status: "history",
+      delivery_method: "history",
+      fallback_reason: "secure_input_owner_unmatched",
+      delivery_user_reason: "系统安全输入由「1Password」持有，听写结果保存在历史记录中",
+    };
+    const { rerender } = render(
+      <I18nProvider initialLanguage="zh">
+        <History
+          items={[secureClipboardItem, secureHistoryItem]}
+          reload={vi.fn()}
+          hasMore={false}
+          loading={false}
+          onLoadMore={vi.fn()}
+        />
+      </I18nProvider>,
+    );
+
+    expect(
+      screen.getByText("系统安全输入由「1Password」持有，听写文字已保留在剪贴板；请按 ⌘V 粘贴"),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText("系统安全输入由「1Password」持有，听写结果保存在历史记录中"),
+    ).toBeInTheDocument();
+
+    rerender(
+      <I18nProvider initialLanguage="en">
+        <History
+          items={[secureClipboardItem, secureHistoryItem]}
+          reload={vi.fn()}
+          hasMore={false}
+          loading={false}
+          onLoadMore={vi.fn()}
+        />
+      </I18nProvider>,
+    );
+
+    expect(
+      screen.getByText("macOS Secure Input is held by “1Password”. Dictated text stays on the clipboard; press ⌘V to paste"),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText("macOS Secure Input is held by “1Password”. The dictation result is saved in History"),
+    ).toBeInTheDocument();
+
+    invokeMock.mockRejectedValueOnce({ code: "operation_busy", message: "Spool cleanup in progress" });
+    fireEvent.click(screen.getByRole("button", { name: "Clear all data" }));
+    fireEvent.click(screen.getByRole("dialog").querySelector("button:last-child")!);
+
+    await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent("Spool cleanup in progress"));
+    expect(screen.getByRole("alert")).not.toHaveTextContent("[object Object]");
   });
 });

@@ -17,7 +17,8 @@
       "react": ["./node_modules/@types/react"],
       "react/*": ["./node_modules/@types/react/*"],
       "thinking-orbs": ["./node_modules/thinking-orbs/dist/index.d.ts"],
-      "border-beam": ["./node_modules/border-beam/dist/index.d.ts"]
+      "border-beam": ["./node_modules/border-beam/dist/index.d.ts"],
+      "voice-glow": ["./node_modules/voice-glow/dist/index.d.ts"]
     }
   },
   "include": ["src"]

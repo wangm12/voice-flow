@@ -1013,7 +1013,11 @@ fn attribution_gate_allows_only_a_proven_asr_substitution_to_write() {
     assert!(result.settled);
     assert_eq!(result.states_consumed, fixture.ordered_samples.len());
     assert!(result.candidate_writer_called);
-    let key = crate::dictionary_learn::pair_key("VoiceFlo", "VoiceFlow");
+    let key = crate::dictionary_learn::scoped_word_key_for(
+        "VoiceFlo",
+        "VoiceFlow",
+        Some(&crate::dictionary_learn::controlled_candidate_scope(&scope)),
+    );
     let row = crate::store::get_learn_pair(&arm.root, &key)
         .expect("read recorded pair")
         .expect("eligible candidate is stored");
@@ -1775,7 +1779,11 @@ fn stable_origins_dedupe_promote_apply_by_scope_and_survive_undo_reopen() {
     assert_eq!(first_receipt.candidate_write, "candidate_written");
     assert_eq!(first_receipt.states_consumed, first.ordered_samples.len());
     assert!(first_receipt.settled);
-    let key = crate::dictionary_learn::pair_key("VoiceFlo", "VoiceFlow");
+    let key = crate::dictionary_learn::scoped_word_key_for(
+        "VoiceFlo",
+        "VoiceFlow",
+        Some(&crate::dictionary_learn::controlled_candidate_scope(&scope)),
+    );
     let first_state = learning_snapshot(&arm, &episode).expect("read first origin state");
     assert_eq!(
         crate::store::get_learn_pair(&arm.root, &key)

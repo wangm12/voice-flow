@@ -4,7 +4,7 @@ Generated from the application Cargo.lock, platform-filtered Cargo metadata, roo
 
 This is an attribution inventory, not a legal license certification, a linker map, or proof that every locked dependency is included in the shipped binary. Rust rows include the metadata graph and mark build-only nodes separately. Npm rows include non-development lock entries. A declared SPDX expression without a full text remains unresolved. A mixed text includes at least one complete license body plus a separate reference or incomplete header; the reference is not counted as another complete body.
 
-Package records: 407 Rust (388 normal graph; 19 build-only graph) and 58 npm. Full license texts are present for 458 records; 6 third-party records remain without a full license text.
+Package records: 407 Rust (388 normal graph; 19 build-only graph) and 57 npm. Full license texts are present for 457 records; 6 third-party records remain without a full license text.
 
 Machine-readable source/version/license/text hashes: [license-index.json](license-index.json). Text files are stored once under [by-sha256/](by-sha256/).
 
@@ -460,9 +460,7 @@ Machine-readable source/version/license/text hashes: [license-index.json](licens
 | `@tanstack/react-store` | `0.11.0` | MIT | [LICENSE (license_text)](by-sha256/cb4a7917af22bd56340e877f10a5c5aa4fded7af2459162630ff7fcb48bb45c7.txt) |
 | `@tanstack/store` | `0.11.0` | MIT | [LICENSE (license_text)](by-sha256/cb4a7917af22bd56340e877f10a5c5aa4fded7af2459162630ff7fcb48bb45c7.txt) |
 | `@tauri-apps/api` | `2.11.1` | Apache-2.0 OR MIT | [LICENSE_APACHE-2.0 (license_text)](by-sha256/0d542e0c8804e39aa7f37eb00da5a762149dc682d7829451287e11b938e94594.txt), [LICENSE_MIT (license_text)](by-sha256/9dd42ea92cff2ede5cd477cbfcce051b2d0115c0ac7f368ee88cb545055dff1d.txt) |
-| `@tauri-apps/plugin-clipboard-manager` | `2.3.2` | MIT OR Apache-2.0 | [LICENSE.spdx (spdx_metadata)](by-sha256/eb8a6c84630461b352badcab1dbe5d0168c56d377358b2b8c86b51003272d5ef.txt), [LICENSE_APACHE-2.0 (license_text)](by-sha256/0cec06e0e55fbc3dc5cee4fca9b607f66cb8f4e4dbcf3b3c013594dd156732e9.txt), [LICENSE_MIT (license_text)](by-sha256/89ff9689dcf9dd53968785d05a26f7898bb169dbfcada8d032b3e68cf0d55607.txt) |
 | `@tauri-apps/plugin-dialog` | `2.7.2` | MIT OR Apache-2.0 | [LICENSE.spdx (spdx_metadata)](by-sha256/eb8a6c84630461b352badcab1dbe5d0168c56d377358b2b8c86b51003272d5ef.txt), [LICENSE_APACHE-2.0 (license_text)](by-sha256/0cec06e0e55fbc3dc5cee4fca9b607f66cb8f4e4dbcf3b3c013594dd156732e9.txt), [LICENSE_MIT (license_text)](by-sha256/89ff9689dcf9dd53968785d05a26f7898bb169dbfcada8d032b3e68cf0d55607.txt) |
-| `@tauri-apps/plugin-global-shortcut` | `2.3.2` | MIT OR Apache-2.0 | [LICENSE.spdx (spdx_metadata)](by-sha256/eb8a6c84630461b352badcab1dbe5d0168c56d377358b2b8c86b51003272d5ef.txt), [LICENSE_APACHE-2.0 (license_text)](by-sha256/0cec06e0e55fbc3dc5cee4fca9b607f66cb8f4e4dbcf3b3c013594dd156732e9.txt), [LICENSE_MIT (license_text)](by-sha256/89ff9689dcf9dd53968785d05a26f7898bb169dbfcada8d032b3e68cf0d55607.txt) |
 | `@types/react` | `19.2.17` | MIT | [LICENSE (license_text)](by-sha256/c2cfccb812fe482101a8f04597dfc5a9991a6b2748266c47ac91b6a5aae15383.txt) |
 | `@types/react-dom` | `19.2.3` | MIT | [LICENSE (license_text)](by-sha256/c2cfccb812fe482101a8f04597dfc5a9991a6b2748266c47ac91b6a5aae15383.txt) |
 | `aria-hidden` | `1.2.6` | MIT | [LICENSE (license_text)](by-sha256/30f0cfddf483d1128e3610205020f2041a6c5e837aa999e0aa82e5576187d4a9.txt) |
@@ -482,6 +480,7 @@ Machine-readable source/version/license/text hashes: [license-index.json](licens
 | `use-callback-ref` | `1.3.3` | MIT | [LICENSE (license_text)](by-sha256/30f0cfddf483d1128e3610205020f2041a6c5e837aa999e0aa82e5576187d4a9.txt) |
 | `use-sidecar` | `1.1.3` | MIT | [LICENSE (license_text)](by-sha256/30f0cfddf483d1128e3610205020f2041a6c5e837aa999e0aa82e5576187d4a9.txt) |
 | `use-sync-external-store` | `1.6.0` | MIT | [LICENSE (license_text)](by-sha256/da6d3703ed11cbe42bd212c725957c98da23cbff1998c05fa4b3d976d1a58e93.txt) |
+| `voice-glow` | `0.3.0` | MIT | [LICENSE (license_text)](by-sha256/915a283980628a0ca9e7b423ebafc6f3a0fa1e630ff17d34e59034808d92011c.txt) |
 
 ## Unresolved records
 

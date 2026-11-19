@@ -61,7 +61,7 @@ describe("persistent dictation completion status", () => {
     emitMock.mockReset();
   });
 
-  it("keeps the human status outside the hidden pill and says insertion is not restoration or readiness", async () => {
+  it("keeps the concise human status outside the hidden pill", async () => {
     invokeMock.mockResolvedValue(snapshot());
     listenMock.mockImplementation(async (_event: string, _handler: (event: { payload: unknown }) => void) => vi.fn());
     render(
@@ -78,8 +78,8 @@ describe("persistent dictation completion status", () => {
     expect(status).toHaveAttribute("aria-live", "polite");
     expect(status).toHaveAttribute("aria-atomic", "true");
     await waitFor(() => expect(status).toHaveTextContent("文字已输入"));
-    expect(status).toHaveTextContent("剪贴板恢复情况");
-    expect(status).toHaveTextContent("下一次录音是否可用均未确认");
+    expect(status).toHaveTextContent("听写完成，文字已输入。");
+    expect(status.textContent?.length).toBeLessThan(20);
     expect(status).not.toHaveTextContent(currentId);
     expect(status).not.toHaveTextContent("writer_admission_sealed");
     expect(status.closest('[aria-hidden="true"]')).toBeNull();

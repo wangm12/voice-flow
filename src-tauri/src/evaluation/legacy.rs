@@ -20,7 +20,7 @@ pub(crate) const QWEN_ASR_BASE: &str = "https://dashscope.aliyuncs.com/compatibl
 /// Bump when request building or the `lib.rs` preparation, routing, policy
 /// translation or finalizer (or the grouped live-test finalizer) changes:
 /// `cleanup_code_fingerprint` hashes only whole dedicated modules.
-pub(crate) const REQUEST_BUILDER_REVISION: &str = "live-cleanup-request-v3";
+pub(crate) const REQUEST_BUILDER_REVISION: &str = "live-cleanup-request-v4";
 
 pub(crate) const RATE_LIMIT_RETRIES_PER_CASE: usize = 1;
 
@@ -1399,7 +1399,16 @@ pub(crate) fn cleanup_code_fingerprint() -> String {
         (b"context.rs", include_str!("../context.rs").as_bytes()),
         (b"providers.rs", include_str!("../providers.rs").as_bytes()),
         (b"store.rs", include_str!("../store.rs").as_bytes()),
+        (
+            b"store/settings_model.rs",
+            include_str!("../store/settings_model.rs").as_bytes(),
+        ),
+        (
+            b"store/learn_pairs.rs",
+            include_str!("../store/learn_pairs.rs").as_bytes(),
+        ),
         (b"lexicon.rs", include_str!("../lexicon.rs").as_bytes()),
+        (b"languages.rs", include_str!("../languages.rs").as_bytes()),
         (
             b"protected_span.rs",
             include_str!("../protected_span.rs").as_bytes(),
@@ -1872,6 +1881,7 @@ pub(crate) async fn run_asr_audio_inputs(
                     AsrExecution::Local { .. } => String::new(),
                 },
                 language: candidate.language.clone(),
+                preferred_languages: Vec::new(),
                 prompt: candidate.prompt.clone(),
                 keywords: candidate.keywords.clone(),
                 model: candidate.model.clone(),

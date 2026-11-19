@@ -79,6 +79,7 @@ impl PasteError {
 #[cfg(target_os = "macos")]
 const COMMAND_PASTE_KEYCODE: u16 = 0x09;
 const POST_PASTE_READBACK_DELAY_MS: u64 = 250;
+const POST_PASTE_UNVERIFIED_SETTLE_MS: u64 = 40;
 const POST_PASTE_READBACK_POLL_DELAYS_MS: [u64; 10] = [0, 75, 75, 75, 75, 150, 200, 300, 400, 450];
 pub(crate) const MAX_FULL_RANGE_READBACK_UTF16: usize = 65_536;
 const FULL_RANGE_AX_TIMEOUT_SECONDS: f32 = 0.15;
@@ -135,13 +136,27 @@ fn secure_input_admission(
     }
 }
 
+#[cfg(test)]
 fn secure_input_admission_with_probe(
     lock: &Mutex<()>,
     probe: impl FnOnce() -> SecureInputProbeResult,
     cancellation: &CancellationToken,
     captured_target_pid: i32,
 ) -> Result<(), PasteError> {
+    secure_input_admission_with_owner_probe(lock, probe, cancellation, captured_target_pid, |_| {})
+}
+
+fn secure_input_admission_with_owner_probe(
+    lock: &Mutex<()>,
+    probe: impl FnOnce() -> SecureInputProbeResult,
+    cancellation: &CancellationToken,
+    captured_target_pid: i32,
+    on_owner_pid: impl FnOnce(Option<i32>),
+) -> Result<(), PasteError> {
     let result = serialized_secure_input_probe(lock, cancellation, probe)?;
+    if let SecureInputProbeResult::Enabled { owner_pid } = result {
+        on_owner_pid(owner_pid);
+    }
     secure_input_admission(|| result, captured_target_pid)
 }
 
@@ -666,6 +681,17 @@ impl FocusedFieldAnchor {
         #[cfg(target_os = "macos")]
         {
             self.inner.read_selected_range()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            None
+        }
+    }
+
+    fn read_marked_range(&self) -> Option<(i64, i64)> {
+        #[cfg(target_os = "macos")]
+        {
+            self.inner.read_marked_range()
         }
         #[cfg(not(target_os = "macos"))]
         {
@@ -2806,7 +2832,14 @@ impl ConfirmedInsertionV1 {
 pub(crate) struct FocusedFieldReadSampleV1 {
     pub(crate) value: Option<String>,
     pub(crate) selection_range_utf16: Option<(i64, i64)>,
+    pub(crate) marked_range_utf16: Option<(i64, i64)>,
     pub(crate) focus_matches: Option<bool>,
+}
+
+impl FocusedFieldReadSampleV1 {
+    pub(crate) fn has_active_marked_text(&self) -> bool {
+        self.marked_range_utf16.is_some_and(|(_, len)| len > 0)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3193,6 +3226,13 @@ impl LearningObservationTicket {
                     expected_epoch,
                     || anchor.read_selected_range(),
                 )?;
+                let marked_range_utf16 = owner_ax_read(
+                    cancellation,
+                    owner_deadline,
+                    observer_epoch,
+                    expected_epoch,
+                    || anchor.read_marked_range(),
+                )?;
                 let focus_after = owner_ax_read(
                     cancellation,
                     owner_deadline,
@@ -3218,6 +3258,7 @@ impl LearningObservationTicket {
                 Ok(FocusedFieldReadSampleV1 {
                     value: Some(value),
                     selection_range_utf16,
+                    marked_range_utf16,
                     focus_matches: focus_after,
                 })
             },
@@ -3775,6 +3816,7 @@ struct DeliveryTrace {
     paste_full_range_attempted: bool,
     clipboard_restore_attempted: bool,
     clipboard_restored: Option<bool>,
+    secure_input_owner_name: Option<String>,
 }
 
 impl DeliveryTrace {
@@ -3828,10 +3870,14 @@ impl DeliveryTrace {
         }
     }
 
-    fn diagnostic(&self, code: &'static str, user_reason: &'static str) -> DeliveryDiagnostic {
+    fn diagnostic(
+        &self,
+        code: &'static str,
+        user_reason: impl Into<std::borrow::Cow<'static, str>>,
+    ) -> DeliveryDiagnostic {
         DeliveryDiagnostic {
             code,
-            user_reason,
+            user_reason: user_reason.into(),
             stage: self.stage,
             target_app: self.target_app.clone(),
             accessibility_available: self.accessibility_available,
@@ -3855,6 +3901,7 @@ impl DeliveryTrace {
             paste_full_range_attempted: self.paste_full_range_attempted,
             clipboard_restore_attempted: self.clipboard_restore_attempted,
             clipboard_restored: self.clipboard_restored,
+            secure_input_owner_name: self.secure_input_owner_name.clone(),
         }
     }
 
@@ -3995,14 +4042,28 @@ impl DeliveryTrace {
                     "安全输入阻止自动粘贴"
                 },
             ),
-            PasteError::SystemSecureInputOtherOwner => (
-                "secure_input_owner_unmatched",
-                if self.clipboard_write_owned == Some(true) {
-                    "系统安全输入由其他或未知进程持有，听写文字已保留在剪贴板；请按 ⌘V 粘贴"
-                } else {
-                    "系统安全输入由其他或未知进程持有，听写结果保存在历史记录中"
-                },
-            ),
+            PasteError::SystemSecureInputOtherOwner => {
+                let reason: std::borrow::Cow<'static, str> = match self
+                    .secure_input_owner_name
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty())
+                {
+                    Some(name) if self.clipboard_write_owned == Some(true) => format!(
+                        "系统安全输入由「{name}」持有，听写文字已保留在剪贴板；请按 ⌘V 粘贴"
+                    )
+                    .into(),
+                    Some(name) => {
+                        format!("系统安全输入由「{name}」持有，听写结果保存在历史记录中").into()
+                    }
+                    None if self.clipboard_write_owned == Some(true) => {
+                        "系统安全输入由其他或未知进程持有，听写文字已保留在剪贴板；请按 ⌘V 粘贴"
+                            .into()
+                    }
+                    None => "系统安全输入由其他或未知进程持有，听写结果保存在历史记录中".into(),
+                };
+                return self.diagnostic("secure_input_owner_unmatched", reason);
+            }
             PasteError::InputUnavailable => (
                 "input_unavailable",
                 if self.clipboard_write_owned == Some(true) {
@@ -4716,13 +4777,24 @@ pub(crate) fn confirm_keyboard_paste_readback(
     // missing pre-injection evidence.
     let expected_after = expected_after.filter(|_| value_before.is_some());
     let started = std::time::Instant::now();
+    if expected_after.is_none() {
+        // Unreadable targets (for example Terminal/Ghostty/Canvas where AXValue
+        // was unavailable before Cmd+V) cannot prove splice readback; settle
+        // immediately as `paste_unverified` without polling.
+        return PasteReadbackConfirmation {
+            value_after: None,
+            proof: None,
+            poll_count: 0,
+            expected_utf16_length: None,
+            actual_utf16_length: None,
+            mismatch_kind: Some("value_unavailable"),
+            full_range_attempted: false,
+            elapsed: started.elapsed(),
+        };
+    }
     let expected_utf16_length =
         expected_after.and_then(|value| u32::try_from(value.encode_utf16().count()).ok());
-    let schedule = if expected_after.is_some() {
-        &POST_PASTE_READBACK_POLL_DELAYS_MS[..]
-    } else {
-        &POST_PASTE_READBACK_POLL_DELAYS_MS[..=4]
-    };
+    let schedule = &POST_PASTE_READBACK_POLL_DELAYS_MS[..];
     let mut value_after = None;
     let mut proof = None;
     let mut poll_count = 0u8;
@@ -7729,6 +7801,14 @@ mod macos_ax {
             .flatten()
         }
 
+        pub(super) fn read_marked_range(&self) -> Option<(i64, i64)> {
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                copy_range_attr(&self.focused, "AXMarkedTextRange")
+            }))
+            .ok()
+            .flatten()
+        }
+
         pub(super) fn read_selected_text(&self) -> Option<String> {
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 copy_string_attr(&self.focused, "AXSelectedText")
@@ -9964,6 +10044,7 @@ fn insert_with_post_verify_timed_inner(
     // the AppKit/tao main-thread callback.
     trace.stage = "pre_paste_guard";
     let failed_pre_paste_stage = std::cell::Cell::new("shortcut_preparation");
+    let secure_input_owner_pid = std::cell::Cell::new(None::<i32>);
     let verify_target_before_keyboard = || {
         failed_pre_paste_stage.set("target_recheck");
         verify_target()?;
@@ -9985,11 +10066,12 @@ fn insert_with_post_verify_timed_inner(
             ));
         }
         failed_pre_paste_stage.set("system_secure_input_guard");
-        secure_input_admission_with_probe(
+        secure_input_admission_with_owner_probe(
             &SECURE_INPUT_PROBE_LOCK,
             system_secure_input_probe_unserialized,
             &cancellation,
             expected_pid,
+            |owner_pid| secure_input_owner_pid.set(owner_pid),
         )?;
         Ok(())
     };
@@ -10124,14 +10206,28 @@ fn insert_with_post_verify_timed_inner(
             | PasteError::InputChanged
             | PasteError::SelectionUnavailable
             | PasteError::SelectionChanged => trace.focused_input_available = Some(false),
+            PasteError::SystemSecureInputOtherOwner => {
+                trace.secure_input_owner_name = secure_input_owner_pid
+                    .get()
+                    .and_then(running_application_localized_name);
+                log::warn!(
+                    "system secure input held by another process: owner={:?}",
+                    trace.secure_input_owner_name
+                );
+            }
             _ => {}
         }
     }
     let (readback_result, readback_confirmation) =
         run_traced_confirmation(trace_handle.as_ref(), attempt.result, || {
             trace.stage = "paste_verification";
-            trace.paste_verification_delay_ms = Some(POST_PASTE_READBACK_DELAY_MS);
-            thread::sleep(Duration::from_millis(POST_PASTE_READBACK_DELAY_MS));
+            let delay_ms = if value_before.is_some() {
+                POST_PASTE_READBACK_DELAY_MS
+            } else {
+                POST_PASTE_UNVERIFIED_SETTLE_MS
+            };
+            trace.paste_verification_delay_ms = Some(delay_ms);
+            thread::sleep(Duration::from_millis(delay_ms));
             Ok({
                 let readback = confirm_keyboard_paste_readback(
                     PasteReadbackExpectation {
@@ -10487,6 +10583,49 @@ pub fn restore_delivery_target_if_needed(
     } else {
         Ok(())
     }
+}
+
+fn running_application_localized_name(pid: i32) -> Option<String> {
+    if pid <= 0 {
+        return None;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use std::ffi::CStr;
+        use std::os::raw::c_char;
+        unsafe {
+            use objc::{class, msg_send, sel, sel_impl};
+            let application: *mut objc::runtime::Object = msg_send![
+                class!(NSRunningApplication),
+                runningApplicationWithProcessIdentifier: pid
+            ];
+            if application.is_null() {
+                return None;
+            }
+            let localized_name: *mut objc::runtime::Object = msg_send![application, localizedName];
+            if localized_name.is_null() {
+                return None;
+            }
+            let utf8_ptr: *const c_char = msg_send![localized_name, UTF8String];
+            if utf8_ptr.is_null() {
+                return None;
+            }
+            let raw = CStr::from_ptr(utf8_ptr).to_str().ok()?.trim();
+            if raw.is_empty() {
+                return None;
+            }
+            Some(raw.chars().take(64).collect())
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+pub(crate) fn reactivate_target_app_best_effort(pid: i32) {
+    let _ = activate_target_now(pid);
 }
 
 fn activate_target_now(pid: i32) -> Result<(), PasteError> {
@@ -11705,7 +11844,7 @@ mod tests {
         );
 
         assert_eq!(result.proof, None);
-        assert_eq!(result.poll_count, 5);
+        assert_eq!(result.poll_count, 0);
         assert!(!result.full_range_attempted);
         assert_eq!(range_reads, 0);
     }
@@ -12025,6 +12164,7 @@ mod tests {
                         FocusedFieldReadSampleV1 {
                             value: Some("must not be read".into()),
                             selection_range_utf16: None,
+                            marked_range_utf16: None,
                             focus_matches: Some(true),
                         }
                     })
@@ -12126,6 +12266,7 @@ mod tests {
                         Ok(FocusedFieldReadSampleV1 {
                             value: Some("late value".into()),
                             selection_range_utf16: None,
+                            marked_range_utf16: None,
                             focus_matches: Some(true),
                         })
                     }
@@ -14003,11 +14144,16 @@ mod secure_copy_regressions {
         let diagnostic = DeliveryTrace {
             clipboard_write_attempted: true,
             clipboard_write_owned: Some(true),
+            secure_input_owner_name: Some("1Password".to_owned()),
             ..Default::default()
         }
         .for_error(&PasteError::SystemSecureInputOtherOwner);
         assert_eq!(diagnostic.code, "secure_input_owner_unmatched");
         assert_eq!(diagnostic.fallback_delivery_method(), "clipboard");
+        assert!(diagnostic.user_reason.contains("1Password"));
+        let serialized = serde_json::to_string(&diagnostic).unwrap();
+        assert!(serialized.contains("1Password"));
+        assert!(!serialized.contains("secure_input_owner_pid"));
     }
 
     #[test]

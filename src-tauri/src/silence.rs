@@ -5,9 +5,78 @@ const FRAME: usize = SAMPLE_RATE * 30 / 1_000;
 const HOP: usize = SAMPLE_RATE * 10 / 1_000;
 const MIN_ACTIVITY_RMS: f32 = 0.0008;
 const MAX_ADAPTIVE_RMS: f32 = 0.01;
-const PAD_SAMPLES: usize = SAMPLE_RATE * 200 / 1_000;
+pub(crate) const PAD_SAMPLES: usize = SAMPLE_RATE * 200 / 1_000;
+pub(crate) const DETERMINISTIC_ONSET_RMS: f32 = 0.003;
 const LONG_GAP: usize = SAMPLE_RATE * 3 / 2;
 const KEPT_GAP: usize = SAMPLE_RATE * 400 / 1_000;
+
+/// Scan from `scan_from` in `HOP` steps for the first 30 ms frame whose RMS
+/// reaches `DETERMINISTIC_ONSET_RMS`. Returns `Some((onset_sample, next_scan_from))`
+/// or `Err(next_scan_from)` if more samples are needed.
+pub(crate) fn scan_deterministic_speech_onset(
+    samples: &[f32],
+    scan_from: usize,
+) -> Result<usize, usize> {
+    let mut cursor = scan_from;
+    while cursor + FRAME <= samples.len() {
+        let energy = rms(&samples[cursor..cursor + FRAME]);
+        if energy.is_finite() && energy >= DETERMINISTIC_ONSET_RMS {
+            return Ok(cursor);
+        }
+        cursor += HOP;
+    }
+    Err(cursor)
+}
+
+/// Trim trailing silence and compress long pauses strictly after
+/// `protected_prefix_len` starting from `baseline_offset`, leaving the
+/// prefetched prefix `[baseline_offset .. baseline_offset + protected_prefix_len]`
+/// bit-identical so `AudioChunkIdentity` hashes match `PrefetchSession`.
+pub fn trim_and_compress_preserving_prefix(
+    samples: &[f32],
+    baseline_offset: usize,
+    protected_prefix_len: usize,
+) -> Vec<f32> {
+    if baseline_offset >= samples.len() {
+        return Vec::new();
+    }
+    let slice = &samples[baseline_offset..];
+    let speech = speech_ranges(slice);
+    if speech.is_empty() {
+        return Vec::new();
+    }
+    let last = (speech[speech.len() - 1].1 + PAD_SAMPLES).min(slice.len());
+    let protected_end = protected_prefix_len.min(last);
+    let mut out = Vec::with_capacity(last);
+    if protected_end > 0 {
+        out.extend_from_slice(&slice[..protected_end]);
+    }
+    let mut cursor = protected_end;
+    for (start, end) in speech {
+        if end <= protected_end {
+            continue;
+        }
+        let clipped_start = start.max(protected_end);
+        let clipped_end = end.min(last);
+        if clipped_start > cursor {
+            let gap = clipped_start - cursor;
+            let keep = if gap > LONG_GAP {
+                KEPT_GAP.min(gap)
+            } else {
+                gap
+            };
+            out.extend_from_slice(&slice[clipped_start - keep..clipped_start]);
+        }
+        if clipped_end > clipped_start {
+            out.extend_from_slice(&slice[clipped_start..clipped_end]);
+        }
+        cursor = clipped_end;
+    }
+    if last > cursor {
+        out.extend_from_slice(&slice[cursor..last]);
+    }
+    out
+}
 
 pub fn trim_and_compress(samples: &[f32]) -> Vec<f32> {
     if samples.is_empty() {
@@ -43,7 +112,7 @@ pub fn trim_and_compress(samples: &[f32]) -> Vec<f32> {
     out
 }
 
-fn speech_ranges(samples: &[f32]) -> Vec<(usize, usize)> {
+pub(crate) fn speech_ranges(samples: &[f32]) -> Vec<(usize, usize)> {
     let frame_rms: Vec<(usize, f32)> = frame_rms(samples).collect();
     let energies: Vec<f32> = frame_rms.iter().map(|(_, energy)| *energy).collect();
     let Some(threshold) = activity_threshold(&energies) else {
@@ -218,6 +287,26 @@ mod tests {
         assert!(
             mixed_output.ends_with(&quiet),
             "quiet speech after a loud phrase remains intact"
+        );
+    }
+
+    #[test]
+    fn trim_and_compress_preserving_prefix_keeps_prefetch_baseline_alignment() {
+        let mut samples = vec![0.0; SAMPLE_RATE / 2]; // 500ms leading silence
+        samples.extend(tone(SAMPLE_RATE * 2));
+        samples.extend(vec![0.0; SAMPLE_RATE / 4]);
+
+        let onset = scan_deterministic_speech_onset(&samples, 0)
+            .expect("deterministic speech onset should be found after leading silence");
+        assert!((SAMPLE_RATE / 2 - FRAME..=SAMPLE_RATE / 2).contains(&onset));
+
+        let baseline = onset.saturating_sub(PAD_SAMPLES);
+        let protected = SAMPLE_RATE; // 1s already prefetched from baseline
+        let out = trim_and_compress_preserving_prefix(&samples, baseline, protected);
+        assert_eq!(
+            &out[..protected],
+            &samples[baseline..baseline + protected],
+            "prefetched prefix must stay bit-identical"
         );
     }
 }

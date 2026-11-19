@@ -247,6 +247,117 @@ describe("ContextSettings", () => {
     expect(screen.getByRole("switch", { name: "允许自动云端视觉" })).toHaveAttribute("aria-checked", "false");
   });
 
+  it("keeps the translation target editable from Writing while output mode is Auto", async () => {
+    const onTargetLanguageChange = vi.fn();
+    render(
+      <ContextSettings
+        combined
+        outputMode="auto"
+        translationTargetLanguage="en"
+        onTranslationTargetLanguageChange={onTargetLanguageChange}
+      />,
+    );
+
+    const targetLanguage = await screen.findByRole("combobox", { name: "翻译目标语言" });
+    expect(targetLanguage).toHaveValue("en");
+    selectOption(targetLanguage, "ja");
+    expect(onTargetLanguageChange).toHaveBeenCalledWith("ja");
+    expect(screen.getByRole("combobox", { name: "输出模式" })).toHaveValue("auto");
+  });
+
+  it("applies the three context privacy presets to the draft and saves the shared provider grant explicitly", async () => {
+    const base = invokeMock.getMockImplementation()!;
+    invokeMock.mockImplementation((command, args, options) => command === "save_context_mapping"
+      ? Promise.resolve([(args as { mapping: unknown }).mapping])
+      : base(command, args, options));
+
+    render(<ContextSettings combined />);
+    selectOption(await screen.findByRole("combobox", { name: "选择 App" }), "com.todesktop.230313mzl4w4u92");
+    revealPermissions();
+    const off = screen.getByRole("radio", { name: /关闭上下文读取/ });
+    const local = screen.getByRole("radio", { name: /仅本机使用/ });
+    const providers = screen.getByRole("radio", { name: /允许文字发送给转写与整理服务/ });
+
+    fireEvent.click(off);
+    expect(off).toBeChecked();
+    expect(screen.getByRole("switch", { name: "允许读取辅助功能文字" })).toHaveAttribute("aria-checked", "false");
+    expect(screen.getByRole("switch", { name: "允许自动云端视觉" })).toHaveAttribute("aria-checked", "false");
+
+    fireEvent.click(local);
+    expect(local).toBeChecked();
+    expect(screen.getByRole("switch", { name: "允许读取辅助功能文字" })).toHaveAttribute("aria-checked", "true");
+    expect(screen.getByRole("switch", { name: "允许本机 OCR" })).toHaveAttribute("aria-checked", "true");
+    expect(screen.getByRole("switch", { name: "允许文字发送给服务商" })).toHaveAttribute("aria-checked", "false");
+
+    fireEvent.click(providers);
+    expect(providers).toBeChecked();
+    expect(screen.getByRole("switch", { name: "允许读取辅助功能文字" })).toHaveAttribute("aria-checked", "true");
+    expect(screen.getByRole("switch", { name: "允许本机 OCR" })).toHaveAttribute("aria-checked", "false");
+    expect(screen.getByRole("switch", { name: "允许文字发送给服务商" })).toHaveAttribute("aria-checked", "true");
+    expect(screen.getByRole("switch", { name: "允许自动云端视觉" })).toHaveAttribute("aria-checked", "false");
+    expect(invokeMock).not.toHaveBeenCalledWith("save_context_mapping", expect.anything());
+
+    fireEvent.click(screen.getByRole("button", { name: "保存映射" }));
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("save_context_mapping", expect.objectContaining({
+      mapping: expect.objectContaining({
+        source_permissions: {
+          ax_text: true,
+          local_ocr: false,
+          cloud_vision: false,
+          context_text_to_providers: true,
+        },
+        style_examples_approved: false,
+        preference_guidance_provider_approved: false,
+      }),
+    })));
+  });
+
+  it("allows task bundle-only binding for a known native app and rejects unknown Chromium IDs", async () => {
+    const base = invokeMock.getMockImplementation()!;
+    invokeMock.mockImplementation((command, args, options) => {
+      if (command === "get_available_applications") {
+        return Promise.resolve([{ bundle_id: "COM.TINYSPECK.SLACKMACGAP", label: "Slack" }]);
+      }
+      if (command === "save_context_mapping") return Promise.resolve([(args as { mapping: unknown }).mapping]);
+      return base(command, args, options);
+    });
+
+    const view = render(<ContextSettings />);
+    selectOption(await screen.findByRole("combobox", { name: "选择 App" }), "COM.TINYSPECK.SLACKMACGAP");
+    fireEvent.click(screen.getByRole("button", { name: /任务级写作偏好/ }));
+    selectOption(screen.getByRole("combobox", { name: "写作任务 ID" }), "work_chat");
+    fireEvent.click(screen.getByText("高级映射选项"));
+    selectOption(screen.getByRole("combobox", { name: "输入框类型" }), "secure");
+    fireEvent.click(screen.getByRole("button", { name: "保存映射" }));
+    expect(await screen.findByText("指定写作任务需要认可的原生 App、可信输入框，或精确网站路径")).toBeInTheDocument();
+    expect(invokeMock).not.toHaveBeenCalledWith("save_context_mapping", expect.anything());
+    selectOption(screen.getByRole("combobox", { name: "输入框类型" }), "");
+    fireEvent.click(screen.getByRole("button", { name: "保存映射" }));
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("save_context_mapping", expect.objectContaining({
+      mapping: expect.objectContaining({
+        bundle_id: "COM.TINYSPECK.SLACKMACGAP",
+        writing_task_id: "work_chat",
+      }),
+    })));
+
+    view.unmount();
+    invokeMock.mockClear();
+    invokeMock.mockImplementation((command, args, options) => {
+      if (command === "get_available_applications") {
+        return Promise.resolve([{ bundle_id: "org.chromium.Chromium", label: "Chromium" }]);
+      }
+      return base(command, args, options);
+    });
+    render(<ContextSettings />);
+    selectOption(await screen.findByRole("combobox", { name: "选择 App" }), "org.chromium.Chromium");
+    fireEvent.click(screen.getByRole("button", { name: /任务级写作偏好/ }));
+    selectOption(screen.getByRole("combobox", { name: "写作任务 ID" }), "work_chat");
+    fireEvent.click(screen.getByRole("button", { name: "保存映射" }));
+
+    expect(await screen.findByText("指定写作任务需要认可的原生 App、可信输入框，或精确网站路径")).toBeInTheDocument();
+    expect(invokeMock).not.toHaveBeenCalledWith("save_context_mapping", expect.anything());
+  });
+
   it("saves task-scoped preferences separately from style-sample approval and supports pause and forget", async () => {
     const base = invokeMock.getMockImplementation()!;
     invokeMock.mockImplementation((command, args, options) => command === "save_context_mapping"
@@ -305,7 +416,7 @@ describe("ContextSettings", () => {
     selectOption(screen.getByRole("combobox", { name: "输入框类型" }), "document");
     fireEvent.click(screen.getByRole("button", { name: "保存映射" }));
 
-    expect(await screen.findByText("指定写作任务需要 App 或网站锚点，以及可验证的输入框类型或网站路径前缀")).toBeInTheDocument();
+    expect(await screen.findByText("指定写作任务需要认可的原生 App、可信输入框，或精确网站路径")).toBeInTheDocument();
     expect(invokeMock).not.toHaveBeenCalledWith("save_context_mapping", expect.anything());
   });
 
@@ -369,7 +480,7 @@ describe("ContextSettings", () => {
     expect(await screen.findByLabelText("精确转写模型")).toHaveValue("");
     expect(screen.getByLabelText("精确转写服务商")).toHaveValue("groq");
     expect(screen.getByText("中英混合、人名多、主转写失败或置信度低时才打第二枪；留空仍关闭。")).toBeInTheDocument();
-    expect(screen.getByText("第二枪需要自定义 / 兼容接口上已填的百炼密钥。")).toBeInTheDocument();
+    expect(screen.getByText("第二枪需要 Groq 上已填的密钥。")).toBeInTheDocument();
     expect(screen.queryByDisplayValue("whisper-large-v3-turbo")).not.toBeInTheDocument();
   });
 
@@ -397,6 +508,7 @@ describe("ContextSettings", () => {
 
     expect(screen.getByLabelText("精确转写服务商")).toHaveValue("custom");
     expect(screen.getByLabelText("精确转写模型")).toHaveValue("qwen3-asr-flash");
+    expect(screen.getByText("第二枪需要 自定义 / 兼容接口 上已填的密钥。")).toBeInTheDocument();
     expect(screen.getByLabelText("精确转写模型")).not.toHaveValue("");
     expect(screen.getByLabelText("精确转写模型")).not.toHaveValue("whisper-large-v3-turbo");
     expect(screen.getByLabelText("精确转写地址")).toHaveValue("https://dashscope.aliyuncs.com/compatible-mode/v1");
@@ -1799,6 +1911,12 @@ describe("ContextSettings", () => {
     cancel.focus(); fireEvent.click(cancel);
     expect(prompt).toHaveFocus();
     expect(screen.queryByRole("button", { name: "取消修改" })).not.toBeInTheDocument();
+  });
+
+  it("displays the selected accurate ASR provider label dynamically instead of hardcoding DashScope", async () => {
+    render(<ContextSettings automationOnly accurateAsrProvider="custom" />);
+    fireEvent.click(screen.getByRole("button", { name: /高级整理设置/ }));
+    expect(screen.getByText("第二枪需要 自定义 / 兼容接口 上已填的密钥。")).toBeInTheDocument();
   });
 
 });

@@ -46,6 +46,7 @@ pub(crate) struct ScreenActionPreview {
     pub(crate) session: ScreenActionSession,
     pub(crate) session_generation: u64,
     pub(crate) context: context::ContextSnapshot,
+    pub(crate) payload: ScreenPreviewPayload,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -65,6 +66,7 @@ pub struct ScreenPreviewPayload {
     pub instruction: String,
     pub delivery_mode: &'static str,
     pub delivery_notice: &'static str,
+    pub provenance_receipt: crate::preview_provenance::PreviewProvenanceReceipt,
 }
 
 pub fn vision_model_ready(vision_model: &str) -> bool {
@@ -546,6 +548,7 @@ pub(crate) async fn confirm_screen_action_preview(
         return Err("Preview text is too long".into());
     }
     let preview = take_current_screen_preview(&state, &transaction_id)?;
+    let target_pid = Some(preview.session.target_guard.pid);
     let identity = preview.session.identity.clone();
     if let Err(error) = crate::selected_action::restore_preview_target_and_validate(
         &app,
@@ -554,7 +557,7 @@ pub(crate) async fn confirm_screen_action_preview(
     )
     .await
     {
-        return match error {
+        let result = match error {
             crate::selected_action::PreviewRestoreError::Stale => {
                 Err("Look-at-screen preview is stale".into())
             }
@@ -572,12 +575,14 @@ pub(crate) async fn confirm_screen_action_preview(
                 .await
             }
         };
+        crate::restore_after_preview(&app, &state, target_pid, &identity.transaction_id).await;
+        return result;
     }
     if verify_screen_source_snapshot(&app, &state, &preview.session)
         .await
         .is_err()
     {
-        return copy_screen_preview_result(
+        let result = copy_screen_preview_result(
             &app,
             &state,
             &final_text,
@@ -587,9 +592,11 @@ pub(crate) async fn confirm_screen_action_preview(
             true,
         )
         .await;
+        crate::restore_after_preview(&app, &state, target_pid, &identity.transaction_id).await;
+        return result;
     }
     if !preview.session.delivery_replace_allowed {
-        return copy_screen_preview_result(
+        let result = copy_screen_preview_result(
             &app,
             &state,
             &final_text,
@@ -599,6 +606,8 @@ pub(crate) async fn confirm_screen_action_preview(
             false,
         )
         .await;
+        crate::restore_after_preview(&app, &state, target_pid, &identity.transaction_id).await;
+        return result;
     }
     let paste_result = paste_screen_action_text(
         &app,
@@ -610,7 +619,7 @@ pub(crate) async fn confirm_screen_action_preview(
         permissions::check().accessibility,
     )
     .await;
-    match paste_result {
+    let outcome_result = match paste_result {
         Ok(outcome) => {
             let result = delivery::DeliveryResult::from_insert_verified(outcome.verified);
             if outcome.verified {
@@ -697,7 +706,9 @@ pub(crate) async fn confirm_screen_action_preview(
             )
             .await
         }
-    }
+    };
+    crate::restore_after_preview(&app, &state, target_pid, &identity.transaction_id).await;
+    outcome_result
 }
 
 async fn verify_screen_source_snapshot(
@@ -746,7 +757,8 @@ pub(crate) async fn copy_screen_action_preview(
         return Err("Preview text is too long".into());
     }
     let preview = take_current_screen_preview(&state, &transaction_id)?;
-    copy_screen_preview_result(
+    let target_pid = Some(preview.session.target_guard.pid);
+    let result = copy_screen_preview_result(
         &app,
         &state,
         &final_text,
@@ -755,7 +767,9 @@ pub(crate) async fn copy_screen_action_preview(
         &preview.session.identity,
         false,
     )
-    .await
+    .await;
+    crate::restore_after_preview(&app, &state, target_pid, &transaction_id).await;
+    result
 }
 
 #[tauri::command(rename_all = "snake_case")]
@@ -764,6 +778,10 @@ pub(crate) async fn cancel_screen_action_preview(
     state: State<'_, AppState>,
     transaction_id: String,
 ) -> Result<(), String> {
+    let target_pid = lock_recover(&state.screen_preview)
+        .as_ref()
+        .filter(|preview| preview.session.identity.transaction_id == transaction_id)
+        .map(|preview| preview.session.target_guard.pid);
     let Some(cancel) =
         dictation::cancel_text_action_by_id(&app, &state, &transaction_id, "screen").await
     else {
@@ -773,6 +791,7 @@ pub(crate) async fn cancel_screen_action_preview(
         return Err("Text action is committing; its result will be reported".into());
     };
     emit_selected_action_state(&app, "cancelled", event_generation, Some(action_sequence));
+    crate::restore_after_preview(&app, &state, target_pid, &transaction_id).await;
     Ok(())
 }
 

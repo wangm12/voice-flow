@@ -7,7 +7,7 @@
 
 ## Vendored glass refraction
 
-VoiceFlow adapts the one-surface WebGL2 rounded-box refraction shader and rendering setup in [`src/components/settings/hud-glasswork/GlassworkRenderer.ts`](src/components/settings/hud-glasswork/GlassworkRenderer.ts) from [Glasswork `refract.js`](https://github.com/kubai087/glasswork/blob/4f0b6744b898b3a9b98fbd913ab24fdb83c53162/refract.js), upstream commit `4f0b6744b898b3a9b98fbd913ab24fdb83c53162` (Copyright © 2026 Kubai087). The locally authored preview scene and React lifecycle code are not upstream Glasswork code. No Glasswork wallpapers, external images, or runtime CDN resources are included.
+VoiceFlow adapts Glasswork's liquid glass material, Chromium SVG rim lens, adaptive legibility sampler, and WebGL2 single-surface rounded-box refraction shader from [`kubai087/glasswork`](https://github.com/kubai087/glasswork/tree/4f0b6744b898b3a9b98fbd913ab24fdb83c53162) (`glass.css`, `lens.js`, `adapt.js`, and `refract.js` at upstream commit `4f0b6744b898b3a9b98fbd913ab24fdb83c53162`, Copyright © 2026 Kubai087) into [`src/components/settings/hud-glasswork/`](src/components/settings/hud-glasswork/glasswork.css). The React lifecycle wrapper and solid preview backdrop are authored in VoiceFlow. No Glasswork wallpapers, external images, or runtime CDN resources are included.
 
 ### Glasswork MIT License
 
@@ -315,7 +315,7 @@ VoiceFlow adapts portions of Handy's onboarding `ModelCard`, `PermissionGuide`, 
 
 ## Locked Rust and frontend dependency texts
 
-VoiceFlow includes a lock-bound attribution inventory for 407 Cargo metadata packages (388 normal dependency graph nodes and 19 build-only nodes) and 58 non-development root npm lock entries. These are lock/metadata populations, not a claim that every record contributes linked runtime code. Package-distributed license/notice text candidates and explicitly identified same-repository, same-version peer texts are included under [`ThirdPartyLicenses/DependencyTexts/`](ThirdPartyLicenses/DependencyTexts/DEPENDENCY_LICENSES.md); package name, version, source class, declared expression, lock identity, per-text source-relative path, byte count, and SHA-256 are in [`license-index.json`](ThirdPartyLicenses/DependencyTexts/license-index.json).
+VoiceFlow includes a lock-bound attribution inventory for 407 Cargo metadata packages (388 normal dependency graph nodes and 19 build-only nodes) and 57 non-development root npm lock entries. These are lock/metadata populations, not a claim that every record contributes linked runtime code. Package-distributed license/notice text candidates and explicitly identified same-repository, same-version peer texts are included under [`ThirdPartyLicenses/DependencyTexts/`](ThirdPartyLicenses/DependencyTexts/DEPENDENCY_LICENSES.md); package name, version, source class, declared expression, lock identity, per-text source-relative path, byte count, and SHA-256 are in [`license-index.json`](ThirdPartyLicenses/DependencyTexts/license-index.json).
 
 The inventory preserves declared expressions when text is absent and lists 6 third-party records without a full license body. It separately records 1 first-party workspace package(s) without a declared project license. A missing text is not treated as permission, and the inventory is not legal clearance. It does not include model weights or certify exact runtime linkage. Existing Swift/MLX and other source notices are preserved.
 

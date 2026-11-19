@@ -73,7 +73,7 @@ void main() {
   vec2 inward = -gradient / max(length(gradient), 1e-5);
   float rim = uShape.y;
   float depth = clamp(-d / rim, 0.0, 1.0);
-  float amount = clamp(uShape.z * rim * pow(1.0 - depth, uShape.w), 0.0, rim * 2.5);
+  float amount = uShape.z * rim * pow(1.0 - depth, uShape.w);
   float split = uMore.y;
   vec3 color;
   if (split > 0.0 && amount > 0.01) {
@@ -101,6 +101,12 @@ export type GlassworkRefraction = {
     sceneHeight: number;
     width: number;
     height: number;
+    kind?: "light" | "dark";
+    keep?: number;
+    rim?: number;
+    edge?: number;
+    power?: number;
+    dispersion?: number;
   }): boolean;
   dispose(): void;
 };
@@ -181,9 +187,26 @@ export function createGlassworkRefraction(canvas: HTMLCanvasElement): GlassworkR
 
     let disposed = false;
     return {
-      render({ source, scale, offsetX, offsetY, sceneWidth, sceneHeight, width, height }) {
+      render({
+        source,
+        scale,
+        offsetX,
+        offsetY,
+        sceneWidth,
+        sceneHeight,
+        width,
+        height,
+        kind = "dark",
+        keep = 1,
+        rim = 40,
+        edge = 1.1,
+        power = 2.6,
+        dispersion = 0.15,
+      }) {
         if (disposed || gl.isContextLost() || !source.width || !source.height || !width || !height) return false;
         try {
+          const radius = Math.min(24, width / 2, height / 2);
+          const bezel = Math.max(4, Math.min(rim, Math.min(width, height) / 3.5));
           gl.useProgram(program);
           gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
           gl.bindTexture(gl.TEXTURE_2D, texture);
@@ -198,9 +221,13 @@ export function createGlassworkRefraction(canvas: HTMLCanvasElement): GlassworkR
           gl.uniform1f(uniforms.scale, scale);
           gl.uniform2f(uniforms.offset, offsetX, offsetY);
           gl.uniform2f(uniforms.sceneSize, sceneWidth, sceneHeight);
-          gl.uniform4f(uniforms.shape, 24, 14, 0.8, 2.6);
-          gl.uniform4f(uniforms.tone, 1.25, 1.12, 1.02, 1.02);
-          gl.uniform2f(uniforms.more, 1.0, 0.08);
+          gl.uniform4f(uniforms.shape, radius, bezel, edge, power);
+          if (kind === "dark") {
+            gl.uniform4f(uniforms.tone, 2.0, 1.6, 1.0, 0.8);
+          } else {
+            gl.uniform4f(uniforms.tone, 2.0, 1.8, 1.0, 1.06);
+          }
+          gl.uniform2f(uniforms.more, keep, dispersion);
           gl.drawArrays(gl.TRIANGLES, 0, 3);
           return gl.getError() === gl.NO_ERROR;
         } catch {
@@ -226,12 +253,17 @@ export function createGlassworkRefraction(canvas: HTMLCanvasElement): GlassworkR
   }
 }
 
+function mixChannel(light: number, dark: number, progress: number) {
+  return Math.round(light + (dark - light) * Math.min(1, Math.max(0, progress)));
+}
+
 export function drawGlassworkScene(
   canvas: HTMLCanvasElement,
   width: number,
   height: number,
   scale: number,
   backdrop: "light" | "dark",
+  darkProgress?: number,
 ) {
   const context = canvas.getContext("2d");
   if (!context || width <= 0 || height <= 0) return false;
@@ -244,102 +276,18 @@ export function drawGlassworkScene(
   context.setTransform(scale, 0, 0, scale, 0, 0);
   context.clearRect(0, 0, width, height);
 
-  const dark = backdrop === "dark";
-  const background = context.createLinearGradient(0, 0, width, height);
-  if (dark) {
-    background.addColorStop(0, "#3a3d42");
-    background.addColorStop(0.42, "#292c30");
-    background.addColorStop(1, "#191b1e");
+  const progress = darkProgress ?? (backdrop === "dark" ? 1 : 0);
+  if (progress <= 0) {
+    context.fillStyle = "#f2f3f5";
+  } else if (progress >= 1) {
+    context.fillStyle = "#121212";
   } else {
-    background.addColorStop(0, "#dde8ef");
-    background.addColorStop(0.48, "#edf0f0");
-    background.addColorStop(1, "#f2eee8");
+    const r = mixChannel(242, 18, progress);
+    const g = mixChannel(243, 18, progress);
+    const b = mixChannel(245, 18, progress);
+    context.fillStyle = `rgb(${r} ${g} ${b})`;
   }
-  context.fillStyle = background;
   context.fillRect(0, 0, width, height);
-
-  const beam = context.createLinearGradient(0, 0, width * 0.78, height * 0.72);
-  beam.addColorStop(0, dark ? "rgba(230, 233, 238, 0.22)" : "rgba(255, 255, 255, 0.78)");
-  beam.addColorStop(0.2, dark ? "rgba(187, 192, 199, 0.09)" : "rgba(255, 255, 255, 0.42)");
-  beam.addColorStop(0.62, dark ? "rgba(142, 148, 157, 0.025)" : "rgba(212, 228, 238, 0.08)");
-  beam.addColorStop(1, "rgba(255, 255, 255, 0)");
-  context.fillStyle = beam;
-  context.fillRect(0, 0, width, height);
-
-  const bloom = context.createRadialGradient(width * 0.14, height * 0.12, 2, width * 0.14, height * 0.12, Math.max(width, height) * 0.8);
-  bloom.addColorStop(0, dark ? "rgba(224, 228, 234, 0.11)" : "rgba(255, 255, 255, 0.32)");
-  bloom.addColorStop(1, "rgba(255, 255, 255, 0)");
-  context.fillStyle = bloom;
-  context.fillRect(0, 0, width, height);
-
-  const windowWidth = Math.min(width * 0.78, 400);
-  const windowHeight = Math.min(116, Math.max(76, height * 0.68));
-  const windowX = (width - windowWidth) / 2;
-  const windowY = 12;
-  const radius = 11;
-  const windowFill = dark ? "rgba(24, 27, 30, 0.69)" : "rgba(255, 255, 255, 0.68)";
-  const windowStroke = dark ? "rgba(242, 244, 247, 0.2)" : "rgba(44, 61, 77, 0.12)";
-  context.save();
-  context.shadowColor = dark ? "rgba(0, 0, 0, 0.24)" : "rgba(36, 54, 72, 0.13)";
-  context.shadowBlur = 18;
-  context.shadowOffsetY = 8;
-  context.beginPath();
-  context.roundRect(windowX, windowY, windowWidth, windowHeight, radius);
-  context.fillStyle = windowFill;
-  context.fill();
-  context.restore();
-
-  context.save();
-  context.beginPath();
-  context.roundRect(windowX, windowY, windowWidth, windowHeight, radius);
-  context.clip();
-  context.fillStyle = windowFill;
-  context.fillRect(windowX, windowY, windowWidth, windowHeight);
-  context.strokeStyle = windowStroke;
-  context.lineWidth = 1;
-  context.strokeRect(windowX + 0.5, windowY + 0.5, windowWidth - 1, windowHeight - 1);
-  context.fillStyle = dark ? "rgba(245, 246, 248, 0.045)" : "rgba(40, 55, 70, 0.025)";
-  context.fillRect(windowX, windowY, windowWidth, 23);
-  context.strokeStyle = dark ? "rgba(238, 240, 243, 0.1)" : "rgba(36, 53, 69, 0.085)";
-  context.beginPath();
-  context.moveTo(windowX, windowY + 23.5);
-  context.lineTo(windowX + windowWidth, windowY + 23.5);
-  context.stroke();
-
-  const dotColors = dark
-    ? ["rgba(255, 255, 255, 0.32)", "rgba(255, 255, 255, 0.23)", "rgba(255, 255, 255, 0.16)"]
-    : ["rgba(82, 96, 110, 0.38)", "rgba(82, 96, 110, 0.26)", "rgba(82, 96, 110, 0.18)"];
-  dotColors.forEach((color, index) => {
-    context.beginPath();
-    context.arc(windowX + 13 + index * 9, windowY + 12, 2.5, 0, Math.PI * 2);
-    context.fillStyle = color;
-    context.fill();
-  });
-
-  const lineColor = dark ? "rgba(232, 234, 237, 0.15)" : "rgba(47, 64, 80, 0.12)";
-  const titleColor = dark ? "rgba(241, 243, 245, 0.24)" : "rgba(51, 68, 84, 0.2)";
-  context.fillStyle = titleColor;
-  context.fillRect(windowX + 15, windowY + 39, Math.min(104, windowWidth * 0.32), 5);
-  context.fillStyle = lineColor;
-  context.fillRect(windowX + 15, windowY + 55, windowWidth * 0.73, 3);
-  context.fillRect(windowX + 15, windowY + 65, windowWidth * 0.61, 3);
-  context.fillRect(windowX + 15, windowY + 75, windowWidth * 0.68, 3);
-  context.fillRect(windowX + 15, windowY + 85, windowWidth * 0.42, 3);
-
-  const chartX = windowX + windowWidth * 0.75;
-  const chartY = windowY + 44;
-  const chartWidth = Math.max(24, windowWidth * 0.19);
-  const chartHeight = Math.max(20, windowHeight - 58);
-  context.strokeStyle = dark ? "rgba(176, 186, 198, 0.3)" : "rgba(92, 144, 181, 0.24)";
-  context.lineWidth = 1.5;
-  context.beginPath();
-  context.moveTo(chartX, chartY + chartHeight * 0.78);
-  context.lineTo(chartX + chartWidth * 0.24, chartY + chartHeight * 0.58);
-  context.lineTo(chartX + chartWidth * 0.46, chartY + chartHeight * 0.68);
-  context.lineTo(chartX + chartWidth * 0.7, chartY + chartHeight * 0.27);
-  context.lineTo(chartX + chartWidth, chartY + chartHeight * 0.18);
-  context.stroke();
-  context.restore();
 
   return true;
 }

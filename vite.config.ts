@@ -14,6 +14,7 @@ export default defineConfig(async () => ({
       input: {
         main: resolve(__dirname, "index.html"),
         island: resolve(__dirname, "island.html"),
+        preview: resolve(__dirname, "preview.html"),
       },
     },
   },

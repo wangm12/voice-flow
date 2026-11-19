@@ -1,9 +1,10 @@
 import { useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { SettingsGroup, SettingsPageHeader, SettingsRow, SettingsShell } from "../SettingsLayout";
+import { SettingsDisclosure, SettingsGroup, SettingsPageHeader, SettingsRow, SettingsShell } from "../SettingsLayout";
 import { Toggle } from "../Toggle";
 import { WhatsNewDialog, type WhatsNewPayload } from "../WhatsNewDialog";
 import { ClampedNumberInput } from "./ClampedNumberInput";
+import { LatencyMetricsViewer } from "./LatencyMetricsViewer";
 import { useI18n } from "../../lib/i18n";
 import { secondaryButtonClass } from "../../lib/theme";
 import type { SaveSettings, Settings } from "../../types/settings";
@@ -19,6 +20,7 @@ export function DebugSettings({
   const [whatsNewPreview, setWhatsNewPreview] = useState<WhatsNewPayload | null>(null);
   const [previewBusy, setPreviewBusy] = useState(false);
   const [previewError, setPreviewError] = useState<string | null>(null);
+  const [metricsError, setMetricsError] = useState<string | null>(null);
 
   return (
     <SettingsShell>
@@ -27,7 +29,7 @@ export function DebugSettings({
         <SettingsRow title={t("句尾缓冲")} description={t("说完后多录一会儿，避免吞掉句尾。")}>
           <ClampedNumberInput
             label={t("句尾缓冲")}
-            value={settings.extra_recording_buffer_ms ?? 250}
+            value={settings.extra_recording_buffer_ms ?? 200}
             min={0}
             max={2000}
             widthClassName="w-28"
@@ -73,6 +75,9 @@ export function DebugSettings({
           {previewError && <p role="alert" className="w-full text-xs text-error-ink">{previewError}</p>}
         </SettingsRow>
       </SettingsGroup>
+      <SettingsDisclosure title={t("本机性能诊断")} description={t("查看阶段延迟和交付计数，仅保存在本机。")} error={metricsError}>
+        <LatencyMetricsViewer onErrorChange={setMetricsError} />
+      </SettingsDisclosure>
       {whatsNewPreview && (
         <WhatsNewDialog payload={whatsNewPreview} onDismiss={() => setWhatsNewPreview(null)} />
       )}

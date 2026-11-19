@@ -121,6 +121,7 @@ pub struct ModelStatus {
     pub selectable: bool,
     pub compatible: bool,
     pub compatibility_error: Option<String>,
+    pub memory_estimate: Option<crate::model_resources::ModelMemoryEstimate>,
 }
 
 impl ModelStatus {
@@ -154,6 +155,12 @@ impl ModelStatus {
             selectable: false,
             compatible,
             compatibility_error: compatibility_error.map(str::to_owned),
+            memory_estimate: crate::model_resources::admission_reserve_estimate(
+                crate::model_resources::cleanup_memory_reserve_estimate_bytes(
+                    manifest.id,
+                    manifest.revision,
+                ),
+            ),
         }
     }
 }
@@ -654,6 +661,7 @@ fn invalid_status(id: &str) -> ModelStatus {
         selectable: false,
         compatible: false,
         compatibility_error: Some("unsupported_model".into()),
+        memory_estimate: None,
     }
 }
 

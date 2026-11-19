@@ -5,8 +5,6 @@ import XCTest
 final class CleanupModelRoutingTests: XCTestCase {
   func testOnlyExactPinnedQwenRoutesAreAdmitted() {
     let routes = [
-      CleanupModelRoute.qwen35TwoB,
-      CleanupModelRoute.qwen35FourB,
       CleanupModelRoute.qwen35NineB,
     ]
 
@@ -18,28 +16,55 @@ final class CleanupModelRoutingTests: XCTestCase {
       XCTAssertEqual(route.promptRecipe, "voiceflow-qwen35-chat-cleanup-v1")
       XCTAssertFalse(route.usesPinnedPrefixCache)
     }
+    XCTAssertTrue(CleanupModelRoute.qwen35TwoB.usesPinnedPrefixCache)
+    XCTAssertTrue(CleanupModelRoute.qwen35FourB.usesPinnedPrefixCache)
+    XCTAssertEqual(
+      CleanupModelRoute.qwen35TwoB.prefixCacheRepository,
+      "mlx-community/Qwen3.5-2B-MLX-4bit"
+    )
+    XCTAssertEqual(
+      CleanupModelRoute.qwen35TwoB.prefixCacheManifestSHA256,
+      "d889464330fc5091ed4398905b5f09a39ac28a15300555dae2ab6b0d5b38e242"
+    )
+    XCTAssertEqual(
+      CleanupModelRoute.qwen35FourB.prefixCacheRepository,
+      "mlx-community/Qwen3.5-4B-MLX-4bit"
+    )
+    XCTAssertEqual(
+      CleanupModelRoute.qwen35FourB.prefixCacheManifestSHA256,
+      "18393f839aade07b606c1f3b50d32314dfd5363b034f1d5f7735b1fc6104b5f6"
+    )
   }
 
   func testTextModelQualificationRoutesHaveExactPinsAndNoPrefixCache() {
-    let routes: [(CleanupModelRoute, String, String)] = [
+    let routes: [(CleanupModelRoute, String, String, String?, String?, Bool)] = [
       (
         .gemma4E2b,
         "gemma_4_e2b_it_mlx_4bit",
-        "75a479632d6a594ea323942b883cdbc1bdd97a14"
+        "75a479632d6a594ea323942b883cdbc1bdd97a14",
+        nil,
+        nil,
+        false
       ),
       (
         .gemma4E4b,
         "gemma_4_e4b_it_mlx_4bit",
-        "da76496efe4486235e6e0aa9315203e27b957bcd"
+        "da76496efe4486235e6e0aa9315203e27b957bcd",
+        "Anotos/Gemma-4-E4B-it-Text-MLX-4bit",
+        "f29888227b0d076a257463fb3f414c0916b298145a283bc4352bf6bc7a54e55e",
+        true
       ),
       (
         .ministral3ThreeB,
         "ministral_3_3b_instruct_mlx_4bit",
-        "a962dcb09eee4169c890e544c9eb938f1113fdee"
+        "a962dcb09eee4169c890e544c9eb938f1113fdee",
+        "mlx-community/Ministral-3-3B-Instruct-2512-4bit",
+        "9c190f28458ff6cd6e1d17fe90913d445cbe745728803364e948cb1e87c16ab2",
+        true
       ),
     ]
 
-    for (route, modelId, revision) in routes {
+    for (route, modelId, revision, repository, manifest, usesPrefixCache) in routes {
       XCTAssertEqual(route.modelId, modelId)
       XCTAssertEqual(route.revision, revision)
       XCTAssertEqual(
@@ -47,7 +72,9 @@ final class CleanupModelRoutingTests: XCTestCase {
         .supported(route)
       )
       XCTAssertEqual(route.promptContract, .standardChat)
-      XCTAssertFalse(route.usesPinnedPrefixCache)
+      XCTAssertEqual(route.prefixCacheRepository, repository)
+      XCTAssertEqual(route.prefixCacheManifestSHA256, manifest)
+      XCTAssertEqual(route.usesPinnedPrefixCache, usesPrefixCache)
     }
     XCTAssertEqual(CleanupModelRoute.gemma4E2b.promptRecipe, "voiceflow-gemma4-chat-cleanup-v1")
     XCTAssertEqual(CleanupModelRoute.gemma4E4b.promptRecipe, "voiceflow-gemma4-chat-cleanup-v1")
@@ -67,6 +94,7 @@ final class CleanupModelRoutingTests: XCTestCase {
       route.prefixCacheManifestSHA256,
       "f67d38ec1261b4d693cee8c006d2c56007e6919a290508266705ba4f571c9ed2"
     )
+    XCTAssertEqual(route.prefixCacheRepository, "lmstudio-community/Qwen3.8-27B-MLX-6bit")
     XCTAssertTrue(route.usesPinnedPrefixCache)
   }
 

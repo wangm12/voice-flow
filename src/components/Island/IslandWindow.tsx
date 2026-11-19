@@ -7,11 +7,18 @@ import { VoicePill } from "./VoicePill";
 import { DictationCompletionStatus } from "./DictationCompletionStatus";
 import type { VoicePillAction } from "./VoicePill";
 import type { HudDestination } from "./hudPresentation";
-import { hudStageTimerKey, shouldHideOnConfirmedPaste } from "./hudOrb";
+import {
+  DEFAULT_HUD_VISUALS,
+  hudStageTimerKey,
+  normalizeHudVisuals,
+  shouldHideOnConfirmedPaste,
+  type HudVisualSettings,
+} from "./hudOrb";
 import { voicePillLearnToastHeight } from "./voicePillTokens";
 import { useReducedMotionPreference } from "./springs";
 import { formatHudContextLabel, formatHudContextSource, formatHudIntensityLabel, formatHudTranslationLabel, type HudContextSource } from "../../lib/hudContextLabel";
 import { useI18n } from "../../lib/i18n";
+import type { Settings } from "../../types/settings";
 
 const nativeGlassPoc = new URLSearchParams(window.location.search).get("native-glass-poc") === "1";
 
@@ -28,6 +35,7 @@ type HudState = {
   quietCompletion: boolean;
   phase: ProcessingPhase;
   phaseConfirmed: boolean;
+  chunkProgress: { done: number; total: number } | null;
   contextApp: string | null;
   contextStyle: string | null;
   contextLabel: string | null;
@@ -345,7 +353,17 @@ export function selectedActionStateForDictation(
   return current;
 }
 
-type LearnToast = { pair_key: string; pair_keys?: string[]; before: string; after: string };
+type LearnToast = {
+  kind?: "promoted" | "candidate";
+  session_generation?: number;
+  pair_key: string;
+  pair_keys?: string[];
+  before: string;
+  after: string;
+  native_bundle?: string | null;
+  browser_host?: string | null;
+  mapping_id?: string | null;
+};
 type HudAppearanceStatus = {
   requested: "classic" | "liquid_glass";
   effective: "classic" | "liquid_glass";
@@ -364,7 +382,12 @@ function LearningHudGlyph() {
 
 export function IslandWindow() {
   const { t } = useI18n();
+  const [hudAppearance, setHudAppearance] = useState<"classic" | "liquid_glass">(() => (
+    nativeGlassPoc ? "liquid_glass" : "classic"
+  ));
+  const [hudVisuals, setHudVisuals] = useState<HudVisualSettings>(DEFAULT_HUD_VISUALS);
   const [learnToast, setLearnToast] = useState<LearnToast | null>(null);
+  const [learnToastHovered, setLearnToastHovered] = useState(false);
   const hasLearnToast = learnToast != null;
   const [learnUndoError, setLearnUndoError] = useState<string | null>(null);
   const [learnUndoBusy, setLearnUndoBusy] = useState(false);
@@ -382,6 +405,7 @@ export function IslandWindow() {
     quietCompletion: false,
     phase: "idle",
     phaseConfirmed: false,
+    chunkProgress: null,
     contextApp: null,
     contextStyle: null,
     contextLabel: null,
@@ -628,8 +652,15 @@ export function IslandWindow() {
               : current);
           }
         }
-        const phase = event.payload.phase ?? (next === "processing" ? "cleanup" : next === "idle" ? "idle" : "finalizing_audio");
-        const phaseConfirmed = event.payload.phase_confirmed === true;
+        const rawPhase = event.payload.phase ?? (next === "processing" ? "cleanup" : next === "idle" ? "idle" : "finalizing_audio");
+        const rawPhaseConfirmed = event.payload.phase_confirmed === true;
+        if ((next === "starting" || next === "recording") && learnToastRef.current?.kind === "candidate") {
+          learnToastRef.current = null;
+          setLearnToast(null);
+          setLearnToastHovered(false);
+          setLearnUndoError(null);
+          setLearnUndoBusy(false);
+        }
         setHud((current) => {
           if (!acceptsSessionGeneration(current.sessionGeneration, eventGeneration)) return current;
           const preserveImmediateHide = next === "idle"
@@ -649,6 +680,21 @@ export function IslandWindow() {
             || pasteWasDispatched
             || uncertainPasteAttempt;
           const displayState = quietCompletion ? "idle" : next;
+          const sameActiveProcessing = eventGeneration === current.sessionGeneration
+            && displayState === "processing"
+            && (current.state === "processing" || current.state === "rate_limited");
+          // Context refreshes must not drop an already confirmed stage back to
+          // an unconfirmed fallback while processing.
+          const [phase, phaseConfirmed]: [ProcessingPhase, boolean] = (
+            eventGeneration === current.sessionGeneration
+            && current.state === "rate_limited"
+            && displayState === "processing"
+            && rawPhase === "waiting_retry"
+          )
+            ? ["waiting_retry", true]
+            : sameActiveProcessing && current.phaseConfirmed && !rawPhaseConfirmed && rawPhase !== "waiting_retry"
+              ? [current.phase, true]
+              : [rawPhase, rawPhaseConfirmed];
           const context = hudContextFromEvent(displayState, current, event.payload);
           const contextSource = hudContextSourceFromEvent(
             displayState,
@@ -656,6 +702,18 @@ export function IslandWindow() {
             event.payload,
             eventGeneration > current.sessionGeneration,
           );
+          const incomingCompleted = event.payload.completed_chunks;
+          const incomingTotal = event.payload.total_chunks;
+          const clearsChunkProgress = displayState === "idle"
+            || (rawPhase !== "asr" && rawPhase !== "cascade_accurate" && rawPhaseConfirmed);
+          const chunkProgress = clearsChunkProgress
+            ? null
+            : typeof incomingCompleted === "number" && Number.isFinite(incomingCompleted)
+              && typeof incomingTotal === "number" && Number.isFinite(incomingTotal) && incomingTotal > 0
+              ? { done: incomingCompleted, total: incomingTotal }
+              : eventGeneration > current.sessionGeneration
+                ? null
+                : current.chunkProgress;
           const nextHud = {
             sessionGeneration: eventGeneration,
             state: displayState,
@@ -675,6 +733,7 @@ export function IslandWindow() {
             historyRecovery: nextHistoryRecovery,
             phase,
             phaseConfirmed,
+            chunkProgress,
             contextApp: context.contextApp,
             contextStyle: context.contextStyle,
             contextLabel: context.contextLabel,
@@ -712,6 +771,8 @@ export function IslandWindow() {
             && current.recordingTargetIcon === nextHud.recordingTargetIcon
             && current.phase === nextHud.phase
             && current.phaseConfirmed === nextHud.phaseConfirmed
+            && current.chunkProgress?.done === nextHud.chunkProgress?.done
+            && current.chunkProgress?.total === nextHud.chunkProgress?.total
             && current.contextApp === nextHud.contextApp
             && current.contextStyle === nextHud.contextStyle
             && current.contextLabel === nextHud.contextLabel
@@ -744,6 +805,7 @@ export function IslandWindow() {
           quietCompletion: true,
           phase: "idle",
           phaseConfirmed: false,
+          chunkProgress: null,
           contextApp: null,
           contextStyle: null,
           contextLabel: null,
@@ -941,20 +1003,38 @@ export function IslandWindow() {
           };
       });
     });
-    register<{ session_generation?: number }>("dictation://progress", (event) => {
+    register<{
+      session_generation?: number;
+      chunks_done?: number;
+      total?: number;
+      progress?: number;
+    }>("dictation://progress", (event) => {
       const eventGeneration = event.payload.session_generation;
       if (!acceptsSessionGeneration(hudRef.current.sessionGeneration, eventGeneration)
         || !acceptsSessionGeneration(recoveryGenerationRef.current, eventGeneration)) return;
       if (eventGeneration > recoveryGenerationRef.current) adoptRecoveryGeneration(eventGeneration);
+      const chunksDone = event.payload.chunks_done;
+      const totalChunks = event.payload.total;
+      const nextChunkProgress = typeof chunksDone === "number" && Number.isFinite(chunksDone) && chunksDone >= 0
+        && typeof totalChunks === "number" && Number.isFinite(totalChunks) && totalChunks > 0
+        ? { done: chunksDone, total: totalChunks }
+        : undefined;
       setHud((current) => {
         if (!acceptsSessionGeneration(current.sessionGeneration, eventGeneration)) return current;
-        if (current.sessionGeneration === eventGeneration) return current;
+        const generationAdvanced = eventGeneration > current.sessionGeneration;
+        const chunkChanged = nextChunkProgress !== undefined
+          && (current.chunkProgress?.done !== nextChunkProgress.done
+            || current.chunkProgress?.total !== nextChunkProgress.total);
+        if (!generationAdvanced && !chunkChanged) return current;
         return {
           ...current,
           sessionGeneration: eventGeneration,
-          audioRecovery: null,
-          historyRecovery: null,
-          audioCapture: null,
+          chunkProgress: generationAdvanced
+            ? (nextChunkProgress ?? null)
+            : (nextChunkProgress ?? current.chunkProgress),
+          audioRecovery: generationAdvanced ? null : current.audioRecovery,
+          historyRecovery: generationAdvanced ? null : current.historyRecovery,
+          audioCapture: generationAdvanced ? null : current.audioCapture,
         };
       });
     });
@@ -1029,8 +1109,29 @@ export function IslandWindow() {
         });
     });
     register<LearnToast>("learn_pairs://promoted", (event) => {
-      learnToastRef.current = event.payload;
-      setLearnToast(event.payload);
+      const next: LearnToast = { ...event.payload, kind: "promoted" };
+      learnToastRef.current = next;
+      setLearnToast(next);
+      setLearnToastHovered(false);
+      setLearnUndoError(null);
+      setLearnUndoBusy(false);
+    });
+    register<LearnToast>("learn_pairs://candidate", (event) => {
+      const eventGeneration = event.payload.session_generation;
+      const admitted = admittedHudStateRef.current;
+      if (typeof eventGeneration !== "number"
+        || !Number.isSafeInteger(eventGeneration)
+        || eventGeneration <= 0
+        || eventGeneration !== admitted.sessionGeneration
+        || eventGeneration !== recoveryGenerationRef.current
+        || eventGeneration < hudRef.current.sessionGeneration
+        || admitted.state === "starting"
+        || admitted.state === "recording"
+        || admitted.state === "recording_limited") return;
+      const next: LearnToast = { ...event.payload, kind: "candidate" };
+      learnToastRef.current = next;
+      setLearnToast(next);
+      setLearnToastHovered(false);
       setLearnUndoError(null);
       setLearnUndoBusy(false);
     });
@@ -1042,8 +1143,10 @@ export function IslandWindow() {
         acknowledgementPending = true;
         if (event.payload.glass === "regular") {
           document.documentElement.dataset.nativeGlassPoc = "true";
+          setHudAppearance("liquid_glass");
         } else {
           delete document.documentElement.dataset.nativeGlassPoc;
+          setHudAppearance("classic");
         }
         void Promise.all(registrations)
           .then(() => {
@@ -1063,6 +1166,7 @@ export function IslandWindow() {
     };
   }, []);
 
+  const refreshHudConfigRef = useRef<() => void>(() => {});
   useEffect(() => {
     if (nativeGlassPoc) return;
 
@@ -1071,6 +1175,7 @@ export function IslandWindow() {
     root.dataset.hudGlassVisible = "false";
     let disposed = false;
     let statusRevision = 0;
+    let visualsRevision = 0;
     const unlisteners = new Set<UnlistenFn>();
     const subscribe = <T,>(eventName: string, callback: (payload: T) => void) =>
       listen<T>(eventName, (event) => callback(event.payload)).then((unlisten) => {
@@ -1082,34 +1187,57 @@ export function IslandWindow() {
       if (status.effective !== "classic" && status.effective !== "liquid_glass") return;
       statusRevision += 1;
       root.dataset.hudAppearance = status.effective;
+      setHudAppearance(status.effective);
       if (status.effective === "classic") root.dataset.hudGlassVisible = "false";
     });
     const materialSubscription = subscribe<boolean>("hud-appearance://material-visible", (visible) => {
       if (typeof visible === "boolean") root.dataset.hudGlassVisible = String(visible);
     });
+    const settingsSubscription = subscribe<Partial<Settings>>("settings://changed", (settings) => {
+      if (!settings || typeof settings !== "object") return;
+      visualsRevision += 1;
+      setHudVisuals(normalizeHudVisuals(settings));
+    });
 
-    void Promise.all([statusSubscription, materialSubscription])
-      .then(() => {
-        if (disposed) return;
-        const queryRevision = statusRevision;
-        return invoke<HudAppearanceStatus>("get_hud_appearance_status")
-          .then((status) => ({ status, queryRevision }));
-      })
-      .then((result) => {
-        if (!result || disposed || statusRevision !== result.queryRevision) return;
-        const { status } = result;
-        if (status.effective !== "classic" && status.effective !== "liquid_glass") return;
-        root.dataset.hudAppearance = status.effective;
-        if (status.effective === "classic") root.dataset.hudGlassVisible = "false";
-      })
+    const refreshHudConfig = () => {
+      if (disposed) return Promise.resolve();
+      const queryStatusRevision = statusRevision;
+      const queryVisualsRevision = visualsRevision;
+      const statusPromise = Promise.resolve(invoke<HudAppearanceStatus>("get_hud_appearance_status"))
+        .then((status) => {
+          if (disposed || statusRevision !== queryStatusRevision || !status) return;
+          if (status.effective !== "classic" && status.effective !== "liquid_glass") return;
+          root.dataset.hudAppearance = status.effective;
+          setHudAppearance(status.effective);
+          if (status.effective === "classic") root.dataset.hudGlassVisible = "false";
+        })
+        .catch(() => undefined);
+      const settingsPromise = Promise.resolve(invoke<Partial<Settings>>("get_settings"))
+        .then((settings) => {
+          if (disposed || visualsRevision !== queryVisualsRevision || !settings || typeof settings !== "object") return;
+          setHudVisuals(normalizeHudVisuals(settings));
+        })
+        .catch(() => undefined);
+      return Promise.all([statusPromise, settingsPromise]);
+    };
+    refreshHudConfigRef.current = () => { void refreshHudConfig(); };
+
+    void Promise.all([statusSubscription, materialSubscription, settingsSubscription])
+      .then(() => refreshHudConfig().then(() => undefined))
       .catch(() => undefined);
 
     return () => {
       disposed = true;
+      refreshHudConfigRef.current = () => {};
       for (const unlisten of unlisteners) unlisten();
       unlisteners.clear();
     };
   }, []);
+
+  useEffect(() => {
+    if (nativeGlassPoc || hud.sessionGeneration <= 0) return;
+    refreshHudConfigRef.current();
+  }, [hud.sessionGeneration]);
 
   useEffect(() => {
     if (!hasLearnToast) return;
@@ -1118,6 +1246,14 @@ export function IslandWindow() {
       void invoke("set_island_learn_interactive", { interactive: false }).catch(() => undefined);
     };
   }, [hasLearnToast]);
+
+  useEffect(() => {
+    if (learnToast?.kind !== "candidate" || learnUndoBusy || learnUndoError || learnToastHovered) return;
+    const timer = window.setTimeout(() => {
+      dismissLearnToast();
+    }, 8_000);
+    return () => window.clearTimeout(timer);
+  }, [learnToast, learnUndoBusy, learnUndoError, learnToastHovered]);
 
   useEffect(() => {
     setRecoveryBusy(false);
@@ -1215,7 +1351,9 @@ export function IslandWindow() {
   };
 
   const dismissLearnToast = () => {
+    learnToastRef.current = null;
     setLearnToast(null);
+    setLearnToastHovered(false);
     setLearnUndoError(null);
     void invoke("hide_island_if_idle");
   };
@@ -1404,6 +1542,26 @@ export function IslandWindow() {
     }
   };
 
+  const confirmCandidateLearning = async (scopeMode: "global" | "local") => {
+    if (!learnToast || learnUndoBusy) return;
+    const toast = learnToast;
+    setLearnUndoBusy(true);
+    setLearnUndoError(null);
+    try {
+      await invoke("promote_learn_pair", {
+        pairKey: toast.pair_key,
+        beforeSurface: toast.before,
+        afterSurface: toast.after,
+        scopeMode,
+      });
+      if (learnToastRef.current === toast) dismissLearnToast();
+    } catch {
+      if (learnToastRef.current === toast) setLearnUndoError(t("词典操作未完成，请重试。"));
+    } finally {
+      setLearnUndoBusy(false);
+    }
+  };
+
   const undoLearning = async () => {
     if (!learnToast || learnUndoBusy) return;
     const toast = learnToast;
@@ -1435,6 +1593,7 @@ export function IslandWindow() {
         state={hud.state}
         phase={hud.phase}
         phaseConfirmed={hud.phaseConfirmed}
+        chunkProgress={hud.chunkProgress}
         hideImmediately={hud.quietCompletion}
         stageElapsedMs={stageElapsedMs}
         clockNowMs={clockNowMs}
@@ -1445,6 +1604,8 @@ export function IslandWindow() {
         selectedActionState={hud.selectedActionState}
         waveformLevels={hud.waveformLevels}
         partialText={hud.partialText}
+        beamTheme={hudAppearance === "liquid_glass" ? "auto" : "dark"}
+        visuals={hudVisuals}
         reduced={reduced}
         sessionGeneration={hud.sessionGeneration}
         detailsOpen={detailsOpen}
@@ -1486,7 +1647,57 @@ export function IslandWindow() {
         } : undefined}
       />
       {!nativeGlassPoc && <DictationCompletionStatus />}
-      {learnToast && (
+      {learnToast && learnToast.kind === "candidate" ? (
+        <div
+          role="status"
+          aria-busy={learnUndoBusy}
+          aria-label={learnUndoError ?? undefined}
+          className="island-learn-toast island-learn-toast--candidate"
+          style={{ height: voicePillLearnToastHeight }}
+          onMouseEnter={() => setLearnToastHovered(true)}
+          onMouseLeave={() => setLearnToastHovered(false)}
+        >
+          <span className="island-learn-toast__icon"><LearningHudGlyph /></span>
+          <span className="island-learn-toast__copy">
+            <span className="island-learn-toast__title" title={`${learnToast.before} → ${learnToast.after}`}>
+              {learnUndoError ? t("保存未完成") : learnUndoBusy ? t("正在保存规则") : `${t("记住「")}${learnToast.before} → ${learnToast.after}${t("」？")}`}
+            </span>
+            {learnUndoError ? (
+              <span className="island-learn-toast__subtitle">{t("可以再次尝试")}</span>
+            ) : learnToast.browser_host ? (
+              <span className="island-learn-toast__subtitle">{learnToast.browser_host}</span>
+            ) : null}
+          </span>
+          <button
+            type="button"
+            className="island-learn-toast__action"
+            disabled={learnUndoBusy}
+            onMouseDown={(event) => event.preventDefault()}
+            onClick={() => void confirmCandidateLearning("global")}
+          >
+            {t("全局记住")}
+          </button>
+          {(learnToast.browser_host || learnToast.native_bundle || learnToast.mapping_id) && (
+            <button
+              type="button"
+              className="island-learn-toast__action"
+              disabled={learnUndoBusy}
+              onMouseDown={(event) => event.preventDefault()}
+              onClick={() => void confirmCandidateLearning("local")}
+            >
+              {t(learnToast.browser_host ? "仅此网站" : "仅此 App")}
+            </button>
+          )}
+          <button
+            type="button"
+            disabled={learnUndoBusy}
+            aria-label={t("关闭")}
+            className="island-learn-toast__action island-learn-toast__close"
+            onMouseDown={(event) => event.preventDefault()}
+            onClick={dismissLearnToast}
+          >✕</button>
+        </div>
+      ) : learnToast && (
         <div role="status" aria-busy={learnUndoBusy} aria-label={learnUndoError ?? undefined} className="island-learn-toast" style={{ height: voicePillLearnToastHeight }}>
           <span className="island-learn-toast__icon"><LearningHudGlyph /></span>
           <span className="island-learn-toast__copy">
@@ -1513,4 +1724,4 @@ export function IslandWindow() {
   );
 }
 
-type DictationStatePayload = { recording_mode?: string | null; recording_hotkey?: string | null; recording_target_icon?: string | null; translation_target_language?: string | null; state: DictationState; session_generation?: number; phase?: ProcessingPhase; phase_confirmed?: boolean; cleanup_status?: string | null; context_id?: string; context_app?: string | null; context_style?: string | null; context_label?: string; context_source?: ContextSourcePayload | null; cleanup_intensity?: "off" | "light" | "standard" | "heavy" | null; delivery_method?: string; fallback_reason?: string | null };
+type DictationStatePayload = { recording_mode?: string | null; recording_hotkey?: string | null; recording_target_icon?: string | null; translation_target_language?: string | null; state: DictationState; session_generation?: number; phase?: ProcessingPhase; phase_confirmed?: boolean; completed_chunks?: number; total_chunks?: number; cleanup_status?: string | null; context_id?: string; context_app?: string | null; context_style?: string | null; context_label?: string; context_source?: ContextSourcePayload | null; cleanup_intensity?: "off" | "light" | "standard" | "heavy" | null; delivery_method?: string; fallback_reason?: string | null };

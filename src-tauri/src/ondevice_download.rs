@@ -379,6 +379,11 @@ fn status_from_info(
     } else {
         None
     };
+    let memory_estimate = info.revision.as_deref().and_then(|revision| {
+        crate::model_resources::admission_reserve_estimate(
+            crate::model_resources::asr_memory_reserve_estimate_bytes(&info.id, revision),
+        )
+    });
     OnDeviceModelStatus {
         id: info.id.clone(),
         label: info.label,
@@ -413,8 +418,10 @@ fn status_from_info(
         runtime_status: runtime_status.to_owned(),
         loaded,
         download_available: info.download_available,
+        license_unreviewed: info.license_unreviewed,
         language_note: info.language_note,
         memory_compatibility_error,
+        memory_estimate,
     }
 }
 
@@ -1168,6 +1175,7 @@ mod tests {
                 file_count: 0,
                 platform_supported: true,
                 download_available: false,
+                license_unreviewed: false,
                 language_note: String::new(),
             },
             None,

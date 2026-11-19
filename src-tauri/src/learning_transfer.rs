@@ -495,11 +495,11 @@ fn validate_transfer_pair_item(pair: &TransferWordPairV1) -> Result<LearnPairSco
         && !matches!(
             (&pair.target, &pair.pair_scope),
             (None, Some(scope))
-                if scope.native_bundle.is_some() && scope.browser_host.is_none()
+                if scope.native_bundle.is_some() != scope.browser_host.is_some()
         )
     {
         return Err(
-            "learning_transfer_invalid_file: manual-scoped pairs must keep a direct native App scope"
+            "learning_transfer_invalid_file: manual-scoped pairs must keep a direct native App or website host scope"
                 .into(),
         );
     }
@@ -537,12 +537,9 @@ fn validate_target(target: &TransferTargetV1) -> Result<(), String> {
             "learning_transfer_invalid_file: mapping selector has surrounding whitespace".into(),
         );
     }
-    if target.selected_task.is_some()
-        && target.selector.focused_field.is_none()
-        && (target.selector.browser_host.is_none() || target.selector.browser_path_prefix.is_none())
-    {
+    if target.selected_task.is_some() && !target.selector.has_task_disambiguator() {
         return Err(
-            "learning_transfer_invalid_file: selected task requires a focused field or browser path selector"
+            "learning_transfer_invalid_file: selected task requires a trusted field, exact browser path, or recognized native App bundle id"
                 .into(),
         );
     }
@@ -4406,5 +4403,76 @@ mod tests {
         ));
         assert_eq!(store::list_learn_pairs(&local_root).unwrap().len(), 1);
         let _ = fs::remove_dir_all(local_root);
+    }
+
+    #[test]
+    fn manual_scoped_browser_host_pair_roundtrips_through_learning_transfer() {
+        let dir = new_transfer_test_root("manual-browser-host");
+        let scope = store::LearnPairScope {
+            family: None,
+            mapping_id: None,
+            browser_host: Some("github.com".into()),
+            native_bundle: None,
+        };
+        let row = store::ensure_manual_scoped_learn_pair(
+            &dir,
+            "word:v2:manual-github",
+            "githab",
+            "GitHub",
+            &scope,
+        )
+        .unwrap();
+        assert!(row.manual_scoped);
+        let exported = transfer_pair_from_record(&row, &[]).unwrap();
+        assert!(exported.manual_scoped);
+        assert_eq!(
+            exported
+                .pair_scope
+                .as_ref()
+                .and_then(|s| s.browser_host.as_deref()),
+            Some("github.com")
+        );
+        let mut transfer_file = file_with_pair(exported);
+        assert!(validate_transfer_file(&mut transfer_file).is_ok());
+
+        let dest = new_transfer_test_root("manual-browser-host-dest");
+        let file_path = dest.join("transfer.json");
+        write_export_file(
+            &file_path,
+            &make_transfer_file_bytes(&transfer_file).unwrap(),
+        )
+        .unwrap();
+        let settings = Settings::default();
+        let preview = build_preview(
+            file_path.clone(),
+            load_transfer_file(&file_path).unwrap(),
+            &settings,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(preview.items.len(), 1);
+        assert_eq!(preview.items[0].status, TransferItemStatus::Ready);
+        let prepared = prepare_apply(
+            LearningTransferApplyInput {
+                preview_id: preview.preview_id,
+                choices: Vec::new(),
+            },
+            &settings,
+            &[],
+            &dest,
+        )
+        .unwrap();
+        let outcomes = store::apply_learn_pair_transfers(&dest, &prepared.pair_intents).unwrap();
+        let outcome = finish_apply(prepared, &outcomes).unwrap();
+        assert!(matches!(
+            outcome.results[0].status,
+            TransferItemResultStatus::Imported
+        ));
+        let imported = store::list_learn_pairs(&dest).unwrap();
+        assert_eq!(imported.len(), 1);
+        assert!(imported[0].manual_scoped);
+        assert_eq!(imported[0].browser_host.as_deref(), Some("github.com"));
+        let _ = fs::remove_dir_all(dir);
+        let _ = fs::remove_dir_all(dest);
     }
 }

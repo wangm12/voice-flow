@@ -108,16 +108,25 @@ pub(crate) fn preserves_with_source_term_waivers(
     operation: Option<CleanupOperation>,
     source_term_waivers: &[std::ops::Range<usize>],
 ) -> bool {
-    let source_term_waivers = if operation == Some(CleanupOperation::Cleanup) {
-        source_term_waivers
-    } else {
-        &[]
-    };
+    let cleanup = operation == Some(CleanupOperation::Cleanup);
+    let source_term_waivers = if cleanup { source_term_waivers } else { &[] };
     let Ok(literal_bindings) = bind_literals(source, candidate) else {
         return false;
     };
+    let revision_waivers = if cleanup {
+        superseded_clause_waivers(source, candidate)
+    } else {
+        Vec::new()
+    };
+    if cleanup
+        && conditional_clause_signatures_excluding(source, &revision_waivers)
+            != conditional_clause_signatures_excluding(candidate, &[])
+    {
+        return false;
+    }
     if should_preserve_deictic_references(operation)
-        && deictic_reference_signature(source) != deictic_reference_signature(candidate)
+        && deictic_reference_signature_excluding(source, &revision_waivers)
+            != deictic_reference_signature(candidate)
     {
         return false;
     }
@@ -137,10 +146,24 @@ pub(crate) fn preserves_with_source_term_waivers(
     let source_spans = source_spans
         .into_iter()
         .filter(|span| {
-            span.kind != ProtectedSpanKind::Term
-                || !source_term_waivers
+            let in_revision_waiver = revision_waivers
+                .iter()
+                .any(|range| span.start_byte >= range.start && span.end_byte <= range.end);
+            if in_revision_waiver {
+                return false;
+            }
+            if span.kind == ProtectedSpanKind::Term {
+                if source_term_waivers
                     .iter()
                     .any(|range| range.start == span.start_byte && range.end == span.end_byte)
+                {
+                    return false;
+                }
+                if cleanup && is_waivable_sentence_initial_source_term(source, *span) {
+                    return false;
+                }
+            }
+            true
         })
         .collect::<Vec<_>>();
     candidate_spans.sort_by_key(|span| (span.start_byte, span.end_byte, span.kind as u8));
@@ -162,12 +185,31 @@ pub(crate) fn preserves_with_source_term_waivers(
                 candidate_token == source_token
             }
         });
-        let Some(candidate_span) = found else {
-            return false;
-        };
-        candidate_end = candidate_span.end_byte;
+        if let Some(candidate_span) = found {
+            candidate_end = candidate_span.end_byte;
+            continue;
+        }
+        if cleanup
+            && source_span.kind == ProtectedSpanKind::Term
+            && is_sentence_or_clause_start(source, source_span.start_byte)
+            && is_simple_titlecase_ascii(source_token)
+        {
+            if let Some(matched_end) =
+                find_clause_merged_lowercase_term(candidate, candidate_end, source_token)
+            {
+                candidate_end = matched_end;
+                continue;
+            }
+        }
+        return false;
     }
-    preserves_negation(source, candidate, operation)
+    let negation_preserved = if revision_waivers.is_empty() {
+        preserves_negation(source, candidate, operation)
+    } else {
+        let masked = mask_ranges_with_spaces(source, &revision_waivers);
+        preserves_negation(&masked, candidate, operation)
+    };
+    negation_preserved
         && (operation != Some(CleanupOperation::Translate)
             || weekday_counts(source) == weekday_counts(candidate))
 }
@@ -3741,9 +3783,70 @@ fn collect_deictic_references(text: &str, out: &mut Vec<ProtectedSpan>) {
         "他",
         "她",
         "它",
+        "大家",
         "嗯",
         "啊",
+        "呃",
+        "额",
         "就",
+        "就是",
+        "就是说",
+        "其实",
+        "然后",
+        "所以",
+        "但是",
+        "不过",
+        "而且",
+        "并且",
+        "或者",
+        "还是",
+        "比如",
+        "总之",
+        "因为",
+        "如果",
+        "要是",
+        "虽然",
+        "即使",
+        "既然",
+        "大概",
+        "可能",
+        "应该",
+        "好像",
+        "似乎",
+        "差不多",
+        "基本上",
+        "本来",
+        "原来",
+        "怎么",
+        "为什么",
+        "什么",
+        "啥",
+        "哪儿",
+        "哪里",
+        "是不是",
+        "能不能",
+        "可不可以",
+        "要不要",
+        "有没有",
+        "已经",
+        "正在",
+        "即将",
+        "马上",
+        "快要",
+        "一直",
+        "刚刚",
+        "真的",
+        "确实",
+        "明天",
+        "今天",
+        "昨天",
+        "后天",
+        "现在",
+        "刚才",
+        "待会",
+        "一会儿",
+        "那个",
+        "这个",
         "很",
         "挺",
         "特别",
@@ -3763,10 +3866,9 @@ fn collect_deictic_references(text: &str, out: &mut Vec<ProtectedSpan>) {
             let Some(next) = remainder.chars().next() else {
                 continue;
             };
-            if CHINESE_FILLER_OR_REQUEST_PREFIXES
-                .iter()
-                .any(|prefix| remainder.starts_with(prefix))
-            {
+            if CHINESE_FILLER_OR_REQUEST_PREFIXES.iter().any(|prefix| {
+                remainder.starts_with(prefix) && !(*prefix == "问" && remainder.starts_with("问题"))
+            }) {
                 continue;
             }
             if is_cjk_character(next) || next.is_ascii_alphanumeric() {
@@ -3872,12 +3974,957 @@ fn collect_deictic_references(text: &str, out: &mut Vec<ProtectedSpan>) {
 }
 
 fn deictic_reference_signature(text: &str) -> Vec<String> {
+    deictic_reference_signature_excluding(text, &[])
+}
+
+fn deictic_reference_signature_excluding(
+    text: &str,
+    excluded: &[std::ops::Range<usize>],
+) -> Vec<String> {
     let mut spans = Vec::new();
     collect_deictic_references(text, &mut spans);
     spans.sort_by_key(|span| span.start_byte);
     spans
         .into_iter()
+        .filter(|span| {
+            !excluded
+                .iter()
+                .any(|range| span.start_byte >= range.start && span.end_byte <= range.end)
+        })
         .map(|span| text[span.start_byte..span.end_byte].to_ascii_lowercase())
+        .collect()
+}
+
+fn is_simple_titlecase_ascii(word: &str) -> bool {
+    word.len() >= 2
+        && word
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_ascii_uppercase())
+        && word.chars().skip(1).all(|ch| ch.is_ascii_lowercase())
+}
+
+pub(crate) fn is_sentence_or_clause_start(text: &str, start_byte: usize) -> bool {
+    let prefix = &text[..start_byte];
+    let trimmed = prefix.trim_end_matches(|ch: char| {
+        ch.is_whitespace() || matches!(ch, '"' | '\'' | '“' | '‘' | '「' | '『' | '(' | '（')
+    });
+    if trimmed.is_empty() {
+        return true;
+    }
+    if matches!(
+        trimmed.chars().next_back(),
+        Some('.' | '?' | '!' | '。' | '？' | '！' | ';' | '；' | ',' | '，' | ':' | '：')
+    ) {
+        return true;
+    }
+    let line_start = trimmed.rfind(['\n', '\r']).map_or(0, |pos| pos + 1);
+    let line_before = trimmed[line_start..].trim_start();
+    line_before == "-"
+        || line_before == "*"
+        || line_before == "•"
+        || (line_before.ends_with('.')
+            && line_before.len() >= 2
+            && line_before[..line_before.len() - 1]
+                .chars()
+                .all(|ch| ch.is_ascii_digit()))
+}
+
+pub(crate) fn is_waivable_sentence_initial_source_term(text: &str, span: ProtectedSpan) -> bool {
+    if span.kind != ProtectedSpanKind::Term || !is_sentence_or_clause_start(text, span.start_byte) {
+        return false;
+    }
+    let word = &text[span.start_byte..span.end_byte];
+    if !is_simple_titlecase_ascii(word) {
+        return false;
+    }
+    const SENTENCE_INITIAL_WAIVABLE_TERMS: &[&str] = &[
+        // English fillers, discourse openers, conjunctions & auxiliaries
+        "actually",
+        "basically",
+        "honestly",
+        "literally",
+        "seriously",
+        "obviously",
+        "anyway",
+        "anyways",
+        "well",
+        "so",
+        "right",
+        "okay",
+        "look",
+        "wait",
+        "listen",
+        "see",
+        "now",
+        "just",
+        "still",
+        "also",
+        "even",
+        "maybe",
+        "perhaps",
+        "probably",
+        "however",
+        "therefore",
+        "meanwhile",
+        "moreover",
+        "because",
+        "although",
+        "though",
+        "while",
+        "since",
+        "when",
+        "where",
+        "which",
+        "who",
+        "what",
+        "why",
+        "how",
+        "yes",
+        "sure",
+        "thanks",
+        "sorry",
+        "can",
+        "could",
+        "would",
+        "should",
+        "will",
+        "shall",
+        "may",
+        "might",
+        "must",
+        "do",
+        "does",
+        "did",
+        "are",
+        "am",
+        "be",
+        "been",
+        "have",
+        "has",
+        "had",
+        "was",
+        "were",
+        "here",
+        "there",
+        "they",
+        "she",
+        "he",
+        "all",
+        "some",
+        "any",
+        "every",
+        "each",
+        "both",
+        "only",
+        "always",
+        "sometimes",
+        "usually",
+        "often",
+        "first",
+        "second",
+        "third",
+        "next",
+        "finally",
+        "then",
+        "please",
+        // Spanish
+        "bueno",
+        "entonces",
+        "pues",
+        "vale",
+        "mira",
+        "oye",
+        "claro",
+        "hola",
+        "gracias",
+        "pero",
+        "porque",
+        "como",
+        "cuando",
+        "donde",
+        "este",
+        "esta",
+        "esto",
+        // French
+        "alors",
+        "bon",
+        "donc",
+        "mais",
+        "oui",
+        "merci",
+        "bonjour",
+        "salut",
+        "vraiment",
+        "pour",
+        "avec",
+        "dans",
+        "qui",
+        "que",
+        "quoi",
+        "enfin",
+        "ben",
+        "euh",
+        // German
+        "also",
+        "ja",
+        "doch",
+        "aber",
+        "oder",
+        "und",
+        "ich",
+        "wir",
+        "sie",
+        "das",
+        "der",
+        "die",
+        "ein",
+        "eine",
+        "gut",
+        "hallo",
+        "danke",
+        "bitte",
+        "eigentlich",
+        "genau",
+        "halt",
+        // Italian
+        "allora",
+        "comunque",
+        "quindi",
+        "ecco",
+        "ciao",
+        "grazie",
+        "prego",
+        "ma",
+        "che",
+        "come",
+        "quando",
+        "dove",
+        "certo",
+        // Portuguese
+        "tipo",
+        "olha",
+        "bom",
+        "entao",
+        "mas",
+        "sim",
+        "obrigado",
+        "obrigada",
+        "oi",
+        "ola",
+        "assim",
+        // Dutch
+        "nou",
+        "dus",
+        "maar",
+        "hoi",
+        "bedankt",
+        "eigenlijk",
+        "precies",
+    ];
+    let lower = word.to_ascii_lowercase();
+    SENTENCE_INITIAL_WAIVABLE_TERMS.contains(&lower.as_str())
+}
+
+fn find_clause_merged_lowercase_term(
+    candidate: &str,
+    min_start: usize,
+    source_token: &str,
+) -> Option<usize> {
+    let lower_target = source_token.to_ascii_lowercase();
+    let literals = crate::spoken_revision::literal_ranges(candidate);
+    for (start, word) in ascii_tokens(candidate) {
+        if start < min_start || word != lower_target {
+            continue;
+        }
+        let end = start + word.len();
+        if literals.iter().any(|r| r.start < end && start < r.end) {
+            continue;
+        }
+        // Require a genuine mid-sentence / clause-merge prefix (never accept
+        // accidentally lowercasing a sentence opener in place).
+        if !is_sentence_or_clause_start(candidate, start)
+            || candidate[..start]
+                .trim_end()
+                .ends_with([',', '，', ';', '；', ':'])
+        {
+            return Some(end);
+        }
+    }
+    None
+}
+
+fn mask_ranges_with_spaces(text: &str, ranges: &[std::ops::Range<usize>]) -> String {
+    let mut bytes = text.as_bytes().to_vec();
+    for range in ranges {
+        if range.start <= range.end
+            && range.end <= bytes.len()
+            && text.is_char_boundary(range.start)
+            && text.is_char_boundary(range.end)
+        {
+            for b in &mut bytes[range.clone()] {
+                *b = b' ';
+            }
+        }
+    }
+    String::from_utf8(bytes).unwrap_or_else(|_| text.to_owned())
+}
+
+fn immediate_preceding_clause_start(source: &str, cue_start: usize) -> usize {
+    let is_clause_terminator = |idx: usize, ch: char| -> bool {
+        if matches!(
+            ch,
+            '\n' | '\r' | '.' | '?' | '!' | '。' | '？' | '！' | ';' | '；'
+        ) {
+            return true;
+        }
+        if matches!(ch, ':' | '：') {
+            let before_digit = source[..idx]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_ascii_digit());
+            let after_digit = source[idx + ch.len_utf8()..]
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_digit());
+            let url_scheme = source[idx + ch.len_utf8()..].starts_with("//");
+            return !(before_digit && after_digit) && !url_scheme;
+        }
+        false
+    };
+
+    let mut clause_start = source[..cue_start]
+        .rfind(['\n', '\r'])
+        .map_or(0, |pos| pos + 1);
+    let same_sentence_start = source[..cue_start]
+        .char_indices()
+        .rev()
+        .find(|&(idx, ch)| is_clause_terminator(idx, ch))
+        .map_or(clause_start, |(idx, ch)| idx + ch.len_utf8());
+    if !source[same_sentence_start..cue_start].trim().is_empty() {
+        clause_start = same_sentence_start;
+    } else if same_sentence_start > clause_start {
+        // Cue began immediately after a sentence terminator: allow 1 short prior sentence/clause.
+        let before_period = source[..same_sentence_start].trim_end_matches(|ch: char| {
+            ch.is_whitespace() || matches!(ch, '.' | '?' | '!' | '。' | '？' | '！' | ';' | '；')
+        });
+        clause_start = before_period
+            .char_indices()
+            .rev()
+            .find(|&(idx, ch)| is_clause_terminator(idx, ch))
+            .map_or(0, |(idx, ch)| idx + ch.len_utf8());
+    }
+
+    // Tighten compound sentences to the immediate superseded clause (e.g.
+    // "Keep $50,000 and send to Alice at 3pm, scratch that..." keeps $50,000 protected).
+    let span = &source[clause_start..cue_start];
+    let span_lower = span.to_ascii_lowercase();
+    let separators = [" and ", " but ", " so ", " then ", " or "];
+    let english_conjunction_start = separators
+        .iter()
+        .flat_map(|separator| {
+            let mut next_search = 0;
+            let mut matches = Vec::new();
+            while let Some(relative_pos) = span_lower[next_search..].find(separator) {
+                let pos = next_search + relative_pos;
+                let after_sep = clause_start + pos + separator.len();
+                if is_clause_predicate_start(&source[after_sep..cue_start]) {
+                    matches.push((pos, after_sep));
+                }
+                next_search = pos + separator.len();
+            }
+            matches
+        })
+        .max_by_key(|(pos, _)| *pos)
+        .map(|(_, after_sep)| after_sep);
+    let chinese_conjunction_start = ["，但是", "，而且", "，然后", "，所以"]
+        .iter()
+        .filter_map(|separator| {
+            let pos = span.rfind(separator)?;
+            let after_sep = clause_start + pos + separator.len();
+            (after_sep < cue_start && !source[after_sep..cue_start].trim().is_empty())
+                .then_some((pos, after_sep))
+        })
+        .max_by_key(|(pos, _)| *pos)
+        .map(|(_, after_sep)| after_sep);
+    let conjunction_start = match (english_conjunction_start, chinese_conjunction_start) {
+        (Some(english), Some(chinese)) => Some(english.max(chinese)),
+        (Some(english), None) => Some(english),
+        (None, Some(chinese)) => Some(chinese),
+        (None, None) => None,
+    };
+    if let Some(after_sep) = conjunction_start {
+        clause_start = after_sep;
+    }
+    let sub = &source[clause_start..cue_start];
+    let sub_trimmed =
+        sub.trim_end_matches(|ch: char| ch.is_whitespace() || matches!(ch, ',' | '，'));
+    if let Some((comma_pos, comma_ch)) = sub_trimmed
+        .char_indices()
+        .rev()
+        .find(|(_, ch)| matches!(ch, ',' | '，'))
+    {
+        let tail = sub_trimmed[comma_pos + comma_ch.len_utf8()..].trim();
+        let tail_lower = tail.to_ascii_lowercase();
+        let trailing_fragment = tail.chars().count() <= 3
+            || [
+                "at ", "on ", "in ", "for ", "to ", "by ", "with ", "until ", "no ", "wait ",
+            ]
+            .iter()
+            .any(|p| tail_lower.starts_with(p))
+            || matches!(
+                tail_lower.as_str(),
+                "no" | "wait" | "不" | "不对" | "哦" | "啊"
+            );
+        let word_count = tail.split_whitespace().count();
+        if !trailing_fragment && (word_count >= 3 || tail.chars().count() >= 6) {
+            clause_start += comma_pos + comma_ch.len_utf8();
+        }
+    }
+
+    while let Some(ch) = source[clause_start..cue_start].chars().next() {
+        if ch.is_whitespace() {
+            clause_start += ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    clause_start
+}
+
+fn superseded_clause_waivers(source: &str, candidate: &str) -> Vec<std::ops::Range<usize>> {
+    const CUES: &[&str] = &[
+        "actually make that",
+        "sorry, make it",
+        "sorry make it",
+        "scratch that",
+        "i meant",
+        "i mean",
+        "no wait",
+        "wait no",
+        "make that",
+        "correction:",
+        "哦，不对",
+        "哦,不对",
+        "哦不对",
+        "我说错了",
+        "我说不对",
+        "抱歉应该是",
+        "重说一遍",
+        "我是说",
+        "不对，",
+        "不对,",
+        "不对是",
+        "不对改",
+        "，算了",
+        ",算了",
+        "。算了",
+        "还是改成",
+        "，还是改成",
+        ",还是改成",
+        "言い直します",
+        "訂正します",
+        "じゃなくて",
+        "mejor dicho",
+        "o sea,",
+        "digo,",
+        "enfin non,",
+        "je veux dire",
+        "nee warte,",
+        "ich meine",
+        "quer dizer",
+    ];
+    const CONDITIONAL_PREFIXES: &[&str] = &[
+        "if ",
+        "when ",
+        "unless ",
+        "provided ",
+        "as long as ",
+        "whether ",
+        "either ",
+        "suppose ",
+        "assuming ",
+        "如果",
+        "假如",
+        "假设",
+        "万一",
+        "要不是",
+        "si ",
+        "wenn ",
+        "se ",
+    ];
+    let literals = crate::spoken_revision::literal_ranges(source);
+    let source_lower = source.to_ascii_lowercase();
+    let candidate_lower = candidate.to_ascii_lowercase();
+    let mut waivers: Vec<std::ops::Range<usize>> = Vec::new();
+
+    for cue in CUES {
+        let is_ascii_cue = cue.is_ascii();
+        let search_haystack = if is_ascii_cue { &source_lower } else { source };
+        for (cue_start, _) in search_haystack.match_indices(cue) {
+            let cue_end = cue_start + cue.len();
+            if !source.is_char_boundary(cue_start) || !source.is_char_boundary(cue_end) {
+                continue;
+            }
+            if literals
+                .iter()
+                .any(|r| r.start < cue_end && cue_start < r.end)
+            {
+                continue;
+            }
+            if is_ascii_cue {
+                let prev_ok = source[..cue_start]
+                    .chars()
+                    .next_back()
+                    .is_none_or(|ch| !ch.is_alphanumeric() && ch != '_');
+                let next_ok = cue.ends_with(':')
+                    || cue.ends_with(',')
+                    || source[cue_end..]
+                        .chars()
+                        .next()
+                        .is_none_or(|ch| !ch.is_alphanumeric() && ch != '_');
+                if !prev_ok || !next_ok {
+                    continue;
+                }
+            }
+            // Skip protected phrases like "对不对" or "我说不对的时候".
+            let around_start = source[..cue_start]
+                .char_indices()
+                .rev()
+                .nth(2)
+                .map_or(0, |(idx, _)| idx);
+            let around_end = source[cue_end..]
+                .char_indices()
+                .nth(3)
+                .map_or(source.len(), |(idx, _)| cue_end + idx);
+            let around = &source[around_start..around_end];
+            if ["对不对", "我说不对的时候", "你说不对的时候"]
+                .iter()
+                .any(|p| around.contains(p))
+            {
+                continue;
+            }
+            // Do not fire shorter "不对," / "不对，" sub-cues inside an "哦,不对" / "啊,不对" list-backtrack marker.
+            if matches!(*cue, "不对," | "不对，")
+                && ["哦,", "哦，", "哦", "啊,", "啊，", "啊"]
+                    .iter()
+                    .any(|p| source[..cue_start].ends_with(p))
+            {
+                continue;
+            }
+            // Locate start of the immediately preceding superseded clause before the cue.
+            let clause_start = immediate_preceding_clause_start(source, cue_start);
+            let clause = &source[clause_start..cue_start];
+            if clause.trim().is_empty() {
+                continue;
+            }
+            let clause_lower = clause.to_ascii_lowercase();
+            if CONDITIONAL_PREFIXES
+                .iter()
+                .any(|prefix| clause_lower.starts_with(prefix) || clause.starts_with(prefix))
+            {
+                continue;
+            }
+            if clause.contains(['"', '“', '”', '「', '」', '『', '』']) {
+                continue;
+            }
+            if matches!(
+                *cue,
+                "i mean"
+                    | "make that"
+                    | "我是说"
+                    | "o sea,"
+                    | "je veux dire"
+                    | "ich meine"
+                    | "quer dizer"
+            ) && !negation_bindings(clause).is_empty()
+            {
+                continue;
+            }
+            let sentence_end = source[cue_end..]
+                .char_indices()
+                .find(|(_, ch)| matches!(ch, '\n' | '\r' | '.' | '?' | '!' | '。' | '？' | '！'))
+                .map_or(source.len(), |(idx, _)| cue_end + idx);
+            let replacement = source[cue_end..sentence_end].trim_start_matches(|ch: char| {
+                ch.is_whitespace() || matches!(ch, ',' | '，' | ':' | '：' | ';' | '；')
+            });
+            if replacement.trim().is_empty()
+                || sentence_has_question_intent(
+                    &source[clause_start..sentence_end],
+                    source[sentence_end..].chars().next(),
+                )
+            {
+                continue;
+            }
+            // Only activate when candidate resolved the cue (cue removed) AND preserves replacement anchor.
+            let cue_still_in_candidate = if is_ascii_cue {
+                candidate_lower.contains(cue)
+            } else {
+                candidate.contains(cue)
+            };
+            if cue_still_in_candidate {
+                continue;
+            }
+            let anchor_present = revision_decision_anchor_present(replacement, candidate);
+            if !anchor_present {
+                continue;
+            }
+            let mut waived_end = cue_end;
+            while let Some(ch) = source[waived_end..].chars().next() {
+                if matches!(ch, ',' | '，' | ':' | '：' | ' ') {
+                    waived_end += ch.len_utf8();
+                } else {
+                    break;
+                }
+            }
+            let range = clause_start..waived_end.min(sentence_end);
+            if !waivers
+                .iter()
+                .any(|existing| existing.start <= range.start && range.end <= existing.end)
+            {
+                waivers.push(range);
+            }
+        }
+    }
+    collect_bu_shi_shi_waivers(source, candidate, &literals, &mut waivers);
+    waivers
+}
+
+fn collect_bu_shi_shi_waivers(
+    source: &str,
+    candidate: &str,
+    literals: &[std::ops::Range<usize>],
+    waivers: &mut Vec<std::ops::Range<usize>>,
+) {
+    const CONDITIONAL_PREFIXES: &[&str] = &["如果", "假如", "假设", "万一", "要不是"];
+    let mut search_from = 0;
+    while let Some(rel) = source[search_from..].find("不是") {
+        let pos = search_from + rel;
+        let after_bu_shi = pos + "不是".len();
+        search_from = after_bu_shi;
+        if literals
+            .iter()
+            .any(|r| r.start < after_bu_shi && pos < r.end)
+        {
+            continue;
+        }
+        if ["是", "并不", "才", "可", "绝"]
+            .iter()
+            .any(|prefix| source[..pos].ends_with(prefix))
+        {
+            continue;
+        }
+        let sentence_end = source[after_bu_shi..]
+            .char_indices()
+            .find(|(_, ch)| matches!(ch, '\n' | '\r' | '.' | '?' | '!' | '。' | '？' | '！'))
+            .map_or(source.len(), |(idx, _)| after_bu_shi + idx);
+        if source[sentence_end..].starts_with(['?', '？']) {
+            continue;
+        }
+        let prev_clause_start = immediate_preceding_clause_start(source, pos);
+        let prev_clause = &source[prev_clause_start..pos];
+        if prev_clause.contains(['"', '“', '”', '「', '」', '『', '』'])
+            || CONDITIONAL_PREFIXES
+                .iter()
+                .any(|prefix| prev_clause.trim_start().starts_with(prefix))
+        {
+            continue;
+        }
+        let window = &source[after_bu_shi..sentence_end];
+        if sentence_has_question_intent(
+            &source[pos..sentence_end],
+            source[sentence_end..].chars().next(),
+        ) {
+            continue;
+        }
+        let mut shi_match = None;
+        for marker in ["，是", ",是", "是"] {
+            if let Some(m) = window.find(marker) {
+                let shi_start = after_bu_shi + m;
+                let shi_end = shi_start + marker.len();
+                let before_shi = &source[..shi_start];
+                if marker == "是"
+                    && ["不", "就", "也", "总", "老", "只", "可", "倒", "而"]
+                        .iter()
+                        .any(|p| before_shi.ends_with(p))
+                {
+                    continue;
+                }
+                shi_match = Some((shi_start, shi_end));
+                break;
+            }
+        }
+        let Some((shi_start, shi_end)) = shi_match else {
+            continue;
+        };
+        let x = source[after_bu_shi..shi_start].trim();
+        let y = source[shi_end..sentence_end].trim();
+        if x.is_empty()
+            || x.len() > 64
+            || y.is_empty()
+            || x.contains(['"', '“', '”', '「', '」', '『', '』', '?', '？'])
+            || candidate.contains("不是")
+            || !negation_bindings(x).is_empty()
+        {
+            continue;
+        }
+        let anchor_present = revision_decision_anchor_present(y, candidate);
+        if !anchor_present {
+            continue;
+        }
+        let x_trimmed = x.trim_matches(|ch: char| ch.is_whitespace() || matches!(ch, ',' | '，'));
+        if x_trimmed.starts_with("因为") || x_trimmed.starts_with("为了") {
+            continue;
+        }
+        let waive_start = if !prev_clause.trim().is_empty()
+            && negation_bindings(prev_clause).is_empty()
+            && !x_trimmed.is_empty()
+            && prev_clause.contains(x_trimmed)
+        {
+            prev_clause_start
+        } else {
+            pos
+        };
+        let range = waive_start..shi_end.min(sentence_end);
+        if !waivers
+            .iter()
+            .any(|existing| existing.start <= range.start && range.end <= existing.end)
+        {
+            waivers.push(range);
+        }
+    }
+}
+
+fn is_clause_predicate_start(text: &str) -> bool {
+    const CLAUSE_PREDICATES: &[&str] = &[
+        "approve", "approved", "ask", "call", "change", "check", "close", "confirm", "create",
+        "delete", "deploy", "do", "email", "fix", "forward", "hold", "include", "install", "keep",
+        "leave", "list", "make", "mark", "move", "notify", "open", "paste", "push", "remove",
+        "review", "run", "save", "send", "set", "share", "ship", "start", "stop", "submit", "take",
+        "test", "turn", "update", "use", "wait", "write",
+    ];
+    let first = text
+        .trim_start()
+        .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+        .next();
+    first.is_some_and(|word| {
+        CLAUSE_PREDICATES
+            .iter()
+            .any(|predicate| word.eq_ignore_ascii_case(predicate))
+    })
+}
+
+fn revision_decision_anchor_present(replacement: &str, candidate: &str) -> bool {
+    let normalize = |text: &str| {
+        text.chars()
+            .filter(|ch| ch.is_alphanumeric())
+            .flat_map(char::to_lowercase)
+            .collect::<String>()
+    };
+    let replacement = normalize(replacement);
+    !replacement.is_empty() && normalize(candidate).contains(&replacement)
+}
+
+fn sentence_has_question_intent(text: &str, following_terminator: Option<char>) -> bool {
+    if matches!(following_terminator, Some('?' | '？')) {
+        return true;
+    }
+    let without_terminal_punctuation = text.trim_end_matches(|ch: char| {
+        matches!(
+            ch,
+            '.' | '!' | '?' | '。' | '！' | '？' | ',' | '，' | ';' | '；'
+        )
+    });
+    ["吗", "嘛", "么", "呢"]
+        .iter()
+        .any(|particle| without_terminal_punctuation.trim_end().ends_with(particle))
+}
+
+fn conditional_predicate_anchor(tail: &str) -> String {
+    const FILLERS: &[&str] = &[
+        "um",
+        "uh",
+        "er",
+        "ah",
+        "hmm",
+        "erm",
+        "那个",
+        "这个",
+        "就是说",
+        "嗯",
+        "啊",
+        "呃",
+        "额",
+        "えっと",
+        "あの",
+    ];
+    const DETERMINERS: &[&str] = &[
+        "the", "a", "an", "this", "that", "these", "those", "your", "our", "their", "my", "its",
+        "any", "no", "all",
+    ];
+
+    let mut slice = tail;
+    loop {
+        slice = slice.trim_start_matches(|ch: char| {
+            ch.is_whitespace()
+                || matches!(ch, ',' | '，' | ';' | '；' | ':' | '：' | '-' | '—' | '、')
+        });
+        let lower = slice.to_lowercase();
+        let mut stripped = false;
+        for filler in FILLERS {
+            let matches_filler = if filler.is_ascii() {
+                lower.starts_with(filler)
+                    && slice
+                        .get(filler.len()..)
+                        .and_then(|rest| rest.chars().next())
+                        .is_none_or(|ch| !ch.is_alphanumeric() && ch != '_')
+            } else {
+                slice.starts_with(filler)
+                    && (!matches!(*filler, "那个" | "这个")
+                        || slice
+                            .get(filler.len()..)
+                            .and_then(|rest| rest.chars().next())
+                            .is_some_and(|ch| {
+                                ch.is_whitespace() || matches!(ch, ',' | '，' | '、')
+                            }))
+            };
+            if matches_filler {
+                slice = &slice[filler.len()..];
+                stripped = true;
+                break;
+            }
+        }
+        if !stripped {
+            break;
+        }
+    }
+
+    let Some(first_ch) = slice.chars().find(|ch| ch.is_alphanumeric()) else {
+        return String::new();
+    };
+    if !first_ch.is_ascii() {
+        let mut out = String::new();
+        for ch in slice.chars() {
+            if ch.is_alphanumeric() {
+                for lc in ch.to_lowercase() {
+                    out.push(lc);
+                }
+                if out.chars().count() >= 2 {
+                    break;
+                }
+            } else if !out.is_empty() {
+                break;
+            }
+        }
+        return out;
+    }
+
+    let first_start = slice.find(first_ch).unwrap_or(0);
+    let mut rem = &slice[first_start..];
+    let first_end = rem
+        .char_indices()
+        .find(|(_, ch)| !ch.is_alphanumeric() && *ch != '_')
+        .map_or(rem.len(), |(idx, _)| idx);
+    let w1: String = rem[..first_end]
+        .chars()
+        .flat_map(char::to_lowercase)
+        .collect();
+    if DETERMINERS.contains(&w1.as_str()) {
+        rem = rem[first_end..].trim_start_matches(|ch: char| !ch.is_alphanumeric());
+        let second_end = rem
+            .char_indices()
+            .find(|(_, ch)| !ch.is_alphanumeric() && *ch != '_')
+            .map_or(rem.len(), |(idx, _)| idx);
+        let w2: String = rem[..second_end]
+            .chars()
+            .flat_map(char::to_lowercase)
+            .collect();
+        return format!("{w1}{w2}");
+    }
+    w1
+}
+
+fn conditional_clause_signatures_excluding(
+    text: &str,
+    waivers: &[std::ops::Range<usize>],
+) -> Vec<String> {
+    const CONDITIONAL_MARKERS: &[&str] = &[
+        "provided that",
+        "as long as",
+        "only if",
+        "unless",
+        "whether",
+        "assuming",
+        "suppose",
+        "when",
+        "if",
+        "otherwise",
+        "either",
+        "or",
+        "until",
+        "只要",
+        "除非",
+        "如果",
+        "假如",
+        "假设",
+        "万一",
+        "要不是",
+    ];
+    let literals = crate::spoken_revision::literal_ranges(text);
+    let lower = text.to_ascii_lowercase();
+    let mut signatures = Vec::new();
+    for marker in CONDITIONAL_MARKERS {
+        let marker_is_ascii = marker.is_ascii();
+        let haystack = if marker_is_ascii {
+            lower.as_str()
+        } else {
+            text
+        };
+        for (start, _) in haystack.match_indices(marker) {
+            let end = start + marker.len();
+            if literals
+                .iter()
+                .any(|range| range.start < end && start < range.end)
+                || waivers
+                    .iter()
+                    .any(|range| range.start < end && start < range.end)
+            {
+                continue;
+            }
+            if marker_is_ascii {
+                let prev_ok = text[..start]
+                    .chars()
+                    .next_back()
+                    .is_none_or(|ch| !ch.is_alphanumeric() && ch != '_');
+                let next_ok = text[end..]
+                    .chars()
+                    .next()
+                    .is_none_or(|ch| !ch.is_alphanumeric() && ch != '_');
+                if !prev_ok || !next_ok {
+                    continue;
+                }
+            }
+            let sentence_end = text[end..]
+                .char_indices()
+                .find(|(_, ch)| matches!(ch, '.' | '?' | '!' | '。' | '？' | '！' | '\n' | '\r'))
+                .map_or(text.len(), |(offset, _)| end + offset);
+            let normalized = if *marker == "otherwise" {
+                "otherwise".to_owned()
+            } else {
+                let anchor = conditional_predicate_anchor(&text[end..sentence_end]);
+                if anchor.is_empty() {
+                    (*marker).to_owned()
+                } else {
+                    format!("{marker}:{anchor}")
+                }
+            };
+            signatures.push((start, normalized));
+        }
+    }
+    signatures.sort_by_key(|(start, _)| *start);
+    signatures
+        .into_iter()
+        .map(|(_, signature)| signature)
         .collect()
 }
 
@@ -4160,14 +5207,14 @@ fn auxiliary_negation_expansion(
 }
 
 pub(crate) fn contains_negation(text: &str) -> bool {
-    let normalized = text.to_ascii_lowercase().replace(['’', '‘', 'ʼ'], "'");
+    let normalized = text.to_lowercase().replace(['’', '‘', 'ʼ'], "'");
     !negation_marker_ranges(&normalized).is_empty()
 }
 
 // Recognized markers are a finite guard, not a semantic classifier.
 fn negation_bindings(text: &str) -> Vec<(String, Option<usize>)> {
-    // Fold English casing and common curly apostrophes before matching.
-    let normalized = text.to_ascii_lowercase().replace(['’', '‘', 'ʼ'], "'");
+    // Fold casing and common curly apostrophes before matching.
+    let normalized = text.to_lowercase().replace(['’', '‘', 'ʼ'], "'");
     let text = normalized.as_str();
     let ranges = negation_marker_ranges(text);
     if ranges.is_empty() {
@@ -4249,7 +5296,7 @@ fn negation_content_and_targets(
     text: &str,
     bindings: &[(String, Option<usize>)],
 ) -> (Vec<String>, Vec<Option<usize>>) {
-    let normalized = text.to_ascii_lowercase().replace(['’', '‘', 'ʼ'], "'");
+    let normalized = text.to_lowercase().replace(['’', '‘', 'ʼ'], "'");
     let text = normalized.as_str();
     let ranges = negation_expression_ranges(text);
     let content = negation_content_tokens(text, &ranges);
@@ -4284,9 +5331,12 @@ fn negation_marker_ranges(text: &str) -> Vec<(usize, usize, &'static str)> {
             'd' => &["doesn't", "don't", "didn't"],
             'h' => &["haven't", "hasn't", "hadn't"],
             'i' => &["isn't"],
+            'j' => &["jamais", "jamás"],
+            'k' => &["keine", "kein"],
             'm' => &["mustn't"],
             'n' => &[
-                "needn't", "neither", "nor", "nobody", "nothing", "never", "none", "not", "no",
+                "needn't", "neither", "nicht", "nor", "nobody", "nothing", "never", "none", "nein",
+                "not", "non", "no", "nunca", "não", "nao",
             ],
             's' => &["shouldn't"],
             'w' => &["wouldn't", "wasn't", "weren't", "won't", "without"],
@@ -4307,9 +5357,9 @@ fn negation_marker_ranges(text: &str) -> Vec<(usize, usize, &'static str)> {
             let end = start + marker.len();
             let before = text[..start].chars().next_back();
             let after = text[end..].chars().next();
-            if marker.is_ascii()
-                && (before.is_some_and(|ch| ch.is_ascii_alphanumeric() || ch == '_')
-                    || after.is_some_and(|ch| ch.is_ascii_alphanumeric() || ch == '_'))
+            if marker.chars().any(|c| c.is_ascii_alphabetic())
+                && (before.is_some_and(|ch| ch.is_alphanumeric() || ch == '_')
+                    || after.is_some_and(|ch| ch.is_alphanumeric() || ch == '_'))
             {
                 continue;
             }
@@ -7695,5 +8745,218 @@ mod tests {
             "rows": rows,
         });
         println!("VOICEFLOW_TASK34_SYNTHETIC_BASELINE={report}");
+    }
+
+    #[test]
+    fn phase2b_sentence_initial_clause_merge_and_chinese_filler_waivers() {
+        let check = |src: &str, cand: &str| {
+            preserves_with_source_term_waivers(src, cand, Some(CleanupOperation::Cleanup), &[])
+        };
+        // Sentence-initial opener & auxiliary waiver
+        assert!(check("Basically we ship today.", "We ship today."));
+        assert!(check("Actually I fixed it.", "I fixed it."));
+        // Clause merge lowercase folding at sentence start, while mid-sentence ProperNoun stays protected
+        assert!(check("Done. Fix it.", "Done, fix it."));
+        assert!(!check("Wait for Alice. Fix it.", "Wait for alice, fix it."));
+        // Comma-less Chinese hesitation filler waived, while referent "那个项目" stays protected
+        assert!(check("我觉得那个明天可以发布", "我觉得明天可以发布"));
+        assert!(!check(
+            "我觉得那个项目明天可以发布",
+            "我觉得项目明天可以发布"
+        ));
+        assert!(!check("那个问题要复盘", "问题要复盘。"));
+    }
+
+    #[test]
+    fn phase2b_superseded_clause_waiver_allows_explicit_self_correction_but_blocks_conditionals_and_quotes(
+    ) {
+        let check = |src: &str, cand: &str| {
+            preserves_with_source_term_waivers(src, cand, Some(CleanupOperation::Cleanup), &[])
+        };
+        // Valid English & Chinese spoken self-correction cues
+        assert!(check(
+            "Send to Alice at 3pm, scratch that, send to Bob at 4pm",
+            "Send to Bob at 4pm."
+        ));
+        assert!(check("不要发给张三，算了发给李四", "发给李四。"));
+        // Adversarial: dropping replacement or deleting without revision cue stays blocked
+        assert!(!check(
+            "Send to Alice at 3pm, scratch that, send to Bob at 4pm",
+            "Send to Alice."
+        ));
+        // Adversarial: conditional and quoted contexts must not be waived
+        assert!(!check(
+            "If he says scratch that send to Alice at 3pm then send to Bob at 4pm",
+            "If he says send to Bob at 4pm"
+        ));
+        assert!(!check(
+            "He wrote \"Send to Alice at 3pm, scratch that, send to Bob at 4pm\"",
+            "He wrote \"Send to Bob at 4pm\""
+        ));
+        // Conditional prefixes and their bounded predicates carry scope.
+        for (source, candidate) in [
+            ("unless approved, deploy today", "Deploy today."),
+            ("when approved, deploy today", "Deploy today."),
+            ("When approved, deploy today", "Deploy today."),
+            (
+                "unless the security team approves, do not deploy",
+                "Unless the alarm sounds, do not deploy.",
+            ),
+            (
+                "when the security team approves, do not deploy",
+                "When the alarm sounds, do not deploy.",
+            ),
+            ("otherwise deploy today", "Deploy today."),
+            ("either stage or deploy today", "Deploy today."),
+        ] {
+            assert!(!check(source, candidate), "source={source:?}");
+        }
+        assert!(check(
+            "unless approved deploy today",
+            "Unless approved, deploy today."
+        ));
+        assert!(check(
+            "when approved deploy today",
+            "When approved, deploy today."
+        ));
+        assert!(check("otherwise deploy today", "Otherwise, deploy today."));
+        assert!(check(
+            "either stage or deploy today",
+            "Either stage or deploy today."
+        ));
+    }
+
+    #[test]
+    fn phase2b_sentence_initial_negations_and_conditionals_are_never_waived() {
+        assert!(!preserves(
+            "Non, envoyez le rapport.",
+            "Envoyez le rapport.",
+            Some(CleanupOperation::Cleanup),
+        ));
+        assert!(!preserves(
+            "Nein, mach das heute.",
+            "Mach das heute.",
+            Some(CleanupOperation::Cleanup),
+        ));
+        assert!(!preserves(
+            "Unless approved, deploy today.",
+            "Deploy today.",
+            Some(CleanupOperation::Cleanup),
+        ));
+    }
+
+    #[test]
+    fn phase2b_superseded_clause_waiver_limits_waiver_to_immediate_clause_and_supports_zh_and_unicode(
+    ) {
+        let check = |src: &str, cand: &str| {
+            preserves_with_source_term_waivers(src, cand, Some(CleanupOperation::Cleanup), &[])
+        };
+        assert!(check(
+            "Keep the Q3 budget at $50,000 and do not delete prod, and send to Alice at 3pm, scratch that, send to Bob at 4pm",
+            "Keep the Q3 budget at $50,000 and do not delete prod, and send to Bob at 4pm.",
+        ));
+        assert!(!check(
+            "Keep the Q3 budget at $50,000 and do not delete prod, and send to Alice at 3pm, scratch that, send to Bob at 4pm",
+            "Send to Bob at 4pm.",
+        ));
+        assert!(!check(
+            "Keep the Q3 budget at $50,000 and do not delete prod, and send to Alice at 3pm, scratch that, send to Bob at 4pm",
+            "Keep the Q3 budget and delete prod, and send to Bob at 4pm.",
+        ));
+        // An unpunctuated clause conjunction limits correction scope.
+        assert!(!check(
+            "Do not delete prod and send to Alice at 3pm, scratch that, send to Bob at 4pm",
+            "Send to Bob at 4pm.",
+        ));
+        assert!(!check(
+            "Do not delete prod and send labels and boxes to Alice at 3pm, scratch that, send them to Bob at 4pm",
+            "Send them to Bob at 4pm.",
+        ));
+        assert!(!check(
+            "Don't delete prod and forward the report to Alice at 3pm, scratch that, forward the report to Bob at 4pm",
+            "Forward the report to Bob at 4pm.",
+        ));
+        assert!(!check(
+            "Keep the package and send it tomorrow, scratch that, hold it until approved",
+            "Keep the package and send it.",
+        ));
+        // The conjunction can also join names; it is not always a clause boundary.
+        assert!(check(
+            "Send to Alice and Bob at 3pm, scratch that, send to Carol at 4pm",
+            "Send to Carol at 4pm.",
+        ));
+        // Do not resolve a correction that changes a question into a statement.
+        assert!(!check(
+            "Send to Alice at 3pm, scratch that, send to Bob at 4pm?",
+            "Send to Bob at 4pm.",
+        ));
+        assert!(!check("不是发给张三，是发给李四吗", "发给李四。"));
+        assert!(!check(
+            "Unless approved send to Alice at 3pm, scratch that, send to Bob at 4pm",
+            "Send to Bob at 4pm.",
+        ));
+        assert!(check("发给张三，还是改成李四", "发给李四。"));
+        assert!(check("不是发给张三，是发给李四", "发给李四。"));
+        assert!(!check("是不是张三要来", "李四要来。"));
+        assert!(check(
+            "Cambiar a mañana, scratch that, enviar hoy",
+            "Enviar hoy.",
+        ));
+        assert!(check("서울로, scratch that, 부산", "부산"));
+        // Do not let "notify"/"不要" match "no"/"不" prefix fragments or bypass independent negations.
+        assert!(!check(
+            "Keep the $50,000 budget, notify Alice at 3pm, scratch that, notify Bob at 4pm",
+            "Notify Bob at 4pm.",
+        ));
+        assert!(check(
+            "Keep the $50,000 budget, notify Alice at 3pm, scratch that, notify Bob at 4pm",
+            "Keep the $50,000 budget, notify Bob at 4pm.",
+        ));
+        assert!(!check(
+            "先确认 Q3 预算，不要发给张三，算了发给李四",
+            "发给李四。",
+        ));
+        assert!(check(
+            "先确认 Q3 预算，不要发给张三，算了发给李四",
+            "先确认 Q3 预算，发给李四。",
+        ));
+        assert!(!check(
+            "先不要删库，不要发给张三，算了发给李四",
+            "发给李四。",
+        ));
+        assert!(!check(
+            "Do not deploy to Alice, make that call to Bob at 4pm",
+            "Call to Bob at 4pm.",
+        ));
+        assert!(!check("不要删库，我是说先测试", "先测试。"));
+        assert!(!check("不是因为张三，而是因为李四", "因为李四。"));
+    }
+
+    #[test]
+    fn final_review_conditional_comma_invariance_and_unicode_waiver_boundaries() {
+        let check = |src: &str, cand: &str| {
+            preserves_with_source_term_waivers(src, cand, Some(CleanupOperation::Cleanup), &[])
+        };
+        assert!(check(
+            "如果你明天有空跟我说一声",
+            "如果你明天有空，跟我说一声。",
+        ));
+        assert!(check(
+            "if you are free tomorrow um let me know",
+            "If you are free tomorrow, let me know.",
+        ));
+        assert!(check(
+            "Meet Tuesday or Wednesday, sorry, make it Thursday.",
+            "Meet Thursday.",
+        ));
+        assert!(!check("Meet Tuesday or Wednesday.", "Meet Thursday."));
+        assert!(check(
+            "Send to Señor later, scratch that, send to naïf tomorrow",
+            "Send to naïf tomorrow.",
+        ));
+        assert!(!check(
+            "Send to Señor or naïf tomorrow.",
+            "Send to naïf tomorrow.",
+        ));
     }
 }

@@ -1,13 +1,13 @@
 import { useEffect, useState, type CSSProperties } from "react";
 import { BorderBeam } from "border-beam";
+import { VoiceBeam } from "voice-glow";
 import { VoiceHudOrb } from "../../src/components/Island/VoiceHudOrb";
 import {
   HUD_LABEL_FADE_MS,
-  HUD_LABEL_OUT_MS,
   HUD_MOTION_MS,
-  HUD_LISTENING_BEAM,
   HUD_PILL_RADIUS_PX,
-  HUD_THINKING_BEAM,
+  HUD_PROCESSING_BEAM,
+  HUD_VOICE_BEAM,
   formatHudElapsed,
   hudOrbFor,
   hudStatusLabel,
@@ -25,23 +25,14 @@ const overlayStyle: CSSProperties = {
 
 function useHudLabel(next: string | null, reduced: boolean) {
   const [text, setText] = useState(next);
-  const [outgoing, setOutgoing] = useState<string | null>(null);
   const [entering, setEntering] = useState(false);
 
   if (next !== text) {
-    setOutgoing(!reduced && text != null && next != null ? text : null);
     setEntering(!reduced && text != null && next != null);
     setText(next);
-  } else if (reduced && (outgoing != null || entering)) {
-    setOutgoing(null);
+  } else if (reduced && entering) {
     setEntering(false);
   }
-
-  useEffect(() => {
-    if (outgoing == null) return undefined;
-    const timer = window.setTimeout(() => setOutgoing(null), HUD_LABEL_OUT_MS);
-    return () => window.clearTimeout(timer);
-  }, [outgoing, text]);
 
   useEffect(() => {
     if (!entering) return undefined;
@@ -49,7 +40,7 @@ function useHudLabel(next: string | null, reduced: boolean) {
     return () => window.clearTimeout(timer);
   }, [entering, text]);
 
-  return { text, outgoing, entering };
+  return { text, entering };
 }
 
 /** A preset visual only: it never presents the demo's timer as microphone evidence. */
@@ -111,7 +102,6 @@ export default function DemoHud({
         ["--voice-pill-height" as string]: "48px",
         ["--hud-motion-duration" as string]: `${HUD_MOTION_MS}ms`,
         ["--hud-label-in-duration" as string]: `${HUD_LABEL_FADE_MS}ms`,
-        ["--hud-label-out-duration" as string]: `${HUD_LABEL_OUT_MS}ms`,
       }}
     >
       <div className={stackClass}>
@@ -133,7 +123,6 @@ export default function DemoHud({
               <span className="voice-pill__title-row">
                 <span className="voice-pill__label-stack" aria-hidden="true">
                   {label.text && <span key={label.text} className={`voice-pill__label${label.entering ? " voice-pill__label--in" : ""}`}>{label.text}</span>}
-                  {label.outgoing && <span key={`out-${label.outgoing}`} className="voice-pill__label voice-pill__label--out">{label.outgoing}</span>}
                 </span>
                 {listening && <time className="voice-pill__elapsed">{formatHudElapsed(elapsedMs)}</time>}
               </span>
@@ -155,12 +144,14 @@ export default function DemoHud({
               </span>
             )}
           </div>
-          <BorderBeam className="voice-pill__beam-fx" {...HUD_LISTENING_BEAM} theme="dark" borderRadius={HUD_PILL_RADIUS_PX} active={false} style={overlayStyle}>
-            <div className="voice-pill__beam-ghost" />
-          </BorderBeam>
-          <div className={`voice-pill__beam-layer${thinking ? "" : " voice-pill__beam-layer--exit"}`}>
-            <BorderBeam className="voice-pill__beam-fx" {...HUD_THINKING_BEAM} theme="dark" borderRadius={HUD_PILL_RADIUS_PX} active={thinking && !reducedMotion && running && pageVisible} style={overlayStyle}>
-              <div className="voice-pill__beam-ghost" />
+          <div className="voice-pill__voice-beam-layer voice-pill__voice-beam-layer--exit">
+            <VoiceBeam className="voice-pill__voice-beam" {...HUD_VOICE_BEAM} level={0} theme="dark" borderRadius={HUD_PILL_RADIUS_PX} active={false} style={overlayStyle}>
+              <div className="voice-pill__voice-beam-ghost" />
+            </VoiceBeam>
+          </div>
+          <div className={`voice-pill__processing-beam-layer${thinking ? "" : " voice-pill__processing-beam-layer--exit"}`}>
+            <BorderBeam className="voice-pill__processing-beam" {...HUD_PROCESSING_BEAM} theme="dark" borderRadius={HUD_PILL_RADIUS_PX} active={thinking && !reducedMotion && running && pageVisible} style={overlayStyle}>
+              <div className="voice-pill__processing-beam-ghost" />
             </BorderBeam>
           </div>
         </div>

@@ -17,6 +17,13 @@ image-path      : /Users/x/Downloads/v2rayN-macos-arm64.dmg
 image-path      : /Users/x/mac-clippy/dist/MacClippy.dmg
 /dev/disk15s1	41504653-0000-11AA-AA11-00306543ECAC	/Volumes/Mac Clippy
 /dev/disk17s1	41504653-0000-11AA-AA11-00306543ECAC	/Volumes/Mac Clippy 1
+================================================
+image-path      : /Users/x/other/rw.999.OtherApp_1.0.0.dmg
+/dev/disk21s1	48465300-0000-11AA-AA11-00306543ECAC	/Volumes/dmg.other1
+================================================
+image-path      : /Users/x/voice-flow/src-tauri/target/release/bundle/macos/rw.30546.VoiceFlow_0.1.4_aarch64.dmg
+/dev/disk22s1	48465300-0000-11AA-AA11-00306543ECAC	/Volumes/dmg.cBP2If
+================================================
 image-path      : /Users/x/voice-flow/.build/release/VoiceFlow.dmg
 /dev/disk34s1	48465300-0000-11AA-AA11-00306543ECAC	/Volumes/VoiceFlow
 /dev/disk35s1	48465300-0000-11AA-AA11-00306543ECAC	/Volumes/VoiceFlow 1
@@ -25,7 +32,7 @@ image-path      : /Users/x/voice-flow/.build/release/VoiceFlow.dmg
 EOF
 
 got="$(printf '%s\n' "${fixture}" | "${LIST}")"
-expected=$'/Volumes/VoiceFlow\n/Volumes/VoiceFlow 1\n/Volumes/VoiceFlow 6'
+expected=$'/Volumes/dmg.cBP2If\n/Volumes/VoiceFlow\n/Volumes/VoiceFlow 1\n/Volumes/VoiceFlow 6'
 [[ "${got}" == "${expected}" ]] || fail "expected VoiceFlow mounts only, got:
 ${got}"
 

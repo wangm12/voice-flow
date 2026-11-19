@@ -42,6 +42,23 @@
         "acceptFirstMouse": true,
         "resizable": false,
         "visible": false
+      },
+      {
+        "label": "preview",
+        "title": "VoiceFlow Preview",
+        "url": "preview.html",
+        "create": false,
+        "width": 480,
+        "height": 300,
+        "resizable": false,
+        "maximizable": false,
+        "center": true,
+        "decorations": true,
+        "alwaysOnTop": true,
+        "visibleOnAllWorkspaces": true,
+        "skipTaskbar": true,
+        "focusable": true,
+        "visible": false
       }
     ],
     "security": {
@@ -61,7 +78,22 @@
       "minimumSystemVersion": "13.0",
       "entitlements": "Entitlements.plist",
       "hardenedRuntime": true,
-      "infoPlist": "Info.plist"
+      "infoPlist": "Info.plist",
+      "dmg": {
+        "background": "icons/dmg-background.png",
+        "windowSize": {
+          "width": 660,
+          "height": 400
+        },
+        "appPosition": {
+          "x": 180,
+          "y": 170
+        },
+        "applicationFolderPosition": {
+          "x": 480,
+          "y": 170
+        }
+      }
     },
     "icon": [
       "icons/32x32.png",

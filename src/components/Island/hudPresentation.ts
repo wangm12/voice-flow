@@ -42,6 +42,7 @@ const FALLBACK_PRESENTATIONS: Record<string, Omit<HudPresentation, "detail">> = 
   accessibility_required: { title: "需要辅助功能权限", subtitle: "开启后可自动输入", icon: "lock", action: { destination: "permissions", label: "打开权限设置" } },
   browser_permission_required: { title: "需要浏览器权限", subtitle: "检查浏览器访问权限", icon: "lock", action: { destination: "permissions", label: "查看权限设置" } },
   secure_input: { title: "无法在此处自动输入", subtitle: "安全输入框会阻止粘贴", icon: "lock", action: { destination: "history", label: "检查历史记录" } },
+  secure_input_owner_unmatched: { title: "系统安全输入阻塞", subtitle: "文字未自动粘贴，检查剪贴板或历史", icon: "lock", action: { destination: "history", label: "检查历史记录" } },
   input_unavailable: { title: "请先选择输入框", subtitle: "将光标放在可编辑位置", icon: "cursor", action: { destination: "history", label: "检查历史记录" } },
   input_changed: { title: "输入框已变化", subtitle: "请先检查当前内容", icon: "target", action: { destination: "history", label: "检查历史记录" } },
   target_changed: { title: "输入目标已变化", subtitle: "先检查输入框内容", icon: "target", action: { destination: "history", label: "检查历史记录" } },

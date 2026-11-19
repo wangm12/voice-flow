@@ -23,7 +23,8 @@
     "lucide-react": "^1.24.0",
     "react": "^19.1.0",
     "react-dom": "^19.1.0",
-    "thinking-orbs": "^0.3.1"
+    "thinking-orbs": "^0.3.1",
+    "voice-glow": "^0.3.0"
   },
   "devDependencies": {
     "@tailwindcss/vite": "^4.3.3",

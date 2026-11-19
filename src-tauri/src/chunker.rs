@@ -232,10 +232,10 @@ pub struct TimedTranscriptChunk {
     pub words: Vec<TimedWord>,
 }
 
-/// Remove a repeated prefix only when provider word timings map unambiguously
-/// to both text strings and identify the same words at the same point in the
-/// actual shared audio window. Missing, malformed, or differently-aligned
-/// timings retain repeated text because duplication is safer than deletion.
+/// Remove a repeated prefix when provider word timings map unambiguously to
+/// both text strings in the shared audio window, or (for untimed providers and
+/// non-space scripts such as CJK/Japanese/Thai) when an overlapping boundary
+/// repeats up to 24 Unicode character clusters across the chunk seam.
 pub fn merge_transcripts_with_timing(mut chunks: Vec<TimedTranscriptChunk>) -> String {
     chunks.sort_by_key(|chunk| chunk.index);
     let mut result = String::new();
@@ -251,14 +251,28 @@ pub fn merge_transcripts_with_timing(mut chunks: Vec<TimedTranscriptChunk>) -> S
             continue;
         }
 
-        let duplicate_prefix = previous
+        let is_adjacent = previous
             .as_ref()
-            .filter(|prev| chunk.index == prev.index.saturating_add(1))
-            .and_then(|prev| matching_timed_prefix_len(prev, &chunk));
-        let remainder = duplicate_prefix
-            .and_then(|word_count| text_prefix_end(&chunk.text, word_count))
-            .map(|end| &chunk.text[end..])
-            .unwrap_or(&chunk.text);
+            .is_some_and(|prev| chunk.index == prev.index.saturating_add(1));
+        let duplicate_prefix = is_adjacent
+            .then(|| {
+                previous
+                    .as_ref()
+                    .and_then(|prev| matching_timed_prefix_len(prev, &chunk))
+            })
+            .flatten();
+        let remainder = if let Some(word_count) = duplicate_prefix {
+            text_prefix_end(&chunk.text, word_count)
+                .map(|end| &chunk.text[end..])
+                .unwrap_or(&chunk.text)
+        } else if is_adjacent {
+            previous
+                .as_ref()
+                .map(|prev| strip_untimed_affix_overlap(&result, prev, &chunk))
+                .unwrap_or(chunk.text.as_str())
+        } else {
+            chunk.text.as_str()
+        };
         result = append_remainder(&result, remainder);
         previous = Some(chunk);
     }
@@ -424,11 +438,181 @@ fn append_remainder(left: &str, remainder: &str) -> String {
         (_, Some(ch)) if ch.is_whitespace() => "",
         (ch, _) if ch.is_whitespace() => "",
         (_, _) if is_punctuation(first) => "",
-        (ch, _) if is_cjk(ch) && is_cjk(first) => "",
-        (ch, _) if is_punctuation(ch) && is_cjk(first) => "",
+        (ch, _) if is_non_space_char(ch) && is_non_space_char(first) => "",
+        (ch, _) if is_punctuation(ch) && is_non_space_char(first) => "",
         _ => " ",
     };
     format!("{left}{separator}{remainder}")
+}
+
+const MAX_AFFIX_OVERLAP_CLUSTERS: usize = 24;
+
+fn is_cluster_continuation(ch: char) -> bool {
+    matches!(
+        ch as u32,
+        0x0300..=0x036F // Combining Diacritical Marks
+            | 0x0591..=0x05C7 // Hebrew marks
+            | 0x064B..=0x065F // Arabic harakat
+            | 0x0670 // Arabic superscript alef
+            | 0x0900..=0x0903 | 0x093A..=0x094F | 0x0951..=0x0957 | 0x0962..=0x0963 // Devanagari marks
+            | 0x0E31 | 0x0E34..=0x0E3A | 0x0E47..=0x0E4E // Thai combining vowels & tone marks
+            | 0x1160..=0x11FF // Hangul Jamo medial/trailing
+            | 0x1AB0..=0x1AFF
+            | 0x1DC0..=0x1DFF
+            | 0x20D0..=0x20FF
+            | 0x3099..=0x309C // Japanese voicing marks (NFD)
+            | 0xFE00..=0xFE0F // Variation selectors
+            | 0xFE20..=0xFE2F
+    )
+}
+
+fn char_cluster_spans(text: &str) -> Vec<(usize, usize)> {
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    let mut join_next = false;
+    for (byte_idx, ch) in text.char_indices() {
+        let end = byte_idx + ch.len_utf8();
+        if join_next {
+            if let Some(last) = spans.last_mut() {
+                last.1 = end;
+            }
+            join_next = ch == '\u{200D}';
+            continue;
+        }
+        if ch == '\u{200D}' {
+            if let Some(last) = spans.last_mut() {
+                last.1 = end;
+                join_next = true;
+                continue;
+            }
+        }
+        if is_cluster_continuation(ch) {
+            if let Some(last) = spans.last_mut() {
+                last.1 = end;
+                continue;
+            }
+        }
+        spans.push((byte_idx, end));
+    }
+    spans
+}
+
+fn is_non_space_char(ch: char) -> bool {
+    is_cjk(ch)
+        || matches!(
+            ch,
+            '\u{3040}'..='\u{30ff}' // Hiragana & Katakana
+                | '\u{31f0}'..='\u{31ff}'
+                | '\u{0e00}'..='\u{0e7f}' // Thai
+        )
+}
+
+fn has_non_space_script(text: &str) -> bool {
+    text.chars().any(is_non_space_char)
+}
+
+/// Strip suffix/prefix character-cluster overlap (up to 24 clusters) across
+/// overlapping chunk seams when word timings are absent (untimed providers)
+/// or non-space scripts (CJK/JP/TH) lack usable per-character timestamps.
+fn strip_untimed_affix_overlap<'a>(
+    accumulated: &str,
+    left: &TimedTranscriptChunk,
+    right: &'a TimedTranscriptChunk,
+) -> &'a str {
+    let raw = right.text.as_str();
+    if accumulated.contains('\n') || raw.contains('\n') {
+        return raw;
+    }
+    if !left.source_end_secs.is_finite()
+        || !right.source_start_secs.is_finite()
+        || left.source_end_secs <= right.source_start_secs
+    {
+        return raw;
+    }
+    if aligned_words(left).is_some() && aligned_words(right).is_some() {
+        // Explicit valid timings exist on both sides and already disproved overlap.
+        return raw;
+    }
+    let untimed = left.words.is_empty() || right.words.is_empty();
+    let non_space = has_non_space_script(accumulated) && has_non_space_script(raw);
+    if !untimed && !non_space {
+        return raw;
+    }
+
+    let overlap_secs = f64::from(left.source_end_secs - right.source_start_secs);
+    let max_non_space_clusters_by_overlap =
+        ((overlap_secs * 10.0).round() as usize).clamp(3, MAX_AFFIX_OVERLAP_CLUSTERS);
+    let max_words_by_overlap = ((overlap_secs * 5.0).ceil() as usize).max(1);
+
+    let trimmed_right = raw.trim_start();
+    if trimmed_right.is_empty() {
+        return raw;
+    }
+
+    let left_spans = char_cluster_spans(accumulated);
+    let right_spans = char_cluster_spans(trimmed_right);
+    let max_len = left_spans
+        .len()
+        .min(right_spans.len())
+        .min(MAX_AFFIX_OVERLAP_CLUSTERS);
+
+    for k in (1..=max_len).rev() {
+        let left_slice_start = left_spans[left_spans.len() - k].0;
+        let left_slice_end = left_spans[left_spans.len() - 1].1;
+        let right_slice_start = right_spans[0].0;
+        let right_slice_end = right_spans[k - 1].1;
+        let left_affix = &accumulated[left_slice_start..left_slice_end];
+        let right_affix = &trimmed_right[right_slice_start..right_slice_end];
+        if left_affix != right_affix {
+            continue;
+        }
+        let overlap_is_non_space = has_non_space_script(right_affix);
+        let next_char = trimmed_right[right_slice_end..].chars().next();
+        let prev_char = left_slice_start
+            .checked_sub(1)
+            .and_then(|_| accumulated[..left_slice_start].chars().last());
+        let starts_ascii_word = right_affix
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_alphanumeric() && !is_non_space_char(ch));
+        let ends_ascii_word = right_affix
+            .chars()
+            .next_back()
+            .is_some_and(|ch| ch.is_alphanumeric() && !is_non_space_char(ch));
+        if starts_ascii_word
+            && prev_char.is_some_and(|ch| {
+                !ch.is_whitespace() && !is_punctuation(ch) && !is_non_space_char(ch)
+            })
+        {
+            continue;
+        }
+        if ends_ascii_word
+            && next_char.is_some_and(|ch| ch.is_alphanumeric() && !is_non_space_char(ch))
+        {
+            continue;
+        }
+        if overlap_is_non_space {
+            if k < 3 || k > max_non_space_clusters_by_overlap {
+                continue;
+            }
+        } else {
+            // For space-delimited scripts, require a word boundary and >= 2 words
+            // (or >= 8 clusters) within the audio overlap speech-rate budget.
+            let ends_on_word_boundary =
+                next_char.is_none_or(|ch| ch.is_whitespace() || is_punctuation(ch));
+            let starts_on_word_boundary =
+                prev_char.is_none_or(|ch| ch.is_whitespace() || is_punctuation(ch));
+            let word_count = right_affix.split_whitespace().count();
+            if !ends_on_word_boundary
+                || !starts_on_word_boundary
+                || (word_count < 2 && k < 8)
+                || word_count > max_words_by_overlap
+            {
+                continue;
+            }
+        }
+        return trimmed_right[right_slice_end..].trim_start_matches(' ');
+    }
+    raw
 }
 
 fn is_cjk(ch: char) -> bool {
@@ -693,7 +877,7 @@ mod tests {
                 timed_chunk(0, "重复这句话", 0.0, 35.0, &[]),
                 timed_chunk(1, "重复这句话", 33.5, 69.888_31, &[]),
             ]),
-            "重复这句话重复这句话"
+            "重复这句话"
         );
     }
 
@@ -707,14 +891,14 @@ mod tests {
     }
 
     #[test]
-    fn missing_or_untrustworthy_word_positions_keep_repeated_text() {
+    fn missing_or_untrustworthy_word_positions_handle_untimed_vs_malformed_timing() {
         assert_eq!(
             merge_untimed(&[
                 (0, "We are ready.", 0.0, 30.0),
                 (1, "We are ready.", 29.5, 60.0),
-            ],),
-            "We are ready. We are ready.",
-            "overlapping audio windows alone do not reveal where speech occurred"
+            ]),
+            "We are ready.",
+            "untimed overlapping English chunks deduplicate at the 24-cluster affix boundary"
         );
 
         let mut malformed = timed_chunk(
@@ -745,14 +929,28 @@ mod tests {
     }
 
     #[test]
-    fn chinese_without_word_alignment_keeps_repeated_referents() {
+    fn chinese_and_non_space_scripts_deduplicate_affix_overlap_within_24_clusters() {
         assert_eq!(
             merge_untimed(&[
                 (0, "这是一个测试内容", 0.0, 30.0),
                 (1, "一个测试内容继续", 29.0, 60.0)
             ]),
-            "这是一个测试内容一个测试内容继续",
-            "without aligned word timing, overlapping character strings remain"
+            "这是一个测试内容继续",
+            "CJK overlap >= 3 clusters deduplicates cleanly across untimed seams"
+        );
+        assert_eq!(
+            merge_untimed(&[
+                (0, "今日はいい天気ですね", 0.0, 30.0),
+                (1, "いい天気ですね散歩しよう", 28.5, 60.0),
+            ]),
+            "今日はいい天気ですね散歩しよう"
+        );
+        assert_eq!(
+            merge_untimed(&[
+                (0, "ทดลองภาษาไทยสวัสดีครับ", 0.0, 30.0),
+                (1, "สวัสดีครับทุกคน", 28.5, 60.0),
+            ]),
+            "ทดลองภาษาไทยสวัสดีครับทุกคน"
         );
         assert_eq!(
             merge_untimed(&[(0, "你好", 0.0, 30.0), (1, "世界", 30.0, 60.0)]),
@@ -761,7 +959,15 @@ mod tests {
         assert_eq!(
             merge_untimed(&[(0, "这是一个测试", 0.0, 30.0), (1, "测试内容", 28.5, 60.0)]),
             "这是一个测试测试内容",
-            "a short repeated referent stays when overlap is ambiguous"
+            "a short 2-char repeated referent stays when overlap is ambiguous"
+        );
+        assert_eq!(
+            merge_untimed(&[
+                (0, "今天我们讨论这个方案的细节", 0.0, 30.0),
+                (1, "今天我们讨论这个方案的细节", 29.8, 60.0),
+            ]),
+            "今天我们讨论这个方案的细节今天我们讨论这个方案的细节",
+            "repetition larger than the audio overlap speech-rate budget stays intact"
         );
     }
 
@@ -785,7 +991,7 @@ mod tests {
         assert_eq!(
             merge_untimed(&[
                 (0, "hello 世界项目", 0.0, 30.0),
-                (1, "世界项目 today", 29.0, 60.0)
+                (1, "世界项目 today", 30.0, 60.0)
             ]),
             "hello 世界项目世界项目 today"
         );

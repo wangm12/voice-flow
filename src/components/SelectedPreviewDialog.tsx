@@ -32,6 +32,16 @@ export type TextActionErrorCode =
 
 export type OrganizeRecipeId = "developer_task" | "work_update" | "todo_list";
 export type OrganizeRecipe = { id: OrganizeRecipeId; version: 1 };
+export type PreviewSourceKind = "selected_text" | "current_field" | "empty_composer" | "screenshot" | "dictation";
+export type PreviewContextSource = "ax" | "ocr" | "cloud_vision" | "ax_nearby_text" | "screenshot";
+export type PreviewProvenanceReceipt = {
+  source_kind: PreviewSourceKind;
+  char_count: number | null;
+  word_count: number | null;
+  screen_captured: boolean | null;
+  context_source: PreviewContextSource[] | null;
+  provider_label: string | null;
+};
 
 export type SelectedActionLifecycle = {
   action_sequence: number;
@@ -65,6 +75,7 @@ export type SelectedActionPreview = {
   final_text: string;
   thumbnail?: string | null;
   replace_allowed: boolean;
+  provenance_receipt?: PreviewProvenanceReceipt | null;
 };
 
 const textActionOperations: readonly TextActionOperation[] = [
@@ -91,6 +102,8 @@ const textActionTargetLabels: readonly TextActionTargetLabel[] = [
 ];
 
 const organizeRecipeIds: readonly OrganizeRecipeId[] = ["developer_task", "work_update", "todo_list"];
+const previewSourceKinds: readonly PreviewSourceKind[] = ["selected_text", "current_field", "empty_composer", "screenshot", "dictation"];
+const previewContextSources: readonly PreviewContextSource[] = ["ax", "ocr", "cloud_vision", "ax_nearby_text", "screenshot"];
 
 const textActionErrorCodes: readonly TextActionErrorCode[] = [
   "no_source",
@@ -138,6 +151,18 @@ export function isSelectedActionPreview(value: unknown): value is SelectedAction
   if (!value || typeof value !== "object") return false;
   const preview = value as Partial<SelectedActionPreview>;
   const recipe = preview.organize_recipe;
+  const receipt = preview.provenance_receipt;
+  const receiptIsValid = receipt === undefined || receipt === null || (
+    typeof receipt === "object"
+    && previewSourceKinds.includes(receipt.source_kind)
+    && (receipt.char_count === null || (Number.isSafeInteger(receipt.char_count) && receipt.char_count >= 0))
+    && (receipt.word_count === null || (Number.isSafeInteger(receipt.word_count) && receipt.word_count >= 0))
+    && (receipt.screen_captured === null || typeof receipt.screen_captured === "boolean")
+    && (receipt.context_source === null || (
+      Array.isArray(receipt.context_source) && receipt.context_source.every((source) => previewContextSources.includes(source))
+    ))
+    && (receipt.provider_label === null || typeof receipt.provider_label === "string")
+  );
   const recipeIsValid = recipe === undefined || recipe === null || (
     preview.kind === "selected" && preview.operation === "organize" && isOrganizeRecipe(recipe)
   );
@@ -158,6 +183,7 @@ export function isSelectedActionPreview(value: unknown): value is SelectedAction
     && typeof preview.transcript === "string"
     && (preview.thumbnail === undefined || preview.thumbnail === null || typeof preview.thumbnail === "string")
     && typeof preview.replace_allowed === "boolean"
+    && receiptIsValid
     && recipeIsValid;
 }
 
@@ -171,6 +197,7 @@ export function SelectedPreviewDialog({
   busy = false,
   error = null,
   restoreFocusRef,
+  standalone = false,
 }: {
   preview: SelectedActionPreview;
   draft: string;
@@ -181,8 +208,9 @@ export function SelectedPreviewDialog({
   busy?: boolean;
   error?: string | null;
   restoreFocusRef?: RefObject<HTMLElement | null>;
+  standalone?: boolean;
 }) {
-  const { t } = useI18n();
+  const { t, language } = useI18n();
   const dialogRef = useRef<HTMLElement>(null);
 
   const operationLabels: Record<TextActionOperation, string> = {
@@ -205,8 +233,23 @@ export function SelectedPreviewDialog({
     empty_composer: "空白回复输入框",
     screen: "已捕获的屏幕",
   };
+  const receiptSourceLabels: Record<PreviewSourceKind, string> = {
+    selected_text: "选中文本",
+    current_field: "当前文本框",
+    empty_composer: "空白回复输入框",
+    screenshot: "窗口截图",
+    dictation: "听写",
+  };
+  const receiptContextLabels: Record<PreviewContextSource, string> = {
+    ax: "辅助功能文字",
+    ocr: "本机 OCR",
+    cloud_vision: "云端视觉",
+    ax_nearby_text: "附近回复文字",
+    screenshot: "截图",
+  };
   const isScreenAssist = preview.operation === "screen_assist";
   const copyOnly = preview.delivery_mode === "clipboard_only" || preview.delivery_notice === "clipboard_only";
+  const receipt = preview.provenance_receipt;
 
   useDialogBehavior({
     open: true,
@@ -217,41 +260,69 @@ export function SelectedPreviewDialog({
   });
 
   return createPortal(
-    <div className="vf-settings fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-6">
-      <div
+    <div className={standalone
+      ? "vf-settings h-full w-full p-2"
+      : "vf-settings fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-6"}>
+      {!standalone && <div
         role="presentation"
         className="absolute inset-0 bg-black/20 backdrop-blur-[2px]"
         onClick={onCancel}
-      />
+      />}
       <section
         ref={dialogRef}
         tabIndex={-1}
         role="dialog"
-        aria-modal="true"
+        aria-modal={standalone ? undefined : "true"}
         aria-labelledby="selected-preview-title"
         onClick={(event) => event.stopPropagation()}
-        style={{ maxHeight: "calc(100dvh - 3rem)" }}
-        className={`relative flex min-h-0 w-full max-w-2xl flex-col overflow-hidden rounded-2xl border ${colors.border} ${colors.bg.card} p-4 sm:p-6 shadow-elevated outline-none ${focusRingClass}`}
+        onKeyDown={(event) => {
+          if (event.nativeEvent.isComposing || event.keyCode === 229) return;
+          if (event.metaKey && !event.ctrlKey && !event.altKey && event.key === "Enter" && !busy && draft.trim()) {
+            event.preventDefault();
+            event.stopPropagation();
+            onConfirm();
+          }
+        }}
+        style={{ maxHeight: standalone ? "100dvh" : "calc(100dvh - 3rem)" }}
+        className={`relative flex min-h-0 ${standalone ? "h-full w-full rounded-xl p-3" : "w-full max-w-2xl rounded-2xl p-4 sm:p-6 shadow-elevated"} flex-col overflow-hidden border ${colors.border} ${colors.bg.card} outline-none ${focusRingClass}`}
       >
         <div className="flex flex-none items-start justify-between gap-4">
           <div>
-            <h2 id="selected-preview-title" className="text-lg font-semibold leading-6 text-primary">
+            <h2 id="selected-preview-title" className={`${standalone ? "text-sm" : "text-lg"} font-semibold leading-6 text-primary`}>
               {isScreenAssist ? t("看屏幕预览") : t("文字操作预览")}
             </h2>
-            <p className="mt-1 text-xs leading-5 text-tertiary">
+            {!standalone && <p className="mt-1 text-xs leading-5 text-tertiary">
               {isScreenAssist
                 ? t("截图和结果只在本次预览中暂存；取消会丢弃，不会保存到历史。")
                 : t("你可以编辑结果。确认前不会写入目标；取消会关闭预览并请求结束当前事务。")}
-            </p>
+            </p>}
           </div>
           <IconButton label={t("关闭")} icon={<X size={16} aria-hidden="true" />} onClick={onCancel} />
         </div>
-        <div className="mt-6 min-h-0 flex-1 space-y-4 overflow-y-auto overscroll-contain">
+        <div className={`${standalone ? "mt-2 space-y-2" : "mt-6 space-y-4"} min-h-0 flex-1 overflow-y-auto overscroll-contain`}>
           <div className="flex flex-wrap gap-x-4 gap-y-1 rounded-lg border border-border bg-elevated/40 px-3 py-2 text-xs">
             <span><span className="text-tertiary">{t("操作")}: </span><span className="font-medium text-primary">{t(preview.organize_recipe ? organizeRecipeLabels[preview.organize_recipe.id] : operationLabels[preview.operation])}</span></span>
             <span><span className="text-tertiary">{t(preview.organize_recipe ? "来源" : "目标")}: </span><span className="font-medium text-primary">{t(targetLabels[preview.target_kind])}</span></span>
             {preview.organize_recipe && <span className="text-tertiary">{t("未提供的信息不会补写")}</span>}
           </div>
+          {receipt && <div data-testid="preview-provenance" className="flex flex-wrap gap-1.5 text-[11px] leading-4" aria-label={t("来源事实")}>
+            <span className="inline-flex items-center rounded-full border border-border bg-elevated/60 px-2 py-1 text-secondary">
+              {t("来源")}: {t(receiptSourceLabels[receipt.source_kind])}
+              {receipt.char_count !== null && <> · {receipt.char_count} {t("字")}</>}
+              {receipt.word_count !== null && <> · {receipt.word_count} {t("词")}</>}
+            </span>
+            {receipt.screen_captured !== null && <span className="inline-flex items-center rounded-full border border-border bg-elevated/60 px-2 py-1 text-secondary">
+              {t(receipt.screen_captured ? "已截屏" : "未截屏")}
+            </span>}
+            {receipt.context_source !== null && (receipt.context_source.length > 0
+              ? <span className="inline-flex items-center rounded-full border border-border bg-elevated/60 px-2 py-1 text-secondary">
+                {t("附加上下文")}: {receipt.context_source.map((source) => t(receiptContextLabels[source])).join(language === "en" ? ", " : "、")}
+              </span>
+              : <span className="inline-flex items-center rounded-full border border-border bg-elevated/60 px-2 py-1 text-secondary">{t("未附加上下文")}</span>)}
+            {receipt.provider_label && <span className="inline-flex items-center rounded-full border border-border bg-elevated/60 px-2 py-1 text-secondary">
+              {t("服务商")}: {receipt.provider_label}
+            </span>}
+          </div>}
           <div>
             <p className="mb-2 text-xs font-medium text-secondary">{t("VoiceFlow 生成结果")}</p>
             <textarea
@@ -259,7 +330,7 @@ export function SelectedPreviewDialog({
               value={draft}
               onChange={(event) => onDraftChange(event.target.value)}
               disabled={busy}
-              rows={5}
+              rows={standalone ? 3 : 5}
               className={`vf-preview-result w-full resize-none rounded-lg border ${colors.border} ${colors.bg.elevated} ${colors.text.primary} px-3 py-2 text-sm leading-6 outline-none focus:border-accent ${focusRingClass}`}
             />
           </div>
@@ -278,7 +349,7 @@ export function SelectedPreviewDialog({
               {t("回复只会作为草稿写入当前输入框或复制，不会发送。")}
             </p>
           )}
-          {isScreenAssist ? <ContextLesson key="screen" /> : <SelectedLesson key="selected" />}
+          {!standalone && (isScreenAssist ? <ContextLesson key="screen" /> : <SelectedLesson key="selected" />)}
           <details className="vf-inline-disclosure border-t border-border pt-3 text-xs text-secondary">
             <summary className={`cursor-pointer rounded-md font-medium text-primary ${focusRingClass}`}>{t("查看来源和指令")}</summary>
             <div className="mt-4 space-y-4">
@@ -310,10 +381,10 @@ export function SelectedPreviewDialog({
           </details>
         </div>
         {error && <p role="alert" className="mt-4 shrink-0 rounded-lg border border-error/30 bg-error/5 px-3 py-2 text-xs leading-5 text-error-ink">{error}</p>}
-        <div className="mt-6 flex flex-none flex-wrap justify-end gap-2">
-          <p role="status" aria-live="polite" className="mr-auto flex min-h-9 items-center text-[13px] leading-5 text-secondary">{busy ? t("处理中…") : ""}</p>
-          <button type="button" onClick={onCancel} className={secondaryButtonClass}>{t("取消")}</button>
-          <button type="button" onClick={onCopy} aria-busy={busy} disabled={busy || !draft.trim()} className={secondaryButtonClass}>
+        <div className={`${standalone ? "mt-2" : "mt-6"} flex flex-none flex-wrap justify-end gap-2`}>
+          <p role="status" aria-live="polite" className="mr-auto flex min-h-8 items-center text-xs text-secondary">{busy ? t("处理中…") : ""}</p>
+          <button type="button" onClick={onCancel} className={standalone ? `vf-button h-8 rounded-lg bg-elevated px-2 text-xs text-secondary ${focusRingClass}` : secondaryButtonClass}>{t("取消")}</button>
+          <button type="button" onClick={onCopy} aria-busy={busy} disabled={busy || !draft.trim()} className={standalone ? `vf-button inline-flex h-8 items-center justify-center gap-1 rounded-lg bg-elevated px-2 text-xs text-secondary disabled:opacity-50 ${focusRingClass}` : secondaryButtonClass}>
             <Copy size={14} aria-hidden="true" />
             {t("只复制")}
           </button>
@@ -322,7 +393,7 @@ export function SelectedPreviewDialog({
             onClick={onConfirm}
             aria-busy={busy}
             disabled={busy || !draft.trim()}
-            className={buttonClass}
+            className={standalone ? `vf-button inline-flex h-8 items-center justify-center gap-1 rounded-lg border border-action-border bg-action px-3 text-xs font-medium text-action-foreground disabled:opacity-50 ${focusRingClass}` : buttonClass}
           >
             <Check size={14} aria-hidden="true" />
             {copyOnly ? t("确认并复制") : t("确认")}

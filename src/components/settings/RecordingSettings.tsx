@@ -1,6 +1,6 @@
 import { audioRetentionOptions as retentionOptions, historyRetentionOptions } from "../../lib/retention";
-import { Select } from "../Select";
 import { invoke } from "@tauri-apps/api/core";
+import { Select } from "../Select";
 import { FnHotkeyNote } from "../FnHotkeyNote";
 import { useCallback, useState } from "react";
 import { ClampedNumberInput } from "./ClampedNumberInput";
@@ -14,18 +14,19 @@ import { useI18n } from "../../lib/i18n";
 import { formatHotkeyDisplay, isFnOnlyHotkey } from "../../lib/hotkeyFormat";
 import { asrLanguageDescription, providerOf } from "../../lib/engineWizard";
 import { asrModelProfile } from "../../lib/providers";
-import { inputClass } from "../../lib/theme";
+import { MAX_PREFERRED_LANGUAGES, PREFERRED_LANGUAGE_OPTIONS, SUPPORTED_LANGUAGES, languageSupportedByModel, modelLanguageSupport, normalizePreferredLanguages } from "../../lib/languages";
+import { compactButtonClass, inputClass } from "../../lib/theme";
+import { friendlySettingsError } from "../../lib/settingsError";
 import type { SaveSettings, Settings } from "../../types/settings";
 
 const controlClass = inputClass;
-const selectClass = `${controlClass} w-40`;
+const selectClass = `${controlClass} w-44`;
 
 export function RecordingSettings({ settings, save, saveFailure, dictationBusy = false, onOpenPermissions, onOpenMappings }: { settings: Settings; save: SaveSettings; saveFailure?: SettingsSaveFailure | null; dictationBusy?: boolean; onOpenPermissions?: () => void; onOpenMappings?: () => void }) {
   const { t } = useI18n();
-  const [modeSaving, setModeSaving] = useState(false);
-  const [modeError, setModeError] = useState<string | null>(null);
   const [captureBusy, setCaptureBusy] = useState<Record<string, boolean>>({});
   const [captureErrors, setCaptureErrors] = useState<Record<string, string | null>>({});
+  const [permissionNoticeError, setPermissionNoticeError] = useState<string | null>(null);
   const updateBusy = useCallback((target: string, busy: boolean) => {
     setCaptureBusy((previous) => previous[target] === busy ? previous : { ...previous, [target]: busy });
   }, []);
@@ -34,12 +35,24 @@ export function RecordingSettings({ settings, save, saveFailure, dictationBusy =
   }, []);
   const otherCaptureBusy = (target: string) => Object.entries(captureBusy).some(([key, busy]) => key !== target && busy);
   const extraShortcutsBusy = Object.entries(captureBusy).some(([key, busy]) => key !== "dictation" && busy);
+  const modeError = saveFailure?.fields.includes("activation_mode") ? saveFailure.message : null;
+  const languageError = saveFailure?.fields.some((field) => field === "language" || field === "preferred_languages") ? saveFailure.message : null;
+  const preferredLanguages = normalizePreferredLanguages(settings.preferred_languages);
   const advancedSaveError = saveFailure?.fields.some((field) => ["input_gain", "chunk_threshold_secs", "chunk_length_secs"].includes(field)) ? saveFailure.message : null;
-  const shortcutSaveError = saveFailure?.fields.some((field) => ["selected_action_hotkey", "selected_actions_enabled", "translation_hotkey", "translation_target_language", "screen_action_hotkey", "screen_actions_enabled", "verbatim_hotkey"].includes(field)) ? saveFailure.message : null;
+  const shortcutSaveError = saveFailure?.fields.some((field) => ["selected_action_hotkey", "selected_actions_enabled", "translation_hotkey", "screen_action_hotkey", "screen_actions_enabled", "verbatim_hotkey"].includes(field)) ? saveFailure.message : null;
   const extraShortcutsError = Object.entries(captureErrors).find(([key, error]) => key !== "dictation" && error)?.[1];
   const configuredShortcuts = [settings.selected_action_hotkey, settings.translation_hotkey, settings.screen_action_hotkey, settings.verbatim_hotkey].filter((hotkey) => hotkey?.trim()).length;
+  const hasEnabledUnboundShortcut = Boolean(settings.selected_actions_enabled && !settings.selected_action_hotkey?.trim());
+  const hotkeyErrorMessage = settings.hotkey_error === "input_monitoring_required" || settings.hotkey_error === "modifier_event_tap_unavailable"
+    ? friendlySettingsError(settings.hotkey_error, t)
+    : settings.hotkey_error;
   const asrProvider = providerOf(settings.asr_provider, settings.asr_base_url);
   const asrProfile = asrModelProfile(asrProvider, settings.asr_model);
+  const langSupport = modelLanguageSupport(asrProvider, settings.asr_model);
+  const languageAllowed = languageSupportedByModel(asrProvider, settings.asr_model, settings.language);
+  const languageOptions = SUPPORTED_LANGUAGES.filter((item) =>
+    langSupport.allowedCodes.includes(item.code) || item.code === settings.language,
+  );
   return (
     <SettingsShell>
       <SettingsPageHeader title={t("录音与输出")} description={t("快捷键、识别语言、输出方式和本地存储。")} saveHint={t("更改自动保存")} />
@@ -47,14 +60,23 @@ export function RecordingSettings({ settings, save, saveFailure, dictationBusy =
         <SettingsRow title={t("全局快捷键")} description={t("在任何 App 中开始听写，设置自动保存。") }>
           <HotkeyRecorder
             compact
-            disabled={dictationBusy || modeSaving || otherCaptureBusy("dictation")}
+            disabled={dictationBusy || otherCaptureBusy("dictation")}
             onCaptureBusyChange={(busy) => updateBusy("dictation", busy)}
             onCaptureErrorChange={(error) => updateError("dictation", error)}
             value={settings.hotkey}
             onChange={(hotkey, options) => save({ hotkey }, options)}
           />
         </SettingsRow>
-        {settings.hotkey_error && <p role="alert" className="px-5 pb-4 text-xs leading-5 text-error-ink">{t("快捷键注册失败：")}{settings.hotkey_error}。{t("请重新设置一个快捷键。")}</p>}
+        {hotkeyErrorMessage && <p role="alert" className="px-5 pb-4 text-xs leading-5 text-error-ink">{t("快捷键注册失败：")}{hotkeyErrorMessage}。{t("请重新设置一个快捷键。")}</p>}
+        {settings.hotkey_notice === "combo_release_uses_carbon_fallback" && (
+          <div role="note" className="px-5 pb-4 text-xs leading-5 text-secondary">
+            <p>{t("修饰键提前释放检测当前不可用；组合快捷键仍可使用，但结束录音会等到整组按键松开。输入监控只读取按键状态，不读取输入内容。")}</p>
+            <button type="button" className={`mt-1 ${compactButtonClass}`} onClick={() => {
+              void invoke("open_privacy_settings", { pane: "input_monitoring" }).catch(() => setPermissionNoticeError(t("无法打开输入监控设置，请从系统设置的隐私与安全性中打开。")));
+            }}>{t("打开输入监控设置")}</button>
+            {permissionNoticeError && <p role="alert" className="mt-1 text-error-ink">{permissionNoticeError}</p>}
+          </div>
+        )}
         <SettingsRow
           title={t("录音方式")}
           description={(
@@ -67,15 +89,10 @@ export function RecordingSettings({ settings, save, saveFailure, dictationBusy =
           <Select
             aria-label={t("录音方式")}
             value={settings.activation_mode}
-            disabled={dictationBusy || modeSaving || Object.values(captureBusy).some(Boolean)}
+            disabled={dictationBusy || Object.values(captureBusy).some(Boolean)}
             onValueChange={(value) => {
-              if (value !== "tap" && value !== "hold_to_talk") return;
-              setModeSaving(true);
-              setModeError(null);
-              void invoke("update_settings_patch", { patch: { activation_mode: value } })
-                .then(() => save({ activation_mode: value }, { persist: false }))
-                .catch((reason) => setModeError(String(reason)))
-                .finally(() => setModeSaving(false));
+              if (value !== "tap" && value !== "hold_to_talk" && value !== "hybrid_hold_lock") return;
+              save({ activation_mode: value }, { immediate: true });
             }}
             className={`${controlClass} w-40 max-w-full`}
           >
@@ -85,8 +102,81 @@ export function RecordingSettings({ settings, save, saveFailure, dictationBusy =
         {modeError && <p role="alert" className="px-5 pb-4 text-xs text-error-ink">{modeError}</p>}
         {isFnOnlyHotkey(settings.hotkey) && <div className="px-5 pb-2"><FnHotkeyNote hotkey={settings.hotkey} /></div>}
         <SettingsRow title={t("识别语言")} description={asrLanguageDescription(asrProfile, settings.language, t)}>
-          <Select aria-label={t("识别语言")} value={settings.language} onValueChange={(value) => save({ language: value })} className={selectClass}><option value="auto">{t("自动检测")}</option><option value="zh">{t("中文")}</option><option value="en">{t("English")}</option></Select>
+          <Select aria-label={t("识别语言")} value={settings.language} onValueChange={(value) => save({ language: value }, { immediate: true })} className={selectClass}>
+            {languageOptions.map((item) => {
+              const supported = langSupport.allowedCodes.includes(item.code);
+              const baseLabel = item.code === "auto"
+                ? t("自动检测")
+                : item.code === "zh"
+                  ? t("中文（简体）")
+                  : item.code === "zh-TW"
+                    ? t("繁體中文")
+                    : item.nativeName;
+              return (
+                <option key={item.code} value={item.code} disabled={!supported}>
+                  {supported ? baseLabel : `${baseLabel} (${t("当前模型不支持")})`}
+                </option>
+              );
+            })}
+          </Select>
         </SettingsRow>
+        {!languageAllowed && (
+          <p role="alert" className="px-5 pb-3 text-xs text-error-ink">
+            {t("当前所选识别语言不受当前转写模型支持，请改选支持列表中的语言。")}
+          </p>
+        )}
+        {settings.language === "auto" && langSupport.hintsAllowed && (
+          <div className="border-t border-border px-5 py-4">
+            <div className="flex flex-wrap items-baseline justify-between gap-2">
+              <div>
+                <p className="text-[13px] font-medium text-primary">{t("常用口述语言（可选）")}</p>
+                <p className="mt-0.5 text-xs leading-5 text-secondary">
+                  {t("留空将对全部支持语言使用无偏向自动检测；需要中英或日英等双语混说时，最多可勾选 4 种常用语言作为候选提示。")}
+                </p>
+              </div>
+              {preferredLanguages.length > 0 && (
+                <button
+                  type="button"
+                  onClick={() => save({ preferred_languages: [] }, { immediate: true })}
+                  className="text-xs text-secondary underline hover:text-primary"
+                >
+                  {t("清空（无偏向自动检测）")}
+                </button>
+              )}
+            </div>
+            <div className="mt-3 flex flex-wrap gap-1.5" role="group" aria-label={t("常用口述语言（可选）")}>
+              {PREFERRED_LANGUAGE_OPTIONS.filter(
+                (item) => langSupport.allowedCodes.includes(item.code) || preferredLanguages.includes(item.code),
+              ).map((item) => {
+                const selected = preferredLanguages.includes(item.code);
+                const disabled = !selected && preferredLanguages.length >= MAX_PREFERRED_LANGUAGES;
+                const label = item.code === "zh" ? t("中文（简体）") : item.code === "zh-TW" ? t("繁體中文") : item.nativeName;
+                return (
+                  <button
+                    key={item.code}
+                    type="button"
+                    aria-pressed={selected}
+                    disabled={disabled}
+                    onClick={() => {
+                      const next = selected
+                        ? preferredLanguages.filter((code) => code !== item.code)
+                        : [...preferredLanguages, item.code];
+                      save({ preferred_languages: next }, { immediate: true });
+                    }}
+                    className={`rounded-md border px-2.5 py-1 text-xs transition ${
+                      selected
+                        ? "border-accent bg-accent/15 font-medium text-primary"
+                        : "border-border bg-elevated text-secondary hover:text-primary disabled:opacity-45"
+                    }`}
+                  >
+                    {label}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        )}
+        {languageError && <p role="alert" className="px-5 pb-4 text-xs text-error-ink">{languageError}</p>}
         <SettingsRow title={t("输出方式")} description={t("自动优先粘贴；目标未接收时，保留文字并复制到剪贴板。") }>
           <Select aria-label={t("输出方式")} value={settings.delivery_policy} onValueChange={(value) => save({ delivery_policy: value })} className={selectClass}>
             <option value="auto">{t("自动（优先粘贴）")}</option>
@@ -164,7 +254,12 @@ export function RecordingSettings({ settings, save, saveFailure, dictationBusy =
         </div>
       </SettingsGroup>
       <SettingsDisclosure
-        title={t("更多快捷键")}
+        title={(
+          <span className="flex flex-wrap items-center gap-2">
+            <span>{t("更多快捷键")}</span>
+            {hasEnabledUnboundShortcut && <span className="rounded-full bg-warning/10 px-2 py-0.5 text-[11px] font-medium text-warning-ink">{t("有快捷键尚未绑定")}</span>}
+          </span>
+        )}
         description={t("为选中文本、翻译、看屏幕和跳过整理设置独立快捷键。")}
         summary={extraShortcutsBusy ? t("快捷键录制中") : t("已配置 {count} / 4").replace("{count}", String(configuredShortcuts))}
         locked={extraShortcutsBusy}
@@ -190,7 +285,7 @@ export function RecordingSettings({ settings, save, saveFailure, dictationBusy =
           <p className="mt-1 text-xs leading-5 text-tertiary">{t("选中文本后按它开始录音，再按一次结束；目标或选区变化时只复制结果，不会替换文字。")}</p>
           <div className="mt-4">
             <HotkeyRecorder
-              disabled={dictationBusy || modeSaving || otherCaptureBusy("selected_action")}
+              disabled={dictationBusy || otherCaptureBusy("selected_action")}
               onCaptureBusyChange={(busy) => updateBusy("selected_action", busy)}
               onCaptureErrorChange={(error) => updateError("selected_action", error)}
               value={settings.selected_action_hotkey ?? ""}
@@ -201,18 +296,21 @@ export function RecordingSettings({ settings, save, saveFailure, dictationBusy =
         </div>
       </SettingsGroup>
       <SettingsGroup title={t("本次翻译")} description={t("用独立快捷键启动翻译听写，只影响本次录音，不改变日常输出模式。")}>
-        <SettingsRow title={t("目标语言")} description={t("与输出模式中的翻译共用目标语言；开始录音后固定本次目标语言。")}>
-          <Select aria-label={t("快捷翻译目标语言")} value={settings.translation_target_language ?? "en"} onValueChange={(value) => save({ translation_target_language: value })} className={selectClass}>
-            {translationLanguageOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
-          </Select>
+        <SettingsRow title={t("目标语言")} description={t("翻译目标统一在“写作与整理”的输出模式中设置；开始录音后固定本次目标语言。")}>
+          <div className="flex items-center gap-2">
+            <span className="text-sm text-primary">
+              {translationLanguageOptions.find((option) => option.value === (settings.translation_target_language ?? "en"))?.label ?? settings.translation_target_language}
+            </span>
+            {onOpenMappings && <button type="button" onClick={onOpenMappings} className={compactButtonClass}>{t("更改")}</button>}
+          </div>
         </SettingsRow>
         <div className="px-5 py-4">
           <p className="text-sm font-medium text-primary">{t("翻译快捷键")}</p>
-          <p className="mt-1 text-xs leading-5 text-tertiary">{t("空着就不注册。与全局快捷键使用相同的录音方式（点按切换 / 按住说话）。")}</p>
+          <p className="mt-1 text-xs leading-5 text-tertiary">{t("空着就不注册。与全局快捷键使用相同的录音方式（点按切换 / 按住说话 / 按住或双击锁定）。")}</p>
           <p className="mt-2 text-xs leading-5 text-tertiary">{t("需要当前场景允许 AI 整理，并已配置整理服务；严格离线时只使用本机模型。")}</p>
           <div className="mt-4">
             <HotkeyRecorder
-              disabled={dictationBusy || modeSaving || otherCaptureBusy("translation_action")}
+              disabled={dictationBusy || otherCaptureBusy("translation_action")}
               onCaptureBusyChange={(busy) => updateBusy("translation_action", busy)}
               onCaptureErrorChange={(error) => updateError("translation_action", error)} value={settings.translation_hotkey ?? ""} captureTarget="translation_action" onChange={(hotkey, options) => save({ translation_hotkey: hotkey }, options)} />
           </div>
@@ -228,7 +326,7 @@ export function RecordingSettings({ settings, save, saveFailure, dictationBusy =
           )}
           <div className="mt-4">
             <HotkeyRecorder
-              disabled={dictationBusy || modeSaving || otherCaptureBusy("screen_action")}
+              disabled={dictationBusy || otherCaptureBusy("screen_action")}
               onCaptureBusyChange={(busy) => updateBusy("screen_action", busy)}
               onCaptureErrorChange={(error) => updateError("screen_action", error)}
               value={settings.screen_action_hotkey ?? ""}
@@ -241,13 +339,13 @@ export function RecordingSettings({ settings, save, saveFailure, dictationBusy =
       <SettingsGroup title={t("本次跳过 AI 整理")} description={t("独立快捷键，跳过 AI 整理，仍会做本地处理、使用所选语音服务。")}>
         <div className="px-5 py-4">
           <p className="text-sm font-medium text-primary">{t("跳过整理快捷键")}</p>
-          <p className="mt-1 text-xs leading-5 text-tertiary">{t("空着就不注册。与全局快捷键使用相同的录音方式（点按切换 / 按住说话）。")}</p>
+          <p className="mt-1 text-xs leading-5 text-tertiary">{t("空着就不注册。与全局快捷键使用相同的录音方式（点按切换 / 按住说话 / 按住或双击锁定）。")}</p>
           {!settings.verbatim_hotkey?.trim() && (
             <p className="mt-2 text-xs text-tertiary">{t("未设置跳过整理快捷键")}</p>
           )}
           <div className="mt-4">
             <HotkeyRecorder
-              disabled={dictationBusy || modeSaving || otherCaptureBusy("verbatim_action")}
+              disabled={dictationBusy || otherCaptureBusy("verbatim_action")}
               onCaptureBusyChange={(busy) => updateBusy("verbatim_action", busy)}
               onCaptureErrorChange={(error) => updateError("verbatim_action", error)}
               value={settings.verbatim_hotkey ?? ""}

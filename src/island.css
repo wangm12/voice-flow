@@ -1,11 +1,12 @@
 :root {
-  --voice-hud-top: #232323;
-  --voice-hud-bottom: #1d1d1d;
-  --voice-hud-border: rgba(255, 255, 255, 0.09);
-  --voice-hud-text: #e8e8e8;
-  --voice-hud-muted: #a9a9a9;
+  --voice-hud-top: #141415;
+  --voice-hud-bottom: #101011;
+  --voice-hud-border: #2c2c2e;
+  --voice-hud-text: #ffffff;
+  --voice-hud-muted: #e2e2e7;
   --voice-hud-focus: #d5d5d5;
   --voice-hud-error: #f87171;
+  --voice-hud-text-shadow: 0 1px 2px rgba(0, 0, 0, 0.78), 0 0 8px rgba(0, 0, 0, 0.45);
   --voice-ease: cubic-bezier(0.22, 1, 0.36, 1);
   --voice-enter-duration: 220ms;
   --voice-pill-width: 220px;
@@ -69,14 +70,27 @@
   width: 220px;
   height: 48px;
   padding: 0 8px 0 12px;
-  border: 1px solid rgba(255, 255, 255, 0.09);
+  border: 1px solid var(--voice-hud-border);
   border-radius: 24px;
-  background: linear-gradient(128deg, #232323 0%, #202020 54%, #1d1d1d 100%);
+  background: linear-gradient(180deg, var(--voice-hud-top) 0%, var(--voice-hud-bottom) 100%);
   color: var(--voice-hud-text);
   font-size: 12px;
   line-height: 1.2;
   pointer-events: auto;
   animation: voice-tray-in 160ms var(--voice-ease) both;
+}
+
+.island-learn-toast--candidate {
+  width: auto;
+  min-width: 220px;
+  max-width: 292px;
+  gap: 5px;
+  padding: 0 8px 0 10px;
+}
+
+.island-learn-toast__close {
+  min-width: 24px;
+  padding: 2px 5px;
 }
 
 .island-learn-toast__icon {
@@ -195,7 +209,9 @@
 .voice-pill-stack--reduced .voice-pill__level-ring,
 .voice-pill-stack--reduced .voice-pill__secondary,
 .voice-pill-stack--reduced .voice-pill__recovery-action,
-.voice-pill-stack--reduced .voice-pill__beam-layer--exit {
+.voice-pill-stack--reduced .voice-pill__beam-layer--exit,
+.voice-pill-stack--reduced .voice-pill__voice-beam-layer--exit,
+.voice-pill-stack--reduced .voice-pill__processing-beam-layer--exit {
   animation: none;
   transition: none;
 }
@@ -216,21 +232,29 @@
 }
 
 .voice-pill__beam-fx,
-.voice-pill__beam-ghost {
+.voice-pill__beam-ghost,
+.voice-pill__voice-beam,
+.voice-pill__voice-beam-ghost,
+.voice-pill__processing-beam,
+.voice-pill__processing-beam-ghost {
   width: 220px !important;
   height: 48px !important;
 }
 
-.voice-pill__beam-fx {
-  /* Library injects [data-beam] { position: relative }. Without a same-size
-     overlay the empty ghost collapses to 0×0 and the rotate/line beam vanishes. */
+.voice-pill__beam-fx,
+.voice-pill__voice-beam,
+.voice-pill__processing-beam {
+  /* Libraries inject position: relative on beam roots. Without a same-size
+     overlay the empty ghost collapses to 0×0 and the glow/line beam vanishes. */
   position: absolute !important;
   inset: 0 !important;
   pointer-events: none;
   z-index: 2;
 }
 
-.voice-pill__beam-layer {
+.voice-pill__beam-layer,
+.voice-pill__voice-beam-layer,
+.voice-pill__processing-beam-layer {
   position: absolute;
   inset: 0;
   z-index: 2;
@@ -238,12 +262,37 @@
   opacity: 1;
 }
 
-.voice-pill__beam-layer--exit {
+.voice-pill > .voice-pill__voice-beam-layer {
+  inset: -1px;
+  z-index: 1;
+  -webkit-mask-image: linear-gradient(
+    180deg,
+    transparent 0%,
+    rgba(0, 0, 0, 0.04) 38%,
+    rgba(0, 0, 0, 0.24) 60%,
+    rgba(0, 0, 0, 0.78) 80%,
+    #000000 100%
+  );
+  mask-image: linear-gradient(
+    180deg,
+    transparent 0%,
+    rgba(0, 0, 0, 0.04) 38%,
+    rgba(0, 0, 0, 0.24) 60%,
+    rgba(0, 0, 0, 0.78) 80%,
+    #000000 100%
+  );
+}
+
+.voice-pill__beam-layer--exit,
+.voice-pill__voice-beam-layer--exit,
+.voice-pill__processing-beam-layer--exit {
   opacity: 0;
   transition: opacity var(--hud-motion-duration, 220ms) var(--voice-ease);
 }
 
-.voice-pill__beam-ghost {
+.voice-pill__beam-ghost,
+.voice-pill__voice-beam-ghost,
+.voice-pill__processing-beam-ghost {
   border-radius: 24px;
 }
 
@@ -260,11 +309,14 @@
   flex-shrink: 0;
   padding: 0 8px 0 12px;
   overflow: hidden;
-  border: 1px solid rgba(255, 255, 255, 0.09);
+  border: 1px solid var(--voice-hud-border);
   border-radius: 24px;
-  background: linear-gradient(128deg, #232323 0%, #202020 54%, #1d1d1d 100%);
+  background: linear-gradient(180deg, var(--voice-hud-top) 0%, var(--voice-hud-bottom) 100%);
   color: var(--voice-hud-text);
-  box-shadow: none;
+  box-shadow:
+    inset 0 0 0 1px rgba(255, 255, 255, 0.085),
+    inset 0 1px 0 rgba(255, 255, 255, 0.11),
+    0 2px 6px rgba(0, 0, 0, 0.44);
   contain: layout paint;
   transition: background var(--hud-motion-duration, 220ms) var(--voice-ease), border-color var(--hud-motion-duration, 220ms) var(--voice-ease);
 }
@@ -281,6 +333,7 @@
 
 .voice-pill__indicator {
   position: relative;
+  z-index: 2;
   display: flex;
   flex: 0 0 24px;
   align-items: center;
@@ -363,6 +416,8 @@
 }
 
 .voice-pill__copy {
+  position: relative;
+  z-index: 2;
   display: flex;
   flex: 1 1 auto;
   flex-direction: column;
@@ -408,37 +463,30 @@
   text-overflow: ellipsis;
   white-space: nowrap;
   font-size: 12px;
-  font-weight: 500;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
   letter-spacing: 0;
   color: var(--voice-hud-text);
+  text-shadow: var(--voice-hud-text-shadow);
   line-height: 1.15;
   opacity: 1;
 }
 
 @keyframes voice-label-in {
-  from { opacity: 0; }
+  from { opacity: 0.72; }
   to { opacity: 1; }
 }
 
-@keyframes voice-label-out {
-  from { opacity: 1; }
-  to { opacity: 0; }
-}
-
 .voice-pill__label--in {
-  opacity: 0;
-  animation: voice-label-in var(--hud-label-in-duration, 220ms) ease-in var(--hud-label-in-delay, 0ms) both;
-}
-
-.voice-pill__label--out {
-  pointer-events: none;
-  animation: voice-label-out var(--hud-label-out-duration, 150ms) ease-out both;
+  animation: voice-label-in var(--hud-label-in-duration, 220ms) var(--voice-ease) var(--hud-label-in-delay, 0ms) both;
 }
 
 .voice-pill__elapsed {
   flex: 0 0 auto;
   color: var(--voice-hud-muted);
+  text-shadow: var(--voice-hud-text-shadow);
   font-size: 11px;
+  font-weight: 500;
   font-variant-numeric: tabular-nums;
   line-height: 1;
 }
@@ -451,8 +499,9 @@
   max-width: 100%;
   overflow: hidden;
   color: var(--voice-hud-muted);
-  font-size: 10px;
-  font-weight: 400;
+  text-shadow: var(--voice-hud-text-shadow);
+  font-size: 11px;
+  font-weight: 500;
   line-height: 1.15;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -487,20 +536,21 @@
   padding: 0;
   border: 0;
   border-radius: 50%;
-  background: rgba(255, 255, 255, 0.045);
-  color: #d7d7d7;
+  background: rgba(255, 255, 255, 0.11);
+  box-shadow: inset 0 0.5px 0 rgba(255, 255, 255, 0.12);
+  color: #f5f5f7;
   cursor: pointer;
   pointer-events: auto;
   -webkit-app-region: no-drag;
 }
 
 .voice-pill__action:hover:not(:disabled) {
-  background: rgba(255, 255, 255, 0.095);
+  background: rgba(255, 255, 255, 0.17);
   color: var(--voice-hud-text);
 }
 
 .voice-pill__action:active:not(:disabled) {
-  background: rgba(255, 255, 255, 0.14);
+  background: rgba(255, 255, 255, 0.22);
   transform: scale(0.94);
 }
 
@@ -515,30 +565,46 @@
   outline-offset: -2px;
 }
 
-/* Keep the live pill's tint constant across native material handoff. The
-   strong translucent tint limits how much the raw desktop can change the
-   capsule when AppKit removes its backdrop; the glass still supplies blur and
-   refraction while its owner is visible. */
+/* Keep a 96% solid surface in Glasswork's tint when AppKit has hidden the
+   native material or reduced transparency is active. A visible native glass
+   layer uses Glasswork's default density tint (0.12 light / 0.24 #1e1e22 dark)
+   and directional inset rim catchlight / bevel so AppKit owns the outer contour. */
 :root[data-hud-appearance="liquid_glass"] {
   --voice-hud-text: #171717;
-  --voice-hud-muted: #303030;
+  --voice-hud-muted: #242426;
   --voice-hud-focus: #171717;
   --voice-hud-border: rgba(23, 23, 23, 0.16);
   --voice-hud-error: #b91c1c;
-  --voice-glass-live-tint: rgba(255, 255, 255, 0.92);
+  --voice-hud-text-shadow: 0 1px 2px rgba(255, 255, 255, 0.78), 0 0 6px rgba(255, 255, 255, 0.42);
+  --voice-glass-live-tint: rgba(255, 255, 255, 0.96);
   --voice-glass-veil: rgba(255, 255, 255, 0.6);
   --voice-glass-shell: linear-gradient(128deg, #fafafa 0%, #f5f5f5 54%, #ededed 100%);
-  --voice-glass-control: rgba(0, 0, 0, 0.08);
-  --voice-glass-control-hover: rgba(0, 0, 0, 0.13);
+  --voice-glass-control: rgba(0, 0, 0, 0.15);
+  --voice-glass-control-hover: rgba(0, 0, 0, 0.2);
+}
+
+:root[data-hud-appearance="liquid_glass"][data-hud-glass-visible="true"] {
+  --voice-glass-live-tint: rgba(255, 255, 255, 0.12);
 }
 
 :root[data-hud-appearance="liquid_glass"] .voice-pill {
+  corner-shape: round;
   background: var(--voice-glass-live-tint) !important;
-  /* Keep the one-pixel content inset without painting a synthetic rim. */
+  /* Keep the one-pixel content inset without painting a second outer rim. */
   border-color: transparent !important;
   box-shadow: none !important;
-  /* The fill stays the same on either side of native material visibility changes. */
+  /* The root tint follows the actual AppKit material visibility state. */
   transition: none;
+}
+
+:root[data-hud-appearance="liquid_glass"][data-hud-glass-visible="true"] .voice-pill {
+  box-shadow:
+    inset 1.5px 1.5px 1px -1px rgb(255 255 255 / 1),
+    inset -1.5px -1.5px 1px -1px rgb(255 255 255 / 0.6),
+    inset 0 6px 8px -6px rgb(255 255 255 / 0.5),
+    inset 4px 0 8px -6px rgb(255 255 255 / 0.22),
+    inset -4px 0 8px -6px rgb(255 255 255 / 0.12),
+    inset 0 -6px 8px -6px rgb(0 0 0 / 0.06) !important;
 }
 
 :root[data-hud-appearance="liquid_glass"] .voice-pill__secondary {
@@ -599,16 +665,34 @@
   filter: none;
 }
 
-/* The isolated POC and Settings preview keep their original glass tint. */
-:root[data-native-glass-poc="true"] .voice-pill,
-.vf-hud-preview-hud[data-appearance="liquid_glass"] .voice-pill {
+/* The isolated POC keeps its light/dark veil, while the Settings preview leaves
+   its ink layer transparent so the single .vf-glasswork-surface underneath owns
+   glass tint, refraction, and rim catchlight. */
+:root[data-native-glass-poc="true"] .voice-pill {
+  corner-shape: round;
   --voice-hud-text: #171717;
-  --voice-hud-muted: #303030;
+  --voice-hud-muted: #242426;
   --voice-hud-focus: #171717;
   --voice-hud-border: rgba(23, 23, 23, 0.16);
+  --voice-hud-text-shadow: 0 1px 2px rgba(255, 255, 255, 0.78), 0 0 6px rgba(255, 255, 255, 0.42);
   --voice-glass-veil: rgba(255, 255, 255, 0.6);
-  --voice-glass-control: rgba(0, 0, 0, 0.08);
-  --voice-glass-control-hover: rgba(0, 0, 0, 0.13);
+  --voice-glass-control: rgba(0, 0, 0, 0.15);
+  --voice-glass-control-hover: rgba(0, 0, 0, 0.2);
+  background: var(--voice-glass-veil) !important;
+  border-color: transparent !important;
+  box-shadow: none !important;
+}
+
+.vf-hud-preview-hud[data-appearance="liquid_glass"] .voice-pill {
+  corner-shape: round;
+  --voice-hud-text: #171717;
+  --voice-hud-muted: #242426;
+  --voice-hud-focus: #171717;
+  --voice-hud-border: rgba(23, 23, 23, 0.16);
+  --voice-hud-text-shadow: 0 1px 2px rgba(255, 255, 255, 0.78), 0 0 6px rgba(255, 255, 255, 0.42);
+  --voice-glass-veil: transparent;
+  --voice-glass-control: rgba(0, 0, 0, 0.15);
+  --voice-glass-control-hover: rgba(0, 0, 0, 0.2);
   background: var(--voice-glass-veil) !important;
   /* Preserve the one-pixel content inset without drawing a second rim. */
   border-color: transparent !important;
@@ -622,11 +706,26 @@
     --voice-hud-focus: #f5f5f5;
     --voice-hud-border: rgba(255, 255, 255, 0.2);
     --voice-hud-error: #f87171;
-    --voice-glass-live-tint: rgba(25, 25, 25, 0.92);
+    --voice-hud-text-shadow: 0 1px 2px rgba(0, 0, 0, 0.68), 0 0 6px rgba(0, 0, 0, 0.34);
+    --voice-glass-live-tint: rgba(30, 30, 34, 0.96);
     --voice-glass-veil: rgba(0, 0, 0, 0.6);
     --voice-glass-shell: linear-gradient(128deg, #252729 0%, #222428 54%, #202226 100%);
-    --voice-glass-control: rgba(255, 255, 255, 0.14);
-    --voice-glass-control-hover: rgba(255, 255, 255, 0.2);
+    --voice-glass-control: rgba(255, 255, 255, 0.22);
+    --voice-glass-control-hover: rgba(255, 255, 255, 0.28);
+  }
+
+  :root[data-hud-appearance="liquid_glass"][data-hud-glass-visible="true"] {
+    --voice-glass-live-tint: rgba(30, 30, 34, 0.24);
+  }
+
+  :root[data-hud-appearance="liquid_glass"][data-hud-glass-visible="true"] .voice-pill {
+    box-shadow:
+      inset 1px 1px 0.5px -0.5px rgb(255 255 255 / 0.46),
+      inset -1px -1px 0.5px -0.5px rgb(255 255 255 / 0.18),
+      inset 0 6px 8px -6px rgb(255 255 255 / 0.18),
+      inset 4px 0 8px -6px rgb(255 255 255 / 0.07),
+      inset -4px 0 8px -6px rgb(255 255 255 / 0.04),
+      inset 0 -6px 8px -6px rgb(0 0 0 / 0.08) !important;
   }
 
   :root[data-native-glass-poc="true"] .voice-pill {
@@ -634,9 +733,10 @@
     --voice-hud-muted: #ebebeb;
     --voice-hud-focus: #f5f5f5;
     --voice-hud-border: rgba(255, 255, 255, 0.2);
+    --voice-hud-text-shadow: 0 1px 2px rgba(0, 0, 0, 0.68), 0 0 6px rgba(0, 0, 0, 0.34);
     --voice-glass-veil: rgba(0, 0, 0, 0.6);
-    --voice-glass-control: rgba(255, 255, 255, 0.14);
-    --voice-glass-control-hover: rgba(255, 255, 255, 0.2);
+    --voice-glass-control: rgba(255, 255, 255, 0.22);
+    --voice-glass-control-hover: rgba(255, 255, 255, 0.28);
   }
 
   :root[data-hud-appearance="liquid_glass"] .voice-pill__orb canvas,
@@ -645,8 +745,20 @@
   }
 }
 
-.vf-hud-preview-hud[data-appearance="liquid_glass"] .voice-pill {
-  --voice-glass-veil: rgba(255, 255, 255, 0.38);
+@media (prefers-reduced-transparency: reduce) {
+  :root[data-hud-appearance="liquid_glass"][data-hud-glass-visible="true"] {
+    --voice-glass-live-tint: rgba(255, 255, 255, 0.96);
+  }
+
+  :root[data-hud-appearance="liquid_glass"][data-hud-glass-visible="true"] .voice-pill {
+    box-shadow: none !important;
+  }
+}
+
+@media (prefers-reduced-transparency: reduce) and (prefers-color-scheme: dark) {
+  :root[data-hud-appearance="liquid_glass"][data-hud-glass-visible="true"] {
+    --voice-glass-live-tint: rgba(30, 30, 34, 0.96);
+  }
 }
 
 .vf-hud-preview[data-backdrop="dark"] .vf-hud-preview-hud[data-appearance="liquid_glass"] .voice-pill {
@@ -654,9 +766,10 @@
   --voice-hud-muted: #ebebeb;
   --voice-hud-focus: #f5f5f5;
   --voice-hud-border: rgba(255, 255, 255, 0.2);
-  --voice-glass-veil: rgba(34, 36, 40, 0.28);
-  --voice-glass-control: rgba(255, 255, 255, 0.14);
-  --voice-glass-control-hover: rgba(255, 255, 255, 0.2);
+  --voice-hud-text-shadow: 0 1px 2px rgba(0, 0, 0, 0.68), 0 0 6px rgba(0, 0, 0, 0.34);
+  --voice-glass-veil: transparent;
+  --voice-glass-control: rgba(255, 255, 255, 0.22);
+  --voice-glass-control-hover: rgba(255, 255, 255, 0.28);
 }
 
 :root[data-hud-appearance="liquid_glass"] .voice-pill .voice-pill__action,
@@ -664,6 +777,7 @@
 .vf-hud-preview-hud[data-appearance="liquid_glass"] .voice-pill .voice-pill__action {
   color: var(--voice-hud-text);
   background: var(--voice-glass-control);
+  box-shadow: inset 0 0.5px 0 rgba(255, 255, 255, 0.24);
 }
 
 :root[data-hud-appearance="liquid_glass"] .voice-pill .voice-pill__action:hover:not(:disabled),
@@ -697,7 +811,7 @@
   overflow: hidden;
   border: 1px solid var(--voice-hud-border);
   border-radius: 18px;
-  background: linear-gradient(128deg, #232323 0%, #202020 54%, #1d1d1d 100%);
+  background: linear-gradient(180deg, var(--voice-hud-top) 0%, var(--voice-hud-bottom) 100%);
   color: var(--voice-hud-text);
   pointer-events: auto;
   animation: voice-tray-in 160ms var(--voice-ease) both;
@@ -954,7 +1068,11 @@
   }
 
   .voice-pill__beam-layer,
-  .voice-pill__beam-fx {
+  .voice-pill__beam-fx,
+  .voice-pill__voice-beam-layer,
+  .voice-pill__voice-beam,
+  .voice-pill__processing-beam-layer,
+  .voice-pill__processing-beam {
     display: none !important;
   }
 }

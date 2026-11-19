@@ -1,4 +1,4 @@
-import { useId, useRef, type RefObject } from "react";
+import { useId, useRef, type ReactNode, type RefObject } from "react";
 import { createPortal } from "react-dom";
 import { useDialogBehavior } from "../lib/focusTrap";
 import { buttonClass, colors, dangerActionButtonClass, focusRingClass, secondaryButtonClass } from "../lib/theme";
@@ -7,6 +7,7 @@ export function ConfirmDialog({
   open,
   title,
   description,
+  children,
   confirmLabel,
   cancelLabel,
   danger = true,
@@ -19,6 +20,7 @@ export function ConfirmDialog({
   open: boolean;
   title: string;
   description: string;
+  children?: ReactNode;
   confirmLabel: string;
   cancelLabel: string;
   danger?: boolean;
@@ -57,6 +59,7 @@ export function ConfirmDialog({
       >
         <h2 id={`${id}-title`} className="shrink-0 text-lg font-semibold leading-6 text-primary">{title}</h2>
         <p id={`${id}-description`} className="mt-2 min-h-0 overflow-y-auto overscroll-contain break-words text-[13px] leading-6 text-secondary">{description}</p>
+        {children}
         {error && <p role="alert" className="mt-4 max-h-24 shrink-0 overflow-y-auto break-words text-[13px] leading-5 text-error-ink">{error}</p>}
         <div className="mt-6 flex shrink-0 flex-wrap justify-end gap-2">
           <button type="button" disabled={busy} className={secondaryButtonClass} onClick={onCancel}>{cancelLabel}</button>

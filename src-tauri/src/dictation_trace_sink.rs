@@ -361,16 +361,26 @@ impl DictationTraceSink {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn clear_all_data_under_guard(
     root: &Path,
     guard: &crate::store::SpoolClearGuard,
     sink: &DictationTraceSink,
 ) -> anyhow::Result<()> {
+    clear_all_data_under_guard_with_options(root, guard, sink, true)
+}
+
+pub(crate) fn clear_all_data_under_guard_with_options(
+    root: &Path,
+    guard: &crate::store::SpoolClearGuard,
+    sink: &DictationTraceSink,
+    include_learned_rules: bool,
+) -> anyhow::Result<()> {
     if !guard.owns_root(root) || crate::store::normalized_data_root(root) != sink.root {
         anyhow::bail!("trace clear owner does not match the admitted data root");
     }
     sink.invalidate_before_clear();
-    crate::store::clear_all_data_under_guard(root, guard)?;
+    crate::store::clear_all_data_under_guard_with_options(root, guard, include_learned_rules)?;
     crate::delivery_diagnostics::clear(root)?;
     Ok(())
 }

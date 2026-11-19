@@ -1,5 +1,6 @@
-import { memo, useEffect, useState, type CSSProperties } from "react";
-import { BorderBeam } from "border-beam";
+import { memo, useCallback, useEffect, useRef, useState, type CSSProperties } from "react";
+import { BorderBeam, type BorderBeamTheme } from "border-beam";
+import { VoiceBeam } from "voice-glow";
 import { useI18n } from "../../lib/i18n";
 import { deliveryReasonHudMessage, deliveryReasonMessage } from "../../lib/deliveryCopy";
 import { VoiceHudOrb } from "./VoiceHudOrb";
@@ -7,18 +8,23 @@ import {
   HUD_LABEL_FADE_MS,
   HUD_LABEL_IN_DELAY_MS,
   HUD_LABEL_IN_DURATION_MS,
-  HUD_LABEL_OUT_MS,
   HUD_MOTION_MS,
   HUD_PILL_RADIUS_PX,
-  HUD_LISTENING_BEAM,
-  HUD_THINKING_BEAM,
+  HUD_STARTUP_NOTICE_DELAY_MS,
   HUD_THINKING_ORB_SPEED,
   formatHudElapsed,
   hudAudioLevel,
   hudBorderBeamFor,
   hudOrbFor,
+  hudProcessingHueRotateDeg,
   hudStatusLabel,
+  hudVoiceBeamFor,
+  hudVoiceDriveLevel,
+  normalizeHudVisuals,
+  resolveProcessingBeamConfig,
+  resolveVoiceBeamConfig,
   type DictationState,
+  type HudVisualSettings,
   type ProcessingPhase,
 } from "./hudOrb";
 import { usePageVisible } from "./hudLineBeam";
@@ -99,8 +105,8 @@ function stateAriaLabel(state: DictationState, t: (source: string) => string): s
     case "starting": return t("准备录音");
     case "recording": return t("录音中");
     case "recording_limited": return t("录音已达上限");
-    case "processing":
-    case "rate_limited": return t("处理中");
+    case "processing": return t("处理中");
+    case "rate_limited": return t("限流重试");
     case "done": return t("已完成");
     case "copied": return t("已复制");
     case "history": return t("已保存到历史");
@@ -114,9 +120,12 @@ function stateAriaLabel(state: DictationState, t: (source: string) => string): s
 function recordingAudioIssue(
   status: AudioCaptureStatus | null | undefined,
   translate: (source: string) => string,
+  suppressStartupWait = false,
 ): { title: string; detail: string } | null {
   switch (status) {
-    case "waiting_first_frame": return { title: translate("等待麦克风"), detail: translate("尚未收到音频") };
+    case "waiting_first_frame": return suppressStartupWait
+      ? null
+      : { title: translate("等待麦克风"), detail: translate("尚未收到音频") };
     case "no_audio_yet": return { title: translate("麦克风尚无输入"), detail: translate("检查所选设备") };
     case "no_recent_audio": return { title: translate("麦克风无响应"), detail: translate("检查连接后重试") };
     case "device_error": return { title: translate("麦克风已中断"), detail: translate("检查输入设备") };
@@ -126,38 +135,30 @@ function recordingAudioIssue(
   }
 }
 
-function useHudLabel(next: string | null, reduced: boolean) {
+function useHudLabel(next: string | null, reduced: boolean, animateTransition: boolean) {
   const [text, setText] = useState(next);
-  const [outgoing, setOutgoing] = useState<string | null>(null);
   const [entering, setEntering] = useState(false);
+  const [enterKey, setEnterKey] = useState(0);
 
   if (next !== text) {
-    if (!reduced && text != null && next != null) {
-      setOutgoing(text);
+    if (!reduced && animateTransition && text != null && next != null) {
       setEntering(true);
+      setEnterKey((value) => value + 1);
     } else {
-      setOutgoing(null);
       setEntering(false);
     }
     setText(next);
-  } else if (reduced && (outgoing != null || entering)) {
-    setOutgoing(null);
+  } else if (reduced && entering) {
     setEntering(false);
   }
-
-  useEffect(() => {
-    if (outgoing == null) return undefined;
-    const timer = window.setTimeout(() => setOutgoing(null), HUD_LABEL_OUT_MS);
-    return () => window.clearTimeout(timer);
-  }, [outgoing, text]);
 
   useEffect(() => {
     if (!entering) return undefined;
     const timer = window.setTimeout(() => setEntering(false), HUD_LABEL_FADE_MS);
     return () => window.clearTimeout(timer);
-  }, [entering, text]);
+  }, [entering, enterKey]);
 
-  return { text, outgoing, entering };
+  return { text, entering, enterKey };
 }
 
 const HUD_BEAM_OVERLAY_STYLE: CSSProperties = {
@@ -171,6 +172,7 @@ export const VoicePill = memo(function VoicePill({
   state,
   phase = "idle",
   phaseConfirmed = false,
+  chunkProgress: _chunkProgress = null,
   hideImmediately = false,
   stageElapsedMs = 0,
   clockNowMs = 0,
@@ -193,6 +195,9 @@ export const VoicePill = memo(function VoicePill({
   recordingHint = null,
   waveformLevels,
   partialText: _partialText = null,
+  beamTheme = "dark",
+  visuals,
+  previewDemoLevel = null,
   reduced,
   detailsOpen = false,
   onDetailsOpenChange,
@@ -206,6 +211,7 @@ export const VoicePill = memo(function VoicePill({
   state: DictationState;
   phase?: ProcessingPhase;
   phaseConfirmed?: boolean;
+  chunkProgress?: { done: number; total: number } | null;
   hideImmediately?: boolean;
   stageElapsedMs?: number;
   clockNowMs?: number;
@@ -228,6 +234,9 @@ export const VoicePill = memo(function VoicePill({
   recordingHint?: string | null;
   waveformLevels: number[];
   partialText?: string | null;
+  beamTheme?: BorderBeamTheme;
+  visuals?: Partial<HudVisualSettings>;
+  previewDemoLevel?: number | null;
   reduced: boolean;
   detailsOpen?: boolean;
   onDetailsOpenChange?: (open: boolean) => void;
@@ -255,18 +264,23 @@ export const VoicePill = memo(function VoicePill({
   const activeHud = listening || processing;
   const selectedActionWaiting = state === "idle" && Boolean(selectedActionState);
   const isIdle = state === "idle" && !selectedActionWaiting;
-  const audioIssue = listening ? recordingAudioIssue(audioCaptureStatus, t) : null;
+  const startupGraceActive = listening && stageElapsedMs < HUD_STARTUP_NOTICE_DELAY_MS;
+  const audioIssue = listening ? recordingAudioIssue(audioCaptureStatus, t, startupGraceActive) : null;
+  const presentationCaptureStatus = startupGraceActive && audioCaptureStatus === "waiting_first_frame"
+    ? null
+    : audioCaptureStatus;
   const presentation = hudPresentation({
     state,
     fallbackReason,
     deliveryMethod,
     cleanupStatus,
-    captureStatus: audioCaptureStatus,
+    captureStatus: presentationCaptureStatus,
     recoveryOutcome,
     selectedActionState,
   }, t);
   const uncertainPasteDetailsAvailable = uncertainPasteAttempt && Boolean(presentation.detail);
-  const device = audioDeviceName?.trim() || t("设备名称不可用");
+  const resolvedDeviceName = audioDeviceName?.trim() || null;
+  const device = resolvedDeviceName || t("设备名称不可用");
   const deviceSource = audioDeviceSourceLabel?.trim() || t("录音设备未知");
   const deviceDescription = audioDeviceTitle?.trim() || `${deviceSource}：${device}`;
   const audioNow = Math.max(Date.now(), clockNowMs);
@@ -280,13 +294,17 @@ export const VoicePill = memo(function VoicePill({
         ?? presentation.title
         ?? (selectedActionWaiting
           ? selectedActionCaption(selectedActionState, t)
-          : hudStatusLabel(state, null, { phase, phaseConfirmed, translate: t })));
+          : hudStatusLabel(state, null, { phase, phaseConfirmed, startupElapsedMs: stageElapsedMs, translate: t })));
   const statusLabel = statusCopy ?? stateAriaLabel(state, t);
   const confirmedTargetChangeOutcome = fallbackReason === "target_changed"
     && ((state === "copied" && deliveryMethod === "clipboard")
       || (state === "history" && deliveryMethod === "history"));
   const caption = listening
-    ? audioIssue?.detail ?? presentation.subtitle ?? (recording ? device : audioStatus)
+    ? audioIssue?.detail
+      ?? presentation.subtitle
+      ?? (startupGraceActive && (state === "starting" || audioCaptureStatus === "waiting_first_frame")
+        ? resolvedDeviceName
+        : (recording ? device : audioStatus))
     : processing ? null
       : confirmedTargetChangeOutcome ? presentation.subtitle
         : uncertainPasteAttempt || unverifiedTextAction ? t("先检查输入框")
@@ -299,7 +317,12 @@ export const VoicePill = memo(function VoicePill({
                 : state === "error" ? t("查看恢复详情")
                   : null);
   const captionWithCleanupNotice = [caption, presentation.detail].filter(Boolean).join(" · ") || null;
-  const captionIsInputDevice = recording && !audioIssue && !presentation.subtitle && !presentation.detail;
+  const captionIsInputDevice = listening
+    && !audioIssue
+    && !presentation.subtitle
+    && !presentation.detail
+    && Boolean(caption)
+    && (recording || (startupGraceActive && Boolean(resolvedDeviceName)));
   const captionIcon = captionIsInputDevice
     ? isRecognizableHeadsetName(device) ? "headphones" : "input-device"
     : null;
@@ -337,7 +360,7 @@ export const VoicePill = memo(function VoicePill({
     reduced ? "voice-pill-stack--reduced" : "",
   ].filter(Boolean).join(" ");
   const liveDetails = [
-    listening ? audioStatus : null,
+    listening && !(startupGraceActive && audioCaptureStatus === "waiting_first_frame") ? audioStatus : null,
     listening ? deviceDescription : null,
     actionError,
     detailsActionError,
@@ -351,7 +374,20 @@ export const VoicePill = memo(function VoicePill({
     reasonDetail,
   ].filter((value): value is string => Boolean(value) && value !== statusLabel).join(" · ");
   const liveLabel = liveDetails ? `${statusLabel}。${liveDetails}` : statusLabel;
-  const { text: labelText, outgoing: labelOutgoing, entering: labelEntering } = useHudLabel(statusLabel, reduced);
+  const [prevProcessing, setPrevProcessing] = useState(processing);
+  const wasProcessing = prevProcessing;
+  if (prevProcessing !== processing) {
+    setPrevProcessing(processing);
+  }
+  const { text: labelText, entering: labelEntering, enterKey } = useHudLabel(
+    statusLabel,
+    reduced,
+    !(wasProcessing && processing),
+  );
+  const isRateLimitRetry = state === "rate_limited"
+    || (state === "processing" && phaseConfirmed && phase === "waiting_retry");
+  const isWaitingForFirstAudioFrame = listening && audioCaptureStatus === "waiting_first_frame";
+  const inputUnavailable = !isWaitingForFirstAudioFrame && Boolean(audioIssue || presentation.icon === "mic-off");
   const orbConfig = hudOrbFor(state, phase, {
     reduced,
     pageVisible,
@@ -359,9 +395,24 @@ export const VoicePill = memo(function VoicePill({
     levelFresh: listeningAudio.fresh,
     selectedActionState,
   });
-  const beam = hudBorderBeamFor(state);
-  const showThinkingBeam = beam?.size === "line" && !reduced && pageVisible;
-  const showListeningBeam = beam?.size === "md" && listeningAudio.fresh && !reduced && pageVisible;
+  const resolvedVisuals = normalizeHudVisuals(visuals);
+  const voiceBeamConfig = resolveVoiceBeamConfig(resolvedVisuals);
+  const processingBeamConfig = resolveProcessingBeamConfig(resolvedVisuals);
+  const processingHueRotateDeg = hudProcessingHueRotateDeg(resolvedVisuals.processingColorVariant);
+  const voiceBeam = hudVoiceBeamFor(state, resolvedVisuals);
+  const hasDemoVoice = previewDemoLevel != null;
+  const isStartupListening = state === "starting" || audioCaptureStatus === "waiting_first_frame";
+  const showVoiceBeam = voiceBeam != null && !inputUnavailable && !reduced && pageVisible && (listeningAudio.fresh || isStartupListening || hasDemoVoice);
+  const liveVoiceLevel = showVoiceBeam
+    ? (hasDemoVoice
+      ? hudVoiceDriveLevel([previewDemoLevel], audioNow, audioNow, resolvedVisuals.voiceIntensity)
+      : hudVoiceDriveLevel(waveformLevels, lastAudioLevelAtMs, audioNow, resolvedVisuals.voiceIntensity))
+    : 0;
+  const voiceLevelRef = useRef(liveVoiceLevel);
+  voiceLevelRef.current = liveVoiceLevel;
+  const getVoiceLevel = useCallback(() => voiceLevelRef.current, []);
+  const beam = hudBorderBeamFor(state, resolvedVisuals);
+  const showProcessingBeam = beam?.size === "line" && !isRateLimitRetry && !reduced && pageVisible;
   const showOrb = processing && orbConfig != null;
   const [prevShowOrb, setPrevShowOrb] = useState(showOrb);
   const [orbExiting, setOrbExiting] = useState(false);
@@ -393,8 +444,6 @@ export const VoicePill = memo(function VoicePill({
     showOrb ? "voice-pill--orb" : "",
     reduced ? "voice-pill--reduced" : "",
   ].filter(Boolean).join(" ");
-  const isWaitingForFirstAudioFrame = listening && audioCaptureStatus === "waiting_first_frame";
-  const inputUnavailable = !isWaitingForFirstAudioFrame && Boolean(audioIssue || presentation.icon === "mic-off");
   const iconUrl = recording && !inputUnavailable && recordingTargetIcon?.startsWith("data:image/png;base64,")
     ? recordingTargetIcon
     : null;
@@ -414,7 +463,6 @@ export const VoicePill = memo(function VoicePill({
         ["--hud-motion-duration" as string]: `${HUD_MOTION_MS}ms`,
         ["--hud-label-in-delay" as string]: `${HUD_LABEL_IN_DELAY_MS}ms`,
         ["--hud-label-in-duration" as string]: `${HUD_LABEL_IN_DURATION_MS}ms`,
-        ["--hud-label-out-duration" as string]: `${HUD_LABEL_OUT_MS}ms`,
         ["--voice-pill-radius" as string]: `${HUD_PILL_RADIUS_PX}px`,
       }}
     >
@@ -429,6 +477,42 @@ export const VoicePill = memo(function VoicePill({
           <span className="voice-pill__sr-only" role="status" aria-live="polite" aria-atomic="true">
             {liveLabel}
           </span>
+          <div className={`voice-pill__voice-beam-layer${showVoiceBeam ? "" : " voice-pill__voice-beam-layer--exit"}`}>
+            <VoiceBeam
+              key={`voice-${resolvedVisuals.colorVariant}-${resolvedVisuals.voiceStyle}`}
+              className="voice-pill__voice-beam"
+              type={voiceBeamConfig.type}
+              colorVariant={voiceBeamConfig.colorVariant}
+              colors={voiceBeamConfig.colors ? [...voiceBeamConfig.colors] : undefined}
+              bandColors={voiceBeamConfig.bandColors}
+              staticColors={voiceBeamConfig.colorVariant === "mono"}
+              reach={voiceBeamConfig.reach}
+              spread={voiceBeamConfig.spread}
+              flow={voiceBeamConfig.flow}
+              bend={voiceBeamConfig.bend}
+              distortion={voiceBeamConfig.distortion}
+              attack={voiceBeamConfig.attack}
+              release={voiceBeamConfig.release}
+              threshold={voiceBeamConfig.threshold}
+              idle={voiceBeamConfig.idle}
+              innerOpacity={voiceBeamConfig.innerOpacity}
+              bloomOpacity={voiceBeamConfig.bloomOpacity}
+              bloomHeight={voiceBeamConfig.bloomHeight}
+              rangeWidth={voiceBeamConfig.rangeWidth}
+              rangeHeight={voiceBeamConfig.rangeHeight}
+              bandStrength={voiceBeamConfig.bandStrength}
+              bandTail={voiceBeamConfig.bandTail}
+              brightness={voiceBeamConfig.brightness}
+              saturation={voiceBeamConfig.saturation}
+              level={getVoiceLevel}
+              theme={beamTheme}
+              borderRadius={HUD_PILL_RADIUS_PX}
+              active={showVoiceBeam}
+              style={HUD_BEAM_OVERLAY_STYLE}
+            >
+              <div className="voice-pill__voice-beam-ghost" />
+            </VoiceBeam>
+          </div>
           <span className="voice-pill__indicator" aria-hidden="true">
             {(showOrb || orbExiting) && (
               <span className={`voice-pill__center-state${showOrb ? " voice-pill__center-state--active" : ""}`}>
@@ -455,8 +539,7 @@ export const VoicePill = memo(function VoicePill({
           <div className="voice-pill__copy">
             <div className="voice-pill__title-row">
               <span className="voice-pill__label-stack" aria-hidden="true">
-                {labelText && <span key={labelText} className={`voice-pill__label${labelEntering ? " voice-pill__label--in" : ""}`}>{labelText}</span>}
-                {labelOutgoing && <span key={`out-${labelOutgoing}`} className="voice-pill__label voice-pill__label--out">{labelOutgoing}</span>}
+                {labelText && <span key={enterKey} className={`voice-pill__label${labelEntering ? " voice-pill__label--in" : ""}`}>{labelText}</span>}
               </span>
               {recording && <time className="voice-pill__elapsed" aria-live="off" aria-label={`${t("已等待")} ${elapsed}`}>{elapsed}</time>}
             </div>
@@ -487,36 +570,24 @@ export const VoicePill = memo(function VoicePill({
             </button>
           )}
         </div>
-        <BorderBeam
-          className="voice-pill__beam-fx"
-          size={HUD_LISTENING_BEAM.size}
-          colorVariant={HUD_LISTENING_BEAM.colorVariant}
-          staticColors
-          strength={HUD_LISTENING_BEAM.strength}
-          brightness={HUD_LISTENING_BEAM.brightness}
-          duration={HUD_LISTENING_BEAM.duration}
-          theme="dark"
-          borderRadius={HUD_PILL_RADIUS_PX}
-          active={showListeningBeam}
-          style={HUD_BEAM_OVERLAY_STYLE}
+        <div
+          className={`voice-pill__processing-beam-layer${showProcessingBeam ? "" : " voice-pill__processing-beam-layer--exit"}`}
+          style={processingHueRotateDeg !== 0 ? { filter: `hue-rotate(${processingHueRotateDeg}deg)` } : undefined}
         >
-          <div className="voice-pill__beam-ghost" />
-        </BorderBeam>
-        <div className={`voice-pill__beam-layer${showThinkingBeam ? "" : " voice-pill__beam-layer--exit"}`}>
           <BorderBeam
-            className="voice-pill__beam-fx"
-            size={HUD_THINKING_BEAM.size}
-            colorVariant={HUD_THINKING_BEAM.colorVariant}
-            staticColors
-            strength={HUD_THINKING_BEAM.strength}
-            brightness={HUD_THINKING_BEAM.brightness}
-            duration={HUD_THINKING_BEAM.duration}
-            theme="dark"
+            key={`border-${resolvedVisuals.processingColorVariant}-${resolvedVisuals.processingStyle}`}
+            className="voice-pill__processing-beam"
+            size={processingBeamConfig.size}
+            colorVariant={processingBeamConfig.colorVariant}
+            strength={processingBeamConfig.strength}
+            brightness={processingBeamConfig.brightness}
+            duration={processingBeamConfig.duration}
+            theme={beamTheme}
             borderRadius={HUD_PILL_RADIUS_PX}
-            active={showThinkingBeam}
+            active={showProcessingBeam}
             style={HUD_BEAM_OVERLAY_STYLE}
           >
-            <div className="voice-pill__beam-ghost" />
+            <div className="voice-pill__processing-beam-ghost" />
           </BorderBeam>
         </div>
       </div>

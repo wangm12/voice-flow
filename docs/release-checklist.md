@@ -54,7 +54,7 @@ Default GitHub Releases use a stable self-signed `VoiceFlow` identity. That keep
 ## Privacy and behavior acceptance
 
 - [ ] Writing-tone trials require an explicit click, compare saved/draft prompts with the same sample, distinguish model/local/provider fallback/guard fallback results, and cancel on edits or close. No History, clipboard, window, style-example capture or automatic paste occurs.
-- [ ] Optional translation shortcut defaults off, captures the target per session and preserves global output/activation settings. Plain dictation becomes a Translate intent through light/standard/heavy cleanup and the final guard; short and merged long transcripts translate without a spoken command prefix. AssemblyAI uses raw Sync followed by shared cleanup. Test tap / hold_to_talk, cross-key releases, cancel, unavailable cleanup and recovery after registration failure. Strict offline keeps cloud requests blocked.
+- [ ] Optional translation shortcut defaults off, captures the target per session and preserves global output/activation settings. Plain dictation becomes a Translate intent through light/standard/heavy cleanup and the final guard; short and merged long transcripts translate without a spoken command prefix. AssemblyAI uses raw Sync followed by shared cleanup. Test tap / hold_to_talk / hybrid_hold_lock, cross-key releases, cancel, unavailable cleanup and recovery after registration failure. Strict offline keeps cloud requests blocked.
 - [ ] Audio evaluation defaults to validation only. An explicit live run selects reviewed external fixtures, model IDs and credentials; actual ASR output enters cleanup, errors remain visible, and candidate/fallback metrics are separate. Adapter timings are not native stop-to-insert evidence.
 
 - [ ] Cursor/native editor uses the developer policy and preserves technical tokens.
@@ -82,7 +82,7 @@ Default GitHub Releases use a stable self-signed `VoiceFlow` identity. That keep
 - [ ] Cloud LLM rejects missing/filtered/tool/budget completion and falls back to the complete prepared transcript; valid stop + EOF is accepted. Anthropic stop reasons are checked.
 - [ ] ASR, shared cloud cleanup and both vision paths reject 307/308 without sending a private body to the redirect target.
 - [ ] Clear-all after an old-schema migration removes owned rollback backups. Retention limits them to at most 7 days (or shorter history retention), preserving settings, models and external exports.
-- [ ] Fn and ⌘⌥Space offer exactly two enabled recording modes in both languages, themes and onboarding. Binding capture preserves the mode; old single modifiers stay visible with rebind guidance; Fn opens Keyboard settings without changing system preferences.
+- [ ] Fn and ⌘⌥Space offer the three enabled recording modes (`tap`, `hold_to_talk`, and `hybrid_hold_lock`) in both languages, themes and onboarding. Binding capture preserves the mode; old single modifiers stay visible with rebind guidance; Fn opens Keyboard settings without changing system preferences.
 - [ ] Shortcut chips open on normal click/keyboard activation. The inline editor captures only from its field, maps Option/Shift physical keys, allows Tab/Shift+Tab navigation, and exposes cancel/Fn/main-default reset/optional clear. Escape with held modifiers, outside interaction, blur and page changes restore the old binding; native keyboard state confirms all physical keys release before registration/save even when WebKit omits a keyup or retains old flags. Pointer clicks with null WebKit blur targets still allow in-group actions. Missing keys do not block legal saves; registration/persistence errors keep the old page value and offer retry. Verify late native ACKs across unmount/new capture, cancelling a queued pause, repeat events and outside focus during save/cancel; completion never steals focus from another control. New ordinary typing/navigation bindings are rejected without rewriting existing legal bindings.
 - [ ] Test repeats, two fast taps, either release order, release/Esc during microphone startup, stale/cross-source releases, Fn chords, simulated paste and ordinary ⌘C/⌘V/Shift. Stopping/processing ignores new recording gestures; sleep/listener interruption cancels and rearms only after release.
 - [ ] Migrating an older settings schema to the current schema (27) is idempotent, preserves bindings and migrates retired gestures to tap. The update notice explains the new Fn rule. Missing unchanged credentials do not block binding/mode saves; registration/write failures restore old bindings and page values.
@@ -125,7 +125,7 @@ No secret values belong in this repository or in app logs.
 - [ ] 普通、翻译及跳过整理热键的点按、纯按住、短按松手、Idle release、取消和重新注册行为正确；AssemblyAI raw Sync 和共同 LLM 禁用可从本次请求验证。
 - [ ] 普通与跳过整理热键交叉按压不会提前停止；主热键注册冲突后原有辅助键仍可触发；可选热键 Backspace / Delete 可清空，Esc 保留原绑定。
 - [ ] 模糊词典开启时保留原片段触发词和明确文字操作；替换不能创建片段触发；Unicode 行／段落分隔符保持原样。
-- [ ] 250ms 尾部音频、取消即时性、自动上限、设备断开和 Soniox 完整恢复。
+- [ ] 自适应（默认 ≤200ms，含显式高缓冲配置）尾部音频、取消即时性、自动上限、设备断开和 Soniox 完整恢复。
 - [ ] 冷启动及第二实例 CLI 动作、登录 --background 不显示或抢焦点；手动打开显示设置；系统登录启动状态与 UI 一致。
 - [ ] 系统登录启动状态与保存值不一致时，显式开关能纠正两个方向的差异；保存失败回滚，其他设置保存不改变系统状态。
 - [ ] Secure Input + 已确认复制、剪贴板写入失败、输入状态不确定的文案分别正确。

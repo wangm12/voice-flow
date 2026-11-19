@@ -920,11 +920,16 @@ impl LearningArmV2 {
         let mut pairs = Vec::with_capacity(episode.terms.len());
         let mut rows = Vec::with_capacity(episode.terms.len());
         let mut has_unsupported_promoted_ownership = false;
+        let scope = crate::dictionary_learn::controlled_candidate_scope(&episode.scope);
         for term in &episode.terms {
             validate_owned_arm_storage(&self.root)?;
             let row = store::get_learn_pair(
                 &self.root,
-                &crate::dictionary_learn::pair_key(&term.before, &term.after),
+                &crate::dictionary_learn::scoped_word_key_for(
+                    &term.before,
+                    &term.after,
+                    Some(&scope),
+                ),
             )?;
             if row.as_ref().is_some_and(|row| {
                 row.before_surface != term.before
@@ -1011,7 +1016,9 @@ impl LearningArmV2 {
         let term = episode
             .term(&followup.term_fixture_id)
             .ok_or_else(|| anyhow::anyhow!("learning_term_fixture_mismatch"))?;
-        let key = crate::dictionary_learn::pair_key(&term.before, &term.after);
+        let scope = crate::dictionary_learn::controlled_candidate_scope(&episode.scope);
+        let key =
+            crate::dictionary_learn::scoped_word_key_for(&term.before, &term.after, Some(&scope));
         let row = store::get_learn_pair(&self.root, &key)?
             .ok_or_else(|| anyhow::anyhow!("selected_learning_pair_unavailable"))?;
         if row.before_surface != term.before
@@ -1157,7 +1164,9 @@ impl LearningArmV2 {
         let term = episode
             .term(&undo.term_fixture_id)
             .ok_or_else(|| anyhow::anyhow!("learning_term_fixture_mismatch"))?;
-        let key = crate::dictionary_learn::pair_key(&term.before, &term.after);
+        let scope = crate::dictionary_learn::controlled_candidate_scope(&episode.scope);
+        let key =
+            crate::dictionary_learn::scoped_word_key_for(&term.before, &term.after, Some(&scope));
         let apply_observation = store::LearnPairObservation::research_fixture_apply(
             &format!(
                 "{}:{}:{}",
@@ -1362,6 +1371,7 @@ impl LearningArmV2 {
         let options = crate::asr::AsrOptions {
             api_key: String::new(),
             language: task.language.clone(),
+            preferred_languages: Vec::new(),
             prompt: None,
             keywords: Vec::new(),
             model: task.model_id.clone(),
@@ -1490,7 +1500,12 @@ impl LearningArmV2 {
             let term = episode
                 .term(&edit.term_fixture_id)
                 .ok_or_else(|| anyhow::anyhow!("learning_term_fixture_mismatch"))?;
-            let key = crate::dictionary_learn::pair_key(&term.before, &term.after);
+            let scope = crate::dictionary_learn::controlled_candidate_scope(&episode.scope);
+            let key = crate::dictionary_learn::scoped_word_key_for(
+                &term.before,
+                &term.after,
+                Some(&scope),
+            );
             let before_row = store::get_learn_pair(&self.root, &key)?;
             if before_row.as_ref().is_some_and(|row| {
                 row.before_surface != term.before
@@ -1671,7 +1686,9 @@ impl LearningArmV2 {
             anyhow::bail!("learning_source_mismatch");
         }
 
-        let key = crate::dictionary_learn::pair_key(&term.before, &term.after);
+        let scope = crate::dictionary_learn::controlled_candidate_scope(&episode.scope);
+        let key =
+            crate::dictionary_learn::scoped_word_key_for(&term.before, &term.after, Some(&scope));
         let state_before = self.selected_state(episode)?;
         if state_before.settings_consistency == "promoted_rule_ownership_unsupported" {
             anyhow::bail!("learning_global_rule_ownership_unsupported");
@@ -2476,32 +2493,56 @@ impl LearningArmV3 {
         validate_phase_arm_settings(&self.settings, plan)?;
         let mut pairs = Vec::with_capacity(plan.terms.len());
         for term in &plan.terms {
-            validate_owned_arm_storage(&self.root)?;
-            let key = crate::dictionary_learn::pair_key(&term.before, &term.after);
-            let row = store::get_learn_pair(&self.root, &key)?;
-            if let Some(row) = row.as_ref() {
-                if row.before_surface != term.before
-                    || row.after_surface != term.after
-                    || !row_within_bounds(row)
-                    || !row_within_phase_plan_scope(row, plan)
+            let mut keys = Vec::new();
+            for phase in &plan.phases {
+                if let learning_phase_v3::LearningPhaseActionV3::LearnText {
+                    term_fixture_id, ..
+                } = &phase.action
                 {
-                    anyhow::bail!("selected learning phase row identity mismatch");
+                    if term_fixture_id == &term.fixture_id {
+                        let scope =
+                            crate::dictionary_learn::controlled_candidate_scope(&phase.scope);
+                        let key = crate::dictionary_learn::scoped_word_key_for(
+                            &term.before,
+                            &term.after,
+                            Some(&scope),
+                        );
+                        if !keys.contains(&key) {
+                            keys.push(key);
+                        }
+                    }
                 }
             }
-            let row_json = row.as_ref().map(serde_json::to_vec).transpose()?;
-            pairs.push(LearningPhasePairSnapshotV3 {
-                term_fixture_id: term.fixture_id.clone(),
-                pair_key: key,
-                hits: row.as_ref().map_or(0, |row| row.hits),
-                promoted: row
-                    .as_ref()
-                    .is_some_and(store::LearnPairRecord::is_live_promoted),
-                tombstoned: row.as_ref().is_some_and(|row| row.tombstoned_at.is_some()),
-                ignored: row.as_ref().is_some_and(|row| row.ignored),
-                state: row.as_ref().map_or("absent", learning_pair_state),
-                stored_scope: row.as_ref().map(phase_row_scope_value),
-                row_sha256: row_json.map(|bytes| hex::encode(Sha256::digest(bytes))),
-            });
+            if keys.is_empty() {
+                keys.push(crate::dictionary_learn::pair_key(&term.before, &term.after));
+            }
+            for key in keys {
+                validate_owned_arm_storage(&self.root)?;
+                let row = store::get_learn_pair(&self.root, &key)?;
+                if let Some(row) = row.as_ref() {
+                    if row.before_surface != term.before
+                        || row.after_surface != term.after
+                        || !row_within_bounds(row)
+                        || !row_within_phase_plan_scope(row, plan)
+                    {
+                        anyhow::bail!("selected learning phase row identity mismatch");
+                    }
+                }
+                let row_json = row.as_ref().map(serde_json::to_vec).transpose()?;
+                pairs.push(LearningPhasePairSnapshotV3 {
+                    term_fixture_id: term.fixture_id.clone(),
+                    pair_key: key,
+                    hits: row.as_ref().map_or(0, |row| row.hits),
+                    promoted: row
+                        .as_ref()
+                        .is_some_and(store::LearnPairRecord::is_live_promoted),
+                    tombstoned: row.as_ref().is_some_and(|row| row.tombstoned_at.is_some()),
+                    ignored: row.as_ref().is_some_and(|row| row.ignored),
+                    state: row.as_ref().map_or("absent", learning_pair_state),
+                    stored_scope: row.as_ref().map(phase_row_scope_value),
+                    row_sha256: row_json.map(|bytes| hex::encode(Sha256::digest(bytes))),
+                });
+            }
         }
         let settings = read_private_bytes(&self.root.join("settings.json"))?;
         Ok(LearningPhaseArmSnapshotV3 {
@@ -2615,7 +2656,9 @@ impl LearningArmV3 {
             anyhow::bail!("learning_phase_mapping_identity_mismatch");
         }
 
-        let key = crate::dictionary_learn::pair_key(&term.before, &term.after);
+        let scope = crate::dictionary_learn::controlled_candidate_scope(&phase.scope);
+        let key =
+            crate::dictionary_learn::scoped_word_key_for(&term.before, &term.after, Some(&scope));
         let state_before = self.selected_state(plan)?;
         let before_row = store::get_learn_pair(&self.root, &key)?;
         let ordered_states = states
@@ -2683,9 +2726,9 @@ impl LearningArmV3 {
             "hits_after": after_row.as_ref().map(|row| row.hits),
             "promoted": after_row.as_ref().map(store::LearnPairRecord::is_live_promoted),
             "actual_rule_id": after_row.as_ref().map(|row| row.pair_key.as_str()),
-            "rule_id_kind": after_row.as_ref().map(|_| "legacy_normalized_pair_key"),
+            "rule_id_kind": after_row.as_ref().map(|_| "c1_word_rule_v2"),
             "stored_scope": after_row.as_ref().map(phase_row_scope_value),
-            "known_gap": if owner_conflict { Some("c1_legacy_pair_key_scope_conflict") } else { None },
+            "known_gap": serde_json::Value::Null,
             "sql_receipt": if owner_conflict { "not_committed_scope_conflict_no_hit" } else { outcome.candidate_write },
             "settings_readback": "unchanged_local_only_global_dictionary",
             "arm_settings_sha256_before": state_before.settings_sha256,
@@ -2760,7 +2803,12 @@ impl LearningArmV3 {
         let term = plan
             .term(term_fixture_id)
             .ok_or_else(|| anyhow::anyhow!("learning_phase_term_not_declared"))?;
-        let key = crate::dictionary_learn::pair_key(&term.before, &term.after);
+        let owner_scope = crate::dictionary_learn::controlled_candidate_scope(&owner_phase.scope);
+        let key = crate::dictionary_learn::scoped_word_key_for(
+            &term.before,
+            &term.after,
+            Some(&owner_scope),
+        );
         let state_before = self.selected_state(plan)?;
         let row = store::get_learn_pair(&self.root, &key)?;
         if let Some(row) = row.as_ref() {
@@ -2908,7 +2956,7 @@ impl LearningArmV3 {
             "requested_scope_assessment": scope_assessment,
             "stored_scope": row_after.as_ref().map(phase_row_scope_value),
             "actual_rule_id": row_after.as_ref().map(|row| row.pair_key.as_str()),
-            "rule_id_kind": if row_after.is_some() { "legacy_normalized_pair_key" } else { "unknown" },
+            "rule_id_kind": if row_after.is_some() { "c1_word_rule_v2" } else { "unknown" },
             "observed_rule_state": row_after.as_ref().map_or("absent", learning_pair_state),
             "scope_application": if applicable.is_empty() { "not_applicable" } else { "applicable" },
             "scope_filter_semantics": "normal_production_applicability_filter",
@@ -3005,7 +3053,12 @@ impl LearningArmV3 {
         let term = plan
             .term(term_fixture_id)
             .ok_or_else(|| anyhow::anyhow!("learning_phase_term_not_declared"))?;
-        let key = crate::dictionary_learn::pair_key(&term.before, &term.after);
+        let owner_scope = crate::dictionary_learn::controlled_candidate_scope(&owner_phase.scope);
+        let key = crate::dictionary_learn::scoped_word_key_for(
+            &term.before,
+            &term.after,
+            Some(&owner_scope),
+        );
         let state_before = self.selected_state(plan)?;
         let dictionary_before = self.settings.dictionary.clone();
         let row = store::get_learn_pair(&self.root, &key)?
@@ -3099,7 +3152,7 @@ impl LearningArmV3 {
             "requested_scope": phase_scope_value(&phase.scope),
             "stored_scope": phase_row_scope_value(&row_after),
             "actual_rule_id": row_after.pair_key,
-            "rule_id_kind": "legacy_normalized_pair_key",
+            "rule_id_kind": "c1_word_rule_v2",
             "state_before": state_before_undo,
             "state_after": "tombstoned",
             "sql_outcome": if duplicate { "duplicate_no_tombstone_refresh" } else { "tombstone_and_receipt_committed" },
@@ -3306,7 +3359,7 @@ fn phase_owner_learning_observations_present(
     for operation_id in operation_ids {
         let observation_id = format!("{}:{}:{}", plan.plan_id, operation_id, source.sha256);
         let observation =
-            store::LearnPairObservation::research_fixture_edit(&observation_id, pair_key);
+            store::LearnPairObservation::research_fixture_c1_edit(&observation_id, pair_key);
         if !store::has_learn_pair_observation(root, &observation)? {
             return Ok(false);
         }
@@ -6981,9 +7034,11 @@ mod fixtures {
         let mut arm = LearningArmV2::open(root.path(), &episode).unwrap();
         let receipt = arm.execute_text_operation(&episode, &operation).unwrap();
         let term = &episode.terms[0];
-        let key = crate::dictionary_learn::pair_key(&term.before, &term.after);
+        let scope = crate::dictionary_learn::controlled_candidate_scope(&episode.scope);
+        let key =
+            crate::dictionary_learn::scoped_word_key_for(&term.before, &term.after, Some(&scope));
         let row = store::get_learn_pair(&arm.root, &key).unwrap();
-        let observation = store::LearnPairObservation::research_fixture_edit(
+        let observation = store::LearnPairObservation::research_fixture_c1_edit(
             &format!(
                 "{}:{}:{}",
                 episode.episode_id, operation.operation_id, episode.source.sha256
@@ -7059,14 +7114,94 @@ mod fixtures {
 
         let operation = operation_for(&episode, &mismatched, 0);
         let term = &episode.terms[0];
-        let observation = store::LearnPairObservation::research_fixture_edit(
+        let scope = crate::dictionary_learn::controlled_candidate_scope(&episode.scope);
+        let key =
+            crate::dictionary_learn::scoped_word_key_for(&term.before, &term.after, Some(&scope));
+        let observation = store::LearnPairObservation::research_fixture_c1_edit(
             &format!(
                 "{}:{}:{}",
                 episode.episode_id, operation.operation_id, episode.source.sha256
             ),
-            &crate::dictionary_learn::pair_key(&term.before, &term.after),
+            &key,
         );
         assert!(!store::has_learn_pair_observation(&arm.root, &observation).unwrap());
+    }
+
+    #[cfg(feature = "research-harness")]
+    #[test]
+    fn v3_arm_learns_same_term_independently_across_distinct_scopes_under_c1_word_keys() {
+        let root = TestRoot::new();
+        let plan = learning_phase_v3::tests::fixture_plan();
+        let mut arm = LearningArmV3::open(root.path(), &plan).unwrap();
+        let scope_a = plan.phases[0].scope.clone();
+        let phase_a_learn = plan.phases[0].clone();
+        let scope_b_phase = plan
+            .phases
+            .iter()
+            .find(|p| {
+                p.scope != scope_a
+                    && matches!(
+                        p.action,
+                        learning_phase_v3::LearningPhaseActionV3::LearnText { .. }
+                    )
+            })
+            .expect("second scope learn phase")
+            .clone();
+        let learning_phase_v3::LearningPhaseActionV3::LearnText {
+            operation_ids: ops_a,
+            ..
+        } = &phase_a_learn.action
+        else {
+            unreachable!()
+        };
+        let states_a = vec![
+            LearningTextStateInputV2 {
+                sequence: 0,
+                state_id: phase_a_learn.edit_states[0].state_id.clone(),
+                layer: LearningTextLayerV2::PostInsert,
+                text: "The release note says VoiceFlo.".to_owned(),
+            },
+            LearningTextStateInputV2 {
+                sequence: 1,
+                state_id: phase_a_learn.edit_states[1].state_id.clone(),
+                layer: LearningTextLayerV2::Settled,
+                text: "The release note says VoiceFlow.".to_owned(),
+            },
+        ];
+        let receipt_a = arm
+            .execute_phase_text(&plan, &phase_a_learn, &ops_a[0], &states_a)
+            .unwrap();
+        assert_eq!(receipt_a["rule_id_kind"], "c1_word_rule_v2");
+        assert!(receipt_a["known_gap"].is_null());
+
+        let learning_phase_v3::LearningPhaseActionV3::LearnText {
+            operation_ids: ops_b,
+            ..
+        } = &scope_b_phase.action
+        else {
+            unreachable!()
+        };
+        let states_b = vec![
+            LearningTextStateInputV2 {
+                sequence: 0,
+                state_id: scope_b_phase.edit_states[0].state_id.clone(),
+                layer: LearningTextLayerV2::PostInsert,
+                text: "The release note says VoiceFlo.".to_owned(),
+            },
+            LearningTextStateInputV2 {
+                sequence: 1,
+                state_id: scope_b_phase.edit_states[1].state_id.clone(),
+                layer: LearningTextLayerV2::Settled,
+                text: "The release note says VoiceFlow.".to_owned(),
+            },
+        ];
+        let receipt_b = arm
+            .execute_phase_text(&plan, &scope_b_phase, &ops_b[0], &states_b)
+            .unwrap();
+        assert_eq!(receipt_b["rule_id_kind"], "c1_word_rule_v2");
+        assert!(receipt_b["known_gap"].is_null());
+        assert_ne!(receipt_a["actual_rule_id"], receipt_b["actual_rule_id"]);
+        assert_eq!(receipt_b["hits_after"], 1);
     }
 }
 

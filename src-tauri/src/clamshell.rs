@@ -103,7 +103,7 @@ pub(crate) fn ensure_input_device_available<F>(
 where
     F: FnMut() -> bool,
 {
-    if lid_state() != LidState::Closed {
+    if current_lid_state() != LidState::Closed {
         return Ok(());
     }
 
@@ -131,11 +131,29 @@ where
 }
 
 pub(crate) fn current_lid_state() -> LidState {
-    lid_state()
+    #[cfg(target_os = "macos")]
+    {
+        macos::lid_state_uncached()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        LidState::Unknown
+    }
 }
 
 pub fn lid_closed() -> bool {
-    current_lid_state() == LidState::Closed
+    lid_state() == LidState::Closed
+}
+
+pub fn default_output_may_bleed_into_mic() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        macos::default_output_may_bleed_into_mic()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
 }
 
 pub(crate) fn actual_coreaudio_identity_for_stable_selection<F>(
@@ -236,6 +254,9 @@ mod macos {
     const PROPERTY_DEVICE_UID: u32 = u32::from_be_bytes(*b"uid ");
     const PROPERTY_TRANSPORT_TYPE: u32 = u32::from_be_bytes(*b"tran");
     const PROPERTY_HARDWARE_DEVICES: u32 = u32::from_be_bytes(*b"dev#");
+    const PROPERTY_DEFAULT_OUTPUT_DEVICE: u32 = u32::from_be_bytes(*b"dOut");
+    const PROPERTY_DATA_SOURCE: u32 = u32::from_be_bytes(*b"ssrc");
+    const DATA_SOURCE_HEADPHONES: u32 = u32::from_be_bytes(*b"hdpn");
     const TRANSPORT_BUILT_IN: u32 = u32::from_be_bytes(*b"bltn");
     const TRANSPORT_UNKNOWN: u32 = 0;
     const IO_REGISTRY_RECURSIVE: u32 = 1;
@@ -509,16 +530,62 @@ mod macos {
         }
     }
 
-    pub(super) fn lid_state() -> LidState {
+    pub(super) fn lid_state_uncached() -> LidState {
         let service = read_lid_state_in_plane(b"IOService\0");
         let device_tree = read_lid_state_in_plane(b"IODeviceTree\0");
-        match (service, device_tree) {
+        let state = match (service, device_tree) {
             (LidState::Closed, LidState::Open) | (LidState::Open, LidState::Closed) => {
                 LidState::Unknown
             }
             (LidState::Closed, _) | (_, LidState::Closed) => LidState::Closed,
             (LidState::Open, LidState::Open) => LidState::Open,
             _ => LidState::Unknown,
+        };
+        if let Ok(mut cache) = lid_state_cache().lock() {
+            *cache = Some((std::time::Instant::now(), state));
+        }
+        state
+    }
+
+    fn lid_state_cache() -> &'static std::sync::Mutex<Option<(std::time::Instant, LidState)>> {
+        static CACHE: std::sync::OnceLock<
+            std::sync::Mutex<Option<(std::time::Instant, LidState)>>,
+        > = std::sync::OnceLock::new();
+        CACHE.get_or_init(|| std::sync::Mutex::new(None))
+    }
+
+    pub(super) fn lid_state() -> LidState {
+        if let Ok(cache) = lid_state_cache().lock() {
+            if let Some((at, state)) = *cache {
+                if at.elapsed() <= std::time::Duration::from_millis(250) {
+                    return state;
+                }
+            }
+        }
+        lid_state_uncached()
+    }
+
+    pub(super) fn default_output_may_bleed_into_mic() -> bool {
+        unsafe {
+            let Some(device_id) = read_u32(
+                AUDIO_OBJECT_SYSTEM,
+                PROPERTY_DEFAULT_OUTPUT_DEVICE,
+                AUDIO_GLOBAL_SCOPE,
+            ) else {
+                return true;
+            };
+            if device_id == 0 {
+                return true;
+            }
+            let Some(transport) = read_u32(device_id, PROPERTY_TRANSPORT_TYPE, AUDIO_GLOBAL_SCOPE)
+            else {
+                return true;
+            };
+            // Suppress cue masking only when we have positive built-in headphone
+            // evidence; external/AirPlay/BT/USB/HDMI devices or unknown reads fail closed (mask).
+            transport != TRANSPORT_BUILT_IN
+                || read_u32(device_id, PROPERTY_DATA_SOURCE, AUDIO_OUTPUT_SCOPE)
+                    != Some(DATA_SOURCE_HEADPHONES)
         }
     }
 }

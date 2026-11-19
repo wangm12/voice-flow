@@ -428,6 +428,8 @@ pub struct CleanupModelStatus {
     pub last_operation_error: Option<String>,
     pub managed: bool,
     pub partial_managed: bool,
+    pub language: String,
+    pub memory_estimate: Option<crate::model_resources::ModelMemoryEstimate>,
 }
 
 impl CleanupModelStatus {
@@ -451,6 +453,13 @@ impl CleanupModelStatus {
             last_operation_error: None,
             managed: false,
             partial_managed: false,
+            language: model.language.to_owned(),
+            memory_estimate: crate::model_resources::admission_reserve_estimate(
+                crate::model_resources::cleanup_memory_reserve_estimate_bytes(
+                    model.id,
+                    model.revision,
+                ),
+            ),
         }
     }
 }
@@ -479,6 +488,7 @@ pub struct MlxCleanupModelStatus {
     pub selectable: bool,
     pub compatible: bool,
     pub compatibility_error: Option<String>,
+    pub memory_estimate: Option<crate::model_resources::ModelMemoryEstimate>,
 }
 
 #[derive(Clone)]
@@ -1140,6 +1150,7 @@ impl Manager {
                 files: verified.clone(),
             });
         }
+        self.notify_revision();
         let (sha256_backend, sha256_hardware_available) = sha256_backend_facts();
         let facts = InventoryVerification {
             cache,
@@ -1731,6 +1742,9 @@ fn catalog_model_status(
         selectable: download_available && compatible && verified,
         compatible,
         compatibility_error,
+        memory_estimate: crate::model_resources::admission_reserve_estimate(
+            crate::model_resources::cleanup_memory_reserve_estimate_bytes(model.id, model.revision),
+        ),
     }
 }
 

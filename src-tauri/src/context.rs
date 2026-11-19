@@ -532,17 +532,17 @@ fn short_browser_display_name(bundle_id: Option<&str>, label: &str) -> Option<&'
 }
 
 fn short_browser_name_for_bundle(bundle_id: Option<&str>) -> Option<&'static str> {
-    match bundle_id {
-        Some("com.google.Chrome") => Some("Chrome"),
-        Some("com.google.Chrome.canary") => Some("Chrome Canary"),
-        Some("com.apple.Safari") => Some("Safari"),
-        Some("company.thebrowser.Browser") => Some("Arc"),
-        Some("com.brave.Browser") => Some("Brave"),
-        Some("com.microsoft.edgemac") => Some("Edge"),
-        Some("org.mozilla.firefox") => Some("Firefox"),
-        Some("com.vivaldi.Vivaldi") => Some("Vivaldi"),
-        Some("com.operasoftware.Opera") => Some("Opera"),
-        Some("com.kagi.kagimacOS") => Some("Orion"),
+    match bundle_id?.to_ascii_lowercase().as_str() {
+        "com.google.chrome" => Some("Chrome"),
+        "com.google.chrome.canary" => Some("Chrome Canary"),
+        "com.apple.safari" => Some("Safari"),
+        "company.thebrowser.browser" => Some("Arc"),
+        "com.brave.browser" => Some("Brave"),
+        "com.microsoft.edgemac" => Some("Edge"),
+        "org.mozilla.firefox" => Some("Firefox"),
+        "com.vivaldi.vivaldi" => Some("Vivaldi"),
+        "com.operasoftware.opera" => Some("Opera"),
+        "com.kagi.kagimacos" => Some("Orion"),
         _ => None,
     }
 }
@@ -738,12 +738,13 @@ pub fn family_label(family: ContextFamily) -> &'static str {
 }
 
 const OLD_SHARED_CHAT_PROMPT: &str = "Keep the message natural, short, and conversational. Do not turn it into an email or add greetings/sign-offs.";
+const OLD_PERSONAL_CHAT_PROMPT: &str = "Keep the user's casual chat voice. Do not add greetings or sign-offs such as 您好, 你好, Hello, or Best. Do not expand fragments into full formal sentences. Do not sanitize swearing, slang, or particles like 哈哈. Add a question mark for a clear question and a period or 。 for a clear sentence end. Do not strip existing periods. Never turn the message into an email.";
 
 pub fn default_writing_prompt(family: ContextFamily) -> &'static str {
     match family {
         ContextFamily::Email => "Write a natural, polite email body. Organize spoken greeting, request, timing, and closing only when they were spoken. Do not create a subject line or signature.",
         ContextFamily::BrowserSearch => "Prefer a concise search query or clear web-field value. Keep named entities, dates, numbers, and URLs exact. Do not add search background.",
-        ContextFamily::PersonalChat => "Keep the user's casual chat voice. Do not add greetings or sign-offs such as 您好, 你好, Hello, or Best. Do not expand fragments into full formal sentences. Do not sanitize swearing, slang, or particles like 哈哈. Add a question mark for a clear question and a period or 。 for a clear sentence end. Do not strip existing periods. Never turn the message into an email.",
+        ContextFamily::PersonalChat => "Keep the user's casual chat voice in every language. Preserve spoken particles, laughter, hesitation, slang, swearing, and informal fragments, including particles such as 哈哈, 嗯, 呃, 啊, uh, and um; do not remove them just because they sound like fillers. Do not add greetings or sign-offs such as 您好, 你好, Hello, or Best. Do not expand fragments into full formal sentences. Keep existing punctuation and do not force a terminal period onto a single casual sentence when the user did not say one. Never turn the message into an email.",
         ContextFamily::WorkChat => "Keep the message short and conversational for workplace chat. Do not add greetings, sign-offs, or email structure. Keep names and project terms exact. Do not add emoji unless spoken.",
         ContextFamily::ProjectManagement => "Keep owners, status, blockers, dates, and next actions explicit. Do not invent a person, deadline, or project fact.",
         ContextFamily::CalendarTask => "Keep dates, times, durations, reminders, attendees, locations, and next actions exact. Return a concise entry and do not invent scheduling details.",
@@ -818,7 +819,12 @@ pub fn normalize_writing_modes(modes: &mut Vec<WritingMode>) {
                 mode.family,
                 ContextFamily::WorkChat | ContextFamily::PersonalChat
             ) && saved.prompt == OLD_SHARED_CHAT_PROMPT;
-            if !saved.prompt.trim().is_empty() && !migrate_old_shared_chat {
+            let migrate_old_personal_chat = mode.family == ContextFamily::PersonalChat
+                && saved.prompt == OLD_PERSONAL_CHAT_PROMPT;
+            if !saved.prompt.trim().is_empty()
+                && !migrate_old_shared_chat
+                && !migrate_old_personal_chat
+            {
                 mode.prompt = saved
                     .prompt
                     .chars()
@@ -1003,6 +1009,15 @@ pub(crate) enum MappingTransferResolution {
 }
 
 impl MappingTransferSelectorV1 {
+    pub(crate) fn has_task_disambiguator(&self) -> bool {
+        has_task_disambiguator_for(
+            self.bundle_id.as_deref(),
+            self.browser_host.as_deref(),
+            self.browser_path_prefix.as_deref(),
+            self.focused_field,
+        )
+    }
+
     pub(crate) fn validate(&self) -> Result<(), String> {
         if self.version != 1 {
             return Err("unsupported mapping transfer selector version".into());
@@ -1322,7 +1337,7 @@ impl AppMapping {
         }
         if self.writing_task_id.is_some() && !self.has_task_disambiguator() {
             return Err(
-                "task identity requires a verified focused field or browser path selector".into(),
+                "task identity requires a verified focused field, a browser host/path selector, or a recognized native App bundle id".into(),
             );
         }
         if self.writing_task_id.is_some()
@@ -1433,8 +1448,12 @@ impl AppMapping {
     }
 
     pub(crate) fn has_task_disambiguator(&self) -> bool {
-        self.focused_field.is_some()
-            || (self.browser_host.is_some() && self.browser_path_prefix.is_some())
+        has_task_disambiguator_for(
+            self.bundle_id.as_deref(),
+            self.browser_host.as_deref(),
+            self.browser_path_prefix.as_deref(),
+            self.focused_field,
+        )
     }
 
     pub(crate) fn has_task_anchor(&self) -> bool {
@@ -2312,11 +2331,21 @@ fn task_identity_is_verified(mapping: &AppMapping, signal: &AppSignal) -> bool {
             && signal.input_token.is_some()
             && (signal.window_id.is_some() || signal.window_token.is_some());
     }
-    mapping.browser_host.is_some()
-        && mapping.browser_path_prefix.is_some()
-        && signal.browser_host.is_some()
-        && signal.browser_path.is_some()
-        && signal.browser_target_token.is_some()
+    if mapping.browser_host.is_some() || mapping.browser_path_prefix.is_some() {
+        return mapping.browser_host.is_some()
+            && mapping.browser_path_prefix.is_some()
+            && signal.browser_host.is_some()
+            && signal.browser_path.is_some()
+            && signal.browser_target_token.is_some();
+    }
+    mapping.bundle_id.as_deref().is_some_and(|bundle_id| {
+        is_qualified_native_task_bundle(bundle_id)
+            && !signal.is_browser()
+            && signal
+                .bundle_id
+                .as_deref()
+                .is_some_and(|actual| bundle_id.eq_ignore_ascii_case(actual))
+    })
 }
 
 fn best_mapping_match<'a>(
@@ -2736,7 +2765,7 @@ fn browser_profile(host: &str) -> Option<(&'static str, ContextFamily, &'static 
 fn native_profile(
     bundle_id: &str,
 ) -> Option<(&'static str, ContextFamily, &'static str, &'static str)> {
-    match bundle_id {
+    match bundle_id.to_ascii_lowercase().as_str() {
         "com.openai.codex" => Some(("code.codex", ContextFamily::PromptOrCode, "Codex", "codex")),
         "com.todesktop.230313mzl4w4u92" => Some((
             "code.cursor",
@@ -2744,37 +2773,37 @@ fn native_profile(
             "Cursor",
             "cursor",
         )),
-        "com.microsoft.VSCode" => Some((
+        "com.microsoft.vscode" => Some((
             "code.vscode",
             ContextFamily::PromptOrCode,
             "VS Code",
             "vscode",
         )),
-        "com.apple.Terminal" | "com.googlecode.iterm2" | "dev.warp.Warp-Stable" => Some((
+        "com.apple.terminal" | "com.googlecode.iterm2" | "dev.warp.warp-stable" => Some((
             "terminal.native",
             ContextFamily::Terminal,
             "Terminal",
             "terminal",
         )),
         "com.apple.mail" => Some(("email.native", ContextFamily::Email, "Mail", "mail")),
-        "com.microsoft.Outlook" => Some(("email.native", ContextFamily::Email, "Outlook", "mail")),
+        "com.microsoft.outlook" => Some(("email.native", ContextFamily::Email, "Outlook", "mail")),
         "com.tinyspeck.slackmacgap" => {
             Some(("chat.native", ContextFamily::WorkChat, "Slack", "chat"))
         }
         "com.microsoft.teams2" => Some(("chat.native", ContextFamily::WorkChat, "Teams", "chat")),
-        "com.tencent.xinWeChat" => Some((
+        "com.tencent.xinwechat" => Some((
             "chat.personal",
             ContextFamily::PersonalChat,
             "WeChat",
             "chat",
         )),
-        "com.apple.MobileSMS" => Some((
+        "com.apple.mobilesms" => Some((
             "chat.personal",
             ContextFamily::PersonalChat,
             "Messages",
             "chat",
         )),
-        "com.hnc.Discord" => Some((
+        "com.hnc.discord" => Some((
             "chat.personal",
             ContextFamily::PersonalChat,
             "Discord",
@@ -2786,13 +2815,13 @@ fn native_profile(
             "Notion",
             "document",
         )),
-        "com.microsoft.Word" => Some((
+        "com.microsoft.word" => Some((
             "document.native",
             ContextFamily::Document,
             "Word",
             "document",
         )),
-        "com.apple.iCal" => Some((
+        "com.apple.ical" => Some((
             "calendar.native",
             ContextFamily::CalendarTask,
             "Calendar",
@@ -2818,17 +2847,17 @@ impl AppSignal {
 /// The adapter list only controls how an authorized browser exposes its active
 /// URL; profile resolution and unknown-app fallback remain independent of it.
 fn browser_application(bundle_id: Option<&str>, process_name: &str) -> Option<&'static str> {
-    let by_bundle = match bundle_id {
-        Some("com.google.Chrome") => Some("Google Chrome"),
-        Some("com.google.Chrome.canary") => Some("Google Chrome Canary"),
-        Some("com.apple.Safari") => Some("Safari"),
-        Some("company.thebrowser.Browser") => Some("Arc"),
-        Some("com.brave.Browser") => Some("Brave Browser"),
+    let by_bundle = match bundle_id.map(str::to_ascii_lowercase).as_deref() {
+        Some("com.google.chrome") => Some("Google Chrome"),
+        Some("com.google.chrome.canary") => Some("Google Chrome Canary"),
+        Some("com.apple.safari") => Some("Safari"),
+        Some("company.thebrowser.browser") => Some("Arc"),
+        Some("com.brave.browser") => Some("Brave Browser"),
         Some("com.microsoft.edgemac") => Some("Microsoft Edge"),
         Some("org.mozilla.firefox") => Some("Firefox"),
-        Some("com.vivaldi.Vivaldi") => Some("Vivaldi"),
-        Some("com.operasoftware.Opera") => Some("Opera"),
-        Some("com.kagi.kagimacOS") => Some("Orion"),
+        Some("com.vivaldi.vivaldi") => Some("Vivaldi"),
+        Some("com.operasoftware.opera") => Some("Opera"),
+        Some("com.kagi.kagimacos") => Some("Orion"),
         _ => None,
     };
     by_bundle.or_else(|| {
@@ -2851,6 +2880,21 @@ fn browser_application(bundle_id: Option<&str>, process_name: &str) -> Option<&'
 
 fn is_browser_bundle_id(bundle_id: Option<&str>) -> bool {
     browser_application(bundle_id, "").is_some()
+}
+
+fn has_task_disambiguator_for(
+    bundle_id: Option<&str>,
+    browser_host: Option<&str>,
+    browser_path_prefix: Option<&str>,
+    focused_field: Option<FocusKind>,
+) -> bool {
+    focused_field.is_some()
+        || (browser_host.is_some() && browser_path_prefix.is_some())
+        || (browser_host.is_none() && bundle_id.is_some_and(is_qualified_native_task_bundle))
+}
+
+fn is_qualified_native_task_bundle(bundle_id: &str) -> bool {
+    !is_browser_bundle_id(Some(bundle_id)) && native_profile(bundle_id).is_some()
 }
 
 /// Tell the idle preview loop whether an unchanged frontmost application is a
@@ -4084,6 +4128,129 @@ pub fn detect_snapshot_with_modes(
 }
 
 #[cfg(target_os = "macos")]
+fn scan_installed_applications() -> Vec<ApplicationOption> {
+    use core_foundation::base::TCFType;
+    use core_foundation::string::CFString;
+    use objc::{class, msg_send, runtime::Object, sel, sel_impl};
+    use std::ffi::CStr;
+    use std::os::raw::c_char;
+
+    unsafe fn ns_string_to_rust(value: *mut Object) -> Option<String> {
+        if value.is_null() {
+            return None;
+        }
+        let is_str: bool = msg_send![value, isKindOfClass: class!(NSString)];
+        if !is_str {
+            return None;
+        }
+        let bytes: *const c_char = msg_send![value, UTF8String];
+        if bytes.is_null() {
+            None
+        } else {
+            CStr::from_ptr(bytes)
+                .to_str()
+                .ok()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+        }
+    }
+
+    unsafe fn dict_string(dict: *mut Object, key: &str) -> Option<String> {
+        let cf_key = CFString::new(key);
+        let value: *mut Object = msg_send![dict, objectForKey: cf_key.as_concrete_TypeRef()];
+        ns_string_to_rust(value)
+    }
+
+    let mut search_dirs = vec![
+        std::path::PathBuf::from("/Applications"),
+        std::path::PathBuf::from("/Applications/Utilities"),
+        std::path::PathBuf::from("/System/Applications"),
+        std::path::PathBuf::from("/System/Applications/Utilities"),
+    ];
+    if let Ok(home) = std::env::var("HOME") {
+        if !home.trim().is_empty() {
+            search_dirs.push(std::path::PathBuf::from(home).join("Applications"));
+        }
+    }
+
+    let mut installed = Vec::new();
+    for dir in search_dirs {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let is_app = path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("app"));
+            if !is_app || !path.is_dir() {
+                continue;
+            }
+            let plist = path.join("Contents").join("Info.plist");
+            let Some(plist_str) = plist.to_str() else {
+                continue;
+            };
+            if !plist.is_file() {
+                continue;
+            }
+            let cf_path = CFString::new(plist_str);
+            let dict: *mut Object = unsafe {
+                msg_send![class!(NSDictionary), dictionaryWithContentsOfFile: cf_path.as_concrete_TypeRef()]
+            };
+            if dict.is_null() {
+                continue;
+            }
+            let Some(bundle_id) = (unsafe { dict_string(dict, "CFBundleIdentifier") }) else {
+                continue;
+            };
+            if bundle_id == "com.voiceflow.desktop" {
+                continue;
+            }
+            let label = unsafe {
+                dict_string(dict, "CFBundleDisplayName")
+                    .or_else(|| dict_string(dict, "CFBundleName"))
+            }
+            .or_else(|| {
+                path.file_stem()
+                    .and_then(|name| name.to_str())
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty())
+                    .map(str::to_owned)
+            });
+            let Some(label) = label else {
+                continue;
+            };
+            installed.push(ApplicationOption { bundle_id, label });
+        }
+    }
+    installed
+}
+
+#[cfg(target_os = "macos")]
+fn cached_installed_applications() -> Vec<ApplicationOption> {
+    static INSTALLED_APPS_CACHE: std::sync::OnceLock<
+        std::sync::Mutex<(std::time::Instant, Vec<ApplicationOption>)>,
+    > = std::sync::OnceLock::new();
+    const CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+    let cache = INSTALLED_APPS_CACHE.get_or_init(|| {
+        std::sync::Mutex::new((
+            std::time::Instant::now() - CACHE_TTL - std::time::Duration::from_secs(1),
+            Vec::new(),
+        ))
+    });
+    let mut guard = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if guard.0.elapsed() >= CACHE_TTL || guard.1.is_empty() {
+        guard.1 = scan_installed_applications();
+        guard.0 = std::time::Instant::now();
+    }
+    guard.1.clone()
+}
+
+#[cfg(target_os = "macos")]
 pub fn available_applications() -> Vec<ApplicationOption> {
     use std::ffi::CStr;
     use std::os::raw::c_char;
@@ -4126,8 +4293,18 @@ pub fn available_applications() -> Vec<ApplicationOption> {
         result
     };
 
+    let mut seen_bundles = applications
+        .iter()
+        .map(|app| app.bundle_id.to_ascii_lowercase())
+        .collect::<std::collections::HashSet<_>>();
+    for app in cached_installed_applications() {
+        if seen_bundles.insert(app.bundle_id.to_ascii_lowercase()) {
+            applications.push(app);
+        }
+    }
+
     applications.sort_by_cached_key(|application| application.label.to_ascii_lowercase());
-    applications.dedup_by(|left, right| left.bundle_id == right.bundle_id);
+    applications.dedup_by(|left, right| left.bundle_id.eq_ignore_ascii_case(&right.bundle_id));
     applications
 }
 
@@ -4747,6 +4924,15 @@ mod tests {
         assert_eq!(codex.profile.id, "code.codex");
         assert_eq!(codex.profile.family, ContextFamily::PromptOrCode);
         assert_eq!(codex.profile.app_label, "Codex");
+
+        let messages =
+            snapshot_for_signal(&signal("COM.APPLE.MOBILESMs", "Messages", None), &[], false);
+        assert_eq!(messages.profile.id, "chat.personal");
+        assert_eq!(messages.profile.app_label, "Messages");
+
+        let discord = snapshot_for_signal(&signal("COM.HNC.DISCORD", "Discord", None), &[], false);
+        assert_eq!(discord.profile.id, "chat.personal");
+        assert_eq!(discord.profile.app_label, "Discord");
     }
 
     #[test]
@@ -4756,7 +4942,7 @@ mod tests {
         assert_ne!(personal, work);
         assert_eq!(
             personal,
-            "Keep the user's casual chat voice. Do not add greetings or sign-offs such as 您好, 你好, Hello, or Best. Do not expand fragments into full formal sentences. Do not sanitize swearing, slang, or particles like 哈哈. Add a question mark for a clear question and a period or 。 for a clear sentence end. Do not strip existing periods. Never turn the message into an email."
+            default_writing_prompt(ContextFamily::PersonalChat)
         );
         assert_eq!(
             work,
@@ -4852,6 +5038,40 @@ mod tests {
         assert_eq!(work.prompt, default_writing_prompt(ContextFamily::WorkChat));
         assert_ne!(personal.prompt, work.prompt);
         assert_eq!(custom.prompt, OLD_SHARED_CHAT_PROMPT);
+    }
+
+    #[test]
+    fn normalize_updates_the_old_personal_chat_default_but_preserves_custom_prompts() {
+        let mut modes = builtin_writing_modes();
+        let personal = modes
+            .iter_mut()
+            .find(|mode| mode.id == "personal_chat")
+            .unwrap();
+        personal.prompt = OLD_PERSONAL_CHAT_PROMPT.into();
+        let work = modes
+            .iter_mut()
+            .find(|mode| mode.id == "work_chat")
+            .unwrap();
+        work.prompt = "Keep my workplace chat wording exactly.".into();
+
+        normalize_writing_modes(&mut modes);
+
+        assert_eq!(
+            modes
+                .iter()
+                .find(|mode| mode.id == "personal_chat")
+                .unwrap()
+                .prompt,
+            default_writing_prompt(ContextFamily::PersonalChat)
+        );
+        assert_eq!(
+            modes
+                .iter()
+                .find(|mode| mode.id == "work_chat")
+                .unwrap()
+                .prompt,
+            "Keep my workplace chat wording exactly."
+        );
     }
 
     #[test]
@@ -5125,18 +5345,18 @@ mod tests {
     }
 
     #[test]
-    fn bundle_only_and_ambiguous_mapping_selectors_never_establish_task_identity() {
+    fn recognized_native_bundle_mapping_can_establish_task_identity_without_ax_field() {
         let mut bundle_only = AppMapping {
-            id: "cursor-project".into(),
-            label: "Cursor project update".into(),
-            family: ContextFamily::Document,
+            id: "slack-project".into(),
+            label: "Slack project update".into(),
+            family: ContextFamily::WorkChat,
             writing_task_id: Some(WritingTaskId::ProjectUpdate),
             writing_preferences: Vec::new(),
             preference_guidance_provider_approved: false,
             preference_revision: 0,
             deleted: false,
             mode_id: None,
-            bundle_id: Some("com.example.editor".into()),
+            bundle_id: Some("COM.TINYSPECK.SLACKMACGAP".into()),
             executable: None,
             browser_host: None,
             browser_path_prefix: None,
@@ -5152,13 +5372,45 @@ mod tests {
             cleanup_enabled: true,
             dictionary_learn_enabled: true,
         };
-        let mut active = signal("com.example.editor", "Editor", None);
+        let mut active = signal("com.tinyspeck.slackmacgap", "Slack", None);
         active.focus_kind = FocusKind::Document;
         active.input_token = Some(111);
         active.window_id = Some(222);
-        assert!(bundle_only.validate().is_err());
+        assert!(bundle_only.validate().is_ok());
         assert_eq!(
             snapshot_for_signal(&active, &[bundle_only.clone()], false)
+                .profile
+                .writing_task_id,
+            Some(WritingTaskId::ProjectUpdate)
+        );
+
+        let mismatched = signal("com.apple.mail", "Mail", None);
+        assert_eq!(
+            snapshot_for_signal(&mismatched, &[bundle_only.clone()], false)
+                .profile
+                .writing_task_id,
+            None
+        );
+
+        let mut unknown_bundle_only = bundle_only.clone();
+        unknown_bundle_only.id = "unknown-browser-project".into();
+        unknown_bundle_only.bundle_id = Some("org.chromium.Chromium".into());
+        assert!(unknown_bundle_only.validate().is_err());
+        let unknown_browser = signal("org.chromium.Chromium", "Chromium", None);
+        assert_eq!(
+            snapshot_for_signal(&unknown_browser, &[unknown_bundle_only], false)
+                .profile
+                .writing_task_id,
+            None
+        );
+
+        let mut browser_bundle_only = bundle_only.clone();
+        browser_bundle_only.id = "browser-project".into();
+        browser_bundle_only.bundle_id = Some("com.google.Chrome".into());
+        assert!(browser_bundle_only.validate().is_err());
+        let browser_signal = signal("com.google.Chrome", "Google Chrome", None);
+        assert_eq!(
+            snapshot_for_signal(&browser_signal, &[browser_bundle_only], false)
                 .profile
                 .writing_task_id,
             None
@@ -5179,6 +5431,15 @@ mod tests {
                 .profile
                 .source,
             ContextSource::UserMapping
+        );
+
+        let mut duplicate_bundle = bundle_only.clone();
+        duplicate_bundle.id = "editor-chat-duplicate".into();
+        assert_eq!(
+            snapshot_for_signal(&active, &[bundle_only.clone(), duplicate_bundle], false)
+                .profile
+                .writing_task_id,
+            None
         );
 
         bundle_only.focused_field = Some(FocusKind::Document);

@@ -16,14 +16,10 @@ static ISLAND_PANEL_WARM: AtomicBool = AtomicBool::new(false);
 static ISLAND_VISIBLE: AtomicBool = AtomicBool::new(false);
 static ISLAND_RECONCILE_SCHEDULED: AtomicBool = AtomicBool::new(false);
 static ISLAND_DESIRED_VISIBLE: AtomicBool = AtomicBool::new(false);
-static ISLAND_HAS_WIDE_CAPTION: AtomicBool = AtomicBool::new(false);
-static ISLAND_WIDE_APPLIED: AtomicBool = AtomicBool::new(false);
-static ISLAND_HAS_WARNING_CAPTION: AtomicBool = AtomicBool::new(false);
-static ISLAND_WARNING_APPLIED: AtomicBool = AtomicBool::new(false);
 static ISLAND_LEARN_APPLIED: AtomicBool = AtomicBool::new(false);
 static ISLAND_DETAILS_APPLIED: AtomicBool = AtomicBool::new(false);
-// 220px monochrome toast with 12px side gutters and a 4px stage gap.
-const LEARN_TOAST_WINDOW_WIDTH: f64 = 244.0;
+// Up to 292px capsule with side gutters and stage gap.
+const LEARN_TOAST_WINDOW_WIDTH: f64 = 316.0;
 const LEARN_TOAST_BAND_HEIGHT: f64 = 52.0;
 const RECOVERY_CAPSULE_WINDOW_WIDTH: f64 = 320.0;
 const RECOVERY_CAPSULE_HEIGHT: f64 = 116.0;
@@ -137,6 +133,65 @@ fn native_status_revision(identifier: &str) -> Option<(&str, u64, bool)> {
         }
     }
     Some((process?, revision?, revision_available?))
+}
+
+fn native_terminal_owner(identifier: &str) -> Option<(String, String, String)> {
+    let (process, _, revision_available) = native_status_revision(identifier)?;
+    if !revision_available {
+        return None;
+    }
+    let current = identifier
+        .split('|')
+        .find_map(|field| field.strip_prefix("current="))?;
+    if current != "none" {
+        return None;
+    }
+    let last = identifier
+        .split('|')
+        .find_map(|field| field.strip_prefix("last="))?;
+    if last == "none" {
+        return None;
+    }
+    let mut id = None;
+    let mut outcome = None;
+    let mut admission_sealed = false;
+    let mut writers_closed = false;
+    for field in last.split(';') {
+        if let Some(value) = field.strip_prefix("id=") {
+            id = Some(value);
+        } else if let Some(value) = field.strip_prefix("outcome=") {
+            outcome = Some(value);
+        } else if let Some(value) = field.strip_prefix("admission_sealed=") {
+            admission_sealed = value == "1";
+        } else if let Some(value) = field.strip_prefix("writers_closed=") {
+            writers_closed = value == "1";
+        }
+    }
+    let id = id?;
+    let outcome = outcome?;
+    if id == "unavailable" || outcome == "pending" || !admission_sealed || !writers_closed {
+        return None;
+    }
+    Some((process.to_owned(), id.to_owned(), outcome.to_owned()))
+}
+
+fn should_announce_native_delivery_status(previous: Option<&str>, incoming: &str) -> bool {
+    let Some(previous) = previous else {
+        return false;
+    };
+    let Some((previous_process, _, _)) = native_status_revision(previous) else {
+        return false;
+    };
+    let Some((incoming_process, _, _)) = native_status_revision(incoming) else {
+        return false;
+    };
+    if previous_process != incoming_process {
+        return false;
+    }
+    let Some(incoming_terminal) = native_terminal_owner(incoming) else {
+        return false;
+    };
+    native_terminal_owner(previous).as_ref() != Some(&incoming_terminal)
 }
 
 /// Keep the retained native identifier monotonic within one process. Equal
@@ -357,40 +412,17 @@ fn resign_island_key_window(window: &WebviewWindow) {
     }
 }
 
-/// Expand the transparent island surface while long status captions are
-/// visible, then shrink it again so idle does not keep a wide hit target in
-/// WindowServer.
-pub fn set_has_wide_caption(app: &AppHandle, wide: bool) {
-    ISLAND_HAS_WIDE_CAPTION.store(wide, Ordering::Release);
-    apply_island_size(app);
-}
-
-pub fn set_has_warning_caption(app: &AppHandle, warning: bool) {
-    ISLAND_HAS_WARNING_CAPTION.store(warning, Ordering::Release);
-    apply_island_size(app);
-}
-
-fn island_should_expand() -> bool {
-    ISLAND_HAS_WIDE_CAPTION.load(Ordering::Acquire)
-}
-
-fn island_window_size(
-    wide: bool,
-    warning: bool,
-    learn_toast: bool,
-    details_visible: bool,
-) -> (f64, f64) {
+fn island_window_size(learn_toast: bool, details_visible: bool) -> (f64, f64) {
     let secondary_visible = details_visible;
-    let base_width = crate::notch::pill_window_width(wide);
     let width = if secondary_visible {
-        base_width.max(RECOVERY_CAPSULE_WINDOW_WIDTH)
+        crate::notch::PILL_WIDTH.max(RECOVERY_CAPSULE_WINDOW_WIDTH)
     } else {
-        base_width
+        crate::notch::PILL_WIDTH
     };
     let height = if secondary_visible {
         RECOVERY_CAPSULE_HEIGHT
     } else {
-        crate::notch::pill_window_height(warning)
+        crate::notch::PILL_HEIGHT
     };
     // Recovery lives inside the VoicePill capsule. Only the independent
     // learning toast adds a second surface below it.
@@ -417,21 +449,12 @@ pub(crate) fn current_primary_pill_bottom_offset() -> f64 {
 }
 
 fn apply_island_size(app: &AppHandle) {
-    let next_wide = island_should_expand();
-    let next_tall = ISLAND_HAS_WARNING_CAPTION.load(Ordering::Acquire);
     let next_learn = ISLAND_LEARN_TOAST.load(Ordering::Acquire);
     let next_details = are_details_visible();
-    let previous_wide = ISLAND_WIDE_APPLIED.swap(next_wide, Ordering::AcqRel);
-    let previous_tall = ISLAND_WARNING_APPLIED.swap(next_tall, Ordering::AcqRel);
     let previous_learn = ISLAND_LEARN_APPLIED.swap(next_learn, Ordering::AcqRel);
     let previous_details = ISLAND_DETAILS_APPLIED.swap(next_details, Ordering::AcqRel);
-    let previous_size = island_window_size(
-        previous_wide,
-        previous_tall,
-        previous_learn,
-        previous_details,
-    );
-    let next_size = island_window_size(next_wide, next_tall, next_learn, next_details);
+    let previous_size = island_window_size(previous_learn, previous_details);
+    let next_size = island_window_size(next_learn, next_details);
     let size_unchanged = (previous_size.0 - next_size.0).abs() < 0.5
         && (previous_size.1 - next_size.1).abs() < 0.5
         && previous_learn == next_learn
@@ -531,12 +554,7 @@ fn show_overlay_on_main(window: &tauri::WebviewWindow, app: &AppHandle) {
 fn position_overlay_on_main(window: &tauri::WebviewWindow, app: &AppHandle) {
     let learn_toast = ISLAND_LEARN_TOAST.load(Ordering::Acquire);
     let details_visible = are_details_visible();
-    let (width, height) = island_window_size(
-        island_should_expand(),
-        ISLAND_HAS_WARNING_CAPTION.load(Ordering::Acquire),
-        learn_toast,
-        details_visible,
-    );
+    let (width, height) = island_window_size(learn_toast, details_visible);
     let placement = crate::notch::placement_for_cursor_screen_with_size(app, width, height);
     let _ = window.set_position(tauri::Position::Physical(tauri::PhysicalPosition {
         x: placement.x.round() as i32,
@@ -736,6 +754,19 @@ pub(crate) fn publish_accessible_delivery_status(
 }
 
 #[cfg(target_os = "macos")]
+#[link(name = "AppKit", kind = "framework")]
+unsafe extern "C" {
+    static NSAccessibilityAnnouncementRequestedNotification: *mut std::ffi::c_void;
+    static NSAccessibilityAnnouncementKey: *mut std::ffi::c_void;
+    static NSAccessibilityPriorityKey: *mut std::ffi::c_void;
+    fn NSAccessibilityPostNotificationWithUserInfo(
+        element: *mut std::ffi::c_void,
+        notification: *mut std::ffi::c_void,
+        user_info: *mut std::ffi::c_void,
+    );
+}
+
+#[cfg(target_os = "macos")]
 fn update_native_delivery_status(
     window: &tauri::WebviewWindow,
     status: &crate::delivery_settlement::NativeAccessibleDeliveryStatus,
@@ -831,6 +862,10 @@ fn update_native_delivery_status(
             let _: () = msg_send![native_window, setAccessibilityChildren: mutable_children];
         }
 
+        let should_announce = should_announce_native_delivery_status(
+            previous_identifier.as_deref(),
+            &status.identifier,
+        );
         if !should_apply_native_delivery_status(previous_identifier.as_deref(), &status.identifier)
         {
             return;
@@ -846,6 +881,23 @@ fn update_native_delivery_status(
         let _: () = msg_send![status_element, setAccessibilityIdentifier: native_identifier];
         let _: () = msg_send![status_element, setAccessibilityLabel: native_label];
         let _: () = msg_send![status_element, setAccessibilityValue: native_value];
+
+        if should_announce {
+            let application: *mut Object = msg_send![class!(NSApplication), sharedApplication];
+            let user_info: *mut Object =
+                msg_send![class!(NSMutableDictionary), dictionaryWithCapacity: 2];
+            let priority: *mut Object = msg_send![class!(NSNumber), numberWithInteger: 50isize];
+            if !application.is_null() && !user_info.is_null() && !priority.is_null() {
+                let _: () = msg_send![user_info, setObject: native_value forKey: NSAccessibilityAnnouncementKey];
+                let _: () =
+                    msg_send![user_info, setObject: priority forKey: NSAccessibilityPriorityKey];
+                NSAccessibilityPostNotificationWithUserInfo(
+                    application as *mut std::ffi::c_void,
+                    NSAccessibilityAnnouncementRequestedNotification,
+                    user_info as *mut std::ffi::c_void,
+                );
+            }
+        }
     }
 }
 
@@ -1019,39 +1071,10 @@ mod tests {
 
     #[test]
     fn learn_toast_and_explicit_details_keep_the_primary_capsule_bottom_anchored() {
-        assert_eq!(
-            super::island_window_size(false, false, false, false),
-            (244.0, 64.0)
-        );
-        assert_eq!(
-            super::island_window_size(false, false, true, false),
-            (244.0, 116.0)
-        );
-        assert_eq!(
-            super::island_window_size(true, true, true, false),
-            (244.0, 116.0)
-        );
-        assert_eq!(
-            super::island_window_size(true, true, false, true),
-            (320.0, 116.0)
-        );
-        assert_eq!(
-            super::island_window_size(false, false, false, true),
-            (320.0, 116.0)
-        );
-        assert_eq!(
-            super::island_window_size(true, true, true, true),
-            (320.0, 168.0)
-        );
-        // Dismissal removes only the toast's band while a warning is still visible.
-        assert_eq!(
-            super::island_window_size(true, true, false, false),
-            (244.0, 64.0)
-        );
-        assert_eq!(
-            super::island_window_size(false, false, false, false),
-            (244.0, 64.0)
-        );
+        assert_eq!(super::island_window_size(false, false), (244.0, 64.0));
+        assert_eq!(super::island_window_size(true, false), (316.0, 116.0));
+        assert_eq!(super::island_window_size(false, true), (320.0, 116.0));
+        assert_eq!(super::island_window_size(true, true), (320.0, 168.0));
         assert_eq!(super::primary_pill_bottom_offset(false, false), 8.0);
         assert_eq!(super::primary_pill_bottom_offset(false, true), 68.0);
         assert_eq!(super::primary_pill_bottom_offset(true, false), 60.0);
@@ -1097,5 +1120,47 @@ mod tests {
             Some(&transaction_b_id),
             &transaction_b_id
         ));
+    }
+
+    #[test]
+    fn native_terminal_announcement_skips_hydration_progress_and_locale_relabels() {
+        let active = "com.voiceflow.dictation.settlement.v1|process=p|revision=2|revision_available=1|current=id=tx-a;outcome=cancelled;admission_sealed=1;writers_closed=0;admitted_writers=1;clipboard_restoration=restore_unverified;next_capture_readiness=readiness_unverified|last=none";
+        let terminal = "com.voiceflow.dictation.settlement.v1|process=p|revision=3|revision_available=1|current=none|last=id=tx-a;outcome=cancelled;admission_sealed=1;writers_closed=1;admitted_writers=0;clipboard_restoration=restore_unverified;next_capture_readiness=readiness_unverified";
+
+        assert!(!super::should_announce_native_delivery_status(
+            None, terminal
+        ));
+        assert!(!super::should_announce_native_delivery_status(
+            Some(active),
+            active
+        ));
+        assert!(super::should_announce_native_delivery_status(
+            Some(active),
+            terminal
+        ));
+        assert!(!super::should_announce_native_delivery_status(
+            Some(terminal),
+            terminal
+        ));
+        assert!(!super::should_announce_native_delivery_status(
+            Some(active),
+            "com.voiceflow.dictation.settlement.v1|process=p|revision=3|revision_available=1|current=id=tx-a;outcome=cancelled;admission_sealed=1;writers_closed=0;admitted_writers=1;clipboard_restoration=restore_unverified;next_capture_readiness=readiness_unverified|last=none"
+        ));
+
+        for outcome in [
+            "inserted",
+            "copy_only",
+            "paste_unverified",
+            "failed",
+            "cancelled",
+        ] {
+            let incoming = format!(
+                "com.voiceflow.dictation.settlement.v1|process=p|revision=4|revision_available=1|current=none|last=id=tx-{outcome};outcome={outcome};admission_sealed=1;writers_closed=1;admitted_writers=0;clipboard_restoration=restore_unverified;next_capture_readiness=readiness_unverified"
+            );
+            assert!(super::should_announce_native_delivery_status(
+                Some(terminal),
+                &incoming
+            ));
+        }
     }
 }
